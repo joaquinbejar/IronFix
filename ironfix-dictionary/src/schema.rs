@@ -311,6 +311,9 @@ pub struct GroupDef {
     pub fields: Vec<FieldRef>,
     /// Nested groups within this group.
     pub groups: Vec<GroupDef>,
+    /// Components used within each group entry.
+    #[serde(default)]
+    pub components: Vec<String>,
     /// Whether the group is required.
     pub required: bool,
 }
@@ -369,8 +372,14 @@ pub struct Dictionary {
     pub components: HashMap<String, ComponentDef>,
     /// Header fields.
     pub header: Vec<FieldRef>,
+    /// Repeating groups in the header (e.g. NoHops in FIX 4.4).
+    #[serde(default)]
+    pub header_groups: Vec<GroupDef>,
     /// Trailer fields.
     pub trailer: Vec<FieldRef>,
+    /// Repeating groups in the trailer.
+    #[serde(default)]
+    pub trailer_groups: Vec<GroupDef>,
 }
 
 impl Dictionary {
@@ -387,7 +396,9 @@ impl Dictionary {
             messages: HashMap::new(),
             components: HashMap::new(),
             header: Vec::new(),
+            header_groups: Vec::new(),
             trailer: Vec::new(),
+            trailer_groups: Vec::new(),
         }
     }
 

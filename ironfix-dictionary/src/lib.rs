@@ -10,10 +10,17 @@
 //!
 //! This crate provides:
 //! - **Schema definitions**: Field, message, and component definitions
-//! - **Dictionary parsing**: QuickFIX XML format parser
-//! - **Runtime validation**: Message validation against dictionary rules
-//! - **Embedded dictionaries**: Pre-loaded FIX 4.0 through 5.0 SP2 specifications
+//! - **Dictionary parsing**: QuickFIX XML format parser ([`Dictionary::from_quickfix_xml`])
+//! - **Runtime validation**: Message validation against dictionary rules ([`Validator`])
+//! - **Embedded dictionaries**: Pre-loaded standard FIX 4.4 specification ([`Dictionary::fix44`])
 
+pub mod loader;
 pub mod schema;
+pub mod validator;
 
-pub use schema::{ComponentDef, Dictionary, FieldDef, FieldType, GroupDef, MessageDef, Version};
+pub use loader::DictionaryError;
+pub use schema::{
+    ComponentDef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, MessageCategory, MessageDef,
+    Version,
+};
+pub use validator::{ValidationError, Validator};

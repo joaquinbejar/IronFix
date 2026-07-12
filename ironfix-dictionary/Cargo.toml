@@ -14,5 +14,7 @@ categories.workspace = true
 ironfix-core.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+quick-xml.workspace = true
 
 [dev-dependencies]
+ironfix-tagvalue.workspace = true
