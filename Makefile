@@ -114,11 +114,11 @@ publish-all: readme
 	@echo "2/11: Publishing ironfix-derive..."
 	cargo publish -p ironfix-derive || true
 	@sleep 30
-	@echo "3/11: Publishing ironfix-dictionary..."
-	cargo publish -p ironfix-dictionary || true
-	@sleep 30
-	@echo "4/11: Publishing ironfix-tagvalue..."
+	@echo "3/11: Publishing ironfix-tagvalue..."
 	cargo publish -p ironfix-tagvalue || true
+	@sleep 30
+	@echo "4/11: Publishing ironfix-dictionary..."
+	cargo publish -p ironfix-dictionary || true
 	@sleep 30
 	@echo "5/11: Publishing ironfix-store..."
 	cargo publish -p ironfix-store || true
