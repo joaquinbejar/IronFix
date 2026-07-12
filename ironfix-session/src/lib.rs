@@ -22,7 +22,8 @@ pub mod state;
 
 pub use config::SessionConfig;
 pub use heartbeat::HeartbeatManager;
-pub use sequence::SequenceManager;
+pub use sequence::{SequenceCounter, SequenceExhausted, SequenceManager};
 pub use state::{
-    Active, Connecting, Disconnected, LogonSent, LogoutPending, Resending, SessionState,
+    Active, Connecting, Disconnected, LogonReceived, LogonSent, LogoutPending, Resending, Session,
+    SessionState,
 };

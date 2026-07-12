@@ -11,6 +11,41 @@
 use ironfix_core::types::SeqNum;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Error returned when a sequence counter has reached its maximum value.
+///
+/// FIX sequence numbers are unbounded in the specification, but this
+/// implementation stores them as `u64`. Once a counter reaches `u64::MAX`
+/// no further numbers can be allocated: the session must perform a
+/// sequence reset (Logon with `ResetSeqNumFlag(141)=Y`, or an out-of-band
+/// reset agreed with the counterparty) and then call
+/// [`SequenceManager::reset`] before continuing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "sequence counter exhausted: {counter} reached u64::MAX, session requires a sequence reset"
+)]
+pub struct SequenceExhausted {
+    /// Which counter was exhausted.
+    pub counter: SequenceCounter,
+}
+
+/// Identifies one of the two sequence counters of a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceCounter {
+    /// Outgoing (sender) sequence counter.
+    Sender,
+    /// Incoming (target) sequence counter.
+    Target,
+}
+
+impl std::fmt::Display for SequenceCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sender => write!(f, "sender"),
+            Self::Target => write!(f, "target"),
+        }
+    }
+}
+
 /// Manages sequence numbers for a FIX session.
 ///
 /// Uses atomic operations for thread-safe access without locks.
@@ -63,17 +98,69 @@ impl SequenceManager {
     ///
     /// This atomically increments the sequence number and returns the
     /// value before the increment.
+    ///
+    /// Note: wraps silently on `u64` overflow. Prefer
+    /// [`try_allocate_sender_seq`](Self::try_allocate_sender_seq) for
+    /// venue-grade sessions where exhaustion must be an explicit error.
     #[inline]
     pub fn allocate_sender_seq(&self) -> SeqNum {
         SeqNum::new(self.next_sender_seq.fetch_add(1, Ordering::SeqCst))
     }
 
+    /// Allocates and returns the next sender sequence number, failing
+    /// instead of wrapping when the counter is exhausted.
+    ///
+    /// On success this atomically increments the counter and returns the
+    /// value before the increment. On exhaustion the counter is left
+    /// untouched; the session must perform a sequence reset (see
+    /// [`SequenceExhausted`]) before more numbers can be allocated.
+    ///
+    /// # Errors
+    /// Returns [`SequenceExhausted`] if the counter has reached `u64::MAX`.
+    #[inline]
+    pub fn try_allocate_sender_seq(&self) -> Result<SeqNum, SequenceExhausted> {
+        self.next_sender_seq
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map(SeqNum::new)
+            .map_err(|_| SequenceExhausted {
+                counter: SequenceCounter::Sender,
+            })
+    }
+
     /// Increments the target sequence number.
     ///
     /// Call this after successfully processing an incoming message.
+    ///
+    /// Note: wraps silently on `u64` overflow. Prefer
+    /// [`try_increment_target_seq`](Self::try_increment_target_seq) for
+    /// venue-grade sessions where exhaustion must be an explicit error.
     #[inline]
     pub fn increment_target_seq(&self) {
         self.next_target_seq.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Increments the target sequence number, failing instead of wrapping
+    /// when the counter is exhausted.
+    ///
+    /// On success returns the new next expected target sequence number.
+    /// On exhaustion the counter is left untouched; the session must
+    /// perform a sequence reset (see [`SequenceExhausted`]) before more
+    /// messages can be accepted.
+    ///
+    /// # Errors
+    /// Returns [`SequenceExhausted`] if the counter has reached `u64::MAX`.
+    #[inline]
+    pub fn try_increment_target_seq(&self) -> Result<SeqNum, SequenceExhausted> {
+        self.next_target_seq
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| SeqNum::new(previous + 1))
+            .map_err(|_| SequenceExhausted {
+                counter: SequenceCounter::Target,
+            })
     }
 
     /// Sets the next sender sequence number.
@@ -216,6 +303,49 @@ mod tests {
         assert!(mgr.validate_incoming(4).is_too_low());
         assert!(mgr.validate_incoming(5).is_ok());
         assert!(mgr.validate_incoming(10).is_gap());
+    }
+
+    #[test]
+    fn test_try_allocate_sender_seq() {
+        let mgr = SequenceManager::new();
+
+        assert_eq!(mgr.try_allocate_sender_seq().unwrap().value(), 1);
+        assert_eq!(mgr.try_allocate_sender_seq().unwrap().value(), 2);
+        assert_eq!(mgr.next_sender_seq().value(), 3);
+    }
+
+    #[test]
+    fn test_try_allocate_sender_seq_exhausted() {
+        let mgr = SequenceManager::with_initial(u64::MAX, 1);
+
+        let err = mgr.try_allocate_sender_seq().unwrap_err();
+        assert_eq!(err.counter, SequenceCounter::Sender);
+        // Counter untouched: still exhausted, no wraparound.
+        assert_eq!(mgr.next_sender_seq().value(), u64::MAX);
+        assert!(mgr.try_allocate_sender_seq().is_err());
+
+        // Reset restores a usable session.
+        mgr.reset();
+        assert_eq!(mgr.try_allocate_sender_seq().unwrap().value(), 1);
+    }
+
+    #[test]
+    fn test_try_increment_target_seq() {
+        let mgr = SequenceManager::new();
+
+        assert_eq!(mgr.try_increment_target_seq().unwrap().value(), 2);
+        assert_eq!(mgr.try_increment_target_seq().unwrap().value(), 3);
+        assert_eq!(mgr.next_target_seq().value(), 3);
+    }
+
+    #[test]
+    fn test_try_increment_target_seq_exhausted() {
+        let mgr = SequenceManager::with_initial(1, u64::MAX);
+
+        let err = mgr.try_increment_target_seq().unwrap_err();
+        assert_eq!(err.counter, SequenceCounter::Target);
+        assert_eq!(mgr.next_target_seq().value(), u64::MAX);
+        assert!(mgr.try_increment_target_seq().is_err());
     }
 
     #[test]

@@ -43,6 +43,17 @@ pub struct LogonSent {
 impl private::Sealed for LogonSent {}
 impl SessionState for LogonSent {}
 
+/// LogonReceived state - Logon received from counterparty (acceptor side),
+/// pending authentication.
+#[derive(Debug, Clone)]
+pub struct LogonReceived {
+    /// Time when the Logon was received.
+    pub received_at: Instant,
+}
+
+impl private::Sealed for LogonReceived {}
+impl SessionState for LogonReceived {}
+
 /// Active state - session is fully established.
 #[derive(Debug, Clone, Copy)]
 pub struct Active;
@@ -104,9 +115,19 @@ impl Session<Disconnected> {
         }
     }
 
-    /// Transitions to the Connecting state.
+    /// Transitions to the Connecting state (initiator side).
     #[must_use]
     pub fn connect(self) -> Session<Connecting> {
+        Session {
+            session_id: self.session_id,
+            _state: PhantomData,
+        }
+    }
+
+    /// Transitions to the Connecting state after accepting an inbound
+    /// TCP connection (acceptor side).
+    #[must_use]
+    pub fn accept(self) -> Session<Connecting> {
         Session {
             session_id: self.session_id,
             _state: PhantomData,
@@ -115,9 +136,19 @@ impl Session<Disconnected> {
 }
 
 impl Session<Connecting> {
-    /// Transitions to the LogonSent state after sending Logon.
+    /// Transitions to the LogonSent state after sending Logon (initiator side).
     #[must_use]
     pub fn send_logon(self) -> Session<LogonSent> {
+        Session {
+            session_id: self.session_id,
+            _state: PhantomData,
+        }
+    }
+
+    /// Transitions to the LogonReceived state when a Logon arrives from
+    /// the counterparty (acceptor side).
+    #[must_use]
+    pub fn on_logon_received(self) -> Session<LogonReceived> {
         Session {
             session_id: self.session_id,
             _state: PhantomData,
@@ -147,6 +178,38 @@ impl Session<LogonSent> {
     /// Transitions to Disconnected on Logon rejection or timeout.
     #[must_use]
     pub fn on_logon_reject(self) -> Session<Disconnected> {
+        Session {
+            session_id: self.session_id,
+            _state: PhantomData,
+        }
+    }
+}
+
+impl Session<LogonReceived> {
+    /// Transitions to Active after successful authentication, once the
+    /// Logon acknowledgement has been sent back to the counterparty.
+    #[must_use]
+    pub fn accept_logon(self) -> Session<Active> {
+        Session {
+            session_id: self.session_id,
+            _state: PhantomData,
+        }
+    }
+
+    /// Transitions to Disconnected when authentication fails and the
+    /// Logon is rejected (Logout/Reject sent, connection dropped).
+    #[must_use]
+    pub fn reject_logon(self) -> Session<Disconnected> {
+        Session {
+            session_id: self.session_id,
+            _state: PhantomData,
+        }
+    }
+
+    /// Transitions to Disconnected when authentication does not complete
+    /// within the allowed time.
+    #[must_use]
+    pub fn on_timeout(self) -> Session<Disconnected> {
         Session {
             session_id: self.session_id,
             _state: PhantomData,
@@ -243,6 +306,34 @@ mod tests {
         // Now in Active state
         let session = session.initiate_logout();
         let _session = session.on_logout_ack();
+    }
+
+    #[test]
+    fn test_acceptor_flow() {
+        let session = Session::<Disconnected>::new("ACCEPTOR");
+        let session = session.accept();
+        let session = session.on_logon_received();
+        let session = session.accept_logon();
+
+        // Now in Active state
+        let session = session.initiate_logout();
+        let _session = session.on_logout_ack();
+    }
+
+    #[test]
+    fn test_acceptor_reject_flow() {
+        let session = Session::<Disconnected>::new("ACCEPTOR");
+        let session = session.accept();
+        let session = session.on_logon_received();
+        let _session = session.reject_logon();
+    }
+
+    #[test]
+    fn test_acceptor_timeout_flow() {
+        let session = Session::<Disconnected>::new("ACCEPTOR");
+        let session = session.accept();
+        let session = session.on_logon_received();
+        let _session = session.on_timeout();
     }
 
     #[test]
