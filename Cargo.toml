@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 license = "MIT"
@@ -26,38 +26,39 @@ categories = ["finance", "data-structures"]
 
 [workspace.dependencies]
 # Internal crates
-ironfix-core = { path = "ironfix-core", version = "0.2.0" }
-ironfix-dictionary = { path = "ironfix-dictionary", version = "0.2.0" }
-ironfix-tagvalue = { path = "ironfix-tagvalue", version = "0.2.0" }
-ironfix-session = { path = "ironfix-session", version = "0.2.0" }
-ironfix-store = { path = "ironfix-store", version = "0.2.0" }
-ironfix-transport = { path = "ironfix-transport", version = "0.2.0" }
-ironfix-fast = { path = "ironfix-fast", version = "0.2.0" }
-ironfix-codegen = { path = "ironfix-codegen", version = "0.2.0" }
-ironfix-derive = { path = "ironfix-derive", version = "0.2.0" }
-ironfix-engine = { path = "ironfix-engine", version = "0.2.0" }
+ironfix-core = { path = "ironfix-core", version = "0.3.0" }
+ironfix-dictionary = { path = "ironfix-dictionary", version = "0.3.0" }
+ironfix-tagvalue = { path = "ironfix-tagvalue", version = "0.3.0" }
+ironfix-session = { path = "ironfix-session", version = "0.3.0" }
+ironfix-store = { path = "ironfix-store", version = "0.3.0" }
+ironfix-transport = { path = "ironfix-transport", version = "0.3.0" }
+ironfix-fast = { path = "ironfix-fast", version = "0.3.0" }
+ironfix-codegen = { path = "ironfix-codegen", version = "0.3.0" }
+ironfix-derive = { path = "ironfix-derive", version = "0.3.0" }
+ironfix-engine = { path = "ironfix-engine", version = "0.3.0" }
 
 # External dependencies
 thiserror = "2.0"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-bytes = { version = "1.9", features = ["serde"] }
-smallvec = { version = "1.13", features = ["union", "const_generics"] }
-memchr = "2.7"
+bytes = { version = "1.12", features = ["serde"] }
+smallvec = { version = "1.15", features = ["union", "const_generics"] }
+memchr = "2.8"
 arrayvec = { version = "0.7", features = ["serde"] }
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
-tokio = { version = "1.43", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = { version = "0.3", features = ["sink"] }
 async-trait = "0.1"
 tracing = "0.1"
 num-traits = "0.2"
 num-derive = "0.4"
-rust_decimal = "1.36"
+rust_decimal = "1.42"
 chrono = { version = "0.4", features = ["serde"] }
 itoa = "1.0"
-quick-xml = "0.37"
+quick-xml = "0.41"
 
 [profile.release]
 opt-level = 3

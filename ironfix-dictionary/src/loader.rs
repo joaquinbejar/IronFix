@@ -17,8 +17,8 @@ use crate::schema::{
     ComponentDef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, MessageCategory, MessageDef,
     Version,
 };
-use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+use quick_xml::{Reader, XmlVersion};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -138,7 +138,10 @@ fn attr_map(e: &BytesStart<'_>) -> Result<HashMap<String, String>, DictionaryErr
     for attr in e.attributes() {
         let attr = attr.map_err(xml_err)?;
         let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-        let value = attr.unescape_value().map_err(xml_err)?.into_owned();
+        let value = attr
+            .normalized_value(XmlVersion::Implicit1_0)
+            .map_err(xml_err)?
+            .into_owned();
         map.insert(key, value);
     }
     Ok(map)
