@@ -73,20 +73,28 @@ async fn handle(
             if let Ok(raw) = decoder.decode() {
                 info!("Received: {:?}", raw.msg_type());
 
+                let seq = {
+                    let mut sessions = state.lock().await;
+                    let s = sessions.get_mut(&key).expect("session present");
+                    let seq = s.seq;
+                    s.seq += 1;
+                    seq
+                };
+
                 let resp = match raw.msg_type() {
                     MsgType::Logon => {
                         if let Some(s) = state.lock().await.get_mut(&key) {
                             s.logged_in = true;
                         }
                         info!("Client logged in");
-                        Some(build_logon(&cfg))
+                        Some(build_logon(&cfg, seq))
                     }
                     MsgType::TestRequest => {
                         let id = raw.get_field_str(112);
-                        Some(build_heartbeat(&cfg, id))
+                        Some(build_heartbeat(&cfg, seq, id))
                     }
                     MsgType::Logout => {
-                        sock.write_all(&build_logout(&cfg)).await?;
+                        sock.write_all(&build_logout(&cfg, seq)).await?;
                         return Ok(());
                     }
                     MsgType::NewOrderSingle => {
@@ -94,19 +102,20 @@ async fn handle(
                         let sym = raw.get_field_str(55).unwrap_or("N/A");
                         let side = raw.get_field_str(54).unwrap_or("1");
                         let qty = raw.get_field_str(38).unwrap_or("0");
-                        Some(build_exec(&cfg, clid, sym, side, qty))
+                        Some(build_exec(&cfg, seq, clid, sym, side, qty))
                     }
                     _ => {
                         warn!("Unhandled: {:?}", raw.msg_type());
+                        // Sequence number not consumed: give it back.
+                        if let Some(s) = state.lock().await.get_mut(&key) {
+                            s.seq -= 1;
+                        }
                         None
                     }
                 };
 
                 if let Some(r) = resp {
                     sock.write_all(&r).await?;
-                    if let Some(s) = state.lock().await.get_mut(&key) {
-                        s.seq += 1;
-                    }
                 }
             }
         }
@@ -114,24 +123,24 @@ async fn handle(
     Ok(())
 }
 
-fn build_logon(c: &ExampleConfig) -> Vec<u8> {
+fn build_logon(c: &ExampleConfig, seq: u64) -> Vec<u8> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "A");
     e.put_str(49, &c.sender_comp_id);
     e.put_str(56, &c.target_comp_id);
-    e.put_str(34, "1");
+    e.put_str(34, &seq.to_string());
     e.put_str(52, &format_timestamp());
     e.put_str(98, "0");
     e.put_str(108, &c.heartbeat_interval.to_string());
     e.finish().to_vec()
 }
 
-fn build_heartbeat(c: &ExampleConfig, test_req_id: Option<&str>) -> Vec<u8> {
+fn build_heartbeat(c: &ExampleConfig, seq: u64, test_req_id: Option<&str>) -> Vec<u8> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "0");
     e.put_str(49, &c.sender_comp_id);
     e.put_str(56, &c.target_comp_id);
-    e.put_str(34, "1");
+    e.put_str(34, &seq.to_string());
     e.put_str(52, &format_timestamp());
     if let Some(id) = test_req_id {
         e.put_str(112, id);
@@ -139,22 +148,29 @@ fn build_heartbeat(c: &ExampleConfig, test_req_id: Option<&str>) -> Vec<u8> {
     e.finish().to_vec()
 }
 
-fn build_logout(c: &ExampleConfig) -> Vec<u8> {
+fn build_logout(c: &ExampleConfig, seq: u64) -> Vec<u8> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "5");
     e.put_str(49, &c.sender_comp_id);
     e.put_str(56, &c.target_comp_id);
-    e.put_str(34, "1");
+    e.put_str(34, &seq.to_string());
     e.put_str(52, &format_timestamp());
     e.finish().to_vec()
 }
 
-fn build_exec(c: &ExampleConfig, clid: &str, sym: &str, side: &str, qty: &str) -> Vec<u8> {
+fn build_exec(
+    c: &ExampleConfig,
+    seq: u64,
+    clid: &str,
+    sym: &str,
+    side: &str,
+    qty: &str,
+) -> Vec<u8> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "8");
     e.put_str(49, &c.sender_comp_id);
     e.put_str(56, &c.target_comp_id);
-    e.put_str(34, "1");
+    e.put_str(34, &seq.to_string());
     e.put_str(52, &format_timestamp());
     e.put_str(37, &format!("ORD{}", clid));
     e.put_str(11, clid);

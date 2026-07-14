@@ -16,6 +16,19 @@
 
 pub mod application;
 pub mod builder;
+pub mod connection;
+pub mod error;
+pub mod initiator;
+pub mod outbound;
+mod wire;
 
-pub use application::Application;
+pub use application::{Application, NoOpApplication, RejectReason, SessionId};
 pub use builder::EngineBuilder;
+pub use connection::Connection;
+pub use error::EngineError;
+pub use initiator::Initiator;
+pub use outbound::OutboundMessage;
+
+// Re-exported for convenience: the per-session configuration consumed by
+// [`Initiator`].
+pub use ironfix_session::SessionConfig;

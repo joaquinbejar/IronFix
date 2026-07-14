@@ -19,6 +19,9 @@ ironfix-tagvalue.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

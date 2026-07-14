@@ -23,6 +23,7 @@ ironfix-engine.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 bytes.workspace = true
+async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow.workspace = true
@@ -99,6 +100,10 @@ path = "examples/fast_server.rs"
 [[example]]
 name = "fast_client"
 path = "examples/fast_client.rs"
+
+[[example]]
+name = "fix44_engine_client"
+path = "examples/fix44_engine_client.rs"
 
 [[example]]
 name = "fix44_server_channel"
