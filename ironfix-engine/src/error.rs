@@ -51,6 +51,19 @@ pub enum EngineError {
         reason: String,
     },
 
+    /// The counterparty confirmed a `HeartBtInt` (108) this engine refuses to
+    /// adopt.
+    ///
+    /// The value drives every liveness timer in the session and is
+    /// counterparty-controlled, so it is bounded by
+    /// [`ironfix_session::heartbeat::MAX_HEARTBEAT_INTERVAL_SECS`]. `108=0` is
+    /// legal and never raises this — it means "do not heartbeat".
+    #[error("unsupported heartbeat interval: {detail}")]
+    HeartbeatInterval {
+        /// Why the confirmed `HeartBtInt` was refused.
+        detail: String,
+    },
+
     /// An unexpected message type arrived while awaiting the Logon
     /// acknowledgement.
     #[error("unexpected message during logon: 35={msg_type}")]

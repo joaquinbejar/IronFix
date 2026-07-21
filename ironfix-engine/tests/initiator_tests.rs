@@ -757,6 +757,179 @@ async fn test_heartbeat_timeout_closes_session() {
     );
 }
 
+/// A counterparty that answers a TestRequest with application traffic instead
+/// of a Heartbeat keeps the session alive: any accepted inbound frame stops
+/// the timeout countdown.
+///
+/// This is the regression that was reproduced against a live session — six
+/// in-sequence ExecutionReports were delivered to the application and the
+/// session was then torn down as timed out.
+#[tokio::test]
+async fn test_test_request_answered_with_app_traffic_keeps_session_alive() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let _logon = next_frame(&mut framed).await;
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "1")]))
+                .await,
+            "send logon ack",
+        );
+
+        // Stay silent until the client probes us.
+        loop {
+            let frame = next_frame(&mut framed).await;
+            if msg_type_of(&frame) == "1" {
+                break;
+            }
+        }
+
+        // Answer with application traffic only: valid, in sequence, and never
+        // a Heartbeat echoing the TestReqID. Eight reports at 200ms span
+        // 1.6s, comfortably past the 1s interval the old timeout used.
+        for seq in 2..10u64 {
+            ok(
+                framed
+                    .send(venue_msg(
+                        "8",
+                        seq,
+                        &[
+                            (37, "ORDER-1"),
+                            (17, "EXEC-1"),
+                            (150, "0"),
+                            (39, "0"),
+                            (55, "AAPL"),
+                        ],
+                    ))
+                    .await,
+                "send execution report",
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    let (app, mut app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(1)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(20), acceptor).await,
+            "acceptor done within 20s",
+        ),
+        "acceptor task",
+    );
+
+    for _ in 0..8 {
+        let received = ok(
+            timeout(Duration::from_secs(5), app_rx.recv()).await,
+            "execution report must reach the application",
+        );
+        assert_eq!(some(received, "app channel must stay open"), "8");
+    }
+
+    assert!(
+        !connection.is_timed_out(),
+        "inbound traffic after the TestRequest must clear the pending probe"
+    );
+    assert!(
+        !connection.is_closed(),
+        "a demonstrably live session must not be torn down"
+    );
+}
+
+/// HeartBtInt = 0 on the Logon ack disables heartbeating: no Heartbeat, no
+/// TestRequest, and no self-inflicted timeout.
+#[tokio::test]
+async fn test_zero_heartbeat_interval_disables_heartbeating() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let _logon = next_frame(&mut framed).await;
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "0")]))
+                .await,
+            "send logon ack with HeartBtInt=0",
+        );
+
+        // The client requested a 1s interval, so without the fix this window
+        // carries two Heartbeats at least — in practice one per 100ms tick.
+        match timeout(Duration::from_secs(2), framed.next()).await {
+            Err(_) => {}
+            Ok(Some(Ok(frame))) => panic!(
+                "HeartBtInt=0 must silence the session, got 35={}",
+                msg_type_of(&frame)
+            ),
+            Ok(Some(Err(err))) => panic!("codec error while expecting silence: {err:?}"),
+            Ok(None) => panic!("session closed itself with HeartBtInt=0"),
+        }
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(1)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+
+    assert!(!connection.is_timed_out());
+    assert!(!connection.is_closed());
+}
+
+/// A counterparty HeartBtInt above the supported ceiling is refused with a
+/// Reject (reason 5, RefTagID 108) and a Logout, and fails the handshake
+/// rather than disabling dead-peer detection.
+#[tokio::test]
+async fn test_out_of_range_heartbeat_interval_fails_handshake() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let _logon = next_frame(&mut framed).await;
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "99999")]))
+                .await,
+            "send logon ack with an out-of-range HeartBtInt",
+        );
+
+        let reject = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reject), "3");
+        assert_eq!(field(&reject, 373).as_deref(), Some("5"));
+        assert_eq!(field(&reject, 371).as_deref(), Some("108"));
+
+        let logout = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logout), "5");
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+
+    match initiator.connect(addr).await {
+        Err(EngineError::HeartbeatInterval { detail }) => {
+            assert!(detail.contains("99999"), "got {detail}");
+        }
+        other => panic!("expected HeartbeatInterval, got {other:?}"),
+    }
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
 /// A sequence gap triggers a ResendRequest and the gapped app message is not
 /// delivered to the application.
 #[tokio::test]

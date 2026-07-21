@@ -25,6 +25,22 @@
 //! heartbeat clock deliberately — traffic from the wrong counterparty must not
 //! keep the session alive, reach the [`Application`], or move sequence state.
 //!
+//! # Heartbeats
+//!
+//! The `HeartBtInt` (108) confirmed on the Logon ack wins, but it is
+//! counterparty-controlled and drives every liveness timer, so it is bounded
+//! by [`ironfix_session::heartbeat::negotiate_interval`]: a confirmed interval
+//! above [`ironfix_session::heartbeat::MAX_HEARTBEAT_INTERVAL_SECS`] that is
+//! not simply an echo of what this side requested fails the handshake with a
+//! Reject (reason 5, `RefTagID` 108) and a Logout. `108=0` is legal and means
+//! "do not heartbeat": the reactor then emits no Heartbeat, sends no
+//! TestRequest, and never times the session out.
+//!
+//! Once a TestRequest is outstanding, **any** inbound frame the session
+//! accepts stops the timeout countdown; a Heartbeat echoing the `TestReqID` is
+//! the positive confirmation. See the `ironfix_session::heartbeat` module
+//! documentation for why the rule is that broad.
+//!
 //! Sequence recovery follows `doc/fix_operations.md`: a `SequenceReset` with
 //! `GapFillFlag` (123) = Y is an ordinary sequenced message and is validated
 //! against its own `MsgSeqNum`, while Reset mode alone may ignore it; an
@@ -76,10 +92,11 @@ use futures_util::{SinkExt, StreamExt};
 use ironfix_core::error::EncodeError;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::version::FixVersion;
-use ironfix_session::heartbeat::generate_test_req_id;
+use ironfix_session::heartbeat::{generate_test_req_id, negotiate_interval};
 use ironfix_session::sequence::{SequenceExhausted, SequenceResult};
 use ironfix_session::{
     Active, Disconnected, HeartbeatManager, LogoutPending, SequenceManager, Session, SessionConfig,
+    TestRequestOutcome,
 };
 use ironfix_transport::FixCodec;
 use std::sync::{Arc, Mutex};
@@ -396,19 +413,50 @@ impl<A: Application + 'static> Initiator<A> {
                 });
             }
 
-            // Honor the heartbeat interval confirmed by the counterparty.
+            // Honor the heartbeat interval confirmed by the counterparty, but
+            // only within the bound `negotiate_interval` enforces: 108 is
+            // counterparty-controlled and drives every liveness timer in the
+            // session. Resolved before the lock is taken, because refusing it
+            // has to send a Reject and a Logout.
+            let mut negotiated = None;
+            if let Some(secs) = raw.get_field_str(108).and_then(|s| s.parse::<u64>().ok()) {
+                match negotiate_interval(self.config.heartbeat_interval, secs) {
+                    Ok(interval) => negotiated = Some(interval),
+                    Err(err) => {
+                        let detail = err.to_string();
+                        let reason = RejectReason::new(5, detail.clone()).with_ref_tag(108);
+                        if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
+                            && let Ok(reject) = factory.session_reject(
+                                out_seq.value(),
+                                ack_seq,
+                                MsgType::Logon.as_str(),
+                                &reason,
+                            )
+                        {
+                            let _ = framed.send(reject).await;
+                        }
+                        if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
+                            && let Ok(logout) = factory.logout(out_seq.value(), Some(&detail))
+                        {
+                            let _ = framed.send(logout).await;
+                        }
+                        let _ = session.on_logon_reject();
+                        return Err(EngineError::HeartbeatInterval { detail });
+                    }
+                }
+            }
             {
                 let mut heartbeat = lock_heartbeat(&runtime);
                 heartbeat.on_message_received(false, None);
-                if let Some(secs) = raw.get_field_str(108).and_then(|s| s.parse::<u64>().ok())
-                    && Duration::from_secs(secs) != heartbeat.interval()
+                if let Some(interval) = negotiated
+                    && interval != heartbeat.interval()
                 {
                     tracing::info!(
                         session = %session_id,
-                        heartbeat_secs = secs,
+                        heartbeat_secs = interval.as_secs(),
                         "using heartbeat interval confirmed by counterparty"
                     );
-                    *heartbeat = HeartbeatManager::new(Duration::from_secs(secs));
+                    *heartbeat = HeartbeatManager::new(interval);
                 }
             }
 
@@ -1184,10 +1232,23 @@ impl<A: Application> Reactor<A> {
         // The frame is well-formed, sequenced, and from the configured
         // counterparty: it proves the peer is alive. A sequence gap is a
         // recoverable condition, not evidence of a dead peer, so gapped
-        // frames still count here.
+        // frames still count here — and so does any frame arriving while a
+        // TestRequest is outstanding, which is what stops the countdown.
         let test_req_id = raw.get_field_str(112);
-        lock_heartbeat(&self.runtime)
+        let outcome = lock_heartbeat(&self.runtime)
             .on_message_received(msg_type == MsgType::Heartbeat, test_req_id);
+        match outcome {
+            TestRequestOutcome::Confirmed => tracing::debug!(
+                session = %self.session_id,
+                "TestRequest answered by Heartbeat with matching TestReqID"
+            ),
+            TestRequestOutcome::SupersededByTraffic => tracing::debug!(
+                session = %self.session_id,
+                msg_type = %msg_type,
+                "pending TestRequest cleared by inbound traffic"
+            ),
+            TestRequestOutcome::NonePending => {}
+        }
 
         if msg_type == MsgType::SequenceReset {
             return self.on_sequence_reset(framed, phase, &raw, seq).await;
