@@ -323,13 +323,22 @@ impl fmt::Display for MsgType {
 /// This struct holds references to the original message buffer,
 /// avoiding allocation during parsing. Fields are stored as
 /// offset ranges into the buffer.
+///
+/// # Range convention
+///
+/// **Every stored range is relative to `buffer`, not to whatever larger buffer
+/// the message may have been decoded from.** A decoder that reads several
+/// messages out of one input must rebase its offsets by the start of the
+/// current message before constructing a `RawMessage`; [`RawMessage::new`]
+/// rejects any range that does not lie within `buffer`.
 #[derive(Debug, Clone)]
 pub struct RawMessage<'a> {
     /// The complete message buffer.
     buffer: &'a [u8],
-    /// Range of the BeginString field value.
+    /// Range of the BeginString field value, relative to `buffer`.
     begin_string: Range<usize>,
-    /// Range of the message body (after BodyLength, before checksum).
+    /// Range of the message body (after BodyLength, before checksum),
+    /// relative to `buffer`.
     body: Range<usize>,
     /// The parsed message type.
     msg_type: MsgType,
@@ -337,30 +346,51 @@ pub struct RawMessage<'a> {
     fields: SmallVec<[FieldRef<'a>; 32]>,
 }
 
+/// Validates that `range` is well ordered and lies within `buffer_len` bytes.
+#[inline]
+fn check_range(range: &Range<usize>, buffer_len: usize) -> Result<(), DecodeError> {
+    if range.start > range.end || range.end > buffer_len {
+        return Err(DecodeError::RangeOutOfBounds {
+            start: range.start,
+            end: range.end,
+            buffer_len,
+        });
+    }
+    Ok(())
+}
+
 impl<'a> RawMessage<'a> {
     /// Creates a new RawMessage from parsed components.
     ///
     /// # Arguments
     /// * `buffer` - The complete message buffer
-    /// * `begin_string` - Range of the BeginString value
-    /// * `body` - Range of the message body
+    /// * `begin_string` - Range of the BeginString value, relative to `buffer`
+    /// * `body` - Range of the message body, relative to `buffer`
     /// * `msg_type` - The parsed message type
     /// * `fields` - Parsed field references
-    #[must_use]
+    ///
+    /// # Errors
+    /// Returns [`DecodeError::RangeOutOfBounds`] if `begin_string` or `body`
+    /// is inverted or does not lie within `buffer`. Every offset here derives
+    /// from attacker-supplied bytes, so the bounds are checked once at
+    /// construction rather than at every accessor.
     pub fn new(
         buffer: &'a [u8],
         begin_string: Range<usize>,
         body: Range<usize>,
         msg_type: MsgType,
         fields: SmallVec<[FieldRef<'a>; 32]>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, DecodeError> {
+        check_range(&begin_string, buffer.len())?;
+        check_range(&body, buffer.len())?;
+
+        Ok(Self {
             buffer,
             begin_string,
             body,
             msg_type,
             fields,
-        }
+        })
     }
 
     /// Returns the complete message buffer.
@@ -371,9 +401,46 @@ impl<'a> RawMessage<'a> {
     }
 
     /// Returns the BeginString value (e.g., "FIX.4.4").
-    #[must_use]
-    pub fn begin_string(&self) -> &'a str {
-        std::str::from_utf8(&self.buffer[self.begin_string.clone()]).unwrap_or("")
+    ///
+    /// # Errors
+    /// Returns [`DecodeError::InvalidUtf8`] if the BeginString bytes are not
+    /// valid UTF-8, or [`DecodeError::RangeOutOfBounds`] if the stored range
+    /// escapes the buffer. The value is never silently defaulted to `""`.
+    pub fn begin_string(&self) -> Result<&'a str, DecodeError> {
+        let range = self.begin_string.clone();
+        debug_assert!(
+            range.end <= self.buffer.len(),
+            "RawMessage ranges must be buffer-relative"
+        );
+        let bytes = self
+            .buffer
+            .get(range.clone())
+            .ok_or(DecodeError::RangeOutOfBounds {
+                start: range.start,
+                end: range.end,
+                buffer_len: self.buffer.len(),
+            })?;
+        std::str::from_utf8(bytes).map_err(DecodeError::from)
+    }
+
+    /// Returns the message body bytes (after BodyLength, before the checksum).
+    ///
+    /// # Errors
+    /// Returns [`DecodeError::RangeOutOfBounds`] if the stored range escapes
+    /// the buffer.
+    pub fn body(&self) -> Result<&'a [u8], DecodeError> {
+        let range = self.body.clone();
+        debug_assert!(
+            range.end <= self.buffer.len(),
+            "RawMessage ranges must be buffer-relative"
+        );
+        self.buffer
+            .get(range.clone())
+            .ok_or(DecodeError::RangeOutOfBounds {
+                start: range.start,
+                end: range.end,
+                buffer_len: self.buffer.len(),
+            })
     }
 
     /// Returns the message type.
@@ -549,13 +616,14 @@ impl OwnedMessage {
     /// * `tag` - The field tag number
     ///
     /// # Returns
-    /// The field value bytes, or `None` if not found.
+    /// The field value bytes, or `None` if not found or if the stored offset
+    /// escapes the buffer.
     #[must_use]
     pub fn get_field(&self, tag: u32) -> Option<&[u8]> {
         self.field_offsets
             .iter()
             .find(|(t, _)| *t == tag)
-            .map(|(_, range)| &self.buffer[range.clone()])
+            .and_then(|(_, range)| self.buffer.get(range.clone()))
     }
 
     /// Gets a field value as a string.
@@ -618,10 +686,10 @@ mod tests {
 
     #[test]
     fn test_msg_type_from_str() {
-        assert_eq!("0".parse::<MsgType>().unwrap(), MsgType::Heartbeat);
-        assert_eq!("A".parse::<MsgType>().unwrap(), MsgType::Logon);
-        assert_eq!("D".parse::<MsgType>().unwrap(), MsgType::NewOrderSingle);
-        assert_eq!("8".parse::<MsgType>().unwrap(), MsgType::ExecutionReport);
+        assert_eq!("0".parse::<MsgType>(), Ok(MsgType::Heartbeat));
+        assert_eq!("A".parse::<MsgType>(), Ok(MsgType::Logon));
+        assert_eq!("D".parse::<MsgType>(), Ok(MsgType::NewOrderSingle));
+        assert_eq!("8".parse::<MsgType>(), Ok(MsgType::ExecutionReport));
     }
 
     #[test]
@@ -642,9 +710,88 @@ mod tests {
 
     #[test]
     fn test_msg_type_custom() {
-        let custom: MsgType = "XX".parse().unwrap();
-        assert!(matches!(custom, MsgType::Custom(_)));
+        let custom = MsgType::Custom("XX".to_string());
+        assert_eq!("XX".parse::<MsgType>(), Ok(custom.clone()));
         assert_eq!(custom.as_str(), "XX");
+    }
+
+    /// Builds the field list for a one-field `RawMessage` over `buffer`.
+    fn single_field(buffer: &[u8]) -> SmallVec<[FieldRef<'_>; 32]> {
+        let mut fields = SmallVec::new();
+        fields.push(FieldRef::new(8, buffer));
+        fields
+    }
+
+    #[test]
+    fn test_raw_message_new_rejects_begin_string_range_past_buffer() {
+        let buffer: &[u8] = b"8=FIX.4.4\x01";
+        let fields = single_field(buffer);
+        let result = RawMessage::new(buffer, 2..64, 0..0, MsgType::Heartbeat, fields);
+        assert_eq!(
+            result.err(),
+            Some(DecodeError::RangeOutOfBounds {
+                start: 2,
+                end: 64,
+                buffer_len: buffer.len(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_raw_message_new_rejects_body_range_past_buffer() {
+        let buffer: &[u8] = b"8=FIX.4.4\x01";
+        let fields = single_field(buffer);
+        let result = RawMessage::new(buffer, 2..9, 0..11, MsgType::Heartbeat, fields);
+        assert!(matches!(
+            result.err(),
+            Some(DecodeError::RangeOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn test_raw_message_new_rejects_inverted_range() {
+        let buffer: &[u8] = b"8=FIX.4.4\x01";
+        let fields = single_field(buffer);
+        // Built via the struct literal: `9..2` as a literal range trips
+        // `clippy::reversed_empty_ranges` before it can reach the check.
+        let inverted = Range { start: 9, end: 2 };
+        let result = RawMessage::new(buffer, inverted, 0..0, MsgType::Heartbeat, fields);
+        assert!(matches!(
+            result.err(),
+            Some(DecodeError::RangeOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn test_raw_message_begin_string_and_body_are_buffer_relative() {
+        let buffer: &[u8] = b"8=FIX.4.4\x0135=0\x01";
+        let fields = single_field(buffer);
+        let Ok(msg) = RawMessage::new(buffer, 2..9, 10..15, MsgType::Heartbeat, fields) else {
+            panic!("in-bounds ranges must be accepted");
+        };
+        assert_eq!(msg.begin_string(), Ok("FIX.4.4"));
+        assert_eq!(msg.body(), Ok(&b"35=0\x01"[..]));
+        assert_eq!(msg.len(), buffer.len());
+    }
+
+    #[test]
+    fn test_raw_message_begin_string_invalid_utf8_is_typed_error() {
+        let buffer: &[u8] = b"8=\xff\xfe\x01";
+        let fields = single_field(buffer);
+        let Ok(msg) = RawMessage::new(buffer, 2..4, 0..0, MsgType::Heartbeat, fields) else {
+            panic!("in-bounds ranges must be accepted");
+        };
+        assert!(matches!(
+            msg.begin_string(),
+            Err(DecodeError::InvalidUtf8(_))
+        ));
+    }
+
+    #[test]
+    fn test_owned_message_get_field_out_of_bounds_offset_returns_none() {
+        let buffer = Bytes::from_static(b"8=FIX.4.4\x01");
+        let msg = OwnedMessage::new(buffer, MsgType::Heartbeat, vec![(8, 2..64)]);
+        assert_eq!(msg.get_field(8), None);
     }
 
     #[test]
