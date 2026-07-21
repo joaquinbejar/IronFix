@@ -57,11 +57,14 @@ pub fn format_checksum(checksum: u8) -> [u8; 3] {
 
 /// Parses a 3-digit checksum string to a u8 value.
 ///
+/// The digits are folded in `u16` and the result is range-checked, so a
+/// hostile value such as `999` is rejected instead of overflowing `u8`.
+///
 /// # Arguments
 /// * `bytes` - The 3-byte checksum string
 ///
 /// # Returns
-/// `Some(checksum)` if valid, `None` otherwise.
+/// `Some(checksum)` if valid and in `0..=255`, `None` otherwise.
 #[inline]
 #[must_use]
 pub fn parse_checksum(bytes: &[u8]) -> Option<u8> {
@@ -77,7 +80,10 @@ pub fn parse_checksum(bytes: &[u8]) -> Option<u8> {
         return None;
     }
 
-    Some(d0 * 100 + d1 * 10 + d2)
+    // Fold in u16: 999 does not fit in u8, and `d0 * 100` alone overflows for
+    // any hundreds digit >= 3.
+    let value = u16::from(d0) * 100 + u16::from(d1) * 10 + u16::from(d2);
+    u8::try_from(value).ok()
 }
 
 #[cfg(test)]
@@ -126,6 +132,16 @@ mod tests {
         assert_eq!(parse_checksum(b"0000"), None);
         assert_eq!(parse_checksum(b"abc"), None);
         assert_eq!(parse_checksum(b"12X"), None);
+    }
+
+    #[test]
+    fn test_parse_checksum_out_of_range() {
+        // Hundreds digit >= 3 used to overflow u8 (`d0 * 100`).
+        assert_eq!(parse_checksum(b"999"), None);
+        assert_eq!(parse_checksum(b"624"), None);
+        assert_eq!(parse_checksum(b"300"), None);
+        assert_eq!(parse_checksum(b"256"), None);
+        assert_eq!(parse_checksum(b"255"), Some(255));
     }
 
     #[test]
