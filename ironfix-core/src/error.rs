@@ -17,6 +17,7 @@ pub type Result<T> = std::result::Result<T, FixError>;
 
 /// Top-level error type for all IronFix operations.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum FixError {
     /// Error during message decoding.
     #[error("decode error: {0}")]
@@ -41,6 +42,7 @@ pub enum FixError {
 
 /// Errors that occur during FIX message decoding.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeError {
     /// Message buffer is incomplete, need more data.
     #[error("incomplete message, need more data")]
@@ -118,10 +120,52 @@ pub enum DecodeError {
         /// Maximum allowed size in bytes.
         max_size: usize,
     },
+
+    /// A field is not terminated by the SOH delimiter.
+    ///
+    /// Distinct from [`DecodeError::Incomplete`]: the tag was well formed, so
+    /// the bytes are structurally a field, but its value never ends.
+    #[error("unterminated field for tag {tag}: missing SOH delimiter")]
+    UnterminatedField {
+        /// The tag whose value is not terminated.
+        tag: u32,
+    },
+
+    /// A Length/Data field pair declares a byte count the buffer cannot satisfy.
+    ///
+    /// Raised when the count declared by a `LENGTH` field (for example
+    /// `RawDataLength`, tag 95) runs past the end of the buffer, or when the
+    /// byte at the declared end of the `DATA` field is not the SOH delimiter.
+    #[error(
+        "data field {data_tag} declares {declared} bytes not terminated by SOH within {available} remaining bytes"
+    )]
+    InvalidDataLength {
+        /// The tag of the `DATA` field being framed.
+        data_tag: u32,
+        /// The byte count declared by the paired `LENGTH` field.
+        declared: usize,
+        /// Bytes actually available after the `=` delimiter.
+        available: usize,
+    },
+
+    /// A stored byte range does not lie within the message buffer.
+    ///
+    /// Guards the offset bookkeeping in [`crate::message::RawMessage`], whose
+    /// ranges are buffer-relative.
+    #[error("range {start}..{end} is out of bounds for a {buffer_len}-byte buffer")]
+    RangeOutOfBounds {
+        /// Start offset of the offending range.
+        start: usize,
+        /// End offset of the offending range.
+        end: usize,
+        /// Length of the buffer the range was applied to.
+        buffer_len: usize,
+    },
 }
 
 /// Errors that occur during FIX message encoding.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// Buffer capacity exceeded during encoding.
     #[error("buffer overflow: need {needed} bytes, have {available}")]
@@ -162,6 +206,7 @@ pub enum EncodeError {
 
 /// Errors in FIX session layer operations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionError {
     /// Session is not in the correct state for the operation.
     #[error("invalid session state: expected {expected}, current {current}")]
@@ -233,6 +278,7 @@ pub enum SessionError {
 
 /// Errors in message store operations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StoreError {
     /// Failed to store message.
     #[error("failed to store message seq={seq_num}: {reason}")]

@@ -33,9 +33,13 @@ pub fn calculate_checksum(data: &[u8]) -> u8 {
 }
 
 /// Portable checksum calculation without SIMD.
+///
+/// The accumulator is `u64`: a `u32` overflows (and panics under the debug
+/// overflow checks) once the input exceeds roughly 16.8 MB of 0xFF bytes,
+/// which is a reachable size for a `RawData`-carrying message.
 #[inline]
 fn calculate_checksum_portable(data: &[u8]) -> u8 {
-    let sum: u32 = data.iter().map(|&b| b as u32).sum();
+    let sum: u64 = data.iter().map(|&b| u64::from(b)).sum();
     (sum % 256) as u8
 }
 
@@ -98,14 +102,25 @@ mod tests {
     #[test]
     fn test_calculate_checksum_simple() {
         let data = b"ABC";
-        let expected = (b'A' as u32 + b'B' as u32 + b'C' as u32) % 256;
+        let expected = (u32::from(b'A') + u32::from(b'B') + u32::from(b'C')) % 256;
         assert_eq!(calculate_checksum(data), expected as u8);
+    }
+
+    #[test]
+    fn test_calculate_checksum_large_input_does_not_overflow() {
+        // A `u32` accumulator overflows past ~16.8 MB of 0xFF bytes and panics
+        // under debug overflow checks. The size is deliberately not a multiple
+        // of 256 so a wrong fold cannot coincidentally produce 0.
+        let len = 17 * 1024 * 1024 + 7;
+        let data = vec![0xFFu8; len];
+        let expected = ((0xFFu64 * len as u64) % 256) as u8;
+        assert_eq!(calculate_checksum(&data), expected);
     }
 
     #[test]
     fn test_calculate_checksum_overflow() {
         let data = vec![255u8; 1000];
-        let expected = ((255u32 * 1000) % 256) as u8;
+        let expected = ((255u64 * 1000) % 256) as u8;
         assert_eq!(calculate_checksum(&data), expected);
     }
 
