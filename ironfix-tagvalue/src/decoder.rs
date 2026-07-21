@@ -190,12 +190,11 @@ impl<'a> Decoder<'a> {
         if msg_type_field.tag != 35 {
             return Err(DecodeError::MissingMsgType);
         }
-        // `MsgType: FromStr` is infallible (unknown values become `Custom`),
-        // so the error arm is uninhabited rather than unwrapped.
-        let msg_type: MsgType = match msg_type_field.as_str()?.parse() {
-            Ok(parsed) => parsed,
-            Err(never) => match never {},
-        };
+        // An unrecognised code becomes `MsgType::Custom` in inline storage, so
+        // this allocates nothing; an empty, over-long, or byte-illegal value is
+        // `DecodeError::InvalidMsgType` rather than a truncated code that would
+        // route the frame to the wrong handler.
+        let msg_type: MsgType = msg_type_field.as_str()?.parse()?;
 
         // Collect all fields
         let mut fields: SmallVec<[FieldRef<'a>; 32]> = SmallVec::new();
@@ -557,6 +556,9 @@ fn parse_length(bytes: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
 
+    use ironfix_core::error::MsgTypeError;
+    use ironfix_core::message::MSG_TYPE_MAX_LEN;
+
     /// Reference table of the spec-defined `(length_tag, data_tag)` pairs.
     ///
     /// This is the complete set of `type='DATA'` fields in the vendored FIX 4.4
@@ -780,6 +782,69 @@ mod tests {
             panic!("valid frame must decode");
         };
         assert_eq!(*decoded.msg_type(), MsgType::Heartbeat);
+    }
+
+    #[test]
+    fn test_decode_unrecognised_msg_type_becomes_custom() {
+        // The whole point of the bounded `Custom`: a vendor-specific MsgType
+        // decodes into inline storage instead of a per-message heap allocation.
+        let body = b"35=U7\x0149=A\x0156=B\x0134=1\x01";
+        let msg = build_frame(body);
+        let Ok(decoded) = Decoder::new(&msg).decode() else {
+            panic!("a representable custom MsgType must decode");
+        };
+        assert_eq!(decoded.msg_type().as_str(), "U7");
+        assert!(matches!(decoded.msg_type(), MsgType::Custom(_)));
+    }
+
+    #[test]
+    fn test_decode_msg_type_at_the_bound_is_accepted() {
+        let body = b"35=U9999999\x0149=A\x0156=B\x0134=1\x01";
+        let msg = build_frame(body);
+        let Ok(decoded) = Decoder::new(&msg).decode() else {
+            panic!("a MSG_TYPE_MAX_LEN-byte MsgType must decode");
+        };
+        assert_eq!(decoded.msg_type().as_str(), "U9999999");
+    }
+
+    #[test]
+    fn test_decode_over_long_msg_type_is_typed_error() {
+        // One byte past MSG_TYPE_MAX_LEN. Truncating it would hand the session
+        // layer a different, valid MsgType.
+        let body = b"35=U99999999\x0149=A\x0156=B\x0134=1\x01";
+        let msg = build_frame(body);
+        assert_eq!(
+            Decoder::new(&msg).decode().err(),
+            Some(DecodeError::InvalidMsgType(MsgTypeError::TooLong {
+                len: 9,
+                max_len: MSG_TYPE_MAX_LEN,
+            }))
+        );
+    }
+
+    #[test]
+    fn test_decode_empty_msg_type_is_typed_error() {
+        let body = b"35=\x0149=A\x0156=B\x0134=1\x01";
+        let msg = build_frame(body);
+        assert_eq!(
+            Decoder::new(&msg).decode().err(),
+            Some(DecodeError::InvalidMsgType(MsgTypeError::Empty))
+        );
+    }
+
+    #[test]
+    fn test_decode_msg_type_with_embedded_equals_is_typed_error() {
+        // `35=A=B` scans as the value "A=B"; it must not survive as a MsgType
+        // that could be written back into a frame verbatim.
+        let body = b"35=A=B\x0149=A\x0156=B\x0134=1\x01";
+        let msg = build_frame(body);
+        assert_eq!(
+            Decoder::new(&msg).decode().err(),
+            Some(DecodeError::InvalidMsgType(MsgTypeError::IllegalByte {
+                byte: b'=',
+                position: 1,
+            }))
+        );
     }
 
     #[test]
