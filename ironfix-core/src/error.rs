@@ -64,10 +64,6 @@ pub enum DecodeError {
     #[error("missing msg type field (tag 35)")]
     MissingMsgType,
 
-    /// Invalid MsgType value.
-    #[error("invalid msg type: {0}")]
-    InvalidMsgType(String),
-
     /// Checksum mismatch between calculated and declared values.
     #[error("checksum mismatch: calculated {calculated}, declared {declared}")]
     ChecksumMismatch {
@@ -97,29 +93,9 @@ pub enum DecodeError {
         reason: String,
     },
 
-    /// Repeating group count mismatch.
-    #[error("group count mismatch for tag {count_tag}: expected {expected}, found {actual}")]
-    GroupCountMismatch {
-        /// The tag containing the group count.
-        count_tag: u32,
-        /// Expected number of group entries.
-        expected: u32,
-        /// Actual number of group entries found.
-        actual: u32,
-    },
-
     /// Invalid UTF-8 in string field.
     #[error("invalid utf-8 in field: {0}")]
     InvalidUtf8(#[from] std::str::Utf8Error),
-
-    /// Message exceeds maximum allowed size.
-    #[error("message too large: {size} bytes exceeds maximum {max_size}")]
-    MessageTooLarge {
-        /// Actual message size in bytes.
-        size: usize,
-        /// Maximum allowed size in bytes.
-        max_size: usize,
-    },
 
     /// A field is not terminated by the SOH delimiter.
     ///
@@ -325,6 +301,120 @@ pub enum StoreError {
     /// I/O error in persistent store.
     #[error("store i/o error: {0}")]
     Io(String),
+}
+
+/// Rejection reasons for [`crate::types::CompId`] construction.
+///
+/// A CompID is written verbatim into SenderCompID (49) and TargetCompID (56)
+/// on every outbound message, so a value carrying SOH or `=` would inject
+/// header fields into the frame. Construction is the chokepoint that makes
+/// that unrepresentable.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CompIdError {
+    /// The value does not fit in the fixed inline storage.
+    #[error("comp id is {len} bytes, exceeding the {max_len}-byte inline storage bound")]
+    TooLong {
+        /// Length of the offered value in bytes.
+        len: usize,
+        /// Maximum length in bytes, [`crate::types::COMP_ID_MAX_LEN`].
+        max_len: usize,
+    },
+
+    /// The value contains a byte outside printable ASCII, or the `=`
+    /// tag/value separator.
+    #[error(
+        "comp id contains illegal byte {byte:#04x} at offset {position}: \
+         only printable ASCII (0x20..=0x7e) except '=' is allowed"
+    )]
+    IllegalByte {
+        /// The offending byte.
+        byte: u8,
+        /// Zero-based offset of the offending byte within the value.
+        position: usize,
+    },
+}
+
+/// Rejection reasons for [`crate::types::Timestamp`] construction.
+///
+/// A `Timestamp` counts nanoseconds since the Unix epoch as an unsigned value
+/// bounded by [`crate::types::Timestamp::MAX_NANOS`], so instants before
+/// 1970-01-01 and after 2262-04-11 are not representable.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TimestampError {
+    /// The nanosecond count exceeds the representable range.
+    #[error("{nanos} nanoseconds since the epoch exceeds the maximum {max_nanos}")]
+    NanosOutOfRange {
+        /// The offered nanosecond count.
+        nanos: u64,
+        /// The largest representable nanosecond count.
+        max_nanos: u64,
+    },
+
+    /// The millisecond count overflows when scaled to nanoseconds.
+    #[error("{millis} milliseconds since the epoch is not representable in nanoseconds")]
+    MillisOutOfRange {
+        /// The offered millisecond count.
+        millis: u64,
+    },
+
+    /// A calendar instant falls outside the representable range — before the
+    /// Unix epoch, or past the nanosecond ceiling.
+    #[error("instant at {seconds} seconds from the epoch is outside the representable range")]
+    InstantOutOfRange {
+        /// Whole seconds from the Unix epoch, negative before 1970.
+        seconds: i64,
+    },
+}
+
+/// A number that is not a legal FIX field tag.
+///
+/// FIX tags are positive integers; `0` is neither a standard nor a
+/// user-defined tag.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("{tag} is not a legal FIX field tag: tags are positive integers starting at 1")]
+pub struct InvalidFieldTag {
+    tag: u32,
+}
+
+impl InvalidFieldTag {
+    /// Creates the error for an offending tag number.
+    #[inline]
+    #[must_use]
+    pub const fn new(tag: u32) -> Self {
+        Self { tag }
+    }
+
+    /// Returns the offending tag number.
+    #[inline]
+    #[must_use]
+    pub const fn tag(self) -> u32 {
+        self.tag
+    }
+}
+
+/// A byte that is not a legal Side (tag 54) code.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[error("{value:#04x} is not a FIX Side (tag 54) code")]
+pub struct InvalidSide {
+    value: u8,
+}
+
+impl InvalidSide {
+    /// Creates the error for an offending byte.
+    #[inline]
+    #[must_use]
+    pub const fn new(value: u8) -> Self {
+        Self { value }
+    }
+
+    /// Returns the offending byte.
+    #[inline]
+    #[must_use]
+    pub const fn value(self) -> u8 {
+        self.value
+    }
 }
 
 #[cfg(test)]

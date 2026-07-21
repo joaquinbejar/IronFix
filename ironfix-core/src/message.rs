@@ -20,133 +20,230 @@ use smallvec::SmallVec;
 use std::fmt;
 use std::ops::Range;
 
-/// Standard FIX message types.
+/// Declares [`MsgType`] and the three mappings that must agree about it.
 ///
-/// This enum covers the most common administrative and application messages.
-/// Custom or less common message types can be represented as `Custom(String)`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-pub enum MsgType {
+/// The variant, its wire code, and its admin/app category are stated **once**
+/// per row; `as_str`, the `from_str` reverse lookup, and `is_admin` are all
+/// generated from that single table, so the three cannot drift. A row's
+/// category must match the `msgcat` the dictionary gives that MsgType — see
+/// [`MsgType::is_admin`].
+macro_rules! define_msg_types {
+    (
+        $(
+            $(#[$variant_meta:meta])*
+            $variant:ident = $code:literal, admin = $admin:literal;
+        )*
+    ) => {
+        /// Standard FIX message types.
+        ///
+        /// This enum covers the most common administrative and application
+        /// messages. Custom or less common message types are represented as
+        /// `Custom(String)`.
+        ///
+        /// # Equality follows the wire form
+        ///
+        /// [`PartialEq`] and [`Hash`] compare [`MsgType::as_str`], not the
+        /// variant: `MsgType::Custom("D".into()) == MsgType::NewOrderSingle`,
+        /// because both put `35=D` on the wire. Without that, a `Custom` value
+        /// reaching a `HashMap` keyed by `MsgType` would silently miss the
+        /// entry its own wire form should have hit. Prefer [`MsgType::new`],
+        /// which folds a known code into its named variant.
+        #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+        pub enum MsgType {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )*
+            /// Custom or unknown message type.
+            Custom(String),
+        }
+
+        impl MsgType {
+            /// Returns the string representation of this message type.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                match self {
+                    $( Self::$variant => $code, )*
+                    Self::Custom(s) => s.as_str(),
+                }
+            }
+
+            /// Creates a MsgType from its on-the-wire code.
+            ///
+            /// A code this enum names folds into that named variant, so the
+            /// result is always in normal form; anything else becomes
+            /// [`MsgType::Custom`].
+            ///
+            /// # Arguments
+            /// * `code` - The message type string (e.g., "D" for NewOrderSingle)
+            #[must_use]
+            pub fn new(code: &str) -> Self {
+                match code {
+                    $( $code => Self::$variant, )*
+                    other => Self::Custom(other.to_owned()),
+                }
+            }
+
+            /// Returns true if this is an administrative (session-level)
+            /// message.
+            ///
+            /// The classification is the `msgcat` attribute the FIX dictionary
+            /// gives each MsgType, and this list must agree with it. Note that
+            /// XMLnonFIX (`n`) is `msgcat='admin'` in `FIX44.xml`, so it is
+            /// administrative despite not being one of the seven classic
+            /// session messages.
+            ///
+            /// A [`MsgType::Custom`] carrying a code this table names is
+            /// classified by that code, so two values that compare equal
+            /// always agree here. A genuinely unrecognised code is treated as
+            /// an application message: nothing here knows a private code's
+            /// category, and routing an unknown message through the session
+            /// path would let a counterparty reach session handling with a
+            /// type this engine cannot interpret.
+            #[must_use]
+            pub fn is_admin(&self) -> bool {
+                match self {
+                    $( Self::$variant => $admin, )*
+                    // Same table, reached by wire code rather than by
+                    // discriminant; borrows the code, never allocates.
+                    Self::Custom(code) => match code.as_str() {
+                        $( $code => $admin, )*
+                        _ => false,
+                    },
+                }
+            }
+        }
+
+        #[cfg(test)]
+        impl MsgType {
+            /// Every named variant, for exhaustive round-trip tests.
+            fn all_named() -> Vec<Self> {
+                vec![ $( Self::$variant, )* ]
+            }
+        }
+    };
+}
+
+define_msg_types! {
     /// Heartbeat (0) - Session level.
     #[default]
-    Heartbeat,
+    Heartbeat = "0", admin = true;
     /// Test Request (1) - Session level.
-    TestRequest,
+    TestRequest = "1", admin = true;
     /// Resend Request (2) - Session level.
-    ResendRequest,
+    ResendRequest = "2", admin = true;
     /// Reject (3) - Session level.
-    Reject,
+    Reject = "3", admin = true;
     /// Sequence Reset (4) - Session level.
-    SequenceReset,
+    SequenceReset = "4", admin = true;
     /// Logout (5) - Session level.
-    Logout,
+    Logout = "5", admin = true;
     /// Indication of Interest (6).
-    IndicationOfInterest,
+    IndicationOfInterest = "6", admin = false;
     /// Advertisement (7).
-    Advertisement,
+    Advertisement = "7", admin = false;
     /// Execution Report (8).
-    ExecutionReport,
+    ExecutionReport = "8", admin = false;
     /// Order Cancel Reject (9).
-    OrderCancelReject,
+    OrderCancelReject = "9", admin = false;
     /// Logon (A) - Session level.
-    Logon,
+    Logon = "A", admin = true;
     /// News (B).
-    News,
+    News = "B", admin = false;
     /// Email (C).
-    Email,
+    Email = "C", admin = false;
     /// New Order Single (D).
-    NewOrderSingle,
+    NewOrderSingle = "D", admin = false;
     /// New Order List (E).
-    NewOrderList,
+    NewOrderList = "E", admin = false;
     /// Order Cancel Request (F).
-    OrderCancelRequest,
+    OrderCancelRequest = "F", admin = false;
     /// Order Cancel/Replace Request (G).
-    OrderCancelReplaceRequest,
+    OrderCancelReplaceRequest = "G", admin = false;
     /// Order Status Request (H).
-    OrderStatusRequest,
+    OrderStatusRequest = "H", admin = false;
     /// Allocation Instruction (J).
-    AllocationInstruction,
+    AllocationInstruction = "J", admin = false;
     /// List Cancel Request (K).
-    ListCancelRequest,
+    ListCancelRequest = "K", admin = false;
     /// List Execute (L).
-    ListExecute,
+    ListExecute = "L", admin = false;
     /// List Status Request (M).
-    ListStatusRequest,
+    ListStatusRequest = "M", admin = false;
     /// List Status (N).
-    ListStatus,
+    ListStatus = "N", admin = false;
     /// Allocation Instruction Ack (P).
-    AllocationInstructionAck,
+    AllocationInstructionAck = "P", admin = false;
     /// Don't Know Trade (Q).
-    DontKnowTrade,
+    DontKnowTrade = "Q", admin = false;
     /// Quote Request (R).
-    QuoteRequest,
+    QuoteRequest = "R", admin = false;
     /// Quote (S).
-    Quote,
+    Quote = "S", admin = false;
     /// Settlement Instructions (T).
-    SettlementInstructions,
+    SettlementInstructions = "T", admin = false;
     /// Market Data Request (V).
-    MarketDataRequest,
+    MarketDataRequest = "V", admin = false;
     /// Market Data Snapshot/Full Refresh (W).
-    MarketDataSnapshotFullRefresh,
+    MarketDataSnapshotFullRefresh = "W", admin = false;
     /// Market Data Incremental Refresh (X).
-    MarketDataIncrementalRefresh,
+    MarketDataIncrementalRefresh = "X", admin = false;
     /// Market Data Request Reject (Y).
-    MarketDataRequestReject,
+    MarketDataRequestReject = "Y", admin = false;
     /// Quote Cancel (Z).
-    QuoteCancel,
+    QuoteCancel = "Z", admin = false;
     /// Quote Status Request (a).
-    QuoteStatusRequest,
+    QuoteStatusRequest = "a", admin = false;
     /// Mass Quote Acknowledgement (b).
-    MassQuoteAcknowledgement,
+    MassQuoteAcknowledgement = "b", admin = false;
     /// Security Definition Request (c).
-    SecurityDefinitionRequest,
+    SecurityDefinitionRequest = "c", admin = false;
     /// Security Definition (d).
-    SecurityDefinition,
+    SecurityDefinition = "d", admin = false;
     /// Security Status Request (e).
-    SecurityStatusRequest,
+    SecurityStatusRequest = "e", admin = false;
     /// Security Status (f).
-    SecurityStatus,
+    SecurityStatus = "f", admin = false;
     /// Trading Session Status Request (g).
-    TradingSessionStatusRequest,
+    TradingSessionStatusRequest = "g", admin = false;
     /// Trading Session Status (h).
-    TradingSessionStatus,
+    TradingSessionStatus = "h", admin = false;
     /// Mass Quote (i).
-    MassQuote,
+    MassQuote = "i", admin = false;
     /// Business Message Reject (j).
-    BusinessMessageReject,
+    BusinessMessageReject = "j", admin = false;
     /// Bid Request (k).
-    BidRequest,
+    BidRequest = "k", admin = false;
     /// Bid Response (l).
-    BidResponse,
+    BidResponse = "l", admin = false;
     /// List Strike Price (m).
-    ListStrikePrice,
-    /// XML Message (n).
-    XmlMessage,
+    ListStrikePrice = "m", admin = false;
+    /// XML Message, XMLnonFIX (n) - `msgcat='admin'` in the FIX dictionary.
+    XmlMessage = "n", admin = true;
     /// Registration Instructions (o).
-    RegistrationInstructions,
+    RegistrationInstructions = "o", admin = false;
     /// Registration Instructions Response (p).
-    RegistrationInstructionsResponse,
+    RegistrationInstructionsResponse = "p", admin = false;
     /// Order Mass Cancel Request (q).
-    OrderMassCancelRequest,
+    OrderMassCancelRequest = "q", admin = false;
     /// Order Mass Cancel Report (r).
-    OrderMassCancelReport,
+    OrderMassCancelReport = "r", admin = false;
     /// New Order Cross (s).
-    NewOrderCross,
+    NewOrderCross = "s", admin = false;
     /// Cross Order Cancel/Replace Request (t).
-    CrossOrderCancelReplaceRequest,
+    CrossOrderCancelReplaceRequest = "t", admin = false;
     /// Cross Order Cancel Request (u).
-    CrossOrderCancelRequest,
+    CrossOrderCancelRequest = "u", admin = false;
     /// Security Type Request (v).
-    SecurityTypeRequest,
+    SecurityTypeRequest = "v", admin = false;
     /// Security Types (w).
-    SecurityTypes,
+    SecurityTypes = "w", admin = false;
     /// Security List Request (x).
-    SecurityListRequest,
+    SecurityListRequest = "x", admin = false;
     /// Security List (y).
-    SecurityList,
+    SecurityList = "y", admin = false;
     /// Derivative Security List Request (z).
-    DerivativeSecurityListRequest,
-    /// Custom or unknown message type.
-    Custom(String),
+    DerivativeSecurityListRequest = "z", admin = false;
 }
 
 impl std::str::FromStr for MsgType {
@@ -154,161 +251,46 @@ impl std::str::FromStr for MsgType {
 
     /// Creates a MsgType from a string value.
     ///
+    /// Infallible: an unrecognised code becomes [`MsgType::Custom`], which is
+    /// how a private or newer message type reaches the application layer
+    /// without the decoder having to know it. Delegates to [`MsgType::new`],
+    /// so the result is always in normal form.
+    ///
     /// # Arguments
     /// * `s` - The message type string (e.g., "D" for NewOrderSingle)
+    ///
+    /// # Errors
+    /// Never returns an error.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(match s {
-            "0" => Self::Heartbeat,
-            "1" => Self::TestRequest,
-            "2" => Self::ResendRequest,
-            "3" => Self::Reject,
-            "4" => Self::SequenceReset,
-            "5" => Self::Logout,
-            "6" => Self::IndicationOfInterest,
-            "7" => Self::Advertisement,
-            "8" => Self::ExecutionReport,
-            "9" => Self::OrderCancelReject,
-            "A" => Self::Logon,
-            "B" => Self::News,
-            "C" => Self::Email,
-            "D" => Self::NewOrderSingle,
-            "E" => Self::NewOrderList,
-            "F" => Self::OrderCancelRequest,
-            "G" => Self::OrderCancelReplaceRequest,
-            "H" => Self::OrderStatusRequest,
-            "J" => Self::AllocationInstruction,
-            "K" => Self::ListCancelRequest,
-            "L" => Self::ListExecute,
-            "M" => Self::ListStatusRequest,
-            "N" => Self::ListStatus,
-            "P" => Self::AllocationInstructionAck,
-            "Q" => Self::DontKnowTrade,
-            "R" => Self::QuoteRequest,
-            "S" => Self::Quote,
-            "T" => Self::SettlementInstructions,
-            "V" => Self::MarketDataRequest,
-            "W" => Self::MarketDataSnapshotFullRefresh,
-            "X" => Self::MarketDataIncrementalRefresh,
-            "Y" => Self::MarketDataRequestReject,
-            "Z" => Self::QuoteCancel,
-            "a" => Self::QuoteStatusRequest,
-            "b" => Self::MassQuoteAcknowledgement,
-            "c" => Self::SecurityDefinitionRequest,
-            "d" => Self::SecurityDefinition,
-            "e" => Self::SecurityStatusRequest,
-            "f" => Self::SecurityStatus,
-            "g" => Self::TradingSessionStatusRequest,
-            "h" => Self::TradingSessionStatus,
-            "i" => Self::MassQuote,
-            "j" => Self::BusinessMessageReject,
-            "k" => Self::BidRequest,
-            "l" => Self::BidResponse,
-            "m" => Self::ListStrikePrice,
-            "n" => Self::XmlMessage,
-            "o" => Self::RegistrationInstructions,
-            "p" => Self::RegistrationInstructionsResponse,
-            "q" => Self::OrderMassCancelRequest,
-            "r" => Self::OrderMassCancelReport,
-            "s" => Self::NewOrderCross,
-            "t" => Self::CrossOrderCancelReplaceRequest,
-            "u" => Self::CrossOrderCancelRequest,
-            "v" => Self::SecurityTypeRequest,
-            "w" => Self::SecurityTypes,
-            "x" => Self::SecurityListRequest,
-            "y" => Self::SecurityList,
-            "z" => Self::DerivativeSecurityListRequest,
-            other => Self::Custom(other.to_string()),
-        })
+        Ok(Self::new(s))
     }
 }
 
 impl MsgType {
-    /// Returns the string representation of this message type.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Heartbeat => "0",
-            Self::TestRequest => "1",
-            Self::ResendRequest => "2",
-            Self::Reject => "3",
-            Self::SequenceReset => "4",
-            Self::Logout => "5",
-            Self::IndicationOfInterest => "6",
-            Self::Advertisement => "7",
-            Self::ExecutionReport => "8",
-            Self::OrderCancelReject => "9",
-            Self::Logon => "A",
-            Self::News => "B",
-            Self::Email => "C",
-            Self::NewOrderSingle => "D",
-            Self::NewOrderList => "E",
-            Self::OrderCancelRequest => "F",
-            Self::OrderCancelReplaceRequest => "G",
-            Self::OrderStatusRequest => "H",
-            Self::AllocationInstruction => "J",
-            Self::ListCancelRequest => "K",
-            Self::ListExecute => "L",
-            Self::ListStatusRequest => "M",
-            Self::ListStatus => "N",
-            Self::AllocationInstructionAck => "P",
-            Self::DontKnowTrade => "Q",
-            Self::QuoteRequest => "R",
-            Self::Quote => "S",
-            Self::SettlementInstructions => "T",
-            Self::MarketDataRequest => "V",
-            Self::MarketDataSnapshotFullRefresh => "W",
-            Self::MarketDataIncrementalRefresh => "X",
-            Self::MarketDataRequestReject => "Y",
-            Self::QuoteCancel => "Z",
-            Self::QuoteStatusRequest => "a",
-            Self::MassQuoteAcknowledgement => "b",
-            Self::SecurityDefinitionRequest => "c",
-            Self::SecurityDefinition => "d",
-            Self::SecurityStatusRequest => "e",
-            Self::SecurityStatus => "f",
-            Self::TradingSessionStatusRequest => "g",
-            Self::TradingSessionStatus => "h",
-            Self::MassQuote => "i",
-            Self::BusinessMessageReject => "j",
-            Self::BidRequest => "k",
-            Self::BidResponse => "l",
-            Self::ListStrikePrice => "m",
-            Self::XmlMessage => "n",
-            Self::RegistrationInstructions => "o",
-            Self::RegistrationInstructionsResponse => "p",
-            Self::OrderMassCancelRequest => "q",
-            Self::OrderMassCancelReport => "r",
-            Self::NewOrderCross => "s",
-            Self::CrossOrderCancelReplaceRequest => "t",
-            Self::CrossOrderCancelRequest => "u",
-            Self::SecurityTypeRequest => "v",
-            Self::SecurityTypes => "w",
-            Self::SecurityListRequest => "x",
-            Self::SecurityList => "y",
-            Self::DerivativeSecurityListRequest => "z",
-            Self::Custom(s) => s.as_str(),
-        }
-    }
-
-    /// Returns true if this is an administrative message.
-    #[must_use]
-    pub fn is_admin(&self) -> bool {
-        matches!(
-            self,
-            Self::Heartbeat
-                | Self::TestRequest
-                | Self::ResendRequest
-                | Self::Reject
-                | Self::SequenceReset
-                | Self::Logout
-                | Self::Logon
-        )
-    }
-
     /// Returns true if this is an application message.
     #[must_use]
     pub fn is_app(&self) -> bool {
         !self.is_admin()
+    }
+}
+
+/// Compares the on-the-wire form, not the variant.
+///
+/// `Custom("D")` and `NewOrderSingle` both encode `35=D`, so they compare
+/// equal; anything else would make a `Custom` value miss its own entry in a
+/// `MsgType`-keyed map.
+impl PartialEq for MsgType {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for MsgType {}
+
+/// Hashes the on-the-wire form, keeping `Hash` consistent with [`PartialEq`].
+impl std::hash::Hash for MsgType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
     }
 }
 
@@ -545,20 +527,37 @@ pub struct OwnedMessage {
 impl OwnedMessage {
     /// Creates an OwnedMessage from a RawMessage.
     ///
+    /// # Borrow invariant
+    ///
+    /// Field offsets are recovered by subtracting the buffer's address from
+    /// each field value's address, so **every `FieldRef` in `raw` must borrow
+    /// from `raw.buffer()`** — which is what a decoder that produced both
+    /// guarantees. A field pointing anywhere else has no offset in this
+    /// buffer; rather than computing a wrapped or out-of-range one, it is
+    /// **dropped**, and `field_count()` on the result is correspondingly
+    /// lower. Such a `RawMessage` is a construction bug in whatever produced
+    /// it, not an input this type can repair.
+    ///
     /// # Arguments
     /// * `raw` - The raw message to copy
     #[must_use]
     pub fn from_raw(raw: &RawMessage<'_>) -> Self {
         let buffer = Bytes::copy_from_slice(raw.buffer);
-        let field_offsets = raw
-            .fields
-            .iter()
-            .map(|f| {
-                let start = f.value.as_ptr() as usize - raw.buffer.as_ptr() as usize;
-                let end = start + f.value.len();
-                (f.tag, start..end)
-            })
-            .collect();
+        let buffer_start = raw.buffer.as_ptr() as usize;
+        let buffer_len = raw.buffer.len();
+
+        let mut field_offsets = Vec::with_capacity(raw.fields.len());
+        for field in &raw.fields {
+            let offset = (field.value.as_ptr() as usize)
+                .checked_sub(buffer_start)
+                .and_then(|start| {
+                    let end = start.checked_add(field.value.len())?;
+                    (end <= buffer_len).then_some(start..end)
+                });
+            if let Some(range) = offset {
+                field_offsets.push((field.tag, range));
+            }
+        }
 
         Self {
             buffer,
@@ -684,6 +683,10 @@ pub trait FixMessage: Sized {
 mod tests {
     use super::*;
 
+    use std::collections::hash_map::DefaultHasher;
+    use std::collections::{HashMap, HashSet};
+    use std::hash::{Hash, Hasher};
+
     #[test]
     fn test_msg_type_from_str() {
         assert_eq!("0".parse::<MsgType>(), Ok(MsgType::Heartbeat));
@@ -700,6 +703,34 @@ mod tests {
     }
 
     #[test]
+    fn test_msg_type_every_variant_round_trips_through_its_code() {
+        for variant in MsgType::all_named() {
+            let code = variant.as_str().to_owned();
+            assert_eq!(
+                MsgType::new(&code),
+                variant,
+                "MsgType::new({code:?}) must recover {variant:?}"
+            );
+            // A named code must never fall through to Custom.
+            assert!(
+                !matches!(MsgType::new(&code), MsgType::Custom(_)),
+                "{code:?} must map to a named variant, not Custom"
+            );
+        }
+    }
+
+    #[test]
+    fn test_msg_type_codes_are_unique() {
+        let named = MsgType::all_named();
+        let codes: HashSet<&str> = named.iter().map(MsgType::as_str).collect();
+        assert_eq!(
+            codes.len(),
+            named.len(),
+            "two variants share one wire code, so the reverse lookup is ambiguous"
+        );
+    }
+
+    #[test]
     fn test_msg_type_is_admin() {
         assert!(MsgType::Heartbeat.is_admin());
         assert!(MsgType::Logon.is_admin());
@@ -709,10 +740,84 @@ mod tests {
     }
 
     #[test]
+    fn test_msg_type_is_admin_matches_dictionary_msgcat() {
+        // The eight msgtype values marked msgcat='admin' in FIX44.xml.
+        const ADMIN_CODES: [&str; 8] = ["0", "1", "2", "3", "4", "5", "A", "n"];
+        for variant in MsgType::all_named() {
+            let expected = ADMIN_CODES.contains(&variant.as_str());
+            assert_eq!(
+                variant.is_admin(),
+                expected,
+                "{variant:?} ({}) disagrees with the dictionary msgcat",
+                variant.as_str()
+            );
+            assert_eq!(variant.is_app(), !expected);
+        }
+    }
+
+    #[test]
+    fn test_msg_type_xml_message_is_admin() {
+        assert_eq!(MsgType::new("n"), MsgType::XmlMessage);
+        assert!(MsgType::XmlMessage.is_admin());
+        assert!(!MsgType::XmlMessage.is_app());
+    }
+
+    #[test]
     fn test_msg_type_custom() {
         let custom = MsgType::Custom("XX".to_string());
         assert_eq!("XX".parse::<MsgType>(), Ok(custom.clone()));
         assert_eq!(custom.as_str(), "XX");
+        assert!(!custom.is_admin());
+        assert!(custom.is_app());
+    }
+
+    #[test]
+    fn test_msg_type_new_normalises_known_code_out_of_custom() {
+        assert_eq!(MsgType::new("D"), MsgType::NewOrderSingle);
+        assert!(matches!(MsgType::new("D"), MsgType::NewOrderSingle));
+        assert!(matches!(MsgType::new("ZZ"), MsgType::Custom(_)));
+    }
+
+    #[test]
+    fn test_msg_type_custom_equals_named_variant_with_same_wire_form() {
+        let custom = MsgType::Custom("D".to_string());
+        assert_eq!(custom, MsgType::NewOrderSingle);
+        assert_eq!(MsgType::NewOrderSingle, custom);
+        assert_ne!(custom, MsgType::ExecutionReport);
+    }
+
+    #[test]
+    fn test_msg_type_equal_values_agree_on_is_admin() {
+        // Equality follows the wire form, so classification must too — a
+        // Custom("A") that routed as an application message while an equal
+        // MsgType::Logon routed as admin would be a session-layer split brain.
+        for variant in MsgType::all_named() {
+            let as_custom = MsgType::Custom(variant.as_str().to_owned());
+            assert_eq!(as_custom, variant);
+            assert_eq!(
+                as_custom.is_admin(),
+                variant.is_admin(),
+                "Custom({:?}) must classify like {variant:?}",
+                variant.as_str()
+            );
+        }
+        // A code no variant names stays an application message.
+        assert!(!MsgType::Custom("ZZ".to_owned()).is_admin());
+    }
+
+    #[test]
+    fn test_msg_type_hash_follows_wire_form() {
+        fn hash_of(value: &MsgType) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
+        let custom = MsgType::Custom("D".to_string());
+        assert_eq!(hash_of(&custom), hash_of(&MsgType::NewOrderSingle));
+
+        let mut map: HashMap<MsgType, u32> = HashMap::new();
+        map.insert(MsgType::NewOrderSingle, 1);
+        assert_eq!(map.get(&custom), Some(&1));
     }
 
     /// Builds the field list for a one-field `RawMessage` over `buffer`.
@@ -792,6 +897,51 @@ mod tests {
         let buffer = Bytes::from_static(b"8=FIX.4.4\x01");
         let msg = OwnedMessage::new(buffer, MsgType::Heartbeat, vec![(8, 2..64)]);
         assert_eq!(msg.get_field(8), None);
+    }
+
+    #[test]
+    fn test_owned_message_from_raw_recovers_buffer_offsets() {
+        let buffer: &[u8] = b"8=FIX.4.4\x0135=D\x0149=SENDER\x01";
+        let mut fields: SmallVec<[FieldRef<'_>; 32]> = SmallVec::new();
+        let Some(begin) = buffer.get(2..9) else {
+            panic!("fixture buffer is long enough")
+        };
+        let Some(sender) = buffer.get(18..24) else {
+            panic!("fixture buffer is long enough")
+        };
+        fields.push(FieldRef::new(8, begin));
+        fields.push(FieldRef::new(49, sender));
+        let Ok(raw) = RawMessage::new(buffer, 2..9, 10..24, MsgType::NewOrderSingle, fields) else {
+            panic!("in-bounds ranges must be accepted");
+        };
+
+        let owned = OwnedMessage::from_raw(&raw);
+        assert_eq!(owned.field_count(), 2);
+        assert_eq!(owned.get_field_str(8), Some("FIX.4.4"));
+        assert_eq!(owned.get_field_str(49), Some("SENDER"));
+    }
+
+    #[test]
+    fn test_owned_message_from_raw_drops_field_not_borrowing_from_buffer() {
+        let buffer: &[u8] = b"8=FIX.4.4\x0135=D\x01";
+        // Deliberately borrowed from a different allocation: the offset of
+        // this value inside `buffer` does not exist, and the old pointer
+        // subtraction would have wrapped into a huge range.
+        let foreign: &[u8] = b"FOREIGN";
+        let mut fields: SmallVec<[FieldRef<'_>; 32]> = SmallVec::new();
+        let Some(begin) = buffer.get(2..9) else {
+            panic!("fixture buffer is long enough")
+        };
+        fields.push(FieldRef::new(8, begin));
+        fields.push(FieldRef::new(49, foreign));
+        let Ok(raw) = RawMessage::new(buffer, 2..9, 10..15, MsgType::NewOrderSingle, fields) else {
+            panic!("in-bounds ranges must be accepted");
+        };
+
+        let owned = OwnedMessage::from_raw(&raw);
+        assert_eq!(owned.field_count(), 1);
+        assert_eq!(owned.get_field_str(8), Some("FIX.4.4"));
+        assert_eq!(owned.get_field(49), None);
     }
 
     #[test]

@@ -48,7 +48,7 @@ fn some<T>(value: Option<T>, what: &str) -> T {
 /// Builds a CompID for the test fixtures.
 #[track_caller]
 fn comp_id(value: &str) -> CompId {
-    some(CompId::new(value), "test CompId must be valid")
+    ok(CompId::new(value), "test CompId must be valid")
 }
 
 /// Stub-acceptor side frame builder (VENUE -> CLIENT).

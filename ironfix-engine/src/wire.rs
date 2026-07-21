@@ -396,10 +396,10 @@ mod tests {
     use ironfix_core::types::CompId;
 
     fn config_for(begin_string: &str) -> SessionConfig {
-        let Some(sender) = CompId::new("CLIENT") else {
+        let Ok(sender) = CompId::new("CLIENT") else {
             unreachable!("CLIENT is a valid CompId")
         };
-        let Some(target) = CompId::new("VENUE") else {
+        let Ok(target) = CompId::new("VENUE") else {
             unreachable!("VENUE is a valid CompId")
         };
         SessionConfig::new(sender, target, begin_string)
