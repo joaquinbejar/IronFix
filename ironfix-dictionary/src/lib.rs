@@ -12,7 +12,9 @@
 //! - **Schema definitions**: field, message, component and repeating-group
 //!   definitions ([`schema`])
 //! - **Dictionary parsing**: a QuickFIX XML loader
-//!   ([`Dictionary::from_quickfix_xml`]) with a component-recursion depth guard
+//!   ([`Dictionary::from_quickfix_xml`]) with a component-recursion depth guard.
+//!   Loading is treated as untrusted-input parsing: see the [`loader`] module
+//!   docs for the ceilings that bound it.
 //! - **Runtime validation**: message validation against dictionary rules
 //!   ([`Validator`]) — known message type, defined and allowed tags, required
 //!   fields, enum values, repeating-group count and delimiter
@@ -30,14 +32,18 @@
 //! `ironfix-engine` nor `ironfix-transport` validates against a dictionary — a
 //! message that decodes successfully has not been schema-checked unless you
 //! call the validator yourself.
+//!
+//! [`FieldRef`] here is the schema's *reference to a field definition*, not
+//! `ironfix_core::field::FieldRef`, which is a field borrowed from a decoded
+//! buffer. Both names exist in the workspace; always qualify them.
 
 pub mod loader;
 pub mod schema;
 pub mod validator;
 
-pub use loader::DictionaryError;
+pub use loader::{DefinitionKind, DictionaryError, MAX_COMPONENT_DEPTH, MAX_NESTING_DEPTH};
 pub use schema::{
-    ComponentDef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, MessageCategory, MessageDef,
-    Version,
+    ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef,
+    MessageCategory, MessageDef, UnknownFieldType, Version,
 };
-pub use validator::{ValidationError, Validator};
+pub use validator::{MAX_SCOPE_DEPTH, MAX_SCOPE_NODES, ValidationError, Validator};

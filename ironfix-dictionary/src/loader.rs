@@ -12,30 +12,84 @@
 //!
 //! Venue-specific dialects can be loaded from their own QuickFIX XML files
 //! with [`Dictionary::from_quickfix_xml`].
+//!
+//! # Untrusted input
+//!
+//! A dictionary file is parser input like any wire message, so the loader is
+//! written to the same standard as the decoders: every malformed document
+//! maps to a typed [`DictionaryError`], never to a panic, an unbounded
+//! recursion, or an allocation sized from the document. Two ceilings bound
+//! the work:
+//!
+//! - [`MAX_NESTING_DEPTH`] caps physical XML element nesting, so a file of
+//!   deeply nested `<group>` elements is rejected instead of exhausting the
+//!   stack.
+//! - [`MAX_COMPONENT_DEPTH`] caps how far component references may chain.
+//!
+//! Reference cycles among components are rejected up front
+//! ([`DictionaryError::ComponentCycle`]), dangling component references are
+//! rejected ([`DictionaryError::UnknownComponent`]), and duplicate
+//! definitions are rejected rather than silently overwriting each other
+//! ([`DictionaryError::DuplicateDefinition`]).
 
 use crate::schema::{
-    ComponentDef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, MessageCategory, MessageDef,
-    Version,
+    ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef,
+    MessageCategory, MessageDef, Version,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::OnceLock;
 
-/// Maximum component nesting depth accepted by the resolver.
+/// Maximum component reference chain length accepted by the loader.
 ///
-/// Guards against reference cycles in malformed dictionaries.
-const MAX_COMPONENT_DEPTH: usize = 32;
+/// A component whose expansion needs more than this many hops is rejected
+/// with [`DictionaryError::NestingTooDeep`]; a component that references
+/// itself, directly or transitively, is rejected with
+/// [`DictionaryError::ComponentCycle`].
+pub const MAX_COMPONENT_DEPTH: usize = 32;
+
+/// Maximum physical XML element nesting depth accepted by the loader.
+///
+/// Bounds the loader's recursion over `<group>`, `<component>`, and
+/// `<field>` elements so that a hostile document of deeply nested elements
+/// is rejected with [`DictionaryError::NestingTooDeep`] instead of
+/// overflowing the stack.
+pub const MAX_NESTING_DEPTH: usize = 32;
 
 /// Embedded QuickFIX FIX 4.4 specification.
 ///
 /// Source: <https://github.com/quickfix/quickfix/blob/master/spec/FIX44.xml>
 const FIX44_XML: &str = include_str!("../spec/FIX44.xml");
 
-static FIX44_DICT: OnceLock<Dictionary> = OnceLock::new();
+static FIX44_DICT: OnceLock<Result<Dictionary, DictionaryError>> = OnceLock::new();
+
+/// The kind of definition a [`DictionaryError::DuplicateDefinition`] refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionKind {
+    /// A `<field>` definition, keyed by name.
+    Field,
+    /// A `<message>` definition, keyed by `msgtype`.
+    Message,
+    /// A `<component>` definition, keyed by name.
+    Component,
+}
+
+impl fmt::Display for DefinitionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Field => "field",
+            Self::Message => "message",
+            Self::Component => "component",
+        };
+        f.write_str(name)
+    }
+}
 
 /// Errors produced while loading a dictionary from XML.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum DictionaryError {
     /// The XML could not be parsed.
     #[error("XML parse error: {0}")]
@@ -63,9 +117,43 @@ pub enum DictionaryError {
     /// A group has no members, so its delimiter cannot be determined.
     #[error("empty group `{0}`: cannot determine delimiter tag")]
     EmptyGroup(String),
-    /// Components are nested too deeply (likely a reference cycle).
-    #[error("component nesting too deep resolving `{0}` (reference cycle?)")]
+    /// A component references itself, directly or through other components.
+    #[error("component `{0}` is part of a reference cycle")]
     ComponentCycle(String),
+    /// Elements or component references nest past the loader's ceiling.
+    #[error("nesting too deep at `{element}` (limit {limit})")]
+    NestingTooDeep {
+        /// The element or component name at which the ceiling was reached.
+        element: String,
+        /// The ceiling that was exceeded.
+        limit: usize,
+    },
+    /// A field declares a data type that is not a known FIX type.
+    #[error("field `{field}` declares unknown type `{field_type}`")]
+    UnknownFieldType {
+        /// Name of the offending field.
+        field: String,
+        /// The unrecognised type name, as spelled in the document.
+        field_type: String,
+    },
+    /// The same name or message type is defined more than once.
+    #[error("duplicate {kind} definition `{name}`")]
+    DuplicateDefinition {
+        /// Which kind of definition was duplicated.
+        kind: DefinitionKind,
+        /// The duplicated name (or `msgtype`, for a message).
+        name: String,
+    },
+    /// Two field definitions claim the same tag number.
+    #[error("fields `{existing}` and `{duplicate}` both claim tag {tag}")]
+    DuplicateFieldTag {
+        /// The contested tag number.
+        tag: u32,
+        /// Name of the field that claimed the tag first.
+        existing: String,
+        /// Name of the field that claimed it again.
+        duplicate: String,
+    },
 }
 
 impl Dictionary {
@@ -74,11 +162,21 @@ impl Dictionary {
     /// The dictionary is parsed from the bundled QuickFIX `FIX44.xml`
     /// specification on first use and cached for the lifetime of the
     /// process.
-    #[must_use]
-    pub fn fix44() -> &'static Self {
-        FIX44_DICT.get_or_init(|| {
-            Self::from_quickfix_xml(FIX44_XML).expect("embedded FIX 4.4 dictionary is valid")
-        })
+    ///
+    /// FIX 4.4 is the only embedded dictionary. Every other version has to be
+    /// supplied by the caller through [`Dictionary::from_quickfix_xml`].
+    ///
+    /// # Errors
+    /// Returns [`DictionaryError`] if the bundled specification fails to
+    /// load. That cannot happen for an unmodified checkout — `cargo test`
+    /// loads it — so the result is a guarantee rather than a case callers
+    /// are expected to recover from; it exists so that the crate has no
+    /// panicking path at all.
+    pub fn fix44() -> Result<&'static Self, DictionaryError> {
+        match FIX44_DICT.get_or_init(|| load(FIX44_XML)) {
+            Ok(dict) => Ok(dict),
+            Err(err) => Err(err.clone()),
+        }
     }
 
     /// Loads a dictionary from a QuickFIX-format XML specification.
@@ -118,6 +216,8 @@ enum Item {
     Component {
         /// Component name.
         name: String,
+        /// Whether the component is required at this reference.
+        required: bool,
     },
 }
 
@@ -188,7 +288,21 @@ fn parse_version(attrs: &HashMap<String, String>) -> Result<Version, DictionaryE
 }
 
 /// Parses members until the matching end tag `end` is consumed.
-fn parse_items(reader: &mut Reader<&[u8]>, end: &[u8]) -> Result<Vec<Item>, DictionaryError> {
+///
+/// `depth` is the physical XML nesting depth of `end` itself; recursion is
+/// refused past [`MAX_NESTING_DEPTH`], which is what keeps a hostile document
+/// of nested `<group>` elements from exhausting the stack.
+fn parse_items(
+    reader: &mut Reader<&[u8]>,
+    end: &[u8],
+    depth: usize,
+) -> Result<Vec<Item>, DictionaryError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(DictionaryError::NestingTooDeep {
+            element: String::from_utf8_lossy(end).into_owned(),
+            limit: MAX_NESTING_DEPTH,
+        });
+    }
     let mut items = Vec::new();
     loop {
         match reader.read_event().map_err(xml_err)? {
@@ -201,6 +315,7 @@ fn parse_items(reader: &mut Reader<&[u8]>, end: &[u8]) -> Result<Vec<Item>, Dict
                     }),
                     b"component" => items.push(Item::Component {
                         name: required_attr(&attrs, "component", "name")?,
+                        required: is_required(&attrs),
                     }),
                     b"group" => items.push(Item::Group {
                         name: required_attr(&attrs, "group", "name")?,
@@ -214,7 +329,7 @@ fn parse_items(reader: &mut Reader<&[u8]>, end: &[u8]) -> Result<Vec<Item>, Dict
                 let attrs = attr_map(&e)?;
                 match e.name().as_ref() {
                     b"group" => {
-                        let inner = parse_items(reader, b"group")?;
+                        let inner = parse_items(reader, b"group", depth + 1)?;
                         items.push(Item::Group {
                             name: required_attr(&attrs, "group", "name")?,
                             required: is_required(&attrs),
@@ -223,16 +338,17 @@ fn parse_items(reader: &mut Reader<&[u8]>, end: &[u8]) -> Result<Vec<Item>, Dict
                     }
                     b"field" => {
                         // Field references never have meaningful children here.
-                        parse_items(reader, b"field")?;
+                        parse_items(reader, b"field", depth + 1)?;
                         items.push(Item::Field {
                             name: required_attr(&attrs, "field", "name")?,
                             required: is_required(&attrs),
                         });
                     }
                     b"component" => {
-                        parse_items(reader, b"component")?;
+                        parse_items(reader, b"component", depth + 1)?;
                         items.push(Item::Component {
                             name: required_attr(&attrs, "component", "name")?,
+                            required: is_required(&attrs),
                         });
                     }
                     _ => {}
@@ -290,9 +406,17 @@ fn field_def(
         .parse()
         .map_err(|_| DictionaryError::InvalidTag(number.clone()))?;
     let name = required_attr(attrs, "field", "name")?;
-    let field_type = required_attr(attrs, "field", "type")?
-        .parse::<FieldType>()
-        .unwrap_or(FieldType::String);
+    let declared_type = required_attr(attrs, "field", "type")?;
+    // An unrecognised type is rejected rather than quietly demoted to
+    // STRING: the dictionary is what answers "what does this tag mean", and
+    // a silent demotion would drop the field's format and enum semantics.
+    let field_type =
+        declared_type
+            .parse::<FieldType>()
+            .map_err(|_| DictionaryError::UnknownFieldType {
+                field: name.clone(),
+                field_type: declared_type.clone(),
+            })?;
 
     let mut def = FieldDef::new(tag, name, field_type);
     if !values.is_empty() {
@@ -326,15 +450,22 @@ impl Resolver<'_> {
 
     /// Returns the tag of the first field reachable in document order,
     /// descending into component references.
+    ///
+    /// Reference cycles are already rejected by [`check_component_graph`]
+    /// before any resolution starts; the depth ceiling here is a second,
+    /// independent bound on the recursion.
     fn first_tag(&self, items: &[Item], depth: usize) -> Result<Option<u32>, DictionaryError> {
         for item in items {
             match item {
                 Item::Field { name, .. } | Item::Group { name, .. } => {
                     return self.tag(name).map(Some);
                 }
-                Item::Component { name } => {
+                Item::Component { name, .. } => {
                     if depth >= MAX_COMPONENT_DEPTH {
-                        return Err(DictionaryError::ComponentCycle(name.clone()));
+                        return Err(DictionaryError::NestingTooDeep {
+                            element: name.clone(),
+                            limit: MAX_COMPONENT_DEPTH,
+                        });
                     }
                     let inner = self
                         .components
@@ -371,12 +502,17 @@ impl Resolver<'_> {
         })
     }
 
-    /// Splits items into field references, resolved groups, and component names.
+    /// Splits items into field references, resolved groups, and component
+    /// references.
+    ///
+    /// Every component reference is existence-checked here, so a typo'd
+    /// `<component name='Nope'/>` fails the load instead of silently
+    /// disappearing from the schema at validation time.
     #[allow(clippy::type_complexity)]
     fn split(
         &self,
         items: &[Item],
-    ) -> Result<(Vec<FieldRef>, Vec<GroupDef>, Vec<String>), DictionaryError> {
+    ) -> Result<(Vec<FieldRef>, Vec<GroupDef>, Vec<ComponentRef>), DictionaryError> {
         let mut fields = Vec::new();
         let mut groups = Vec::new();
         let mut components = Vec::new();
@@ -388,11 +524,89 @@ impl Resolver<'_> {
                     required,
                     items,
                 } => groups.push(self.group(name, *required, items)?),
-                Item::Component { name } => components.push(name.clone()),
+                Item::Component { name, required } => {
+                    if !self.components.contains_key(name) {
+                        return Err(DictionaryError::UnknownComponent(name.clone()));
+                    }
+                    components.push(ComponentRef::new(name.clone(), *required));
+                }
             }
         }
         Ok((fields, groups, components))
     }
+}
+
+/// Traversal state of a component during cycle detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisitState {
+    /// On the current depth-first path: reaching it again is a cycle.
+    InProgress,
+    /// Fully expanded already, and acyclic.
+    Done,
+}
+
+/// Rejects reference cycles and dangling references in the component graph.
+///
+/// Runs before any resolution, so the rest of the loader (and every consumer
+/// of the resulting [`Dictionary`]) can walk component references knowing the
+/// graph is a DAG of bounded depth. Components are visited in document order
+/// (`order`) and memoised, which keeps the walk linear in the number of
+/// references.
+fn check_component_graph(
+    components: &HashMap<String, Vec<Item>>,
+    order: &[String],
+) -> Result<(), DictionaryError> {
+    let mut state: HashMap<String, VisitState> = HashMap::new();
+    for name in order {
+        visit_component(name, components, &mut state, 0)?;
+    }
+    Ok(())
+}
+
+/// Depth-first visit of one component definition.
+fn visit_component(
+    name: &str,
+    components: &HashMap<String, Vec<Item>>,
+    state: &mut HashMap<String, VisitState>,
+    depth: usize,
+) -> Result<(), DictionaryError> {
+    match state.get(name) {
+        Some(VisitState::Done) => return Ok(()),
+        Some(VisitState::InProgress) => {
+            return Err(DictionaryError::ComponentCycle(name.to_string()));
+        }
+        None => {}
+    }
+    let Some(items) = components.get(name) else {
+        return Err(DictionaryError::UnknownComponent(name.to_string()));
+    };
+    state.insert(name.to_string(), VisitState::InProgress);
+    visit_items(items, components, state, depth + 1)?;
+    state.insert(name.to_string(), VisitState::Done);
+    Ok(())
+}
+
+/// Depth-first visit of a member list, descending into groups and components.
+fn visit_items(
+    items: &[Item],
+    components: &HashMap<String, Vec<Item>>,
+    state: &mut HashMap<String, VisitState>,
+    depth: usize,
+) -> Result<(), DictionaryError> {
+    if depth > MAX_COMPONENT_DEPTH {
+        return Err(DictionaryError::NestingTooDeep {
+            element: "component".to_string(),
+            limit: MAX_COMPONENT_DEPTH,
+        });
+    }
+    for item in items {
+        match item {
+            Item::Field { .. } => {}
+            Item::Group { items, .. } => visit_items(items, components, state, depth + 1)?,
+            Item::Component { name, .. } => visit_component(name, components, state, depth)?,
+        }
+    }
+    Ok(())
 }
 
 fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
@@ -410,8 +624,8 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
         match reader.read_event().map_err(xml_err)? {
             Event::Start(e) => match e.name().as_ref() {
                 b"fix" => version = Some(parse_version(&attr_map(&e)?)?),
-                b"header" => header_items = parse_items(&mut reader, b"header")?,
-                b"trailer" => trailer_items = parse_items(&mut reader, b"trailer")?,
+                b"header" => header_items = parse_items(&mut reader, b"header", 1)?,
+                b"trailer" => trailer_items = parse_items(&mut reader, b"trailer", 1)?,
                 b"message" => {
                     let attrs = attr_map(&e)?;
                     let category = if attrs.get("msgcat").map(String::as_str) == Some("admin") {
@@ -423,13 +637,19 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
                         name: required_attr(&attrs, "message", "name")?,
                         msg_type: required_attr(&attrs, "message", "msgtype")?,
                         category,
-                        items: parse_items(&mut reader, b"message")?,
+                        items: parse_items(&mut reader, b"message", 1)?,
                     });
                 }
                 b"component" => {
                     let attrs = attr_map(&e)?;
                     let name = required_attr(&attrs, "component", "name")?;
-                    let items = parse_items(&mut reader, b"component")?;
+                    let items = parse_items(&mut reader, b"component", 1)?;
+                    if component_irs.contains_key(&name) {
+                        return Err(DictionaryError::DuplicateDefinition {
+                            kind: DefinitionKind::Component,
+                            name,
+                        });
+                    }
                     component_order.push(name.clone());
                     component_irs.insert(name, items);
                 }
@@ -444,8 +664,25 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
     let version =
         version.ok_or_else(|| DictionaryError::Xml("missing root <fix> element".to_string()))?;
 
+    check_component_graph(&component_irs, &component_order)?;
+
     let mut dict = Dictionary::new(version);
     for def in field_defs {
+        // Last-wins insertion would leave name and tag lookups pointing at
+        // different definitions, so a duplicate is a load error.
+        if dict.fields_by_name.contains_key(&def.name) {
+            return Err(DictionaryError::DuplicateDefinition {
+                kind: DefinitionKind::Field,
+                name: def.name,
+            });
+        }
+        if let Some(existing) = dict.get_field(def.tag) {
+            return Err(DictionaryError::DuplicateFieldTag {
+                tag: def.tag,
+                existing: existing.name.clone(),
+                duplicate: def.name,
+            });
+        }
         dict.add_field(def);
     }
 
@@ -459,7 +696,10 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
 
     let mut components = Vec::with_capacity(component_order.len());
     for name in &component_order {
-        let (fields, groups, nested) = resolver.split(&component_irs[name])?;
+        let items = component_irs
+            .get(name)
+            .ok_or_else(|| DictionaryError::UnknownComponent(name.clone()))?;
+        let (fields, groups, nested) = resolver.split(items)?;
         components.push(ComponentDef {
             name: name.clone(),
             fields,
@@ -469,7 +709,14 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
     }
 
     let mut messages = Vec::with_capacity(message_irs.len());
+    let mut seen_msg_types: HashSet<&str> = HashSet::new();
     for ir in &message_irs {
+        if !seen_msg_types.insert(ir.msg_type.as_str()) {
+            return Err(DictionaryError::DuplicateDefinition {
+                kind: DefinitionKind::Message,
+                name: ir.msg_type.clone(),
+            });
+        }
         let (fields, groups, comps) = resolver.split(&ir.items)?;
         messages.push(MessageDef {
             msg_type: ir.msg_type.clone(),
@@ -498,96 +745,174 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Debug;
+
+    /// Unwraps a `Result` with test context instead of `.unwrap()`.
+    #[track_caller]
+    fn ok<T, E: Debug>(result: Result<T, E>, what: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => panic!("{what}: {err:?}"),
+        }
+    }
+
+    /// Unwraps an `Option` with test context instead of `.expect()`.
+    #[track_caller]
+    fn some<T>(value: Option<T>, what: &str) -> T {
+        match value {
+            Some(value) => value,
+            None => panic!("{what}"),
+        }
+    }
+
+    /// Returns the error a load is expected to fail with.
+    #[track_caller]
+    fn load_err(xml: &str) -> DictionaryError {
+        match Dictionary::from_quickfix_xml(xml) {
+            Ok(_) => panic!("expected the dictionary to be rejected, but it loaded"),
+            Err(err) => err,
+        }
+    }
+
+    /// Returns the embedded FIX 4.4 dictionary for a test.
+    #[track_caller]
+    fn fix44() -> &'static Dictionary {
+        ok(Dictionary::fix44(), "embedded FIX 4.4 dictionary loads")
+    }
 
     #[test]
     fn test_fix44_loads() {
-        let dict = Dictionary::fix44();
+        let dict = fix44();
         assert_eq!(dict.version, Version::Fix44);
 
         // Cached: same instance on every call.
-        assert!(std::ptr::eq(dict, Dictionary::fix44()));
+        assert!(std::ptr::eq(dict, fix44()));
     }
 
     #[test]
     fn test_fix44_fields() {
-        let dict = Dictionary::fix44();
+        let dict = fix44();
 
-        let msg_type = dict.get_field(35).expect("MsgType defined");
+        let msg_type = some(dict.get_field(35), "MsgType defined");
         assert_eq!(msg_type.name, "MsgType");
 
-        let cl_ord_id = dict.get_field_by_name("ClOrdID").expect("ClOrdID defined");
+        let cl_ord_id = some(dict.get_field_by_name("ClOrdID"), "ClOrdID defined");
         assert_eq!(cl_ord_id.tag, 11);
 
-        let side = dict.get_field(54).expect("Side defined");
-        let values = side.values.as_ref().expect("Side has enum values");
+        let side = some(dict.get_field(54), "Side defined");
+        let values = some(side.values.as_ref(), "Side has enum values");
         assert!(values.contains_key("1"));
         assert!(values.contains_key("2"));
         assert!(!values.contains_key("X"));
     }
 
     #[test]
-    fn test_fix44_header_and_trailer() {
-        let dict = Dictionary::fix44();
+    fn test_fix44_multiple_value_string_fields_keep_their_type() {
+        // The vendored FIX 4.4 dictionary spells this type
+        // `MULTIPLEVALUESTRING`; every one of its eight fields must survive
+        // the load as `MultipleStringValue`, not as a plain String.
+        let dict = fix44();
+        for (tag, name) in [
+            (18, "ExecInst"),
+            (276, "QuoteCondition"),
+            (277, "TradeCondition"),
+            (286, "OpenCloseSettlFlag"),
+            (291, "FinancialStatus"),
+            (292, "CorporateAction"),
+            (529, "OrderRestrictions"),
+            (546, "Scope"),
+        ] {
+            let def = some(dict.get_field(tag), "multi-value field defined");
+            assert_eq!(def.name, name);
+            assert_eq!(
+                def.field_type,
+                FieldType::MultipleStringValue,
+                "{name}({tag}) lost its multi-value type"
+            );
+        }
+    }
 
-        let sender = dict
-            .header
-            .iter()
-            .find(|f| f.name == "SenderCompID")
-            .expect("SenderCompID in header");
+    #[test]
+    fn test_fix44_header_and_trailer() {
+        let dict = fix44();
+
+        let sender = some(
+            dict.header.iter().find(|f| f.name == "SenderCompID"),
+            "SenderCompID in header",
+        );
         assert_eq!(sender.tag, 49);
         assert!(sender.required);
 
-        let hops = dict
-            .header_groups
-            .iter()
-            .find(|g| g.name == "NoHops")
-            .expect("NoHops group in header");
+        let hops = some(
+            dict.header_groups.iter().find(|g| g.name == "NoHops"),
+            "NoHops group in header",
+        );
         assert_eq!(hops.count_tag, 627);
         assert_eq!(hops.delimiter_tag, 628);
         assert!(!hops.required);
 
-        let checksum = dict
-            .trailer
-            .iter()
-            .find(|f| f.name == "CheckSum")
-            .expect("CheckSum in trailer");
+        let checksum = some(
+            dict.trailer.iter().find(|f| f.name == "CheckSum"),
+            "CheckSum in trailer",
+        );
         assert_eq!(checksum.tag, 10);
         assert!(checksum.required);
     }
 
     #[test]
     fn test_fix44_messages() {
-        let dict = Dictionary::fix44();
+        let dict = fix44();
 
-        let nos = dict.get_message("D").expect("NewOrderSingle defined");
+        let nos = some(dict.get_message("D"), "NewOrderSingle defined");
         assert_eq!(nos.name, "NewOrderSingle");
         assert_eq!(nos.category, MessageCategory::App);
         assert!(nos.fields.iter().any(|f| f.name == "ClOrdID" && f.required));
-        assert!(nos.components.iter().any(|c| c == "Instrument"));
+        assert!(nos.components.iter().any(|c| c.name == "Instrument"));
 
-        let heartbeat = dict.get_message("0").expect("Heartbeat defined");
+        let heartbeat = some(dict.get_message("0"), "Heartbeat defined");
         assert_eq!(heartbeat.category, MessageCategory::Admin);
     }
 
     #[test]
-    fn test_fix44_components_and_groups() {
-        let dict = Dictionary::fix44();
+    fn test_fix44_component_references_keep_their_required_flag() {
+        let dict = fix44();
 
-        let instrument = dict
-            .get_component("Instrument")
-            .expect("Instrument defined");
+        // NewOrderSingle requires <component name='Instrument' required='Y'/>
+        // but only optionally carries Parties.
+        let nos = some(dict.get_message("D"), "NewOrderSingle defined");
+        let instrument = some(
+            nos.components.iter().find(|c| c.name == "Instrument"),
+            "NewOrderSingle references Instrument",
+        );
+        assert!(instrument.required);
+        let parties = some(
+            nos.components.iter().find(|c| c.name == "Parties"),
+            "NewOrderSingle references Parties",
+        );
+        assert!(!parties.required);
+    }
+
+    #[test]
+    fn test_fix44_components_and_groups() {
+        let dict = fix44();
+
+        let instrument = some(dict.get_component("Instrument"), "Instrument defined");
         assert!(instrument.fields.iter().any(|f| f.name == "Symbol"));
 
-        let parties = dict.get_component("Parties").expect("Parties defined");
-        let no_party_ids = parties
-            .groups
-            .iter()
-            .find(|g| g.name == "NoPartyIDs")
-            .expect("NoPartyIDs group");
+        let parties = some(dict.get_component("Parties"), "Parties defined");
+        let no_party_ids = some(
+            parties.groups.iter().find(|g| g.name == "NoPartyIDs"),
+            "NoPartyIDs group",
+        );
         assert_eq!(no_party_ids.count_tag, 453);
         assert_eq!(no_party_ids.delimiter_tag, 448);
         // Nested component reference within the group.
-        assert!(no_party_ids.components.iter().any(|c| c == "PtysSubGrp"));
+        assert!(
+            no_party_ids
+                .components
+                .iter()
+                .any(|c| c.name == "PtysSubGrp")
+        );
     }
 
     #[test]
@@ -638,29 +963,325 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_version() {
+    fn test_unsupported_version_is_rejected() {
         let xml = "<fix type='FIX' major='9' minor='9'><fields></fields></fix>";
-        let err = Dictionary::from_quickfix_xml(xml).unwrap_err();
-        assert!(matches!(err, DictionaryError::UnsupportedVersion(_)));
+        assert!(matches!(
+            load_err(xml),
+            DictionaryError::UnsupportedVersion(_)
+        ));
     }
 
     #[test]
-    fn test_unknown_field_reference() {
+    fn test_missing_attribute_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header><trailer></trailer><messages></messages>
+            <fields><field number='8' type='STRING'/></fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::MissingAttribute {
+                element: "field".to_string(),
+                attribute: "name".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_non_numeric_field_number_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header><trailer></trailer><messages></messages>
+            <fields><field number='8x' name='BeginString' type='STRING'/></fields>
+        </fix>";
+        assert_eq!(load_err(xml), DictionaryError::InvalidTag("8x".to_string()));
+    }
+
+    #[test]
+    fn test_unknown_field_reference_is_rejected() {
         let xml = r"<fix type='FIX' major='4' minor='4'>
             <header><field name='DoesNotExist' required='Y'/></header>
             <trailer></trailer>
             <messages></messages>
             <fields></fields>
         </fix>";
-        let err = Dictionary::from_quickfix_xml(xml).unwrap_err();
         assert_eq!(
-            err,
+            load_err(xml),
             DictionaryError::UnknownFieldName("DoesNotExist".to_string())
         );
     }
 
     #[test]
-    fn test_minimal_dialect() {
+    fn test_unknown_field_type_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header><trailer></trailer><messages></messages>
+            <fields>
+                <field number='8' name='BeginString' type='NOTATYPE'/>
+            </fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::UnknownFieldType {
+                field: "BeginString".to_string(),
+                field_type: "NOTATYPE".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_dangling_component_reference_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header>
+            <trailer></trailer>
+            <messages>
+                <message name='Ping' msgtype='U1' msgcat='app'>
+                    <component name='Nope' required='N'/>
+                </message>
+            </messages>
+            <components></components>
+            <fields>
+                <field number='112' name='TestReqID' type='STRING'/>
+            </fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::UnknownComponent("Nope".to_string())
+        );
+    }
+
+    #[test]
+    fn test_dangling_component_reference_inside_a_component_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header>
+            <trailer></trailer>
+            <messages></messages>
+            <components>
+                <component name='Outer'>
+                    <component name='Nope' required='N'/>
+                </component>
+            </components>
+            <fields>
+                <field number='112' name='TestReqID' type='STRING'/>
+            </fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::UnknownComponent("Nope".to_string())
+        );
+    }
+
+    #[test]
+    fn test_component_cycle_is_rejected() {
+        // Two components that reference each other. Nothing here reaches a
+        // field, so the cycle has to be caught by the graph check rather
+        // than by delimiter discovery.
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header>
+            <trailer></trailer>
+            <messages></messages>
+            <components>
+                <component name='Ping'>
+                    <component name='Pong' required='N'/>
+                </component>
+                <component name='Pong'>
+                    <component name='Ping' required='N'/>
+                </component>
+            </components>
+            <fields>
+                <field number='112' name='TestReqID' type='STRING'/>
+            </fields>
+        </fix>";
+        assert!(matches!(load_err(xml), DictionaryError::ComponentCycle(_)));
+    }
+
+    #[test]
+    fn test_self_referential_component_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header>
+            <trailer></trailer>
+            <messages></messages>
+            <components>
+                <component name='Loop'>
+                    <field name='TestReqID' required='N'/>
+                    <component name='Loop' required='N'/>
+                </component>
+            </components>
+            <fields>
+                <field number='112' name='TestReqID' type='STRING'/>
+            </fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::ComponentCycle("Loop".to_string())
+        );
+    }
+
+    #[test]
+    fn test_empty_group_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header>
+            <trailer></trailer>
+            <messages>
+                <message name='Ping' msgtype='U1' msgcat='app'>
+                    <group name='NoPartyIDs' required='N'></group>
+                </message>
+            </messages>
+            <fields>
+                <field number='453' name='NoPartyIDs' type='NUMINGROUP'/>
+            </fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::EmptyGroup("NoPartyIDs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_deeply_nested_groups_are_rejected_without_stack_overflow() {
+        // A hostile document: element nesting far past the ceiling. This must
+        // come back as a typed error rather than exhausting the stack.
+        let depth = MAX_NESTING_DEPTH * 100;
+        let mut xml = String::from(
+            "<fix type='FIX' major='4' minor='4'><header></header><trailer></trailer>\
+             <messages><message name='Ping' msgtype='U1' msgcat='app'>",
+        );
+        for _ in 0..depth {
+            xml.push_str("<group name='NoPartyIDs' required='N'>");
+        }
+        xml.push_str("<field name='TestReqID' required='N'/>");
+        for _ in 0..depth {
+            xml.push_str("</group>");
+        }
+        xml.push_str("</message></messages><fields></fields></fix>");
+
+        assert_eq!(
+            load_err(&xml),
+            DictionaryError::NestingTooDeep {
+                element: "group".to_string(),
+                limit: MAX_NESTING_DEPTH,
+            }
+        );
+    }
+
+    #[test]
+    fn test_long_component_chain_is_rejected() {
+        // A chain of components longer than the component ceiling: acyclic,
+        // so only the depth bound stops it.
+        let mut xml = String::from(
+            "<fix type='FIX' major='4' minor='4'><header></header><trailer></trailer>\
+             <messages></messages><components>",
+        );
+        let links = MAX_COMPONENT_DEPTH + 10;
+        for index in 0..links {
+            xml.push_str(&format!("<component name='C{index}'>"));
+            xml.push_str(&format!("<component name='C{}' required='N'/>", index + 1));
+            xml.push_str("</component>");
+        }
+        xml.push_str(&format!(
+            "<component name='C{links}'><field name='TestReqID' required='N'/></component>"
+        ));
+        xml.push_str(
+            "</components><fields><field number='112' name='TestReqID' type='STRING'/></fields></fix>",
+        );
+
+        assert!(matches!(
+            load_err(&xml),
+            DictionaryError::NestingTooDeep {
+                limit: MAX_COMPONENT_DEPTH,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_duplicate_field_name_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header><trailer></trailer><messages></messages>
+            <fields>
+                <field number='112' name='TestReqID' type='STRING'/>
+                <field number='113' name='TestReqID' type='STRING'/>
+            </fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::DuplicateDefinition {
+                kind: DefinitionKind::Field,
+                name: "TestReqID".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_duplicate_field_tag_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header><trailer></trailer><messages></messages>
+            <fields>
+                <field number='112' name='TestReqID' type='STRING'/>
+                <field number='112' name='OtherName' type='STRING'/>
+            </fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::DuplicateFieldTag {
+                tag: 112,
+                existing: "TestReqID".to_string(),
+                duplicate: "OtherName".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_duplicate_message_type_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header><trailer></trailer>
+            <messages>
+                <message name='Ping' msgtype='U1' msgcat='app'>
+                    <field name='TestReqID' required='Y'/>
+                </message>
+                <message name='Pong' msgtype='U1' msgcat='app'>
+                    <field name='TestReqID' required='Y'/>
+                </message>
+            </messages>
+            <fields><field number='112' name='TestReqID' type='STRING'/></fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::DuplicateDefinition {
+                kind: DefinitionKind::Message,
+                name: "U1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_duplicate_component_name_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header><trailer></trailer><messages></messages>
+            <components>
+                <component name='Twice'>
+                    <field name='TestReqID' required='N'/>
+                </component>
+                <component name='Twice'>
+                    <field name='TestReqID' required='N'/>
+                </component>
+            </components>
+            <fields><field number='112' name='TestReqID' type='STRING'/></fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::DuplicateDefinition {
+                kind: DefinitionKind::Component,
+                name: "Twice".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_malformed_xml_is_rejected() {
+        let xml = "<fix type='FIX' major='4' minor='4'><header>";
+        assert!(matches!(load_err(xml), DictionaryError::Xml(_)));
+    }
+
+    #[test]
+    fn test_minimal_dialect_loads() {
         let xml = r"<fix type='FIX' major='4' minor='4'>
             <header><field name='BeginString' required='Y'/></header>
             <trailer><field name='CheckSum' required='Y'/></trailer>
@@ -675,9 +1296,9 @@ mod tests {
                 <field number='112' name='TestReqID' type='STRING'/>
             </fields>
         </fix>";
-        let dict = Dictionary::from_quickfix_xml(xml).unwrap();
-        let ping = dict.get_message("U1").expect("custom message defined");
+        let dict = ok(Dictionary::from_quickfix_xml(xml), "dialect loads");
+        let ping = some(dict.get_message("U1"), "custom message defined");
         assert_eq!(ping.name, "Ping");
-        assert_eq!(ping.fields[0].tag, 112);
+        assert_eq!(some(ping.fields.first(), "Ping has a field").tag, 112);
     }
 }
