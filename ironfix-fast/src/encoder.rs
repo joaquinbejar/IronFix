@@ -7,9 +7,22 @@
 //! FAST protocol encoder.
 //!
 //! This module provides encoding of values using FAST stop-bit encoding.
+//!
+//! Every encoding produced here is minimal — the shortest byte sequence that
+//! decodes back to the same value — and never longer than
+//! [`MAX_INT_ENCODED_LEN`] for an integer, so the encoder can never emit a
+//! frame its own decoder would reject.
 
+use crate::decoder::{MAX_INT_ENCODED_LEN, PAYLOAD_BITS, PAYLOAD_MASK, SIGN_BIT, STOP_BIT};
+use crate::error::FastError;
 use crate::operators::DictionaryValue;
+use smallvec::SmallVec;
 use std::collections::HashMap;
+
+/// Scratch buffer for one stop-bit encoded integer.
+///
+/// Sized so a full-width `i64` or `u64` encoding never spills to the heap.
+type IntScratch = SmallVec<[u8; MAX_INT_ENCODED_LEN]>;
 
 /// FAST protocol encoder.
 #[derive(Debug)]
@@ -45,100 +58,116 @@ impl FastEncoder {
 
     /// Encodes an unsigned integer using stop-bit encoding.
     ///
+    /// The encoding is minimal: `0` is a single stop byte and `u64::MAX`
+    /// occupies [`MAX_INT_ENCODED_LEN`] bytes.
+    ///
     /// # Arguments
     /// * `value` - The value to encode
     pub fn encode_uint(&mut self, value: u64) {
-        if value == 0 {
-            self.buffer.push(0x80);
-            return;
+        let mut bytes = IntScratch::new();
+        let mut remaining = value;
+
+        loop {
+            bytes.push((remaining & u64::from(PAYLOAD_MASK)) as u8);
+            remaining >>= PAYLOAD_BITS;
+
+            if remaining == 0 {
+                break;
+            }
         }
 
-        let mut bytes = Vec::new();
-        let mut v = value;
-
-        while v > 0 {
-            bytes.push((v & 0x7F) as u8);
-            v >>= 7;
-        }
-
-        bytes.reverse();
-
-        // Set stop bit on last byte
-        if let Some(last) = bytes.last_mut() {
-            *last |= 0x80;
-        }
-
-        self.buffer.extend(bytes);
+        Self::flush_stop_bit_encoded(&mut self.buffer, &mut bytes);
     }
 
     /// Encodes a signed integer using stop-bit encoding.
     ///
+    /// The value is emitted in two's complement, seven bits per byte, most
+    /// significant byte first. When bit 6 of the most significant payload byte
+    /// does not already carry the sign, an extra carry byte (`0x00` for a
+    /// positive value, `0x7F` for a negative one) is prepended — without it the
+    /// decoder would read the value back with the opposite sign.
+    ///
+    /// The encoding is minimal and never exceeds [`MAX_INT_ENCODED_LEN`] bytes.
+    ///
     /// # Arguments
     /// * `value` - The value to encode
     pub fn encode_int(&mut self, value: i64) {
-        if (0..64).contains(&value) {
-            self.buffer.push((value as u8) | 0x80);
-            return;
-        }
-
-        if (-64..0).contains(&value) {
-            self.buffer.push((value as u8) | 0x80);
-            return;
-        }
-
-        let mut bytes = Vec::new();
-        let mut v = value;
         let negative = value < 0;
+        let mut bytes = IntScratch::new();
+        let mut remaining = value;
 
         loop {
-            bytes.push((v & 0x7F) as u8);
-            v >>= 7;
+            bytes.push((remaining & i64::from(PAYLOAD_MASK)) as u8);
+            // Arithmetic shift: converges to 0 for a positive value and to -1
+            // for a negative one.
+            remaining >>= PAYLOAD_BITS;
 
-            if (negative && v == -1 && (bytes.last().unwrap() & 0x40) != 0)
-                || (!negative && v == 0 && (bytes.last().unwrap() & 0x40) == 0)
-            {
-                break;
-            }
-
-            if v == 0 && !negative {
-                break;
-            }
-            if v == -1 && negative {
+            if (negative && remaining == -1) || (!negative && remaining == 0) {
                 break;
             }
         }
 
-        bytes.reverse();
+        // The loop always pushes at least one byte, so `last` is always `Some`.
+        let sign_conflicts = bytes
+            .last()
+            .is_some_and(|most_significant| (most_significant & SIGN_BIT != 0) != negative);
 
-        if let Some(last) = bytes.last_mut() {
-            *last |= 0x80;
+        if sign_conflicts {
+            bytes.push(if negative { PAYLOAD_MASK } else { 0x00 });
         }
 
-        self.buffer.extend(bytes);
+        Self::flush_stop_bit_encoded(&mut self.buffer, &mut bytes);
     }
 
     /// Encodes an ASCII string using stop-bit encoding.
     ///
+    /// Follows the FAST 1.1 string encodings: the empty string is a lone stop
+    /// byte (`0x80`) and the one-character NUL string is `0x00 0x80`. A longer
+    /// string beginning with NUL has no legal representation — its encoding
+    /// would be an over-long form the decoder must reject — so it is refused
+    /// here rather than written to the wire.
+    ///
     /// # Arguments
     /// * `value` - The string to encode
-    pub fn encode_ascii(&mut self, value: &str) {
+    ///
+    /// # Errors
+    /// Returns [`FastError::InvalidString`] if `value` contains a non-ASCII
+    /// character, or if it begins with a NUL and is longer than one character.
+    pub fn encode_ascii(&mut self, value: &str) -> Result<(), FastError> {
+        if !value.is_ascii() {
+            return Err(FastError::InvalidString);
+        }
+
         let bytes = value.as_bytes();
 
-        if bytes.is_empty() {
-            self.buffer.push(0x80);
-            return;
+        match bytes {
+            [] => {
+                self.buffer.push(STOP_BIT);
+                return Ok(());
+            }
+            [0x00] => {
+                self.buffer.extend_from_slice(&[0x00, STOP_BIT]);
+                return Ok(());
+            }
+            [0x00, ..] => return Err(FastError::InvalidString),
+            _ => {}
         }
 
-        for (i, &b) in bytes.iter().enumerate() {
-            if i == bytes.len() - 1 {
-                self.buffer.push(b | 0x80);
-            } else {
-                self.buffer.push(b & 0x7F);
-            }
-        }
+        let Some((last, head)) = bytes.split_last() else {
+            // Unreachable: the empty slice is handled above.
+            return Err(FastError::InvalidString);
+        };
+
+        self.buffer.reserve(bytes.len());
+        // Every byte is ASCII, so no payload bit is lost and no stop bit is set
+        // by accident.
+        self.buffer.extend_from_slice(head);
+        self.buffer.push(last | STOP_BIT);
+
+        Ok(())
     }
 
-    /// Encodes a byte vector with length prefix.
+    /// Encodes a byte vector with a stop-bit encoded length prefix.
     ///
     /// # Arguments
     /// * `value` - The bytes to encode
@@ -149,13 +178,27 @@ impl FastEncoder {
 
     /// Encodes a nullable unsigned integer.
     ///
+    /// A nullable unsigned integer is encoded with a bias of one so that the
+    /// single stop byte `0x80` is reserved for `None`. The representable
+    /// domain is therefore `0..=u64::MAX - 1`: `Some(u64::MAX)` has no
+    /// encoding and is rejected rather than silently biased into the `None`
+    /// representation.
+    ///
     /// # Arguments
     /// * `value` - The optional value to encode
-    pub fn encode_nullable_uint(&mut self, value: Option<u64>) {
+    ///
+    /// # Errors
+    /// Returns [`FastError::IntegerOverflow`] for `Some(u64::MAX)`.
+    pub fn encode_nullable_uint(&mut self, value: Option<u64>) -> Result<(), FastError> {
         match value {
-            Some(v) => self.encode_uint(v + 1),
-            None => self.buffer.push(0x80),
+            Some(v) => {
+                let biased = v.checked_add(1).ok_or(FastError::IntegerOverflow)?;
+                self.encode_uint(biased);
+            }
+            None => self.buffer.push(STOP_BIT),
         }
+
+        Ok(())
     }
 
     /// Returns the encoded bytes.
@@ -204,6 +247,18 @@ impl FastEncoder {
     pub fn set_global(&mut self, key: impl Into<String>, value: DictionaryValue) {
         self.global_dict.insert(key.into(), value);
     }
+
+    /// Appends `bytes` — accumulated least significant byte first — to `out` in
+    /// wire order with the stop bit set on the final byte.
+    fn flush_stop_bit_encoded(out: &mut Vec<u8>, bytes: &mut IntScratch) {
+        bytes.reverse();
+
+        if let Some(last) = bytes.last_mut() {
+            *last |= STOP_BIT;
+        }
+
+        out.extend_from_slice(bytes.as_slice());
+    }
 }
 
 impl Default for FastEncoder {
@@ -234,32 +289,193 @@ mod tests {
     fn test_encode_uint_larger() {
         let mut encoder = FastEncoder::new();
         encoder.encode_uint(942);
-        let bytes = encoder.finish();
         // 942 = 7 * 128 + 46, so first byte is 7, second is 46 | 0x80 = 0xAE
-        assert_eq!(bytes, vec![0x07, 0xAE]);
+        assert_eq!(encoder.finish(), vec![0x07, 0xAE]);
+    }
+
+    #[test]
+    fn test_encode_uint_boundaries_are_byte_exact() {
+        let cases: [(u64, &[u8]); 6] = [
+            (0, &[0x80]),
+            (127, &[0xFF]),
+            (128, &[0x01, 0x80]),
+            (16383, &[0x7F, 0xFF]),
+            (16384, &[0x01, 0x00, 0x80]),
+            (
+                u64::MAX,
+                &[0x01, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0xFF],
+            ),
+        ];
+
+        for (value, expected) in cases {
+            let mut encoder = FastEncoder::new();
+            encoder.encode_uint(value);
+            assert_eq!(encoder.finish(), expected, "minimal encoding of {value}");
+        }
+    }
+
+    #[test]
+    fn test_encode_uint_never_exceeds_the_decoder_ceiling() {
+        for shift in 0..64u32 {
+            let Some(value) = 1u64.checked_shl(shift) else {
+                continue;
+            };
+            let mut encoder = FastEncoder::new();
+            encoder.encode_uint(value);
+            assert!(encoder.len() <= MAX_INT_ENCODED_LEN, "value {value}");
+        }
+    }
+
+    #[test]
+    fn test_encode_int_emits_the_sign_carry_byte() {
+        // 64 needs a leading 0x00: without it, bit 6 of the only payload byte
+        // would make the decoder read -64.
+        let mut encoder = FastEncoder::new();
+        encoder.encode_int(64);
+        assert_eq!(encoder.finish(), vec![0x00, 0xC0]);
+
+        // -65 needs a leading 0x7F for the mirror-image reason.
+        let mut encoder = FastEncoder::new();
+        encoder.encode_int(-65);
+        assert_eq!(encoder.finish(), vec![0x7F, 0xBF]);
+    }
+
+    #[test]
+    fn test_encode_int_omits_the_carry_byte_when_the_sign_already_fits() {
+        let mut encoder = FastEncoder::new();
+        encoder.encode_int(63);
+        assert_eq!(encoder.finish(), vec![0xBF]);
+
+        let mut encoder = FastEncoder::new();
+        encoder.encode_int(-64);
+        assert_eq!(encoder.finish(), vec![0xC0]);
+    }
+
+    #[test]
+    fn test_encode_int_extremes_use_ten_bytes() {
+        let mut encoder = FastEncoder::new();
+        encoder.encode_int(i64::MAX);
+        assert_eq!(
+            encoder.finish(),
+            vec![0x00, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0xFF]
+        );
+
+        let mut encoder = FastEncoder::new();
+        encoder.encode_int(i64::MIN);
+        assert_eq!(
+            encoder.finish(),
+            vec![0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80]
+        );
+    }
+
+    #[test]
+    fn test_encode_int_never_exceeds_the_decoder_ceiling() {
+        for shift in 0..63u32 {
+            let Some(value) = 1i64.checked_shl(shift) else {
+                continue;
+            };
+            for candidate in [Some(value), value.checked_neg(), value.checked_sub(1)] {
+                let Some(value) = candidate else {
+                    continue;
+                };
+                let mut encoder = FastEncoder::new();
+                encoder.encode_int(value);
+                assert!(encoder.len() <= MAX_INT_ENCODED_LEN, "value {value}");
+            }
+        }
     }
 
     #[test]
     fn test_encode_ascii() {
         let mut encoder = FastEncoder::new();
-        encoder.encode_ascii("Hi!");
-        let bytes = encoder.finish();
-        assert_eq!(bytes, vec![b'H', b'i', b'!' | 0x80]);
+        assert_eq!(encoder.encode_ascii("Hi!"), Ok(()));
+        assert_eq!(encoder.finish(), vec![b'H', b'i', b'!' | 0x80]);
     }
 
     #[test]
-    fn test_encode_ascii_empty() {
+    fn test_encode_ascii_empty_is_a_lone_stop_byte() {
         let mut encoder = FastEncoder::new();
-        encoder.encode_ascii("");
+        assert_eq!(encoder.encode_ascii(""), Ok(()));
         assert_eq!(encoder.finish(), vec![0x80]);
+    }
+
+    #[test]
+    fn test_encode_ascii_nul_is_zero_then_stop() {
+        let mut encoder = FastEncoder::new();
+        assert_eq!(encoder.encode_ascii("\0"), Ok(()));
+        assert_eq!(encoder.finish(), vec![0x00, 0x80]);
+    }
+
+    #[test]
+    fn test_encode_ascii_leading_nul_string_is_invalid_string() {
+        let mut encoder = FastEncoder::new();
+        assert_eq!(
+            encoder.encode_ascii("\0a"),
+            Err(FastError::InvalidString),
+            "a leading NUL followed by more characters is an over-long form"
+        );
+        assert!(encoder.is_empty(), "nothing may reach the wire on error");
+    }
+
+    #[test]
+    fn test_encode_ascii_non_ascii_is_invalid_string() {
+        let mut encoder = FastEncoder::new();
+        assert_eq!(encoder.encode_ascii("€"), Err(FastError::InvalidString));
+        assert_eq!(encoder.encode_ascii("café"), Err(FastError::InvalidString));
+        assert!(encoder.is_empty(), "nothing may reach the wire on error");
     }
 
     #[test]
     fn test_encode_bytes() {
         let mut encoder = FastEncoder::new();
         encoder.encode_bytes(&[1, 2, 3]);
-        let bytes = encoder.finish();
-        assert_eq!(bytes, vec![0x83, 1, 2, 3]);
+        assert_eq!(encoder.finish(), vec![0x83, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_encode_bytes_empty_is_a_zero_length_prefix() {
+        let mut encoder = FastEncoder::new();
+        encoder.encode_bytes(&[]);
+        assert_eq!(encoder.finish(), vec![0x80]);
+    }
+
+    #[test]
+    fn test_encode_nullable_uint_none_is_a_lone_stop_byte() {
+        let mut encoder = FastEncoder::new();
+        assert_eq!(encoder.encode_nullable_uint(None), Ok(()));
+        assert_eq!(encoder.finish(), vec![0x80]);
+    }
+
+    #[test]
+    fn test_encode_nullable_uint_some_is_biased_by_one() {
+        let mut encoder = FastEncoder::new();
+        assert_eq!(encoder.encode_nullable_uint(Some(0)), Ok(()));
+        assert_eq!(encoder.finish(), vec![0x81]);
+
+        let mut encoder = FastEncoder::new();
+        assert_eq!(encoder.encode_nullable_uint(Some(126)), Ok(()));
+        assert_eq!(encoder.finish(), vec![0xFF]);
+    }
+
+    #[test]
+    fn test_encode_nullable_uint_max_is_integer_overflow() {
+        let mut encoder = FastEncoder::new();
+        assert_eq!(
+            encoder.encode_nullable_uint(Some(u64::MAX)),
+            Err(FastError::IntegerOverflow),
+            "u64::MAX is outside the 0..=u64::MAX-1 nullable domain"
+        );
+        assert!(
+            encoder.is_empty(),
+            "an overflowing value must not be biased into the NULL representation"
+        );
+    }
+
+    #[test]
+    fn test_encode_nullable_uint_domain_upper_bound_is_representable() {
+        let mut encoder = FastEncoder::new();
+        assert_eq!(encoder.encode_nullable_uint(Some(u64::MAX - 1)), Ok(()));
+        assert_eq!(encoder.len(), MAX_INT_ENCODED_LEN);
     }
 
     #[test]
@@ -270,5 +486,21 @@ mod tests {
 
         encoder.clear();
         assert!(encoder.is_empty());
+    }
+
+    #[test]
+    fn test_encoder_reset_clears_buffer_and_dictionaries() {
+        let mut encoder = FastEncoder::with_capacity(64);
+        encoder.encode_uint(42);
+        encoder.set_global("test", DictionaryValue::UInt(7));
+        assert_eq!(
+            encoder.get_global("test").and_then(DictionaryValue::as_u64),
+            Some(7)
+        );
+
+        encoder.reset();
+        assert!(encoder.is_empty());
+        assert_eq!(encoder.as_bytes(), &[] as &[u8]);
+        assert!(encoder.get_global("test").is_none());
     }
 }

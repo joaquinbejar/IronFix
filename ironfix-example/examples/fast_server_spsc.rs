@@ -22,7 +22,7 @@ mod common;
 
 use common::{ExampleConfig, format_timestamp, init_logging};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
-use ironfix_fast::FastEncoder;
+use ironfix_fast::{FastEncoder, FastError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -202,7 +202,13 @@ async fn market_data_broadcaster(
         // Non-blocking receive with timeout
         match rx.recv_timeout(Duration::from_millis(10)) {
             Ok(tick) => {
-                let encoded = encode_market_data(&tick);
+                let encoded = match encode_market_data(&tick) {
+                    Ok(encoded) => encoded,
+                    Err(e) => {
+                        warn!("Failed to encode tick {}: {}", tick.seq_num, e);
+                        continue;
+                    }
+                };
 
                 // Broadcast to all clients
                 let clients_read = clients.read().await;
@@ -273,7 +279,11 @@ async fn handle_client(
 }
 
 /// Encode a market data tick to FAST format
-fn encode_market_data(tick: &MarketDataTick) -> Vec<u8> {
+///
+/// # Errors
+/// Returns `FastError::InvalidString` if the timestamp or symbol is not
+/// representable as a FAST ASCII string.
+fn encode_market_data(tick: &MarketDataTick) -> Result<Vec<u8>, FastError> {
     let mut encoder = FastEncoder::new();
 
     // Presence map: all fields present
@@ -287,10 +297,10 @@ fn encode_market_data(tick: &MarketDataTick) -> Vec<u8> {
     encoder.encode_uint(tick.seq_num);
 
     // Timestamp (as string for simplicity)
-    encoder.encode_ascii(&format_timestamp());
+    encoder.encode_ascii(&format_timestamp())?;
 
     // Symbol
-    encoder.encode_ascii(tick.symbol);
+    encoder.encode_ascii(tick.symbol)?;
 
     // Bid price (in cents)
     encoder.encode_uint(tick.bid_price);
@@ -304,5 +314,5 @@ fn encode_market_data(tick: &MarketDataTick) -> Vec<u8> {
     // Ask size
     encoder.encode_uint(tick.ask_size);
 
-    encoder.finish()
+    Ok(encoder.finish())
 }
