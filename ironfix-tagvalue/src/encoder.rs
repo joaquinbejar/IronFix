@@ -1235,27 +1235,11 @@ mod tests {
 
     #[test]
     fn test_encoder_put_data_round_trips_every_spec_pair() {
-        // Each pair the decoder frames by count must also be emittable.
-        let pairs = [
-            (90u32, 91u32),
-            (93, 89),
-            (95, 96),
-            (212, 213),
-            (348, 349),
-            (350, 351),
-            (352, 353),
-            (354, 355),
-            (356, 357),
-            (358, 359),
-            (360, 361),
-            (362, 363),
-            (364, 365),
-            (445, 446),
-            (618, 619),
-            (621, 622),
-        ];
+        // Each pair the decoder frames by count must also be emittable. Walking
+        // the decoder's own reference table means a pair added on one side
+        // cannot be forgotten on the other.
         let payload: &[u8] = b"\x01=\x01";
-        for (length_tag, data_tag) in pairs {
+        for (length_tag, data_tag) in crate::decoder::LENGTH_DATA_PAIRS {
             let mut encoder = Encoder::new("FIX.4.4");
             encoder.put_str(35, "A");
             encoder.put_data(length_tag, data_tag, payload);
