@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 
 /// Maximum number of encoded bytes a presence map may occupy.
 ///
-/// Each byte carries [`PAYLOAD_BITS`] field bits, so this ceiling admits
+/// Each byte carries seven field bits, so this ceiling admits
 /// presence maps of up to 448 fields — far beyond any practical FAST template
 /// — while bounding the work and the memory a single hostile map can cost.
 ///

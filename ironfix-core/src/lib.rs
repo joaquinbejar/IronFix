@@ -8,12 +8,19 @@
 //!
 //! Core types, traits, and error definitions for the IronFix FIX protocol engine.
 //!
-//! This crate provides the fundamental building blocks used across all IronFix crates:
-//! - **Error types**: Unified error handling with `thiserror`
-//! - **Field types**: `FieldTag`, `FieldValue`, and the `FixField` trait
-//! - **Message types**: `RawMessage`, `OwnedMessage`, and the `FixMessage` trait
-//! - **Core types**: `SeqNum`, `Timestamp`, `CompID`, `MsgType`
-//! - **Protocol versions**: `FixVersion`, the single mapping from a FIX
+//! This is the root of the workspace dependency graph: it depends on no other
+//! IronFix crate, and every other crate speaks the vocabulary defined here.
+//!
+//! - **Error types**: [`FixError`] and its children [`DecodeError`],
+//!   [`EncodeError`], [`SessionError`] and [`StoreError`], all built with
+//!   `thiserror`
+//! - **Field types**: [`FieldTag`], [`FieldRef`], [`FieldValue`], and the
+//!   [`FixField`] trait
+//! - **Message types**: [`RawMessage`], [`OwnedMessage`], [`MsgType`], and the
+//!   [`FixMessage`] trait
+//! - **Core types**: [`SeqNum`], [`Timestamp`], [`CompId`] (an inline
+//!   `ArrayString`, not a `String`), and [`Side`]
+//! - **Protocol versions**: [`FixVersion`], the single mapping from a FIX
 //!   version to its `BeginString` (8) and `ApplVerID` (1128 / 1137)
 //!
 //! ## Zero-Copy Design

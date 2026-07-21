@@ -44,8 +44,8 @@ pub(crate) const SIGN_BIT: u8 = 0x40;
 
 /// Maximum number of bytes a stop-bit encoded 64-bit integer may occupy.
 ///
-/// A 64-bit value carries at most 64 significant bits at
-/// [`PAYLOAD_BITS`] bits per byte; a signed value needs nine payload bytes
+/// A 64-bit value carries at most 64 significant bits at seven payload
+/// bits per byte; a signed value needs nine payload bytes
 /// plus one sign-carry byte, so ten bytes is the longest legal encoding of
 /// either `i64::MIN` / `i64::MAX` or `u64::MAX`.
 ///

@@ -12,12 +12,28 @@
 //! It uses techniques like stop-bit encoding, presence maps, and field operators
 //! to achieve high compression ratios.
 //!
-//! ## Features
+//! ## What this crate provides
 //!
-//! - **Stop-bit encoding**: Efficient integer and string encoding
-//! - **Presence maps**: Track which optional fields are present
-//! - **Field operators**: Copy, Delta, Increment, Tail, etc.
-//! - **Template support**: Message structure definitions
+//! These are encoding *primitives*, not a complete FAST implementation:
+//!
+//! - **Stop-bit encoding**: integer and string encode/decode
+//! - **Presence maps**: [`PresenceMap`] / [`PresenceMapBuilder`], tracking which
+//!   optional fields are present
+//! - **Field operators**: [`operators::Operator`] — copy, delta, increment,
+//!   tail and default — with per-template and global
+//!   [`operators::DictionaryScope`] for previous-value state
+//!
+//! ## Not provided
+//!
+//! - **No template definitions and no template XML parser.** Templates are
+//!   referred to only by numeric id, for scoping the previous-value dictionary;
+//!   nothing here reads a FAST template file or describes a message structure.
+//! - **No transport.** There is no UDP multicast receiver and no A/B feed
+//!   arbitration.
+//! - **Not wired into the engine.** This crate sits parallel to
+//!   `ironfix-tagvalue`, depends only on `ironfix-core`, and is not used by the
+//!   session or engine path. Driving it is the caller's job — see the `fast_*`
+//!   examples in `ironfix-example`.
 //!
 //! ## Untrusted input
 //!
