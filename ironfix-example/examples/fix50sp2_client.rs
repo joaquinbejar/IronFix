@@ -1,5 +1,6 @@
 //! FIX 5.0 SP2 Client Example (FIXT.1.1 Transport)
 use bytes::BytesMut;
+use ironfix_core::error::EncodeError;
 use ironfix_core::{MsgType, Side};
 use ironfix_tagvalue::{Decoder, Encoder};
 use std::time::Duration;
@@ -31,7 +32,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut seq = 1u64;
     let mut buf = BytesMut::with_capacity(4096);
 
-    sock.write_all(&build_logon(&cfg, seq)).await?;
+    sock.write_all(&build_logon(&cfg, seq)?).await?;
     seq += 1;
     match timeout(Duration::from_secs(10), read_msg(&mut sock, &mut buf)).await {
         Ok(Ok(m))
@@ -48,8 +49,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    sock.write_all(&build_order(&cfg, seq, "O1", "META", Side::Sell, 20, 500.0))
-        .await?;
+    sock.write_all(&build_order(
+        &cfg,
+        seq,
+        "O1",
+        "META",
+        Side::Sell,
+        20,
+        500.0,
+    )?)
+    .await?;
     seq += 1;
     if let Ok(Ok(m)) = timeout(Duration::from_secs(5), read_msg(&mut sock, &mut buf)).await
         && let Ok(r) = Decoder::new(&m).decode()
@@ -60,12 +69,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut hb = interval(Duration::from_secs(cfg.heartbeat_interval));
     for _ in 0..2 {
         hb.tick().await;
-        sock.write_all(&build_hb(&cfg, seq)).await?;
+        sock.write_all(&build_hb(&cfg, seq)?).await?;
         seq += 1;
         info!("HB");
     }
 
-    sock.write_all(&build_logout(&cfg, seq)).await?;
+    sock.write_all(&build_logout(&cfg, seq)?).await?;
     info!("Done");
     Ok(())
 }
@@ -84,7 +93,7 @@ async fn read_msg(
     }
 }
 
-fn build_logon(c: &ExampleConfig, seq: u64) -> Vec<u8> {
+fn build_logon(c: &ExampleConfig, seq: u64) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "A");
     e.put_str(49, &c.sender_comp_id);
@@ -94,27 +103,27 @@ fn build_logon(c: &ExampleConfig, seq: u64) -> Vec<u8> {
     e.put_str(98, "0");
     e.put_str(108, &c.heartbeat_interval.to_string());
     e.put_str(1137, APPL_VER_ID);
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
-fn build_hb(c: &ExampleConfig, seq: u64) -> Vec<u8> {
+fn build_hb(c: &ExampleConfig, seq: u64) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "0");
     e.put_str(49, &c.sender_comp_id);
     e.put_str(56, &c.target_comp_id);
     e.put_str(34, &seq.to_string());
     e.put_str(52, &format_timestamp());
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
-fn build_logout(c: &ExampleConfig, seq: u64) -> Vec<u8> {
+fn build_logout(c: &ExampleConfig, seq: u64) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "5");
     e.put_str(49, &c.sender_comp_id);
     e.put_str(56, &c.target_comp_id);
     e.put_str(34, &seq.to_string());
     e.put_str(52, &format_timestamp());
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
 fn build_order(
@@ -125,7 +134,7 @@ fn build_order(
     side: Side,
     qty: u64,
     px: f64,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "D");
     e.put_str(49, &c.sender_comp_id);
@@ -141,5 +150,5 @@ fn build_order(
     e.put_str(38, &qty.to_string());
     e.put_str(40, "2");
     e.put_str(44, &format!("{:.2}", px));
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }

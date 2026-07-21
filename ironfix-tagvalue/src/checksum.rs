@@ -74,13 +74,14 @@ pub fn format_checksum(checksum: u8) -> [u8; 3] {
 #[inline]
 #[must_use]
 pub fn parse_checksum(bytes: &[u8]) -> Option<u8> {
-    if bytes.len() != 3 {
-        return None;
-    }
+    // Destructured rather than indexed: the length check and the reads are then
+    // one operation the compiler verifies, instead of two that a later edit
+    // could separate.
+    let [b0, b1, b2] = <[u8; 3]>::try_from(bytes).ok()?;
 
-    let d0 = bytes[0].checked_sub(b'0')?;
-    let d1 = bytes[1].checked_sub(b'0')?;
-    let d2 = bytes[2].checked_sub(b'0')?;
+    let d0 = b0.checked_sub(b'0')?;
+    let d1 = b1.checked_sub(b'0')?;
+    let d2 = b2.checked_sub(b'0')?;
 
     if d0 > 9 || d1 > 9 || d2 > 9 {
         return None;

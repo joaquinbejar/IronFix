@@ -14,7 +14,7 @@
 use crate::application::RejectReason;
 use crate::outbound::OutboundMessage;
 use bytes::BytesMut;
-use ironfix_core::error::DecodeError;
+use ironfix_core::error::{DecodeError, EncodeError};
 use ironfix_core::message::{OwnedMessage, RawMessage};
 use ironfix_core::types::Timestamp;
 use ironfix_core::version::FixVersion;
@@ -194,6 +194,19 @@ pub(crate) fn owned_from_frame(frame: &[u8]) -> Result<OwnedMessage, DecodeError
     Ok(decode_frame(frame)?.to_owned())
 }
 
+/// Stamps the frame and moves it into a buffer the transport owns.
+///
+/// # Errors
+/// Returns the [`EncodeError`] the encoder recorded — a field value that
+/// cannot be represented on the wire, such as a `Text` (58) carrying the SOH
+/// delimiter or an empty `TestReqID` (112) echoed back from a peer. A frame is
+/// never produced from a rejected value.
+fn into_frame(encoder: &mut Encoder) -> Result<BytesMut, EncodeError> {
+    let mut frame = BytesMut::new();
+    encoder.finish_into(&mut frame)?;
+    Ok(frame)
+}
+
 /// Builds outbound frames with the session header stamped.
 #[derive(Debug)]
 pub(crate) struct MessageFactory {
@@ -267,7 +280,12 @@ impl MessageFactory {
 
     /// Builds a Logon (35=A) with EncryptMethod=0, HeartBtInt and, for a
     /// FIXT.1.1 session, DefaultApplVerID (1137).
-    pub(crate) fn logon(&self, seq: u64, heartbeat_secs: u64, reset_seq: bool) -> BytesMut {
+    pub(crate) fn logon(
+        &self,
+        seq: u64,
+        heartbeat_secs: u64,
+        reset_seq: bool,
+    ) -> Result<BytesMut, EncodeError> {
         let mut encoder = self.header("A", seq, false, None);
         encoder.put_uint(98, 0);
         encoder.put_uint(108, heartbeat_secs);
@@ -277,53 +295,70 @@ impl MessageFactory {
         if let Some(appl_ver_id) = self.version.appl_ver_id() {
             encoder.put_str(1137, appl_ver_id);
         }
-        encoder.finish()
+        into_frame(&mut encoder)
     }
 
     /// Builds a Heartbeat (35=0), echoing TestReqID (112) when replying to
     /// a TestRequest.
-    pub(crate) fn heartbeat(&self, seq: u64, test_req_id: Option<&str>) -> BytesMut {
+    pub(crate) fn heartbeat(
+        &self,
+        seq: u64,
+        test_req_id: Option<&str>,
+    ) -> Result<BytesMut, EncodeError> {
         let mut encoder = self.header("0", seq, false, None);
         if let Some(id) = test_req_id {
             encoder.put_str(112, id);
         }
-        encoder.finish()
+        into_frame(&mut encoder)
     }
 
     /// Builds a TestRequest (35=1) with TestReqID (112).
-    pub(crate) fn test_request(&self, seq: u64, test_req_id: &str) -> BytesMut {
+    pub(crate) fn test_request(
+        &self,
+        seq: u64,
+        test_req_id: &str,
+    ) -> Result<BytesMut, EncodeError> {
         let mut encoder = self.header("1", seq, false, None);
         encoder.put_str(112, test_req_id);
-        encoder.finish()
+        into_frame(&mut encoder)
     }
 
     /// Builds a Logout (35=5) with optional Text (58).
-    pub(crate) fn logout(&self, seq: u64, text: Option<&str>) -> BytesMut {
+    pub(crate) fn logout(&self, seq: u64, text: Option<&str>) -> Result<BytesMut, EncodeError> {
         let mut encoder = self.header("5", seq, false, None);
         if let Some(text) = text {
             encoder.put_str(58, text);
         }
-        encoder.finish()
+        into_frame(&mut encoder)
     }
 
     /// Builds a ResendRequest (35=2) for `begin_seq..end_seq`
     /// (`end_seq` = 0 means "up to infinity").
-    pub(crate) fn resend_request(&self, seq: u64, begin_seq: u64, end_seq: u64) -> BytesMut {
+    pub(crate) fn resend_request(
+        &self,
+        seq: u64,
+        begin_seq: u64,
+        end_seq: u64,
+    ) -> Result<BytesMut, EncodeError> {
         let mut encoder = self.header("2", seq, false, None);
         encoder.put_uint(7, begin_seq);
         encoder.put_uint(16, end_seq);
-        encoder.finish()
+        into_frame(&mut encoder)
     }
 
     /// Builds a SequenceReset-GapFill (35=4, 123=Y) that answers a
     /// ResendRequest by jumping the counterparty's expectation to `new_seq`.
     /// Stamped with the gap's begin sequence, PossDupFlag (43=Y) and
     /// OrigSendingTime (122).
-    pub(crate) fn sequence_reset_gap_fill(&self, seq: u64, new_seq: u64) -> BytesMut {
+    pub(crate) fn sequence_reset_gap_fill(
+        &self,
+        seq: u64,
+        new_seq: u64,
+    ) -> Result<BytesMut, EncodeError> {
         let mut encoder = self.header("4", seq, true, None);
         encoder.put_bool(123, true);
         encoder.put_uint(36, new_seq);
-        encoder.finish()
+        into_frame(&mut encoder)
     }
 
     /// Builds a session-level Reject (35=3).
@@ -333,7 +368,7 @@ impl MessageFactory {
         ref_seq: u64,
         ref_msg_type: &str,
         reason: &RejectReason,
-    ) -> BytesMut {
+    ) -> Result<BytesMut, EncodeError> {
         let mut encoder = self.header("3", seq, false, None);
         encoder.put_uint(45, ref_seq);
         if let Some(ref_tag) = reason.ref_tag {
@@ -344,12 +379,16 @@ impl MessageFactory {
         if !reason.text.is_empty() {
             encoder.put_str(58, &reason.text);
         }
-        encoder.finish()
+        into_frame(&mut encoder)
     }
 
     /// Builds an application message from an [`OutboundMessage`], stamping
     /// ApplVerID (1128) for a FIXT.1.1 session.
-    pub(crate) fn application_message(&self, seq: u64, message: &OutboundMessage) -> BytesMut {
+    pub(crate) fn application_message(
+        &self,
+        seq: u64,
+        message: &OutboundMessage,
+    ) -> Result<BytesMut, EncodeError> {
         let mut encoder = self.header(
             message.msg_type().as_str(),
             seq,
@@ -359,7 +398,7 @@ impl MessageFactory {
         for (tag, value) in message.fields() {
             encoder.put_raw(*tag, value);
         }
-        encoder.finish()
+        into_frame(&mut encoder)
     }
 }
 
@@ -398,9 +437,18 @@ mod tests {
         }
     }
 
+    /// Unwraps a factory frame, failing the test with the encoder's rejection.
+    #[track_caller]
+    fn framed(frame: Result<BytesMut, EncodeError>) -> BytesMut {
+        match frame {
+            Ok(frame) => frame,
+            Err(err) => panic!("factory frame must encode: {err}"),
+        }
+    }
+
     #[test]
     fn test_logon_frame_roundtrip() {
-        let frame = factory().logon(1, 30, true);
+        let frame = framed(factory().logon(1, 30, true));
         let raw = decode(&frame);
         assert_eq!(raw.msg_type(), &MsgType::Logon);
         assert_eq!(raw.get_field_str(49), Some("CLIENT"));
@@ -415,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_gap_fill_frame_carries_orig_sending_time() {
-        let frame = factory().sequence_reset_gap_fill(3, 10);
+        let frame = framed(factory().sequence_reset_gap_fill(3, 10));
         let raw = decode(&frame);
         assert_eq!(raw.msg_type(), &MsgType::SequenceReset);
         assert_eq!(raw.get_field_str(34), Some("3"));
@@ -430,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_non_poss_dup_frame_omits_orig_sending_time() {
-        let frame = factory().heartbeat(4, None);
+        let frame = framed(factory().heartbeat(4, None));
         let raw = decode(&frame);
         assert_eq!(raw.get_field_str(43), None);
         assert_eq!(raw.get_field_str(122), None);
@@ -441,7 +489,7 @@ mod tests {
         let mut message = OutboundMessage::new(MsgType::NewOrderSingle);
         message.push_str(11, "ORDER-1").push_char(54, '1');
 
-        let frame = factory().application_message(7, &message);
+        let frame = framed(factory().application_message(7, &message));
         let raw = decode(&frame);
         assert_eq!(raw.msg_type(), &MsgType::NewOrderSingle);
         assert_eq!(raw.get_field_str(34), Some("7"));
@@ -479,7 +527,7 @@ mod tests {
 
             assert_eq!(resolved, Ok(version));
 
-            let frame = factory_for(version.as_str()).logon(1, 30, false);
+            let frame = framed(factory_for(version.as_str()).logon(1, 30, false));
             let raw = decode(&frame);
             assert_eq!(
                 raw.begin_string(),
@@ -539,7 +587,7 @@ mod tests {
 
     #[test]
     fn test_fix50sp2_logon_carries_fixt_begin_string_and_default_appl_ver_id() {
-        let frame = factory_for("FIX.5.0SP2").logon(1, 30, false);
+        let frame = framed(factory_for("FIX.5.0SP2").logon(1, 30, false));
         let raw = decode(&frame);
         assert_eq!(raw.begin_string(), Ok("FIXT.1.1"));
         assert_eq!(raw.get_field_str(1137), Some("9"));
@@ -550,7 +598,7 @@ mod tests {
         let mut message = OutboundMessage::new(MsgType::NewOrderSingle);
         message.push_str(11, "ORDER-1");
 
-        let frame = factory_for("FIX.5.0SP2").application_message(2, &message);
+        let frame = framed(factory_for("FIX.5.0SP2").application_message(2, &message));
         let raw = decode(&frame);
         assert_eq!(raw.begin_string(), Ok("FIXT.1.1"));
         assert_eq!(raw.get_field_str(1128), Some("9"));
@@ -564,7 +612,10 @@ mod tests {
         encoder.put_str(49, "VENUE");
         encoder.put_str(56, "CLIENT");
         encoder.put_uint(34, 1);
-        let frame = encoder.finish();
+        let frame = match encoder.finish() {
+            Ok(frame) => frame.to_vec(),
+            Err(err) => panic!("fixture frame must encode: {err}"),
+        };
 
         assert_eq!(identity.validate(&decode(&frame)), Ok(()));
     }
@@ -577,7 +628,10 @@ mod tests {
         encoder.put_str(49, "OTHER");
         encoder.put_str(56, "CLIENT");
         encoder.put_uint(34, 1);
-        let frame = encoder.finish();
+        let frame = match encoder.finish() {
+            Ok(frame) => frame.to_vec(),
+            Err(err) => panic!("fixture frame must encode: {err}"),
+        };
 
         assert_eq!(
             identity.validate(&decode(&frame)),
@@ -598,7 +652,10 @@ mod tests {
         encoder.put_str(49, "VENUE");
         encoder.put_str(56, "CLIENT");
         encoder.put_uint(34, 1);
-        let frame = encoder.finish();
+        let frame = match encoder.finish() {
+            Ok(frame) => frame.to_vec(),
+            Err(err) => panic!("fixture frame must encode: {err}"),
+        };
 
         // Our SenderSubID is the peer's TargetSubID (57).
         assert_eq!(

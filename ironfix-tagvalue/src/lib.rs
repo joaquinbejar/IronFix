@@ -26,15 +26,29 @@
 //!   targets.
 //! - **Checksum**: [`calculate_checksum`] plus formatting and parsing of the
 //!   tag 10 trailer.
+//! - **Single-buffer encoding**: [`Encoder`] reserves room for the header and
+//!   back-fills it, so a frame is assembled without an intermediate buffer or a
+//!   copy of the body, and [`Encoder::clear`] retains the capacity for the next
+//!   message.
 //!
-//! ## Untrusted input
+//! ## Both directions are hostile-input boundaries
 //!
-//! Every entry point here is an untrusted-input parser. Truncated messages, a
-//! bogus `BodyLength` (tag 9), a bad or malformed `CheckSum` (tag 10), a
-//! non-numeric tag, and an out-of-range declared length each map to a typed
-//! `DecodeError` — never a panic and never an attacker-controlled allocation.
-//! A genuinely incomplete buffer is reported distinctly from malformed input,
-//! so a caller framing a stream can tell "read more" from "reject this".
+//! Every entry point here is an untrusted-input parser. [`Decoder`] treats
+//! every byte as attacker-controlled: truncated messages, a `BodyLength` (tag
+//! 9) that disagrees with the bytes, a bad or malformed `CheckSum` (tag 10), a
+//! non-numeric tag, and a `DATA` field whose declared count reaches past the
+//! body each map to a typed [`ironfix_core::error::DecodeError`] — never a
+//! panic and never an attacker-controlled allocation. A genuinely incomplete
+//! buffer is reported distinctly from malformed input, so a caller framing a
+//! stream can tell "read more" from "reject this".
+//!
+//! [`Encoder`] holds the mirror invariant: **every frame it produces is one
+//! this crate's [`Decoder`] accepts**. A value carrying the SOH delimiter, an
+//! empty value, a framing tag written into the body, a `MsgType` (tag 35) that
+//! is missing, not first, or unrepresentable, and half of a `LENGTH`/`DATA`
+//! pair written alone are all refused with a typed
+//! [`ironfix_core::error::EncodeError`] rather than stamped into a frame whose
+//! `BodyLength` and `CheckSum` are correct for corrupted bytes.
 //!
 //! No performance figure is quoted here, and none should be: the criterion
 //! harness under `benches/` records no baseline, so nothing here has been
@@ -43,6 +57,16 @@
 pub mod checksum;
 pub mod decoder;
 pub mod encoder;
+
+/// SOH (Start of Header), the byte that terminates every FIX field.
+///
+/// Defined once here and re-exported from [`decoder`] and [`encoder`], which
+/// both need it: two independent definitions of one protocol byte are two
+/// semver-governed paths that can drift.
+pub const SOH: u8 = 0x01;
+
+/// The `=` byte that separates a tag from its value.
+pub const EQUALS: u8 = b'=';
 
 pub use checksum::calculate_checksum;
 pub use decoder::Decoder;

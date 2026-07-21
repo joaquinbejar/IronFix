@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
 use ironfix_core::MsgType;
+use ironfix_core::error::EncodeError;
 use ironfix_tagvalue::{Decoder, Encoder};
 
 mod common;
@@ -188,6 +189,20 @@ async fn handle_connection(
 }
 
 /// Message processor - handles business logic
+/// Unwraps an encoded frame, dropping the response if the encoder refused it.
+///
+/// A rejected value has no legal wire form, so there is nothing to send; the
+/// processor logs it and carries on rather than taking the session down.
+fn encoded(session_id: &str, frame: Result<Vec<u8>, EncodeError>) -> Option<Vec<u8>> {
+    match frame {
+        Ok(frame) => Some(frame),
+        Err(err) => {
+            error!("cannot encode response for session {session_id}: {err}");
+            None
+        }
+    }
+}
+
 async fn message_processor(mut rx: mpsc::Receiver<IncomingMessage>, cfg: ExampleConfig) {
     info!("Message processor started");
 
@@ -204,29 +219,33 @@ async fn message_processor(mut rx: mpsc::Receiver<IncomingMessage>, cfg: Example
         let response = match msg.msg_type {
             MsgType::Logon => {
                 info!("Session {} logged in", msg.session_id);
-                Some(OutgoingMessage {
+                encoded(&msg.session_id, build_logon(&cfg)).map(|data| OutgoingMessage {
                     session_id: msg.session_id.clone(),
-                    data: build_logon(&cfg),
+                    data,
                     close_after: false,
                 })
             }
             MsgType::TestRequest => {
                 let test_req_id = msg.fields.get(&112).map(|s| s.as_str());
-                Some(OutgoingMessage {
-                    session_id: msg.session_id.clone(),
-                    data: build_heartbeat(&cfg, test_req_id),
-                    close_after: false,
+                encoded(&msg.session_id, build_heartbeat(&cfg, test_req_id)).map(|data| {
+                    OutgoingMessage {
+                        session_id: msg.session_id.clone(),
+                        data,
+                        close_after: false,
+                    }
                 })
             }
             MsgType::Heartbeat => {
                 // Just acknowledge, no response needed
                 None
             }
-            MsgType::Logout => Some(OutgoingMessage {
-                session_id: msg.session_id.clone(),
-                data: build_logout(&cfg),
-                close_after: true,
-            }),
+            MsgType::Logout => {
+                encoded(&msg.session_id, build_logout(&cfg)).map(|data| OutgoingMessage {
+                    session_id: msg.session_id.clone(),
+                    data,
+                    close_after: true,
+                })
+            }
             MsgType::NewOrderSingle => {
                 order_counter += 1;
                 let clid = msg.fields.get(&11).map(|s| s.as_str()).unwrap_or("0");
@@ -239,9 +258,13 @@ async fn message_processor(mut rx: mpsc::Receiver<IncomingMessage>, cfg: Example
                     clid, sym, side, qty, order_counter
                 );
 
-                Some(OutgoingMessage {
+                encoded(
+                    &msg.session_id,
+                    build_exec(&cfg, clid, sym, side, qty, order_counter),
+                )
+                .map(|data| OutgoingMessage {
                     session_id: msg.session_id.clone(),
-                    data: build_exec(&cfg, clid, sym, side, qty, order_counter),
+                    data,
                     close_after: false,
                 })
             }
@@ -262,7 +285,7 @@ async fn message_processor(mut rx: mpsc::Receiver<IncomingMessage>, cfg: Example
     info!("Message processor stopped");
 }
 
-fn build_logon(c: &ExampleConfig) -> Vec<u8> {
+fn build_logon(c: &ExampleConfig) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "A");
     e.put_str(49, &c.sender_comp_id);
@@ -271,10 +294,10 @@ fn build_logon(c: &ExampleConfig) -> Vec<u8> {
     e.put_str(52, &format_timestamp());
     e.put_str(98, "0");
     e.put_str(108, &c.heartbeat_interval.to_string());
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
-fn build_heartbeat(c: &ExampleConfig, test_req_id: Option<&str>) -> Vec<u8> {
+fn build_heartbeat(c: &ExampleConfig, test_req_id: Option<&str>) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "0");
     e.put_str(49, &c.sender_comp_id);
@@ -284,17 +307,17 @@ fn build_heartbeat(c: &ExampleConfig, test_req_id: Option<&str>) -> Vec<u8> {
     if let Some(id) = test_req_id {
         e.put_str(112, id);
     }
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
-fn build_logout(c: &ExampleConfig) -> Vec<u8> {
+fn build_logout(c: &ExampleConfig) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "5");
     e.put_str(49, &c.sender_comp_id);
     e.put_str(56, &c.target_comp_id);
     e.put_str(34, "1");
     e.put_str(52, &format_timestamp());
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
 fn build_exec(
@@ -304,7 +327,7 @@ fn build_exec(
     side: &str,
     qty: &str,
     order_id: u64,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "8");
     e.put_str(49, &c.sender_comp_id);
@@ -321,5 +344,5 @@ fn build_exec(
     e.put_str(151, qty); // LeavesQty
     e.put_str(14, "0"); // CumQty
     e.put_str(6, "0"); // AvgPx
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }

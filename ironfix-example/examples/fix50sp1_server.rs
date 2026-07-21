@@ -1,6 +1,7 @@
 //! FIX 5.0 SP1 Server Example (FIXT.1.1 Transport)
 use bytes::BytesMut;
 use ironfix_core::MsgType;
+use ironfix_core::error::EncodeError;
 use ironfix_tagvalue::{Decoder, Encoder};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,14 +63,14 @@ async fn handle(
                 let resp = match raw.msg_type() {
                     MsgType::Logon => {
                         info!("Logon");
-                        Some(build_logon(&cfg))
+                        Some(build_logon(&cfg)?)
                     }
-                    MsgType::TestRequest => Some(build_hb(&cfg, raw.get_field_str(112))),
+                    MsgType::TestRequest => Some(build_hb(&cfg, raw.get_field_str(112))?),
                     MsgType::Logout => {
-                        sock.write_all(&build_logout(&cfg)).await?;
+                        sock.write_all(&build_logout(&cfg)?).await?;
                         return Ok(());
                     }
-                    MsgType::NewOrderSingle => Some(build_exec(&cfg, &raw)),
+                    MsgType::NewOrderSingle => Some(build_exec(&cfg, &raw)?),
                     _ => {
                         warn!("Unhandled: {:?}", raw.msg_type());
                         None
@@ -85,7 +86,7 @@ async fn handle(
     Ok(())
 }
 
-fn build_logon(c: &ExampleConfig) -> Vec<u8> {
+fn build_logon(c: &ExampleConfig) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "A");
     e.put_str(49, &c.sender_comp_id);
@@ -95,10 +96,10 @@ fn build_logon(c: &ExampleConfig) -> Vec<u8> {
     e.put_str(98, "0");
     e.put_str(108, &c.heartbeat_interval.to_string());
     e.put_str(1137, APPL_VER_ID);
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
-fn build_hb(c: &ExampleConfig, id: Option<&str>) -> Vec<u8> {
+fn build_hb(c: &ExampleConfig, id: Option<&str>) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "0");
     e.put_str(49, &c.sender_comp_id);
@@ -108,20 +109,23 @@ fn build_hb(c: &ExampleConfig, id: Option<&str>) -> Vec<u8> {
     if let Some(i) = id {
         e.put_str(112, i);
     }
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
-fn build_logout(c: &ExampleConfig) -> Vec<u8> {
+fn build_logout(c: &ExampleConfig) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "5");
     e.put_str(49, &c.sender_comp_id);
     e.put_str(56, &c.target_comp_id);
     e.put_str(34, "1");
     e.put_str(52, &format_timestamp());
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
-fn build_exec(c: &ExampleConfig, raw: &ironfix_tagvalue::RawMessage<'_>) -> Vec<u8> {
+fn build_exec(
+    c: &ExampleConfig,
+    raw: &ironfix_tagvalue::RawMessage<'_>,
+) -> Result<Vec<u8>, EncodeError> {
     let clid = raw.get_field_str(11).unwrap_or("0");
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "8");
@@ -140,5 +144,5 @@ fn build_exec(c: &ExampleConfig, raw: &ironfix_tagvalue::RawMessage<'_>) -> Vec<
     e.put_str(151, raw.get_field_str(38).unwrap_or("0"));
     e.put_str(14, "0");
     e.put_str(6, "0");
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }

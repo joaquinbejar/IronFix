@@ -1,5 +1,6 @@
 //! FIX 4.2 Client Example
 use bytes::BytesMut;
+use ironfix_core::error::EncodeError;
 use ironfix_core::{MsgType, Side};
 use ironfix_tagvalue::{Decoder, Encoder};
 use std::time::Duration;
@@ -26,7 +27,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut seq = 1u64;
     let mut buf = BytesMut::with_capacity(4096);
 
-    sock.write_all(&build_msg(&cfg, "A", seq, None)).await?;
+    sock.write_all(&build_msg(&cfg, "A", seq, None)?).await?;
     seq += 1;
     match timeout(Duration::from_secs(10), read_msg(&mut sock, &mut buf)).await {
         Ok(Ok(m))
@@ -43,8 +44,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    sock.write_all(&build_order(&cfg, seq, "O1", "GOOG", Side::Sell, 25, 140.0))
-        .await?;
+    sock.write_all(&build_order(
+        &cfg,
+        seq,
+        "O1",
+        "GOOG",
+        Side::Sell,
+        25,
+        140.0,
+    )?)
+    .await?;
     seq += 1;
     if let Ok(Ok(m)) = timeout(Duration::from_secs(5), read_msg(&mut sock, &mut buf)).await
         && let Ok(r) = Decoder::new(&m).decode()
@@ -55,12 +64,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut hb = interval(Duration::from_secs(cfg.heartbeat_interval));
     for _ in 0..2 {
         hb.tick().await;
-        sock.write_all(&build_msg(&cfg, "0", seq, None)).await?;
+        sock.write_all(&build_msg(&cfg, "0", seq, None)?).await?;
         seq += 1;
         info!("HB");
     }
 
-    sock.write_all(&build_msg(&cfg, "5", seq, None)).await?;
+    sock.write_all(&build_msg(&cfg, "5", seq, None)?).await?;
     info!("Done");
     Ok(())
 }
@@ -79,7 +88,12 @@ async fn read_msg(
     }
 }
 
-fn build_msg(c: &ExampleConfig, mt: &str, seq: u64, id: Option<&str>) -> Vec<u8> {
+fn build_msg(
+    c: &ExampleConfig,
+    mt: &str,
+    seq: u64,
+    id: Option<&str>,
+) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, mt);
     e.put_str(49, &c.sender_comp_id);
@@ -93,7 +107,7 @@ fn build_msg(c: &ExampleConfig, mt: &str, seq: u64, id: Option<&str>) -> Vec<u8>
     if let Some(i) = id {
         e.put_str(112, i);
     }
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
 fn build_order(
@@ -104,7 +118,7 @@ fn build_order(
     side: Side,
     qty: u64,
     px: f64,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "D");
     e.put_str(49, &c.sender_comp_id);
@@ -119,5 +133,5 @@ fn build_order(
     e.put_str(38, &qty.to_string());
     e.put_str(40, "2");
     e.put_str(44, &format!("{:.2}", px));
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }

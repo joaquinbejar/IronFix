@@ -74,7 +74,33 @@ fn venue_msg_from(
     for (tag, value) in extra {
         encoder.put_str(*tag, value);
     }
-    encoder.finish()
+    frame_of(&mut encoder)
+}
+
+/// Returns the finished frame, failing the test with the encoder's rejection.
+#[track_caller]
+fn frame_of(encoder: &mut Encoder) -> BytesMut {
+    let mut frame = BytesMut::new();
+    match encoder.finish_into(&mut frame) {
+        Ok(()) => frame,
+        Err(err) => panic!("test fixture frame must encode: {err}"),
+    }
+}
+
+/// Builds a frame around `body` with a correct BodyLength and CheckSum,
+/// bypassing the encoder's conformance checks.
+///
+/// The encoder refuses to stamp a frame whose first body field is not MsgType,
+/// which is exactly the malformed input some of these tests must put on the
+/// wire.
+fn raw_frame(body: &[u8]) -> BytesMut {
+    let mut frame = Vec::with_capacity(body.len() + 32);
+    frame.extend_from_slice(b"8=FIX.4.4\x01");
+    frame.extend_from_slice(format!("9={}\x01", body.len()).as_bytes());
+    frame.extend_from_slice(body);
+    let sum: u64 = frame.iter().map(|&b| u64::from(b)).sum();
+    frame.extend_from_slice(format!("10={:03}\x01", (sum % 256) as u8).as_bytes());
+    BytesMut::from(&frame[..])
 }
 
 /// Extracts a field from a framed message.
@@ -1521,13 +1547,11 @@ async fn test_undecodable_frame_is_dropped() {
         let mut framed = accept_logon(listener).await;
 
         // Framing is valid (8/9/10) but MsgType is absent, so the tag=value
-        // decoder rejects it.
-        let mut encoder = Encoder::new("FIX.4.4");
-        encoder.put_str(49, "VENUE");
-        encoder.put_str(56, "CLIENT");
-        encoder.put_uint(34, 2);
+        // decoder rejects it. Hand-rolled: the encoder will not produce it.
         ok(
-            framed.send(encoder.finish()).await,
+            framed
+                .send(raw_frame(b"49=VENUE\x0156=CLIENT\x0134=2\x01"))
+                .await,
             "send undecodable frame",
         );
 
@@ -1568,7 +1592,7 @@ async fn test_frame_without_msg_seq_num_is_dropped() {
         encoder.put_str(56, "CLIENT");
         encoder.put_str(52, Timestamp::now().format_millis().as_str());
         ok(
-            framed.send(encoder.finish()).await,
+            framed.send(frame_of(&mut encoder)).await,
             "send frame without MsgSeqNum",
         );
 
