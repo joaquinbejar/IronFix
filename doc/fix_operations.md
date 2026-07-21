@@ -930,10 +930,13 @@ session with `EngineError::UnsupportedVersion` before dialling; configure
 `FIX.5.0`, `FIX.5.0SP1` or `FIX.5.0SP2` instead. An unrecognised version string
 is refused the same way, rather than being passed through onto the wire.
 
-This table is duplicated from `ironfix_dictionary::schema::Version`, because
-`ironfix-engine` does not and must not depend on `ironfix-dictionary`. The two
-can drift apart and no test can cross-check them without taking that
-dependency; unifying them into `ironfix-core` is follow-up work.
+This table exists exactly once in the workspace, as `ironfix_core::FixVersion`
+(`ironfix-core/src/version.rs`). `ironfix-dictionary` re-exports it as
+`schema::Version` and `ironfix-engine` resolves the configured string to it in
+`wire::wire_version`, so the two consumers cannot drift — which matters because
+`ironfix-engine` does not and must not depend on `ironfix-dictionary`. Note the
+distinction the type draws: `FixVersion::as_str` is the version's own name
+(`FIX.5.0SP2`), `FixVersion::begin_string` is what goes in tag 8 (`FIXT.1.1`).
 
 **Not implemented for 5.0:** no application-version-driven validation of any
 kind. The `ApplVerID` values are stamped, not enforced, and the engine never

@@ -17,68 +17,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// FIX protocol version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Version {
-    /// FIX 4.0
-    Fix40,
-    /// FIX 4.1
-    Fix41,
-    /// FIX 4.2
-    Fix42,
-    /// FIX 4.3
-    Fix43,
-    /// FIX 4.4
-    Fix44,
-    /// FIX 5.0
-    Fix50,
-    /// FIX 5.0 SP1
-    Fix50Sp1,
-    /// FIX 5.0 SP2
-    Fix50Sp2,
-    /// FIXT 1.1 (transport layer for FIX 5.0+)
-    Fixt11,
-}
-
-impl Version {
-    /// Returns the BeginString value for this version.
-    #[must_use]
-    pub const fn begin_string(&self) -> &'static str {
-        match self {
-            Self::Fix40 => "FIX.4.0",
-            Self::Fix41 => "FIX.4.1",
-            Self::Fix42 => "FIX.4.2",
-            Self::Fix43 => "FIX.4.3",
-            Self::Fix44 => "FIX.4.4",
-            Self::Fix50 | Self::Fix50Sp1 | Self::Fix50Sp2 | Self::Fixt11 => "FIXT.1.1",
-        }
-    }
-
-    /// Returns the ApplVerID for FIX 5.0+ versions.
-    #[must_use]
-    pub const fn appl_ver_id(&self) -> Option<&'static str> {
-        match self {
-            Self::Fix50 => Some("7"),
-            Self::Fix50Sp1 => Some("8"),
-            Self::Fix50Sp2 => Some("9"),
-            _ => None,
-        }
-    }
-
-    /// Returns true if this version uses FIXT transport.
-    #[must_use]
-    pub const fn uses_fixt(&self) -> bool {
-        matches!(
-            self,
-            Self::Fix50 | Self::Fix50Sp1 | Self::Fix50Sp2 | Self::Fixt11
-        )
-    }
-}
-
-impl std::fmt::Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.begin_string())
-    }
-}
+///
+/// This is [`ironfix_core::FixVersion`], re-exported under the name this
+/// crate has always published. The version-to-wire mapping (`BeginString`
+/// tag 8, and `ApplVerID` for the 5.0 family) lives in `ironfix-core` because
+/// `ironfix-engine` needs the same answer and must not depend on
+/// `ironfix-dictionary`; keeping a second copy here let the two drift with no
+/// test able to cross-check them.
+///
+/// Note that `Display` and [`FixVersion::as_str`](ironfix_core::FixVersion::as_str)
+/// render the version's own name (`FIX.5.0SP2`), which for the 5.0 family is
+/// **not** its
+/// [`begin_string`](ironfix_core::FixVersion::begin_string) (`FIXT.1.1`).
+pub use ironfix_core::FixVersion as Version;
 
 /// FIX field data type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -476,6 +427,17 @@ mod tests {
         assert_eq!(Version::Fix44.appl_ver_id(), None);
         assert_eq!(Version::Fix50.appl_ver_id(), Some("7"));
         assert_eq!(Version::Fix50Sp2.appl_ver_id(), Some("9"));
+    }
+
+    #[test]
+    fn test_version_is_the_core_type_not_a_copy() {
+        // `Version` is a re-export of `ironfix_core::FixVersion`, so the
+        // version-to-wire table exists exactly once in the workspace and
+        // cannot drift from the copy `ironfix-engine` consumes. Assigning
+        // across the two names only compiles while that holds.
+        let from_core: Version = ironfix_core::FixVersion::Fix50Sp2;
+        assert_eq!(from_core, Version::Fix50Sp2);
+        assert_eq!(Version::ALL.len(), ironfix_core::FixVersion::ALL.len());
     }
 
     #[test]

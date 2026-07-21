@@ -471,6 +471,36 @@ impl InvalidSide {
     }
 }
 
+/// A string that names no [`FixVersion`](crate::version::FixVersion).
+///
+/// An unrecognised version cannot be framed: its `BeginString` (8) and, for a
+/// FIXT session, its `DefaultApplVerID` (1137) are unknown. Callers must
+/// surface this rather than substitute a default, which would put a fabricated
+/// version on the wire.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error("'{value}' is not a known FIX version")]
+pub struct UnknownFixVersion {
+    value: String,
+}
+
+impl UnknownFixVersion {
+    /// Creates the error for an offending version string.
+    #[inline]
+    #[must_use]
+    pub fn new(value: &str) -> Self {
+        Self {
+            value: value.to_owned(),
+        }
+    }
+
+    /// Returns the offending version string.
+    #[inline]
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
