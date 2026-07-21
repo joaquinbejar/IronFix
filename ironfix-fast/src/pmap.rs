@@ -24,6 +24,11 @@ use smallvec::SmallVec;
 /// Each byte carries [`PAYLOAD_BITS`] field bits, so this ceiling admits
 /// presence maps of up to 448 fields — far beyond any practical FAST template
 /// — while bounding the work and the memory a single hostile map can cost.
+///
+/// The ceiling applies to [`PresenceMap::decode`], the only path fed by the
+/// wire. [`PresenceMap::from_bits`] and [`PresenceMapBuilder`] take bits the
+/// caller already holds and are not bounded by it; an oversized map built that
+/// way is refused by [`PresenceMap::encode`] before it can reach a socket.
 pub const MAX_PMAP_BYTES: usize = 64;
 
 /// Number of presence bits held inline before spilling to the heap.
@@ -111,9 +116,25 @@ impl PresenceMap {
     /// `true` if the corresponding field is present, `false` otherwise.
     ///
     /// # Errors
-    /// Returns [`FastError::PresenceMapExhausted`] if every bit has already
-    /// been consumed. A truncated map must never read as "all remaining fields
-    /// absent".
+    /// Returns [`FastError::PresenceMapExhausted`] once every decoded bit has
+    /// been consumed, rather than answering "absent" forever.
+    ///
+    /// # Granularity
+    ///
+    /// A decoded map always holds a multiple of seven bits, because that is
+    /// what the wire encoding carries: a sender meaning one present bit emits
+    /// a single byte, and this map then offers seven. Those six padding bits
+    /// read as "absent" and are indistinguishable here from real absent
+    /// fields — the primitive layer never sees the template, so it cannot know
+    /// how many bits were meant. Exhaustion therefore only fires at a
+    /// seven-bit boundary.
+    ///
+    /// The mirror of that is over-rejection: a sender that omits trailing
+    /// all-absent bytes (legal in some implementations) produces a map shorter
+    /// than the template's field count, and the reads past its end error here
+    /// rather than yielding "absent". Resolving either direction requires the
+    /// expected field count, which belongs to the template layer — see the
+    /// template-driven decode work tracked in issue #13.
     #[inline]
     pub fn next_bit(&mut self) -> Result<bool, FastError> {
         let bit = *self

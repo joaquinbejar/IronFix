@@ -12,6 +12,16 @@
 //! Every function here is an untrusted-input parser: the bytes arrive from a
 //! counterparty over a socket. Malformed input maps to a typed [`FastError`]
 //! with a resource ceiling — never a panic, never an allocation sized from a
+//! declared length before it is validated. The ceilings are fixed for
+//! integers and presence maps; a string or byte vector is instead bounded by
+//! the bytes the peer has actually delivered, since neither has a length the
+//! specification caps. A caller that must bound field size does so by bounding
+//! the frame it hands in.
+//!
+//! On error the read offset is left wherever the failure was detected, which
+//! differs per entry point. Every error here is fatal for the frame, so a
+//! caller must not resume from a partially advanced offset; restart from a
+//! known frame boundary instead.
 //! declared length that has not been validated against the bytes actually
 //! available.
 
@@ -189,6 +199,31 @@ impl FastDecoder {
         Ok(result)
     }
 
+    /// Decodes a nullable unsigned integer.
+    ///
+    /// FAST represents a nullable unsigned integer with a bias of one: a lone
+    /// stop byte is NULL, and any other value is the encoded value minus one.
+    /// This is the counterpart of
+    /// [`FastEncoder::encode_nullable_uint`](crate::FastEncoder::encode_nullable_uint);
+    /// the two must agree, so the bias lives here rather than in every caller,
+    /// which is where an off-by-one reappears.
+    ///
+    /// The representable domain is therefore `0..=u64::MAX - 1`.
+    ///
+    /// # Errors
+    /// Returns [`FastError::UnexpectedEof`] if the input ends mid-value, or
+    /// [`FastError::IntegerOverflow`] if the encoded value exceeds the
+    /// representable domain.
+    pub fn decode_nullable_uint(data: &[u8], offset: &mut usize) -> Result<Option<u64>, FastError> {
+        let raw = Self::decode_uint(data, offset)?;
+        match raw {
+            0 => Ok(None),
+            biased => biased
+                .checked_sub(1)
+                .map(Some)
+                .ok_or(FastError::IntegerOverflow),
+        }
+    }
     /// Decodes an ASCII string using stop-bit encoding.
     ///
     /// Follows the FAST 1.1 string encodings: a lone stop byte (`0x80`) is the
@@ -224,17 +259,24 @@ impl FastDecoder {
             return Ok(String::from('\0'));
         }
 
-        let mut result = String::new();
+        // Locate the stop byte first, so the buffer is sized once from bytes
+        // that are actually present rather than grown geometrically -- which
+        // otherwise costs twice the field size in peak heap. The scan is
+        // bounded by the input, and a field with no stop byte is rejected
+        // before anything is allocated.
+        let tail = data.get(*offset..).ok_or(FastError::UnexpectedEof)?;
+        let len = tail
+            .iter()
+            .position(|byte| byte & STOP_BIT != 0)
+            .ok_or(FastError::UnexpectedEof)?
+            .checked_add(1)
+            .ok_or(FastError::UnexpectedEof)?;
 
-        loop {
+        let mut result = String::with_capacity(len);
+        for _ in 0..len {
             let byte = read_byte(data, offset)?;
-
             // The payload is always <= 0x7F, so it is a valid ASCII scalar.
             result.push(char::from(byte & PAYLOAD_MASK));
-
-            if byte & STOP_BIT != 0 {
-                break;
-            }
         }
 
         Ok(result)
@@ -606,6 +648,50 @@ mod tests {
             encoder.encode_int(value);
             assert_eq!(encoder.finish(), expected, "minimal encoding of {value}");
         }
+    }
+
+    #[test]
+    fn test_decode_nullable_uint_round_trips_through_the_encoder() {
+        // The bias lives in one place now, so encoder and decoder cannot
+        // disagree about it -- which is exactly where the off-by-one this
+        // change fixes used to reappear in every caller.
+        for value in [
+            None,
+            Some(0),
+            Some(1),
+            Some(127),
+            Some(128),
+            Some(u64::MAX - 1),
+        ] {
+            let mut encoder = crate::FastEncoder::new();
+            assert!(encoder.encode_nullable_uint(value).is_ok());
+            let buffer = encoder.finish();
+            let mut offset = 0;
+            assert_eq!(
+                FastDecoder::decode_nullable_uint(&buffer, &mut offset),
+                Ok(value),
+                "round trip failed for {value:?}"
+            );
+            assert_eq!(offset, buffer.len(), "the whole value must be consumed");
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_uint_lone_stop_byte_is_null() {
+        let mut offset = 0;
+        assert_eq!(
+            FastDecoder::decode_nullable_uint(&[0x80], &mut offset),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn test_encode_nullable_uint_rejects_the_value_outside_its_domain() {
+        let mut encoder = crate::FastEncoder::new();
+        assert_eq!(
+            encoder.encode_nullable_uint(Some(u64::MAX)),
+            Err(FastError::IntegerOverflow)
+        );
     }
 
     #[test]
