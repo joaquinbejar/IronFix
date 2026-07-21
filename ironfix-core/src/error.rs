@@ -131,11 +131,12 @@ pub enum DecodeError {
         tag: u32,
     },
 
-    /// A Length/Data field pair declares a byte count the buffer cannot satisfy.
+    /// A Length/Data field pair declares a byte count the frame cannot satisfy.
     ///
     /// Raised when the count declared by a `LENGTH` field (for example
-    /// `RawDataLength`, tag 95) runs past the end of the buffer, or when the
-    /// byte at the declared end of the `DATA` field is not the SOH delimiter.
+    /// `RawDataLength`, tag 95) runs past what the field may consume, or when
+    /// the byte at the declared end of the `DATA` field is not the SOH
+    /// delimiter.
     #[error(
         "data field {data_tag} declares {declared} bytes not terminated by SOH within {available} remaining bytes"
     )]
@@ -144,7 +145,9 @@ pub enum DecodeError {
         data_tag: u32,
         /// The byte count declared by the paired `LENGTH` field.
         declared: usize,
-        /// Bytes actually available after the `=` delimiter.
+        /// Bytes the field was allowed to consume: what remains after the `=`
+        /// delimiter, bounded by the frame's declared body end when decoding a
+        /// whole message. The terminating SOH must fall inside this.
         available: usize,
     },
 

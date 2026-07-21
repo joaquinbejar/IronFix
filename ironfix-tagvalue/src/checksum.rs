@@ -35,8 +35,10 @@ pub fn calculate_checksum(data: &[u8]) -> u8 {
 /// Portable checksum calculation without SIMD.
 ///
 /// The accumulator is `u64`: a `u32` overflows (and panics under the debug
-/// overflow checks) once the input exceeds roughly 16.8 MB of 0xFF bytes,
-/// which is a reachable size for a `RawData`-carrying message.
+/// overflow checks) once the input exceeds roughly 16.8 MB of 0xFF bytes.
+/// The transport caps frames well below that by default, so this is not
+/// reachable through the codec — it is reachable by calling this function
+/// directly on a caller-supplied buffer, which is a public API.
 #[inline]
 fn calculate_checksum_portable(data: &[u8]) -> u8 {
     let sum: u64 = data.iter().map(|&b| u64::from(b)).sum();
