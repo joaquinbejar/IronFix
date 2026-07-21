@@ -13,7 +13,7 @@
 //! [`MAX_INT_ENCODED_LEN`] for an integer, so the encoder can never emit a
 //! frame its own decoder would reject.
 
-use crate::decoder::{MAX_INT_ENCODED_LEN, PAYLOAD_BITS, PAYLOAD_MASK, SIGN_BIT, STOP_BIT};
+use crate::decoder::{MAX_INT_ENCODED_LEN, PAYLOAD_BITS, PAYLOAD_MASK, SIGN_BIT, STOP_BIT, store};
 use crate::error::FastError;
 use crate::operators::DictionaryValue;
 use smallvec::SmallVec;
@@ -201,6 +201,97 @@ impl FastEncoder {
         Ok(())
     }
 
+    /// Encodes a nullable signed integer.
+    ///
+    /// FAST biases only the non-negative half of the range: `None` is the
+    /// single stop byte `0x80`, a non-negative value is encoded one higher than
+    /// it is, and a negative value is encoded as itself. The representable
+    /// domain is therefore `i64::MIN..=i64::MAX - 1`: `Some(i64::MAX)` has no
+    /// encoding and is rejected rather than silently biased into the `None`
+    /// representation.
+    ///
+    /// # Arguments
+    /// * `value` - The optional value to encode
+    ///
+    /// # Errors
+    /// Returns [`FastError::IntegerOverflow`] for `Some(i64::MAX)`.
+    pub fn encode_nullable_int(&mut self, value: Option<i64>) -> Result<(), FastError> {
+        match value {
+            Some(v) if v < 0 => self.encode_int(v),
+            Some(v) => {
+                let biased = v.checked_add(1).ok_or(FastError::IntegerOverflow)?;
+                self.encode_int(biased);
+            }
+            None => self.buffer.push(STOP_BIT),
+        }
+
+        Ok(())
+    }
+
+    /// Encodes a nullable ASCII string.
+    ///
+    /// The nullable string forms shift each of the FAST 1.1 special encodings
+    /// by one leading `0x00`: `None` is a lone stop byte (`0x80`), the empty
+    /// string is `0x00 0x80`, and the one-character NUL string is
+    /// `0x00 0x00 0x80`. A longer string beginning with NUL has no legal
+    /// representation and is refused rather than written to the wire in a form
+    /// the decoder must reject.
+    ///
+    /// # Arguments
+    /// * `value` - The optional string to encode
+    ///
+    /// # Errors
+    /// Returns [`FastError::InvalidString`] if `value` contains a non-ASCII
+    /// character, or if it begins with a NUL and is longer than one character.
+    pub fn encode_nullable_ascii(&mut self, value: Option<&str>) -> Result<(), FastError> {
+        let Some(value) = value else {
+            self.buffer.push(STOP_BIT);
+            return Ok(());
+        };
+
+        if !value.is_ascii() {
+            return Err(FastError::InvalidString);
+        }
+
+        match value.as_bytes() {
+            [] => {
+                self.buffer.extend_from_slice(&[0x00, STOP_BIT]);
+                Ok(())
+            }
+            [0x00] => {
+                self.buffer.extend_from_slice(&[0x00, 0x00, STOP_BIT]);
+                Ok(())
+            }
+            [0x00, ..] => Err(FastError::InvalidString),
+            _ => self.encode_ascii(value),
+        }
+    }
+
+    /// Encodes a nullable byte vector with a nullable length prefix.
+    ///
+    /// `None` is a lone stop byte; any other value carries a length prefix
+    /// biased by one, matching
+    /// [`FastDecoder::decode_nullable_bytes`](crate::FastDecoder::decode_nullable_bytes).
+    ///
+    /// # Arguments
+    /// * `value` - The optional bytes to encode
+    ///
+    /// # Errors
+    /// Returns [`FastError::IntegerOverflow`] if the length of `value` cannot
+    /// be represented in the biased nullable domain.
+    pub fn encode_nullable_bytes(&mut self, value: Option<&[u8]>) -> Result<(), FastError> {
+        match value {
+            Some(bytes) => {
+                let length = u64::try_from(bytes.len()).map_err(|_| FastError::IntegerOverflow)?;
+                self.encode_nullable_uint(Some(length))?;
+                self.buffer.extend_from_slice(bytes);
+            }
+            None => self.buffer.push(STOP_BIT),
+        }
+
+        Ok(())
+    }
+
     /// Returns the encoded bytes.
     #[must_use]
     pub fn finish(self) -> Vec<u8> {
@@ -244,8 +335,12 @@ impl FastEncoder {
     }
 
     /// Sets a value in the global dictionary.
-    pub fn set_global(&mut self, key: impl Into<String>, value: DictionaryValue) {
-        self.global_dict.insert(key.into(), value);
+    ///
+    /// Overwriting an entry that already exists reuses its key, so the steady
+    /// state — the same fields updated message after message — allocates
+    /// nothing. Only the first write of a given key allocates.
+    pub fn set_global(&mut self, key: impl AsRef<str>, value: DictionaryValue) {
+        store(&mut self.global_dict, key.as_ref(), value);
     }
 
     /// Appends `bytes` — accumulated least significant byte first — to `out` in

@@ -12,28 +12,40 @@
 //! It uses techniques like stop-bit encoding, presence maps, and field operators
 //! to achieve high compression ratios.
 //!
-//! ## What this crate provides
+//! ## What this crate implements
 //!
-//! These are encoding *primitives*, not a complete FAST implementation:
+//! - **Stop-bit encoding**: unsigned and signed integers, ASCII strings and
+//!   byte vectors, each in a nullable and a non-nullable form, encoder and
+//!   decoder paired so every encoding this crate emits is one it accepts back.
+//! - **Presence maps**: [`PresenceMap`] decodes a map with a size ceiling and
+//!   encodes it in the minimal form.
+//! - **Field operators**: the [`Operator`] table, and the
+//!   rule that decides — from the operator, the field's optionality and the
+//!   presence map — whether a field's value is in the stream, comes from the
+//!   template's initial value, comes from the operator dictionary, or is
+//!   absent. That decision is
+//!   [`Operator::transfer`](operators::Operator::transfer), and it is the piece
+//!   that keeps a positional presence map aligned.
 //!
-//! - **Stop-bit encoding**: integer and string encode/decode
-//! - **Presence maps**: [`PresenceMap`] / [`PresenceMapBuilder`], tracking which
-//!   optional fields are present
-//! - **Field operators**: [`operators::Operator`] — copy, delta, increment,
-//!   tail and default — with per-template and global
-//!   [`operators::DictionaryScope`] for previous-value state
+//! ## What this crate does not implement yet
 //!
-//! ## Not provided
+//! There is **no template layer**: nothing here parses a FAST template XML
+//! file, holds a field sequence, or applies an operator to produce a value.
+//! Concretely, still missing are the template model (field identity, type,
+//! optionality and initial value), operator *application* (delta arithmetic,
+//! increment, tail combination), the decimal codec that pairs a mantissa with
+//! an exponent, and sequence decoding with its length ceiling. Several
+//! [`FastError`] variants exist for that work and are not constructed yet.
 //!
-//! - **No template definitions and no template XML parser.** Templates are
-//!   referred to only by numeric id, for scoping the previous-value dictionary;
-//!   nothing here reads a FAST template file or describes a message structure.
-//! - **No transport.** There is no UDP multicast receiver and no A/B feed
-//!   arbitration.
-//! - **Not wired into the engine.** This crate sits parallel to
-//!   `ironfix-tagvalue`, depends only on `ironfix-core`, and is not used by the
-//!   session or engine path. Driving it is the caller's job — see the `fast_*`
-//!   examples in `ironfix-example`.
+//! Two consequences are worth stating plainly. This crate cannot decode a FAST
+//! message end to end — it decodes the fields of one, given something else that
+//! knows their order. And because a presence map's bits are only meaningful
+//! against a known field count, the padding bits inside its last byte are
+//! indistinguishable here from genuinely absent fields; closing that gap needs
+//! the template layer.
+//!
+//! `ironfix-fast` is also not wired into the session path: it is parallel to
+//! `ironfix-tagvalue`, not downstream of it.
 //!
 //! ## Untrusted input
 //!
@@ -60,4 +72,5 @@ pub mod pmap;
 pub use decoder::{FastDecoder, MAX_INT_ENCODED_LEN};
 pub use encoder::FastEncoder;
 pub use error::FastError;
+pub use operators::{DictionaryScope, DictionaryValue, FieldTransfer, Operator};
 pub use pmap::{MAX_PMAP_BYTES, PresenceMap, PresenceMapBuilder};

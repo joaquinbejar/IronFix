@@ -22,8 +22,6 @@
 //! differs per entry point. Every error here is fatal for the frame, so a
 //! caller must not resume from a partially advanced offset; restart from a
 //! known frame boundary instead.
-//! declared length that has not been validated against the bytes actually
-//! available.
 
 use crate::error::FastError;
 use crate::operators::DictionaryValue;
@@ -44,8 +42,8 @@ pub(crate) const SIGN_BIT: u8 = 0x40;
 
 /// Maximum number of bytes a stop-bit encoded 64-bit integer may occupy.
 ///
-/// A 64-bit value carries at most 64 significant bits at seven payload
-/// bits per byte; a signed value needs nine payload bytes
+/// A 64-bit value carries at most 64 significant bits at seven payload bits
+/// per byte; a signed value needs nine payload bytes
 /// plus one sign-carry byte, so ten bytes is the longest legal encoding of
 /// either `i64::MIN` / `i64::MAX` or `u64::MAX`.
 ///
@@ -68,6 +66,25 @@ pub(crate) fn read_byte(data: &[u8], offset: &mut usize) -> Result<u8, FastError
     // cannot overflow a `usize`.
     *offset += 1;
     Ok(byte)
+}
+
+/// Writes `value` into `dict` under `key`, reusing the stored key when it is
+/// already there.
+///
+/// Operator state is rewritten for the same handful of fields on every message,
+/// so the interesting case is the one that must not allocate: an entry that
+/// already exists is overwritten in place, and only a key seen for the first
+/// time is copied into the map.
+pub(crate) fn store(
+    dict: &mut HashMap<String, DictionaryValue>,
+    key: &str,
+    value: DictionaryValue,
+) {
+    if let Some(slot) = dict.get_mut(key) {
+        *slot = value;
+    } else {
+        dict.insert(key.to_owned(), value);
+    }
 }
 
 /// FAST protocol decoder.
@@ -224,6 +241,106 @@ impl FastDecoder {
                 .ok_or(FastError::IntegerOverflow),
         }
     }
+
+    /// Decodes a nullable signed integer.
+    ///
+    /// FAST biases only the non-negative half of the range: zero is NULL, a
+    /// positive encoded value is one more than the value it denotes, and a
+    /// negative encoded value denotes itself. This is the counterpart of
+    /// [`FastEncoder::encode_nullable_int`](crate::FastEncoder::encode_nullable_int),
+    /// and the bias lives here rather than in every caller for the same reason
+    /// it does for the unsigned form.
+    ///
+    /// The representable domain is `i64::MIN..=i64::MAX - 1`.
+    ///
+    /// # Arguments
+    /// * `data` - The input bytes
+    /// * `offset` - Current position (will be updated)
+    ///
+    /// # Returns
+    /// The decoded value, or `None` for NULL.
+    ///
+    /// # Errors
+    /// Returns [`FastError::UnexpectedEof`] if the input ends mid-value, or
+    /// [`FastError::IntegerOverflow`] if the encoding is over-long or denotes a
+    /// value outside `i64`.
+    pub fn decode_nullable_int(data: &[u8], offset: &mut usize) -> Result<Option<i64>, FastError> {
+        let raw = Self::decode_int(data, offset)?;
+
+        if raw == 0 {
+            return Ok(None);
+        }
+
+        if raw < 0 {
+            // Negative values carry no bias.
+            return Ok(Some(raw));
+        }
+
+        raw.checked_sub(1)
+            .map(Some)
+            .ok_or(FastError::IntegerOverflow)
+    }
+
+    /// Decodes a nullable ASCII string.
+    ///
+    /// The nullable string forms shift each of the FAST 1.1 special encodings
+    /// by one leading `0x00`: a lone stop byte is NULL, `0x00 0x80` is the
+    /// empty string, and `0x00 0x00 0x80` is the one-character NUL string. Any
+    /// other encoding beginning with `0x00` is over-long and is rejected. This
+    /// is the counterpart of
+    /// [`FastEncoder::encode_nullable_ascii`](crate::FastEncoder::encode_nullable_ascii).
+    ///
+    /// # Arguments
+    /// * `data` - The input bytes
+    /// * `offset` - Current position (will be updated)
+    ///
+    /// # Returns
+    /// The decoded string, or `None` for NULL.
+    ///
+    /// # Errors
+    /// Returns [`FastError::UnexpectedEof`] if the stop bit is never reached
+    /// before the end of `data`, or [`FastError::InvalidString`] for an
+    /// over-long encoding with a leading `0x00`.
+    pub fn decode_nullable_ascii(
+        data: &[u8],
+        offset: &mut usize,
+    ) -> Result<Option<String>, FastError> {
+        let first_byte = *data.get(*offset).ok_or(FastError::UnexpectedEof)?;
+
+        if first_byte == STOP_BIT {
+            *offset += 1;
+            return Ok(None);
+        }
+
+        if first_byte == 0x00 {
+            let second_index = offset.checked_add(1).ok_or(FastError::UnexpectedEof)?;
+            let second_byte = *data.get(second_index).ok_or(FastError::UnexpectedEof)?;
+
+            if second_byte == STOP_BIT {
+                *offset = second_index
+                    .checked_add(1)
+                    .ok_or(FastError::UnexpectedEof)?;
+                return Ok(Some(String::new()));
+            }
+
+            if second_byte != 0x00 {
+                return Err(FastError::InvalidString);
+            }
+
+            let third_index = second_index
+                .checked_add(1)
+                .ok_or(FastError::UnexpectedEof)?;
+            if *data.get(third_index).ok_or(FastError::UnexpectedEof)? != STOP_BIT {
+                return Err(FastError::InvalidString);
+            }
+
+            *offset = third_index.checked_add(1).ok_or(FastError::UnexpectedEof)?;
+            return Ok(Some(String::from('\0')));
+        }
+
+        Self::read_ascii_run(data, offset).map(Some)
+    }
+
     /// Decodes an ASCII string using stop-bit encoding.
     ///
     /// Follows the FAST 1.1 string encodings: a lone stop byte (`0x80`) is the
@@ -259,6 +376,18 @@ impl FastDecoder {
             return Ok(String::from('\0'));
         }
 
+        Self::read_ascii_run(data, offset)
+    }
+
+    /// Reads a stop-bit terminated run of ASCII characters.
+    ///
+    /// This is the general string form, shared by the nullable and non-nullable
+    /// entry points once each has handled its own special encodings.
+    ///
+    /// # Errors
+    /// Returns [`FastError::UnexpectedEof`] if the stop bit is never reached
+    /// before the end of `data`.
+    fn read_ascii_run(data: &[u8], offset: &mut usize) -> Result<String, FastError> {
         // Locate the stop byte first, so the buffer is sized once from bytes
         // that are actually present rather than grown geometrically -- which
         // otherwise costs twice the field size in peak heap. The scan is
@@ -282,28 +411,74 @@ impl FastDecoder {
         Ok(result)
     }
 
-    /// Decodes a length-prefixed byte vector.
+    /// Decodes a length-prefixed byte vector, borrowing it from the input.
+    ///
+    /// The returned slice points into `data`, so decoding a byte field costs
+    /// neither an allocation nor a copy: a caller materialises an owned value
+    /// only when it needs one to outlive the buffer — which, for a FAST field,
+    /// is only true when it becomes operator state.
     ///
     /// The declared length is validated against the bytes actually remaining
-    /// **before** it is narrowed to a `usize` or used to size an allocation,
-    /// so a hostile length prefix can never over-allocate or index out of
-    /// bounds.
+    /// **before** it is narrowed to a `usize` or used to bound a slice, so a
+    /// hostile length prefix can never index out of bounds.
     ///
     /// # Arguments
     /// * `data` - The input bytes
     /// * `offset` - Current position (will be updated)
     ///
     /// # Returns
-    /// The decoded bytes.
+    /// The decoded bytes, borrowed from `data`.
     ///
     /// # Errors
     /// Returns [`FastError::UnexpectedEof`] if the length prefix is truncated
     /// or declares more bytes than remain in `data`, or
     /// [`FastError::IntegerOverflow`] if the length prefix itself is not a
     /// valid unsigned integer.
-    pub fn decode_bytes(data: &[u8], offset: &mut usize) -> Result<Vec<u8>, FastError> {
+    pub fn decode_bytes<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'a [u8], FastError> {
         let declared_length = Self::decode_uint(data, offset)?;
+        Self::take_bytes(data, offset, declared_length)
+    }
 
+    /// Decodes a nullable length-prefixed byte vector, borrowing it from the
+    /// input.
+    ///
+    /// The length prefix is a nullable unsigned integer, so a lone stop byte is
+    /// NULL and every other length is biased by one. This is the counterpart of
+    /// [`FastEncoder::encode_nullable_bytes`](crate::FastEncoder::encode_nullable_bytes).
+    ///
+    /// # Arguments
+    /// * `data` - The input bytes
+    /// * `offset` - Current position (will be updated)
+    ///
+    /// # Returns
+    /// The decoded bytes borrowed from `data`, or `None` for NULL.
+    ///
+    /// # Errors
+    /// Returns [`FastError::UnexpectedEof`] if the length prefix is truncated
+    /// or declares more bytes than remain in `data`, or
+    /// [`FastError::IntegerOverflow`] if the length prefix is not a valid
+    /// unsigned integer.
+    pub fn decode_nullable_bytes<'a>(
+        data: &'a [u8],
+        offset: &mut usize,
+    ) -> Result<Option<&'a [u8]>, FastError> {
+        match Self::decode_nullable_uint(data, offset)? {
+            Some(declared_length) => Self::take_bytes(data, offset, declared_length).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Borrows `declared_length` bytes from `data` at `offset`, validating the
+    /// length against the bytes actually present before it is used.
+    ///
+    /// # Errors
+    /// Returns [`FastError::UnexpectedEof`] if `declared_length` exceeds the
+    /// bytes remaining in `data`.
+    fn take_bytes<'a>(
+        data: &'a [u8],
+        offset: &mut usize,
+        declared_length: u64,
+    ) -> Result<&'a [u8], FastError> {
         let remaining = data
             .len()
             .checked_sub(*offset)
@@ -317,10 +492,7 @@ impl FastDecoder {
         }
 
         let end = offset.checked_add(length).ok_or(FastError::UnexpectedEof)?;
-        let bytes = data
-            .get(*offset..end)
-            .ok_or(FastError::UnexpectedEof)?
-            .to_vec();
+        let bytes = data.get(*offset..end).ok_or(FastError::UnexpectedEof)?;
         *offset = end;
 
         Ok(bytes)
@@ -350,8 +522,12 @@ impl FastDecoder {
     }
 
     /// Sets a value in the global dictionary.
-    pub fn set_global(&mut self, key: impl Into<String>, value: DictionaryValue) {
-        self.global_dict.insert(key.into(), value);
+    ///
+    /// Overwriting an entry that already exists reuses its key, so the steady
+    /// state — the same fields updated message after message — allocates
+    /// nothing. Only the first write of a given key allocates.
+    pub fn set_global(&mut self, key: impl AsRef<str>, value: DictionaryValue) {
+        store(&mut self.global_dict, key.as_ref(), value);
     }
 
     /// Gets a value from a template dictionary.
@@ -363,16 +539,15 @@ impl FastDecoder {
     }
 
     /// Sets a value in a template dictionary.
-    pub fn set_template(
-        &mut self,
-        template_id: u32,
-        key: impl Into<String>,
-        value: DictionaryValue,
-    ) {
-        self.template_dicts
-            .entry(template_id)
-            .or_default()
-            .insert(key.into(), value);
+    ///
+    /// As with [`FastDecoder::set_global`], overwriting an existing entry
+    /// reuses its key and allocates nothing.
+    pub fn set_template(&mut self, template_id: u32, key: impl AsRef<str>, value: DictionaryValue) {
+        store(
+            self.template_dicts.entry(template_id).or_default(),
+            key.as_ref(),
+            value,
+        );
     }
 
     /// Returns the last used template ID.
@@ -791,9 +966,29 @@ mod tests {
         let mut offset = 0;
         assert_eq!(
             FastDecoder::decode_bytes(&bytes, &mut offset),
-            Ok(vec![1, 2, 3])
+            Ok(&[1, 2, 3][..])
         );
         assert_eq!(offset, bytes.len());
+    }
+
+    #[test]
+    fn test_decode_bytes_borrows_from_the_input() {
+        // The decoded field must point into the caller's buffer, not a copy of
+        // it: that is what makes decoding a byte field allocation-free.
+        let data = [0x83, 1, 2, 3];
+        let mut offset = 0;
+        let decoded = FastDecoder::decode_bytes(&data, &mut offset);
+        let payload = data.get(1..4);
+
+        assert!(decoded.is_ok());
+        assert!(payload.is_some());
+
+        if let (Ok(decoded), Some(payload)) = (decoded, payload) {
+            assert!(
+                std::ptr::eq(decoded.as_ptr(), payload.as_ptr()),
+                "the decoded slice must borrow the input buffer, not copy it"
+            );
+        }
     }
 
     #[test]
@@ -802,9 +997,186 @@ mod tests {
         let mut offset = 0;
         assert_eq!(
             FastDecoder::decode_bytes(&data, &mut offset),
-            Ok(Vec::new())
+            Ok(&[][..] as &[u8])
         );
         assert_eq!(offset, 1);
+    }
+
+    #[test]
+    fn test_decode_nullable_bytes_round_trips_through_the_encoder() {
+        for value in [None, Some(&[][..]), Some(&[1, 2, 3][..]), Some(&[0xFF][..])] {
+            let mut encoder = FastEncoder::new();
+            assert_eq!(encoder.encode_nullable_bytes(value), Ok(()));
+            let buffer = encoder.finish();
+
+            let mut offset = 0;
+            assert_eq!(
+                FastDecoder::decode_nullable_bytes(&buffer, &mut offset),
+                Ok(value),
+                "nullable bytes round trip {value:?}"
+            );
+            assert_eq!(offset, buffer.len(), "the whole value must be consumed");
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_bytes_lone_stop_byte_is_null() {
+        let mut offset = 0;
+        assert_eq!(
+            FastDecoder::decode_nullable_bytes(&[0x80], &mut offset),
+            Ok(None)
+        );
+        assert_eq!(offset, 1);
+    }
+
+    #[test]
+    fn test_decode_nullable_bytes_huge_declared_length_is_unexpected_eof() {
+        // A biased length of u64::MAX with a three-byte body.
+        let mut data = vec![0x01, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0xFF];
+        data.extend_from_slice(&[1, 2, 3]);
+
+        let mut offset = 0;
+        assert_eq!(
+            FastDecoder::decode_nullable_bytes(&data, &mut offset),
+            Err(FastError::UnexpectedEof)
+        );
+    }
+
+    #[test]
+    fn test_decode_nullable_int_round_trips_through_the_encoder() {
+        for value in [
+            None,
+            Some(0),
+            Some(1),
+            Some(-1),
+            Some(63),
+            Some(64),
+            Some(-64),
+            Some(-65),
+            Some(i64::MIN),
+            Some(i64::MAX - 1),
+        ] {
+            let mut encoder = FastEncoder::new();
+            assert_eq!(encoder.encode_nullable_int(value), Ok(()));
+            let buffer = encoder.finish();
+
+            let mut offset = 0;
+            assert_eq!(
+                FastDecoder::decode_nullable_int(&buffer, &mut offset),
+                Ok(value),
+                "nullable int round trip {value:?}"
+            );
+            assert_eq!(offset, buffer.len(), "the whole value must be consumed");
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_int_biases_only_the_non_negative_half() {
+        // Zero is NULL, positive values carry the bias, negative ones do not.
+        let cases: [(&[u8], Option<i64>); 4] = [
+            (&[0x80], None),
+            (&[0x81], Some(0)),
+            (&[0x82], Some(1)),
+            (&[0xFF], Some(-1)),
+        ];
+
+        for (encoded, expected) in cases {
+            let mut offset = 0;
+            assert_eq!(
+                FastDecoder::decode_nullable_int(encoded, &mut offset),
+                Ok(expected),
+                "{encoded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_nullable_int_rejects_the_value_outside_its_domain() {
+        let mut encoder = FastEncoder::new();
+        assert_eq!(
+            encoder.encode_nullable_int(Some(i64::MAX)),
+            Err(FastError::IntegerOverflow)
+        );
+        assert!(
+            encoder.is_empty(),
+            "an overflowing value must not be biased into the NULL representation"
+        );
+    }
+
+    #[test]
+    fn test_decode_nullable_ascii_round_trips_through_the_encoder() {
+        for value in [None, Some(""), Some("\0"), Some("A"), Some("EURUSD")] {
+            let mut encoder = FastEncoder::new();
+            assert_eq!(encoder.encode_nullable_ascii(value), Ok(()));
+            let buffer = encoder.finish();
+
+            let mut offset = 0;
+            assert_eq!(
+                FastDecoder::decode_nullable_ascii(&buffer, &mut offset),
+                Ok(value.map(str::to_string)),
+                "nullable ascii round trip {value:?}"
+            );
+            assert_eq!(offset, buffer.len(), "the whole value must be consumed");
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_ascii_special_forms_are_shifted_by_one_zero_byte() {
+        // Each nullable form is its non-nullable counterpart with one more
+        // leading 0x00; confusing the two shifts every value in the message.
+        let cases: [(&[u8], Option<&str>); 3] = [
+            (&[0x80], None),
+            (&[0x00, 0x80], Some("")),
+            (&[0x00, 0x00, 0x80], Some("\0")),
+        ];
+
+        for (encoded, expected) in cases {
+            let mut offset = 0;
+            assert_eq!(
+                FastDecoder::decode_nullable_ascii(encoded, &mut offset),
+                Ok(expected.map(str::to_string)),
+                "{encoded:?}"
+            );
+            assert_eq!(offset, encoded.len());
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_ascii_over_long_leading_zero_is_invalid_string() {
+        for data in [
+            &[0x00, b'a' | 0x80][..],
+            &[0x00, 0x00, b'a' | 0x80][..],
+            &[0x00, 0x00, 0x00, 0x80][..],
+        ] {
+            let mut offset = 0;
+            assert_eq!(
+                FastDecoder::decode_nullable_ascii(data, &mut offset),
+                Err(FastError::InvalidString),
+                "{data:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_nullable_ascii_truncated_leading_zeros_is_unexpected_eof() {
+        for data in [&[0x00][..], &[0x00, 0x00][..]] {
+            let mut offset = 0;
+            assert_eq!(
+                FastDecoder::decode_nullable_ascii(data, &mut offset),
+                Err(FastError::UnexpectedEof),
+                "{data:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_encode_nullable_ascii_leading_nul_string_is_invalid_string() {
+        let mut encoder = FastEncoder::new();
+        assert_eq!(
+            encoder.encode_nullable_ascii(Some("\0a")),
+            Err(FastError::InvalidString)
+        );
+        assert!(encoder.is_empty(), "nothing may reach the wire on error");
     }
 
     #[test]
