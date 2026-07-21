@@ -598,6 +598,82 @@ These messages are required for establishing and maintaining FIX sessions.
 
 ## Error Handling
 
+### Garbled Messages and Transport Resynchronization
+
+**Scope**: `ironfix-transport::FixCodec` — the framing layer that turns a byte
+stream into complete FIX frames. This subsection is the codec's contract; it
+does not describe session-level rejection.
+
+**FIX convention**: a *garbled* message — one whose framing cannot be trusted:
+BeginString (8) is not the first field, BodyLength (9) is missing or does not
+agree with the frame layout, or CheckSum (10) is absent or malformed — is
+**ignored**. The receiver does **not** send a Reject, does **not** send a
+ResendRequest for it, and does **not** increment the inbound MsgSeqNum, because
+the sequence number of a garbled message cannot be trusted either. Recovery is
+left to the normal gap-detection path on the next well-formed message.
+
+**What IronFix implements today**
+
+The codec detects garbling and, for the errors where a frame boundary can be
+inferred, decides how many bytes to discard so that a caller which keeps reading
+can make progress. The remaining variants consume nothing and a caller must
+treat them as fatal. Consumption per error:
+
+| `CodecError` | Bytes consumed from the read buffer |
+|---|---|
+| `InvalidBeginString` | up to and including the `<SOH>` of the next `<SOH>8` pair, so the buffer restarts at the `8` (the whole buffer when there is no such pair, minus a trailing `<SOH>` that may still be the first half of one) |
+| `InvalidTrailer` | the same resync as above — the trailer is absent from the offsets BodyLength implies, so BodyLength is not corroborated and its declared length is not trusted to bound the discard |
+| `InvalidChecksumFormat`, `ChecksumMismatch` | the whole declared frame (`BodyLength` + header + 7-byte trailer) |
+| `MissingBodyLength`, `InvalidBodyLength`, `HeaderTooLong`, `MessageTooLarge`, `Io` | none — no frame boundary can be inferred |
+
+Rationale for the two policies:
+
+- After `InvalidBeginString` the stream position is unknown, so the only safe
+  anchor is the next byte sequence that can legally start a frame: an SOH
+  followed by `8`. Scanning to it is bounded by the buffer length and never
+  allocates.
+- After a checksum error the trailer literal is exactly where BodyLength said it
+  would be, so the declared boundary is corroborated by the frame's own
+  structure: consuming `BodyLength`-worth of bytes keeps a stream of otherwise
+  well-formed frames aligned.
+- A missing trailer is the opposite case — nothing corroborates BodyLength, and
+  trusting it to size the discard hands an attacker a lever. A short header
+  declaring a large body would otherwise consume every well-formed frame that
+  merely follows it (tens of thousands, at the default ceiling) and report the
+  loss as a single error. So this case resyncs instead.
+- Recovery is best-effort, not lossless: because the anchor is `<SOH>8` rather
+  than a bare `8=` (which occurs inside ordinary tags such as `18=` and `58=`),
+  a well-formed frame arriving immediately after garbage is normally discarded
+  with it, unless the garbage happens to end on an SOH. Recovery resumes at the
+  frame after that one.
+- Before the header is complete no boundary exists at all, so the codec keeps
+  the bytes and bounds them instead: the header region `8=…<SOH>9=…<SOH>` is
+  capped at 64 bytes and the whole frame at `max_message_size` (1 MiB by
+  default). Exceeding either is an error, never a request for more data — this
+  is what stops a peer from growing the read buffer without bound.
+
+**What IronFix does not implement**
+
+- **The MsgSeqNum half of the convention is the session layer's
+  responsibility and is not implemented.** The codec has no access to session
+  state and never touches sequence numbers; nothing in `ironfix-session` or
+  `ironfix-engine` currently distinguishes "garbled, do not count" from any
+  other failure.
+- **The resynchronization above is not reachable from the engine as built, and
+  not only because `ironfix-engine::Initiator` treats every codec error as
+  fatal.** `tokio_util::Framed` terminates its stream after *any* decoder error:
+  it latches an internal error flag and returns `None` on the next poll, so the
+  well-formed frame the resync had just aligned onto is discarded along with the
+  stream. No way of writing the caller changes that. Honouring the convention
+  from the engine would require either the codec to report garbling as
+  `Ok(None)` while skipping the bad bytes internally — which is itself a change
+  to framing semantics — or the engine to drive `Decoder::decode` by hand
+  instead of using `Framed`. The consumption policy above is therefore
+  observable today only by a caller that drives the codec directly, which is how
+  it is tested.
+
+---
+
 ### Business Message Reject (MsgType = j)
 
 **Purpose**: Reject an application-level message.
