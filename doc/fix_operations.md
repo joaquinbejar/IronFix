@@ -178,6 +178,15 @@ reactor polls it on a 100 ms tick.
   zero-length interval. Note the consequence the FIX spec implies: with
   `108=0` there is no heartbeat-driven liveness check at all, so a dead peer is
   only noticed when TCP notices.
+- **The configured interval is whole seconds.** Tag 108 carries whole seconds,
+  so a fractional `SessionConfig::heartbeat_interval` is refused at
+  configuration time (`SessionConfigError::FractionalHeartbeatInterval`) rather
+  than truncated: flooring 500 ms to `108=0` would negotiate *no heartbeating*
+  while the local timers ran sub-second. The accepted range is 1 s to
+  `MAX_HEARTBEAT_INTERVAL_SECS` (3600 s), plus the `108=0` case, which
+  `SessionConfigBuilder::disable_heartbeats` asks for by name. `Initiator`
+  re-checks the whole configuration before it dials, so a configuration
+  assembled through the public fields cannot bypass this either.
 - **Heartbeat due.** One interval with nothing sent. Any outbound message
   resets the timer, so a busy session emits no Heartbeats.
 - **TestRequest due.** One interval plus a transmission grace with nothing

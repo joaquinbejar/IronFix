@@ -7,6 +7,7 @@
 //! Engine error types.
 
 use ironfix_core::error::{DecodeError, EncodeError};
+use ironfix_session::config::SessionConfigError;
 use ironfix_session::sequence::SequenceExhausted;
 use ironfix_transport::CodecError;
 use std::time::Duration;
@@ -35,6 +36,16 @@ pub enum EngineError {
     /// for corrupted bytes.
     #[error("encode error: {0}")]
     Encode(#[from] EncodeError),
+
+    /// The session configuration is not usable.
+    ///
+    /// Checked before the socket is dialled: an out-of-range knob — a
+    /// fractional `HeartBtInt`, an identity string carrying SOH or `=`, a zero
+    /// timeout — would otherwise corrupt the session's own messages.
+    /// [`ironfix_session::SessionConfigBuilder`] reports the same errors at
+    /// configuration time.
+    #[error("invalid session configuration: {0}")]
+    Config(#[from] SessionConfigError),
 
     /// TCP connect did not complete within the configured timeout.
     #[error("connect timed out after {0:?}")]

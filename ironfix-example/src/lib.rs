@@ -177,7 +177,8 @@ pub mod prelude {
     // Session
     pub use ironfix_session::{
         Active, Connecting, Disconnected, HeartbeatIntervalError, HeartbeatManager, LogonSent,
-        LogoutPending, Resending, SequenceManager, SessionConfig, SessionState, TestRequestOutcome,
+        LogoutPending, Resending, SequenceManager, SequenceResult, SessionConfig,
+        SessionConfigBuilder, SessionConfigError, SessionState, TestRequestOutcome,
     };
 
     // Store

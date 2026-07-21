@@ -69,9 +69,14 @@ impl SequenceManager {
 
     /// Creates a new sequence manager with specified starting values.
     ///
+    /// Both counters must be **at least 1**: FIX numbers messages from 1, and
+    /// a `MsgSeqNum` (34) of 0 is rejected by every conforming counterparty.
+    /// That contract is not enforced here yet — seeding 0 is accepted and
+    /// would put `34=0` on the wire.
+    ///
     /// # Arguments
-    /// * `sender_seq` - Initial sender sequence number
-    /// * `target_seq` - Initial target sequence number
+    /// * `sender_seq` - Next outgoing sequence number, `>= 1`
+    /// * `target_seq` - Next expected incoming sequence number, `>= 1`
     #[must_use]
     pub fn with_initial(sender_seq: u64, target_seq: u64) -> Self {
         Self {
@@ -103,6 +108,7 @@ impl SequenceManager {
     /// [`try_allocate_sender_seq`](Self::try_allocate_sender_seq) for
     /// venue-grade sessions where exhaustion must be an explicit error.
     #[inline]
+    #[must_use = "dropping the allocated sequence number leaves a gap in the outbound stream"]
     #[deprecated(
         since = "0.4.0",
         note = "wraps silently on overflow, which corrupts a live session; use try_allocate_sender_seq. Removed in the next breaking release."
@@ -174,7 +180,8 @@ impl SequenceManager {
     /// Sets the next sender sequence number.
     ///
     /// # Arguments
-    /// * `seq` - The new sequence number
+    /// * `seq` - The new sequence number, `>= 1` (see
+    ///   [`SequenceManager::with_initial`] for the contract)
     #[inline]
     pub fn set_sender_seq(&self, seq: u64) {
         self.next_sender_seq.store(seq, Ordering::SeqCst);
@@ -183,7 +190,8 @@ impl SequenceManager {
     /// Sets the next target sequence number.
     ///
     /// # Arguments
-    /// * `seq` - The new sequence number
+    /// * `seq` - The new sequence number, `>= 1` (see
+    ///   [`SequenceManager::with_initial`] for the contract)
     #[inline]
     pub fn set_target_seq(&self, seq: u64) {
         self.next_target_seq.store(seq, Ordering::SeqCst);
@@ -196,15 +204,20 @@ impl SequenceManager {
         self.next_target_seq.store(1, Ordering::SeqCst);
     }
 
-    /// Validates an incoming sequence number.
+    /// Validates an incoming `MsgSeqNum` (34) against the next expected
+    /// target sequence number.
+    ///
+    /// This only classifies; it moves no counter. Acting on the answer —
+    /// a ResendRequest for a gap, a `PossDupFlag` check for a duplicate — is
+    /// the engine's job.
     ///
     /// # Arguments
     /// * `received` - The received sequence number
     ///
     /// # Returns
-    /// - `Ok(())` if the sequence number matches expected
-    /// - `Err(SequenceResult::TooLow)` if it's a possible duplicate
-    /// - `Err(SequenceResult::Gap)` if there's a gap
+    /// - [`SequenceResult::Ok`] when it is exactly the expected number
+    /// - [`SequenceResult::TooLow`] when it is lower (a possible duplicate)
+    /// - [`SequenceResult::Gap`] when it is higher (messages were missed)
     #[must_use]
     pub fn validate_incoming(&self, received: u64) -> SequenceResult {
         let expected = self.next_target_seq.load(Ordering::SeqCst);

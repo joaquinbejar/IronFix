@@ -16,8 +16,8 @@ use ironfix_core::message::RawMessage;
 use ironfix_core::types::{CompId, Timestamp};
 use ironfix_engine::application::{Application, RejectReason, SessionId};
 use ironfix_engine::{EngineError, Initiator, OutboundMessage};
-use ironfix_session::SessionConfig;
 use ironfix_session::sequence::SequenceCounter;
+use ironfix_session::{SessionConfig, SessionConfigError};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
 use std::sync::{Arc, Mutex};
@@ -2346,4 +2346,63 @@ async fn test_logon_ack_wrong_begin_string_fails_handshake() {
     }
 
     ok(acceptor.await, "acceptor task");
+}
+
+/// A configuration knob that would corrupt the session's own messages is
+/// refused before the socket is dialled: an identity string carrying SOH would
+/// terminate tag 50 early in every outbound header.
+#[tokio::test]
+async fn test_connect_refuses_an_invalid_configuration_without_dialling() {
+    let (listener, addr) = bind_listener().await;
+
+    let (app, _app_rx) = RecordingApp::new();
+    let config = client_config(Duration::from_secs(30)).with_sender_sub_id("DE\x01SK");
+    let initiator = Initiator::new(config, Arc::clone(&app));
+
+    match initiator.connect(addr).await {
+        Err(EngineError::Config(SessionConfigError::IllegalByte {
+            field,
+            byte,
+            position,
+        })) => {
+            assert_eq!(field, "sender_sub_id");
+            assert_eq!(byte, 0x01);
+            assert_eq!(position, 2);
+        }
+        Err(other) => panic!("expected a configuration error, got {other:?}"),
+        Ok(_) => panic!("an unencodable SenderSubID must not establish a session"),
+    }
+
+    assert!(
+        timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err(),
+        "the socket must never be dialled"
+    );
+}
+
+/// A fractional heartbeat interval never reaches the wire: HeartBtInt (108) is
+/// whole seconds, and truncating 500ms to 108=0 would negotiate no
+/// heartbeating at all.
+#[tokio::test]
+async fn test_connect_refuses_a_fractional_heartbeat_interval() {
+    let (listener, addr) = bind_listener().await;
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_millis(500)), Arc::clone(&app));
+
+    match initiator.connect(addr).await {
+        Err(EngineError::Config(SessionConfigError::FractionalHeartbeatInterval { interval })) => {
+            assert_eq!(interval, Duration::from_millis(500));
+        }
+        Err(other) => panic!("expected a configuration error, got {other:?}"),
+        Ok(_) => panic!("a sub-second HeartBtInt must not establish a session"),
+    }
+
+    assert!(
+        timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err(),
+        "the socket must never be dialled"
+    );
 }

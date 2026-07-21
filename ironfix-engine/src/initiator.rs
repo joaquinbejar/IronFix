@@ -92,6 +92,7 @@ use futures_util::{SinkExt, StreamExt};
 use ironfix_core::error::{DecodeError, EncodeError};
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::version::FixVersion;
+use ironfix_session::config::SessionConfigError;
 use ironfix_session::heartbeat::{generate_test_req_id, negotiate_interval};
 use ironfix_session::sequence::{SequenceExhausted, SequenceResult};
 use ironfix_session::{
@@ -100,7 +101,7 @@ use ironfix_session::{
 };
 use ironfix_transport::FixCodec;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{MissedTickBehavior, interval, timeout};
@@ -131,6 +132,10 @@ pub struct Initiator<A: Application = NoOpApplication> {
     /// The configured FIX version, or why it cannot be framed. Resolved once
     /// at construction and reported by [`Initiator::connect`] before dialling.
     version: Result<FixVersion, UnsupportedVersion>,
+    /// Whether the configuration is usable. Resolved once at construction and
+    /// reported by [`Initiator::connect`] before dialling, so a knob that
+    /// would corrupt the session's own messages never reaches a socket.
+    config_check: Result<(), SessionConfigError>,
     /// TCP connect timeout.
     connect_timeout: Duration,
     /// Initial (sender, target) sequence numbers for session continuity.
@@ -141,6 +146,11 @@ pub struct Initiator<A: Application = NoOpApplication> {
 
 impl<A: Application + 'static> Initiator<A> {
     /// Creates a new initiator.
+    ///
+    /// The configuration is validated here and the verdict is reported by
+    /// [`Initiator::connect`], which refuses to dial with an unusable one.
+    /// Building it through [`ironfix_session::SessionConfigBuilder`] surfaces
+    /// the same errors earlier.
     ///
     /// # Arguments
     /// * `config` - The session configuration
@@ -159,12 +169,14 @@ impl<A: Application + 'static> Initiator<A> {
             session_id = session_id.with_target_sub_id(sub.clone());
         }
         let version = wire::wire_version(&config.begin_string);
+        let config_check = config.validate();
 
         Self {
             config,
             application,
             session_id,
             version,
+            config_check,
             connect_timeout: Duration::from_secs(30),
             initial_sequences: None,
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
@@ -229,8 +241,17 @@ impl<A: Application + 'static> Initiator<A> {
     /// sequence counter has reached `u64::MAX` and the session must be reset
     /// before it can number another message. A `BeginString` this engine
     /// cannot frame conformantly is refused up front with
-    /// [`EngineError::UnsupportedVersion`], before the socket is dialled.
+    /// [`EngineError::UnsupportedVersion`], and an unusable configuration with
+    /// [`EngineError::Config`], both before the socket is dialled.
     pub async fn connect(&self, addr: impl ToSocketAddrs) -> Result<Connection, EngineError> {
+        // Refuse before dialling: a knob outside its documented range corrupts
+        // the session's own messages — an identity string carrying SOH breaks
+        // every header, and a fractional HeartBtInt negotiates one interval
+        // while the local timers run another.
+        if let Err(err) = &self.config_check {
+            return Err(EngineError::Config(err.clone()));
+        }
+
         // Refuse before dialling: an unsupported version cannot produce a
         // conforming Logon, and guessing one would put a fabricated version on
         // the wire.
@@ -569,7 +590,6 @@ impl<A: Application + 'static> Initiator<A> {
             application: Arc::clone(&self.application),
             session_id: session_id.clone(),
             pending_resend,
-            logout_deadline: None,
         };
         tokio::spawn(run_reactor(framed, command_rx, closed_tx, reactor, session));
 
@@ -658,9 +678,11 @@ struct Reactor<A: Application> {
     /// Session identifier.
     session_id: SessionId,
     /// Expected sequence number a pending ResendRequest was issued for.
+    ///
+    /// The logout deadline is *not* tracked here: `Session<LogoutPending>`
+    /// carries the instant the Logout went out, so the phase itself is the
+    /// deadline.
     pending_resend: Option<u64>,
-    /// Deadline for a locally initiated logout.
-    logout_deadline: Option<Instant>,
 }
 
 /// The session reactor: owns the socket, multiplexes inbound frames,
@@ -818,8 +840,8 @@ impl<A: Application> Reactor<A> {
                         let _ = session.disconnect();
                         return Err(closed(format!("send failed: {err}"), false));
                     }
-                    self.logout_deadline = Some(Instant::now() + self.config.logout_timeout);
-                    // Typestate: Active -> LogoutPending.
+                    // Typestate: Active -> LogoutPending. The new state records
+                    // when the Logout went out, which is what on_tick times.
                     Ok(Phase::LogoutPending(session.initiate_logout()))
                 }
             },
@@ -832,8 +854,11 @@ impl<A: Application> Reactor<A> {
         framed: &mut FixFramed,
         phase: Phase,
     ) -> Result<Phase, SessionClosed> {
-        if let Some(deadline) = self.logout_deadline
-            && Instant::now() >= deadline
+        // The logout deadline lives in the typestate: LogoutPending is defined
+        // by the instant its Logout was sent, so there is no second copy of it
+        // to drift.
+        if let Phase::LogoutPending(session) = &phase
+            && session.sent_at().elapsed() >= self.config.logout_timeout
         {
             teardown(phase);
             return Err(closed("logout ack timeout", true));
