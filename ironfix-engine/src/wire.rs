@@ -20,23 +20,188 @@ use ironfix_core::types::Timestamp;
 use ironfix_session::SessionConfig;
 use ironfix_tagvalue::{Decoder, Encoder};
 
-/// Returns a `'static` copy of a FIX BeginString.
+/// How a configured FIX version is carried on the wire.
+///
+/// FIX 5.0 and later split the transport version from the application
+/// version: the frame is always a FIXT.1.1 frame (`BeginString` = FIXT.1.1)
+/// and the application version travels in `DefaultApplVerID` (1137) on the
+/// Logon and `ApplVerID` (1128) on application messages
+/// (`doc/fix_operations.md`, "FIX 5.0 / FIXT.1.1"). Putting `FIX.5.0*` in
+/// tag 8 is rejected outright by conforming acceptors.
+///
+/// `ironfix_dictionary::schema::Version` encodes exactly the same mapping in
+/// its `begin_string` / `appl_ver_id` methods, but `ironfix-engine` must not
+/// depend on `ironfix-dictionary` (a hard DAG invariant, see `CLAUDE.md`), so
+/// the mapping is duplicated here in a small spec-derived table. Unifying the
+/// two belongs in `ironfix-core`, which both crates already depend on; that is
+/// follow-up work.
+///
+/// The cost of that duplication is that the two tables can drift apart and no
+/// test can cross-check them without taking the forbidden dependency. Both are
+/// derived from the same fixed clause of the specification and neither changes
+/// unless a new FIX version ships, so the exposure is small — but it is the
+/// reason unifying them is worth doing rather than a permanent arrangement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WireVersion {
+    /// Value stamped into `BeginString` (8).
+    pub(crate) begin_string: &'static str,
+    /// Application version for `DefaultApplVerID` (1137) and `ApplVerID`
+    /// (1128), or `None` for a pre-5.0 session that has neither.
+    pub(crate) appl_ver_id: Option<&'static str>,
+}
+
+/// A configured `BeginString` the engine cannot frame conformantly.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unsupported FIX version {version}: {detail}")]
+pub(crate) struct UnsupportedVersion {
+    /// The configured version string.
+    pub(crate) version: String,
+    /// Why it cannot be framed.
+    pub(crate) detail: String,
+}
+
+/// Resolves the configured version string to its on-the-wire representation.
 ///
 /// Well-known versions map to interned constants; anything else is leaked
 /// once (bounded: once per `Initiator`), because the tag-value `Encoder`
-/// requires a `&'static str` BeginString.
-pub(crate) fn static_begin_string(value: &str) -> &'static str {
-    match value {
-        "FIX.4.0" => "FIX.4.0",
-        "FIX.4.1" => "FIX.4.1",
-        "FIX.4.2" => "FIX.4.2",
-        "FIX.4.3" => "FIX.4.3",
-        "FIX.4.4" => "FIX.4.4",
-        "FIX.5.0" => "FIX.5.0",
-        "FIX.5.0SP1" => "FIX.5.0SP1",
-        "FIX.5.0SP2" => "FIX.5.0SP2",
-        "FIXT.1.1" => "FIXT.1.1",
-        other => Box::leak(other.to_owned().into_boxed_str()),
+/// requires a `&'static str` BeginString. An unrecognized version is passed
+/// through verbatim with no application version, which is the only honest
+/// answer available without a dictionary.
+///
+/// A session configured as `FIXT.1.1` gets no `ApplVerID`: FIXT.1.1 names the
+/// transport version only and does not identify an application version.
+/// Configure `FIX.5.0`, `FIX.5.0SP1` or `FIX.5.0SP2` to have 1137 and 1128
+/// stamped.
+pub(crate) fn wire_version(value: &str) -> Result<WireVersion, UnsupportedVersion> {
+    let (begin_string, appl_ver_id) = match value {
+        "FIX.4.0" => ("FIX.4.0", None),
+        "FIX.4.1" => ("FIX.4.1", None),
+        "FIX.4.2" => ("FIX.4.2", None),
+        "FIX.4.3" => ("FIX.4.3", None),
+        "FIX.4.4" => ("FIX.4.4", None),
+        "FIX.5.0" => ("FIXT.1.1", Some("7")),
+        "FIX.5.0SP1" => ("FIXT.1.1", Some("8")),
+        "FIX.5.0SP2" => ("FIXT.1.1", Some("9")),
+        // FIXT.1.1 names the transport version only. A FIXT Logon must carry
+        // DefaultApplVerID (1137), which is required, and nothing here can
+        // supply it: the application version is exactly what this string
+        // failed to state. Defaulting it would put a guessed version on the
+        // wire, so the session is refused instead.
+        "FIXT.1.1" => {
+            return Err(UnsupportedVersion {
+                version: value.to_owned(),
+                detail: "FIXT.1.1 names only the transport version and carries no application \
+                         version for DefaultApplVerID (1137), which a FIXT Logon requires; \
+                         configure FIX.5.0, FIX.5.0SP1 or FIX.5.0SP2 instead"
+                    .to_owned(),
+            });
+        }
+        other => {
+            return Err(UnsupportedVersion {
+                version: other.to_owned(),
+                detail: "not a FIX version this engine can frame; supported values are FIX.4.0 \
+                         through FIX.4.4 and FIX.5.0, FIX.5.0SP1, FIX.5.0SP2"
+                    .to_owned(),
+            });
+        }
+    };
+    Ok(WireVersion {
+        begin_string,
+        appl_ver_id,
+    })
+}
+
+/// A mismatch between an inbound message's identity fields and the
+/// configured counterparty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdentityMismatch {
+    /// The offending tag (49, 56, 50 or 57).
+    pub(crate) tag: u32,
+    /// The value the configuration requires.
+    pub(crate) expected: String,
+    /// The value the counterparty sent, empty when the tag was absent.
+    pub(crate) received: String,
+}
+
+impl std::fmt::Display for IdentityMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CompID problem: tag {} expected '{}', received '{}'",
+            self.tag, self.expected, self.received
+        )
+    }
+}
+
+/// The identity every inbound message must carry, derived from the session
+/// configuration with sender and target reversed.
+///
+/// A cross-wired connection that is never checked advances sequence state
+/// against the wrong counterparty and delivers another session's traffic to
+/// the application, so this is validated before anything else touches
+/// session state. A mismatch is `SessionRejectReason` 9, "CompID problem"
+/// (`doc/fix_operations.md`, "Session Reject Reasons").
+#[derive(Debug, Clone)]
+pub(crate) struct PeerIdentity {
+    /// Required inbound `SenderCompID` (49) — our configured target.
+    sender_comp_id: String,
+    /// Required inbound `TargetCompID` (56) — our configured sender.
+    target_comp_id: String,
+    /// Required inbound `SenderSubID` (50), when configured.
+    sender_sub_id: Option<String>,
+    /// Required inbound `TargetSubID` (57), when configured.
+    target_sub_id: Option<String>,
+}
+
+impl PeerIdentity {
+    /// Builds the expected inbound identity from the session configuration.
+    #[must_use]
+    pub(crate) fn new(config: &SessionConfig) -> Self {
+        Self {
+            sender_comp_id: config.target_comp_id.as_str().to_string(),
+            target_comp_id: config.sender_comp_id.as_str().to_string(),
+            sender_sub_id: config.target_sub_id.clone(),
+            target_sub_id: config.sender_sub_id.clone(),
+        }
+    }
+
+    /// Checks an inbound message's identity fields.
+    ///
+    /// Sub IDs are only checked when configured; an unconfigured sub ID
+    /// places no requirement on the counterparty.
+    /// # Positional caveat
+    ///
+    /// Field lookup is by tag over the whole decoded message, not by position,
+    /// so CompIDs appearing anywhere in the frame satisfy the check. A message
+    /// that omits them from the standard header but carries them in the body is
+    /// therefore accepted. Enforcing header position needs positional
+    /// information the decoder does not currently retain; the practical impact
+    /// is small, since a peer able to place the tags in the body can equally
+    /// place them in the header.
+    pub(crate) fn validate(&self, raw: &RawMessage<'_>) -> Result<(), IdentityMismatch> {
+        check_field(raw, 49, &self.sender_comp_id)?;
+        check_field(raw, 56, &self.target_comp_id)?;
+        if let Some(expected) = &self.sender_sub_id {
+            check_field(raw, 50, expected)?;
+        }
+        if let Some(expected) = &self.target_sub_id {
+            check_field(raw, 57, expected)?;
+        }
+        Ok(())
+    }
+}
+
+/// Compares one inbound identity field against its required value.
+fn check_field(raw: &RawMessage<'_>, tag: u32, expected: &str) -> Result<(), IdentityMismatch> {
+    let received = raw.get_field_str(tag).unwrap_or_default();
+    if received == expected {
+        Ok(())
+    } else {
+        Err(IdentityMismatch {
+            tag,
+            expected: expected.to_string(),
+            received: received.to_string(),
+        })
     }
 }
 
@@ -58,7 +223,7 @@ pub(crate) fn owned_from_frame(frame: &[u8]) -> Result<OwnedMessage, DecodeError
 /// Builds outbound frames with the session header stamped.
 #[derive(Debug)]
 pub(crate) struct MessageFactory {
-    begin_string: &'static str,
+    version: WireVersion,
     sender_comp_id: String,
     target_comp_id: String,
     sender_sub_id: Option<String>,
@@ -67,9 +232,10 @@ pub(crate) struct MessageFactory {
 
 impl MessageFactory {
     /// Creates a factory from the session configuration.
-    pub(crate) fn new(config: &SessionConfig, begin_string: &'static str) -> Self {
+    #[must_use]
+    pub(crate) fn new(config: &SessionConfig, version: WireVersion) -> Self {
         Self {
-            begin_string,
+            version,
             sender_comp_id: config.sender_comp_id.as_str().to_string(),
             target_comp_id: config.target_comp_id.as_str().to_string(),
             sender_sub_id: config.sender_sub_id.clone(),
@@ -78,10 +244,33 @@ impl MessageFactory {
     }
 
     /// Starts an encoder with the standard header:
-    /// 35, 49, 56, [50], [57], 34, [43], 52.
-    fn header(&self, msg_type: &str, seq: u64, poss_dup: bool) -> Encoder {
-        let mut encoder = Encoder::new(self.begin_string);
+    /// 35, [1128], 49, 56, [50], [57], 34, [43], 52, [122].
+    ///
+    /// `poss_dup` stamps both `PossDupFlag` (43) and `OrigSendingTime` (122):
+    /// FIX requires 122 on every message carrying 43=Y, and
+    /// `doc/fix_operations.md` mandates it for resends. The engine has no
+    /// message store, so the original sending time of the replaced messages
+    /// is not recoverable; per the spec's handling of an unavailable
+    /// OrigSendingTime the current time is used, which is also what a
+    /// SequenceReset-GapFill (whose "original" messages are administrative
+    /// filler, not replayed traffic) needs.
+    ///
+    /// `appl_ver_id` stamps `ApplVerID` (1128) immediately after MsgType,
+    /// its position in the FIXT.1.1 standard header. It is passed only for
+    /// application messages; session-level messages are versioned by the
+    /// FIXT.1.1 BeginString itself.
+    fn header(
+        &self,
+        msg_type: &str,
+        seq: u64,
+        poss_dup: bool,
+        appl_ver_id: Option<&str>,
+    ) -> Encoder {
+        let mut encoder = Encoder::new(self.version.begin_string);
         encoder.put_str(35, msg_type);
+        if let Some(appl_ver_id) = appl_ver_id {
+            encoder.put_str(1128, appl_ver_id);
+        }
         encoder.put_str(49, &self.sender_comp_id);
         encoder.put_str(56, &self.target_comp_id);
         if let Some(sub) = &self.sender_sub_id {
@@ -94,17 +283,25 @@ impl MessageFactory {
         if poss_dup {
             encoder.put_bool(43, true);
         }
-        encoder.put_str(52, Timestamp::now().format_millis().as_str());
+        let sending_time = Timestamp::now().format_millis();
+        encoder.put_str(52, sending_time.as_str());
+        if poss_dup {
+            encoder.put_str(122, sending_time.as_str());
+        }
         encoder
     }
 
-    /// Builds a Logon (35=A) with EncryptMethod=0 and HeartBtInt.
+    /// Builds a Logon (35=A) with EncryptMethod=0, HeartBtInt and, for a
+    /// FIXT.1.1 session, DefaultApplVerID (1137).
     pub(crate) fn logon(&self, seq: u64, heartbeat_secs: u64, reset_seq: bool) -> BytesMut {
-        let mut encoder = self.header("A", seq, false);
+        let mut encoder = self.header("A", seq, false, None);
         encoder.put_uint(98, 0);
         encoder.put_uint(108, heartbeat_secs);
         if reset_seq {
             encoder.put_bool(141, true);
+        }
+        if let Some(appl_ver_id) = self.version.appl_ver_id {
+            encoder.put_str(1137, appl_ver_id);
         }
         encoder.finish()
     }
@@ -112,7 +309,7 @@ impl MessageFactory {
     /// Builds a Heartbeat (35=0), echoing TestReqID (112) when replying to
     /// a TestRequest.
     pub(crate) fn heartbeat(&self, seq: u64, test_req_id: Option<&str>) -> BytesMut {
-        let mut encoder = self.header("0", seq, false);
+        let mut encoder = self.header("0", seq, false, None);
         if let Some(id) = test_req_id {
             encoder.put_str(112, id);
         }
@@ -121,14 +318,14 @@ impl MessageFactory {
 
     /// Builds a TestRequest (35=1) with TestReqID (112).
     pub(crate) fn test_request(&self, seq: u64, test_req_id: &str) -> BytesMut {
-        let mut encoder = self.header("1", seq, false);
+        let mut encoder = self.header("1", seq, false, None);
         encoder.put_str(112, test_req_id);
         encoder.finish()
     }
 
     /// Builds a Logout (35=5) with optional Text (58).
     pub(crate) fn logout(&self, seq: u64, text: Option<&str>) -> BytesMut {
-        let mut encoder = self.header("5", seq, false);
+        let mut encoder = self.header("5", seq, false, None);
         if let Some(text) = text {
             encoder.put_str(58, text);
         }
@@ -138,7 +335,7 @@ impl MessageFactory {
     /// Builds a ResendRequest (35=2) for `begin_seq..end_seq`
     /// (`end_seq` = 0 means "up to infinity").
     pub(crate) fn resend_request(&self, seq: u64, begin_seq: u64, end_seq: u64) -> BytesMut {
-        let mut encoder = self.header("2", seq, false);
+        let mut encoder = self.header("2", seq, false, None);
         encoder.put_uint(7, begin_seq);
         encoder.put_uint(16, end_seq);
         encoder.finish()
@@ -146,9 +343,10 @@ impl MessageFactory {
 
     /// Builds a SequenceReset-GapFill (35=4, 123=Y) that answers a
     /// ResendRequest by jumping the counterparty's expectation to `new_seq`.
-    /// Stamped with the gap's begin sequence and PossDupFlag (43=Y).
+    /// Stamped with the gap's begin sequence, PossDupFlag (43=Y) and
+    /// OrigSendingTime (122).
     pub(crate) fn sequence_reset_gap_fill(&self, seq: u64, new_seq: u64) -> BytesMut {
-        let mut encoder = self.header("4", seq, true);
+        let mut encoder = self.header("4", seq, true, None);
         encoder.put_bool(123, true);
         encoder.put_uint(36, new_seq);
         encoder.finish()
@@ -162,7 +360,7 @@ impl MessageFactory {
         ref_msg_type: &str,
         reason: &RejectReason,
     ) -> BytesMut {
-        let mut encoder = self.header("3", seq, false);
+        let mut encoder = self.header("3", seq, false, None);
         encoder.put_uint(45, ref_seq);
         if let Some(ref_tag) = reason.ref_tag {
             encoder.put_uint(371, u64::from(ref_tag));
@@ -175,9 +373,15 @@ impl MessageFactory {
         encoder.finish()
     }
 
-    /// Builds an application message from an [`OutboundMessage`].
+    /// Builds an application message from an [`OutboundMessage`], stamping
+    /// ApplVerID (1128) for a FIXT.1.1 session.
     pub(crate) fn application_message(&self, seq: u64, message: &OutboundMessage) -> BytesMut {
-        let mut encoder = self.header(message.msg_type().as_str(), seq, false);
+        let mut encoder = self.header(
+            message.msg_type().as_str(),
+            seq,
+            false,
+            self.version.appl_ver_id,
+        );
         for (tag, value) in message.fields() {
             encoder.put_raw(*tag, value);
         }
@@ -191,19 +395,39 @@ mod tests {
     use ironfix_core::message::MsgType;
     use ironfix_core::types::CompId;
 
+    fn config_for(begin_string: &str) -> SessionConfig {
+        let Some(sender) = CompId::new("CLIENT") else {
+            unreachable!("CLIENT is a valid CompId")
+        };
+        let Some(target) = CompId::new("VENUE") else {
+            unreachable!("VENUE is a valid CompId")
+        };
+        SessionConfig::new(sender, target, begin_string)
+    }
+
+    fn factory_for(begin_string: &str) -> MessageFactory {
+        let config = config_for(begin_string);
+        match wire_version(&config.begin_string) {
+            Ok(version) => MessageFactory::new(&config, version),
+            Err(err) => panic!("test fixture uses an unsupported version: {err}"),
+        }
+    }
+
     fn factory() -> MessageFactory {
-        let config = SessionConfig::new(
-            CompId::new("CLIENT").unwrap(),
-            CompId::new("VENUE").unwrap(),
-            "FIX.4.4",
-        );
-        MessageFactory::new(&config, static_begin_string(&config.begin_string))
+        factory_for("FIX.4.4")
+    }
+
+    fn decode(frame: &[u8]) -> RawMessage<'_> {
+        match decode_frame(frame) {
+            Ok(raw) => raw,
+            Err(err) => unreachable!("factory frame must decode: {err}"),
+        }
     }
 
     #[test]
     fn test_logon_frame_roundtrip() {
         let frame = factory().logon(1, 30, true);
-        let raw = decode_frame(&frame).unwrap();
+        let raw = decode(&frame);
         assert_eq!(raw.msg_type(), &MsgType::Logon);
         assert_eq!(raw.get_field_str(49), Some("CLIENT"));
         assert_eq!(raw.get_field_str(56), Some("VENUE"));
@@ -211,17 +435,31 @@ mod tests {
         assert_eq!(raw.get_field_str(98), Some("0"));
         assert_eq!(raw.get_field_str(108), Some("30"));
         assert_eq!(raw.get_field_str(141), Some("Y"));
+        // Pre-5.0 session: no application version fields.
+        assert_eq!(raw.get_field_str(1137), None);
     }
 
     #[test]
-    fn test_gap_fill_frame() {
+    fn test_gap_fill_frame_carries_orig_sending_time() {
         let frame = factory().sequence_reset_gap_fill(3, 10);
-        let raw = decode_frame(&frame).unwrap();
+        let raw = decode(&frame);
         assert_eq!(raw.msg_type(), &MsgType::SequenceReset);
         assert_eq!(raw.get_field_str(34), Some("3"));
         assert_eq!(raw.get_field_str(43), Some("Y"));
         assert_eq!(raw.get_field_str(123), Some("Y"));
         assert_eq!(raw.get_field_str(36), Some("10"));
+        // Every frame carrying PossDupFlag must carry OrigSendingTime, and
+        // absent a store it equals SendingTime.
+        assert_eq!(raw.get_field_str(122), raw.get_field_str(52));
+        assert!(raw.get_field_str(122).is_some());
+    }
+
+    #[test]
+    fn test_non_poss_dup_frame_omits_orig_sending_time() {
+        let frame = factory().heartbeat(4, None);
+        let raw = decode(&frame);
+        assert_eq!(raw.get_field_str(43), None);
+        assert_eq!(raw.get_field_str(122), None);
     }
 
     #[test]
@@ -230,16 +468,149 @@ mod tests {
         message.push_str(11, "ORDER-1").push_char(54, '1');
 
         let frame = factory().application_message(7, &message);
-        let raw = decode_frame(&frame).unwrap();
+        let raw = decode(&frame);
         assert_eq!(raw.msg_type(), &MsgType::NewOrderSingle);
         assert_eq!(raw.get_field_str(34), Some("7"));
         assert_eq!(raw.get_field_str(11), Some("ORDER-1"));
         assert_eq!(raw.get_field_str(54), Some("1"));
+        assert_eq!(raw.get_field_str(1128), None);
     }
 
     #[test]
-    fn test_static_begin_string_interned() {
-        assert_eq!(static_begin_string("FIX.4.4"), "FIX.4.4");
-        assert_eq!(static_begin_string("FIX.9.9"), "FIX.9.9");
+    fn test_wire_version_pre_fixt_passthrough() {
+        assert_eq!(
+            wire_version("FIX.4.4"),
+            Ok(WireVersion {
+                begin_string: "FIX.4.4",
+                appl_ver_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_wire_version_unknown_is_typed_error() {
+        // An unsupported version must degrade to an explicit typed error, never
+        // travel onto the wire as a fabricated BeginString.
+        match wire_version("FIX.9.9") {
+            Err(err) => assert_eq!(err.version, "FIX.9.9"),
+            Ok(version) => panic!("FIX.9.9 must not be framed, got {version:?}"),
+        }
+    }
+
+    #[test]
+    fn test_wire_version_bare_fixt_is_rejected_for_missing_appl_ver_id() {
+        // FIXT.1.1 names only the transport version. Its Logon requires
+        // DefaultApplVerID (1137) and nothing here can supply it, so the
+        // session is refused rather than sent without a required field.
+        match wire_version("FIXT.1.1") {
+            Err(err) => {
+                assert_eq!(err.version, "FIXT.1.1");
+                assert!(
+                    err.detail.contains("1137"),
+                    "the reason should name the missing field, got {}",
+                    err.detail
+                );
+            }
+            Ok(version) => panic!("bare FIXT.1.1 must be refused, got {version:?}"),
+        }
+    }
+
+    #[test]
+    fn test_wire_version_fix50_maps_to_fixt() {
+        assert_eq!(
+            wire_version("FIX.5.0"),
+            Ok(WireVersion {
+                begin_string: "FIXT.1.1",
+                appl_ver_id: Some("7"),
+            })
+        );
+        assert_eq!(
+            wire_version("FIX.5.0SP1"),
+            Ok(WireVersion {
+                begin_string: "FIXT.1.1",
+                appl_ver_id: Some("8"),
+            })
+        );
+        assert_eq!(
+            wire_version("FIX.5.0SP2"),
+            Ok(WireVersion {
+                begin_string: "FIXT.1.1",
+                appl_ver_id: Some("9"),
+            })
+        );
+    }
+
+    #[test]
+    fn test_fix50sp2_logon_carries_fixt_begin_string_and_default_appl_ver_id() {
+        let frame = factory_for("FIX.5.0SP2").logon(1, 30, false);
+        let raw = decode(&frame);
+        assert_eq!(raw.begin_string(), Ok("FIXT.1.1"));
+        assert_eq!(raw.get_field_str(1137), Some("9"));
+    }
+
+    #[test]
+    fn test_fix50sp2_application_message_carries_appl_ver_id() {
+        let mut message = OutboundMessage::new(MsgType::NewOrderSingle);
+        message.push_str(11, "ORDER-1");
+
+        let frame = factory_for("FIX.5.0SP2").application_message(2, &message);
+        let raw = decode(&frame);
+        assert_eq!(raw.begin_string(), Ok("FIXT.1.1"));
+        assert_eq!(raw.get_field_str(1128), Some("9"));
+    }
+
+    #[test]
+    fn test_peer_identity_accepts_reversed_comp_ids() {
+        let identity = PeerIdentity::new(&config_for("FIX.4.4"));
+        let mut encoder = Encoder::new("FIX.4.4");
+        encoder.put_str(35, "0");
+        encoder.put_str(49, "VENUE");
+        encoder.put_str(56, "CLIENT");
+        encoder.put_uint(34, 1);
+        let frame = encoder.finish();
+
+        assert_eq!(identity.validate(&decode(&frame)), Ok(()));
+    }
+
+    #[test]
+    fn test_peer_identity_rejects_wrong_sender_comp_id() {
+        let identity = PeerIdentity::new(&config_for("FIX.4.4"));
+        let mut encoder = Encoder::new("FIX.4.4");
+        encoder.put_str(35, "0");
+        encoder.put_str(49, "OTHER");
+        encoder.put_str(56, "CLIENT");
+        encoder.put_uint(34, 1);
+        let frame = encoder.finish();
+
+        assert_eq!(
+            identity.validate(&decode(&frame)),
+            Err(IdentityMismatch {
+                tag: 49,
+                expected: "VENUE".to_string(),
+                received: "OTHER".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_peer_identity_rejects_missing_sub_id_when_configured() {
+        let config = config_for("FIX.4.4").with_sender_sub_id("DESK");
+        let identity = PeerIdentity::new(&config);
+        let mut encoder = Encoder::new("FIX.4.4");
+        encoder.put_str(35, "0");
+        encoder.put_str(49, "VENUE");
+        encoder.put_str(56, "CLIENT");
+        encoder.put_uint(34, 1);
+        let frame = encoder.finish();
+
+        // Our SenderSubID is the peer's TargetSubID (57).
+        assert_eq!(
+            identity.validate(&decode(&frame)),
+            Err(IdentityMismatch {
+                tag: 57,
+                expected: "DESK".to_string(),
+                received: String::new(),
+            })
+        );
     }
 }

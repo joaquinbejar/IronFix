@@ -52,6 +52,50 @@ These messages are required for establishing and maintaining FIX sessions.
 4. Respond with Logon message
 5. Begin heartbeat monitoring
 
+**What IronFix implements today (initiator side)**
+
+`ironfix-engine::Initiator` validates the Logon acknowledgement in this order,
+and stops at the first failure:
+
+1. **MsgType.** A Logout or Reject is a rejected Logon; anything else is an
+   unexpected message.
+2. **Identity.** Inbound `SenderCompID` (49) must equal the configured
+   `target_comp_id` and inbound `TargetCompID` (56) the configured
+   `sender_comp_id`; when `sender_sub_id` / `target_sub_id` are configured,
+   inbound `TargetSubID` (57) and `SenderSubID` (50) are checked the same way.
+   A mismatch produces a session Reject with reason 9 (CompID problem) followed
+   by a Logout, and the handshake fails. This is checked before any callback
+   runs and before sequence state moves, so a cross-wired connection can never
+   establish a session.
+3. **`from_admin`.** A rejection sends a Logout and fails the handshake.
+4. **`HeartBtInt` (108).** The interval confirmed by the counterparty wins.
+   Note the counterparty therefore controls this value, and `108=0` — legal
+   FIX for "do not send heartbeats" — is not handled correctly today; see the
+   Phase 1 checklist entry for Heartbeat / Test Request.
+5. **`ResetSeqNumFlag` (141).** `141=Y` on the ack must arrive under
+   `MsgSeqNum = 1` — the reset and the number carrying it have to describe the
+   same stream — and a peer that sends any other number fails the handshake
+   rather than having one half of the contradiction guessed for it. It is
+   honored **before** MsgSeqNum is validated — otherwise the ack's
+   `34=1` reads as fatally too low against continuity-seeded counters. The
+   inbound counter is reset to 1. The outbound counter is set to 2, not 1.
+   That is an interpretive choice, not a derivation: it is exact when
+   `reset_on_logon` was set (the Logon on the wire really was message 1 of the
+   reset stream, and rewinding would re-emit a number the peer has seen), but
+   with continuity-seeded counters the Logon went out under its seeded number
+   and nothing numbered 1 was ever sent. QuickFIX/J's two halves disagree here
+   — its initiator would set 1, its acceptor 2 — and IronFix matches the
+   acceptor. The mismatch self-heals: the peer sees a gap at 2, requests a
+   resend of 1, and receives a GapFill that resynchronises it.
+6. **`MsgSeqNum` (34).** Too low fails the handshake; a gap completes the
+   handshake and immediately issues a ResendRequest.
+
+The same identity check (step 2) runs on every inbound frame once the session
+is established; there a mismatch produces the Reject and Logout and then tears
+the session down.
+
+Outbound `ResetSeqNumFlag` is driven by `SessionConfig::reset_on_logon`.
+
 ---
 
 ### Logout (MsgType = 5)
@@ -151,6 +195,40 @@ These messages are required for establishing and maintaining FIX sessions.
 3. Use SequenceReset-GapFill for admin messages
 4. Maintain original SendingTime with OrigSendingTime
 
+**What IronFix implements today**
+
+`ironfix-engine` has **no message store dependency**, so mandate items 1, 2 and
+4 above are **not implemented**: the engine cannot replay a single stored
+message. What it does is answer the whole requested range with one
+SequenceReset-GapFill (item 3, generalized to every message type):
+
+- `BeginSeqNo` (7) absent or unparseable → session Reject, reason 1 (required
+  tag missing), `RefTagID` = 7. There is deliberately **no** default value;
+  defaulting a missing BeginSeqNo to 1 silently answers a request the
+  counterparty never made.
+- `EndSeqNo` (16) absent or unparseable → session Reject, reason 1,
+  `RefTagID` = 16.
+- `BeginSeqNo` = 0, or at or beyond our next outbound sequence number → session
+  Reject, reason 5 (value incorrect), `RefTagID` = 7. We cannot resend what we
+  have not sent.
+- `EndSeqNo` below `BeginSeqNo` (and not 0) → session Reject, reason 5,
+  `RefTagID` = 16.
+- Otherwise the reply is `SequenceReset`-GapFill with `MsgSeqNum` = BeginSeqNo
+  and `NewSeqNo` = min(EndSeqNo + 1, next outbound sequence), or the next
+  outbound sequence when `EndSeqNo` = 0 (infinity). A bounded request therefore
+  never advances the counterparty past what it asked for.
+
+The GapFill carries `PossDupFlag` (43) = Y and `OrigSendingTime` (122). Absent
+a store there is no recorded original sending time, so 122 is stamped with the
+same value as `SendingTime` (52), which is the FIX handling for an unavailable
+OrigSendingTime. A GapFill's "original" messages are administrative filler
+rather than replayed traffic, so no information is lost by this.
+
+Consequence for consumers: **application messages are never replayed.** A
+counterparty that requests a resend of business traffic receives a gap fill,
+not the traffic. Real replay requires wiring a `MessageStore` into the engine,
+which is separate, tracked work.
+
 ---
 
 ### Reject (MsgType = 3)
@@ -190,6 +268,22 @@ These messages are required for establishing and maintaining FIX sessions.
 | 11 | Invalid MsgType |
 | 99 | Other |
 
+**Reason codes IronFix emits today**
+
+| Code | Emitted when |
+|---|---|
+| 1 | `SequenceReset` without `NewSeqNo` (36); `ResendRequest` without `BeginSeqNo` (7) or `EndSeqNo` (16) |
+| 5 | `SequenceReset` whose `NewSeqNo` would rewind or fails to advance; `ResendRequest` whose range is outside what we have sent |
+| 9 | Inbound `SenderCompID`/`TargetCompID` (and `SenderSubID`/`TargetSubID` when configured) do not match the session configuration |
+| any | Whatever an `Application::from_admin` / `from_app` implementation returns in its `RejectReason` |
+
+**Reason 10 (SendingTime accuracy) is not implemented.** `SendingTime` (52) is
+never compared against the local clock. Doing so requires a tolerance window,
+and a tolerance is a policy decision — it needs its own typed
+`SessionConfig` knob with a defensible default and a documented unit and range,
+not a guessed constant. Until that decision is made, a message with a wildly
+skewed `SendingTime` is accepted. This is a known, deliberate omission.
+
 ---
 
 ### Sequence Reset (MsgType = 4)
@@ -212,6 +306,37 @@ These messages are required for establishing and maintaining FIX sessions.
 **Server Behavior**:
 - **Gap Fill Mode**: Skip sequence numbers for admin messages during resend
 - **Reset Mode**: Force sequence number reset (use with caution)
+
+**What IronFix implements today**
+
+The two modes are **not** interchangeable, and `GapFillFlag` (123) is what
+selects between them. A Gap Fill is an ordinary sequenced message: it occupies
+its own `MsgSeqNum` and is validated like any other inbound message. **Reset
+mode is the only mode allowed to ignore `MsgSeqNum`.** Applying a gapped Gap
+Fill as though it were a Reset jumps the inbound expectation past messages that
+were never received and will now never be requested — a silent, permanent loss
+of (potentially) Execution Reports.
+
+**Not bounded:** `NewSeqNo` is accepted at any magnitude, so a peer can jump the
+inbound expectation arbitrarily far ahead — up to `u64::MAX`, after which the
+next message exhausts the counter and the session is torn down with a typed
+error. There is no principled ceiling in the specification to check against, and
+the failure mode is a clean teardown rather than silent corruption, so no
+arbitrary limit is invented here.
+
+`ironfix-engine` handles an inbound `SequenceReset` as follows:
+
+| Condition | Behavior |
+|---|---|
+| `from_admin` rejects the message | session Reject with the application's reason; `NewSeqNo` not applied |
+| `NewSeqNo` (36) absent or unparseable | session Reject, reason 1, `RefTagID` = 36; MsgSeqNum is **not** validated and **not** consumed, matching QuickFIX/J, which excludes SequenceReset from its increment-on-reject rule. For a GapFill this leaves the peer's next in-order message looking gapped, so expect a ResendRequest to follow |
+| `123=Y`, MsgSeqNum gapped | ResendRequest for the missing range; `NewSeqNo` **not** applied |
+| `123=Y`, MsgSeqNum too low with `PossDupFlag` = Y | dropped as an already-applied duplicate |
+| `123=Y`, MsgSeqNum too low without `PossDupFlag` | Logout and disconnect, as for any other too-low message |
+| `123=Y`, MsgSeqNum in sequence, `NewSeqNo` ≤ MsgSeqNum | session Reject, reason 5, `RefTagID` = 36; the fill message itself is consumed so the session does not deadlock on that number |
+| `123=Y`, MsgSeqNum in sequence, `NewSeqNo` > MsgSeqNum | applied: inbound expectation becomes `NewSeqNo` |
+| `123=N` or 123 absent (Reset mode), `NewSeqNo` < expected | session Reject, reason 5, `RefTagID` = 36; not applied |
+| `123=N` or 123 absent (Reset mode), `NewSeqNo` ≥ expected | applied regardless of MsgSeqNum. An outstanding ResendRequest is only cleared when the reset actually advances the expectation; a reset landing on the number already expected changes nothing, and clearing for it would let a peer replay it to trigger a fresh ResendRequest every round |
 
 ---
 
@@ -705,10 +830,20 @@ Rationale for the two policies:
 
 ### Phase 1: Core Session Layer (Required)
 - [x] Logon / Logout
-- [x] Heartbeat / Test Request
+- [ ] Heartbeat / Test Request — **partial**: the interval is negotiated and
+  heartbeats, TestRequests and the silent-peer timeout all work at the
+  configured interval, but two cases in `ironfix-session::HeartbeatManager` are
+  wrong. `HeartBtInt = 0` (legal FIX, meaning "do not send heartbeats") is
+  taken literally as a zero-length interval, so the session floods the peer and
+  then times itself out; and a pending TestRequest is cleared only by a
+  Heartbeat echoing the matching `TestReqID`, so a peer that answers without
+  tag 112 — or whose Heartbeat is reordered behind application traffic — is
+  disconnected despite being demonstrably alive.
 - [x] Reject
 - [x] Sequence Reset
-- [x] Resend Request
+- [ ] Resend Request — **partial**: inbound requests are validated and answered
+  with a correctly bounded SequenceReset-GapFill, but the engine has no message
+  store, so no message is ever actually replayed. See "Resend Request" above.
 
 ### Phase 2: Order Entry (High Priority)
 - [ ] New Order Single
@@ -753,6 +888,38 @@ Rationale for the two policies:
 - DefaultApplVerID (tag 1137) in Logon
 - ApplVerID (tag 1128) in application messages
 - Enhanced market data support
+
+**What IronFix implements today.** A session configured with a 5.0 version
+string is carried as a FIXT.1.1 session on the wire: `BeginString` (8) is
+always `FIXT.1.1` and the application version travels in 1137 / 1128. Putting
+`FIX.5.0` in tag 8 is rejected outright by conforming acceptors, so the
+configured string is a *session* version, not a literal BeginString.
+
+| `SessionConfig::begin_string` | Tag 8 | 1137 (Logon) / 1128 (app messages) |
+|---|---|---|
+| `FIX.4.0` … `FIX.4.4` | verbatim | not sent |
+| `FIX.5.0` | `FIXT.1.1` | `7` |
+| `FIX.5.0SP1` | `FIXT.1.1` | `8` |
+| `FIX.5.0SP2` | `FIXT.1.1` | `9` |
+| `FIXT.1.1` | — | session refused |
+| anything else | — | session refused |
+
+`FIXT.1.1` on its own names the transport version and no application version,
+so the engine cannot supply `DefaultApplVerID` (1137) — a **required** field of
+the FIXT.1.1 Logon. Rather than send a Logon missing a required field, or
+default the application version to a guess, `Initiator::connect` refuses the
+session with `EngineError::UnsupportedVersion` before dialling; configure
+`FIX.5.0`, `FIX.5.0SP1` or `FIX.5.0SP2` instead. An unrecognised version string
+is refused the same way, rather than being passed through onto the wire.
+
+This table is duplicated from `ironfix_dictionary::schema::Version`, because
+`ironfix-engine` does not and must not depend on `ironfix-dictionary`. The two
+can drift apart and no test can cross-check them without taking that
+dependency; unifying them into `ironfix-core` is follow-up work.
+
+**Not implemented for 5.0:** no application-version-driven validation of any
+kind. The `ApplVerID` values are stamped, not enforced, and the engine never
+consults a dictionary.
 
 ---
 
