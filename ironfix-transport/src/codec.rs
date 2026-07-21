@@ -156,7 +156,13 @@ impl Decoder for FixCodec {
         // Calculate total message length
         // BodyLength counts from after 9=XXX| to before 10=
         // Total = header + body + trailer (10=XXX|)
-        let total_length = body_len_soh + 1 + body_length + 7; // +7 for |10=XXX|
+        // BodyLength is attacker-controlled: fold with checked arithmetic so a
+        // hostile declared length errors instead of overflowing usize.
+        let total_length = body_len_soh
+            .checked_add(1)
+            .and_then(|n| n.checked_add(body_length))
+            .and_then(|n| n.checked_add(7)) // +7 for |10=XXX|
+            .ok_or(CodecError::InvalidBodyLength)?;
 
         // Check maximum size
         if total_length > self.max_message_size {
@@ -248,6 +254,31 @@ mod tests {
 
         let result = codec.decode(&mut buf).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_codec_decode_body_length_overflow() {
+        let mut codec = FixCodec::new();
+        let msg = format!("8=FIX.4.4\x019={}\x0135=0\x0110=000\x01", usize::MAX);
+        let mut buf = BytesMut::from(msg.as_bytes());
+
+        // Must error, not overflow the framing arithmetic.
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(CodecError::InvalidBodyLength)
+        ));
+    }
+
+    #[test]
+    fn test_codec_decode_body_length_too_large() {
+        let mut codec = FixCodec::new();
+        let msg = format!("8=FIX.4.4\x019={}\x0135=0\x0110=000\x01", 10 * 1024 * 1024);
+        let mut buf = BytesMut::from(msg.as_bytes());
+
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(CodecError::MessageTooLarge { .. })
+        ));
     }
 
     #[test]

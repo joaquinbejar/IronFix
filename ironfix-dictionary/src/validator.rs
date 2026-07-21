@@ -398,13 +398,34 @@ mod tests {
 
     const SOH: char = '\x01';
 
+    /// Builds a message, recomputing BodyLength (9) from the actual body so the
+    /// decoder's declared-vs-actual length check passes.
     fn build(fields: &[&str]) -> String {
-        let mut msg = String::new();
-        for field in fields {
-            msg.push_str(field);
-            msg.push(SOH);
+        let begin = fields
+            .iter()
+            .find(|f| f.starts_with("8="))
+            .copied()
+            .unwrap_or("8=FIX.4.4");
+        let trailer = fields
+            .iter()
+            .find(|f| f.starts_with("10="))
+            .copied()
+            .unwrap_or("10=000");
+
+        let mut body = String::new();
+        for field in fields
+            .iter()
+            .filter(|f| !f.starts_with("8=") && !f.starts_with("9=") && !f.starts_with("10="))
+        {
+            body.push_str(field);
+            body.push(SOH);
         }
-        msg
+
+        format!(
+            "{begin}{SOH}9={}{SOH}{body}{trailer}{SOH}",
+            body.len(),
+            SOH = SOH
+        )
     }
 
     fn validate(fields: &[&str]) -> Result<(), Vec<ValidationError>> {

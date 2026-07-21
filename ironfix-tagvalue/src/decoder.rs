@@ -111,9 +111,18 @@ impl<'a> Decoder<'a> {
 
         // Parse remaining fields until checksum
         let mut checksum_field: Option<FieldRef<'a>> = None;
-        while let Some(field) = self.next_field() {
+        // Offset of the first byte of the CheckSum (10) field, i.e. the end of
+        // the body. Tracked explicitly so it stays correct for zero-padded tags
+        // ("010=") that `parse_tag` folds numerically.
+        let mut checksum_field_start = self.offset;
+        loop {
+            let field_start = self.offset;
+            let Some(field) = self.next_field() else {
+                break;
+            };
             if field.tag == 10 {
                 checksum_field = Some(field);
+                checksum_field_start = field_start;
                 break;
             }
             fields.push(field);
@@ -130,9 +139,7 @@ impl<'a> Decoder<'a> {
             })?;
 
             // Calculate checksum of everything before the checksum field
-            let checksum_start =
-                checksum_ref.value.as_ptr() as usize - self.input.as_ptr() as usize - 3; // "10="
-            let calculated = calculate_checksum(&self.input[start_offset..checksum_start]);
+            let calculated = calculate_checksum(&self.input[start_offset..checksum_field_start]);
 
             if calculated != declared {
                 return Err(DecodeError::ChecksumMismatch {
@@ -142,7 +149,20 @@ impl<'a> Decoder<'a> {
             }
         }
 
-        let body_end = body_start + body_length;
+        // BodyLength (tag 9) is fully attacker-controlled: use checked arithmetic
+        // and validate the declared length against the bytes actually consumed.
+        let body_end = body_start
+            .checked_add(body_length)
+            .ok_or(DecodeError::InvalidBodyLength)?;
+        if checksum_field.is_some() {
+            // A well-formed frame declares exactly the bytes between the
+            // BodyLength SOH and the start of the CheckSum field.
+            if body_end != checksum_field_start {
+                return Err(DecodeError::InvalidBodyLength);
+            }
+        } else if body_end > self.offset {
+            return Err(DecodeError::InvalidBodyLength);
+        }
         let body = body_start..body_end;
 
         Ok(RawMessage::new(
@@ -281,5 +301,79 @@ mod tests {
         let input = b"8=FIX.4.4";
         let mut decoder = Decoder::new(input);
         assert!(decoder.next_field().is_none());
+    }
+
+    /// Builds a frame with the given BodyLength text (which may be hostile) and
+    /// a valid trailing checksum over the resulting bytes.
+    fn frame_with_body_length(body_length_text: &str, body_length_tag: &str) -> Vec<u8> {
+        let body = b"35=0\x0149=A\x0156=B\x0134=1\x0152=20240329-12:00:00\x01";
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"8=FIX.4.4\x01");
+        msg.extend_from_slice(format!("{body_length_tag}={body_length_text}\x01").as_bytes());
+        msg.extend_from_slice(body);
+        let sum: u32 = msg.iter().map(|&b| u32::from(b)).sum();
+        msg.extend_from_slice(format!("10={:03}\x01", (sum % 256) as u8).as_bytes());
+        msg
+    }
+
+    #[test]
+    fn test_decode_body_length_overflow_does_not_panic() {
+        let msg = frame_with_body_length(&usize::MAX.to_string(), "9");
+        assert_eq!(
+            Decoder::new(&msg).decode().unwrap_err(),
+            DecodeError::InvalidBodyLength
+        );
+    }
+
+    #[test]
+    fn test_decode_body_length_overflow_zero_padded_tag() {
+        // `parse_tag` folds digits numerically, so "009" is tag 9 here too.
+        let msg = frame_with_body_length(&usize::MAX.to_string(), "009");
+        assert_eq!(
+            Decoder::new(&msg).decode().unwrap_err(),
+            DecodeError::InvalidBodyLength
+        );
+    }
+
+    #[test]
+    fn test_decode_rejects_body_length_mismatch() {
+        let msg = frame_with_body_length("5", "9");
+        assert_eq!(
+            Decoder::new(&msg).decode().unwrap_err(),
+            DecodeError::InvalidBodyLength
+        );
+    }
+
+    #[test]
+    fn test_decode_accepts_correct_body_length() {
+        let body = b"35=0\x0149=A\x0156=B\x0134=1\x0152=20240329-12:00:00\x01";
+        let msg = frame_with_body_length(&body.len().to_string(), "9");
+        let decoded = Decoder::new(&msg).decode().expect("valid frame decodes");
+        assert_eq!(*decoded.msg_type(), MsgType::Heartbeat);
+    }
+
+    #[test]
+    fn test_decode_checksum_field_start_with_padded_tag() {
+        // Trailing checksum written as "010=" must still checksum the same span.
+        let body = b"35=0\x0149=A\x0156=B\x0134=1\x0152=20240329-12:00:00\x01";
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"8=FIX.4.4\x01");
+        msg.extend_from_slice(format!("9={}\x01", body.len()).as_bytes());
+        msg.extend_from_slice(body);
+        let sum: u32 = msg.iter().map(|&b| u32::from(b)).sum();
+        msg.extend_from_slice(format!("010={:03}\x01", (sum % 256) as u8).as_bytes());
+        assert!(Decoder::new(&msg).decode().is_ok());
+    }
+
+    #[test]
+    fn test_decode_mid_body_checksum_out_of_range_is_rejected() {
+        // A duplicate/injected `10=624` must not overflow the checksum parser.
+        let body = b"35=0\x0110=624\x0149=A\x01";
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"8=FIX.4.4\x01");
+        msg.extend_from_slice(format!("9={}\x01", body.len()).as_bytes());
+        msg.extend_from_slice(body);
+        msg.extend_from_slice(b"10=000\x01");
+        assert!(Decoder::new(&msg).decode().is_err());
     }
 }
