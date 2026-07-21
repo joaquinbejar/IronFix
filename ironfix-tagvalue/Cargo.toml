@@ -19,3 +19,8 @@ memchr.workspace = true
 itoa.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "tagvalue"
+harness = false

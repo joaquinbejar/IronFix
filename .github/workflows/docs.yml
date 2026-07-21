@@ -1,0 +1,52 @@
+name: Docs
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Documentation coverage gate.
+  #
+  # This runs clippy with `-D missing_docs` over the library targets of all 11
+  # crates, so an undocumented public item fails the build. It deliberately does
+  # NOT add `#![deny(missing_docs)]` to the crate roots: that is a change to 11
+  # source files and a decision for an ADR, not a side effect of a CI patch.
+  #
+  # Scope note: library targets only. `--all-targets` would pull in
+  # ironfix-example's example binaries, which have undocumented public fields
+  # and are not part of any published API surface.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Missing-docs gate
+        run: make doc
+
+      # Catches broken intra-doc links and malformed doc attributes, which the
+      # missing-docs lint does not see.
+      #
+      # `rustdoc::private_intra_doc_links` is allowed, not fixed: ironfix-fast's
+      # MAX_INT_ENCODED_LEN and MAX_PMAP_BYTES both link to the private
+      # PAYLOAD_BITS constant, and correcting that means editing crate sources,
+      # which this infrastructure change deliberately does not do. Those two
+      # links render dead on docs.rs and are worth a follow-up.
+      - name: Build rustdoc
+        run: cargo doc --no-deps --workspace --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links

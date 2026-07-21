@@ -15,21 +15,21 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
-    
+
     steps:
       - uses: actions/checkout@v4
-        
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
           components: clippy
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Lint
         run: make lint
+
+      # rules/global_rules.md requires English throughout. This is the machine
+      # enforcement of that rule; `make check-spanish` is a self-contained grep.
+      - name: English-only check
+        run: make check-spanish

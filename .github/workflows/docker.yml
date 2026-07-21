@@ -1,0 +1,100 @@
+name: Docker
+
+# The nine images under Docker/ were previously built by nobody: a change to an
+# example or to a Dockerfile could break them and CI would stay green. Each
+# image is a full musl release build, so this is path-filtered rather than run
+# on every push.
+on:
+  push:
+    branches:
+      - '**'
+    paths:
+      - 'Docker/**'
+      - 'ironfix-example/**'
+      - '.dockerignore'
+      - '**/Cargo.toml'
+      - '.github/workflows/docker.yml'
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+    paths:
+      - 'Docker/**'
+      - 'ironfix-example/**'
+      - '.dockerignore'
+      - '**/Cargo.toml'
+      - '.github/workflows/docker.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker_build:
+    name: build ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: fix40, port: 9870 }
+          - { image: fix41, port: 9871 }
+          - { image: fix42, port: 9872 }
+          - { image: fix43, port: 9873 }
+          - { image: fix44, port: 9876 }
+          - { image: fix50, port: 9880 }
+          - { image: fix50sp1, port: 9881 }
+          - { image: fix50sp2, port: 9882 }
+          - { image: fast, port: 9890 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build only; nothing is pushed to a registry from CI.
+      - name: Build ${{ matrix.image }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Docker/${{ matrix.image }}.Dockerfile
+          push: false
+          load: true
+          tags: ironfix-${{ matrix.image }}:ci
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      # An image that builds but is unreachable is still broken. The container
+      # must start AND accept a connection on its published port: fast's
+      # Dockerfile used to set FAST_HOST, which nothing reads, so the server
+      # bound 127.0.0.1 inside the container and the exposed port answered
+      # nobody. A "does it start" check alone would not have caught that.
+      - name: Smoke run ${{ matrix.image }} image
+        run: |
+          set -euo pipefail
+          port=${{ matrix.port }}
+
+          docker run -d --name ironfix-smoke \
+            -p "$port:$port" "ironfix-${{ matrix.image }}:ci"
+
+          reachable=0
+          for _ in $(seq 1 30); do
+            if nc -z 127.0.0.1 "$port" 2>/dev/null; then reachable=1; break; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' ironfix-smoke)" != "true" ]; then
+              echo "Container exited before binding port $port."
+              docker logs ironfix-smoke
+              exit 1
+            fi
+            sleep 1
+          done
+
+          docker logs ironfix-smoke
+
+          if [ "$reachable" -ne 1 ]; then
+            echo "Container is running but port $port is not reachable from the host."
+            echo "Check that the server binds 0.0.0.0 - the image's host env var"
+            echo "must be one the example actually reads."
+            docker rm -f ironfix-smoke
+            exit 1
+          fi
+
+          docker rm -f ironfix-smoke

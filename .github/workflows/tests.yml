@@ -3,7 +3,7 @@ name: Run Tests
 on:
   push:
     branches:
-      - '**' 
+      - '**'
   pull_request:
     branches:
       - main
@@ -15,20 +15,20 @@ env:
 jobs:
   run_tests:
     runs-on: ubuntu-latest
-    
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config
+      - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
         run: make test
+
+      # Compiles the criterion benchmarks without running them. A timing taken
+      # on a shared runner is not a measurement, but a benchmark that stops
+      # compiling is a real regression, and this catches it.
+      - name: Compile benchmarks
+        run: make bench-build
