@@ -8,13 +8,21 @@
 //!
 //! Procedural macros for the IronFix FIX protocol engine.
 //!
-//! This crate provides derive macros for automatic implementation of
-//! FIX message encoding and decoding traits.
+//! This crate is intended to provide derive macros for automatic
+//! implementation of the FIX message encoding and decoding traits.
+//!
+//! ## Status: not implemented
+//!
+//! Both macros are **stubs**. `#[derive(FixMessage)]` and
+//! `#[derive(FixField)]` currently expand to a `todo!()`, so any type that
+//! derives them will panic at run time on the generated methods. Nothing in
+//! this workspace uses either macro. Implement the traits by hand until this
+//! crate is finished.
 //!
 //! ## Macros
 //!
-//! - `#[derive(FixMessage)]` - Implements the `FixMessage` trait
-//! - `#[derive(FixField)]` - Implements the `FixField` trait
+//! - `#[derive(FixMessage)]` — intended to implement the `FixMessage` trait
+//! - `#[derive(FixField)]` — intended to implement the `FixField` trait
 
 use proc_macro::TokenStream;
 use quote::quote;

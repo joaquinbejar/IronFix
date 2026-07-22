@@ -8,12 +8,18 @@
 //!
 //! Build-time code generation for the IronFix FIX protocol engine.
 //!
-//! This crate generates Rust source code from FIX dictionary definitions,
-//! providing type-safe field constants and message structs.
+//! This crate generates Rust source code from a loaded
+//! `ironfix_dictionary::Dictionary`, producing type-safe field constants and
+//! message structs. FIX `Price`, `Qty` and `Percentage` fields are generated as
+//! `rust_decimal::Decimal`, never `f64`.
 //!
 //! ## Usage
 //!
-//! Typically used in a `build.rs` script to generate code at compile time.
+//! Intended for a `build.rs` script that generates code at compile time.
+//!
+//! No crate in this workspace consumes the generated output yet — the
+//! generator is exercised only by its own unit tests, so treat the emitted
+//! source as unproven against a real build.
 
 pub mod generator;
 

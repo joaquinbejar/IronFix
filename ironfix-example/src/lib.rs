@@ -8,45 +8,108 @@
 
 //! # IronFix
 //!
-//! A high-performance FIX/FAST protocol engine for Rust.
+//! Umbrella facade over the IronFix FIX/FAST workspace: this crate re-exports
+//! the runtime `ironfix-*` crates — `core`, `tagvalue`, `dictionary`,
+//! `session`, `store`, `transport`, `fast`, and `engine` — each under a module
+//! of its own, plus a [`prelude`] of the types most programs need. The
+//! code-generation crates `ironfix-codegen` and `ironfix-derive` are not
+//! re-exported. It adds no protocol logic of its own.
 //!
-//! IronFix provides a complete implementation of the FIX protocol with support for
-//! all versions from FIX 4.0 through FIX 5.0 SP2, as well as FAST-encoded market data.
+//! IronFix implements FIX tag=value messaging and the FAST encoding primitives
+//! directly — there is no upstream protocol library beneath it. Decoding is
+//! zero-copy and dictionary-free; validating a message against a schema is a
+//! separate, opt-in pass ([`dictionary::Validator`]).
 //!
 //! ## Features
 //!
-//! - **Zero-copy parsing**: Field values reference the original buffer
-//! - **SIMD-accelerated**: Uses `memchr` for fast delimiter search
-//! - **Type-safe**: Compile-time checked session states and message types
-//! - **Async support**: Built on Tokio for high-performance networking
-//! - **Flexible**: Supports both sync and async operation modes
+//! - **Zero-copy decoding**: decoded fields borrow the input buffer instead of
+//!   allocating; delimiter search uses `memchr`, which is SIMD-accelerated on
+//!   supported targets.
+//! - **Typed error paths**: every malformed-input case in the decoders is a
+//!   typed error, never a panic and never an attacker-sized allocation.
+//! - **Type-safe session states**: the session FSM is a sealed typestate, so
+//!   illegal transitions do not compile.
+//! - **Async**: everything that touches a socket runs on Tokio. There is no
+//!   synchronous or kernel-bypass transport mode.
+//!
+//! ## Current limitations
+//!
+//! Read these before designing around the crate:
+//!
+//! - `ironfix-engine` provides an [`engine::Initiator`] only — there is **no
+//!   Acceptor**. The server-side examples hand-roll their accept loop.
+//! - [`engine::EngineBuilder`] collects configuration but has **no terminal
+//!   `build()` method**; the working entry point is
+//!   `Initiator::new(config, app).connect(addr)`.
+//! - The engine never reads or writes a [`store::MessageStore`], so
+//!   resend-from-store is not implemented; an inbound `ResendRequest` is
+//!   answered with a gap fill. [`store::MemoryStore`] is the only store.
+//! - [`transport`] contains only a framing codec — no TCP connector or
+//!   acceptor and no TLS.
+//! - Only FIX 4.4 has an embedded dictionary; other versions need
+//!   `Dictionary::from_quickfix_xml`. The validator is never invoked
+//!   automatically.
+//! - [`fast`] is standalone: no template XML parser, no UDP multicast, and no
+//!   wiring into the session path.
+//! - No benchmark harness exists in this workspace, so no latency or
+//!   throughput figure here has been measured.
 //!
 //! ## Quick Start
 //!
-//! ```rust,ignore
-//! use ironfix_example::prelude::*;
+//! Connect as an initiator, send a `NewOrderSingle`, then log out. The engine
+//! owns the socket and stamps the header, `MsgSeqNum` and trailer.
 //!
-//! // Create an engine with your application handler
-//! let engine = EngineBuilder::new()
-//!     .with_application(MyApplication)
-//!     .add_session(SessionConfig::new(
-//!         CompId::new("SENDER").unwrap(),
-//!         CompId::new("TARGET").unwrap(),
+//! ```rust,no_run
+//! use std::sync::Arc;
+//! use std::time::Duration;
+//!
+//! use ironfix_example::core::{CompId, MsgType};
+//! use ironfix_example::engine::{Initiator, NoOpApplication, OutboundMessage, SessionConfig};
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let config = SessionConfig::new(
+//!         CompId::new("SENDER")?,
+//!         CompId::new("TARGET")?,
 //!         "FIX.4.4",
-//!     ))
-//!     .build();
+//!     )
+//!     .with_heartbeat_interval(Duration::from_secs(30));
+//!
+//!     // Substitute your own `Application` impl for NoOpApplication to receive
+//!     // on_logon / from_app / from_admin callbacks.
+//!     let initiator = Initiator::new(config, Arc::new(NoOpApplication))
+//!         .with_connect_timeout(Duration::from_secs(5));
+//!     let connection = initiator.connect("127.0.0.1:9876").await?;
+//!
+//!     let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+//!     order
+//!         .push_str(11, "ORD001")
+//!         .push_str(55, "AAPL")
+//!         .push_char(54, '1')
+//!         .push_uint(38, 100)
+//!         .push_str(44, "150.50")
+//!         .push_char(40, '2');
+//!     connection.send(order).await?;
+//!
+//!     connection.logout().await?;
+//!     connection.wait_closed().await;
+//!     Ok(())
+//! }
 //! ```
+//!
+//! See `examples/fix44_engine_client.rs` for the same flow with a real
+//! `Application` implementation.
 //!
 //! ## Crate Organization
 //!
 //! - [`core`]: Fundamental types, traits, and error definitions
 //! - [`dictionary`]: FIX specification parsing and dictionary management
 //! - [`tagvalue`]: Zero-copy tag=value encoding and decoding
-//! - [`session`]: Session layer protocol implementation
-//! - [`store`]: Message persistence and storage
-//! - [`transport`]: Network transport layer
-//! - [`fast`]: FAST protocol encoding and decoding
-//! - [`engine`]: High-level engine facade
+//! - [`session`]: Session layer protocol logic (no I/O)
+//! - [`store`]: The `MessageStore` trait and an in-memory implementation
+//! - [`transport`]: The `FixCodec` framing codec
+//! - [`fast`]: FAST protocol encoding and decoding primitives
+//! - [`engine`]: The composition root — `Initiator`, `Connection`, `Application`
 
 pub mod core {
     //! Core types, traits, and error definitions.
@@ -69,22 +132,29 @@ pub mod session {
 }
 
 pub mod store {
-    //! Message persistence and storage.
+    //! The `MessageStore` trait and its in-memory implementation.
+    //!
+    //! Note that the engine does not currently read from or write to a store.
     pub use ironfix_store::*;
 }
 
 pub mod transport {
-    //! Network transport layer.
+    //! FIX message framing: the `FixCodec` Tokio codec.
+    //!
+    //! This crate does not provide TCP connect/accept helpers or TLS.
     pub use ironfix_transport::*;
 }
 
 pub mod fast {
-    //! FAST protocol encoding and decoding.
+    //! FAST protocol encoding and decoding primitives.
+    //!
+    //! Standalone: not wired into the session or engine path.
     pub use ironfix_fast::*;
 }
 
 pub mod engine {
-    //! High-level engine facade.
+    //! The composition root: `Initiator`, `Connection`, and the `Application`
+    //! callback trait. Client-side only — there is no acceptor.
     pub use ironfix_engine::*;
 }
 
