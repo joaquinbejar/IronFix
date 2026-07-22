@@ -51,6 +51,21 @@ pub enum EngineError {
         reason: String,
     },
 
+    /// The `HeartBtInt` (108) on the Logon acknowledgement could not be adopted
+    /// as the session's heartbeat interval.
+    ///
+    /// Raised when the ack omits the required field, carries a non-numeric
+    /// value, or confirms an interval above
+    /// [`ironfix_session::heartbeat::MAX_HEARTBEAT_INTERVAL_SECS`] — the value
+    /// drives every liveness timer in the session and is counterparty
+    /// controlled, so an unbounded one is refused. `108=0` is legal and never
+    /// raises this — it means "do not heartbeat".
+    #[error("unsupported heartbeat interval: {detail}")]
+    HeartbeatInterval {
+        /// Why the confirmed `HeartBtInt` was refused.
+        detail: String,
+    },
+
     /// An unexpected message type arrived while awaiting the Logon
     /// acknowledgement.
     #[error("unexpected message during logon: 35={msg_type}")]

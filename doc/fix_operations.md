@@ -68,10 +68,24 @@ and stops at the first failure:
    runs and before sequence state moves, so a cross-wired connection can never
    establish a session.
 3. **`from_admin`.** A rejection sends a Logout and fails the handshake.
-4. **`HeartBtInt` (108).** The interval confirmed by the counterparty wins.
-   Note the counterparty therefore controls this value, and `108=0` — legal
-   FIX for "do not send heartbeats" — is not handled correctly today; see the
-   Phase 1 checklist entry for Heartbeat / Test Request.
+4. **`HeartBtInt` (108).** 108 is a *required* field of the Logon, so an ack
+   that omits it (session Reject, reason 1 — required tag missing) or carries a
+   non-numeric value (session Reject, reason 6 — incorrect data format for
+   value), `RefTagID` = 108 in both cases and each followed by a Logout, fails
+   the handshake with `EngineError::HeartbeatInterval` rather than silently
+   establishing the session on the locally configured interval. When present and
+   numeric the interval confirmed by the counterparty wins, within a bound.
+   Because the value is counterparty-controlled and drives every liveness timer
+   in the session, a confirmed interval above
+   `ironfix_session::heartbeat::MAX_HEARTBEAT_INTERVAL_SECS` (3600 s) is
+   refused with a session Reject, reason 5 (value is incorrect),
+   `RefTagID` = 108, followed by a Logout; the handshake then fails with
+   `EngineError::HeartbeatInterval`. Adopting an unbounded value would let a
+   peer switch dead-peer detection off for as long as it liked. The one
+   exception is a confirmed value that is *exactly* the interval this side
+   requested: echoing our own configuration back is our choice, not the
+   counterparty pushing us past the ceiling. `108=0` is legal and always
+   accepted; see "Heartbeat" below for what it means.
 5. **`ResetSeqNumFlag` (141).** `141=Y` on the ack must arrive under
    `MsgSeqNum = 1` — the reset and the number carrying it have to describe the
    same stream — and a peer that sends any other number fails the handshake
@@ -151,6 +165,29 @@ Outbound `ResetSeqNumFlag` is driven by `SessionConfig::reset_on_logon`.
 2. When responding to TestRequest, include TestReqID (tag 112)
 3. Monitor for missing heartbeats from counterparty
 
+**What IronFix implements today**
+
+`ironfix-session::HeartbeatManager` owns the timing; `ironfix-engine`'s
+reactor polls it on a 100 ms tick.
+
+- **`HeartBtInt` = 0 means no heartbeating.** Zero is a legal negotiated
+  interval and disables the mechanism outright: no Heartbeat is emitted, no
+  TestRequest is sent, and the session is never timed out for silence.
+  `should_send_heartbeat`, `should_send_test_request` and `is_timed_out` all
+  return `false` for the life of such a session. It is *not* treated as a
+  zero-length interval. Note the consequence the FIX spec implies: with
+  `108=0` there is no heartbeat-driven liveness check at all, so a dead peer is
+  only noticed when TCP notices.
+- **Heartbeat due.** One interval with nothing sent. Any outbound message
+  resets the timer, so a busy session emits no Heartbeats.
+- **TestRequest due.** One interval plus a transmission grace with nothing
+  received, and no TestRequest already outstanding.
+- **Transmission grace.** Derived from the interval, not configured:
+  `HeartBtInt / 5` (the 20% the QuickFIX family uses), floored at 250 ms. The
+  floor exists because the proportional allowance collapses into scheduling
+  noise for sub-second intervals. It is readable as
+  `HeartbeatManager::test_request_grace()`.
+
 ---
 
 ### Test Request (MsgType = 1)
@@ -173,6 +210,41 @@ Outbound `ResetSeqNumFlag` is driven by `SessionConfig::reset_on_logon`.
 1. Send TestRequest if no message received within HeartBtInt + tolerance
 2. Expect Heartbeat response with matching TestReqID
 3. If no response, consider session disconnected
+
+**What IronFix implements today — what counts as "a response"**
+
+Item 3 above is the only guidance the FIX session spec gives, and it does not
+define what a response is. IronFix defines it explicitly, because the choice is
+the difference between disconnecting a dead peer and disconnecting a live one:
+
+> **Any inbound message the session accepts stops the timeout countdown.** A
+> Heartbeat echoing the outstanding `TestReqID` (112) is the positive
+> confirmation; anything else — an ExecutionReport, a Heartbeat without tag
+> 112, a Heartbeat with the wrong ID — clears the pending TestRequest as
+> *superseded by traffic*.
+
+"Accepted" means the frame decoded, carried a `MsgSeqNum` (34), and passed the
+CompID identity check; foreign traffic never touches the heartbeat clock. A
+sequence gap does *not* disqualify a message here: a gapped frame is still
+proof the peer is transmitting.
+
+Rationale. A peer that is sending us messages is alive, whatever it did with
+our `TestReqID`, and the FIX liveness question is about the connection, not
+about protocol pedantry. Real venues answer a TestRequest with a Heartbeat that
+omits tag 112, or let that Heartbeat be reordered behind a burst of application
+traffic; keying the timeout on the echo alone tears down demonstrably healthy
+sessions. This is also what the QuickFIX family does — it resets its
+test-request counter on any successfully verified inbound message.
+
+Consequence, stated plainly: a peer that streams traffic but never answers a
+TestRequest is never disconnected by this engine. That is deliberate. The
+timeout exists to detect a peer that has stopped talking, and such a peer is
+still talking. The engine distinguishes the two cases in its logs
+(`ironfix_session::TestRequestOutcome`), so a counterparty that never echoes
+`TestReqID` is observable without being disconnected.
+
+The countdown itself is: `is_timed_out()` is true only when a TestRequest was
+sent and **nothing at all** arrived in the interval that followed.
 
 ---
 
@@ -848,15 +920,16 @@ Rationale for the two policies:
 
 ### Phase 1: Core Session Layer (Required)
 - [x] Logon / Logout
-- [ ] Heartbeat / Test Request — **partial**: the interval is negotiated and
-  heartbeats, TestRequests and the silent-peer timeout all work at the
-  configured interval, but two cases in `ironfix-session::HeartbeatManager` are
-  wrong. `HeartBtInt = 0` (legal FIX, meaning "do not send heartbeats") is
-  taken literally as a zero-length interval, so the session floods the peer and
-  then times itself out; and a pending TestRequest is cleared only by a
-  Heartbeat echoing the matching `TestReqID`, so a peer that answers without
-  tag 112 — or whose Heartbeat is reordered behind application traffic — is
-  disconnected despite being demonstrably alive.
+- [x] Heartbeat / Test Request — the interval is negotiated (bounded, since it
+  is counterparty-controlled), a Logon ack that omits the required `HeartBtInt`
+  (108) or carries a non-numeric value fails the handshake rather than
+  establishing a session on the local interval, `HeartBtInt = 0` disables
+  heartbeating as FIX intends, heartbeats and TestRequests fire at the interval
+  plus a derived grace, and the silent-peer timeout stops the moment any
+  accepted inbound message arrives. See "Heartbeat" and "Test Request" above for
+  the negotiation bound, the grace rule, and the definition of "a response".
+  Note this covers the **initiator** only: there is no Acceptor in
+  `ironfix-engine`, so the server-side examples do their own heartbeating.
 - [x] Reject
 - [x] Sequence Reset
 - [ ] Resend Request — **partial**: inbound requests are validated and answered

@@ -31,7 +31,7 @@ pub mod sequence;
 pub mod state;
 
 pub use config::SessionConfig;
-pub use heartbeat::HeartbeatManager;
+pub use heartbeat::{HeartbeatIntervalError, HeartbeatManager, TestRequestOutcome};
 pub use sequence::{SequenceCounter, SequenceExhausted, SequenceManager};
 pub use state::{
     Active, Connecting, Disconnected, LogonReceived, LogonSent, LogoutPending, Resending, Session,
