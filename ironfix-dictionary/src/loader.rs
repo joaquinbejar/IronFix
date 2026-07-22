@@ -591,6 +591,53 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_version_covers_every_known_version() {
+        // The XML attribute table here is a separate mapping from the wire
+        // mapping in `ironfix_core::FixVersion`, so it can only be kept
+        // exhaustive by driving it from the same list of versions.
+        let attrs_for = |version: Version| -> Vec<(&'static str, &'static str)> {
+            match version {
+                Version::Fix40 => vec![("type", "FIX"), ("major", "4"), ("minor", "0")],
+                Version::Fix41 => vec![("type", "FIX"), ("major", "4"), ("minor", "1")],
+                Version::Fix42 => vec![("type", "FIX"), ("major", "4"), ("minor", "2")],
+                Version::Fix43 => vec![("type", "FIX"), ("major", "4"), ("minor", "3")],
+                Version::Fix44 => vec![("type", "FIX"), ("major", "4"), ("minor", "4")],
+                Version::Fix50 => vec![
+                    ("type", "FIX"),
+                    ("major", "5"),
+                    ("minor", "0"),
+                    ("servicepack", "0"),
+                ],
+                Version::Fix50Sp1 => vec![
+                    ("type", "FIX"),
+                    ("major", "5"),
+                    ("minor", "0"),
+                    ("servicepack", "1"),
+                ],
+                Version::Fix50Sp2 => vec![
+                    ("type", "FIX"),
+                    ("major", "5"),
+                    ("minor", "0"),
+                    ("servicepack", "2"),
+                ],
+                Version::Fixt11 => vec![("type", "FIXT"), ("major", "1"), ("minor", "1")],
+            }
+        };
+
+        for version in Version::ALL {
+            let attrs: HashMap<String, String> = attrs_for(version)
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            assert_eq!(
+                parse_version(&attrs),
+                Ok(version),
+                "{version} is not loadable from its QuickFIX XML attributes"
+            );
+        }
+    }
+
+    #[test]
     fn test_unsupported_version() {
         let xml = "<fix type='FIX' major='9' minor='9'><fields></fields></fix>";
         let err = Dictionary::from_quickfix_xml(xml).unwrap_err();

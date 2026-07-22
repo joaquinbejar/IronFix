@@ -17,38 +17,9 @@ use bytes::BytesMut;
 use ironfix_core::error::DecodeError;
 use ironfix_core::message::{OwnedMessage, RawMessage};
 use ironfix_core::types::Timestamp;
+use ironfix_core::version::FixVersion;
 use ironfix_session::SessionConfig;
 use ironfix_tagvalue::{Decoder, Encoder};
-
-/// How a configured FIX version is carried on the wire.
-///
-/// FIX 5.0 and later split the transport version from the application
-/// version: the frame is always a FIXT.1.1 frame (`BeginString` = FIXT.1.1)
-/// and the application version travels in `DefaultApplVerID` (1137) on the
-/// Logon and `ApplVerID` (1128) on application messages
-/// (`doc/fix_operations.md`, "FIX 5.0 / FIXT.1.1"). Putting `FIX.5.0*` in
-/// tag 8 is rejected outright by conforming acceptors.
-///
-/// `ironfix_dictionary::schema::Version` encodes exactly the same mapping in
-/// its `begin_string` / `appl_ver_id` methods, but `ironfix-engine` must not
-/// depend on `ironfix-dictionary` (a hard DAG invariant, see `CLAUDE.md`), so
-/// the mapping is duplicated here in a small spec-derived table. Unifying the
-/// two belongs in `ironfix-core`, which both crates already depend on; that is
-/// follow-up work.
-///
-/// The cost of that duplication is that the two tables can drift apart and no
-/// test can cross-check them without taking the forbidden dependency. Both are
-/// derived from the same fixed clause of the specification and neither changes
-/// unless a new FIX version ships, so the exposure is small — but it is the
-/// reason unifying them is worth doing rather than a permanent arrangement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WireVersion {
-    /// Value stamped into `BeginString` (8).
-    pub(crate) begin_string: &'static str,
-    /// Application version for `DefaultApplVerID` (1137) and `ApplVerID`
-    /// (1128), or `None` for a pre-5.0 session that has neither.
-    pub(crate) appl_ver_id: Option<&'static str>,
-}
 
 /// A configured `BeginString` the engine cannot frame conformantly.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -60,55 +31,58 @@ pub(crate) struct UnsupportedVersion {
     pub(crate) detail: String,
 }
 
-/// Resolves the configured version string to its on-the-wire representation.
+/// Resolves the configured version string to the [`FixVersion`] whose wire
+/// representation the header stamper uses.
 ///
-/// Well-known versions map to interned constants; anything else is leaked
-/// once (bounded: once per `Initiator`), because the tag-value `Encoder`
-/// requires a `&'static str` BeginString. An unrecognized version is passed
-/// through verbatim with no application version, which is the only honest
-/// answer available without a dictionary.
+/// The version-to-wire mapping — `BeginString` (8), and the application
+/// version for `DefaultApplVerID` (1137) and `ApplVerID` (1128) — belongs to
+/// [`FixVersion`] in `ironfix-core`, which is the workspace's single copy of
+/// it. This function only decides whether a configured string names a version
+/// the engine can frame; it does not restate the table.
 ///
-/// A session configured as `FIXT.1.1` gets no `ApplVerID`: FIXT.1.1 names the
-/// transport version only and does not identify an application version.
-/// Configure `FIX.5.0`, `FIX.5.0SP1` or `FIX.5.0SP2` to have 1137 and 1128
-/// stamped.
-pub(crate) fn wire_version(value: &str) -> Result<WireVersion, UnsupportedVersion> {
-    let (begin_string, appl_ver_id) = match value {
-        "FIX.4.0" => ("FIX.4.0", None),
-        "FIX.4.1" => ("FIX.4.1", None),
-        "FIX.4.2" => ("FIX.4.2", None),
-        "FIX.4.3" => ("FIX.4.3", None),
-        "FIX.4.4" => ("FIX.4.4", None),
-        "FIX.5.0" => ("FIXT.1.1", Some("7")),
-        "FIX.5.0SP1" => ("FIXT.1.1", Some("8")),
-        "FIX.5.0SP2" => ("FIXT.1.1", Some("9")),
-        // FIXT.1.1 names the transport version only. A FIXT Logon must carry
-        // DefaultApplVerID (1137), which is required, and nothing here can
-        // supply it: the application version is exactly what this string
-        // failed to state. Defaulting it would put a guessed version on the
-        // wire, so the session is refused instead.
-        "FIXT.1.1" => {
-            return Err(UnsupportedVersion {
-                version: value.to_owned(),
-                detail: "FIXT.1.1 names only the transport version and carries no application \
-                         version for DefaultApplVerID (1137), which a FIXT Logon requires; \
-                         configure FIX.5.0, FIX.5.0SP1 or FIX.5.0SP2 instead"
-                    .to_owned(),
-            });
-        }
-        other => {
-            return Err(UnsupportedVersion {
-                version: other.to_owned(),
-                detail: "not a FIX version this engine can frame; supported values are FIX.4.0 \
-                         through FIX.4.4 and FIX.5.0, FIX.5.0SP1, FIX.5.0SP2"
-                    .to_owned(),
-            });
-        }
-    };
-    Ok(WireVersion {
-        begin_string,
-        appl_ver_id,
-    })
+/// Two strings are refused:
+///
+/// - one that names no version at all, which has no `BeginString` to stamp;
+/// - bare `FIXT.1.1`, which names the transport version only. A FIXT Logon
+///   must carry `DefaultApplVerID` (1137), which is **required**, and the
+///   application version is exactly what this string failed to state.
+///   Defaulting it would put a guessed version on the wire, so the session is
+///   refused instead — configure `FIX.5.0`, `FIX.5.0SP1` or `FIX.5.0SP2`.
+///
+/// # Errors
+/// Returns [`UnsupportedVersion`] in either of those cases.
+pub(crate) fn wire_version(value: &str) -> Result<FixVersion, UnsupportedVersion> {
+    let version: FixVersion = value.parse().map_err(|_| UnsupportedVersion {
+        version: value.to_owned(),
+        detail: format!(
+            "not a FIX version this engine can frame; supported values are {}",
+            framable_versions()
+        ),
+    })?;
+
+    if version.uses_fixt() && version.appl_ver_id().is_none() {
+        return Err(UnsupportedVersion {
+            version: value.to_owned(),
+            detail: format!(
+                "{version} names only the transport version and carries no application version \
+                 for DefaultApplVerID (1137), which a FIXT Logon requires; supported values are {}",
+                framable_versions()
+            ),
+        });
+    }
+
+    Ok(version)
+}
+
+/// Lists the versions [`wire_version`] accepts, derived from [`FixVersion`] so
+/// the message cannot go stale when a version is added.
+fn framable_versions() -> String {
+    FixVersion::ALL
+        .into_iter()
+        .filter(|version| !(version.uses_fixt() && version.appl_ver_id().is_none()))
+        .map(FixVersion::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A mismatch between an inbound message's identity fields and the
@@ -223,7 +197,7 @@ pub(crate) fn owned_from_frame(frame: &[u8]) -> Result<OwnedMessage, DecodeError
 /// Builds outbound frames with the session header stamped.
 #[derive(Debug)]
 pub(crate) struct MessageFactory {
-    version: WireVersion,
+    version: FixVersion,
     sender_comp_id: String,
     target_comp_id: String,
     sender_sub_id: Option<String>,
@@ -233,7 +207,7 @@ pub(crate) struct MessageFactory {
 impl MessageFactory {
     /// Creates a factory from the session configuration.
     #[must_use]
-    pub(crate) fn new(config: &SessionConfig, version: WireVersion) -> Self {
+    pub(crate) fn new(config: &SessionConfig, version: FixVersion) -> Self {
         Self {
             version,
             sender_comp_id: config.sender_comp_id.as_str().to_string(),
@@ -266,7 +240,7 @@ impl MessageFactory {
         poss_dup: bool,
         appl_ver_id: Option<&str>,
     ) -> Encoder {
-        let mut encoder = Encoder::new(self.version.begin_string);
+        let mut encoder = Encoder::new(self.version.begin_string());
         encoder.put_str(35, msg_type);
         if let Some(appl_ver_id) = appl_ver_id {
             encoder.put_str(1128, appl_ver_id);
@@ -300,7 +274,7 @@ impl MessageFactory {
         if reset_seq {
             encoder.put_bool(141, true);
         }
-        if let Some(appl_ver_id) = self.version.appl_ver_id {
+        if let Some(appl_ver_id) = self.version.appl_ver_id() {
             encoder.put_str(1137, appl_ver_id);
         }
         encoder.finish()
@@ -380,7 +354,7 @@ impl MessageFactory {
             message.msg_type().as_str(),
             seq,
             false,
-            self.version.appl_ver_id,
+            self.version.appl_ver_id(),
         );
         for (tag, value) in message.fields() {
             encoder.put_raw(*tag, value);
@@ -478,13 +452,46 @@ mod tests {
 
     #[test]
     fn test_wire_version_pre_fixt_passthrough() {
-        assert_eq!(
-            wire_version("FIX.4.4"),
-            Ok(WireVersion {
-                begin_string: "FIX.4.4",
-                appl_ver_id: None,
-            })
-        );
+        assert_eq!(wire_version("FIX.4.4"), Ok(FixVersion::Fix44));
+    }
+
+    /// The mapping now lives once, in `ironfix_core::FixVersion`. This walks
+    /// every version from that single list and asserts the engine frames each
+    /// one exactly as the core table says — the cross-check that was
+    /// impossible while the engine kept its own copy, since asserting against
+    /// `ironfix-dictionary` would have taken a forbidden dependency.
+    #[test]
+    fn test_wire_version_matches_core_table_for_every_version() {
+        for version in FixVersion::ALL {
+            let resolved = wire_version(version.as_str());
+
+            // Only a FIXT session with no application version is refused; it
+            // cannot supply the required DefaultApplVerID (1137).
+            if version.uses_fixt() && version.appl_ver_id().is_none() {
+                match resolved {
+                    Err(err) => assert_eq!(err.version, version.as_str()),
+                    Ok(framable) => {
+                        unreachable!("{version} must be refused, got {framable:?}")
+                    }
+                }
+                continue;
+            }
+
+            assert_eq!(resolved, Ok(version));
+
+            let frame = factory_for(version.as_str()).logon(1, 30, false);
+            let raw = decode(&frame);
+            assert_eq!(
+                raw.begin_string(),
+                Ok(version.begin_string()),
+                "{version} framed the wrong BeginString"
+            );
+            assert_eq!(
+                raw.get_field_str(1137),
+                version.appl_ver_id(),
+                "{version} framed the wrong DefaultApplVerID"
+            );
+        }
     }
 
     #[test]
@@ -517,27 +524,17 @@ mod tests {
 
     #[test]
     fn test_wire_version_fix50_maps_to_fixt() {
-        assert_eq!(
-            wire_version("FIX.5.0"),
-            Ok(WireVersion {
-                begin_string: "FIXT.1.1",
-                appl_ver_id: Some("7"),
-            })
-        );
-        assert_eq!(
-            wire_version("FIX.5.0SP1"),
-            Ok(WireVersion {
-                begin_string: "FIXT.1.1",
-                appl_ver_id: Some("8"),
-            })
-        );
-        assert_eq!(
-            wire_version("FIX.5.0SP2"),
-            Ok(WireVersion {
-                begin_string: "FIXT.1.1",
-                appl_ver_id: Some("9"),
-            })
-        );
+        for (configured, appl_ver_id) in
+            [("FIX.5.0", "7"), ("FIX.5.0SP1", "8"), ("FIX.5.0SP2", "9")]
+        {
+            match wire_version(configured) {
+                Ok(version) => {
+                    assert_eq!(version.begin_string(), "FIXT.1.1");
+                    assert_eq!(version.appl_ver_id(), Some(appl_ver_id));
+                }
+                Err(err) => unreachable!("{configured} must be framable: {err}"),
+            }
+        }
     }
 
     #[test]

@@ -70,10 +70,11 @@
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Command, Connection, SessionRuntime};
 use crate::error::EngineError;
-use crate::wire::{self, MessageFactory, PeerIdentity, UnsupportedVersion, WireVersion};
+use crate::wire::{self, MessageFactory, PeerIdentity, UnsupportedVersion};
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use ironfix_core::message::{MsgType, RawMessage};
+use ironfix_core::version::FixVersion;
 use ironfix_session::heartbeat::generate_test_req_id;
 use ironfix_session::sequence::{SequenceExhausted, SequenceResult};
 use ironfix_session::{
@@ -109,9 +110,9 @@ pub struct Initiator<A: Application = NoOpApplication> {
     application: Arc<A>,
     /// Session identifier derived from the configuration.
     session_id: SessionId,
-    /// Wire representation (BeginString + ApplVerID) of the configured
-    /// FIX version.
-    version: Result<WireVersion, UnsupportedVersion>,
+    /// The configured FIX version, or why it cannot be framed. Resolved once
+    /// at construction and reported by [`Initiator::connect`] before dialling.
+    version: Result<FixVersion, UnsupportedVersion>,
     /// TCP connect timeout.
     connect_timeout: Duration,
     /// Initial (sender, target) sequence numbers for session continuity.
