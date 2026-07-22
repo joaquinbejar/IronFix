@@ -80,9 +80,11 @@ around it.
   `ironfix-codegen` has an in-workspace consumer.
 - **FAST is standalone.** There is no FAST template XML parser, no UDP multicast
   receiver, and no wiring into the session or engine path.
-- **No benchmark harness.** There is no `benches/` directory and no `criterion`
-  dependency, so no latency or throughput figure in this repository has been
-  measured. The `make bench*` targets currently measure nothing.
+- **No recorded benchmark baseline.** A criterion harness now exists (see
+  Benchmarks below): `ironfix-tagvalue`, `ironfix-fast` and `ironfix-transport`
+  each carry a `benches/` target run by `make bench`. It ships no saved baseline
+  and no published figures, so every latency and throughput target in `doc/`
+  remains a design goal, unmeasured until you run it on hardware you name.
 
 ## FIX version support
 
@@ -241,10 +243,6 @@ make check-spanish       # Enforce English-only sources and docs (runs in CI)
 make zip                 # Create zip without target/ and temp files
 make tree                # Visualize project tree (excludes common clutter)
 ```
-
-`make check-spanish` is defined but currently broken — it invokes a `scripts/`
-directory that is not present in the repository. The English-only rule for code,
-comments and commit messages still applies; it is simply not machine-enforced.
 
 ### 🤖 GitHub Actions (via act)
 

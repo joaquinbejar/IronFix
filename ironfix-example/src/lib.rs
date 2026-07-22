@@ -51,8 +51,9 @@
 //!   automatically.
 //! - [`fast`] is standalone: no template XML parser, no UDP multicast, and no
 //!   wiring into the session path.
-//! - No benchmark harness exists in this workspace, so no latency or
-//!   throughput figure here has been measured.
+//! - A criterion harness exists (`benches/` in `ironfix-tagvalue`,
+//!   `ironfix-fast` and `ironfix-transport`) but records no baseline, so no
+//!   latency or throughput figure here has been measured.
 //!
 //! ## Quick Start
 //!

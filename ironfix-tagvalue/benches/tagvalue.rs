@@ -6,12 +6,16 @@
 
 //! Criterion benchmarks for the tag=value hot path.
 //!
-//! Three groups, each over a fixture built by the crate's own `Encoder` so the
-//! `BodyLength` and `CheckSum` fields are always self-consistent:
+//! The groups covered:
 //!
-//! - `tagvalue/decode` — full `Decoder::decode` and bare field iteration.
-//! - `tagvalue/encode` — a full `finish()` and the reused-buffer append path.
-//! - `tagvalue/checksum` — `calculate_checksum` across payload sizes.
+//! - `tagvalue/decode` — full `Decoder::decode` and bare field iteration over
+//!   two pinned message literals (a Logon and an ExecutionReport), captured once
+//!   from the crate's `Encoder` so the decode input does not silently track a
+//!   later encoder change.
+//! - `tagvalue/encode` — a full `finish()` and the reused-buffer append path,
+//!   built inline by the `Encoder` under test.
+//! - `tagvalue/checksum` — `calculate_checksum` across payload sizes, with the
+//!   scalar `format`/`parse` of the tag 10 field in `tagvalue/checksum_field`.
 //!
 //! This harness only makes measurement possible. It records no baseline and
 //! asserts no latency or throughput figure: run `make bench` to obtain numbers
@@ -25,56 +29,28 @@ use ironfix_tagvalue::{Decoder, Encoder, calculate_checksum};
 
 const BEGIN_STRING: &str = "FIX.4.4";
 
-/// Builds a Logon (35=A) — the shortest message a real session exchanges.
-fn logon() -> Vec<u8> {
-    let mut e = Encoder::new(BEGIN_STRING);
-    e.put_str(35, "A");
-    e.put_str(49, "INITIATOR");
-    e.put_str(56, "ACCEPTOR");
-    e.put_uint(34, 1);
-    e.put_str(52, "20260721-10:15:30.123");
-    e.put_str(98, "0");
-    e.put_uint(108, 30);
-    e.finish().to_vec()
-}
+/// Pinned Logon (35=A) — the shortest message a real session exchanges.
+///
+/// Captured once from the crate's own `Encoder` and kept as a literal, so the
+/// decode benches measure a fixed input rather than tracking the encoder's
+/// current output. `BodyLength` (9) and `CheckSum` (10) are self-consistent as
+/// written.
+const LOGON: &[u8] = b"8=FIX.4.4\x019=72\x0135=A\x0149=INITIATOR\x0156=ACCEPTOR\x0134=1\x0152=20260721-10:15:30.123\x0198=0\x01108=30\x0110=247\x01";
 
-/// Builds an ExecutionReport (35=8) — a representative application message.
-fn execution_report() -> Vec<u8> {
-    let mut e = Encoder::new(BEGIN_STRING);
-    e.put_str(35, "8");
-    e.put_str(49, "ACCEPTOR");
-    e.put_str(56, "INITIATOR");
-    e.put_uint(34, 4242);
-    e.put_str(52, "20260721-10:15:30.123");
-    e.put_str(37, "ORD-0000000042");
-    e.put_str(11, "CLORD-0000000042");
-    e.put_str(17, "EXEC-0000000042");
-    e.put_str(150, "F");
-    e.put_str(39, "2");
-    e.put_str(55, "AAPL");
-    e.put_char(54, '1');
-    e.put_uint(38, 10_000);
-    e.put_str(44, "150.50");
-    e.put_uint(32, 10_000);
-    e.put_str(31, "150.49");
-    e.put_uint(14, 10_000);
-    e.put_str(6, "150.49");
-    e.put_uint(151, 0);
-    e.put_str(60, "20260721-10:15:30.120");
-    e.put_str(1, "ACCOUNT-01");
-    e.put_str(207, "XNAS");
-    e.finish().to_vec()
-}
+/// Pinned ExecutionReport (35=8) — a representative application message.
+///
+/// Captured the same way as [`LOGON`]: a literal, not a live `Encoder` call.
+const EXECUTION_REPORT: &[u8] = b"8=FIX.4.4\x019=253\x0135=8\x0149=ACCEPTOR\x0156=INITIATOR\x0134=4242\x0152=20260721-10:15:30.123\x0137=ORD-0000000042\x0111=CLORD-0000000042\x0117=EXEC-0000000042\x01150=F\x0139=2\x0155=AAPL\x0154=1\x0138=10000\x0144=150.50\x0132=10000\x0131=150.49\x0114=10000\x016=150.49\x01151=0\x0160=20260721-10:15:30.120\x011=ACCOUNT-01\x01207=XNAS\x0110=199\x01";
 
 fn bench_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("tagvalue/decode");
 
-    for (name, msg) in [("logon", logon()), ("execution_report", execution_report())] {
+    for (name, msg) in [("logon", LOGON), ("execution_report", EXECUTION_REPORT)] {
         group.throughput(Throughput::Bytes(msg.len() as u64));
 
-        group.bench_with_input(BenchmarkId::new("decode", name), &msg, |b, msg| {
+        group.bench_with_input(BenchmarkId::new("decode", name), &msg, |b, &msg| {
             b.iter(|| {
-                let mut decoder = Decoder::new(black_box(msg.as_slice()));
+                let mut decoder = Decoder::new(black_box(msg));
                 black_box(decoder.decode().expect("fixture decodes"))
             });
         });
@@ -83,19 +59,18 @@ fn bench_decode(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("decode_no_checksum", name),
             &msg,
-            |b, msg| {
+            |b, &msg| {
                 b.iter(|| {
-                    let mut decoder =
-                        Decoder::new(black_box(msg.as_slice())).with_checksum_validation(false);
+                    let mut decoder = Decoder::new(black_box(msg)).with_checksum_validation(false);
                     black_box(decoder.decode().expect("fixture decodes"))
                 });
             },
         );
 
         // Field iteration alone, without the header/trailer structural checks.
-        group.bench_with_input(BenchmarkId::new("next_field", name), &msg, |b, msg| {
+        group.bench_with_input(BenchmarkId::new("next_field", name), &msg, |b, &msg| {
             b.iter(|| {
-                let mut decoder = Decoder::new(black_box(msg.as_slice()));
+                let mut decoder = Decoder::new(black_box(msg));
                 let mut count = 0usize;
                 while let Some(field) = decoder.next_field().expect("fixture scans") {
                     count += black_box(field).value.len();
@@ -125,7 +100,10 @@ fn bench_encode(c: &mut Criterion) {
         });
     });
 
-    // The zero-allocation path: one buffer, cleared and refilled per message.
+    // Field-append cost on a reused buffer: clear() then the put_* calls, one
+    // buffer refilled per iteration. It stops at body_len(), so it times the
+    // append path only — not finish()'s length/checksum pass — and does not by
+    // itself prove that path allocates nothing.
     group.bench_function("execution_report_body_reused_buffer", |b| {
         let mut e = Encoder::with_capacity(BEGIN_STRING, 512);
         b.iter(|| {
@@ -165,6 +143,13 @@ fn bench_checksum(c: &mut Criterion) {
             },
         );
     }
+
+    group.finish();
+
+    // `format`/`parse` operate on the fixed three-byte tag 10 field, not on a
+    // payload, so they carry no byte throughput. They live in their own group to
+    // keep the per-size `Throughput::Bytes` above from labelling them.
+    let mut group = c.benchmark_group("tagvalue/checksum_field");
 
     group.bench_function("format", |b| {
         b.iter(|| black_box(format_checksum(black_box(213))));

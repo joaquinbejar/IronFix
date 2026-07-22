@@ -36,8 +36,9 @@
 //! A genuinely incomplete buffer is reported distinctly from malformed input,
 //! so a caller framing a stream can tell "read more" from "reject this".
 //!
-//! No performance figure is quoted here, and none should be: this workspace has
-//! no benchmark harness, so nothing in it has been measured.
+//! No performance figure is quoted here, and none should be: the criterion
+//! harness under `benches/` records no baseline, so nothing here has been
+//! measured — run `make bench` to obtain numbers on your own hardware.
 
 pub mod checksum;
 pub mod decoder;

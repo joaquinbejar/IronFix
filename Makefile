@@ -212,7 +212,11 @@ publish-all: require-token readme
 		published="$$published $$crate"; \
 		if [ "$$index" -lt "$$total" ] && [ -z "$(DRY_RUN)" ]; then sleep 30; fi; \
 	done; \
-	echo "Done: all $$total crates are on crates.io at $$version."
+	if [ -n "$(DRY_RUN)" ]; then \
+		echo "DRY_RUN complete: previewed $$total crates at $$version; nothing was published."; \
+	else \
+		echo "Done: all $$total crates are on crates.io at $$version."; \
+	fi
 
 .PHONY: check-cargo-tarpaulin
 check-cargo-tarpaulin:
