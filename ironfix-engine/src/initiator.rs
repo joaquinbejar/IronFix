@@ -89,7 +89,7 @@ use crate::error::EngineError;
 use crate::wire::{self, MessageFactory, PeerIdentity, UnsupportedVersion};
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
-use ironfix_core::error::EncodeError;
+use ironfix_core::error::{DecodeError, EncodeError};
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::version::FixVersion;
 use ironfix_session::heartbeat::{generate_test_req_id, negotiate_interval};
@@ -418,45 +418,82 @@ impl<A: Application + 'static> Initiator<A> {
             // counterparty-controlled and drives every liveness timer in the
             // session. Resolved before the lock is taken, because refusing it
             // has to send a Reject and a Logout.
-            let mut negotiated = None;
-            if let Some(secs) = raw.get_field_str(108).and_then(|s| s.parse::<u64>().ok()) {
-                match negotiate_interval(self.config.heartbeat_interval, secs) {
-                    Ok(interval) => negotiated = Some(interval),
-                    Err(err) => {
-                        let detail = err.to_string();
-                        let reason = RejectReason::new(5, detail.clone()).with_ref_tag(108);
-                        if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
-                            && let Ok(reject) = factory.session_reject(
-                                out_seq.value(),
-                                ack_seq,
-                                MsgType::Logon.as_str(),
-                                &reason,
-                            )
-                        {
-                            let _ = framed.send(reject).await;
-                        }
-                        if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
-                            && let Ok(logout) = factory.logout(out_seq.value(), Some(&detail))
-                        {
-                            let _ = framed.send(logout).await;
-                        }
-                        let _ = session.on_logon_reject();
-                        return Err(EngineError::HeartbeatInterval { detail });
+            //
+            // HeartBtInt (108) is a *required* field of the Logon
+            // (`doc/fix_operations.md`, "Logon"). An ack that omits it or
+            // carries a non-numeric value gives the two sides nothing to agree
+            // liveness timing on, so the handshake fails rather than silently
+            // establishing the session on the locally configured interval.
+            let secs: u64 = match raw.get_field_as::<u64>(108) {
+                Ok(secs) => secs,
+                Err(err) => {
+                    // SessionRejectReason 1 (Required tag missing) for an
+                    // absent 108, 6 (Incorrect data format for value) for a
+                    // present-but-unparseable one.
+                    let (code, detail) = if matches!(err, DecodeError::MissingRequiredField { .. })
+                    {
+                        (
+                            1,
+                            "Logon acknowledgement omitted the required HeartBtInt (108)"
+                                .to_string(),
+                        )
+                    } else {
+                        (6, err.to_string())
+                    };
+                    let reason = RejectReason::new(code, detail.clone()).with_ref_tag(108);
+                    if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
+                        && let Ok(reject) = factory.session_reject(
+                            out_seq.value(),
+                            ack_seq,
+                            MsgType::Logon.as_str(),
+                            &reason,
+                        )
+                    {
+                        let _ = framed.send(reject).await;
                     }
+                    if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
+                        && let Ok(logout) = factory.logout(out_seq.value(), Some(&detail))
+                    {
+                        let _ = framed.send(logout).await;
+                    }
+                    let _ = session.on_logon_reject();
+                    return Err(EngineError::HeartbeatInterval { detail });
                 }
-            }
+            };
+            let negotiated = match negotiate_interval(self.config.heartbeat_interval, secs) {
+                Ok(interval) => interval,
+                Err(err) => {
+                    let detail = err.to_string();
+                    let reason = RejectReason::new(5, detail.clone()).with_ref_tag(108);
+                    if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
+                        && let Ok(reject) = factory.session_reject(
+                            out_seq.value(),
+                            ack_seq,
+                            MsgType::Logon.as_str(),
+                            &reason,
+                        )
+                    {
+                        let _ = framed.send(reject).await;
+                    }
+                    if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
+                        && let Ok(logout) = factory.logout(out_seq.value(), Some(&detail))
+                    {
+                        let _ = framed.send(logout).await;
+                    }
+                    let _ = session.on_logon_reject();
+                    return Err(EngineError::HeartbeatInterval { detail });
+                }
+            };
             {
                 let mut heartbeat = lock_heartbeat(&runtime);
                 heartbeat.on_message_received(false, None);
-                if let Some(interval) = negotiated
-                    && interval != heartbeat.interval()
-                {
+                if negotiated != heartbeat.interval() {
                     tracing::info!(
                         session = %session_id,
-                        heartbeat_secs = interval.as_secs(),
+                        heartbeat_secs = negotiated.as_secs(),
                         "using heartbeat interval confirmed by counterparty"
                     );
-                    *heartbeat = HeartbeatManager::new(interval);
+                    *heartbeat = HeartbeatManager::new(negotiated);
                 }
             }
 

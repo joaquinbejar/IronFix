@@ -68,9 +68,15 @@ and stops at the first failure:
    runs and before sequence state moves, so a cross-wired connection can never
    establish a session.
 3. **`from_admin`.** A rejection sends a Logout and fails the handshake.
-4. **`HeartBtInt` (108).** The interval confirmed by the counterparty wins,
-   within a bound. Because the value is counterparty-controlled and drives
-   every liveness timer in the session, a confirmed interval above
+4. **`HeartBtInt` (108).** 108 is a *required* field of the Logon, so an ack
+   that omits it (session Reject, reason 1 — required tag missing) or carries a
+   non-numeric value (session Reject, reason 6 — incorrect data format for
+   value), `RefTagID` = 108 in both cases and each followed by a Logout, fails
+   the handshake with `EngineError::HeartbeatInterval` rather than silently
+   establishing the session on the locally configured interval. When present and
+   numeric the interval confirmed by the counterparty wins, within a bound.
+   Because the value is counterparty-controlled and drives every liveness timer
+   in the session, a confirmed interval above
    `ironfix_session::heartbeat::MAX_HEARTBEAT_INTERVAL_SECS` (3600 s) is
    refused with a session Reject, reason 5 (value is incorrect),
    `RefTagID` = 108, followed by a Logout; the handshake then fails with
@@ -915,13 +921,15 @@ Rationale for the two policies:
 ### Phase 1: Core Session Layer (Required)
 - [x] Logon / Logout
 - [x] Heartbeat / Test Request — the interval is negotiated (bounded, since it
-  is counterparty-controlled), `HeartBtInt = 0` disables heartbeating as FIX
-  intends, heartbeats and TestRequests fire at the interval plus a derived
-  grace, and the silent-peer timeout stops the moment any accepted inbound
-  message arrives. See "Heartbeat" and "Test Request" above for the negotiation
-  bound, the grace rule, and the definition of "a response". Note this covers
-  the **initiator** only: there is no Acceptor in `ironfix-engine`, so the
-  server-side examples do their own heartbeating.
+  is counterparty-controlled), a Logon ack that omits the required `HeartBtInt`
+  (108) or carries a non-numeric value fails the handshake rather than
+  establishing a session on the local interval, `HeartBtInt = 0` disables
+  heartbeating as FIX intends, heartbeats and TestRequests fire at the interval
+  plus a derived grace, and the silent-peer timeout stops the moment any
+  accepted inbound message arrives. See "Heartbeat" and "Test Request" above for
+  the negotiation bound, the grace rule, and the definition of "a response".
+  Note this covers the **initiator** only: there is no Acceptor in
+  `ironfix-engine`, so the server-side examples do their own heartbeating.
 - [x] Reject
 - [x] Sequence Reset
 - [ ] Resend Request — **partial**: inbound requests are validated and answered

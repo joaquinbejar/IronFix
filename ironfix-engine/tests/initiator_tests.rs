@@ -767,6 +767,10 @@ async fn test_heartbeat_timeout_closes_session() {
 #[tokio::test]
 async fn test_test_request_answered_with_app_traffic_keeps_session_alive() {
     let (listener, addr) = bind_listener().await;
+    // Keeps the acceptor's socket open until the client-side assertions have
+    // run, so `!is_closed()` below cannot race the acceptor dropping its
+    // framed socket at end of task.
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
     let acceptor = tokio::spawn(async move {
         let mut framed = accept_framed(listener).await;
@@ -808,19 +812,15 @@ async fn test_test_request_answered_with_app_traffic_keeps_session_alive() {
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+
+        // Hold the socket open until the test has finished asserting on the
+        // live session, then let the task end (dropping `framed`).
+        let _ = done_rx.await;
     });
 
     let (app, mut app_rx) = RecordingApp::new();
     let initiator = Initiator::new(client_config(Duration::from_secs(1)), Arc::clone(&app));
     let connection = ok(initiator.connect(addr).await, "connect");
-
-    ok(
-        ok(
-            timeout(Duration::from_secs(20), acceptor).await,
-            "acceptor done within 20s",
-        ),
-        "acceptor task",
-    );
 
     for _ in 0..8 {
         let received = ok(
@@ -837,6 +837,16 @@ async fn test_test_request_answered_with_app_traffic_keeps_session_alive() {
     assert!(
         !connection.is_closed(),
         "a demonstrably live session must not be torn down"
+    );
+
+    // Release the acceptor now that the live-session assertions have passed.
+    let _ = done_tx.send(());
+    ok(
+        ok(
+            timeout(Duration::from_secs(20), acceptor).await,
+            "acceptor done within 20s",
+        ),
+        "acceptor task",
     );
 }
 
@@ -917,6 +927,95 @@ async fn test_out_of_range_heartbeat_interval_fails_handshake() {
     match initiator.connect(addr).await {
         Err(EngineError::HeartbeatInterval { detail }) => {
             assert!(detail.contains("99999"), "got {detail}");
+        }
+        other => panic!("expected HeartbeatInterval, got {other:?}"),
+    }
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// HeartBtInt (108) is a required field of the Logon. An ack that omits it is
+/// refused with a Reject (reason 1, RefTagID 108) and a Logout, and fails the
+/// handshake rather than silently establishing a session on the locally
+/// configured interval.
+#[tokio::test]
+async fn test_missing_heartbeat_interval_fails_handshake() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let _logon = next_frame(&mut framed).await;
+        ok(
+            framed.send(venue_msg("A", 1, &[(98, "0")])).await,
+            "send logon ack without HeartBtInt",
+        );
+
+        let reject = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reject), "3");
+        assert_eq!(field(&reject, 373).as_deref(), Some("1"));
+        assert_eq!(field(&reject, 371).as_deref(), Some("108"));
+
+        let logout = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logout), "5");
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+
+    match initiator.connect(addr).await {
+        Err(EngineError::HeartbeatInterval { detail }) => {
+            assert!(detail.contains("108"), "got {detail}");
+        }
+        other => panic!("expected HeartbeatInterval, got {other:?}"),
+    }
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// A non-numeric HeartBtInt (108) on the Logon ack is refused with a Reject
+/// (reason 6, RefTagID 108) and a Logout, and fails the handshake rather than
+/// silently establishing a session on the locally configured interval.
+#[tokio::test]
+async fn test_non_numeric_heartbeat_interval_fails_handshake() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let _logon = next_frame(&mut framed).await;
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "abc")]))
+                .await,
+            "send logon ack with a non-numeric HeartBtInt",
+        );
+
+        let reject = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reject), "3");
+        assert_eq!(field(&reject, 373).as_deref(), Some("6"));
+        assert_eq!(field(&reject, 371).as_deref(), Some("108"));
+
+        let logout = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logout), "5");
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+
+    match initiator.connect(addr).await {
+        Err(EngineError::HeartbeatInterval { detail }) => {
+            assert!(detail.contains("108"), "got {detail}");
         }
         other => panic!("expected HeartbeatInterval, got {other:?}"),
     }
