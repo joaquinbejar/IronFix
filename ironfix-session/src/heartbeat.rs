@@ -489,6 +489,27 @@ mod tests {
         assert!(!mgr.should_send_test_request());
     }
 
+    #[test]
+    fn test_predicates_near_duration_max_do_not_panic() {
+        // Backstop for the remote-DoS root cause: a manager built with a huge
+        // interval (e.g. from a counterparty HeartBtInt of u64::MAX that slipped
+        // past the handshake bound) must not overflow the `interval + grace`
+        // arithmetic. Under `panic = "abort"` an overflow here is a process
+        // kill, so every timing predicate has to return, not panic. An
+        // unreachable interval means "effectively never": nothing is ever due
+        // and the session never times out.
+        let mut mgr = HeartbeatManager::new(Duration::MAX);
+        assert!(!mgr.should_send_heartbeat());
+        assert!(!mgr.should_send_test_request());
+        assert!(!mgr.is_timed_out());
+
+        // Reach the `is_timed_out` comparison against the near-MAX interval by
+        // leaving a TestRequest outstanding; it must compare, not overflow.
+        mgr.on_test_request_sent("TEST-NEAR-MAX".to_string());
+        assert!(!mgr.is_timed_out());
+        assert!(!mgr.should_send_test_request());
+    }
+
     // --- Timeout branches ----------------------------------------------------
 
     #[test]

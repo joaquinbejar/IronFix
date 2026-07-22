@@ -940,6 +940,59 @@ async fn test_out_of_range_heartbeat_interval_fails_handshake() {
     );
 }
 
+/// A HeartBtInt (108) of `u64::MAX` parses as a valid u64, so it is not caught
+/// as malformed; `Duration::from_secs(u64::MAX)` plus the transmission grace
+/// would overflow and — under `panic = "abort"` — kill the process on the first
+/// heartbeat tick. The handshake bound refuses it before any `HeartbeatManager`
+/// is built, so a single crafted Logon field fails the handshake with a Reject
+/// (reason 5, RefTagID 108) and a Logout rather than aborting.
+#[tokio::test]
+async fn test_max_u64_heartbeat_interval_fails_handshake_without_abort() {
+    let (listener, addr) = bind_listener().await;
+    let absurd = u64::MAX.to_string();
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let _logon = next_frame(&mut framed).await;
+        ok(
+            framed
+                .send(venue_msg(
+                    "A",
+                    1,
+                    &[(98, "0"), (108, "18446744073709551615")],
+                ))
+                .await,
+            "send logon ack with a u64::MAX HeartBtInt",
+        );
+
+        let reject = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reject), "3");
+        assert_eq!(field(&reject, 373).as_deref(), Some("5"));
+        assert_eq!(field(&reject, 371).as_deref(), Some("108"));
+
+        let logout = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logout), "5");
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+
+    match initiator.connect(addr).await {
+        Err(EngineError::HeartbeatInterval { detail }) => {
+            assert!(detail.contains(&absurd), "got {detail}");
+        }
+        other => panic!("expected HeartbeatInterval, got {other:?}"),
+    }
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
 /// HeartBtInt (108) is a required field of the Logon. An ack that omits it is
 /// refused with a Reject (reason 1, RefTagID 108) and a Logout, and fails the
 /// handshake rather than silently establishing a session on the locally
