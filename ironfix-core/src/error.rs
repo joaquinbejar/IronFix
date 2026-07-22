@@ -306,12 +306,19 @@ pub enum StoreError {
 /// Rejection reasons for [`crate::types::CompId`] construction.
 ///
 /// A CompID is written verbatim into SenderCompID (49) and TargetCompID (56)
-/// on every outbound message, so a value carrying SOH or `=` would inject
-/// header fields into the frame. Construction is the chokepoint that makes
-/// that unrepresentable.
+/// on every outbound message, so an empty value or one carrying SOH or another
+/// control byte would produce a malformed or injectable frame. Construction is
+/// the chokepoint that makes that unrepresentable.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CompIdError {
+    /// The value is empty.
+    ///
+    /// An empty CompID would encode as `49=<SOH>` (or `56=<SOH>`), a field
+    /// with no value that FIX TagValue treats as malformed.
+    #[error("comp id is empty")]
+    Empty,
+
     /// The value does not fit in the fixed inline storage.
     #[error("comp id is {len} bytes, exceeding the {max_len}-byte inline storage bound")]
     TooLong {
@@ -321,11 +328,10 @@ pub enum CompIdError {
         max_len: usize,
     },
 
-    /// The value contains a byte outside printable ASCII, or the `=`
-    /// tag/value separator.
+    /// The value contains a byte outside printable ASCII (`0x20..=0x7e`).
     #[error(
         "comp id contains illegal byte {byte:#04x} at offset {position}: \
-         only printable ASCII (0x20..=0x7e) except '=' is allowed"
+         only printable ASCII (0x20..=0x7e) is allowed"
     )]
     IllegalByte {
         /// The offending byte.

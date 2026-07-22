@@ -103,7 +103,7 @@ impl fmt::Display for SeqNum {
 /// representable and are rejected by the fallible constructors rather than
 /// wrapped or zeroed. Because the bound is enforced at construction,
 /// [`Timestamp::to_datetime`] and the `format_*` methods are total.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Timestamp {
     /// Nanoseconds since Unix epoch (1970-01-01 00:00:00 UTC).
     nanos_since_epoch: u64,
@@ -313,6 +313,28 @@ impl fmt::Display for Timestamp {
     }
 }
 
+impl<'de> Deserialize<'de> for Timestamp {
+    /// Deserializes a timestamp, routing the raw nanosecond count through
+    /// [`Timestamp::from_nanos`] so the [`Timestamp::MAX_NANOS`] bound is
+    /// enforced. A serialized value whose `nanos_since_epoch` exceeds the
+    /// ceiling is a deserialization error, not a silently clamped or wrapped
+    /// instant — that is what keeps [`Timestamp::to_datetime`] total by
+    /// construction even for values that arrive over serde.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Mirrors the field-per-struct shape the derived `Serialize` emits, so
+        // the pair round-trips, but re-validates instead of trusting the input.
+        #[derive(Deserialize)]
+        struct Raw {
+            nanos_since_epoch: u64,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::from_nanos(raw.nanos_since_epoch).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Component identifier for FIX sessions.
 ///
 /// Used for SenderCompID (tag 49), TargetCompID (tag 56), and related fields.
@@ -326,13 +348,17 @@ impl fmt::Display for Timestamp {
 ///
 /// # Charset
 ///
-/// Only printable ASCII (`0x20..=0x7e`) except `=` is accepted. A CompID is
-/// written verbatim into tags 49 and 56 on every outbound message, so SOH
-/// would terminate the field early and `=` would open a new tag/value pair:
-/// either byte lets a hostile CompID inject header fields or corrupt framing.
-/// Rejecting them at construction is the chokepoint that makes such a value
-/// unrepresentable rather than escaping it at every encode site.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Only printable ASCII (`0x20..=0x7e`) is accepted, and the value must not be
+/// empty. A CompID is written verbatim into tags 49 and 56 on every outbound
+/// message, so a SOH or any other control byte would terminate the field early
+/// and let a hostile CompID inject header fields or corrupt framing; an empty
+/// value would emit `49=<SOH>`, a field FIX TagValue treats as malformed.
+/// Rejecting those at construction is the chokepoint that makes such a value
+/// unrepresentable rather than escaping it at every encode site. The `=` byte
+/// is deliberately **not** rejected: it is a legal FIX String value byte (only
+/// the first `=` of a field separates tag from value, and a CompID is a value,
+/// never a tag), so a counterparty identifier may legitimately contain it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[repr(transparent)]
 #[serde(transparent)]
 pub struct CompId(ArrayString<COMP_ID_MAX_LEN>);
@@ -344,10 +370,13 @@ impl CompId {
     /// * `s` - The component identifier string
     ///
     /// # Errors
-    /// Returns [`CompIdError::TooLong`] if `s` exceeds [`COMP_ID_MAX_LEN`]
-    /// bytes, or [`CompIdError::IllegalByte`] if it contains any byte outside
-    /// printable ASCII, or the `=` tag/value separator.
+    /// Returns [`CompIdError::Empty`] if `s` is empty, [`CompIdError::TooLong`]
+    /// if `s` exceeds [`COMP_ID_MAX_LEN`] bytes, or [`CompIdError::IllegalByte`]
+    /// if it contains any byte outside printable ASCII (`0x20..=0x7e`).
     pub fn new(s: &str) -> Result<Self, CompIdError> {
+        if s.is_empty() {
+            return Err(CompIdError::Empty);
+        }
         if s.len() > COMP_ID_MAX_LEN {
             return Err(CompIdError::TooLong {
                 len: s.len(),
@@ -356,7 +385,7 @@ impl CompId {
         }
         for (position, &byte) in s.as_bytes().iter().enumerate() {
             let printable = byte.is_ascii_graphic() || byte == b' ';
-            if !printable || byte == b'=' {
+            if !printable {
                 return Err(CompIdError::IllegalByte { byte, position });
             }
         }
@@ -407,13 +436,32 @@ impl fmt::Display for CompId {
 impl FromStr for CompId {
     type Err = CompIdError;
 
-    /// Parses a CompID, applying the same length and charset checks as
-    /// [`CompId::new`].
+    /// Parses a CompID, applying the same emptiness, length, and charset checks
+    /// as [`CompId::new`].
     ///
     /// # Errors
-    /// Returns [`CompIdError::TooLong`] or [`CompIdError::IllegalByte`].
+    /// Returns [`CompIdError::Empty`], [`CompIdError::TooLong`], or
+    /// [`CompIdError::IllegalByte`].
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::new(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompId {
+    /// Deserializes a CompID by routing the raw string through [`CompId::new`],
+    /// so the emptiness, length, and charset invariants hold for a value that
+    /// arrives over serde exactly as they do for one built in code. The derived
+    /// `Serialize` is transparent, so a serialized CompID is just its string;
+    /// re-validating it here stops a hand-crafted payload (an embedded SOH, a
+    /// control byte, an over-length or empty value) from reconstructing a
+    /// `CompId` that never passed the constructor and then being written
+    /// verbatim into tags 49 and 56.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -667,6 +715,36 @@ mod tests {
     }
 
     #[test]
+    fn test_timestamp_deserialize_out_of_range_nanos_is_rejected() {
+        use serde::de::value::{Error as ValueError, MapDeserializer};
+
+        // A payload one nanosecond past MAX_NANOS must not rebuild a Timestamp
+        // that skipped `from_nanos` and would trip `to_datetime`'s bound.
+        let de = MapDeserializer::new(std::iter::once((
+            "nanos_since_epoch",
+            Timestamp::MAX_NANOS + 1,
+        )));
+        let result: Result<Timestamp, ValueError> = Timestamp::deserialize(de);
+        assert!(
+            result.is_err(),
+            "nanos past MAX_NANOS must fail to deserialize"
+        );
+    }
+
+    #[test]
+    fn test_timestamp_deserialize_in_range_nanos_round_trips() {
+        use serde::de::value::{Error as ValueError, MapDeserializer};
+
+        let de = MapDeserializer::new(std::iter::once((
+            "nanos_since_epoch",
+            1_700_000_000_123_456_789_u64,
+        )));
+        let result: Result<Timestamp, ValueError> = Timestamp::deserialize(de);
+        let ts = ok(result, "in-range nanos deserializes");
+        assert_eq!(ts.as_nanos(), 1_700_000_000_123_456_789);
+    }
+
+    #[test]
     fn test_comp_id_accepts_plain_value() {
         let id = ok(CompId::new("SENDER"), "SENDER is a valid CompId");
         assert_eq!(id.as_str(), "SENDER");
@@ -706,14 +784,35 @@ mod tests {
     }
 
     #[test]
-    fn test_comp_id_rejects_equals() {
-        assert_eq!(
-            CompId::new("SEND=ER"),
-            Err(CompIdError::IllegalByte {
-                byte: b'=',
-                position: 4,
-            })
+    fn test_comp_id_accepts_equals() {
+        // `=` is a legal FIX String value byte: only the first `=` of a field
+        // separates tag from value, and a CompID is a value, never a tag.
+        let id = ok(CompId::new("SEND=ER"), "'=' is legal inside a CompId value");
+        assert_eq!(id.as_str(), "SEND=ER");
+    }
+
+    #[test]
+    fn test_comp_id_new_empty_is_rejected() {
+        assert_eq!(CompId::new(""), Err(CompIdError::Empty));
+    }
+
+    #[test]
+    fn test_comp_id_deserialize_with_soh_is_rejected() {
+        // A serialized CompID is transparently its string; a hand-crafted value
+        // carrying SOH must not rebuild a CompId that skipped `CompId::new`.
+        let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new("SEND\u{1}ER");
+        let result = CompId::deserialize(de);
+        assert!(
+            result.is_err(),
+            "SOH-bearing CompId must fail to deserialize"
         );
+    }
+
+    #[test]
+    fn test_comp_id_deserialize_valid_round_trips() {
+        let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new("SENDER");
+        let id = ok(CompId::deserialize(de), "SENDER is a valid CompId");
+        assert_eq!(id.as_str(), "SENDER");
     }
 
     #[test]
