@@ -6,7 +6,7 @@
 
 //! Engine error types.
 
-use ironfix_core::error::DecodeError;
+use ironfix_core::error::{DecodeError, EncodeError};
 use ironfix_session::sequence::SequenceExhausted;
 use ironfix_transport::CodecError;
 use std::time::Duration;
@@ -26,6 +26,15 @@ pub enum EngineError {
     /// Failure decoding a framed FIX message.
     #[error("decode error: {0}")]
     Decode(#[from] DecodeError),
+
+    /// A message could not be encoded into a legal frame.
+    ///
+    /// Raised when a field value has no on-the-wire form — a value carrying the
+    /// SOH delimiter, or an empty one. The encoder refuses to stamp such a
+    /// frame rather than emit one whose `BodyLength` and `CheckSum` are correct
+    /// for corrupted bytes.
+    #[error("encode error: {0}")]
+    Encode(#[from] EncodeError),
 
     /// TCP connect did not complete within the configured timeout.
     #[error("connect timed out after {0:?}")]

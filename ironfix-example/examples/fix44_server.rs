@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use ironfix_core::MsgType;
+use ironfix_core::error::EncodeError;
 use ironfix_tagvalue::{Decoder, Encoder};
 
 mod common;
@@ -87,14 +88,14 @@ async fn handle(
                             s.logged_in = true;
                         }
                         info!("Client logged in");
-                        Some(build_logon(&cfg, seq))
+                        Some(build_logon(&cfg, seq)?)
                     }
                     MsgType::TestRequest => {
                         let id = raw.get_field_str(112);
-                        Some(build_heartbeat(&cfg, seq, id))
+                        Some(build_heartbeat(&cfg, seq, id)?)
                     }
                     MsgType::Logout => {
-                        sock.write_all(&build_logout(&cfg, seq)).await?;
+                        sock.write_all(&build_logout(&cfg, seq)?).await?;
                         return Ok(());
                     }
                     MsgType::NewOrderSingle => {
@@ -102,7 +103,7 @@ async fn handle(
                         let sym = raw.get_field_str(55).unwrap_or("N/A");
                         let side = raw.get_field_str(54).unwrap_or("1");
                         let qty = raw.get_field_str(38).unwrap_or("0");
-                        Some(build_exec(&cfg, seq, clid, sym, side, qty))
+                        Some(build_exec(&cfg, seq, clid, sym, side, qty)?)
                     }
                     _ => {
                         warn!("Unhandled: {:?}", raw.msg_type());
@@ -123,7 +124,7 @@ async fn handle(
     Ok(())
 }
 
-fn build_logon(c: &ExampleConfig, seq: u64) -> Vec<u8> {
+fn build_logon(c: &ExampleConfig, seq: u64) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "A");
     e.put_str(49, &c.sender_comp_id);
@@ -132,10 +133,14 @@ fn build_logon(c: &ExampleConfig, seq: u64) -> Vec<u8> {
     e.put_str(52, &format_timestamp());
     e.put_str(98, "0");
     e.put_str(108, &c.heartbeat_interval.to_string());
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
-fn build_heartbeat(c: &ExampleConfig, seq: u64, test_req_id: Option<&str>) -> Vec<u8> {
+fn build_heartbeat(
+    c: &ExampleConfig,
+    seq: u64,
+    test_req_id: Option<&str>,
+) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "0");
     e.put_str(49, &c.sender_comp_id);
@@ -145,17 +150,17 @@ fn build_heartbeat(c: &ExampleConfig, seq: u64, test_req_id: Option<&str>) -> Ve
     if let Some(id) = test_req_id {
         e.put_str(112, id);
     }
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
-fn build_logout(c: &ExampleConfig, seq: u64) -> Vec<u8> {
+fn build_logout(c: &ExampleConfig, seq: u64) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "5");
     e.put_str(49, &c.sender_comp_id);
     e.put_str(56, &c.target_comp_id);
     e.put_str(34, &seq.to_string());
     e.put_str(52, &format_timestamp());
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }
 
 fn build_exec(
@@ -165,7 +170,7 @@ fn build_exec(
     sym: &str,
     side: &str,
     qty: &str,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, EncodeError> {
     let mut e = Encoder::new(FIX_VERSION);
     e.put_str(35, "8");
     e.put_str(49, &c.sender_comp_id);
@@ -182,5 +187,5 @@ fn build_exec(
     e.put_str(151, qty);
     e.put_str(14, "0");
     e.put_str(6, "0");
-    e.finish().to_vec()
+    Ok(e.finish()?.to_vec())
 }

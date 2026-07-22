@@ -73,6 +73,7 @@ use crate::error::EngineError;
 use crate::wire::{self, MessageFactory, PeerIdentity, UnsupportedVersion};
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
+use ironfix_core::error::EncodeError;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::version::FixVersion;
 use ironfix_session::heartbeat::generate_test_req_id;
@@ -275,7 +276,7 @@ impl<A: Application + 'static> Initiator<A> {
             seq,
             self.config.heartbeat_interval_secs(),
             self.config.reset_on_logon,
-        );
+        )?;
         if let Ok(mut owned) = wire::owned_from_frame(&logon) {
             self.application.to_admin(&mut owned, &session_id).await;
         }
@@ -352,19 +353,20 @@ impl<A: Application + 'static> Initiator<A> {
             if let Err(mismatch) = identity.validate(&raw) {
                 let detail = mismatch.to_string();
                 let reason = RejectReason::new(9, detail.clone()).with_ref_tag(mismatch.tag);
-                if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq() {
-                    let reject = factory.session_reject(
+                if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
+                    && let Ok(reject) = factory.session_reject(
                         out_seq.value(),
                         ack_seq,
                         MsgType::Logon.as_str(),
                         &reason,
-                    );
+                    )
+                {
                     let _ = framed.send(reject).await;
                 }
-                if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq() {
-                    let _ = framed
-                        .send(factory.logout(out_seq.value(), Some(&detail)))
-                        .await;
+                if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
+                    && let Ok(logout) = factory.logout(out_seq.value(), Some(&detail))
+                {
+                    let _ = framed.send(logout).await;
                 }
                 let _ = session.on_logon_reject();
                 return Err(EngineError::IdentityMismatch { detail });
@@ -372,11 +374,16 @@ impl<A: Application + 'static> Initiator<A> {
 
             if let Err(reason) = self.application.from_admin(&raw, &session_id).await {
                 match runtime.sequences.try_allocate_sender_seq() {
-                    Ok(seq) => {
-                        let _ = framed
-                            .send(factory.logout(seq.value(), Some(&reason.text)))
-                            .await;
-                    }
+                    Ok(seq) => match factory.logout(seq.value(), Some(&reason.text)) {
+                        Ok(logout) => {
+                            let _ = framed.send(logout).await;
+                        }
+                        Err(err) => tracing::warn!(
+                            session = %session_id,
+                            error = %err,
+                            "cannot encode Logout after from_admin rejection"
+                        ),
+                    },
                     Err(err) => tracing::warn!(
                         session = %session_id,
                         error = %err,
@@ -458,7 +465,7 @@ impl<A: Application + 'static> Initiator<A> {
         // A gap in the Logon ack means we missed messages: request a resend.
         if let Some(expected) = pending_resend {
             let seq = runtime.sequences.try_allocate_sender_seq()?.value();
-            let frame = factory.resend_request(seq, expected, 0);
+            let frame = factory.resend_request(seq, expected, 0)?;
             if let Ok(mut owned) = wire::owned_from_frame(&frame) {
                 self.application.to_admin(&mut owned, &session_id).await;
             }
@@ -635,7 +642,15 @@ async fn run_reactor<A: Application + 'static>(
 impl<A: Application> Reactor<A> {
     /// Sends an admin frame, running the `to_admin` callback and updating
     /// heartbeat bookkeeping.
-    async fn send_admin(&self, framed: &mut FixFramed, frame: BytesMut) -> Result<(), EngineError> {
+    async fn send_admin(
+        &self,
+        framed: &mut FixFramed,
+        frame: Result<BytesMut, EncodeError>,
+    ) -> Result<(), EngineError> {
+        // The frame arrives as the encoder's result so every caller reports an
+        // unencodable message through the path it already uses for a failed
+        // send, rather than each deciding for itself.
+        let frame = frame?;
         if let Ok(mut owned) = wire::owned_from_frame(&frame) {
             self.application
                 .to_admin(&mut owned, &self.session_id)
@@ -663,11 +678,36 @@ impl<A: Application> Reactor<A> {
                     );
                     return Ok(phase);
                 }
-                let seq = match self.runtime.sequences.try_allocate_sender_seq() {
-                    Ok(seq) => seq.value(),
-                    Err(err) => return Err(exhausted(phase, err)),
+                // Build the frame against the sequence number that *would* be
+                // allocated next, without consuming it. An application may hand
+                // us a message with no legal wire form — an ordinary field
+                // carrying SOH, an empty value, a DATA half without its LENGTH.
+                // Validating before allocation makes that a clean drop that
+                // leaves the session and the sequence counter intact, rather
+                // than a teardown over a spent number the counterparty would
+                // have to resend over. The reactor is the sole allocator of the
+                // sender counter and does not await between this peek and the
+                // commit below, so the number it commits is the one framed here.
+                let seq = self.runtime.sequences.next_sender_seq().value();
+                let frame = match self.factory.application_message(seq, &message) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        // The message never reached the wire and no number was
+                        // spent. The value itself is not logged: it may carry a
+                        // credential (554/925) or RawData.
+                        tracing::warn!(
+                            session = %self.session_id,
+                            msg_type = %message.msg_type(),
+                            error = %err,
+                            "dropping outbound message: cannot encode"
+                        );
+                        return Ok(phase);
+                    }
                 };
-                let frame = self.factory.application_message(seq, &message);
+                // The frame encoded; commit the sequence number it carries.
+                if let Err(err) = self.runtime.sequences.try_allocate_sender_seq() {
+                    return Err(exhausted(phase, err));
+                }
                 if let Ok(mut owned) = wire::owned_from_frame(&frame) {
                     self.application.to_app(&mut owned, &self.session_id).await;
                 }
@@ -1216,7 +1256,12 @@ impl<A: Application> Reactor<A> {
                     Ok(out_seq) => out_seq.value(),
                     Err(err) => return Err(exhausted(phase, err)),
                 };
-                let frame = self.factory.heartbeat(out_seq, raw.get_field_str(112));
+                // `112=` with no value is a malformed TestRequest. There is
+                // nothing to echo, and an empty field has no legal wire form,
+                // so the Heartbeat is sent without TestReqID rather than the
+                // session being torn down over the peer's mistake.
+                let test_req_id = raw.get_field_str(112).filter(|id| !id.is_empty());
+                let frame = self.factory.heartbeat(out_seq, test_req_id);
                 if let Err(err) = self.send_admin(framed, frame).await {
                     teardown(phase);
                     return Err(closed(format!("send failed: {err}"), false));

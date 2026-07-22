@@ -23,11 +23,12 @@ use memchr::memchr;
 use smallvec::SmallVec;
 use std::ops::Range;
 
-/// SOH (Start of Header) delimiter used in FIX messages.
-pub const SOH: u8 = 0x01;
-
-/// Equals sign delimiter between tag and value.
-pub const EQUALS: u8 = b'=';
+/// SOH (Start of Header) delimiter, and the `=` tag/value separator.
+///
+/// Both are defined once at the crate root and re-exported here, so
+/// `ironfix_tagvalue::decoder::SOH` keeps resolving to the same item as
+/// `ironfix_tagvalue::SOH`.
+pub use crate::{EQUALS, SOH};
 
 /// Maximum number of digits accepted in a tag number.
 const MAX_TAG_DIGITS: usize = 10;
@@ -64,7 +65,7 @@ const MAX_TAG_DIAGNOSTIC_LEN: usize = 16;
 /// drift.
 #[inline]
 #[must_use]
-const fn paired_data_tag(length_tag: u32) -> Option<u32> {
+pub(crate) const fn paired_data_tag(length_tag: u32) -> Option<u32> {
     match length_tag {
         90 => Some(91),   // SecureDataLen / SecureData
         93 => Some(89),   // SignatureLength / Signature
@@ -84,6 +85,25 @@ const fn paired_data_tag(length_tag: u32) -> Option<u32> {
         621 => Some(622), // EncodedLegSecurityDescLen / EncodedLegSecurityDesc
         _ => None,
     }
+}
+
+/// Returns true if `tag` is a spec-defined `DATA` field.
+///
+/// The right-hand column of [`paired_data_tag`]: a value under one of these
+/// tags may legally contain SOH and `=`, so it is only decodable when the
+/// paired `LENGTH` field precedes it and declares its byte count. The encoder
+/// uses this to refuse a `DATA` field written through the ordinary field path,
+/// which would emit a frame no decoder can frame back.
+///
+/// Written as a `match` for the same reason as [`paired_data_tag`], and
+/// cross-checked against `LENGTH_DATA_PAIRS` in the tests.
+#[inline]
+#[must_use]
+pub(crate) const fn is_data_tag(tag: u32) -> bool {
+    matches!(
+        tag,
+        89 | 91 | 96 | 213 | 349 | 351 | 353 | 355 | 357 | 359 | 361 | 363 | 365 | 446 | 619 | 622
+    )
 }
 
 /// A `DATA` field announced by the `LENGTH` field just consumed.
@@ -168,10 +188,12 @@ impl<'a> Decoder<'a> {
         if body_length_field.tag != 9 {
             return Err(DecodeError::MissingBodyLength);
         }
-        let body_length: usize = body_length_field
-            .as_str()?
-            .parse()
-            .map_err(|_| DecodeError::InvalidBodyLength)?;
+        // FIX types tag 9 as a `Length`: ASCII digits only. `str::parse` would
+        // accept `9=+8`, and would additionally cost a UTF-8 validation pass
+        // per frame, so the same strict digit fold used for every other length
+        // in this file is used here.
+        let body_length =
+            parse_length(body_length_field.value).ok_or(DecodeError::InvalidBodyLength)?;
 
         // Record body start position. BodyLength (tag 9) is fully
         // attacker-controlled, so the end of the body is computed with checked
@@ -530,7 +552,11 @@ fn parse_tag(bytes: &[u8]) -> Option<u32> {
     Some(result)
 }
 
-/// Parses a `LENGTH` field value (a byte count) from ASCII bytes.
+/// Parses a FIX `Length` field value (a byte count) from ASCII bytes.
+///
+/// Used for `BodyLength` (tag 9) and for every `LENGTH` field that frames a
+/// paired `DATA` field. FIX defines these as unsigned integers, so a leading
+/// sign, a space, or any other non-digit byte is rejected rather than coerced.
 ///
 /// # Returns
 /// The declared count, or `None` if the value is empty, non-numeric, too long,
@@ -1094,6 +1120,166 @@ mod tests {
             result.err(),
             Some(DecodeError::UnterminatedField { tag: 58 })
         );
+    }
+
+    #[test]
+    fn test_decode_body_length_with_leading_sign_is_rejected() {
+        // FIX types tag 9 as a digits-only Length. `str::parse` accepted "+8",
+        // so a frame whose declared length carried a sign framed cleanly.
+        for text in ["+8", "-8", " 8", "8 ", "0x8", ""] {
+            let msg = frame_with_body_length(text, "9");
+            assert_eq!(
+                Decoder::new(&msg).decode().err(),
+                Some(DecodeError::InvalidBodyLength),
+                "9={text:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_body_length_non_utf8_is_invalid_body_length() {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"8=FIX.4.4\x01");
+        msg.extend_from_slice(b"9=\xff\xfe\x01");
+        msg.extend_from_slice(b"35=0\x0110=000\x01");
+        assert_eq!(
+            Decoder::new(&msg).decode().err(),
+            Some(DecodeError::InvalidBodyLength)
+        );
+    }
+
+    #[test]
+    fn test_decode_body_length_with_too_many_digits_is_rejected() {
+        let msg = frame_with_body_length("00000000008", "9");
+        assert_eq!(
+            Decoder::new(&msg).decode().err(),
+            Some(DecodeError::InvalidBodyLength)
+        );
+    }
+
+    #[test]
+    fn test_decode_first_tag_not_8_is_invalid_begin_string() {
+        let msg = b"9=5\x018=FIX.4.4\x0135=0\x0110=000\x01";
+        assert_eq!(
+            Decoder::new(msg).decode().err(),
+            Some(DecodeError::InvalidBeginString)
+        );
+    }
+
+    #[test]
+    fn test_decode_second_tag_not_9_is_missing_body_length() {
+        let msg = b"8=FIX.4.4\x0135=0\x0110=000\x01";
+        assert_eq!(
+            Decoder::new(msg).decode().err(),
+            Some(DecodeError::MissingBodyLength)
+        );
+    }
+
+    #[test]
+    fn test_decode_body_length_only_is_missing_msg_type() {
+        // Nothing after the header at all: the body is empty and there is no
+        // third field to read a MsgType from.
+        let msg = b"8=FIX.4.4\x019=0\x01";
+        assert_eq!(
+            Decoder::new(msg).decode().err(),
+            Some(DecodeError::MissingMsgType)
+        );
+    }
+
+    #[test]
+    fn test_decode_third_tag_not_35_is_missing_msg_type() {
+        let body = b"49=A\x0135=0\x01";
+        let msg = build_frame(body);
+        assert_eq!(
+            Decoder::new(&msg).decode().err(),
+            Some(DecodeError::MissingMsgType)
+        );
+    }
+
+    #[test]
+    fn test_decode_wrong_checksum_is_checksum_mismatch() {
+        let body: &[u8] = b"35=0\x0149=A\x0156=B\x01";
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"8=FIX.4.4\x01");
+        msg.extend_from_slice(format!("9={}\x01", body.len()).as_bytes());
+        msg.extend_from_slice(body);
+        let sum: u64 = msg.iter().map(|&b| u64::from(b)).sum();
+        let declared = ((sum % 256) as u8) ^ 0x01;
+        msg.extend_from_slice(format!("10={declared:03}\x01").as_bytes());
+
+        assert_eq!(
+            Decoder::new(&msg).decode().err(),
+            Some(DecodeError::ChecksumMismatch {
+                calculated: (sum % 256) as u8,
+                declared,
+            })
+        );
+    }
+
+    #[test]
+    fn test_decode_out_of_range_checksum_is_typed_error() {
+        let body: &[u8] = b"35=0\x0149=A\x01";
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"8=FIX.4.4\x01");
+        msg.extend_from_slice(format!("9={}\x01", body.len()).as_bytes());
+        msg.extend_from_slice(body);
+        // 999 does not fit in a u8 and must not wrap to 231.
+        msg.extend_from_slice(b"10=999\x01");
+
+        assert!(matches!(
+            Decoder::new(&msg).decode(),
+            Err(DecodeError::InvalidFieldValue { tag: 10, .. })
+        ));
+    }
+
+    #[test]
+    fn test_decode_wrong_checksum_is_accepted_without_validation() {
+        // The production path (`with_checksum_validation(false)`, used by the
+        // engine after the codec has already verified the frame) ignores the
+        // checksum *value* — but the BodyLength cross-check still binds.
+        let body: &[u8] = b"35=0\x0149=A\x0156=B\x01";
+        let mut msg = Vec::new();
+        msg.extend_from_slice(b"8=FIX.4.4\x01");
+        msg.extend_from_slice(format!("9={}\x01", body.len()).as_bytes());
+        msg.extend_from_slice(body);
+        msg.extend_from_slice(b"10=000\x01");
+
+        let Ok(decoded) = Decoder::new(&msg).with_checksum_validation(false).decode() else {
+            panic!("a wrong checksum must not stop the validation-off path");
+        };
+        assert_eq!(*decoded.msg_type(), MsgType::Heartbeat);
+        assert_eq!(decoded.body(), Ok(body));
+
+        // Same frame, BodyLength one byte short.
+        let mut short = Vec::new();
+        short.extend_from_slice(b"8=FIX.4.4\x01");
+        short.extend_from_slice(format!("9={}\x01", body.len() - 1).as_bytes());
+        short.extend_from_slice(body);
+        short.extend_from_slice(b"10=000\x01");
+        assert_eq!(
+            Decoder::new(&short)
+                .with_checksum_validation(false)
+                .decode()
+                .err(),
+            Some(DecodeError::InvalidBodyLength)
+        );
+    }
+
+    #[test]
+    fn test_is_data_tag_matches_the_spec_table() {
+        for (length_tag, data_tag) in LENGTH_DATA_PAIRS {
+            assert!(is_data_tag(data_tag), "tag {data_tag} is a DATA field");
+            assert!(
+                !is_data_tag(length_tag),
+                "tag {length_tag} is a LENGTH field, not a DATA field"
+            );
+        }
+        let data_tags: Vec<u32> = LENGTH_DATA_PAIRS.iter().map(|(_, data)| *data).collect();
+        for tag in 1..=700u32 {
+            if !data_tags.contains(&tag) {
+                assert!(!is_data_tag(tag), "tag {tag} must not be a DATA field");
+            }
+        }
     }
 
     #[test]

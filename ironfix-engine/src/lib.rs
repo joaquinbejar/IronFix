@@ -56,7 +56,7 @@ pub use builder::EngineBuilder;
 pub use connection::Connection;
 pub use error::EngineError;
 pub use initiator::Initiator;
-pub use outbound::OutboundMessage;
+pub use outbound::{OutboundField, OutboundMessage};
 
 // Re-exported for convenience: the per-session configuration consumed by
 // [`Initiator`].
