@@ -77,7 +77,7 @@ jobs:
               echo "$version client exited with $client_rc"
               exit 1
             fi
-            if ! grep -q "Logon OK" "client-${version}.log"; then
+            if ! grep -q "logon accepted" "client-${version}.log"; then
               echo "$version client never completed logon"
               exit 1
             fi
@@ -125,7 +125,7 @@ jobs:
           echo "--- server ---"; cat server-fast.log
           echo "--- client ---"; cat client-fast.log
 
-          if ! grep -q "Received:" client-fast.log; then
+          if ! grep -q "market data" client-fast.log; then
             echo "FAST client never decoded a market data message"
             exit 1
           fi
