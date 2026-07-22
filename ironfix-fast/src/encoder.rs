@@ -226,26 +226,63 @@ impl FastEncoder {
         Ok(())
     }
 
+    /// Encodes a signed integer using stop-bit encoding, in `i128`.
+    ///
+    /// Identical to [`FastEncoder::encode_int`] but takes an `i128`, so it can
+    /// emit the biased `2^63` a nullable signed uses to denote `i64::MAX`.
+    /// `2^63` occupies ten payload bytes, within [`MAX_INT_ENCODED_LEN`].
+    fn encode_int_i128(&mut self, value: i128) {
+        let negative = value < 0;
+        let mut bytes = IntScratch::new();
+        let mut remaining = value;
+
+        loop {
+            bytes.push((remaining & i128::from(PAYLOAD_MASK)) as u8);
+            // Arithmetic shift: converges to 0 for a positive value and to -1
+            // for a negative one.
+            remaining >>= PAYLOAD_BITS;
+
+            if (negative && remaining == -1) || (!negative && remaining == 0) {
+                break;
+            }
+        }
+
+        // The loop always pushes at least one byte, so `last` is always `Some`.
+        let sign_conflicts = bytes
+            .last()
+            .is_some_and(|most_significant| (most_significant & SIGN_BIT != 0) != negative);
+
+        if sign_conflicts {
+            bytes.push(if negative { PAYLOAD_MASK } else { 0x00 });
+        }
+
+        Self::flush_stop_bit_encoded(&mut self.buffer, &mut bytes);
+    }
+
     /// Encodes a nullable signed integer.
     ///
     /// FAST biases only the non-negative half of the range: `None` is the
     /// single stop byte `0x80`, a non-negative value is encoded one higher than
-    /// it is, and a negative value is encoded as itself. The representable
-    /// domain is therefore `i64::MIN..=i64::MAX - 1`: `Some(i64::MAX)` has no
-    /// encoding and is rejected rather than silently biased into the `None`
-    /// representation.
+    /// it is, and a negative value is encoded as itself. The full
+    /// `i64::MIN..=i64::MAX` domain is representable: `Some(i64::MAX)` biases to
+    /// `2^63`, which does not fit `i64`, so the biased value is widened to
+    /// `i128` and emitted in ten stop-bit bytes — the same frame
+    /// [`FastDecoder::decode_nullable_int`](crate::FastDecoder::decode_nullable_int)
+    /// reads back.
     ///
     /// # Arguments
     /// * `value` - The optional value to encode
     ///
     /// # Errors
-    /// Returns [`FastError::IntegerOverflow`] for `Some(i64::MAX)`.
+    /// Never returns an error; the `Result` is kept for API stability and to
+    /// match the fallible ASCII and byte-vector encoders.
     pub fn encode_nullable_int(&mut self, value: Option<i64>) -> Result<(), FastError> {
         match value {
             Some(v) if v < 0 => self.encode_int(v),
             Some(v) => {
-                let biased = v.checked_add(1).ok_or(FastError::IntegerOverflow)?;
-                self.encode_int(biased);
+                // The biased value is at most `2^63`, which fits `i128`, not `i64`.
+                let biased = i128::from(v) + 1;
+                self.encode_int_i128(biased);
             }
             None => self.buffer.push(STOP_BIT),
         }
