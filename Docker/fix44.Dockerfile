@@ -27,11 +27,12 @@ COPY . .
 
 # Cache mounts carry the registry and the build directory across builds. They
 # are not part of the image, so the binary is copied out inside the same RUN.
-# `--locked` fails the build rather than silently resolving a different
-# dependency set than Cargo.lock records.
+# Cargo.lock is not committed (it is git-ignored for this workspace), so the
+# build resolves dependencies fresh rather than passing `--locked` against a
+# lock file the build context does not carry.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked --example fix44_server -p ironfix-example \
+    cargo build --release --example fix44_server -p ironfix-example \
     && cp target/release/examples/fix44_server /fix44_server
 
 # Runtime stage
