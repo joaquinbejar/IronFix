@@ -1,146 +1,49 @@
-//! FIX 5.0 SP1 Client Example (FIXT.1.1 Transport)
-use bytes::BytesMut;
-use ironfix_core::error::EncodeError;
-use ironfix_core::{MsgType, Side};
-use ironfix_tagvalue::{Decoder, Encoder};
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::time::{interval, timeout};
-use tracing::{error, info};
-mod common;
-use common::{ExampleConfig, format_timestamp, init_logging, try_decode_message};
+/******************************************************************************
+   Author: Joaquín Béjar García
+   Email: jb@taunais.com
+   Date: 21/7/26
+******************************************************************************/
+//! FIX 5.0 SP1 client example.
+//!
+//! Dials the matching `fix50sp1_server`, then runs one full session: Logon,
+//! a limit `NewOrderSingle`, the `ExecutionReport` that acknowledges it, a
+//! `TestRequest` / `Heartbeat` round trip, and Logout. Every outbound message
+//! carries the next `MsgSeqNum` (34) from a real `SequenceManager`, and every
+//! inbound one is checked against the expected sequence number.
+//!
+//! ## What the 5.0 family changes on the wire
+//!
+//! * `BeginString` (8) is `FIXT.1.1`, not `FIX 5.0 SP1`: 5.0 splits the session
+//!   version from the application version. Putting `FIX 5.0 SP1` in tag 8 is
+//!   rejected by a conforming counterparty.
+//! * The application version travels in `DefaultApplVerID` (1137) on the Logon
+//!   and `ApplVerID` (1128) on application messages; for FIX 5.0 SP1 it is `8`.
+//!
+//! **This pair demonstrates FIXT.1.1 transport only.** Its application messages
+//! are the 4.4 ones re-stamped with 1128; IronFix has no coverage that is
+//! specific to 5.0, SP1 or SP2, and this example is not evidence of any.
+//!
+//! The session itself lives in [`common::run_demo_client`] and the message
+//! layouts in [`ironfix_example::demo`], because nine near-identical copies of
+//! both had already drifted into protocol bugs. Framing is
+//! `ironfix_transport::FixCodec` — the same codec the engine uses.
+//!
+//! ```text
+//! FIX_HOST=127.0.0.1 FIX_PORT=9881 cargo run --example fix50sp1_client
+//! ```
 
-const FIX_VERSION: &str = "FIXT.1.1";
-const APPL_VER_ID: &str = "8"; // FIX 5.0 SP1
+mod common;
+use common::{ExampleConfig, init_logging, run_demo_client};
+use ironfix_core::FixVersion;
+
+/// FIX version this example speaks.
+const VERSION: FixVersion = FixVersion::Fix50Sp1;
+
+/// Port dialled when `FIX_PORT` is unset.
 const DEFAULT_PORT: u16 = 9881;
 
 #[tokio::main]
-async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     init_logging();
-    let mut cfg = ExampleConfig::client();
-    cfg.port = std::env::var("FIX_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
-    info!(
-        "FIX 5.0 SP1 ({}) Client connecting to {}",
-        FIX_VERSION,
-        cfg.addr()
-    );
-    let mut sock: TcpStream = TcpStream::connect(&cfg.addr()).await?;
-    let mut seq = 1u64;
-    let mut buf = BytesMut::with_capacity(4096);
-
-    sock.write_all(&build_logon(&cfg, seq)?).await?;
-    seq += 1;
-    match timeout(Duration::from_secs(10), read_msg(&mut sock, &mut buf)).await {
-        Ok(Ok(m))
-            if Decoder::new(&m)
-                .decode()
-                .map(|r| *r.msg_type() == MsgType::Logon)
-                .unwrap_or(false) =>
-        {
-            info!("Logon OK")
-        }
-        _ => {
-            error!("Logon failed");
-            return Ok(());
-        }
-    }
-
-    sock.write_all(&build_order(&cfg, seq, "O1", "NVDA", Side::Buy, 30, 450.0)?)
-        .await?;
-    seq += 1;
-    if let Ok(Ok(m)) = timeout(Duration::from_secs(5), read_msg(&mut sock, &mut buf)).await
-        && let Ok(r) = Decoder::new(&m).decode()
-    {
-        info!("Got {:?}", r.msg_type());
-    }
-
-    let mut hb = interval(Duration::from_secs(cfg.heartbeat_interval));
-    for _ in 0..2 {
-        hb.tick().await;
-        sock.write_all(&build_hb(&cfg, seq)?).await?;
-        seq += 1;
-        info!("HB");
-    }
-
-    sock.write_all(&build_logout(&cfg, seq)?).await?;
-    info!("Done");
-    Ok(())
-}
-
-async fn read_msg(
-    s: &mut TcpStream,
-    b: &mut BytesMut,
-) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    loop {
-        if let Some(len) = try_decode_message(b) {
-            return Ok(b.split_to(len).to_vec());
-        }
-        if s.read_buf(b).await? == 0 {
-            return Err("closed".into());
-        }
-    }
-}
-
-fn build_logon(c: &ExampleConfig, seq: u64) -> Result<Vec<u8>, EncodeError> {
-    let mut e = Encoder::new(FIX_VERSION);
-    e.put_str(35, "A");
-    e.put_str(49, &c.sender_comp_id);
-    e.put_str(56, &c.target_comp_id);
-    e.put_str(34, &seq.to_string());
-    e.put_str(52, &format_timestamp());
-    e.put_str(98, "0");
-    e.put_str(108, &c.heartbeat_interval.to_string());
-    e.put_str(1137, APPL_VER_ID);
-    Ok(e.finish()?.to_vec())
-}
-
-fn build_hb(c: &ExampleConfig, seq: u64) -> Result<Vec<u8>, EncodeError> {
-    let mut e = Encoder::new(FIX_VERSION);
-    e.put_str(35, "0");
-    e.put_str(49, &c.sender_comp_id);
-    e.put_str(56, &c.target_comp_id);
-    e.put_str(34, &seq.to_string());
-    e.put_str(52, &format_timestamp());
-    Ok(e.finish()?.to_vec())
-}
-
-fn build_logout(c: &ExampleConfig, seq: u64) -> Result<Vec<u8>, EncodeError> {
-    let mut e = Encoder::new(FIX_VERSION);
-    e.put_str(35, "5");
-    e.put_str(49, &c.sender_comp_id);
-    e.put_str(56, &c.target_comp_id);
-    e.put_str(34, &seq.to_string());
-    e.put_str(52, &format_timestamp());
-    Ok(e.finish()?.to_vec())
-}
-
-fn build_order(
-    c: &ExampleConfig,
-    seq: u64,
-    id: &str,
-    sym: &str,
-    side: Side,
-    qty: u64,
-    px: f64,
-) -> Result<Vec<u8>, EncodeError> {
-    let mut e = Encoder::new(FIX_VERSION);
-    e.put_str(35, "D");
-    e.put_str(49, &c.sender_comp_id);
-    e.put_str(56, &c.target_comp_id);
-    e.put_str(34, &seq.to_string());
-    e.put_str(52, &format_timestamp());
-    e.put_str(1128, APPL_VER_ID);
-    e.put_str(11, id);
-    e.put_str(21, "1");
-    e.put_str(55, sym);
-    e.put_char(54, side.as_char());
-    e.put_str(60, &format_timestamp());
-    e.put_str(38, &qty.to_string());
-    e.put_str(40, "2");
-    e.put_str(44, &format!("{:.2}", px));
-    Ok(e.finish()?.to_vec())
+    run_demo_client(VERSION, &ExampleConfig::client(DEFAULT_PORT)).await
 }

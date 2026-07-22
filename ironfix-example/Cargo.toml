@@ -19,10 +19,15 @@ ironfix-store.workspace = true
 ironfix-transport.workspace = true
 ironfix-fast.workspace = true
 ironfix-engine.workspace = true
+rust_decimal.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
 bytes.workspace = true
+parking_lot.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -110,5 +115,5 @@ name = "fix44_server_channel"
 path = "examples/fix44_server_channel.rs"
 
 [[example]]
-name = "fast_server_spsc"
-path = "examples/fast_server_spsc.rs"
+name = "fast_server_lockfree"
+path = "examples/fast_server_lockfree.rs"

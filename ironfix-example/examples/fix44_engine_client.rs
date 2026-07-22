@@ -1,4 +1,10 @@
-//! FIX 4.4 Client Example using the `ironfix-engine` Initiator.
+/******************************************************************************
+   Author: Joaquín Béjar García
+   Email: jb@taunais.com
+   Date: 21/7/26
+******************************************************************************/
+
+//! FIX 4.4 client using the `ironfix-engine` Initiator.
 //!
 //! Counterpart to `fix44_server`: run the server first, then this client.
 //! Unlike `fix44_client` (hand-rolled framing and session logic), this
@@ -9,10 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
+use rust_decimal::Decimal;
+
 use async_trait::async_trait;
-use ironfix_core::MsgType;
 use ironfix_core::message::RawMessage;
 use ironfix_core::types::CompId;
+use ironfix_core::{MsgType, Timestamp};
 use ironfix_engine::application::{Application, NoOpApplication, RejectReason, SessionId};
 use ironfix_engine::{Initiator, OutboundMessage};
 use ironfix_session::SessionConfigBuilder;
@@ -20,7 +28,11 @@ use ironfix_session::SessionConfigBuilder;
 mod common;
 use common::{ExampleConfig, init_logging};
 
+/// Session version string the engine maps to BeginString and header stamping.
 const FIX_VERSION: &str = "FIX.4.4";
+
+/// Port dialled when `FIX_PORT` is unset; matches `fix44_server`.
+const DEFAULT_PORT: u16 = 9876;
 
 /// Logs execution reports; everything else is engine-managed.
 #[derive(Debug, Default)]
@@ -77,9 +89,9 @@ impl Application for LoggingApp {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     init_logging();
-    let cfg = ExampleConfig::client();
+    let cfg = ExampleConfig::client(DEFAULT_PORT);
     info!("{FIX_VERSION} engine client connecting to {}", cfg.addr());
 
     // The builder validates every knob, so a bad CompID or an out-of-range
@@ -96,14 +108,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let connection = initiator.connect(cfg.addr()).await?;
 
     // Send a NewOrderSingle; the engine stamps the header and MsgSeqNum.
+    // TransactTime (60) is stamped now, not from a literal: a fixed date is
+    // rejected by any counterparty that validates it. Price (44) comes from a
+    // Decimal, never an f64.
+    let price = Decimal::new(15050, 2);
     let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
     order
         .push_str(11, "ORD001")
         .push_str(55, "AAPL")
         .push_char(54, '1')
-        .push_str(60, "20260714-00:00:00.000")
+        .push_str(60, Timestamp::now().format_millis().as_str())
         .push_uint(38, 100)
-        .push_str(44, "150.50")
+        .push_str(44, &price.to_string())
         .push_char(40, '2');
     connection.send(order).await?;
 
