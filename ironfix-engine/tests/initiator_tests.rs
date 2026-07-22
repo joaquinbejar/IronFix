@@ -2063,6 +2063,57 @@ async fn test_frame_without_msg_seq_num_is_dropped() {
     assert_eq!(connection.next_target_seq(), 3);
 }
 
+/// A frame whose MsgSeqNum (34) appears only after the body is dropped as a
+/// missing header field on the shared in-session reactor path, the same
+/// positional contract the CompID and SendingTime checks already enforce.
+/// Initiator and Acceptor share this reactor, so this covers both.
+#[tokio::test]
+async fn test_frame_with_body_only_msg_seq_num_is_dropped() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+
+        // 11 (ClOrdID) opens the body, so the 34 that follows it is not the
+        // standard-header MsgSeqNum. Built by hand: the encoder refuses a frame
+        // whose header field order is not standard, which is exactly the shape
+        // under test.
+        let ts = Timestamp::now().format_millis();
+        let body = format!(
+            "35=0\x0149=VENUE\x0156=CLIENT\x0152={}\x0111=ORDER-1\x0134=1\x01",
+            ts.as_str()
+        );
+        ok(
+            framed.send(raw_frame(body.as_bytes())).await,
+            "send frame with a body-only MsgSeqNum",
+        );
+
+        // The dropped frame consumed no sequence number, so 2 is still next: a
+        // valid TestRequest at 2 is answered, proving sequence state is intact.
+        ok(
+            framed.send(venue_msg("1", 2, &[(112, "PING-1")])).await,
+            "send test request",
+        );
+        let reply = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reply), "0");
+        assert_eq!(field(&reply, 112).as_deref(), Some("PING-1"));
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+    // The body-only-34 frame was dropped; 2 was consumed by the TestRequest.
+    assert_eq!(connection.next_target_seq(), 3);
+}
+
 /// A Logout that is never acknowledged closes the session at the logout
 /// deadline.
 #[tokio::test]
