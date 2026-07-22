@@ -7,16 +7,34 @@
 //! Internal helpers for building and parsing FIX frames.
 //!
 //! Admin messages (Logon, Heartbeat, TestRequest, Logout, ResendRequest,
-//! SequenceReset, Reject) are constructed here with the standard header
-//! stamped from the session configuration. Application messages built by
-//! consumers via [`OutboundMessage`] get the same header treatment.
+//! SequenceReset, Reject) are built here as [`PendingMessage`]s — a MsgType
+//! plus body fields, with no header and no sequence number yet — exactly the
+//! form an application message arrives in. [`MessageFactory::encode`] stamps
+//! the standard header and trailer around either.
+//!
+//! The split is what makes `to_admin` / `to_app` mean something: the callback
+//! mutates the [`OutboundMessage`] inside a [`PendingMessage`], and that is the
+//! value the encoder then reads. It is also what lets the caller encode
+//! **before** spending a sequence number, so a body with no legal wire form
+//! costs nothing.
+//!
+//! One [`Encoder`] lives for the life of the factory and is rewound with
+//! [`Encoder::clear`] between messages, so its buffer is allocated once and
+//! [`MessageFactory::encode`] hands back a slice of it rather than a fresh
+//! owned frame.
+//!
+//! A resend of a **stored** message takes a different path: [`resend_frame`]
+//! rebuilds a verbatim frame the store handed back, keeping its original
+//! `MsgSeqNum` and stamping `PossDupFlag` (43) / `OrigSendingTime` (122). That
+//! is a replay of real traffic, not a freshly numbered message, so it does not
+//! go through the factory's sequence-numbering `encode`.
 
 use crate::application::RejectReason;
 use crate::outbound::{OutboundField, OutboundMessage};
 use bytes::BytesMut;
 use ironfix_core::error::{DecodeError, EncodeError};
 use ironfix_core::field::FieldRef;
-use ironfix_core::message::{OwnedMessage, RawMessage};
+use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::Timestamp;
 use ironfix_core::version::FixVersion;
 use ironfix_session::SessionConfig;
@@ -189,12 +207,6 @@ pub(crate) fn decode_frame(frame: &[u8]) -> Result<RawMessage<'_>, DecodeError> 
     decoder.decode()
 }
 
-/// Decodes a frame into an [`OwnedMessage`] for the `to_admin`/`to_app`
-/// application callbacks.
-pub(crate) fn owned_from_frame(frame: &[u8]) -> Result<OwnedMessage, DecodeError> {
-    Ok(decode_frame(frame)?.to_owned())
-}
-
 /// Why a stored message could not be rebuilt as a resend.
 ///
 /// Every variant means the same thing to the reactor — this particular message
@@ -310,18 +322,70 @@ const RESEND_HEADROOM: usize = 64;
 
 /// Stamps the frame and moves it into a buffer the transport owns.
 ///
+/// Used by [`resend_frame`], which builds a fresh encoder per replayed message
+/// rather than sharing the factory's reused one.
+///
 /// # Errors
 /// Returns the [`EncodeError`] the encoder recorded — a field value that
 /// cannot be represented on the wire, such as a `Text` (58) carrying the SOH
-/// delimiter or an empty `TestReqID` (112) echoed back from a peer. A frame is
-/// never produced from a rejected value.
+/// delimiter. A frame is never produced from a rejected value.
 fn into_frame(encoder: &mut Encoder) -> Result<BytesMut, EncodeError> {
     let mut frame = BytesMut::new();
     encoder.finish_into(&mut frame)?;
     Ok(frame)
 }
 
-/// Builds outbound frames with the session header stamped.
+/// A message built but not yet framed: body fields, plus the one header
+/// property that is not derivable from the MsgType.
+///
+/// This is what the `to_admin` / `to_app` callbacks mutate and what
+/// [`MessageFactory::encode`] reads, so the two cannot disagree about what
+/// goes on the wire.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingMessage {
+    /// MsgType and body fields.
+    message: OutboundMessage,
+    /// Whether the header carries `PossDupFlag` (43) and `OrigSendingTime`
+    /// (122). Only a SequenceReset-GapFill answering a ResendRequest sets it.
+    poss_dup: bool,
+}
+
+impl PendingMessage {
+    /// Wraps a message that is not a possible duplicate.
+    #[must_use]
+    fn plain(message: OutboundMessage) -> Self {
+        Self {
+            message,
+            poss_dup: false,
+        }
+    }
+
+    /// Wraps an application message handed in by a consumer.
+    #[must_use]
+    pub(crate) fn application(message: OutboundMessage) -> Self {
+        Self::plain(message)
+    }
+
+    /// Returns the message type.
+    #[must_use]
+    pub(crate) fn msg_type(&self) -> &MsgType {
+        self.message.msg_type()
+    }
+
+    /// Returns the message body.
+    #[must_use]
+    pub(crate) fn message(&self) -> &OutboundMessage {
+        &self.message
+    }
+
+    /// Returns the message body for the `to_admin` / `to_app` callbacks.
+    #[must_use]
+    pub(crate) fn message_mut(&mut self) -> &mut OutboundMessage {
+        &mut self.message
+    }
+}
+
+/// Builds outbound messages and frames them with the session header stamped.
 #[derive(Debug)]
 pub(crate) struct MessageFactory {
     version: FixVersion,
@@ -331,6 +395,9 @@ pub(crate) struct MessageFactory {
     target_sub_id: Option<String>,
     sender_location_id: Option<String>,
     target_location_id: Option<String>,
+    /// Reused across every message: [`Encoder::clear`] rewinds it while
+    /// retaining its buffer, so framing does not allocate per message.
+    encoder: Encoder,
 }
 
 impl MessageFactory {
@@ -345,196 +412,188 @@ impl MessageFactory {
             target_sub_id: config.target_sub_id.clone(),
             sender_location_id: config.sender_location_id.clone(),
             target_location_id: config.target_location_id.clone(),
+            encoder: Encoder::new(version.begin_string()),
         }
     }
 
-    /// Starts an encoder with the standard header:
-    /// 35, [1128], 49, 56, [50], [142], [57], [143], 34, [43], 52, [122].
+    /// Frames `pending` under `seq` and returns the finished frame, which
+    /// borrows the factory's own buffer until the next call.
+    ///
+    /// The standard header is stamped first —
+    /// 35, [1128], 49, 56, [50], [142], [57], [143], 34, [43], 52, [122] —
+    /// then the body fields in insertion order.
     ///
     /// `SenderLocationID` (142) follows `SenderSubID` (50) and
     /// `TargetLocationID` (143) follows `TargetSubID` (57), the standard-header
-    /// pairing of the routing fields. Both are stamped only when configured;
-    /// an unset LocationID places nothing on the wire.
+    /// pairing of the routing fields. Both are stamped only when configured; an
+    /// unset LocationID places nothing on the wire.
     ///
-    /// `poss_dup` stamps both `PossDupFlag` (43) and `OrigSendingTime` (122),
-    /// because FIX requires 122 on every message carrying 43=Y. Its only user
-    /// is [`MessageFactory::sequence_reset_gap_fill`], which is not a replay of
-    /// anything: a gap fill's "original" is administrative filler that was
-    /// never sent, so there is no recorded sending time to copy and 122 takes
-    /// the same value as `SendingTime` (52) — the FIX handling for an
-    /// unavailable OrigSendingTime. A genuine replay of a stored message goes
-    /// through [`resend_frame`], which copies the real original 52 into 122.
+    /// `PossDupFlag` (43) is always accompanied by `OrigSendingTime` (122):
+    /// FIX requires 122 on every message carrying 43=Y. Its only user here is a
+    /// SequenceReset-GapFill, whose "original" messages are administrative
+    /// filler that was never sent, so there is no recorded sending time to copy
+    /// and 122 takes the same value as `SendingTime` (52) — the FIX handling
+    /// for an unavailable OrigSendingTime. A genuine replay of a stored message
+    /// goes through [`resend_frame`], which copies the real original 52 into
+    /// 122.
     ///
-    /// `appl_ver_id` stamps `ApplVerID` (1128) immediately after MsgType,
-    /// its position in the FIXT.1.1 standard header. It is passed only for
-    /// application messages; session-level messages are versioned by the
-    /// FIXT.1.1 BeginString itself.
-    fn header(
-        &self,
-        msg_type: &str,
+    /// `ApplVerID` (1128) is stamped immediately after MsgType, its position in
+    /// the FIXT.1.1 standard header, and only for application messages;
+    /// session-level messages are versioned by the FIXT.1.1 BeginString itself.
+    ///
+    /// # Errors
+    /// Returns the [`EncodeError`] the encoder recorded — a field value with no
+    /// on-the-wire form, such as a `Text` (58) carrying the SOH delimiter or an
+    /// empty `TestReqID` (112) echoed back from a peer. A frame is never
+    /// produced from a rejected value, and the caller has not yet spent a
+    /// sequence number on it.
+    pub(crate) fn encode(
+        &mut self,
         seq: u64,
-        poss_dup: bool,
-        appl_ver_id: Option<&str>,
-    ) -> Encoder {
-        let mut encoder = Encoder::new(self.version.begin_string());
-        encoder.put_str(35, msg_type);
+        pending: &PendingMessage,
+    ) -> Result<&[u8], EncodeError> {
+        let poss_dup = pending.poss_dup;
+        let message = &pending.message;
+        // Session-level messages are versioned by the BeginString; only
+        // application messages carry ApplVerID.
+        let appl_ver_id = if message.msg_type().is_admin() {
+            None
+        } else {
+            self.version.appl_ver_id()
+        };
+
+        self.encoder.clear();
+        self.encoder.put_str(35, message.msg_type().as_str());
         if let Some(appl_ver_id) = appl_ver_id {
-            encoder.put_str(1128, appl_ver_id);
+            self.encoder.put_str(1128, appl_ver_id);
         }
-        encoder.put_str(49, &self.sender_comp_id);
-        encoder.put_str(56, &self.target_comp_id);
+        self.encoder.put_str(49, &self.sender_comp_id);
+        self.encoder.put_str(56, &self.target_comp_id);
         if let Some(sub) = &self.sender_sub_id {
-            encoder.put_str(50, sub);
+            self.encoder.put_str(50, sub);
         }
         if let Some(location) = &self.sender_location_id {
-            encoder.put_str(142, location);
+            self.encoder.put_str(142, location);
         }
         if let Some(sub) = &self.target_sub_id {
-            encoder.put_str(57, sub);
+            self.encoder.put_str(57, sub);
         }
         if let Some(location) = &self.target_location_id {
-            encoder.put_str(143, location);
+            self.encoder.put_str(143, location);
         }
-        encoder.put_uint(34, seq);
+        self.encoder.put_uint(34, seq);
         if poss_dup {
-            encoder.put_bool(43, true);
+            self.encoder.put_bool(43, true);
         }
         let sending_time = Timestamp::now().format_millis();
-        encoder.put_str(52, sending_time.as_str());
+        self.encoder.put_str(52, sending_time.as_str());
         if poss_dup {
-            encoder.put_str(122, sending_time.as_str());
+            self.encoder.put_str(122, sending_time.as_str());
         }
-        encoder
-    }
 
-    /// Builds a Logon (35=A) with EncryptMethod=0, HeartBtInt and, for a
-    /// FIXT.1.1 session, DefaultApplVerID (1137).
-    pub(crate) fn logon(
-        &self,
-        seq: u64,
-        heartbeat_secs: u64,
-        reset_seq: bool,
-    ) -> Result<BytesMut, EncodeError> {
-        let mut encoder = self.header("A", seq, false, None);
-        encoder.put_uint(98, 0);
-        encoder.put_uint(108, heartbeat_secs);
-        if reset_seq {
-            encoder.put_bool(141, true);
-        }
-        if let Some(appl_ver_id) = self.version.appl_ver_id() {
-            encoder.put_str(1137, appl_ver_id);
-        }
-        into_frame(&mut encoder)
-    }
-
-    /// Builds a Heartbeat (35=0), echoing TestReqID (112) when replying to
-    /// a TestRequest.
-    pub(crate) fn heartbeat(
-        &self,
-        seq: u64,
-        test_req_id: Option<&str>,
-    ) -> Result<BytesMut, EncodeError> {
-        let mut encoder = self.header("0", seq, false, None);
-        if let Some(id) = test_req_id {
-            encoder.put_str(112, id);
-        }
-        into_frame(&mut encoder)
-    }
-
-    /// Builds a TestRequest (35=1) with TestReqID (112).
-    pub(crate) fn test_request(
-        &self,
-        seq: u64,
-        test_req_id: &str,
-    ) -> Result<BytesMut, EncodeError> {
-        let mut encoder = self.header("1", seq, false, None);
-        encoder.put_str(112, test_req_id);
-        into_frame(&mut encoder)
-    }
-
-    /// Builds a Logout (35=5) with optional Text (58).
-    pub(crate) fn logout(&self, seq: u64, text: Option<&str>) -> Result<BytesMut, EncodeError> {
-        let mut encoder = self.header("5", seq, false, None);
-        if let Some(text) = text {
-            encoder.put_str(58, text);
-        }
-        into_frame(&mut encoder)
-    }
-
-    /// Builds a ResendRequest (35=2) for `begin_seq..end_seq`
-    /// (`end_seq` = 0 means "up to infinity").
-    pub(crate) fn resend_request(
-        &self,
-        seq: u64,
-        begin_seq: u64,
-        end_seq: u64,
-    ) -> Result<BytesMut, EncodeError> {
-        let mut encoder = self.header("2", seq, false, None);
-        encoder.put_uint(7, begin_seq);
-        encoder.put_uint(16, end_seq);
-        into_frame(&mut encoder)
-    }
-
-    /// Builds a SequenceReset-GapFill (35=4, 123=Y) that answers a
-    /// ResendRequest by jumping the counterparty's expectation to `new_seq`.
-    /// Stamped with the gap's begin sequence, PossDupFlag (43=Y) and
-    /// OrigSendingTime (122).
-    pub(crate) fn sequence_reset_gap_fill(
-        &self,
-        seq: u64,
-        new_seq: u64,
-    ) -> Result<BytesMut, EncodeError> {
-        let mut encoder = self.header("4", seq, true, None);
-        encoder.put_bool(123, true);
-        encoder.put_uint(36, new_seq);
-        into_frame(&mut encoder)
-    }
-
-    /// Builds a session-level Reject (35=3).
-    pub(crate) fn session_reject(
-        &self,
-        seq: u64,
-        ref_seq: u64,
-        ref_msg_type: &str,
-        reason: &RejectReason,
-    ) -> Result<BytesMut, EncodeError> {
-        let mut encoder = self.header("3", seq, false, None);
-        encoder.put_uint(45, ref_seq);
-        if let Some(ref_tag) = reason.ref_tag {
-            encoder.put_uint(371, u64::from(ref_tag));
-        }
-        encoder.put_str(372, ref_msg_type);
-        encoder.put_uint(373, u64::from(reason.code));
-        if !reason.text.is_empty() {
-            encoder.put_str(58, &reason.text);
-        }
-        into_frame(&mut encoder)
-    }
-
-    /// Builds an application message from an [`OutboundMessage`], stamping
-    /// ApplVerID (1128) for a FIXT.1.1 session.
-    pub(crate) fn application_message(
-        &self,
-        seq: u64,
-        message: &OutboundMessage,
-    ) -> Result<BytesMut, EncodeError> {
-        let mut encoder = self.header(
-            message.msg_type().as_str(),
-            seq,
-            false,
-            self.version.appl_ver_id(),
-        );
         for field in message.fields() {
             match field {
-                OutboundField::Raw { tag, value } => encoder.put_raw(*tag, value),
+                OutboundField::Raw { tag, value } => self.encoder.put_raw(*tag, value),
                 OutboundField::Data {
                     length_tag,
                     data_tag,
                     value,
-                } => encoder.put_data(*length_tag, *data_tag, value),
+                } => self.encoder.put_data(*length_tag, *data_tag, value),
             }
         }
-        into_frame(&mut encoder)
+        self.encoder.finish()
+    }
+
+    /// Builds a Logon (35=A) with EncryptMethod=0, HeartBtInt and, for a
+    /// FIXT.1.1 session, DefaultApplVerID (1137).
+    #[must_use]
+    pub(crate) fn logon(&self, heartbeat_secs: u64, reset_seq: bool) -> PendingMessage {
+        let mut message = OutboundMessage::new(MsgType::Logon);
+        message.push_uint(98, 0).push_uint(108, heartbeat_secs);
+        if reset_seq {
+            message.push_bool(141, true);
+        }
+        if let Some(appl_ver_id) = self.version.appl_ver_id() {
+            message.push_str(1137, appl_ver_id);
+        }
+        PendingMessage::plain(message)
+    }
+
+    /// Builds a Heartbeat (35=0), echoing TestReqID (112) when replying to
+    /// a TestRequest.
+    #[must_use]
+    pub(crate) fn heartbeat(&self, test_req_id: Option<&str>) -> PendingMessage {
+        let mut message = OutboundMessage::new(MsgType::Heartbeat);
+        if let Some(id) = test_req_id {
+            message.push_str(112, id);
+        }
+        PendingMessage::plain(message)
+    }
+
+    /// Builds a TestRequest (35=1) with TestReqID (112).
+    #[must_use]
+    pub(crate) fn test_request(&self, test_req_id: &str) -> PendingMessage {
+        let mut message = OutboundMessage::new(MsgType::TestRequest);
+        message.push_str(112, test_req_id);
+        PendingMessage::plain(message)
+    }
+
+    /// Builds a Logout (35=5) with optional Text (58).
+    ///
+    /// An empty text is dropped rather than written: `58=` has no legal wire
+    /// form, and losing the reason is better than losing the Logout.
+    #[must_use]
+    pub(crate) fn logout(&self, text: Option<&str>) -> PendingMessage {
+        let mut message = OutboundMessage::new(MsgType::Logout);
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            message.push_str(58, text);
+        }
+        PendingMessage::plain(message)
+    }
+
+    /// Builds a ResendRequest (35=2) for `begin_seq..end_seq`
+    /// (`end_seq` = 0 means "up to infinity").
+    #[must_use]
+    pub(crate) fn resend_request(&self, begin_seq: u64, end_seq: u64) -> PendingMessage {
+        let mut message = OutboundMessage::new(MsgType::ResendRequest);
+        message.push_uint(7, begin_seq).push_uint(16, end_seq);
+        PendingMessage::plain(message)
+    }
+
+    /// Builds a SequenceReset-GapFill (35=4, 123=Y) that answers a
+    /// ResendRequest by jumping the counterparty's expectation to `new_seq`.
+    /// Carries PossDupFlag (43=Y) and OrigSendingTime (122); the caller
+    /// encodes it under the gap's begin sequence.
+    #[must_use]
+    pub(crate) fn sequence_reset_gap_fill(&self, new_seq: u64) -> PendingMessage {
+        let mut message = OutboundMessage::new(MsgType::SequenceReset);
+        message.push_bool(123, true).push_uint(36, new_seq);
+        PendingMessage {
+            message,
+            poss_dup: true,
+        }
+    }
+
+    /// Builds a session-level Reject (35=3).
+    #[must_use]
+    pub(crate) fn session_reject(
+        &self,
+        ref_seq: u64,
+        ref_msg_type: &str,
+        reason: &RejectReason,
+    ) -> PendingMessage {
+        let mut message = OutboundMessage::new(MsgType::Reject);
+        message.push_uint(45, ref_seq);
+        if let Some(ref_tag) = reason.ref_tag {
+            message.push_uint(371, u64::from(ref_tag));
+        }
+        message
+            .push_str(372, ref_msg_type)
+            .push_uint(373, u64::from(reason.code));
+        if !reason.text.is_empty() {
+            message.push_str(58, &reason.text);
+        }
+        PendingMessage::plain(message)
     }
 }
 
@@ -573,12 +632,23 @@ mod tests {
         }
     }
 
-    /// Unwraps a factory frame, failing the test with the encoder's rejection.
+    /// Frames `pending` under `seq`, failing the test with the encoder's
+    /// rejection.
     #[track_caller]
-    fn framed(frame: Result<BytesMut, EncodeError>) -> BytesMut {
+    fn framed(factory: &mut MessageFactory, seq: u64, pending: &PendingMessage) -> Vec<u8> {
+        match factory.encode(seq, pending) {
+            Ok(frame) => frame.to_vec(),
+            Err(err) => panic!("factory frame must encode: {err}"),
+        }
+    }
+
+    /// Unwraps a hand-built frame, failing the test with the encoder's
+    /// rejection.
+    #[track_caller]
+    fn built(frame: Result<BytesMut, EncodeError>) -> BytesMut {
         match frame {
             Ok(frame) => frame,
-            Err(err) => panic!("factory frame must encode: {err}"),
+            Err(err) => panic!("fixture frame must encode: {err}"),
         }
     }
 
@@ -600,7 +670,9 @@ mod tests {
 
     #[test]
     fn test_logon_frame_roundtrip() {
-        let frame = framed(factory().logon(1, 30, true));
+        let mut factory = factory();
+        let logon = factory.logon(30, true);
+        let frame = framed(&mut factory, 1, &logon);
         let raw = decode(&frame);
         assert_eq!(raw.msg_type(), &MsgType::Logon);
         assert_eq!(raw.get_field_str(49), Some("CLIENT"));
@@ -615,7 +687,9 @@ mod tests {
 
     #[test]
     fn test_gap_fill_frame_carries_orig_sending_time() {
-        let frame = framed(factory().sequence_reset_gap_fill(3, 10));
+        let mut factory = factory();
+        let gap_fill = factory.sequence_reset_gap_fill(10);
+        let frame = framed(&mut factory, 3, &gap_fill);
         let raw = decode(&frame);
         assert_eq!(raw.msg_type(), &MsgType::SequenceReset);
         assert_eq!(raw.get_field_str(34), Some("3"));
@@ -630,10 +704,59 @@ mod tests {
 
     #[test]
     fn test_non_poss_dup_frame_omits_orig_sending_time() {
-        let frame = framed(factory().heartbeat(4, None));
+        let mut factory = factory();
+        let heartbeat = factory.heartbeat(None);
+        let frame = framed(&mut factory, 4, &heartbeat);
         let raw = decode(&frame);
         assert_eq!(raw.get_field_str(43), None);
         assert_eq!(raw.get_field_str(122), None);
+    }
+
+    #[test]
+    fn test_encoder_reuse_produces_independent_frames() {
+        // One encoder is reused for the life of the session; a message must
+        // never carry residue of the one before it.
+        let mut factory = factory();
+        let logon = factory.logon(30, false);
+        let first = framed(&mut factory, 1, &logon);
+        let heartbeat = factory.heartbeat(Some("TEST-1"));
+        let second = framed(&mut factory, 2, &heartbeat);
+
+        assert_eq!(decode(&first).msg_type(), &MsgType::Logon);
+        assert_eq!(decode(&first).get_field_str(108), Some("30"));
+        let raw = decode(&second);
+        assert_eq!(raw.msg_type(), &MsgType::Heartbeat);
+        assert_eq!(raw.get_field_str(34), Some("2"));
+        assert_eq!(raw.get_field_str(112), Some("TEST-1"));
+        assert_eq!(raw.get_field_str(108), None);
+    }
+
+    #[test]
+    fn test_encode_rejects_an_unframeable_body_without_a_frame() {
+        // A value with no legal wire form is refused here, before the caller
+        // spends a sequence number on it.
+        let mut factory = factory();
+        let mut logout = factory.logout(None);
+        logout.message_mut().push_str(58, "bye\x0149=EVIL");
+        match factory.encode(9, &logout) {
+            Err(EncodeError::InvalidFieldValue { tag: 58, .. }) => {}
+            other => panic!("an embedded SOH must be refused, got {other:?}"),
+        }
+
+        // And the factory still frames the next message.
+        let heartbeat = factory.heartbeat(None);
+        let frame = framed(&mut factory, 9, &heartbeat);
+        assert_eq!(decode(&frame).msg_type(), &MsgType::Heartbeat);
+    }
+
+    #[test]
+    fn test_logout_drops_an_empty_text() {
+        let mut factory = factory();
+        let logout = factory.logout(Some(""));
+        let frame = framed(&mut factory, 1, &logout);
+        let raw = decode(&frame);
+        assert_eq!(raw.msg_type(), &MsgType::Logout);
+        assert_eq!(raw.get_field_str(58), None);
     }
 
     #[test]
@@ -641,7 +764,9 @@ mod tests {
         let mut message = OutboundMessage::new(MsgType::NewOrderSingle);
         message.push_str(11, "ORDER-1").push_char(54, '1');
 
-        let frame = framed(factory().application_message(7, &message));
+        let mut factory = factory();
+        let pending = PendingMessage::application(message);
+        let frame = framed(&mut factory, 7, &pending);
         let raw = decode(&frame);
         assert_eq!(raw.msg_type(), &MsgType::NewOrderSingle);
         assert_eq!(raw.get_field_str(34), Some("7"));
@@ -661,7 +786,9 @@ mod tests {
             .push_str(11, "ORDER-1")
             .push_data(95, 96, payload.to_vec());
 
-        let frame = framed(factory().application_message(7, &message));
+        let mut factory = factory();
+        let pending = PendingMessage::application(message);
+        let frame = framed(&mut factory, 7, &pending);
         let raw = decode(&frame);
         assert_eq!(raw.get_field_str(11), Some("ORDER-1"));
         assert_eq!(raw.get_field(95).map(|f| f.value), Some(b"5".as_slice()));
@@ -677,9 +804,10 @@ mod tests {
             Ok(version) => version,
             Err(err) => panic!("test fixture uses an unsupported version: {err}"),
         };
-        let factory = MessageFactory::new(&config, version);
+        let mut factory = MessageFactory::new(&config, version);
 
-        let frame = framed(factory.logon(1, 30, false));
+        let logon = factory.logon(30, false);
+        let frame = framed(&mut factory, 1, &logon);
         let raw = decode(&frame);
         // SenderLocationID (142) and TargetLocationID (143) are routing fields
         // of the standard header, so a configured value is stamped onto every
@@ -690,7 +818,9 @@ mod tests {
 
     #[test]
     fn test_header_omits_unset_location_ids() {
-        let frame = framed(factory().logon(1, 30, false));
+        let mut factory = factory();
+        let logon = factory.logon(30, false);
+        let frame = framed(&mut factory, 1, &logon);
         let raw = decode(&frame);
         assert_eq!(raw.get_field_str(142), None);
         assert_eq!(raw.get_field_str(143), None);
@@ -725,7 +855,9 @@ mod tests {
 
             assert_eq!(resolved, Ok(version));
 
-            let frame = framed(factory_for(version.as_str()).logon(1, 30, false));
+            let mut factory = factory_for(version.as_str());
+            let logon = factory.logon(30, false);
+            let frame = framed(&mut factory, 1, &logon);
             let raw = decode(&frame);
             assert_eq!(
                 raw.begin_string(),
@@ -785,7 +917,9 @@ mod tests {
 
     #[test]
     fn test_fix50sp2_logon_carries_fixt_begin_string_and_default_appl_ver_id() {
-        let frame = framed(factory_for("FIX.5.0SP2").logon(1, 30, false));
+        let mut factory = factory_for("FIX.5.0SP2");
+        let logon = factory.logon(30, false);
+        let frame = framed(&mut factory, 1, &logon);
         let raw = decode(&frame);
         assert_eq!(raw.begin_string(), Ok("FIXT.1.1"));
         assert_eq!(raw.get_field_str(1137), Some("9"));
@@ -796,7 +930,9 @@ mod tests {
         let mut message = OutboundMessage::new(MsgType::NewOrderSingle);
         message.push_str(11, "ORDER-1");
 
-        let frame = framed(factory_for("FIX.5.0SP2").application_message(2, &message));
+        let mut factory = factory_for("FIX.5.0SP2");
+        let pending = PendingMessage::application(message);
+        let frame = framed(&mut factory, 2, &pending);
         let raw = decode(&frame);
         assert_eq!(raw.begin_string(), Ok("FIXT.1.1"));
         assert_eq!(raw.get_field_str(1128), Some("9"));
@@ -806,7 +942,9 @@ mod tests {
     fn test_resend_frame_preserves_body_and_stamps_poss_dup() {
         let mut message = OutboundMessage::new(MsgType::NewOrderSingle);
         message.push_str(11, "ORDER-1").push_char(54, '1');
-        let original = framed(factory().application_message(7, &message));
+        let mut factory = factory();
+        let pending = PendingMessage::application(message);
+        let original = framed(&mut factory, 7, &pending);
         let original_sending_time = some(
             field_of(&original, 52),
             "the original must carry SendingTime",
@@ -851,7 +989,7 @@ mod tests {
         encoder.put_str(52, PRIOR_REPLAY);
         encoder.put_str(122, FIRST_SENT);
         encoder.put_str(11, "ORDER-1");
-        let once = framed(into_frame(&mut encoder));
+        let once = built(into_frame(&mut encoder));
 
         let twice = match resend_frame(&once) {
             Ok(frame) => frame,
@@ -882,7 +1020,7 @@ mod tests {
         encoder.put_str(49, "CLIENT");
         encoder.put_str(56, "VENUE");
         encoder.put_uint(34, 4);
-        let frame = framed(into_frame(&mut encoder));
+        let frame = built(into_frame(&mut encoder));
 
         match resend_frame(&frame) {
             Err(ResendError::MissingSendingTime) => {}
@@ -912,7 +1050,7 @@ mod tests {
         encoder.put_uint(34, 9);
         encoder.put_str(52, "20260721-10:00:00.000");
         encoder.put_data(95, 96, b"opaque\x01payload");
-        let original = framed(into_frame(&mut encoder));
+        let original = built(into_frame(&mut encoder));
 
         let resent = match resend_frame(&original) {
             Ok(frame) => frame,

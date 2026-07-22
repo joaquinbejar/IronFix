@@ -40,11 +40,15 @@ impl Application for LoggingApp {
         info!("logged out: {session_id}");
     }
 
-    async fn to_admin(
-        &self,
-        _message: &mut ironfix_core::message::OwnedMessage,
-        _session_id: &SessionId,
-    ) {
+    /// Stamps credentials onto the outbound Logon.
+    ///
+    /// The body is mutable and the engine encodes exactly what this hands
+    /// back, so the fields added here reach the counterparty. Every other
+    /// administrative message goes out untouched.
+    async fn to_admin(&self, message: &mut OutboundMessage, _session_id: &SessionId) {
+        if message.msg_type() == &MsgType::Logon {
+            message.push_str(553, "DEMO-USER");
+        }
     }
 
     async fn from_admin(
@@ -55,12 +59,7 @@ impl Application for LoggingApp {
         Ok(())
     }
 
-    async fn to_app(
-        &self,
-        _message: &mut ironfix_core::message::OwnedMessage,
-        _session_id: &SessionId,
-    ) {
-    }
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
 
     async fn from_app(
         &self,

@@ -22,6 +22,7 @@ use ironfix_session::{SessionConfig, SessionConfigError};
 use ironfix_store::{MemoryStore, MessageStore, StoredMessage};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -231,12 +232,7 @@ impl Application for RecordingApp {
         self.record("logout");
     }
 
-    async fn to_admin(
-        &self,
-        _message: &mut ironfix_core::message::OwnedMessage,
-        _session_id: &SessionId,
-    ) {
-    }
+    async fn to_admin(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
 
     async fn from_admin(
         &self,
@@ -249,12 +245,7 @@ impl Application for RecordingApp {
         Ok(())
     }
 
-    async fn to_app(
-        &self,
-        _message: &mut ironfix_core::message::OwnedMessage,
-        _session_id: &SessionId,
-    ) {
-    }
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
 
     async fn from_app(
         &self,
@@ -417,18 +408,21 @@ async fn test_send_raw_data_field_round_trips_byte_exact() {
     ok(acceptor.await, "acceptor task");
 }
 
-/// An `OutboundMessage` with no legal wire form is dropped cleanly: it spends
-/// no sequence number and does not tear the session down, so a following
-/// encodable message still flows with an unbroken sequence.
+/// An `OutboundMessage` with no legal wire form is refused at the send
+/// boundary: it spends no sequence number and does not tear the session down,
+/// so a following encodable message still flows with an unbroken sequence.
+/// The engine validates eagerly (`Connection::send` returns a typed error)
+/// rather than queuing the message and silently dropping it at encode time,
+/// and the rejection never quotes the offending value.
 #[tokio::test]
-async fn test_unencodable_outbound_message_is_dropped_without_teardown() {
+async fn test_unencodable_outbound_message_is_refused_without_teardown() {
     let (listener, addr) = bind_listener().await;
 
     let acceptor = tokio::spawn(async move {
         let mut framed = accept_logon(listener).await;
 
         // Only the encodable message reaches the wire, and it carries seq 2:
-        // the rejected one before it neither reached the wire nor spent a
+        // the refused one before it neither reached the wire nor spent a
         // number, so there is no gap for the peer to resend over.
         let good = next_frame(&mut framed).await;
         assert_eq!(msg_type_of(&good), "D");
@@ -440,19 +434,27 @@ async fn test_unencodable_outbound_message_is_dropped_without_teardown() {
     let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
     let connection = ok(initiator.connect(addr).await, "connect");
 
-    // An ordinary field carrying SOH has no legal wire form; the encoder
-    // refuses it. This used to allocate a sender seq and then tear the session
-    // down on the encode failure.
+    // An ordinary field carrying SOH has no legal wire form; `send` refuses it
+    // at the boundary with a typed error, spending no sequence number, rather
+    // than queuing it and tearing the session down on a later encode failure.
     let mut bad = OutboundMessage::new(MsgType::NewOrderSingle);
     bad.push_str(11, "BAD").push_str(58, "text\x0149=EVIL");
-    ok(connection.send(bad).await, "queue unencodable message");
+    match connection.send(bad).await {
+        Err(EngineError::InvalidField { tag: 58, reason }) => {
+            assert!(
+                !reason.contains("EVIL"),
+                "the rejection must not quote the value, got {reason}"
+            );
+        }
+        other => panic!("an embedded SOH must be refused, got {other:?}"),
+    }
 
     let mut good = OutboundMessage::new(MsgType::NewOrderSingle);
     good.push_str(11, "GOOD");
     ok(connection.send(good).await, "queue encodable message");
 
     // The session is closed by the acceptor's transport drop after it reads the
-    // good frame, not by a teardown from the rejected message.
+    // good frame, not by a teardown from the refused message.
     ok(
         timeout(Duration::from_secs(5), connection.wait_closed()).await,
         "closed within 5s",
@@ -2461,6 +2463,7 @@ async fn test_connect_refuses_a_fractional_heartbeat_interval() {
         "the socket must never be dialled"
     );
 }
+
 // ---------------------------------------------------------------------------
 // Resend from a message store
 // ---------------------------------------------------------------------------
@@ -3195,4 +3198,775 @@ async fn test_resend_request_replays_across_store_pages() {
         ),
         "acceptor task",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Outbound path: effective callbacks, a guarded public boundary, and a reactor
+// that no callback or peer can park.
+// ---------------------------------------------------------------------------
+
+/// Stamps fields onto every outbound message, so the test can look for them in
+/// the bytes the acceptor actually receives.
+#[derive(Debug)]
+struct StampingApp {
+    /// Fields appended to every administrative message.
+    admin_fields: Vec<(u32, String)>,
+    /// Fields appended to every application message.
+    app_fields: Vec<(u32, String)>,
+}
+
+impl StampingApp {
+    fn build(admin_fields: &[(u32, &str)], app_fields: &[(u32, &str)]) -> Arc<Self> {
+        let own = |fields: &[(u32, &str)]| {
+            fields
+                .iter()
+                .map(|(tag, value)| (*tag, (*value).to_string()))
+                .collect()
+        };
+        Arc::new(Self {
+            admin_fields: own(admin_fields),
+            app_fields: own(app_fields),
+        })
+    }
+}
+
+#[async_trait]
+impl Application for StampingApp {
+    async fn on_create(&self, _session_id: &SessionId) {}
+
+    async fn on_logon(&self, _session_id: &SessionId) {}
+
+    async fn on_logout(&self, _session_id: &SessionId) {}
+
+    async fn to_admin(&self, message: &mut OutboundMessage, _session_id: &SessionId) {
+        for (tag, value) in &self.admin_fields {
+            message.push_str(*tag, value);
+        }
+    }
+
+    async fn from_admin(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+
+    async fn to_app(&self, message: &mut OutboundMessage, _session_id: &SessionId) {
+        for (tag, value) in &self.app_fields {
+            message.push_str(*tag, value);
+        }
+    }
+
+    async fn from_app(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+}
+
+/// A `to_admin` mutation is what the counterparty receives. Stamping
+/// credentials onto the Logon is the documented use of the callback, and the
+/// engine used to hand the application a throwaway copy and then transmit the
+/// original.
+#[tokio::test]
+async fn test_to_admin_mutation_reaches_the_wire() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logon), "A");
+        // The fields the application appended, in the frame that went out.
+        assert_eq!(field(&logon, 553).as_deref(), Some("trader"));
+        assert_eq!(field(&logon, 554).as_deref(), Some("s3cret"));
+        // And the header the engine stamps is intact and unduplicated.
+        assert_eq!(field(&logon, 34).as_deref(), Some("1"));
+        assert_eq!(field(&logon, 108).as_deref(), Some("30"));
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30")]))
+                .await,
+            "send logon ack",
+        );
+        framed
+    });
+
+    let app = StampingApp::build(&[(553, "trader"), (554, "s3cret")], &[]);
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), app);
+    let connection = ok(initiator.connect(addr).await, "connect");
+    let _framed = ok(acceptor.await, "acceptor task");
+    assert!(!connection.is_closed());
+}
+
+/// The same for `to_app`: a field added in the callback is encoded into the
+/// application message the counterparty receives.
+#[tokio::test]
+async fn test_to_app_mutation_reaches_the_wire() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let order = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&order), "D");
+        assert_eq!(field(&order, 11).as_deref(), Some("ORDER-1"));
+        assert_eq!(field(&order, 1).as_deref(), Some("ACCOUNT-9"));
+        assert_eq!(field(&order, 34).as_deref(), Some("2"));
+    });
+
+    let app = StampingApp::build(&[], &[(1, "ACCOUNT-9")]);
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), app);
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+    order.push_str(11, "ORDER-1");
+    ok(connection.send(order).await, "send order");
+
+    ok(acceptor.await, "acceptor task");
+}
+
+/// Administrative traffic belongs to the session layer. A Logon, Logout or
+/// SequenceReset sent through the public path would bypass the typestate and
+/// the reactor's phase tracking.
+#[tokio::test]
+async fn test_send_refuses_admin_msg_types() {
+    let (listener, addr) = bind_listener().await;
+    let acceptor = tokio::spawn(async move { accept_logon(listener).await });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+    let _framed = ok(acceptor.await, "acceptor task");
+
+    for msg_type in [
+        MsgType::Logon,
+        MsgType::Logout,
+        MsgType::SequenceReset,
+        MsgType::Heartbeat,
+        MsgType::TestRequest,
+        MsgType::ResendRequest,
+        MsgType::Reject,
+    ] {
+        let expected = msg_type.as_str().to_string();
+        match connection.send(OutboundMessage::new(msg_type)).await {
+            Err(EngineError::ReservedMsgType { msg_type }) => assert_eq!(msg_type, expected),
+            other => panic!("35={expected} must be refused, got {other:?}"),
+        }
+    }
+
+    // Nothing was queued, so the session is untouched.
+    assert_eq!(connection.next_sender_seq(), 2);
+    assert!(!connection.is_closed());
+}
+
+/// A body field repeating a tag the engine stamps would give the frame two
+/// occurrences of it, which a conforming counterparty rejects or misparses.
+#[tokio::test]
+async fn test_send_refuses_reserved_header_tags() {
+    let (listener, addr) = bind_listener().await;
+    let acceptor = tokio::spawn(async move { accept_logon(listener).await });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+    let _framed = ok(acceptor.await, "acceptor task");
+
+    for tag in ironfix_engine::outbound::RESERVED_TAGS {
+        let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+        order.push_str(11, "ORDER-1").push_str(tag, "1");
+        match connection.send(order).await {
+            Err(EngineError::ReservedTag { tag: actual }) => assert_eq!(actual, tag),
+            other => panic!("tag {tag} must be refused, got {other:?}"),
+        }
+    }
+
+    assert_eq!(connection.next_sender_seq(), 2);
+    assert!(!connection.is_closed());
+}
+
+/// A value with no wire form is refused at the boundary rather than becoming
+/// an encoder failure after a sequence number has been spent.
+#[tokio::test]
+async fn test_send_refuses_values_with_no_wire_form() {
+    let (listener, addr) = bind_listener().await;
+    let acceptor = tokio::spawn(async move { accept_logon(listener).await });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+    let _framed = ok(acceptor.await, "acceptor task");
+
+    let mut empty = OutboundMessage::new(MsgType::NewOrderSingle);
+    empty.push_str(11, "");
+    match connection.send(empty).await {
+        Err(EngineError::InvalidField { tag: 11, .. }) => {}
+        other => panic!("an empty value must be refused, got {other:?}"),
+    }
+
+    let mut injected = OutboundMessage::new(MsgType::NewOrderSingle);
+    injected.push_str(58, "text\x0149=EVIL");
+    match connection.send(injected).await {
+        Err(EngineError::InvalidField { tag: 58, reason }) => {
+            assert!(
+                !reason.contains("EVIL"),
+                "the rejection must not quote the value, got {reason}"
+            );
+        }
+        other => panic!("an embedded SOH must be refused, got {other:?}"),
+    }
+
+    assert_eq!(connection.next_sender_seq(), 2);
+    assert!(!connection.is_closed());
+}
+
+/// Corrupts the first outbound application message from inside `to_app`, then
+/// leaves every later one alone.
+#[derive(Debug, Default)]
+struct CorruptFirstApp {
+    /// How many application messages have passed through `to_app`.
+    seen: AtomicU64,
+}
+
+#[async_trait]
+impl Application for CorruptFirstApp {
+    async fn on_create(&self, _session_id: &SessionId) {}
+
+    async fn on_logon(&self, _session_id: &SessionId) {}
+
+    async fn on_logout(&self, _session_id: &SessionId) {}
+
+    async fn to_admin(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_admin(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+
+    async fn to_app(&self, message: &mut OutboundMessage, _session_id: &SessionId) {
+        if self.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            // MsgSeqNum is stamped by the engine; a second copy would give the
+            // frame two of it.
+            message.push_str(34, "999");
+        }
+    }
+
+    async fn from_app(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+}
+
+/// A `to_app` callback that makes a message unsendable costs nothing: the
+/// message is dropped, the sequence number is not spent, and the next message
+/// takes the number the dropped one would have had. Detecting this after the
+/// allocation would leave a gap the counterparty has to resend over.
+#[tokio::test]
+async fn test_a_message_rejected_after_to_app_spends_no_sequence_number() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        // The first order never reaches the wire; the second takes MsgSeqNum 2.
+        let order = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&order), "D");
+        assert_eq!(field(&order, 34).as_deref(), Some("2"));
+        assert_eq!(field(&order, 11).as_deref(), Some("ORDER-2"));
+        // Exactly one MsgSeqNum in the frame, not two.
+        assert_eq!(
+            String::from_utf8_lossy(&order).matches("\x0134=").count(),
+            1
+        );
+    });
+
+    let app = Arc::new(CorruptFirstApp::default());
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    let mut first = OutboundMessage::new(MsgType::NewOrderSingle);
+    first.push_str(11, "ORDER-1");
+    ok(connection.send(first).await, "queue the first order");
+
+    // Give the reactor time to process and drop it.
+    let mut waited = Duration::ZERO;
+    while app.seen.load(Ordering::SeqCst) == 0 && waited < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waited += Duration::from_millis(20);
+    }
+    assert_eq!(
+        connection.next_sender_seq(),
+        2,
+        "a dropped message must not spend a sequence number"
+    );
+    assert!(!connection.is_closed(), "the session must survive the drop");
+
+    let mut second = OutboundMessage::new(MsgType::NewOrderSingle);
+    second.push_str(11, "ORDER-2");
+    ok(connection.send(second).await, "queue the second order");
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor must finish",
+        ),
+        "acceptor task",
+    );
+}
+
+/// Records how long `from_app` was inside the callback, so a test can hold the
+/// application up while asserting the reactor kept working.
+#[derive(Debug)]
+struct SlowApp {
+    /// How long `from_app` blocks.
+    delay: Duration,
+    /// Fires when `from_app` is entered.
+    entered: mpsc::UnboundedSender<u64>,
+}
+
+impl SlowApp {
+    fn build(delay: Duration) -> (Arc<Self>, mpsc::UnboundedReceiver<u64>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Arc::new(Self { delay, entered: tx }), rx)
+    }
+}
+
+#[async_trait]
+impl Application for SlowApp {
+    async fn on_create(&self, _session_id: &SessionId) {}
+
+    async fn on_logon(&self, _session_id: &SessionId) {}
+
+    async fn on_logout(&self, _session_id: &SessionId) {}
+
+    async fn to_admin(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_admin(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_app(
+        &self,
+        message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        let seq = message
+            .get_field_str(34)
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        let _ = self.entered.send(seq);
+        tokio::time::sleep(self.delay).await;
+        Ok(())
+    }
+}
+
+/// A slow `from_app` no longer stalls the reactor: while the application is
+/// blocked inside the callback, the heartbeat the session owes its
+/// counterparty still goes out.
+#[tokio::test]
+async fn test_slow_from_app_does_not_stall_heartbeats() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logon), "A");
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "1")]))
+                .await,
+            "send logon ack",
+        );
+
+        // One application message, which the handler will sit on for 3s.
+        ok(
+            framed
+                .send(venue_msg(
+                    "8",
+                    2,
+                    &[
+                        (37, "EX-1"),
+                        (11, "ORDER-1"),
+                        (17, "E-1"),
+                        (150, "0"),
+                        (39, "0"),
+                    ],
+                ))
+                .await,
+            "send execution report",
+        );
+
+        // The reactor must keep working while the handler is blocked. Answer
+        // any TestRequest so the session stays alive, and stop as soon as a
+        // Heartbeat proves the timer arm still runs.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+        loop {
+            let Ok(polled) = tokio::time::timeout_at(deadline, framed.next()).await else {
+                return false;
+            };
+            let Some(Ok(frame)) = polled else {
+                return false;
+            };
+            match msg_type_of(&frame).as_str() {
+                "0" => return true,
+                "1" => {
+                    let id = some(field(&frame, 112), "TestRequest must carry TestReqID");
+                    ok(
+                        framed.send(venue_msg("0", 3, &[(112, &id)])).await,
+                        "answer the TestRequest",
+                    );
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let (app, mut entered) = SlowApp::build(Duration::from_secs(3));
+    let initiator = Initiator::new(client_config(Duration::from_secs(1)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    // The handler really did get the message and really is blocked in it.
+    let seq = ok(
+        timeout(Duration::from_secs(2), entered.recv()).await,
+        "from_app must be entered",
+    );
+    assert_eq!(seq, Some(2));
+
+    let saw_heartbeat = ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor must finish",
+        ),
+        "acceptor task",
+    );
+    assert!(
+        saw_heartbeat,
+        "the reactor must emit a heartbeat while from_app is blocked"
+    );
+    assert!(!connection.is_closed());
+}
+
+/// A counterparty that stops reading closes its TCP receive window, and a
+/// write into a closed window never completes. The write timeout turns that
+/// into a session close in bounded time instead of a reactor parked forever
+/// with its liveness timers.
+#[tokio::test]
+async fn test_stalled_peer_write_timeout_closes_the_session() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let framed = accept_logon(listener).await;
+        // Hold the socket open and never read again.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        drop(framed);
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_write_timeout(Duration::from_millis(300));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    // Push until the socket buffers fill and the reactor's write parks. The
+    // command queue is bounded, so this throttles itself rather than
+    // allocating without limit.
+    let pushed = timeout(Duration::from_secs(15), async {
+        loop {
+            let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+            order
+                .push_str(11, "ORDER-1")
+                .push_raw(58, vec![b'x'; 60_000]);
+            if connection.send(order).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
+    ok(pushed, "the session must close rather than block forever");
+
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "wait_closed must fire after the write timeout",
+    );
+    assert!(connection.is_closed());
+    acceptor.abort();
+}
+
+/// Removes a configured tag from every administrative message in `to_admin`,
+/// standing in for a callback that strips a field the message cannot go out
+/// without.
+#[derive(Debug)]
+struct DropAdminFieldApp {
+    /// The tag removed from every admin message.
+    tag: u32,
+}
+
+#[async_trait]
+impl Application for DropAdminFieldApp {
+    async fn on_create(&self, _session_id: &SessionId) {}
+
+    async fn on_logon(&self, _session_id: &SessionId) {}
+
+    async fn on_logout(&self, _session_id: &SessionId) {}
+
+    async fn to_admin(&self, message: &mut OutboundMessage, _session_id: &SessionId) {
+        message.remove(self.tag);
+    }
+
+    async fn from_admin(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_app(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+}
+
+/// A `to_admin` that drops a required field cannot put a malformed
+/// administrative frame on the wire: the Logon, stripped of HeartBtInt (108), is
+/// refused before it is written and the handshake fails with a typed error
+/// rather than the engine emitting a Logon every venue would reject.
+#[tokio::test]
+async fn test_to_admin_dropping_a_required_admin_field_fails_the_handshake() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        // The Logon is refused before the socket write, so the venue must never
+        // receive a frame — it observes either silence or the client closing.
+        if let Ok(Some(Ok(frame))) = timeout(Duration::from_millis(500), framed.next()).await {
+            panic!("no frame must be sent, got 35={}", msg_type_of(&frame));
+        }
+    });
+
+    let app = Arc::new(DropAdminFieldApp { tag: 108 });
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), app);
+
+    match initiator.connect(addr).await {
+        Err(EngineError::MissingRequiredField { msg_type, tag }) => {
+            assert_eq!(msg_type, "A");
+            assert_eq!(tag, 108);
+        }
+        other => panic!("expected MissingRequiredField, got {other:?}"),
+    }
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// Corrupts every Logout from inside `to_admin` so it has no legal wire form,
+/// leaving every other administrative message untouched.
+#[derive(Debug)]
+struct CorruptLogoutApp;
+
+#[async_trait]
+impl Application for CorruptLogoutApp {
+    async fn on_create(&self, _session_id: &SessionId) {}
+
+    async fn on_logon(&self, _session_id: &SessionId) {}
+
+    async fn on_logout(&self, _session_id: &SessionId) {}
+
+    async fn to_admin(&self, message: &mut OutboundMessage, _session_id: &SessionId) {
+        if message.msg_type() == &MsgType::Logout {
+            // An embedded SOH leaves the value with no legal wire form, so the
+            // Logout is dropped after the callback rather than framed.
+            message.push_str(58, "bye\x01evil");
+        }
+    }
+
+    async fn from_admin(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_app(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+}
+
+/// An administrative message a callback made unsendable must not advance the
+/// state machine as if it had gone out. A `to_admin` that corrupts the Logout
+/// leaves nothing on the wire, so the reactor must stay Active — before the fix
+/// it entered LogoutPending anyway and closed the session at the logout
+/// deadline, tearing it down over a Logout the peer was never told about.
+#[tokio::test]
+async fn test_admin_message_rejected_by_callback_does_not_enter_logout_pending() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        // The Logout never reaches the wire; hold the socket open and readable
+        // so the client closes on neither a write nor a transport error.
+        let _ = timeout(Duration::from_secs(2), framed.next()).await;
+    });
+
+    let app = Arc::new(CorruptLogoutApp);
+    let mut config = client_config(Duration::from_secs(30));
+    config.logout_timeout = Duration::from_millis(300);
+    let initiator = Initiator::new(config, app);
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(connection.logout().await, "logout");
+
+    // Wait well past the logout deadline: a session that wrongly entered
+    // LogoutPending would have closed by now.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !connection.is_closed(),
+        "a Logout that never went out must not close the session"
+    );
+    assert_eq!(
+        connection.next_sender_seq(),
+        2,
+        "the dropped Logout must spend no sequence number"
+    );
+
+    acceptor.abort();
+}
+
+/// A `from_app` that never returns, bumping a counter each time it wakes so a
+/// test can tell an aborted dispatcher (counter frozen) from a detached one
+/// (counter still climbing).
+#[derive(Debug)]
+struct WedgedApp {
+    /// Bumped on every loop iteration inside `from_app`.
+    ticks: Arc<AtomicU64>,
+    /// Fires once when `from_app` is entered.
+    entered: mpsc::UnboundedSender<()>,
+}
+
+#[async_trait]
+impl Application for WedgedApp {
+    async fn on_create(&self, _session_id: &SessionId) {}
+
+    async fn on_logon(&self, _session_id: &SessionId) {}
+
+    async fn on_logout(&self, _session_id: &SessionId) {}
+
+    async fn to_admin(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_admin(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_app(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        let _ = self.entered.send(());
+        // Never returns: the dispatcher can only leave this handler by being
+        // aborted.
+        loop {
+            self.ticks.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// A `from_app` still wedged when the session closes is aborted, not detached,
+/// so it cannot outlive `on_logout` / `wait_closed`. The handler's tick counter
+/// stops climbing after the close; a detached task would keep running.
+#[tokio::test]
+async fn test_wedged_from_app_is_aborted_when_the_session_closes() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        // One application message to wedge the handler on.
+        ok(
+            framed
+                .send(venue_msg(
+                    "8",
+                    2,
+                    &[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "send report",
+        );
+        // Let the handler enter, then close the session from the venue side.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ok(framed.send(venue_msg("5", 3, &[])).await, "send logout");
+        // Keep the socket open and drain the client's reply until the test
+        // aborts this task.
+        while let Ok(Some(Ok(_))) = timeout(Duration::from_secs(10), framed.next()).await {}
+    });
+
+    let ticks = Arc::new(AtomicU64::new(0));
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let app = Arc::new(WedgedApp {
+        ticks: Arc::clone(&ticks),
+        entered: entered_tx,
+    });
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    // The handler really is inside from_app.
+    ok(
+        timeout(Duration::from_secs(2), entered_rx.recv()).await,
+        "from_app must be entered",
+    );
+
+    // The counterparty Logout closes the session; the reactor drains for its
+    // bounded window and then aborts the still-wedged dispatcher.
+    ok(
+        timeout(Duration::from_secs(10), connection.wait_closed()).await,
+        "closed within 10s",
+    );
+
+    // Let any in-flight cancellation land, then confirm the loop is dead: an
+    // aborted task makes no further progress, a detached one keeps ticking.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let first = ticks.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let second = ticks.load(Ordering::SeqCst);
+    assert_eq!(
+        first, second,
+        "an aborted dispatcher must stop; a detached one would keep ticking \
+         (first={first}, second={second})"
+    );
+
+    acceptor.abort();
 }
