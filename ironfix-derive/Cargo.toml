@@ -19,3 +19,7 @@ quote = "1.0"
 proc-macro2 = "1.0"
 
 [dev-dependencies]
+# Integration tests derive against the real traits to prove the expansion
+# type-checks; a proc-macro crate cannot use its own derives in-crate. Dev-only,
+# so it does not change the published dependency graph.
+ironfix-core = { path = "../ironfix-core" }
