@@ -96,7 +96,12 @@ fn bench_encode(c: &mut Criterion) {
             e.put_str(52, black_box("20260721-10:15:30.123"));
             e.put_str(98, black_box("0"));
             e.put_uint(108, black_box(30));
-            black_box(e.finish())
+            match e.finish() {
+                Ok(frame) => {
+                    black_box(frame);
+                }
+                Err(err) => panic!("bench logon encodes: {err}"),
+            }
         });
     });
 

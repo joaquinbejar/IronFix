@@ -1081,12 +1081,28 @@ mod tests {
 
     #[test]
     fn test_encoder_unrepresentable_msg_type_is_rejected() {
-        // Each of these frames decodes as far as tag 35 and is then refused by
-        // the decoder, so the encoder must not produce it in the first place.
-        for code in ["A B", "A=B", "\u{7f}"] {
+        // A non-printable or non-ASCII byte does not round-trip as a MsgType, so
+        // the encoder refuses it rather than emitting a frame the decoder would
+        // reject. NUL, DEL and a non-ASCII lead byte all fall outside the legal
+        // 0x20..=0x7e MsgType range enforced by CustomMsgType::new.
+        for code in ["\u{0}", "\u{7f}", "\u{80}"] {
             let mut encoder = Encoder::new("FIX.4.4");
             encoder.put_str(35, code);
             assert_rejected(&mut encoder, 35);
+        }
+
+        // Space and `=` are printable ASCII and round-trip unchanged, so they
+        // are deliberately legal inside a MsgType: the decoder builds a Custom
+        // MsgType from them and the encoder may emit them. Rejecting "A B" as a
+        // message type is the dictionary Validator's job, not the codec's.
+        for code in ["A B", "A=B"] {
+            let mut encoder = Encoder::new("FIX.4.4");
+            encoder.put_str(35, code);
+            encoder.put_str(49, "SENDER");
+            assert!(
+                encoder.finish().is_ok(),
+                "a printable-ASCII MsgType {code:?} must be accepted"
+            );
         }
 
         let mut encoder = Encoder::new("FIX.4.4");

@@ -2327,10 +2327,11 @@ async fn test_logon_ack_wrong_begin_string_fails_handshake() {
         encoder.put_str(52, Timestamp::now().format_millis().as_str());
         encoder.put_str(98, "0");
         encoder.put_str(108, "30");
-        ok(
-            framed.send(encoder.finish()).await,
-            "send wrong-version logon ack",
-        );
+        let ack = match encoder.finish() {
+            Ok(bytes) => bytes,
+            Err(err) => panic!("encode wrong-version logon ack: {err}"),
+        };
+        ok(framed.send(ack).await, "send wrong-version logon ack");
     });
 
     let (app, _app_rx) = RecordingApp::new();

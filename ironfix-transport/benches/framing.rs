@@ -47,7 +47,11 @@ fn frame(seq: u64) -> BytesMut {
     e.put_uint(32, 10_000);
     e.put_str(31, "150.49");
     e.put_str(60, "20260721-10:15:30.120");
-    e.finish()
+    let mut out = BytesMut::new();
+    match e.finish_into(&mut out) {
+        Ok(()) => out,
+        Err(err) => panic!("bench frame encodes: {err}"),
+    }
 }
 
 /// Concatenates `count` frames into a single read-sized buffer.
