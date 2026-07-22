@@ -93,7 +93,7 @@ pub fn derive_fix_field(input: TokenStream) -> TokenStream {
                 todo!("FixField::decode not yet implemented for {}", stringify!(#name))
             }
 
-            fn encode(value: &Self::Value, buf: &mut Vec<u8>) {
+            fn encode(value: &Self::Value, buf: &mut Vec<u8>) -> Result<(), EncodeError> {
                 todo!("FixField::encode not yet implemented for {}", stringify!(#name))
             }
         }

@@ -12,6 +12,7 @@
 //! - [`CompId`]: Component identifier (SenderCompID, TargetCompID)
 //! - [`Side`]: Order side enumeration
 
+use crate::error::{CompIdError, InvalidSide, TimestampError};
 use arrayvec::ArrayString;
 use chrono::{DateTime, Utc};
 use num_derive::{FromPrimitive, ToPrimitive};
@@ -92,45 +93,126 @@ impl fmt::Display for SeqNum {
 ///
 /// Timestamps in FIX are formatted as `YYYYMMDD-HH:MM:SS.sss` (milliseconds)
 /// or `YYYYMMDD-HH:MM:SS.ssssss` (microseconds) or `YYYYMMDD-HH:MM:SS.sssssssss` (nanoseconds).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// # Representable range
+///
+/// The count is unsigned nanoseconds since the Unix epoch, bounded by
+/// [`Timestamp::MAX_NANOS`]. The representable interval is therefore
+/// `1970-01-01T00:00:00.000000000Z ..= 2262-04-11T23:47:16.854775807Z`
+/// inclusive. Instants before the epoch and past that ceiling are **not**
+/// representable and are rejected by the fallible constructors rather than
+/// wrapped or zeroed. Because the bound is enforced at construction,
+/// [`Timestamp::to_datetime`] and the `format_*` methods are total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Timestamp {
     /// Nanoseconds since Unix epoch (1970-01-01 00:00:00 UTC).
     nanos_since_epoch: u64,
 }
 
 impl Timestamp {
+    /// The largest representable nanosecond count, `i64::MAX` nanoseconds.
+    ///
+    /// Equals `2262-04-11T23:47:16.854775807Z`. The bound is `i64`-shaped
+    /// because a `chrono::DateTime` counts nanoseconds in an `i64`; keeping
+    /// the invariant here is what makes [`Timestamp::to_datetime`] total.
+    pub const MAX_NANOS: u64 = 9_223_372_036_854_775_807;
+
+    /// The Unix epoch, `1970-01-01T00:00:00.000000000Z`.
+    pub const EPOCH: Self = Self {
+        nanos_since_epoch: 0,
+    };
+
     /// Creates a timestamp from nanoseconds since Unix epoch.
     ///
     /// # Arguments
     /// * `nanos` - Nanoseconds since 1970-01-01 00:00:00 UTC
+    ///
+    /// # Errors
+    /// Returns [`TimestampError::NanosOutOfRange`] if `nanos` exceeds
+    /// [`Timestamp::MAX_NANOS`].
     #[inline]
-    #[must_use]
-    pub const fn from_nanos(nanos: u64) -> Self {
-        Self {
-            nanos_since_epoch: nanos,
+    pub const fn from_nanos(nanos: u64) -> Result<Self, TimestampError> {
+        if nanos > Self::MAX_NANOS {
+            return Err(TimestampError::NanosOutOfRange {
+                nanos,
+                max_nanos: Self::MAX_NANOS,
+            });
         }
+        Ok(Self {
+            nanos_since_epoch: nanos,
+        })
     }
 
     /// Creates a timestamp from milliseconds since Unix epoch.
     ///
     /// # Arguments
     /// * `millis` - Milliseconds since 1970-01-01 00:00:00 UTC
+    ///
+    /// # Errors
+    /// Returns [`TimestampError::MillisOutOfRange`] if scaling `millis` to
+    /// nanoseconds overflows, or [`TimestampError::NanosOutOfRange`] if the
+    /// result exceeds [`Timestamp::MAX_NANOS`].
     #[inline]
-    #[must_use]
-    pub const fn from_millis(millis: u64) -> Self {
-        Self {
-            nanos_since_epoch: millis * 1_000_000,
+    pub const fn from_millis(millis: u64) -> Result<Self, TimestampError> {
+        match millis.checked_mul(1_000_000) {
+            Some(nanos) => Self::from_nanos(nanos),
+            None => Err(TimestampError::MillisOutOfRange { millis }),
+        }
+    }
+
+    /// Converts a calendar instant to a timestamp.
+    ///
+    /// # Errors
+    /// Returns [`TimestampError::InstantOutOfRange`] if `dt` lies before the
+    /// Unix epoch or past [`Timestamp::MAX_NANOS`].
+    fn from_datetime(dt: DateTime<Utc>) -> Result<Self, TimestampError> {
+        let out_of_range = || TimestampError::InstantOutOfRange {
+            seconds: dt.timestamp(),
+        };
+        let Some(nanos) = dt.timestamp_nanos_opt() else {
+            return Err(out_of_range());
+        };
+        match u64::try_from(nanos) {
+            Ok(nanos) => Self::from_nanos(nanos),
+            Err(_) => Err(out_of_range()),
+        }
+    }
+
+    /// Converts a calendar instant to a timestamp, clamping an unrepresentable
+    /// instant to [`Timestamp::EPOCH`].
+    fn clamp_datetime(dt: DateTime<Utc>) -> Self {
+        match Self::from_datetime(dt) {
+            Ok(ts) => ts,
+            Err(_) => Self::EPOCH,
         }
     }
 
     /// Returns the current UTC timestamp.
+    ///
+    /// # Clamping
+    ///
+    /// This reads the system clock, which is not untrusted input, and is
+    /// infallible so that header stamping cannot fail. A system clock outside
+    /// the representable range (before 1970 or after 2262) yields
+    /// [`Timestamp::EPOCH`], which formats as `19700101-00:00:00.000` — an
+    /// obviously wrong SendingTime a counterparty will reject, not a plausible
+    /// substitute. Use [`Timestamp::try_now`] to observe that condition as a
+    /// typed error instead.
     #[inline]
     #[must_use]
     pub fn now() -> Self {
-        let dt = Utc::now();
-        Self {
-            nanos_since_epoch: dt.timestamp_nanos_opt().unwrap_or(0) as u64,
-        }
+        Self::clamp_datetime(Utc::now())
+    }
+
+    /// Returns the current UTC timestamp, or an error if the system clock is
+    /// outside the representable range.
+    ///
+    /// # Errors
+    /// Returns [`TimestampError::InstantOutOfRange`] if the system clock reads
+    /// before the Unix epoch or past [`Timestamp::MAX_NANOS`].
+    #[inline]
+    pub fn try_now() -> Result<Self, TimestampError> {
+        Self::from_datetime(Utc::now())
     }
 
     /// Returns nanoseconds since Unix epoch.
@@ -155,9 +237,22 @@ impl Timestamp {
     }
 
     /// Converts to a chrono `DateTime<Utc>`.
+    ///
+    /// Total by construction: every constructor bounds the nanosecond count to
+    /// [`Timestamp::MAX_NANOS`], which is exactly what an `i64` nanosecond
+    /// count can hold.
     #[must_use]
     pub fn to_datetime(self) -> DateTime<Utc> {
-        DateTime::from_timestamp_nanos(self.nanos_since_epoch as i64)
+        debug_assert!(
+            self.nanos_since_epoch <= Self::MAX_NANOS,
+            "Timestamp constructors bound nanos_since_epoch to MAX_NANOS"
+        );
+        match i64::try_from(self.nanos_since_epoch) {
+            Ok(nanos) => DateTime::from_timestamp_nanos(nanos),
+            // Unreachable while the constructor invariant holds; still typed
+            // rather than a panic, since the release profile aborts.
+            Err(_) => DateTime::from_timestamp_nanos(i64::MAX),
+        }
     }
 
     /// Formats the timestamp in FIX format with millisecond precision.
@@ -195,11 +290,20 @@ impl Default for Timestamp {
     }
 }
 
-impl From<DateTime<Utc>> for Timestamp {
-    fn from(dt: DateTime<Utc>) -> Self {
-        Self {
-            nanos_since_epoch: dt.timestamp_nanos_opt().unwrap_or(0) as u64,
-        }
+impl TryFrom<DateTime<Utc>> for Timestamp {
+    type Error = TimestampError;
+
+    /// Converts a calendar instant to a timestamp.
+    ///
+    /// This is the landing point for a parsed SendingTime (tag 52), so an
+    /// instant outside the representable range is an error rather than a
+    /// silently zeroed or wrapped value.
+    ///
+    /// # Errors
+    /// Returns [`TimestampError::InstantOutOfRange`] if `dt` lies before the
+    /// Unix epoch or past [`Timestamp::MAX_NANOS`].
+    fn try_from(dt: DateTime<Utc>) -> Result<Self, Self::Error> {
+        Self::from_datetime(dt)
     }
 }
 
@@ -209,11 +313,52 @@ impl fmt::Display for Timestamp {
     }
 }
 
+impl<'de> Deserialize<'de> for Timestamp {
+    /// Deserializes a timestamp, routing the raw nanosecond count through
+    /// [`Timestamp::from_nanos`] so the [`Timestamp::MAX_NANOS`] bound is
+    /// enforced. A serialized value whose `nanos_since_epoch` exceeds the
+    /// ceiling is a deserialization error, not a silently clamped or wrapped
+    /// instant — that is what keeps [`Timestamp::to_datetime`] total by
+    /// construction even for values that arrive over serde.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Mirrors the field-per-struct shape the derived `Serialize` emits, so
+        // the pair round-trips, but re-validates instead of trusting the input.
+        #[derive(Deserialize)]
+        struct Raw {
+            nanos_since_epoch: u64,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::from_nanos(raw.nanos_since_epoch).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Component identifier for FIX sessions.
 ///
 /// Used for SenderCompID (tag 49), TargetCompID (tag 56), and related fields.
-/// Maximum length is 32 characters as per FIX specification.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// # Bounds
+///
+/// The value is at most [`COMP_ID_MAX_LEN`] **bytes**. That bound is an
+/// IronFix engineering choice — it is what keeps a CompID in inline
+/// [`ArrayString`] storage instead of a heap allocation. The FIX specification
+/// types CompID as an unbounded `String` and does not bound its length.
+///
+/// # Charset
+///
+/// Only printable ASCII (`0x20..=0x7e`) is accepted, and the value must not be
+/// empty. A CompID is written verbatim into tags 49 and 56 on every outbound
+/// message, so a SOH or any other control byte would terminate the field early
+/// and let a hostile CompID inject header fields or corrupt framing; an empty
+/// value would emit `49=<SOH>`, a field FIX TagValue treats as malformed.
+/// Rejecting those at construction is the chokepoint that makes such a value
+/// unrepresentable rather than escaping it at every encode site. The `=` byte
+/// is deliberately **not** rejected: it is a legal FIX String value byte (only
+/// the first `=` of a field separates tag from value, and a CompID is a value,
+/// never a tag), so a counterparty identifier may legitimately contain it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[repr(transparent)]
 #[serde(transparent)]
 pub struct CompId(ArrayString<COMP_ID_MAX_LEN>);
@@ -224,11 +369,34 @@ impl CompId {
     /// # Arguments
     /// * `s` - The component identifier string
     ///
-    /// # Returns
-    /// `Some(CompId)` if the string fits within the maximum length, `None` otherwise.
-    #[must_use]
-    pub fn new(s: &str) -> Option<Self> {
-        ArrayString::from(s).ok().map(Self)
+    /// # Errors
+    /// Returns [`CompIdError::Empty`] if `s` is empty, [`CompIdError::TooLong`]
+    /// if `s` exceeds [`COMP_ID_MAX_LEN`] bytes, or [`CompIdError::IllegalByte`]
+    /// if it contains any byte outside printable ASCII (`0x20..=0x7e`).
+    pub fn new(s: &str) -> Result<Self, CompIdError> {
+        if s.is_empty() {
+            return Err(CompIdError::Empty);
+        }
+        if s.len() > COMP_ID_MAX_LEN {
+            return Err(CompIdError::TooLong {
+                len: s.len(),
+                max_len: COMP_ID_MAX_LEN,
+            });
+        }
+        for (position, &byte) in s.as_bytes().iter().enumerate() {
+            let printable = byte.is_ascii_graphic() || byte == b' ';
+            if !printable {
+                return Err(CompIdError::IllegalByte { byte, position });
+            }
+        }
+        match ArrayString::from(s) {
+            Ok(inner) => Ok(Self(inner)),
+            // Unreachable: the length was checked above.
+            Err(_) => Err(CompIdError::TooLong {
+                len: s.len(),
+                max_len: COMP_ID_MAX_LEN,
+            }),
+        }
     }
 
     /// Returns the CompId as a string slice.
@@ -266,12 +434,34 @@ impl fmt::Display for CompId {
 }
 
 impl FromStr for CompId {
-    type Err = arrayvec::CapacityError<()>;
+    type Err = CompIdError;
 
+    /// Parses a CompID, applying the same emptiness, length, and charset checks
+    /// as [`CompId::new`].
+    ///
+    /// # Errors
+    /// Returns [`CompIdError::Empty`], [`CompIdError::TooLong`], or
+    /// [`CompIdError::IllegalByte`].
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ArrayString::try_from(s)
-            .map(Self)
-            .map_err(|_| arrayvec::CapacityError::new(()))
+        Self::new(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for CompId {
+    /// Deserializes a CompID by routing the raw string through [`CompId::new`],
+    /// so the emptiness, length, and charset invariants hold for a value that
+    /// arrives over serde exactly as they do for one built in code. The derived
+    /// `Serialize` is transparent, so a serialized CompID is just its string;
+    /// re-validating it here stops a hand-crafted payload (an embedded SOH, a
+    /// control byte, an over-length or empty value) from reconstructing a
+    /// `CompId` that never passed the constructor and then being written
+    /// verbatim into tags 49 and 56.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::new(&raw).map_err(serde::de::Error::custom)
     }
 }
 
@@ -376,10 +566,15 @@ impl fmt::Display for Side {
 }
 
 impl TryFrom<u8> for Side {
-    type Error = ();
+    type Error = InvalidSide;
 
+    /// Converts a wire byte to a `Side`.
+    ///
+    /// # Errors
+    /// Returns [`InvalidSide`] if `value` is not one of the Side (tag 54)
+    /// codes.
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Self::from_char(value as char).ok_or(())
+        Self::from_char(char::from(value)).ok_or(InvalidSide::new(value))
     }
 }
 
@@ -402,33 +597,253 @@ mod tests {
         assert_eq!(seq.value(), 1);
     }
 
+    /// Unwraps a `Result` with test context instead of `.unwrap()`.
+    #[track_caller]
+    fn ok<T, E: fmt::Debug>(result: Result<T, E>, what: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => panic!("{what}: {err:?}"),
+        }
+    }
+
     #[test]
-    fn test_timestamp_conversions() {
-        let ts = Timestamp::from_millis(1000);
+    fn test_timestamp_from_millis_converts() {
+        let ts = ok(Timestamp::from_millis(1000), "1000ms is representable");
         assert_eq!(ts.as_millis(), 1000);
         assert_eq!(ts.as_micros(), 1_000_000);
         assert_eq!(ts.as_nanos(), 1_000_000_000);
     }
 
     #[test]
-    fn test_timestamp_format() {
-        let ts = Timestamp::from_millis(0);
-        let formatted = ts.format_millis();
-        assert!(formatted.starts_with("19700101-00:00:00"));
+    fn test_timestamp_from_millis_overflow_is_typed_error() {
+        // u64::MAX ms scaled to nanoseconds overflows the multiply itself.
+        assert_eq!(
+            Timestamp::from_millis(u64::MAX),
+            Err(TimestampError::MillisOutOfRange { millis: u64::MAX })
+        );
     }
 
     #[test]
-    fn test_comp_id() {
-        let id = CompId::new("SENDER").unwrap();
+    fn test_timestamp_from_millis_past_ceiling_is_typed_error() {
+        // Multiplies cleanly within u64 but lands past MAX_NANOS (year 2262).
+        let millis = 10_000_000_000_000_u64;
+        assert_eq!(
+            Timestamp::from_millis(millis),
+            Err(TimestampError::NanosOutOfRange {
+                nanos: 10_000_000_000_000_000_000,
+                max_nanos: Timestamp::MAX_NANOS,
+            })
+        );
+    }
+
+    #[test]
+    fn test_timestamp_from_nanos_boundaries() {
+        let max = ok(
+            Timestamp::from_nanos(Timestamp::MAX_NANOS),
+            "MAX_NANOS is representable",
+        );
+        assert_eq!(max.as_nanos(), Timestamp::MAX_NANOS);
+        assert_eq!(
+            Timestamp::from_nanos(Timestamp::MAX_NANOS + 1),
+            Err(TimestampError::NanosOutOfRange {
+                nanos: Timestamp::MAX_NANOS + 1,
+                max_nanos: Timestamp::MAX_NANOS,
+            })
+        );
+    }
+
+    #[test]
+    fn test_timestamp_try_from_pre_epoch_datetime_is_typed_error() {
+        let Some(dt) = DateTime::from_timestamp(-1, 0) else {
+            panic!("1969-12-31T23:59:59Z is a valid chrono instant");
+        };
+        assert_eq!(
+            Timestamp::try_from(dt),
+            Err(TimestampError::InstantOutOfRange { seconds: -1 })
+        );
+    }
+
+    #[test]
+    fn test_timestamp_clamp_datetime_pre_epoch_yields_epoch() {
+        let Some(dt) = DateTime::from_timestamp(-86_400, 0) else {
+            panic!("1969-12-31T00:00:00Z is a valid chrono instant");
+        };
+        assert_eq!(Timestamp::clamp_datetime(dt), Timestamp::EPOCH);
+        assert_eq!(Timestamp::EPOCH.as_nanos(), 0);
+    }
+
+    #[test]
+    fn test_timestamp_clamp_datetime_in_range_is_exact() {
+        let Some(dt) = DateTime::from_timestamp(1_700_000_000, 123_456_789) else {
+            panic!("2023-11-14T22:13:20Z is a valid chrono instant");
+        };
+        assert_eq!(
+            Timestamp::clamp_datetime(dt).as_nanos(),
+            1_700_000_000_123_456_789
+        );
+    }
+
+    #[test]
+    fn test_timestamp_try_now_is_representable() {
+        let now = ok(Timestamp::try_now(), "the system clock is in range");
+        assert!(now.as_nanos() > 0);
+    }
+
+    #[test]
+    fn test_timestamp_format_millis_at_epoch() {
+        let ts = ok(Timestamp::from_millis(0), "0ms is representable");
+        assert_eq!(ts.format_millis().as_str(), "19700101-00:00:00.000");
+    }
+
+    #[test]
+    fn test_timestamp_format_micros_at_known_instant() {
+        // 2023-11-14T22:13:20.123456Z
+        let ts = ok(
+            Timestamp::from_nanos(1_700_000_000_123_456_000),
+            "instant is representable",
+        );
+        assert_eq!(ts.format_micros().as_str(), "20231114-22:13:20.123456");
+    }
+
+    #[test]
+    fn test_timestamp_round_trips_through_datetime() {
+        let ts = ok(
+            Timestamp::from_nanos(1_700_000_000_123_456_789),
+            "instant is representable",
+        );
+        assert_eq!(Timestamp::try_from(ts.to_datetime()), Ok(ts));
+    }
+
+    #[test]
+    fn test_timestamp_deserialize_out_of_range_nanos_is_rejected() {
+        use serde::de::value::{Error as ValueError, MapDeserializer};
+
+        // A payload one nanosecond past MAX_NANOS must not rebuild a Timestamp
+        // that skipped `from_nanos` and would trip `to_datetime`'s bound.
+        let de = MapDeserializer::new(std::iter::once((
+            "nanos_since_epoch",
+            Timestamp::MAX_NANOS + 1,
+        )));
+        let result: Result<Timestamp, ValueError> = Timestamp::deserialize(de);
+        assert!(
+            result.is_err(),
+            "nanos past MAX_NANOS must fail to deserialize"
+        );
+    }
+
+    #[test]
+    fn test_timestamp_deserialize_in_range_nanos_round_trips() {
+        use serde::de::value::{Error as ValueError, MapDeserializer};
+
+        let de = MapDeserializer::new(std::iter::once((
+            "nanos_since_epoch",
+            1_700_000_000_123_456_789_u64,
+        )));
+        let result: Result<Timestamp, ValueError> = Timestamp::deserialize(de);
+        let ts = ok(result, "in-range nanos deserializes");
+        assert_eq!(ts.as_nanos(), 1_700_000_000_123_456_789);
+    }
+
+    #[test]
+    fn test_comp_id_accepts_plain_value() {
+        let id = ok(CompId::new("SENDER"), "SENDER is a valid CompId");
         assert_eq!(id.as_str(), "SENDER");
         assert_eq!(id.len(), 6);
         assert!(!id.is_empty());
     }
 
     #[test]
-    fn test_comp_id_too_long() {
-        let long_str = "A".repeat(COMP_ID_MAX_LEN + 1);
-        assert!(CompId::new(&long_str).is_none());
+    fn test_comp_id_at_exact_capacity_is_accepted() {
+        let exact = "A".repeat(COMP_ID_MAX_LEN);
+        let id = ok(CompId::new(&exact), "32 bytes is exactly the bound");
+        assert_eq!(id.len(), COMP_ID_MAX_LEN);
+        assert_eq!(id.as_str(), exact.as_str());
+    }
+
+    #[test]
+    fn test_comp_id_one_past_capacity_is_rejected() {
+        let long = "A".repeat(COMP_ID_MAX_LEN + 1);
+        assert_eq!(
+            CompId::new(&long),
+            Err(CompIdError::TooLong {
+                len: COMP_ID_MAX_LEN + 1,
+                max_len: COMP_ID_MAX_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn test_comp_id_rejects_soh() {
+        assert_eq!(
+            CompId::new("SEND\u{1}ER"),
+            Err(CompIdError::IllegalByte {
+                byte: 0x01,
+                position: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn test_comp_id_accepts_equals() {
+        // `=` is a legal FIX String value byte: only the first `=` of a field
+        // separates tag from value, and a CompID is a value, never a tag.
+        let id = ok(CompId::new("SEND=ER"), "'=' is legal inside a CompId value");
+        assert_eq!(id.as_str(), "SEND=ER");
+    }
+
+    #[test]
+    fn test_comp_id_new_empty_is_rejected() {
+        assert_eq!(CompId::new(""), Err(CompIdError::Empty));
+    }
+
+    #[test]
+    fn test_comp_id_deserialize_with_soh_is_rejected() {
+        // A serialized CompID is transparently its string; a hand-crafted value
+        // carrying SOH must not rebuild a CompId that skipped `CompId::new`.
+        let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new("SEND\u{1}ER");
+        let result = CompId::deserialize(de);
+        assert!(
+            result.is_err(),
+            "SOH-bearing CompId must fail to deserialize"
+        );
+    }
+
+    #[test]
+    fn test_comp_id_deserialize_valid_round_trips() {
+        let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new("SENDER");
+        let id = ok(CompId::deserialize(de), "SENDER is a valid CompId");
+        assert_eq!(id.as_str(), "SENDER");
+    }
+
+    #[test]
+    fn test_comp_id_rejects_non_ascii() {
+        // 'ñ' is two bytes, 0xc3 0xb1; the first is reported.
+        assert_eq!(
+            CompId::new("SEÑOR"),
+            Err(CompIdError::IllegalByte {
+                byte: 0xc3,
+                position: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn test_comp_id_rejects_control_bytes() {
+        assert_eq!(
+            CompId::new("SENDER\n"),
+            Err(CompIdError::IllegalByte {
+                byte: b'\n',
+                position: 6,
+            })
+        );
+    }
+
+    #[test]
+    fn test_comp_id_from_str_matches_new() {
+        let parsed = ok("SENDER".parse::<CompId>(), "SENDER is a valid CompId");
+        let built = ok(CompId::new("SENDER"), "SENDER is a valid CompId");
+        assert_eq!(parsed, built);
+        assert!("SEND\u{1}ER".parse::<CompId>().is_err());
     }
 
     #[test]
@@ -436,6 +851,44 @@ mod tests {
         assert_eq!(Side::from_char('1'), Some(Side::Buy));
         assert_eq!(Side::from_char('2'), Some(Side::Sell));
         assert_eq!(Side::from_char('X'), None);
+    }
+
+    #[test]
+    fn test_side_round_trips_every_variant() {
+        const ALL: [Side; 16] = [
+            Side::Buy,
+            Side::Sell,
+            Side::BuyMinus,
+            Side::SellPlus,
+            Side::SellShort,
+            Side::SellShortExempt,
+            Side::Undisclosed,
+            Side::Cross,
+            Side::CrossShort,
+            Side::CrossShortExempt,
+            Side::AsDefined,
+            Side::Opposite,
+            Side::Subscribe,
+            Side::Redeem,
+            Side::Lend,
+            Side::Borrow,
+        ];
+        for side in ALL {
+            assert_eq!(Side::from_char(side.as_char()), Some(side));
+            let byte = u8::try_from(side.as_char());
+            let byte = ok(byte, "every Side code is a single ASCII byte");
+            assert_eq!(Side::try_from(byte), Ok(side));
+        }
+    }
+
+    #[test]
+    fn test_side_try_from_unknown_byte_is_typed_error() {
+        assert_eq!(Side::try_from(b'X'), Err(InvalidSide::new(b'X')));
+        let Err(err) = Side::try_from(0xff) else {
+            panic!("0xff is not a Side code");
+        };
+        assert_eq!(err.value(), 0xff);
+        assert_eq!(err.to_string(), "0xff is not a FIX Side (tag 54) code");
     }
 
     #[test]

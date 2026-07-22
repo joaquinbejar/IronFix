@@ -12,32 +12,55 @@
 //! - [`FieldValue`]: Enumeration of possible field value types
 //! - [`FixField`]: Trait for typed field access
 
-use crate::error::DecodeError;
+use crate::error::{DecodeError, EncodeError, InvalidFieldTag};
 use bytes::Bytes;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+/// The lowest tag number FIX reserves for user-defined fields.
+///
+/// FIX reserves 5000-9999 for user-defined fields, so 4999 is the highest
+/// standard tag and 5000 the first user-defined one.
+pub const USER_DEFINED_TAG_MIN: u32 = 5000;
+
 /// FIX field tag number.
 ///
 /// Tags are positive integers that identify fields within a FIX message.
-/// Standard tags are defined in the FIX specification (1-5000 range),
-/// while user-defined tags use the 5001+ range.
+/// Standard tags are defined in the FIX specification (1-4999), while FIX
+/// reserves 5000-9999 for user-defined fields. Tags at or above
+/// [`USER_DEFINED_TAG_MIN`] are treated as user-defined; venues do assign
+/// beyond 9999 in practice, and a dictionary — not this type — is what says
+/// whether a given tag is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
 #[serde(transparent)]
 pub struct FieldTag(u32);
 
 impl FieldTag {
-    /// Creates a new field tag.
+    /// Creates a new field tag **without validating it**.
     ///
-    /// # Arguments
-    /// * `tag` - The tag number (must be > 0)
+    /// `tag` is not checked against [`FieldTag::is_valid`]; `FieldTag::new(0)`
+    /// yields a tag that is neither standard nor user-defined. Use
+    /// [`FieldTag::try_new`] for a value that came off the wire or from a
+    /// caller.
     #[inline]
     #[must_use]
     pub const fn new(tag: u32) -> Self {
         Self(tag)
+    }
+
+    /// Creates a new field tag, rejecting numbers that are not legal FIX tags.
+    ///
+    /// # Errors
+    /// Returns [`InvalidFieldTag`] if `tag` is `0`.
+    #[inline]
+    pub const fn try_new(tag: u32) -> Result<Self, InvalidFieldTag> {
+        if tag == 0 {
+            return Err(InvalidFieldTag::new(tag));
+        }
+        Ok(Self(tag))
     }
 
     /// Returns the raw tag number.
@@ -47,18 +70,25 @@ impl FieldTag {
         self.0
     }
 
-    /// Returns true if this is a standard FIX tag (1-5000).
+    /// Returns true if this is a legal FIX tag number (>= 1).
+    #[inline]
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.0 >= 1
+    }
+
+    /// Returns true if this is a standard FIX tag (1-4999).
     #[inline]
     #[must_use]
     pub const fn is_standard(self) -> bool {
-        self.0 >= 1 && self.0 <= 5000
+        self.0 >= 1 && self.0 < USER_DEFINED_TAG_MIN
     }
 
-    /// Returns true if this is a user-defined tag (5001+).
+    /// Returns true if this is a user-defined tag (5000+).
     #[inline]
     #[must_use]
     pub const fn is_user_defined(self) -> bool {
-        self.0 > 5000
+        self.0 >= USER_DEFINED_TAG_MIN
     }
 }
 
@@ -329,55 +359,179 @@ pub trait FixField: Sized {
     /// # Arguments
     /// * `value` - The value to encode
     /// * `buf` - The buffer to write to
-    fn encode(value: &Self::Value, buf: &mut Vec<u8>);
+    ///
+    /// # Errors
+    /// Returns [`EncodeError`] if `value` has no legal on-the-wire form — for
+    /// example a string carrying the SOH delimiter
+    /// ([`EncodeError::InvalidFieldValue`]) or one past a length bound
+    /// ([`EncodeError::FieldTooLong`]). Mirrors
+    /// [`crate::message::FixMessage::encode`], so an implementor never has to
+    /// panic or emit corrupt bytes.
+    fn encode(value: &Self::Value, buf: &mut Vec<u8>) -> Result<(), EncodeError>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Unwraps a `Result` with test context instead of `.unwrap()`.
+    #[track_caller]
+    fn ok<T, E: fmt::Debug>(result: Result<T, E>, what: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(err) => panic!("{what}: {err:?}"),
+        }
+    }
+
+    /// Asserts that `result` failed with `InvalidFieldValue` for `tag`.
+    #[track_caller]
+    fn assert_invalid_field_value<T: fmt::Debug>(result: Result<T, DecodeError>, tag: u32) {
+        match result {
+            Err(DecodeError::InvalidFieldValue { tag: actual, .. }) => assert_eq!(actual, tag),
+            other => panic!("expected InvalidFieldValue for tag {tag}, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn test_field_tag() {
+    fn test_field_tag_standard_range() {
         let tag = FieldTag::new(35);
         assert_eq!(tag.value(), 35);
+        assert!(tag.is_valid());
         assert!(tag.is_standard());
         assert!(!tag.is_user_defined());
+    }
 
-        let user_tag = FieldTag::new(5001);
-        assert!(!user_tag.is_standard());
-        assert!(user_tag.is_user_defined());
+    #[test]
+    fn test_field_tag_zero_is_neither_standard_nor_user_defined() {
+        let zero = FieldTag::new(0);
+        assert!(!zero.is_valid());
+        assert!(!zero.is_standard());
+        assert!(!zero.is_user_defined());
+        assert_eq!(FieldTag::try_new(0), Err(InvalidFieldTag::new(0)));
+    }
+
+    #[test]
+    fn test_field_tag_boundary_4999_is_standard() {
+        let tag = ok(FieldTag::try_new(4999), "4999 is a legal tag");
+        assert!(tag.is_standard());
+        assert!(!tag.is_user_defined());
+    }
+
+    #[test]
+    fn test_field_tag_boundary_5000_is_user_defined() {
+        let tag = ok(FieldTag::try_new(5000), "5000 is a legal tag");
+        assert!(!tag.is_standard());
+        assert!(tag.is_user_defined());
+        assert_eq!(tag.value(), USER_DEFINED_TAG_MIN);
     }
 
     #[test]
     fn test_field_ref_as_str() {
         let field = FieldRef::new(11, b"ORDER123");
-        assert_eq!(field.as_str().unwrap(), "ORDER123");
+        assert_eq!(field.as_str(), Ok("ORDER123"));
     }
 
     #[test]
     fn test_field_ref_as_u64() {
         let field = FieldRef::new(34, b"12345");
-        assert_eq!(field.as_u64().unwrap(), 12345);
+        assert_eq!(field.as_u64(), Ok(12345));
+    }
+
+    #[test]
+    fn test_field_ref_as_u64_non_numeric_is_typed_error() {
+        assert_invalid_field_value(FieldRef::new(34, b"abc").as_u64(), 34);
+    }
+
+    #[test]
+    fn test_field_ref_as_u64_negative_is_typed_error() {
+        assert_invalid_field_value(FieldRef::new(34, b"-1").as_u64(), 34);
+    }
+
+    #[test]
+    fn test_field_ref_as_u64_empty_is_typed_error() {
+        assert_invalid_field_value(FieldRef::new(34, b"").as_u64(), 34);
+    }
+
+    #[test]
+    fn test_field_ref_as_i64_accepts_negative() {
+        assert_eq!(FieldRef::new(14, b"-42").as_i64(), Ok(-42));
+    }
+
+    #[test]
+    fn test_field_ref_as_decimal_parses_price() {
+        let field = FieldRef::new(44, b"123.45");
+        let price = ok(field.as_decimal(), "123.45 is a valid price");
+        assert_eq!(price, Decimal::new(12345, 2));
+    }
+
+    #[test]
+    fn test_field_ref_as_decimal_preserves_scale() {
+        // Trailing zeros are significant on the wire; the parse keeps them.
+        let field = FieldRef::new(44, b"1.500");
+        let price = ok(field.as_decimal(), "1.500 is a valid price");
+        assert_eq!(price.to_string(), "1.500");
+    }
+
+    #[test]
+    fn test_field_ref_as_decimal_negative_price() {
+        let field = FieldRef::new(44, b"-0.01");
+        let price = ok(field.as_decimal(), "-0.01 is a valid price");
+        assert_eq!(price, Decimal::new(-1, 2));
+    }
+
+    #[test]
+    fn test_field_ref_as_decimal_two_points_is_typed_error() {
+        assert_invalid_field_value(FieldRef::new(44, b"1.2.3").as_decimal(), 44);
+    }
+
+    #[test]
+    fn test_field_ref_as_decimal_garbage_is_typed_error() {
+        assert_invalid_field_value(FieldRef::new(44, b"abc").as_decimal(), 44);
+        assert_invalid_field_value(FieldRef::new(44, b"").as_decimal(), 44);
+        assert_invalid_field_value(FieldRef::new(44, b"1,50").as_decimal(), 44);
+    }
+
+    #[test]
+    fn test_field_ref_as_decimal_invalid_utf8_is_typed_error() {
+        let field = FieldRef::new(44, &[0xFF, 0xFE]);
+        assert!(matches!(
+            field.as_decimal(),
+            Err(DecodeError::InvalidUtf8(_))
+        ));
     }
 
     #[test]
     fn test_field_ref_as_bool() {
-        let yes = FieldRef::new(141, b"Y");
-        let no = FieldRef::new(141, b"N");
-        assert!(yes.as_bool().unwrap());
-        assert!(!no.as_bool().unwrap());
+        assert_eq!(FieldRef::new(141, b"Y").as_bool(), Ok(true));
+        assert_eq!(FieldRef::new(141, b"N").as_bool(), Ok(false));
+    }
+
+    #[test]
+    fn test_field_ref_as_bool_rejects_lowercase_and_words() {
+        assert_invalid_field_value(FieldRef::new(141, b"y").as_bool(), 141);
+        assert_invalid_field_value(FieldRef::new(141, b"n").as_bool(), 141);
+        assert_invalid_field_value(FieldRef::new(141, b"YES").as_bool(), 141);
+        assert_invalid_field_value(FieldRef::new(141, b"").as_bool(), 141);
     }
 
     #[test]
     fn test_field_ref_as_char() {
-        let field = FieldRef::new(54, b"1");
-        assert_eq!(field.as_char().unwrap(), '1');
+        assert_eq!(FieldRef::new(54, b"1").as_char(), Ok('1'));
+    }
+
+    #[test]
+    fn test_field_ref_as_char_rejects_multi_byte_and_non_ascii() {
+        assert_invalid_field_value(FieldRef::new(54, b"12").as_char(), 54);
+        assert_invalid_field_value(FieldRef::new(54, b"").as_char(), 54);
+        // 'ñ' is two bytes and neither is ASCII.
+        assert_invalid_field_value(FieldRef::new(54, "ñ".as_bytes()).as_char(), 54);
+        assert_invalid_field_value(FieldRef::new(54, &[0x80]).as_char(), 54);
     }
 
     #[test]
     fn test_field_ref_invalid_utf8() {
         let field = FieldRef::new(1, &[0xFF, 0xFE]);
-        assert!(field.as_str().is_err());
+        assert!(matches!(field.as_str(), Err(DecodeError::InvalidUtf8(_))));
     }
 
     #[test]
