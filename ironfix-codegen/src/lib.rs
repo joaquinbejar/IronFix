@@ -8,19 +8,38 @@
 //!
 //! Build-time code generation for the IronFix FIX protocol engine.
 //!
-//! This crate generates Rust source code from a loaded
-//! `ironfix_dictionary::Dictionary`, producing type-safe field constants and
-//! message structs. FIX `Price`, `Qty` and `Percentage` fields are generated as
+//! This crate turns a loaded `ironfix_dictionary::Dictionary` into Rust
+//! source: one `u32` constant per field tag, and one struct per message
+//! (including the fields its components contribute and a struct per repeating
+//! group entry). FIX `Price`, `Qty` and `Percentage` fields are generated as
 //! `rust_decimal::Decimal`, never `f64`.
+//!
+//! The generated structs are **data definitions only** — they carry no
+//! `FixMessage` or `FixField` implementation, and nothing in the IronFix
+//! workspace consumes this crate today.
 //!
 //! ## Usage
 //!
-//! Intended for a `build.rs` script that generates code at compile time.
+//! Typically used in a `build.rs` script to generate code at compile time:
 //!
-//! No crate in this workspace consumes the generated output yet — the
-//! generator is exercised only by its own unit tests, so treat the emitted
-//! source as unproven against a real build.
+//! ```no_run
+//! use ironfix_codegen::CodeGenerator;
+//! use ironfix_dictionary::Dictionary;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let code = CodeGenerator::new().generate(Dictionary::fix44()?)?;
+//! std::fs::write("fix44.rs", code)?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The generated file is written with `//` line comments rather than an inner
+//! `//!` header, so it can be `include!`d inside a module.
+//!
+//! Generation **fails closed**: a dictionary that references a field or
+//! component it does not define, or a component that contains itself, is a
+//! [`GeneratorError`] rather than a struct silently missing a field.
 
 pub mod generator;
 
-pub use generator::{CodeGenerator, GeneratorConfig};
+pub use generator::{CodeGenerator, GeneratorConfig, GeneratorError};

@@ -13,6 +13,5 @@ categories.workspace = true
 [dependencies]
 ironfix-dictionary.workspace = true
 thiserror.workspace = true
-serde.workspace = true
 
 [dev-dependencies]
