@@ -460,16 +460,22 @@ mod tests {
         let mgr = HeartbeatManager::new(Duration::from_secs(1));
         assert_eq!(mgr.test_request_grace(), Duration::from_millis(250));
 
-        sleep(Duration::from_millis(700));
+        // The "not due" side is asserted at ~0ms elapsed rather than after a
+        // sleep: `sleep` only ever overshoots, so a scheduler stall could push a
+        // mid-interval sleep past the 1250ms boundary and fail a negative
+        // assertion even when the logic is correct. At construction no inbound
+        // silence has elapsed, so it cannot be due for any realistic stall.
         assert!(
             !mgr.should_send_test_request(),
-            "neither interval nor grace has elapsed"
+            "not due before interval plus grace elapses"
         );
 
-        sleep(Duration::from_millis(700));
+        // The "due" side is robust: sleeping past the boundary can only ever
+        // wait longer than requested, so once well past 1250ms it is due.
+        sleep(Duration::from_millis(1400));
         assert!(
             mgr.should_send_test_request(),
-            "interval plus grace has elapsed"
+            "due once interval plus grace has elapsed"
         );
     }
 
