@@ -35,10 +35,15 @@ pub enum FastError {
         max_bytes: usize,
     },
 
-    /// A presence map bit was requested after every bit had been consumed.
+    /// Every encoded presence-map bit has been consumed.
     ///
-    /// A truncated presence map must not read as "all remaining fields
-    /// absent"; exhaustion is an explicit protocol error.
+    /// This is a primitive-level signal from
+    /// [`PresenceMap::next_bit`](crate::PresenceMap::next_bit), not a decode
+    /// failure. Per FAST v1.1 §6.3.1 a presence map carries an infinite implied
+    /// suffix of zero bits, so a field past the encoded bits is absent; the
+    /// operator layer reads this exhaustion as absent and does not surface it.
+    /// It is exposed so a caller that wants the strict encoded length can tell
+    /// where the encoded bits end.
     #[error("presence map exhausted")]
     PresenceMapExhausted,
 

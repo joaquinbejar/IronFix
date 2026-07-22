@@ -10,10 +10,19 @@
 //! are present in a FAST message. It uses stop-bit encoding where the high
 //! bit of each byte indicates whether more bytes follow.
 //!
-//! Two hardening rules apply, because a presence map is attacker-controlled
-//! input: its encoded size is capped by [`MAX_PMAP_BYTES`], and running off
-//! the end of the map is an explicit [`FastError::PresenceMapExhausted`]
-//! rather than a fabricated "field absent" answer.
+//! Two rules apply, because a presence map is attacker-controlled input. Its
+//! encoded size is capped by [`MAX_PMAP_BYTES`], which bounds the work a hostile
+//! map can cost. Beyond that encoded size the map is not truncated: FAST v1.1
+//! §6.3.1 defines an infinite implied suffix of zero bits, so every field past
+//! the encoded bits is absent (0). The primitive [`PresenceMap::next_bit`]
+//! reports that the encoded bits are used up with
+//! [`FastError::PresenceMapExhausted`]; the operator layer
+//! ([`Operator::transfer`](crate::Operator::transfer)) applies the zero suffix
+//! by reading that exhaustion as absent.
+//!
+//! On the way out, [`PresenceMap::encode`] emits the minimal form — no
+//! trailing all-absent bytes — because that is what a conformant FAST receiver
+//! expects and what a strict one insists on.
 
 use crate::decoder::{PAYLOAD_BITS, STOP_BIT, read_byte};
 use crate::error::FastError;
@@ -110,31 +119,33 @@ impl PresenceMap {
         Ok(Self { bits, position: 0 })
     }
 
-    /// Consumes and returns the next bit from the presence map.
+    /// Consumes and returns the next encoded bit from the presence map.
     ///
     /// # Returns
     /// `true` if the corresponding field is present, `false` otherwise.
     ///
     /// # Errors
-    /// Returns [`FastError::PresenceMapExhausted`] once every decoded bit has
-    /// been consumed, rather than answering "absent" forever.
+    /// Returns [`FastError::PresenceMapExhausted`] once every encoded bit has
+    /// been consumed. This is a primitive-level signal, not a decode failure:
+    /// per FAST v1.1 §6.3.1 a presence map carries an infinite implied suffix of
+    /// zero bits, so reading past the encoded bits means the field is absent
+    /// (0). The primitive does not fabricate that zero itself; the operator
+    /// layer ([`Operator::transfer`](crate::Operator::transfer)) applies the
+    /// zero suffix by mapping this exhaustion to absent, so a caller that wants
+    /// the strict encoded length can still see where it ends. A failed read
+    /// does not advance the position.
     ///
     /// # Granularity
     ///
-    /// A decoded map always holds a multiple of seven bits, because that is
-    /// what the wire encoding carries: a sender meaning one present bit emits
-    /// a single byte, and this map then offers seven. Those six padding bits
-    /// read as "absent" and are indistinguishable here from real absent
-    /// fields — the primitive layer never sees the template, so it cannot know
-    /// how many bits were meant. Exhaustion therefore only fires at a
-    /// seven-bit boundary.
-    ///
-    /// The mirror of that is over-rejection: a sender that omits trailing
-    /// all-absent bytes (legal in some implementations) produces a map shorter
-    /// than the template's field count, and the reads past its end error here
-    /// rather than yielding "absent". Resolving either direction requires the
-    /// expected field count, which belongs to the template layer — see the
-    /// template-driven decode work tracked in issue #13.
+    /// A decoded map always holds a multiple of seven bits, because that is what
+    /// the wire encoding carries: a sender meaning one present bit emits a
+    /// single byte, and this map then offers seven. Those six padding bits read
+    /// as absent and are indistinguishable here from the implied zero suffix —
+    /// the primitive layer never sees the template, so both simply mean the
+    /// field is absent. Exhaustion therefore fires only at a seven-bit boundary,
+    /// and everything past it is absent all the same. A caller that already
+    /// knows how many fields to expect may instead read with
+    /// [`PresenceMap::bit`], which answers `None` past the end.
     #[inline]
     pub fn next_bit(&mut self) -> Result<bool, FastError> {
         let bit = *self
@@ -191,6 +202,22 @@ impl PresenceMap {
 
     /// Encodes the presence map to bytes.
     ///
+    /// The encoding is **minimal**: trailing bytes in which every bit is clear
+    /// are dropped, so a map of fourteen absent fields is the single byte
+    /// `0x80` rather than `0x00 0x80`. FAST allows a receiver to treat bits
+    /// past the end of the map as clear, and strict counterparties reject the
+    /// over-long form.
+    ///
+    /// The consequence is that `encode` followed by
+    /// [`PresenceMap::decode`] does not round-trip bit count: the decoded map
+    /// is as short as the last set bit allows, and every bit past its end is
+    /// absent per the FAST zero-suffix rule. A reader consults
+    /// [`PresenceMap::bit`], which answers `None` past the end, or reads through
+    /// the operator layer, which treats a bit past the end as absent; the
+    /// primitive [`PresenceMap::next_bit`] instead reports
+    /// [`FastError::PresenceMapExhausted`] so a caller can still see where the
+    /// encoded bits end.
+    ///
     /// # Returns
     /// The encoded bytes with stop-bit encoding.
     ///
@@ -199,10 +226,6 @@ impl PresenceMap {
     /// than [`MAX_PMAP_BYTES`] can carry — the encoder must never emit a map
     /// its own decoder would reject.
     pub fn encode(&self) -> Result<Vec<u8>, FastError> {
-        if self.bits.is_empty() {
-            return Ok(vec![STOP_BIT]); // Empty pmap with stop bit
-        }
-
         let byte_len = self.bits.len().div_ceil(PAYLOAD_BITS);
         if byte_len > MAX_PMAP_BYTES {
             return Err(FastError::PresenceMapTooLarge {
@@ -225,6 +248,18 @@ impl PresenceMap {
             result.push(byte);
         }
 
+        // Drop trailing all-absent bytes: they carry no information and the
+        // over-long form is not minimal. At least one byte must survive, since
+        // a presence map is never zero bytes on the wire.
+        while result.len() > 1 && result.last() == Some(&0) {
+            result.pop();
+        }
+
+        // An empty map still needs its lone stop byte.
+        if result.is_empty() {
+            result.push(0);
+        }
+
         // Set the stop bit on the last byte.
         if let Some(last) = result.last_mut() {
             *last |= STOP_BIT;
@@ -241,9 +276,12 @@ impl Default for PresenceMap {
 }
 
 /// Builder for constructing presence maps.
+///
+/// Bits accumulate inline, so a map covering every realistic template is built
+/// without touching the heap.
 #[derive(Debug, Default)]
 pub struct PresenceMapBuilder {
-    bits: Vec<bool>,
+    bits: PmapBits,
 }
 
 impl PresenceMapBuilder {
@@ -263,7 +301,10 @@ impl PresenceMapBuilder {
     /// Builds the presence map.
     #[must_use]
     pub fn build(self) -> PresenceMap {
-        PresenceMap::from_bits(self.bits)
+        PresenceMap {
+            bits: self.bits,
+            position: 0,
+        }
     }
 }
 
@@ -363,6 +404,9 @@ mod tests {
 
     #[test]
     fn test_presence_map_next_bit_past_the_end_is_exhausted() {
+        // The primitive reports where the encoded bits end; it does not fabricate
+        // the FAST zero suffix. Applying that suffix — reading a bit past the end
+        // as absent — is the operator layer's job (see `Operator::transfer`).
         let mut pmap = PresenceMap::from_bits(vec![true]);
 
         assert!(!pmap.is_exhausted());
@@ -423,13 +467,50 @@ mod tests {
 
             if let Ok(decoded) = decoded {
                 assert_eq!(offset, encoded.len());
-                // The wire form is padded to whole bytes, so the decoded map is
-                // at least as long as the original and agrees on every bit.
-                assert!(decoded.len() >= bits.len());
+                // Every bit survives, either explicitly or as a bit past the
+                // end of the minimal map, which reads as absent.
                 for (index, &expected) in bits.iter().enumerate() {
-                    assert_eq!(decoded.bit(index), Some(expected), "bit {index}");
+                    assert_eq!(decoded.bit(index).unwrap_or(false), expected, "bit {index}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_presence_map_encode_drops_trailing_absent_bytes() {
+        // Fourteen absent fields fit in one byte, not two: the second byte
+        // would carry no information and is not the minimal form.
+        let pmap = PresenceMap::from_bits(vec![false; 14]);
+        assert_eq!(pmap.encode(), Ok(vec![STOP_BIT]));
+    }
+
+    #[test]
+    fn test_presence_map_encode_keeps_bytes_up_to_the_last_present_field() {
+        // One present field followed by thirteen absent ones: the first byte
+        // carries the set bit and the second is dropped.
+        let mut bits = vec![false; 14];
+        if let Some(first) = bits.first_mut() {
+            *first = true;
+        }
+        let pmap = PresenceMap::from_bits(bits);
+        assert_eq!(pmap.encode(), Ok(vec![0b1100_0000]));
+
+        // A set bit in the second byte keeps that byte alive.
+        let mut bits = vec![false; 14];
+        if let Some(last) = bits.last_mut() {
+            *last = true;
+        }
+        let pmap = PresenceMap::from_bits(bits);
+        assert_eq!(pmap.encode(), Ok(vec![0x00, 0b1000_0001]));
+    }
+
+    #[test]
+    fn test_presence_map_encode_all_absent_is_a_lone_stop_byte() {
+        // However many absent fields the template has, the minimal map is one
+        // byte -- and it must still decode as a presence map.
+        for count in [1_usize, 7, 8, 63, 64] {
+            let pmap = PresenceMap::from_bits(vec![false; count]);
+            assert_eq!(pmap.encode(), Ok(vec![STOP_BIT]), "{count} absent fields");
         }
     }
 
