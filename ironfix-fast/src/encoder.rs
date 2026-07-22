@@ -274,14 +274,20 @@ impl FastEncoder {
     /// * `value` - The optional value to encode
     ///
     /// # Errors
-    /// Never returns an error; the `Result` is kept for API stability and to
-    /// match the fallible ASCII and byte-vector encoders.
+    /// [`FastError::IntegerOverflow`] if the internal bias overflowed `i128`,
+    /// which cannot happen for an `i64` input; the arithmetic is checked per the
+    /// checked-arithmetic rule rather than assumed. The `Result` also matches
+    /// the fallible ASCII and byte-vector encoders.
     pub fn encode_nullable_int(&mut self, value: Option<i64>) -> Result<(), FastError> {
         match value {
             Some(v) if v < 0 => self.encode_int(v),
             Some(v) => {
-                // The biased value is at most `2^63`, which fits `i128`, not `i64`.
-                let biased = i128::from(v) + 1;
+                // The biased value is at most `2^63`, which fits `i128`, not
+                // `i64`; checked even though an `i64` input can never overflow
+                // `i128`, per the checked-arithmetic rule.
+                let biased = i128::from(v)
+                    .checked_add(1)
+                    .ok_or(FastError::IntegerOverflow)?;
                 self.encode_int_i128(biased);
             }
             None => self.buffer.push(STOP_BIT),

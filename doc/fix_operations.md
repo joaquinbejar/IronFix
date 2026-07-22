@@ -106,11 +106,11 @@ and stops at the first failure:
    — its initiator would set 1, its acceptor 2 — and IronFix matches the
    acceptor. The mismatch self-heals: the peer sees a gap at 2, requests a
    resend of 1, and receives a GapFill that resynchronises it.
-7. **`MsgSeqNum` (34).** Read positionally: 34 must appear in the standard
-   header, the same contract steps 2 and 5 enforce, so a 34 that occurs only
-   after the body is treated as missing and fails the handshake. When present in
-   the header, too low fails the handshake and a gap completes the handshake and
-   immediately issues a ResendRequest.
+7. **`MsgSeqNum` (34).** The header 34 is read positionally, *before* identity —
+   the same standard-header contract step 2 applies to the CompIDs — so a 34 that
+   occurs only after the body is treated as missing and fails the handshake. The
+   value read there is then validated at this step: too low fails the handshake,
+   and a gap completes the handshake and immediately issues a ResendRequest.
 
 The same identity and `SendingTime` checks (steps 2 and 3) run on every inbound
 frame once the session is established; there a failure produces the Reject and

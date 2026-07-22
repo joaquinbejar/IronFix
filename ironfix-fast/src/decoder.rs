@@ -321,7 +321,9 @@ impl FastDecoder {
                 return Err(FastError::IntegerOverflow);
             }
             let byte = read_byte(data, offset)?;
-            consumed += 1;
+            // Checked even though the ceiling above already bounds it, per the
+            // decoder checked-arithmetic rule.
+            consumed = consumed.checked_add(1).ok_or(FastError::IntegerOverflow)?;
 
             // `checked_mul` rejects any value that would lose significant bits.
             // The product is a multiple of `RADIX`, so its low seven bits are
@@ -1282,6 +1284,34 @@ mod tests {
         assert_eq!(
             FastDecoder::decode_nullable_int(&hostile, &mut offset),
             Err(FastError::IntegerOverflow)
+        );
+    }
+
+    #[test]
+    fn test_decode_nullable_int_negative_below_i64_min_is_overflow() {
+        // The negative narrowing branch (raw < 0) has its own exit: a fully
+        // stopped ten-byte negative value whose magnitude is far below i64::MIN.
+        // The first byte's sign bit is set, so decode seeds -1 and accumulates a
+        // ~70-bit negative that i64::try_from rejects — distinct from the
+        // positive-overflow fixture and the byte-count ceiling.
+        let below_min = [0x7e, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0xff];
+        let mut offset = 0;
+        assert_eq!(
+            FastDecoder::decode_nullable_int(&below_min, &mut offset),
+            Err(FastError::IntegerOverflow)
+        );
+    }
+
+    #[test]
+    fn test_decode_nullable_int_truncated_input_is_unexpected_eof() {
+        // Truncated input through the new i128 path: a first byte with no stop
+        // bit and nothing after it ends mid-value. This exercises
+        // decode_nullable_int itself, not the old decode_int helper.
+        let truncated = [0x01u8];
+        let mut offset = 0;
+        assert_eq!(
+            FastDecoder::decode_nullable_int(&truncated, &mut offset),
+            Err(FastError::UnexpectedEof)
         );
     }
 
