@@ -63,12 +63,17 @@ and stops at the first failure:
    `target_comp_id` and inbound `TargetCompID` (56) the configured
    `sender_comp_id`; when `sender_sub_id` / `target_sub_id` are configured,
    inbound `TargetSubID` (57) and `SenderSubID` (50) are checked the same way.
-   A mismatch produces a session Reject with reason 9 (CompID problem) followed
-   by a Logout, and the handshake fails. This is checked before any callback
-   runs and before sequence state moves, so a cross-wired connection can never
-   establish a session.
-3. **`from_admin`.** A rejection sends a Logout and fails the handshake.
-4. **`HeartBtInt` (108).** 108 is a *required* field of the Logon, so an ack
+   Each must both carry the expected value **and** occur in the standard header:
+   a CompID that appears only after the message body identifies nothing and is
+   treated as missing. A mismatch or a misplacement produces a session Reject
+   with reason 9 (CompID problem) followed by a Logout, and the handshake fails.
+   This is checked before any callback runs and before sequence state moves, so
+   a cross-wired connection can never establish a session.
+3. **`SendingTime` (52).** Validated against the local clock (see "Reject",
+   reason 10). A skew beyond the tolerance, an absent field, or an unparseable
+   one Rejects and fails the handshake, before the heartbeat clock is set.
+4. **`from_admin`.** A rejection sends a Logout and fails the handshake.
+5. **`HeartBtInt` (108).** 108 is a *required* field of the Logon, so an ack
    that omits it (session Reject, reason 1 — required tag missing) or carries a
    non-numeric value (session Reject, reason 6 — incorrect data format for
    value), `RefTagID` = 108 in both cases and each followed by a Logout, fails
@@ -86,7 +91,7 @@ and stops at the first failure:
    requested: echoing our own configuration back is our choice, not the
    counterparty pushing us past the ceiling. `108=0` is legal and always
    accepted; see "Heartbeat" below for what it means.
-5. **`ResetSeqNumFlag` (141).** `141=Y` on the ack must arrive under
+6. **`ResetSeqNumFlag` (141).** `141=Y` on the ack must arrive under
    `MsgSeqNum = 1` — the reset and the number carrying it have to describe the
    same stream — and a peer that sends any other number fails the handshake
    rather than having one half of the contradiction guessed for it. It is
@@ -101,12 +106,14 @@ and stops at the first failure:
    — its initiator would set 1, its acceptor 2 — and IronFix matches the
    acceptor. The mismatch self-heals: the peer sees a gap at 2, requests a
    resend of 1, and receives a GapFill that resynchronises it.
-6. **`MsgSeqNum` (34).** Too low fails the handshake; a gap completes the
+7. **`MsgSeqNum` (34).** Too low fails the handshake; a gap completes the
    handshake and immediately issues a ResendRequest.
 
-The same identity check (step 2) runs on every inbound frame once the session
-is established; there a mismatch produces the Reject and Logout and then tears
-the session down.
+The same identity and `SendingTime` checks (steps 2 and 3) run on every inbound
+frame once the session is established; there a failure produces the Reject and
+Logout and then tears the session down. An unsatisfied ResendRequest from step 7
+does not stall forever — it is retried and then escalated to Logout; see "Resend
+Request".
 
 Outbound `ResetSeqNumFlag` is driven by `SessionConfig::reset_on_logon`.
 
@@ -367,6 +374,18 @@ isolated follow-up work. (The inbound direction is unaffected in practice: a
 because the GapFill's `NewSeqNo` is capped at our next outbound sequence
 regardless.)
 
+**Outbound resend recovery is bounded.** When *this* engine detects an inbound
+gap it sends a `ResendRequest` and waits. A peer that never satisfies it — while
+its other traffic keeps the heartbeat clock alive — used to hold the session
+open indefinitely, the inbound expectation pinned and nothing reaching the
+application. The request is now retried every
+`SessionConfig::resend_timeout` (default **10 seconds**), up to
+`SessionConfig::resend_attempt_limit` attempts (default **3**, counting the
+first). Once the attempts are spent the session is logged out with a `Text` (58)
+naming the stalled sequence number, turning a silent stall into an observable,
+graceful close. Any in-sequence message clears the outstanding request, so the
+timer measures a gap that is making no progress at all, not a slow replay.
+
 ---
 
 ### Reject (MsgType = 3)
@@ -410,18 +429,25 @@ regardless.)
 
 | Code | Emitted when |
 |---|---|
-| 1 | `SequenceReset` without `NewSeqNo` (36); `ResendRequest` without `BeginSeqNo` (7) or `EndSeqNo` (16) |
+| 1 | `SequenceReset` without `NewSeqNo` (36); `ResendRequest` without `BeginSeqNo` (7) or `EndSeqNo` (16); inbound `SendingTime` (52) absent |
 | 5 | `SequenceReset` whose `NewSeqNo` would rewind or fails to advance; `ResendRequest` whose range is outside what we have sent |
-| 6 | `SequenceReset` with a malformed `GapFillFlag` (123) that is present but neither `Y` nor `N` |
-| 9 | Inbound `SenderCompID`/`TargetCompID` (and `SenderSubID`/`TargetSubID` when configured) do not match the session configuration |
+| 6 | `SequenceReset` with a malformed `GapFillFlag` (123) that is present but neither `Y` nor `N`; inbound `SendingTime` (52) present but not a `UTCTimestamp` |
+| 9 | Inbound `SenderCompID`/`TargetCompID` (and `SenderSubID`/`TargetSubID` when configured) do not match the session configuration, **or** appear outside the standard header |
+| 10 | Inbound `SendingTime` (52) differs from the local clock by more than the configured tolerance |
 | any | Whatever an `Application::from_admin` / `from_app` implementation returns in its `RejectReason` |
 
-**Reason 10 (SendingTime accuracy) is not implemented.** `SendingTime` (52) is
-never compared against the local clock. Doing so requires a tolerance window,
-and a tolerance is a policy decision — it needs its own typed
-`SessionConfig` knob with a defensible default and a documented unit and range,
-not a guessed constant. Until that decision is made, a message with a wildly
-skewed `SendingTime` is accepted. This is a known, deliberate omission.
+**Reason 10 (SendingTime accuracy) is implemented.** Every inbound frame's
+`SendingTime` (52) is compared against the local clock, immediately after the
+CompID check and before the heartbeat clock is refreshed. The tolerance is the
+typed `SessionConfig::sending_time_tolerance`, defaulting to **120 seconds** in
+either direction — the interval FIX engines have converged on (QuickFIX's
+`MaxLatency`): far more slack than an NTP-synchronised host ever needs, yet
+tight enough that an unsynchronised clock is caught within days. A value outside
+the window is rejected with reason 10 (`RefTagID` = 52), an absent field with
+reason 1, and an unparseable one with reason 6; in each case the session is then
+logged out, because a wrong clock is systemic rather than per-message. Setting
+the tolerance to `Duration::ZERO` disables the check — including the presence and
+format checks — for a peer with a known clock problem.
 
 ---
 
@@ -989,7 +1015,10 @@ Rationale for the two policies:
   messages and unavailable sequence numbers gap-filled. Two limits are worth
   stating: the store is **opt-in**, and without one the whole range is still
   answered with a single gap fill; and `MemoryStore` is not persistent, so
-  nothing is replayable after a restart. See "Resend Request" above.
+  nothing is replayable after a restart. An *outbound* request the peer never
+  satisfies is also bounded — retried every `SessionConfig::resend_timeout` and
+  then escalated to Logout after `SessionConfig::max_resend_requests` attempts,
+  rather than stalling the session forever. See "Resend Request" above.
 
 ### Phase 2: Order Entry (High Priority)
 - [ ] New Order Single

@@ -20,10 +20,27 @@
 //! # Inbound conformance
 //!
 //! Every inbound frame is checked in this order: decode, `MsgSeqNum` (34)
-//! presence, counterparty identity (49/56, plus 50/57 when configured), then
-//! heartbeat bookkeeping, then sequence validation. Identity comes before the
-//! heartbeat clock deliberately — traffic from the wrong counterparty must not
-//! keep the session alive, reach the [`Application`], or move sequence state.
+//! presence, counterparty identity (49/56, plus 50/57 when configured),
+//! `SendingTime` (52) accuracy, then heartbeat bookkeeping, then sequence
+//! validation. Identity and clock come before the heartbeat bookkeeping
+//! deliberately — traffic from the wrong counterparty, or from one whose clock
+//! is wrong, must not keep the session alive, reach the [`Application`], or
+//! move sequence state.
+//!
+//! Both of those failures end the session after a Reject and a Logout, because
+//! both are systemic rather than per-message: a peer that is cross-wired, or
+//! whose clock is two minutes out, will be so on its next message too.
+//!
+//! # Bounded recovery
+//!
+//! A gap is answered with a `ResendRequest` (2), and a request that goes
+//! unanswered does not wait forever: it is retried every
+//! [`SessionConfig::resend_timeout`] up to
+//! [`SessionConfig::resend_attempt_limit`] attempts, after which the session is
+//! logged out. Without that bound a peer that keeps sending gapped frames holds
+//! a session open indefinitely — the frames refresh the heartbeat clock, so
+//! nothing times out, while the inbound expectation never moves and nothing
+//! reaches the application.
 //!
 //! # Heartbeats
 //!
@@ -119,7 +136,10 @@ use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Command, Connection, SessionRuntime};
 use crate::error::EngineError;
 use crate::outbound;
-use crate::wire::{self, MessageFactory, PeerIdentity, PendingMessage, UnsupportedVersion};
+use crate::wire::{
+    self, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard, SendingTimeProblem,
+    UnsupportedVersion,
+};
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use ironfix_core::error::{DecodeError, EncodeError};
@@ -136,7 +156,7 @@ use ironfix_store::MessageStore;
 use ironfix_transport::FixCodec;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -572,6 +592,7 @@ impl<A: Application + 'static> Initiator<A> {
         });
         let mut factory = MessageFactory::new(&self.config, version);
         let identity = PeerIdentity::new(&self.config);
+        let sending_time = SendingTimeGuard::new(&self.config);
         let write_timeout = self.write_timeout;
         let store = self.store.as_ref();
 
@@ -618,7 +639,8 @@ impl<A: Application + 'static> Initiator<A> {
             Ok(Some(Ok(frame))) => frame,
         };
 
-        let mut pending_resend = None;
+        // (gap start, high-water) of a gap detected in the Logon ack itself.
+        let mut pending_resend: Option<(u64, u64)> = None;
         {
             let raw = wire::decode_frame(&ack)?;
             match raw.msg_type() {
@@ -696,6 +718,41 @@ impl<A: Application + 'static> Initiator<A> {
                 .await;
                 let _ = session.on_logon_reject();
                 return Err(EngineError::IdentityMismatch { detail });
+            }
+
+            // The clock is checked on the ack for the same reason it is checked
+            // on every later frame: a peer whose SendingTime is wildly skewed
+            // cannot be trusted to sequence a session, and the handshake is the
+            // cheapest place to refuse it.
+            if let Err(problem) = sending_time.validate(&raw) {
+                let detail = problem.to_string();
+                let reason = problem.reject_reason();
+                let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
+                let _ = send_handshake_admin(
+                    self.application.as_ref(),
+                    &session_id,
+                    &mut framed,
+                    &mut factory,
+                    &runtime.sequences,
+                    store,
+                    write_timeout,
+                    reject,
+                )
+                .await;
+                let logout = factory.logout(Some(&detail));
+                let _ = send_handshake_admin(
+                    self.application.as_ref(),
+                    &session_id,
+                    &mut framed,
+                    &mut factory,
+                    &runtime.sequences,
+                    store,
+                    write_timeout,
+                    logout,
+                )
+                .await;
+                let _ = session.on_logon_reject();
+                return Err(EngineError::SendingTime { detail });
             }
 
             if let Err(reason) = self.application.from_admin(&raw, &session_id).await {
@@ -867,7 +924,9 @@ impl<A: Application + 'static> Initiator<A> {
                         "logon ack MsgSeqNum too low: expected {expected}, received {received}"
                     )));
                 }
-                SequenceResult::Gap { expected, .. } => pending_resend = Some(expected),
+                SequenceResult::Gap { expected, received } => {
+                    pending_resend = Some((expected, received));
+                }
             }
         }
 
@@ -877,7 +936,7 @@ impl<A: Application + 'static> Initiator<A> {
         tracing::info!(session = %session_id, "FIX session established");
 
         // A gap in the Logon ack means we missed messages: request a resend.
-        if let Some(expected) = pending_resend {
+        if let Some((expected, _high_water)) = pending_resend {
             let request = factory.resend_request(expected, 0);
             send_handshake_admin(
                 self.application.as_ref(),
@@ -907,15 +966,18 @@ impl<A: Application + 'static> Initiator<A> {
             reject_tx,
         ));
 
+        let resend = pending_resend
+            .map(|(expected, high_water)| ResendState::first(expected, high_water, &self.config));
         let reactor = Reactor {
             factory,
             identity,
+            sending_time,
             runtime: Arc::clone(&runtime),
             config: self.config.clone(),
             application: Arc::clone(&self.application),
             session_id: session_id.clone(),
             store: self.store.clone(),
-            pending_resend,
+            resend,
             write_timeout,
             app_tx,
         };
@@ -1209,12 +1271,90 @@ struct ReactorChannels {
     dispatcher: JoinHandle<()>,
 }
 
+/// Bookkeeping for an outstanding `ResendRequest` (2).
+///
+/// A resend that is never satisfied must not keep the session open forever:
+/// gapped frames refresh the heartbeat clock, so the heartbeat timeout never
+/// fires while the inbound expectation sits pinned. This tracks the gap so the
+/// reactor can retry the request and, once the attempts are spent, log the
+/// session out instead of waiting on a peer that is not answering.
+#[derive(Debug, Clone, Copy)]
+struct ResendState {
+    /// The next sequence number the recovery is waiting to receive. It advances
+    /// with in-order inbound progress so a retry re-requests from the current
+    /// gap start, never a number already consumed.
+    expected: u64,
+    /// The top of the outstanding range: the highest sequence number seen while
+    /// the gap has been open. The request is open-ended (`EndSeqNo` = 0), so
+    /// this is the water mark the expectation must cross for the gap to be
+    /// considered closed — clearing recovery on the first in-order message
+    /// instead would forget that later numbers in the range are still missing.
+    high_water: u64,
+    /// When the most recent request for this gap was sent.
+    requested_at: Instant,
+    /// How many requests have been sent for this gap, counting the first.
+    attempts: u32,
+    /// Attempt ceiling, resolved once from the configuration.
+    limit: u32,
+    /// How long a request may make no progress before it is retried.
+    timeout: Duration,
+}
+
+impl ResendState {
+    /// Opens recovery for a gap at `expected`, with `high_water` the highest
+    /// sequence number outstanding, counting the first request.
+    #[must_use]
+    fn first(expected: u64, high_water: u64, config: &SessionConfig) -> Self {
+        Self {
+            expected,
+            high_water,
+            requested_at: Instant::now(),
+            attempts: 1,
+            limit: config.resend_attempt_limit(),
+            timeout: config.resend_timeout,
+        }
+    }
+
+    /// Whether this gap has waited longer than its retry timeout.
+    #[must_use]
+    fn is_stalled(&self) -> bool {
+        self.requested_at.elapsed() >= self.timeout
+    }
+
+    /// Whether another request may still be sent for this gap.
+    #[must_use]
+    const fn can_retry(&self) -> bool {
+        self.attempts < self.limit
+    }
+
+    /// Records that another request for this same gap has gone out.
+    fn record_retry(&mut self) {
+        self.requested_at = Instant::now();
+        self.attempts = self.attempts.saturating_add(1);
+    }
+
+    /// Records genuine in-order progress within the outstanding range.
+    ///
+    /// The gap start has advanced to `expected`, so the stall clock and the
+    /// retry budget both reset: a peer that is actively feeding the gap has
+    /// proved itself responsive and must not be logged out for being slow. A
+    /// duplicate or an out-of-order frame makes no such progress and so does not
+    /// reach here.
+    fn record_progress(&mut self, expected: u64) {
+        self.expected = expected;
+        self.requested_at = Instant::now();
+        self.attempts = 1;
+    }
+}
+
 /// Reactor state shared across event handlers.
 struct Reactor<A: Application> {
     /// Outbound frame factory, holding the encoder reused for every message.
     factory: MessageFactory,
     /// Identity every inbound message must carry.
     identity: PeerIdentity,
+    /// Clock-skew check applied to every inbound `SendingTime` (52).
+    sending_time: SendingTimeGuard,
     /// Shared session runtime (sequences + heartbeat).
     runtime: Arc<SessionRuntime>,
     /// Session configuration.
@@ -1225,12 +1365,12 @@ struct Reactor<A: Application> {
     session_id: SessionId,
     /// Optional message store for outbound frames and resend replay.
     store: Option<Arc<dyn MessageStore>>,
-    /// Expected sequence number a pending ResendRequest was issued for.
+    /// The outstanding ResendRequest, if a gap is being recovered.
     ///
     /// The logout deadline is *not* tracked here: `Session<LogoutPending>`
     /// carries the instant the Logout went out, so the phase itself is the
     /// deadline.
-    pending_resend: Option<u64>,
+    resend: Option<ResendState>,
     /// Bound on a single socket write.
     write_timeout: Duration,
     /// Hand-off queue to the application dispatcher.
@@ -1619,26 +1759,42 @@ impl<A: Application> Reactor<A> {
             }
             Command::Logout => match phase {
                 Phase::LogoutPending(_) => Ok(phase),
-                Phase::Active(session) => {
-                    let logout = self.factory.logout(None);
-                    match self.send(framed, logout).await {
-                        Err(err) => {
-                            let _ = session.disconnect();
-                            Err(closed(format!("send failed: {err}"), false))
-                        }
-                        // The Logout never reached the wire — a `to_admin`
-                        // callback left it unframeable. Staying Active is the
-                        // honest verdict: arming the logout deadline for a frame
-                        // the peer never saw would tear the session down over a
-                        // Logout it was never told about.
-                        Ok(Sent::Dropped) => Ok(Phase::Active(session)),
-                        // Typestate: Active -> LogoutPending. The new state
-                        // records when the Logout went out, which is what
-                        // on_tick times.
-                        Ok(Sent::Yes) => Ok(Phase::LogoutPending(session.initiate_logout())),
-                    }
-                }
+                Phase::Active(session) => self.begin_logout(framed, session, None).await,
             },
+        }
+    }
+
+    /// Sends a Logout (35=5) and moves the session to LogoutPending, where it
+    /// waits for the acknowledgement until `logout_timeout` expires.
+    ///
+    /// `text` is the `Text` (58) explaining an engine-initiated logout; a
+    /// consumer-initiated one carries none.
+    async fn begin_logout(
+        &mut self,
+        framed: &mut FixFramed,
+        session: Session<Active>,
+        text: Option<&str>,
+    ) -> Result<Phase, SessionClosed> {
+        let logout = self.factory.logout(text);
+        match self.send(framed, logout).await {
+            Err(err) => {
+                let _ = session.disconnect();
+                Err(closed(format!("send failed: {err}"), false))
+            }
+            // The Logout never reached the wire — a `to_admin` callback left it
+            // unframeable. Staying Active is the honest verdict: arming the
+            // logout deadline for a frame the peer never saw would tear the
+            // session down over a Logout it was never told about.
+            Ok(Sent::Dropped) => Ok(Phase::Active(session)),
+            Ok(Sent::Yes) => {
+                // Recovery is over: a session on its way out will not process a
+                // replay, and leaving the gap armed would keep asking for one.
+                self.resend = None;
+                // Typestate: Active -> LogoutPending. The new state records when
+                // the Logout went out, which is what `on_tick` times through
+                // `Session::sent_at`.
+                Ok(Phase::LogoutPending(session.initiate_logout()))
+            }
         }
     }
 
@@ -1656,6 +1812,15 @@ impl<A: Application> Reactor<A> {
         {
             teardown(phase);
             return Err(closed("logout ack timeout", true));
+        }
+
+        // A gap that is making no progress is chased on its own clock,
+        // independent of the heartbeat: gapped frames keep the heartbeat alive,
+        // so this is the only thing that bounds an unsatisfied resend.
+        if let Some(resend) = self.resend
+            && resend.is_stalled()
+        {
+            return self.on_resend_stalled(framed, phase, resend).await;
         }
 
         let (timed_out, send_test_request, send_heartbeat) = {
@@ -1715,16 +1880,29 @@ impl<A: Application> Reactor<A> {
         Ok(phase)
     }
 
-    /// Requests retransmission from `expected` onwards, unless the same
-    /// range is already outstanding.
+    /// Requests retransmission from `expected` onwards, unless the same range
+    /// is already outstanding. `high_water` is the highest sequence number seen
+    /// for this gap — the top of the range the request must eventually fill.
+    ///
+    /// The first request for a gap opens a [`ResendState`], whose timer bounds
+    /// how long the gap may sit unfilled (see [`Reactor::on_resend_stalled`]).
+    /// A frame that reaches beyond an already-open gap only raises the recorded
+    /// water mark; it does not emit a second overlapping request.
     async fn request_resend(
         &mut self,
         framed: &mut FixFramed,
         phase: Phase,
         expected: u64,
+        high_water: u64,
     ) -> Result<Phase, SessionClosed> {
-        if self.pending_resend == Some(expected) {
-            return Ok(phase);
+        if let Some(state) = self.resend.as_mut() {
+            if high_water > state.high_water {
+                state.high_water = high_water;
+            }
+            // The request from this gap start is already on the wire.
+            if state.expected == expected {
+                return Ok(phase);
+            }
         }
         let request = self.factory.resend_request(expected, 0);
         match self.send(framed, request).await {
@@ -1738,7 +1916,86 @@ impl<A: Application> Reactor<A> {
             Ok(Sent::Dropped) => return Ok(phase),
             Ok(Sent::Yes) => {}
         }
-        self.pending_resend = Some(expected);
+        // A re-request at a new gap start keeps the highest water mark seen so
+        // far, so the range is never narrowed by a later, lower frame.
+        let high_water = self
+            .resend
+            .map_or(high_water, |state| state.high_water.max(high_water));
+        self.resend = Some(ResendState::first(expected, high_water, &self.config));
+        Ok(phase)
+    }
+
+    /// Reconciles the outstanding resend, if any, with in-order inbound
+    /// progress.
+    ///
+    /// Called after the target expectation advances by one in order. Recovery
+    /// is cleared only once the expectation has moved past the whole outstanding
+    /// range (above the water mark); until then the state is kept and its gap
+    /// start advanced, so a single in-order message can no longer wipe all
+    /// knowledge of a still-open gap. Leaving the marker armed also keeps the
+    /// stall timer honest against a peer that fills the gap start and then
+    /// stalls while spamming timely duplicates.
+    fn note_inbound_progress(&mut self) {
+        let Some(high_water) = self.resend.as_ref().map(|state| state.high_water) else {
+            return;
+        };
+        let next_target = self.runtime.sequences.next_target_seq().value();
+        if next_target > high_water {
+            self.resend = None;
+        } else if let Some(state) = self.resend.as_mut() {
+            state.record_progress(next_target);
+        }
+    }
+
+    /// Handles an outstanding ResendRequest that has gone unanswered past its
+    /// timeout: retry it while attempts remain, otherwise log the session out.
+    ///
+    /// A peer that keeps a gap open indefinitely — answering neither the gap
+    /// nor a fresh request, while its other traffic keeps the heartbeat clock
+    /// alive — is one this session cannot make progress with. Retrying a bounded
+    /// number of times absorbs a lost request or a slow store; exhausting the
+    /// retries turns a silent stall into an observable, graceful close.
+    async fn on_resend_stalled(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        resend: ResendState,
+    ) -> Result<Phase, SessionClosed> {
+        if !resend.can_retry() {
+            let reason = format!(
+                "resend of MsgSeqNum {} unanswered after {} request(s)",
+                resend.expected, resend.attempts
+            );
+            tracing::warn!(session = %self.session_id, reason = %reason, "abandoning stalled resend");
+            return match phase {
+                // A logout already in flight cannot be reissued; let its own
+                // deadline close the session.
+                Phase::LogoutPending(_) => Ok(phase),
+                Phase::Active(session) => self.begin_logout(framed, session, Some(&reason)).await,
+            };
+        }
+
+        let expected = resend.expected;
+        let request = self.factory.resend_request(expected, 0);
+        match self.send(framed, request).await {
+            Err(err) => {
+                teardown(phase);
+                return Err(closed(format!("send failed: {err}"), false));
+            }
+            // The retry never went out; leave the state untouched so the next
+            // stall tick tries again rather than counting a request the peer
+            // never received.
+            Ok(Sent::Dropped) => return Ok(phase),
+            Ok(Sent::Yes) => {}
+        }
+        if let Some(state) = self.resend.as_mut() {
+            state.record_retry();
+        }
+        tracing::debug!(
+            session = %self.session_id,
+            expected,
+            "retrying unanswered ResendRequest"
+        );
         Ok(phase)
     }
 
@@ -1785,6 +2042,37 @@ impl<A: Application> Reactor<A> {
         closed(detail, false)
     }
 
+    /// Rejects an inbound message whose `SendingTime` (52) is missing,
+    /// unparseable, or outside the configured tolerance, then logs out and
+    /// tears the session down.
+    ///
+    /// A wrong clock is a systemic problem, not a per-message one: the peer's
+    /// next frame will be just as skewed, so accepting this one and moving on
+    /// would only defer the same failure while advancing sequence state on
+    /// timestamps that cannot be trusted. The Reject carries
+    /// `SessionRejectReason` 10 for a skew, 1 for an absent field and 6 for a
+    /// malformed one (`doc/fix_operations.md`, "Session Reject Reasons"), then
+    /// the session is closed as it is for an identity mismatch.
+    async fn close_on_sending_time(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        ref_seq: u64,
+        ref_msg_type: &str,
+        problem: SendingTimeProblem,
+    ) -> SessionClosed {
+        let detail = problem.to_string();
+        tracing::warn!(session = %self.session_id, detail = %detail, "inbound SendingTime problem");
+
+        let reason = problem.reject_reason();
+        let reject = self.factory.session_reject(ref_seq, ref_msg_type, &reason);
+        let _ = self.send(framed, reject).await;
+        let logout = self.factory.logout(Some(&detail));
+        let _ = self.send(framed, logout).await;
+        teardown(phase);
+        closed(detail, false)
+    }
+
     /// Consumes the MsgSeqNum of a `SequenceReset` that is being rejected.
     ///
     /// A Gap Fill participates in normal sequencing: it occupies the number it
@@ -1793,14 +2081,34 @@ impl<A: Application> Reactor<A> {
     /// everything that follows. A Reset-mode message does not participate in
     /// sequencing, so nothing is consumed for it, and neither is anything
     /// consumed for a fill that was not in sequence to begin with.
-    fn consume_if_in_sequence(&self, gap_fill: bool, seq: u64) -> Result<(), SequenceExhausted> {
+    ///
+    /// Returns whether the target expectation actually advanced, so the caller
+    /// can keep an outstanding resend in step with the consumed number.
+    fn consume_if_in_sequence(&self, gap_fill: bool, seq: u64) -> Result<bool, SequenceExhausted> {
         if !gap_fill || !self.runtime.sequences.validate_incoming(seq).is_ok() {
-            return Ok(());
+            return Ok(false);
         }
         self.runtime
             .sequences
             .try_increment_target_seq()
-            .map(|_| ())
+            .map(|_| true)
+    }
+
+    /// Consumes a rejected in-sequence GapFill's MsgSeqNum and keeps recovery in
+    /// step with the advance.
+    ///
+    /// The reject paths in [`Reactor::on_sequence_reset`] discard the fill's
+    /// payload but must not discard the fact that its number is now consumed: an
+    /// outstanding resend whose gap start is left pointing at that number would
+    /// re-request an already-processed sequence and eventually log the session
+    /// out despite real progress. Only a fill that genuinely advanced the target
+    /// reconciles; a duplicate or a gapped one makes no progress and so does not
+    /// disturb the stall clock.
+    fn consume_rejected_fill(&mut self, gap_fill: bool, seq: u64) -> Result<(), SequenceExhausted> {
+        if self.consume_if_in_sequence(gap_fill, seq)? {
+            self.note_inbound_progress();
+        }
+        Ok(())
     }
 
     /// Handles an inbound SequenceReset (35=4).
@@ -1862,11 +2170,11 @@ impl<A: Application> Reactor<A> {
         // Reset mode carries no meaningful MsgSeqNum and is not classified.
         if gap_fill {
             match self.runtime.sequences.validate_incoming(seq) {
-                SequenceResult::Gap { expected, .. } => {
+                SequenceResult::Gap { expected, received } => {
                     // The fill is itself gapped: it cannot be trusted to
                     // describe the missing range, so NewSeqNo is not applied
                     // and the range is requested instead.
-                    return self.request_resend(framed, phase, expected).await;
+                    return self.request_resend(framed, phase, expected, received).await;
                 }
                 SequenceResult::TooLow { expected, received } => {
                     if raw.get_field_str(43) == Some("Y") {
@@ -1890,7 +2198,7 @@ impl<A: Application> Reactor<A> {
             // deduplicated against the outstanding ResendRequest and dropped,
             // and the session goes on reporting itself healthy while it
             // silently discards traffic.
-            if let Err(err) = self.consume_if_in_sequence(gap_fill, seq) {
+            if let Err(err) = self.consume_rejected_fill(gap_fill, seq) {
                 return Err(exhausted(phase, err));
             }
             return self
@@ -1903,7 +2211,7 @@ impl<A: Application> Reactor<A> {
                 .with_ref_tag(36);
             // Same hazard as the rejection path above: the fill still occupies
             // its sequence number even though its NewSeqNo is unusable.
-            if let Err(err) = self.consume_if_in_sequence(gap_fill, seq) {
+            if let Err(err) = self.consume_rejected_fill(gap_fill, seq) {
                 return Err(exhausted(phase, err));
             }
             return self
@@ -1920,6 +2228,9 @@ impl<A: Application> Reactor<A> {
                 if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
                     return Err(exhausted(phase, err));
                 }
+                // The consumed number is real progress: keep an outstanding
+                // resend from re-requesting it.
+                self.note_inbound_progress();
                 let reason = RejectReason::new(
                     5,
                     format!("GapFill NewSeqNo {new_seq} does not advance past MsgSeqNum {seq}"),
@@ -1957,13 +2268,15 @@ impl<A: Application> Reactor<A> {
 
         let expected_before = self.runtime.sequences.next_target_seq().value();
         self.runtime.sequences.set_target_seq(new_seq);
-        // Only a reset that actually advances the expectation resolves an
+        // Only a reset that actually advances the expectation touches an
         // outstanding ResendRequest. A reset landing on the number we already
-        // expect changes nothing, and clearing the marker for it would let a
-        // peer replay it to make the engine emit a fresh ResendRequest every
-        // round -- sequence amplification with no progress.
+        // expect changes nothing, and reconciling for it would let a peer replay
+        // it to make the engine emit a fresh ResendRequest every round --
+        // sequence amplification with no progress. A reset that advances but
+        // stays inside the outstanding range keeps recovery armed against the
+        // rest of it; one that jumps past the water mark clears it.
         if new_seq > expected_before {
-            self.pending_resend = None;
+            self.note_inbound_progress();
         }
         Ok(phase)
     }
@@ -2232,9 +2545,19 @@ impl<A: Application> Reactor<A> {
                 .await);
         }
 
-        // The frame is well-formed, sequenced, and from the configured
-        // counterparty: it proves the peer is alive. A sequence gap is a
-        // recoverable condition, not evidence of a dead peer, so gapped
+        // Clock accuracy is checked next, and likewise before the heartbeat is
+        // refreshed: a peer whose SendingTime is outside the tolerance is one
+        // whose sequencing cannot be trusted, so it must not keep the session
+        // alive either.
+        if let Err(problem) = self.sending_time.validate(&raw) {
+            return Err(self
+                .close_on_sending_time(framed, phase, seq, msg_type.as_str(), problem)
+                .await);
+        }
+
+        // The frame is well-formed, sequenced, from the configured
+        // counterparty, and timely: it proves the peer is alive. A sequence gap
+        // is a recoverable condition, not evidence of a dead peer, so gapped
         // frames still count here — and so does any frame arriving while a
         // TestRequest is outstanding, which is what stops the countdown.
         let test_req_id = raw.get_field_str(112);
@@ -2266,7 +2589,11 @@ impl<A: Application> Reactor<A> {
                     if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
                         return Err(exhausted(phase, err));
                     }
-                    self.pending_resend = None;
+                    // An in-order message advances recovery but does not
+                    // necessarily end it: clear the marker only once the whole
+                    // outstanding range is filled, never on the first message
+                    // back.
+                    self.note_inbound_progress();
                     self.dispatch_admin(framed, phase, &raw, seq).await
                 } else {
                     // Hand the frame to the dispatcher *before* the inbound
@@ -2277,7 +2604,9 @@ impl<A: Application> Reactor<A> {
                     if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
                         return Err(exhausted(phase, err));
                     }
-                    self.pending_resend = None;
+                    // In-order progress, as above: reconcile recovery rather
+                    // than clearing it on the first message back.
+                    self.note_inbound_progress();
                     Ok(phase)
                 }
             }
@@ -2290,8 +2619,10 @@ impl<A: Application> Reactor<A> {
                     .close_on_too_low(framed, phase, expected, received)
                     .await)
             }
-            SequenceResult::Gap { expected, .. } => {
-                let phase = self.request_resend(framed, phase, expected).await?;
+            SequenceResult::Gap { expected, received } => {
+                let phase = self
+                    .request_resend(framed, phase, expected, received)
+                    .await?;
                 if msg_type.is_app() {
                     // Application messages inside a gap will be resent in
                     // order; admin messages are still processed below
