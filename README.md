@@ -80,9 +80,11 @@ around it.
   `ironfix-codegen` has an in-workspace consumer.
 - **FAST is standalone.** There is no FAST template XML parser, no UDP multicast
   receiver, and no wiring into the session or engine path.
-- **No benchmark harness.** There is no `benches/` directory and no `criterion`
-  dependency, so no latency or throughput figure in this repository has been
-  measured. The `make bench*` targets currently measure nothing.
+- **No recorded benchmark baseline.** A criterion harness now exists (see
+  Benchmarks below): `ironfix-tagvalue`, `ironfix-fast` and `ironfix-transport`
+  each carry a `benches/` target run by `make bench`. It ships no saved baseline
+  and no published figures, so every latency and throughput target in `doc/`
+  remains a design goal, unmeasured until you run it on hardware you name.
 
 ## FIX version support
 
@@ -177,9 +179,9 @@ Here's a list of useful commands:
 ### 🔧 Build & Run
 
 ```sh
-make build         # Compile the project
-make release       # Build in release mode
-make run           # Bare 'cargo run'; the workspace has no default binary, so run an example instead
+make build         # Compile the workspace
+make release       # Build the workspace in release mode
+make run EXAMPLE=fix44_server   # Run one example (the workspace has no binaries)
 ```
 
 ### 🧪 Test & Quality
@@ -191,23 +193,24 @@ make fmt-check     # Check formatting without applying
 make lint          # Run clippy with warnings as errors
 make lint-fix      # Auto-fix lint issues
 make fix           # Auto-fix Rust compiler suggestions
-make check         # Run fmt-check + lint + test
-make pre-push      # Run fix + fmt + lint-fix + test + readme + doc (recommended before pushing)
+make check         # Run fmt-check + lint + test + doc + check-spanish
+make pre-push      # Run fix + fmt + lint-fix + test + check-spanish + readme + doc
 ```
 
 ### 📦 Packaging & Docs
 
 ```sh
-make doc           # Check for missing docs via clippy
+make doc           # Fail on any undocumented public item (clippy -D missing_docs)
 make doc-open      # Build and open Rust documentation
 make create-doc    # Generate internal docs
-make publish       # Print the dependency-ordered publish instructions (publishes nothing itself)
-make publish-all   # Publish all crates in dependency order
+make readme        # No-op: README.md is hand-maintained in this workspace
+make publish       # Explain how to publish; see publish-all
+make publish-all   # Publish all crates in dependency order, fail-fast
 ```
 
-`make readme` exists but is a no-op on this workspace — `cargo-readme` does not
-apply to a multi-crate workspace, so `README.md` is maintained by hand. Edit it
-directly when the public surface changes.
+Publishing reads `CARGO_REGISTRY_TOKEN` from the environment — it is never
+passed on a command line. Preview the sequence without touching crates.io with
+`make publish-all DRY_RUN=1`.
 
 ### 📈 Coverage & Benchmarks
 
@@ -215,22 +218,31 @@ directly when the public surface changes.
 make coverage            # Generate code coverage report (XML)
 make coverage-html       # Generate HTML coverage report
 make open-coverage       # Open HTML report
+make bench               # Run the criterion benchmarks
+make bench-quick         # Reduced sample count; a smoke run, not a measurement
+make bench-build         # Compile the benchmarks without running them
+make bench-show          # Open the criterion HTML report
+make bench-save          # Save the current run as a named baseline
+make bench-compare       # Compare the current run against a saved baseline
+make bench-clean         # Remove benchmark data
 ```
 
-The `make bench*` targets are defined but there is no `benches/` directory and
-no `criterion` dependency in the workspace, so they currently measure nothing.
+Benchmarks cover the hot paths: tag=value decode/encode and checksum
+(`ironfix-tagvalue`), the FAST stop-bit and presence-map primitives
+(`ironfix-fast`), and the `FixCodec` framing loop (`ironfix-transport`).
+
+ℹ️ The harness ships **no recorded baseline and no published figures**. Every
+performance number in `doc/` is a design target; treat any figure as unmeasured
+until you have produced it yourself with `make bench` on hardware you name.
 
 ### 🧪 Git & Workflow Helpers
 
 ```sh
 make git-log             # Show commits on current branch vs main
+make check-spanish       # Enforce English-only sources and docs (runs in CI)
 make zip                 # Create zip without target/ and temp files
 make tree                # Visualize project tree (excludes common clutter)
 ```
-
-`make check-spanish` is defined but currently broken — it invokes a `scripts/`
-directory that is not present in the repository. The English-only rule for code,
-comments and commit messages still applies; it is simply not machine-enforced.
 
 ### 🤖 GitHub Actions (via act)
 

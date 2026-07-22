@@ -1,0 +1,25 @@
+# The Dockerfiles under Docker/ all `COPY . .` from the repository root, so
+# anything not excluded here is uploaded as build context and baked into the
+# builder layer. `target/` alone is hundreds of megabytes and is rebuilt inside
+# the image anyway.
+target/
+**/target/
+Cargo.lock
+**/Cargo.lock
+
+.git/
+.github/
+.idea/
+.run/
+.env
+.secrets
+.local/
+
+coverage/
+cobertura.xml
+tarpaulin-report.html
+*.profraw
+*.zip
+
+**/.DS_Store
+**/*.rs.bk

@@ -1,0 +1,132 @@
+name: Examples
+
+# End-to-end smoke test of the runnable client/server pairs. Nothing else in CI
+# ever connects two IronFix processes over a socket, so a regression in the
+# logon handshake could previously ship with every gate green.
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build examples
+        run: cargo build -p ironfix-example --examples
+
+      # Each pair gets its own port so a lingering socket from one run cannot
+      # make the next one pass by accident.
+      #
+      # Exit status alone proves nothing here: the clients return Ok(()) after
+      # logging "Logon failed", so every pair is judged on its log contents.
+      - name: Smoke test FIX client/server pairs
+        run: |
+          set -euo pipefail
+
+          run_pair() {
+            version="$1"
+            port="$2"
+            echo "::group::$version on port $port"
+
+            FIX_PORT="$port" "./target/debug/examples/${version}_server" \
+              > "server-${version}.log" 2>&1 &
+            server_pid=$!
+
+            bound=0
+            for _ in $(seq 1 30); do
+              if nc -z 127.0.0.1 "$port" 2>/dev/null; then bound=1; break; fi
+              sleep 1
+            done
+            if [ "$bound" -ne 1 ]; then
+              echo "$version server never bound port $port"
+              cat "server-${version}.log"
+              exit 1
+            fi
+
+            client_rc=0
+            FIX_PORT="$port" timeout 120 \
+              "./target/debug/examples/${version}_client" \
+              > "client-${version}.log" 2>&1 || client_rc=$?
+
+            kill "$server_pid" 2>/dev/null || true
+            wait "$server_pid" 2>/dev/null || true
+
+            echo "--- server ---"; cat "server-${version}.log"
+            echo "--- client ---"; cat "client-${version}.log"
+
+            if [ "$client_rc" -ne 0 ]; then
+              echo "$version client exited with $client_rc"
+              exit 1
+            fi
+            if ! grep -q "Logon OK" "client-${version}.log"; then
+              echo "$version client never completed logon"
+              exit 1
+            fi
+
+            echo "::endgroup::"
+            echo "$version: OK"
+          }
+
+          run_pair fix40 9870
+          run_pair fix41 9871
+          run_pair fix42 9872
+          run_pair fix43 9873
+          run_pair fix44 9876
+          run_pair fix50 9880
+          run_pair fix50sp1 9881
+          run_pair fix50sp2 9882
+
+      # The FAST client streams until the server disconnects rather than
+      # finishing on its own, so it is bounded by `timeout` and judged purely on
+      # whether it decoded a market data message.
+      - name: Smoke test FAST client/server pair
+        run: |
+          set -euo pipefail
+
+          FAST_PORT=9890 ./target/debug/examples/fast_server > server-fast.log 2>&1 &
+          server_pid=$!
+
+          bound=0
+          for _ in $(seq 1 30); do
+            if nc -z 127.0.0.1 9890 2>/dev/null; then bound=1; break; fi
+            sleep 1
+          done
+          if [ "$bound" -ne 1 ]; then
+            echo "FAST server never bound port 9890"
+            cat server-fast.log
+            exit 1
+          fi
+
+          FAST_PORT=9890 timeout 15 ./target/debug/examples/fast_client \
+            > client-fast.log 2>&1 || true
+
+          kill "$server_pid" 2>/dev/null || true
+          wait "$server_pid" 2>/dev/null || true
+
+          echo "--- server ---"; cat server-fast.log
+          echo "--- client ---"; cat client-fast.log
+
+          if ! grep -q "Received:" client-fast.log; then
+            echo "FAST client never decoded a market data message"
+            exit 1
+          fi
+          echo "fast: OK"

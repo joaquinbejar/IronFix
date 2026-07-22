@@ -7,11 +7,12 @@
 > in the present tense. Concretely:
 >
 > - **Every latency and throughput figure in this document is a target that has
->   never been measured.** There is no `benches/` directory and no `criterion`
->   dependency anywhere in the workspace, so no number here — "single-digit
->   microseconds", "millions of messages per second", "<10μs", "50-200μs" — is a
->   benchmark result. Do not restate any of them as a measurement in a README,
->   doc comment, commit message or PR body.
+>   never been measured.** A criterion harness now exists (`ironfix-tagvalue`,
+>   `ironfix-fast` and `ironfix-transport` each carry a `benches/` target and
+>   `make bench` runs them), but it records no baseline and ships no figures, so
+>   no number here — "single-digit microseconds", "millions of messages per
+>   second", "<10μs", "50-200μs" — is a benchmark result. Do not restate any of
+>   them as a measurement in a README, doc comment, commit message or PR body.
 > - **The module tree below does not match the repository.** It names files and
 >   crates that do not exist (`ironfix/` facade crate, `transport/tcp/`,
 >   `transport/tls.rs`, `transport/multicast.rs`, `store/file.rs`,
@@ -835,10 +836,11 @@ impl FastDecoder {
 ## Performance optimization strategies
 
 > **None of this section is implemented, and none of it is measured.** There is
-> no socket-tuning helper, no `libc`/`core_affinity` dependency, no lock-free
+> no socket-tuning helper, no `libc`/`core_affinity` dependency, and no lock-free
 > ring buffer on the message path beyond the `crossbeam` channels used by the
-> examples, and no benchmark harness to evaluate any of it against. Treat the
-> whole section as a wish list with sketches.
+> examples. The criterion harness that now exists covers the codec hot paths, not
+> any of the socket or affinity work sketched here. Treat the whole section as a
+> wish list with sketches.
 
 ### TCP socket configuration
 
@@ -1294,11 +1296,14 @@ impl ConformanceTestRunner {
 
 ### Performance benchmarking
 
-> **This harness does not exist.** There is no `benches/` directory and no
-> `criterion` dependency in the workspace; the `make bench*` targets are defined
-> but measure nothing. The sketch below is the harness that *should* be stood
-> up. Until it is, IronFix has no performance data of any kind, and no
-> performance claim about it may be stated as fact.
+> **A criterion harness now exists, though not in the exact shape sketched
+> below.** `ironfix-tagvalue`, `ironfix-fast` and `ironfix-transport` each carry
+> a `benches/` target and `make bench` runs them. What it does *not* yet have is
+> a recorded baseline or any published figure, so IronFix still has no
+> performance data that may be stated as fact — run `make bench` on hardware you
+> name to produce your own. The sketch below is illustrative; the real benches
+> live in each crate's `benches/` directory. See `doc/adr/0001-criterion-benchmark-harness.md`
+> for the decision to adopt criterion as a dev-only dependency.
 
 ```rust
 // benches/parsing.rs
@@ -1490,4 +1495,4 @@ fn configure_thread_affinity() {
 - Performance benchmarks
 - Documentation and examples
 
-This architecture is intended as a foundation for building a FIX engine in Rust that combines the correctness guarantees of the type system with the performance characteristics required for modern electronic trading. Whether it delivers those performance characteristics is currently unknown: standing up the benchmark harness described above is a prerequisite for any claim either way.
+This architecture is intended as a foundation for building a FIX engine in Rust that combines the correctness guarantees of the type system with the performance characteristics required for modern electronic trading. Whether it delivers those performance characteristics is currently unknown: the criterion harness is now in place, but no baseline has been recorded, so producing and publishing real measurements remains a prerequisite for any performance claim either way.

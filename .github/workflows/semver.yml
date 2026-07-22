@@ -19,65 +19,43 @@ env:
   RUST_BACKTRACE: full
 
 jobs:
+  # Every crate published by `make publish-all` that cargo-semver-checks can
+  # analyse. ironfix-example is included: it is published to crates.io like the
+  # rest, so its `prelude` and module facade are a semver-governed surface, and
+  # "it is only a demo" is not a reason to leave a published crate ungated.
+  #
+  # ironfix-derive is absent, and that is not a policy choice. cargo-semver-checks
+  # analyses rustdoc JSON for library targets and refuses a proc-macro crate:
+  #
+  #   error: no crates with library targets selected, nothing to semver-check
+  #   note: skipped the following crates since they have no library target:
+  #         ironfix-derive
+  #
+  # The two exported derives (FixMessage, FixField) are still a public surface;
+  # renaming or removing one is still a breaking change. It has to be caught in
+  # review until the tool grows proc-macro support.
   semver:
-    name: semver
+    name: semver (${{ matrix.package }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - ironfix-core
+          - ironfix-tagvalue
+          - ironfix-dictionary
+          - ironfix-session
+          - ironfix-store
+          - ironfix-transport
+          - ironfix-fast
+          - ironfix-engine
+          - ironfix-codegen
+          - ironfix-example
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y make libfontconfig1-dev pkg-config build-essential
-      - name: Check semver for ironfix-core
+      - name: Check semver for ${{ matrix.package }}
         uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
-          package: ironfix-core
-          feature-group: all-features
-          rust-toolchain: stable
-      - name: Check semver for ironfix-tagvalue
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: ironfix-tagvalue
-          feature-group: all-features
-          rust-toolchain: stable
-      - name: Check semver for ironfix-dictionary
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: ironfix-dictionary
-          feature-group: all-features
-          rust-toolchain: stable
-      - name: Check semver for ironfix-session
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: ironfix-session
-          feature-group: all-features
-          rust-toolchain: stable
-      - name: Check semver for ironfix-store
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: ironfix-store
-          feature-group: all-features
-          rust-toolchain: stable
-      - name: Check semver for ironfix-transport
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: ironfix-transport
-          feature-group: all-features
-          rust-toolchain: stable
-      - name: Check semver for ironfix-fast
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: ironfix-fast
-          feature-group: all-features
-          rust-toolchain: stable
-      - name: Check semver for ironfix-engine
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: ironfix-engine
-          feature-group: all-features
-          rust-toolchain: stable
-      - name: Check semver for ironfix-codegen
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: ironfix-codegen
+          package: ${{ matrix.package }}
           feature-group: all-features
           rust-toolchain: stable

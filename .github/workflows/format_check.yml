@@ -15,17 +15,17 @@ env:
 jobs:
   format_check:
     runs-on: ubuntu-latest
-    
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          toolchain: stable
-          override: true
           components: rustfmt
 
+      # `make fmt-check` runs `cargo fmt --all --check`: it prints the diff and
+      # exits non-zero. It must never be `make fmt`, which rewrites the files in
+      # the runner's own checkout and always exits 0 - a gate that cannot fail.
       - name: Format check
-        run: make fmt
+        run: make fmt-check

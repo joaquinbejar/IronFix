@@ -18,7 +18,11 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/examples/fast_server /app/fast_server
 
-ENV FAST_HOST=0.0.0.0
+# fast_server reads its bind address from FIX_HOST (via ExampleConfig) and only
+# its port from FAST_PORT. FAST_HOST was never read by anything, so the server
+# fell back to 127.0.0.1 and the exposed port was unreachable from outside the
+# container.
+ENV FIX_HOST=0.0.0.0
 ENV FAST_PORT=9890
 
 EXPOSE 9890

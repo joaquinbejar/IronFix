@@ -21,3 +21,8 @@ memchr.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "framing"
+harness = false

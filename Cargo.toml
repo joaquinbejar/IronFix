@@ -60,6 +60,9 @@ chrono = { version = "0.4", features = ["serde"] }
 itoa = "1.0"
 quick-xml = "0.41"
 
+# Benchmark harness (dev-dependency only; never linked into a published library)
+criterion = { version = "0.8", features = ["html_reports"] }
+
 [profile.release]
 opt-level = 3
 lto = "fat"
