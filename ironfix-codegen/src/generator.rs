@@ -45,9 +45,9 @@
 //!
 //! # What it does not contain
 //!
-//! The generated structs are **data definitions only**: no
-//! [`FixMessage`](ironfix_core::message::FixMessage) implementations, no
-//! encode/decode. Deriving those is `ironfix-derive`'s job, and the two are not
+//! The generated structs are **data definitions only**: no `FixMessage`
+//! implementations, no encode/decode. Deriving those is `ironfix-derive`'s job,
+//! and the two are not
 //! wired together — nothing in this workspace consumes either.
 //!
 //! # Fidelity limits, stated rather than hidden
