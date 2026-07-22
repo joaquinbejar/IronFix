@@ -928,6 +928,34 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_nullable_uint_boundary_from_external_fixtures() {
+        // Hand-built stop-bit fixtures, independent of the encoder, that pin the
+        // u128 narrowing branch directly: a properly stopped biased value that
+        // does fit u64 after debiasing, and the first one that does not.
+        //
+        // Biased 2^64 (10 stop-bit bytes, MSB first, stop bit on the last):
+        // decodes to 2^64, debiases to u64::MAX. This is the accepted boundary.
+        let biased_two_pow_64 = [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80];
+        let mut offset = 0;
+        assert_eq!(
+            FastDecoder::decode_nullable_uint(&biased_two_pow_64, &mut offset),
+            Ok(Some(u64::MAX))
+        );
+        assert_eq!(offset, biased_two_pow_64.len());
+
+        // Biased 2^64 + 1: a valid, fully-stopped ten-byte encoding whose
+        // debiased value is 2^64, one past u64::MAX. This exercises the
+        // `u64::try_from` narrowing failure, not the byte-count ceiling.
+        let biased_two_pow_64_plus_one =
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81];
+        let mut offset = 0;
+        assert_eq!(
+            FastDecoder::decode_nullable_uint(&biased_two_pow_64_plus_one, &mut offset),
+            Err(FastError::IntegerOverflow)
+        );
+    }
+
+    #[test]
     fn test_decode_ascii() {
         let data = [b'H', b'i', b'!' | 0x80]; // "Hi!"
         let mut offset = 0;

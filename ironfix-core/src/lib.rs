@@ -39,7 +39,8 @@ pub use error::{
     Result, SessionError, StoreError, TimestampError, UnknownFixVersion,
 };
 pub use field::{
-    FieldRef, FieldTag, FieldValue, FixField, USER_DEFINED_TAG_MAX, USER_DEFINED_TAG_MIN,
+    FieldRef, FieldTag, FieldValue, FixField, USER_DEFINED_EXT_TAG_MAX, USER_DEFINED_EXT_TAG_MIN,
+    USER_DEFINED_TAG_MAX, USER_DEFINED_TAG_MIN,
 };
 pub use message::{CustomMsgType, FixMessage, MSG_TYPE_MAX_LEN, MsgType, OwnedMessage, RawMessage};
 pub use types::{COMP_ID_MAX_LEN, CompId, SeqNum, Side, Timestamp};
