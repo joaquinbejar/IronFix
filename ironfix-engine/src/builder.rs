@@ -6,28 +6,39 @@
 
 //! Engine builder for fluent configuration.
 //!
-//! This module provides a builder API for configuring FIX engines.
+//! [`EngineBuilder`] collects an [`Application`] and a session configuration
+//! and terminates in a ready-to-run engine: [`EngineBuilder::into_initiator`]
+//! for the client side, [`EngineBuilder::into_acceptor`] for the server side.
+//!
+//! Every setter on this builder configures something an engine actually honors.
+//! The builder does **not** carry TLS or reconnection knobs: there is no TLS in
+//! the workspace, and reconnection is the consumer's responsibility (the
+//! [`Initiator`] establishes a single session per `connect`, and a supervisor
+//! calls it again). The connect timeout applies to the initiator only; an
+//! acceptor waits for inbound connections and bounds the Logon handshake with
+//! [`SessionConfig::logon_timeout`] instead.
 
+use crate::acceptor::Acceptor;
 use crate::application::{Application, NoOpApplication};
+use crate::error::EngineError;
+use crate::initiator::Initiator;
 use ironfix_session::config::SessionConfig;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Builder for configuring a FIX engine.
+///
+/// Set the [`Application`] and add exactly one [`SessionConfig`], then call
+/// [`EngineBuilder::into_initiator`] or [`EngineBuilder::into_acceptor`] to
+/// obtain a runnable engine.
 #[derive(Debug)]
 pub struct EngineBuilder<A: Application = NoOpApplication> {
     /// Application callback handler.
     application: Arc<A>,
     /// Session configurations.
     sessions: Vec<SessionConfig>,
-    /// Whether to use TLS.
-    use_tls: bool,
-    /// Connection timeout.
+    /// TCP connect timeout applied by [`EngineBuilder::into_initiator`].
     connect_timeout: Duration,
-    /// Reconnect interval.
-    reconnect_interval: Duration,
-    /// Maximum reconnect attempts.
-    max_reconnect_attempts: u32,
 }
 
 impl Default for EngineBuilder<NoOpApplication> {
@@ -43,60 +54,38 @@ impl EngineBuilder<NoOpApplication> {
         Self {
             application: Arc::new(NoOpApplication),
             sessions: Vec::new(),
-            use_tls: false,
             connect_timeout: Duration::from_secs(30),
-            reconnect_interval: Duration::from_secs(5),
-            max_reconnect_attempts: 10,
         }
     }
 }
 
-impl<A: Application> EngineBuilder<A> {
+impl<A: Application + 'static> EngineBuilder<A> {
     /// Sets the application callback handler.
     #[must_use]
     pub fn with_application<B: Application>(self, application: B) -> EngineBuilder<B> {
         EngineBuilder {
             application: Arc::new(application),
             sessions: self.sessions,
-            use_tls: self.use_tls,
             connect_timeout: self.connect_timeout,
-            reconnect_interval: self.reconnect_interval,
-            max_reconnect_attempts: self.max_reconnect_attempts,
         }
     }
 
     /// Adds a session configuration.
+    ///
+    /// The terminal methods build a single-session engine, so exactly one
+    /// session must be added before [`EngineBuilder::into_initiator`] or
+    /// [`EngineBuilder::into_acceptor`] is called.
     #[must_use]
     pub fn add_session(mut self, config: SessionConfig) -> Self {
         self.sessions.push(config);
         self
     }
 
-    /// Enables TLS for connections.
-    #[must_use]
-    pub const fn with_tls(mut self, enabled: bool) -> Self {
-        self.use_tls = enabled;
-        self
-    }
-
-    /// Sets the connection timeout.
+    /// Sets the TCP connect timeout used by [`EngineBuilder::into_initiator`]
+    /// (default 30s). It has no effect on an acceptor.
     #[must_use]
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
-        self
-    }
-
-    /// Sets the reconnect interval.
-    #[must_use]
-    pub fn with_reconnect_interval(mut self, interval: Duration) -> Self {
-        self.reconnect_interval = interval;
-        self
-    }
-
-    /// Sets the maximum reconnect attempts.
-    #[must_use]
-    pub const fn with_max_reconnect_attempts(mut self, attempts: u32) -> Self {
-        self.max_reconnect_attempts = attempts;
         self
     }
 
@@ -106,34 +95,53 @@ impl<A: Application> EngineBuilder<A> {
         &self.sessions
     }
 
-    /// Returns whether TLS is enabled.
-    #[must_use]
-    pub const fn use_tls(&self) -> bool {
-        self.use_tls
-    }
-
     /// Returns the connection timeout.
     #[must_use]
     pub const fn connect_timeout(&self) -> Duration {
         self.connect_timeout
     }
 
-    /// Returns the reconnect interval.
-    #[must_use]
-    pub const fn reconnect_interval(&self) -> Duration {
-        self.reconnect_interval
-    }
-
-    /// Returns the maximum reconnect attempts.
-    #[must_use]
-    pub const fn max_reconnect_attempts(&self) -> u32 {
-        self.max_reconnect_attempts
-    }
-
     /// Returns the application handler.
     #[must_use]
     pub fn application(&self) -> Arc<A> {
         Arc::clone(&self.application)
+    }
+
+    /// Consumes the builder and produces a client-side [`Initiator`] for the
+    /// single configured session, applying the configured connect timeout.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Configuration`] unless exactly one session has
+    /// been added.
+    pub fn into_initiator(self) -> Result<Initiator<A>, EngineError> {
+        let config = self.single_session()?;
+        Ok(Initiator::new(config, self.application).with_connect_timeout(self.connect_timeout))
+    }
+
+    /// Consumes the builder and produces a server-side [`Acceptor`] for the
+    /// single configured session.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Configuration`] unless exactly one session has
+    /// been added.
+    pub fn into_acceptor(self) -> Result<Acceptor<A>, EngineError> {
+        let config = self.single_session()?;
+        Ok(Acceptor::new(config, self.application))
+    }
+
+    /// Extracts the single configured session, or explains why there is not
+    /// exactly one.
+    fn single_session(&self) -> Result<SessionConfig, EngineError> {
+        match self.sessions.as_slice() {
+            [config] => Ok(config.clone()),
+            [] => Err(EngineError::Configuration(
+                "no session configured: add exactly one with add_session".to_string(),
+            )),
+            many => Err(EngineError::Configuration(format!(
+                "{} sessions configured, but a single-session engine requires exactly one",
+                many.len()
+            ))),
+        }
     }
 }
 
@@ -142,30 +150,80 @@ mod tests {
     use super::*;
     use ironfix_core::types::CompId;
 
+    /// Fails the test with context instead of `.unwrap()` / `.expect()`.
+    #[track_caller]
+    fn comp_id(value: &str) -> CompId {
+        match CompId::new(value) {
+            Ok(id) => id,
+            Err(err) => panic!("test CompId must be valid: {err}"),
+        }
+    }
+
+    fn session() -> SessionConfig {
+        SessionConfig::new(comp_id("SENDER"), comp_id("TARGET"), "FIX.4.4")
+    }
+
     #[test]
-    fn test_engine_builder_default() {
+    fn test_engine_builder_default_is_empty() {
         let builder = EngineBuilder::new();
-        assert!(!builder.use_tls());
         assert_eq!(builder.connect_timeout(), Duration::from_secs(30));
-        assert_eq!(builder.max_reconnect_attempts(), 10);
         assert!(builder.sessions().is_empty());
     }
 
     #[test]
-    fn test_engine_builder_with_session() {
-        let config = SessionConfig::new(
-            CompId::new("SENDER").unwrap(),
-            CompId::new("TARGET").unwrap(),
-            "FIX.4.4",
-        );
-
+    fn test_engine_builder_add_session_records_it() {
         let builder = EngineBuilder::new()
-            .add_session(config)
-            .with_tls(true)
+            .add_session(session())
             .with_connect_timeout(Duration::from_secs(60));
 
         assert_eq!(builder.sessions().len(), 1);
-        assert!(builder.use_tls());
         assert_eq!(builder.connect_timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_into_initiator_single_session_carries_connect_timeout() {
+        let initiator = EngineBuilder::new()
+            .add_session(session())
+            .with_connect_timeout(Duration::from_secs(7))
+            .into_initiator();
+
+        match initiator {
+            Ok(initiator) => {
+                assert_eq!(initiator.session_id().to_string(), "FIX.4.4:SENDER->TARGET");
+            }
+            Err(err) => panic!("a single-session builder must produce an initiator: {err}"),
+        }
+    }
+
+    #[test]
+    fn test_into_acceptor_single_session_builds() {
+        let acceptor = EngineBuilder::new().add_session(session()).into_acceptor();
+
+        match acceptor {
+            Ok(acceptor) => {
+                assert_eq!(acceptor.session_id().to_string(), "FIX.4.4:SENDER->TARGET");
+            }
+            Err(err) => panic!("a single-session builder must produce an acceptor: {err}"),
+        }
+    }
+
+    #[test]
+    fn test_into_initiator_without_session_is_configuration_error() {
+        match EngineBuilder::new().into_initiator() {
+            Err(EngineError::Configuration(detail)) => assert!(detail.contains("no session")),
+            other => panic!("an empty builder must fail with Configuration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_into_acceptor_with_two_sessions_is_configuration_error() {
+        match EngineBuilder::new()
+            .add_session(session())
+            .add_session(session())
+            .into_acceptor()
+        {
+            Err(EngineError::Configuration(detail)) => assert!(detail.contains("2 sessions")),
+            other => panic!("a two-session builder must fail with Configuration, got {other:?}"),
+        }
     }
 }

@@ -17,40 +17,45 @@
 //!   to a background reactor that owns framing, heartbeats and TestRequests,
 //!   CompID validation, sequence-gap detection, `ResendRequest` /
 //!   `SequenceReset` / gap fill, `PossDupFlag` and `OrigSendingTime`,
-//!   `ResetSeqNumFlag`, and session-level `Reject`.
-//! - **[`Connection`]**: a cheap-clone handle returned by
-//!   [`Initiator::connect`] — send, logout, await close, read sequence numbers.
+//!   `ResetSeqNumFlag`, resend-from-store replay, and session-level `Reject`.
+//! - **[`Acceptor`]**: the server-side engine. [`Acceptor::serve`] runs the
+//!   acceptor half of the Logon handshake on an inbound connection and hands the
+//!   socket to the same reactor.
+//! - **[`Connection`]**: a cheap-clone handle returned by both engines — send,
+//!   logout, await close, read sequence numbers.
 //! - **[`OutboundMessage`]**: the body you hand to [`Connection::send`]; the
 //!   engine stamps the header, `MsgSeqNum` and trailer.
 //! - **[`Application`]**: the QuickFIX-shaped callback trait
 //!   (`on_create` / `on_logon` / `on_logout` / `to_admin` / `from_admin` /
 //!   `to_app` / `from_app`), plus [`NoOpApplication`].
+//! - **[`EngineBuilder`]**: fluent configuration that terminates in a
+//!   ready-to-run [`Initiator`] or [`Acceptor`].
+//!
+//! Both engines share the same internal session reactor ([`mod@reactor`]): once
+//! a Logon handshake completes, the inbound-frame contract — sequence
+//! validation, gap recovery, identity and clock checks, heartbeating, and the
+//! Logout handshake — is identical for the two roles.
 //!
 //! ## Current limitations
 //!
-//! - **There is no acceptor.** This crate is client-side only; nothing here
-//!   listens for inbound connections. The server-side examples under
-//!   `ironfix-example/examples/` hand-roll their own accept loop using
-//!   `Decoder` and `Encoder` directly.
-//! - **[`EngineBuilder`] has no terminal method.** It accumulates sessions,
-//!   timeouts and reconnect settings, but there is no `build()` and it does not
-//!   produce a running engine. Use [`Initiator::new`] followed by
-//!   [`Initiator::connect`].
-//! - **The engine does not use `ironfix-store`.** Outbound messages are not
-//!   persisted and sequence numbers are not durable, so an inbound
-//!   `ResendRequest` is answered with a gap fill rather than with the original
-//!   messages.
 //! - **There is no TLS**, and no dictionary validation: `ironfix-dictionary`'s
 //!   `Validator` is never invoked on the session path.
+//! - **The store is opt-in and in-memory.** Attaching an
+//!   [`ironfix_store::MemoryStore`] with [`Initiator::with_store`] enables
+//!   resend-from-store replay, but there is no persistent implementation yet;
+//!   the acceptor attaches no store, so its resends are gap-filled.
 
+pub mod acceptor;
 pub mod application;
 pub mod builder;
 pub mod connection;
 pub mod error;
 pub mod initiator;
 pub mod outbound;
+mod reactor;
 mod wire;
 
+pub use acceptor::Acceptor;
 pub use application::{Application, NoOpApplication, RejectReason, SessionId};
 pub use builder::EngineBuilder;
 pub use connection::Connection;

@@ -117,6 +117,46 @@ Request".
 
 Outbound `ResetSeqNumFlag` is driven by `SessionConfig::reset_on_logon`.
 
+**What IronFix implements today (acceptor side)**
+
+`ironfix-engine::Acceptor` is the mirror of the above. It waits for the inbound
+Logon (bounded by `SessionConfig::logon_timeout`) and validates it in the same
+order — it must decode and be a Logon; its `BeginString` (8) must match this
+session's version and its `EncryptMethod` (98) must be 0 (None); it must carry
+`MsgSeqNum` (34) **in the standard header** (a body-only 34 is treated as
+missing, exactly as for the CompIDs); then identity (49/56, plus 50/57 when
+configured), after which the acceptor claims its single admission slot;
+then `SendingTime` (52), and the `from_admin` authentication hook (where
+`Username` (553) / `Password` (554) are inspected); then `HeartBtInt` (108) and
+`ResetSeqNumFlag` (141); then `MsgSeqNum`. The differences from the initiator
+are role-symmetric:
+
+- **`HeartBtInt` (108).** The acceptor *adopts* the interval the initiator
+  requested and echoes it back on its Logon reply, rather than proposing one.
+  Because the value is counterparty-controlled and drives a `Duration` on the
+  heartbeat clock, it is bounded at the handshake: a missing, non-numeric, or
+  over-range 108 (above one day) fails the handshake with a Logout rather than
+  being defaulted — a value near `u64::MAX` would otherwise overflow the clock's
+  `interval + grace` and abort the process under `panic = "abort"`. `108 = 0`
+  remains legal and is not specially handled today.
+- **`ResetSeqNumFlag` (141).** The acceptor resets when the peer asks (`141=Y`,
+  which must arrive under `MsgSeqNum = 1`) **or** when it is locally configured
+  with `reset_on_logon`. Whichever drives the reset, both counters go to 1 and
+  the reply Logon carries `141=Y` at its own `MsgSeqNum = 1`: a locally driven
+  reset that acked without the flag would silently desync the peer.
+- **Duplicate connections.** An `Acceptor` is one configured session, so it
+  admits one live session at a time for its counterparty. A second concurrent
+  Logon while a session is established is refused with a Logout ("session
+  already active") rather than allowed to fork the session into two independent
+  sequence streams; the slot frees when the live session closes.
+
+A failure at any step sends a session Reject (reason 9 for identity, the
+`SendingTime` reason for a clock problem) and/or a Logout, drives the typestate
+through `reject_logon`, and drops the connection without ever reaching Active. A
+gap in the inbound Logon completes the handshake and immediately issues a
+`ResendRequest` (2). Once Active, the session runs the same reactor as the
+initiator, so every inbound-frame rule below applies identically to both roles.
+
 ---
 
 ### Logout (MsgType = 5)

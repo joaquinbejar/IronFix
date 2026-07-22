@@ -228,4 +228,10 @@ pub enum EngineError {
     /// The connection is closed; no more messages can be sent.
     #[error("connection closed")]
     Closed,
+
+    /// The builder was asked to produce an engine it was not configured for —
+    /// for example a terminal method called with no session, or with more than
+    /// one where a single-session engine is required.
+    #[error("engine configuration error: {0}")]
+    Configuration(String),
 }
