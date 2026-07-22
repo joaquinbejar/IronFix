@@ -103,6 +103,10 @@ impl SequenceManager {
     /// [`try_allocate_sender_seq`](Self::try_allocate_sender_seq) for
     /// venue-grade sessions where exhaustion must be an explicit error.
     #[inline]
+    #[deprecated(
+        since = "0.4.0",
+        note = "wraps silently on overflow, which corrupts a live session; use try_allocate_sender_seq. Removed in the next breaking release."
+    )]
     pub fn allocate_sender_seq(&self) -> SeqNum {
         SeqNum::new(self.next_sender_seq.fetch_add(1, Ordering::SeqCst))
     }
@@ -137,6 +141,10 @@ impl SequenceManager {
     /// [`try_increment_target_seq`](Self::try_increment_target_seq) for
     /// venue-grade sessions where exhaustion must be an explicit error.
     #[inline]
+    #[deprecated(
+        since = "0.4.0",
+        note = "wraps silently on overflow, which corrupts a live session; use try_increment_target_seq. Removed in the next breaking release."
+    )]
     pub fn increment_target_seq(&self) {
         self.next_target_seq.fetch_add(1, Ordering::SeqCst);
     }
@@ -270,6 +278,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_allocate_sender_seq() {
         let mgr = SequenceManager::new();
 
@@ -283,6 +292,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_increment_target_seq() {
         let mgr = SequenceManager::new();
 
@@ -309,8 +319,8 @@ mod tests {
     fn test_try_allocate_sender_seq() {
         let mgr = SequenceManager::new();
 
-        assert_eq!(mgr.try_allocate_sender_seq().unwrap().value(), 1);
-        assert_eq!(mgr.try_allocate_sender_seq().unwrap().value(), 2);
+        assert_eq!(mgr.try_allocate_sender_seq().map(SeqNum::value), Ok(1));
+        assert_eq!(mgr.try_allocate_sender_seq().map(SeqNum::value), Ok(2));
         assert_eq!(mgr.next_sender_seq().value(), 3);
     }
 
@@ -318,23 +328,27 @@ mod tests {
     fn test_try_allocate_sender_seq_exhausted() {
         let mgr = SequenceManager::with_initial(u64::MAX, 1);
 
-        let err = mgr.try_allocate_sender_seq().unwrap_err();
-        assert_eq!(err.counter, SequenceCounter::Sender);
+        assert_eq!(
+            mgr.try_allocate_sender_seq(),
+            Err(SequenceExhausted {
+                counter: SequenceCounter::Sender
+            })
+        );
         // Counter untouched: still exhausted, no wraparound.
         assert_eq!(mgr.next_sender_seq().value(), u64::MAX);
         assert!(mgr.try_allocate_sender_seq().is_err());
 
         // Reset restores a usable session.
         mgr.reset();
-        assert_eq!(mgr.try_allocate_sender_seq().unwrap().value(), 1);
+        assert_eq!(mgr.try_allocate_sender_seq().map(SeqNum::value), Ok(1));
     }
 
     #[test]
     fn test_try_increment_target_seq() {
         let mgr = SequenceManager::new();
 
-        assert_eq!(mgr.try_increment_target_seq().unwrap().value(), 2);
-        assert_eq!(mgr.try_increment_target_seq().unwrap().value(), 3);
+        assert_eq!(mgr.try_increment_target_seq().map(SeqNum::value), Ok(2));
+        assert_eq!(mgr.try_increment_target_seq().map(SeqNum::value), Ok(3));
         assert_eq!(mgr.next_target_seq().value(), 3);
     }
 
@@ -342,8 +356,12 @@ mod tests {
     fn test_try_increment_target_seq_exhausted() {
         let mgr = SequenceManager::with_initial(1, u64::MAX);
 
-        let err = mgr.try_increment_target_seq().unwrap_err();
-        assert_eq!(err.counter, SequenceCounter::Target);
+        assert_eq!(
+            mgr.try_increment_target_seq(),
+            Err(SequenceExhausted {
+                counter: SequenceCounter::Target
+            })
+        );
         assert_eq!(mgr.next_target_seq().value(), u64::MAX);
         assert!(mgr.try_increment_target_seq().is_err());
     }
