@@ -1,25 +1,47 @@
-# The Dockerfiles under Docker/ all `COPY . .` from the repository root, so
-# anything not excluded here is uploaded as build context and baked into the
-# builder layer. `target/` alone is hundreds of megabytes and is rebuilt inside
-# the image anyway.
+# Build context exclusions for the Dockerfiles under Docker/.
+#
+# Every Dockerfile does `COPY . .` from the repository root, so anything not
+# excluded here is uploaded as build context and baked into the builder layer.
+# target/ alone is multiple gigabytes and is rebuilt inside the image anyway,
+# and any change to an excluded artefact would otherwise invalidate cached
+# layers.
+
+# Build output
 target/
 **/target/
 Cargo.lock
 **/Cargo.lock
 
+# Version control
 .git/
+.gitignore
 .github/
-.idea/
+
+# The Dockerfiles themselves are never needed inside the image
+Docker/
+
+# Local run / secret material must never enter the build context
 .run/
 .env
 .secrets
 .local/
 
+# Coverage and profiling output
 coverage/
 cobertura.xml
-tarpaulin-report.html
+tarpaulin-report.*
 *.profraw
+*.profdata
 *.zip
 
+# Editor and OS noise
+.idea/
+.vscode/
 **/.DS_Store
+*.swp
 **/*.rs.bk
+
+# Documentation that no build step reads
+doc/
+*.md
+!README.md

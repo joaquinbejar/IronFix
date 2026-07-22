@@ -111,6 +111,12 @@
 //! - [`transport`]: The `FixCodec` framing codec
 //! - [`fast`]: FAST protocol encoding and decoding primitives
 //! - [`engine`]: The composition root — `Initiator`, `Connection`, `Application`
+//! - [`demo`]: Version-parameterised message builders backing the runnable
+//!   examples
+//! - [`fast_market_data`]: The FAST template the `fast_*` examples exchange
+
+pub mod demo;
+pub mod fast_market_data;
 
 pub mod core {
     //! Core types, traits, and error definitions.
@@ -164,9 +170,12 @@ pub mod prelude {
     // Core types
     pub use ironfix_core::{
         CompId, DecodeError, EncodeError, FieldRef, FieldTag, FieldValue, FixError, FixField,
-        FixMessage, MsgType, OwnedMessage, RawMessage, Result, SeqNum, SessionError, Side,
-        StoreError, Timestamp,
+        FixMessage, FixVersion, MsgType, OwnedMessage, RawMessage, Result, SeqNum, SessionError,
+        Side, StoreError, Timestamp,
     };
+
+    // Demonstration message builders
+    pub use crate::demo::{DemoError, DemoOrder, DemoSession, IncomingOrder};
 
     // Dictionary
     pub use ironfix_dictionary::{Dictionary, FieldDef, FieldType, MessageDef, Version};

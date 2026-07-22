@@ -1,156 +1,146 @@
-//! FAST protocol server example.
+/******************************************************************************
+   Author: Joaquín Béjar García
+   Email: jb@taunais.com
+   Date: 21/7/26
+******************************************************************************/
+
+//! FAST market data server example.
 //!
-//! This example demonstrates a simple FAST market data server that sends
-//! encoded market data messages to connected clients.
+//! Publishes a MarketData tick every 100 ms to each connected client, encoded
+//! with the illustrative framing in [`ironfix_example::fast_market_data`] — an
+//! honest [`PresenceMap`](ironfix_fast::PresenceMap), not a hand-rolled byte,
+//! though the framing itself is this example's own and not a conforming FAST
+//! template (see that module's docs).
+//!
+//! Prices are carried as scaled integers (hundredths) and are exact; they
+//! become [`Decimal`] values, never `f64`. Every fifth tick omits `Size`, so a
+//! reader can see the presence map doing its job rather than being decoration.
+//!
+//! ```text
+//! FIX_HOST=0.0.0.0 FAST_PORT=9890 cargo run --example fast_server
+//! ```
+//!
+//! `ironfix-fast` is standalone: there is no template-XML parser and no
+//! integration with the session layer. This example carries its framing in
+//! Rust because that is what exists today.
 
 mod common;
 
-use common::{ExampleConfig, format_timestamp, init_logging};
-use ironfix_fast::{FastEncoder, FastError};
+use common::{ExampleConfig, init_logging};
+use ironfix_core::Timestamp;
+use ironfix_example::fast_market_data::{MarketData, PRICE_SCALE, encode};
+use rust_decimal::Decimal;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
 
+/// Port bound when neither `FAST_PORT` nor `FIX_PORT` is set.
 const DEFAULT_PORT: u16 = 9890;
+
+/// Instruments this feed publishes.
+const SYMBOLS: [&str; 5] = ["AAPL", "GOOGL", "MSFT", "AMZN", "META"];
+
+/// Opening prices, in hundredths.
+const OPENING_PRICES: [u64; 5] = [15_000, 14_000, 38_000, 17_500, 50_000];
+
+/// Floor a simulated price never goes below, in hundredths.
+const PRICE_FLOOR: u64 = 100;
+
+/// Interval between ticks.
+const TICK: Duration = Duration::from_millis(100);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_logging();
 
-    let cfg = ExampleConfig::server();
-    let port = std::env::var("FAST_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
-
-    let addr = format!("{}:{}", cfg.host, port);
-    let listener: TcpListener = TcpListener::bind(&addr).await?;
-    info!("FAST server listening on {}", addr);
+    let cfg = ExampleConfig::fast_server(DEFAULT_PORT);
+    let listener = TcpListener::bind(cfg.addr()).await?;
+    info!(addr = %cfg.addr(), "FAST server listening");
 
     loop {
         let (socket, peer) = listener.accept().await?;
-        info!("Client connected: {}", peer);
-
+        info!(%peer, "client connected");
         tokio::spawn(async move {
-            if let Err(e) = handle_client(socket).await {
-                error!("Client error: {}", e);
+            if let Err(error) = publish(socket).await {
+                warn!(%peer, %error, "client stream ended");
             }
-            info!("Client disconnected: {}", peer);
+            info!(%peer, "client disconnected");
         });
     }
 }
 
-async fn handle_client(mut socket: TcpStream) -> anyhow::Result<()> {
+/// Publishes ticks to one client until it goes away.
+async fn publish(mut socket: TcpStream) -> anyhow::Result<()> {
+    let mut ticker = interval(TICK);
+    let mut prices = OPENING_PRICES;
     let mut seq_num: u64 = 1;
-    let mut ticker_interval = interval(Duration::from_millis(100));
-
-    // Simulated market data
-    let symbols = ["AAPL", "GOOGL", "MSFT", "AMZN", "META"];
-    let mut prices: Vec<f64> = vec![150.0, 140.0, 380.0, 175.0, 500.0];
 
     loop {
-        tokio::select! {
-            _ = ticker_interval.tick() => {
-                // Generate market data update for a random symbol
-                let idx = (seq_num as usize) % symbols.len();
-                let symbol = symbols[idx];
+        ticker.tick().await;
 
-                // Simulate price movement
-                let delta = ((seq_num % 10) as f64 - 5.0) * 0.01;
-                prices[idx] += delta;
-                let price = prices[idx];
-                let size: u64 = 100 + (seq_num % 900);
+        let index = usize::try_from(seq_num % SYMBOLS.len() as u64).unwrap_or(0);
+        let Some(symbol) = SYMBOLS.get(index) else {
+            break;
+        };
+        let Some(price) = prices.get_mut(index) else {
+            break;
+        };
+        *price = walk(*price, seq_num);
 
-                // Build FAST message
-                let msg = match build_market_data(seq_num, symbol, price, size) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        error!("Failed to encode market data: {}", e);
-                        break;
-                    }
-                };
+        let message = MarketData {
+            seq_num,
+            sending_time: Some(Timestamp::now().format_millis().to_string()),
+            symbol: Some((*symbol).to_string()),
+            price_scaled: Some(*price),
+            // Every fifth tick is an indicative quote with no size attached.
+            size: (!seq_num.is_multiple_of(5)).then(|| 100 + (seq_num % 900)),
+        };
 
-                if let Err(e) = socket.write_all(&msg).await {
-                    warn!("Write error: {}", e);
-                    break;
-                }
-
-                info!("Sent: seq={} symbol={} price={:.2} size={}", seq_num, symbol, price, size);
-                seq_num += 1;
+        let frame = match encode(&message) {
+            Ok(frame) => frame,
+            Err(error) => {
+                error!(%error, "cannot encode a tick");
+                break;
             }
-            result = socket.readable() => {
-                if result.is_err() {
-                    break;
-                }
-                // Check if client disconnected
-                let mut buf = [0u8; 1];
-                match socket.try_read(&mut buf) {
-                    Ok(0) => {
-                        info!("Client closed connection");
-                        break;
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No data available, continue
-                    }
-                    Err(e) => {
-                        warn!("Read error: {}", e);
-                        break;
-                    }
-                    _ => {}
-                }
-            }
+        };
+
+        if let Err(error) = socket.write_all(&frame).await {
+            warn!(%error, "write failed");
+            break;
         }
+
+        info!(
+            seq_num,
+            symbol,
+            price = %Decimal::new(i64::try_from(*price).unwrap_or(i64::MAX), PRICE_SCALE),
+            size = ?message.size,
+            "published"
+        );
+
+        // A sequence number never wraps: reusing a number would misrepresent a
+        // fresh tick as a replay. On exhaustion the feed stops rather than
+        // silently reusing 1.
+        let Some(next) = seq_num.checked_add(1) else {
+            warn!("market-data sequence number exhausted; stopping this client");
+            break;
+        };
+        seq_num = next;
     }
 
     Ok(())
 }
 
-/// Build a FAST-encoded market data message.
+/// Moves a price by a deterministic pseudo-random step, in hundredths.
 ///
-/// Message structure:
-/// - Presence map (1 byte with stop bit)
-/// - Template ID (uint32)
-/// - Sequence number (uint64)
-/// - Timestamp (string)
-/// - Symbol (string)
-/// - Price (scaled decimal as uint64, scale 2)
-/// - Size (uint64)
-///
-/// # Errors
-/// Returns `FastError::InvalidString` if the timestamp or symbol is not
-/// representable as a FAST ASCII string.
-fn build_market_data(
-    seq_num: u64,
-    symbol: &str,
-    price: f64,
-    size: u64,
-) -> Result<Vec<u8>, FastError> {
-    let mut encoder = FastEncoder::new();
-
-    // Presence map: all fields present (6 bits set + stop bit)
-    // Bits: template_id, seq_num, timestamp, symbol, price, size
-    let pmap_byte: u8 = 0b1111_1100 | 0x80; // 6 bits set + stop bit
-    encoder.encode_uint(pmap_byte as u64);
-
-    // Template ID = 1 (Market Data)
-    encoder.encode_uint(1);
-
-    // Sequence number
-    encoder.encode_uint(seq_num);
-
-    // Timestamp
-    encoder.encode_ascii(&format_timestamp())?;
-
-    // Symbol
-    encoder.encode_ascii(symbol)?;
-
-    // Price as scaled integer (price * 100)
-    let scaled_price = (price * 100.0) as u64;
-    encoder.encode_uint(scaled_price);
-
-    // Size
-    encoder.encode_uint(size);
-
-    Ok(encoder.finish())
+/// Checked throughout: a simulated feed that overflows into a nonsense price is
+/// exactly the bug an example must not teach.
+fn walk(price: u64, seq_num: u64) -> u64 {
+    let step = (seq_num % 11) * 10;
+    let moved = if seq_num.is_multiple_of(2) {
+        price.checked_add(step).unwrap_or(price)
+    } else {
+        price.checked_sub(step).unwrap_or(PRICE_FLOOR)
+    };
+    moved.max(PRICE_FLOOR)
 }

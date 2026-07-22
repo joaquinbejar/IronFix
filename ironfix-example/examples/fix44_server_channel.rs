@@ -1,348 +1,343 @@
-//! FIX 4.4 Server Example with Channel-based Message Processing
+/******************************************************************************
+   Author: Joaquín Béjar García
+   Email: jb@taunais.com
+   Date: 21/7/26
+******************************************************************************/
+
+//! FIX 4.4 server with channel-based message processing.
 //!
-//! This example demonstrates a production-ready architecture where:
-//! - Network I/O is handled in separate tasks
-//! - Messages are sent through channels for processing
-//! - Business logic is decoupled from network handling
-//! - Responses are sent back through a response channel
-
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use bytes::BytesMut;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
-use tracing::{error, info, warn};
-
-use ironfix_core::MsgType;
-use ironfix_core::error::EncodeError;
-use ironfix_tagvalue::{Decoder, Encoder};
+//! The same protocol behaviour as `fix44_server`, arranged differently: network
+//! I/O runs in per-connection tasks, decoded messages go to a single processor
+//! task over an mpsc channel, and responses come back over a per-connection
+//! reply channel. This is the shape to copy when business logic must not sit on
+//! the read path.
+//!
+//! ```text
+//! ┌──────────────┐  IncomingMessage  ┌──────────────┐
+//! │ reader task  │ ────────────────▶ │  processor   │
+//! │ (per client) │                   │  (one task)  │
+//! └──────────────┘ ◀──────────────── └──────────────┘
+//!        │           encoded frame
+//!        ▼
+//!   writer task ──▶ socket
+//! ```
+//!
+//! # What is shared with the other examples
+//!
+//! Framing is `ironfix_transport::FixCodec` and the messages come from
+//! [`ironfix_example::demo`], so this server stamps the same real, incrementing
+//! `MsgSeqNum` (34) as the rest. The sequence counter lives with the connection
+//! rather than with the processor, because it belongs to the session.
+//!
+//! ```text
+//! FIX_HOST=0.0.0.0 FIX_PORT=9876 cargo run --example fix44_server_channel
+//! ```
 
 mod common;
-use common::{ExampleConfig, format_timestamp, init_logging, try_decode_message};
 
-const FIX_VERSION: &str = "FIX.4.4";
-const CHANNEL_BUFFER_SIZE: usize = 1000;
+use std::collections::HashMap;
 
-/// Incoming FIX message with session context
-#[derive(Debug, Clone)]
-pub struct IncomingMessage {
-    /// Session identifier (sender:target)
-    pub session_id: String,
-    /// Message type
-    pub msg_type: MsgType,
-    /// Raw message fields (tag -> value)
-    pub fields: HashMap<u32, String>,
-    /// Response channel for this message
-    pub response_tx: mpsc::Sender<OutgoingMessage>,
+use anyhow::Context;
+use bytes::BytesMut;
+use common::{ExampleConfig, init_logging};
+use futures_util::{SinkExt, StreamExt};
+use ironfix_core::{FixVersion, MsgType};
+use ironfix_example::demo::{DemoSession, IncomingOrder};
+use ironfix_session::sequence::SequenceResult;
+use ironfix_tagvalue::Decoder;
+use ironfix_transport::FixCodec;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::codec::Framed;
+use tracing::{error, info, warn};
+
+/// FIX version this example speaks.
+const VERSION: FixVersion = FixVersion::Fix44;
+
+/// Port bound when `FIX_PORT` is unset.
+const DEFAULT_PORT: u16 = 9876;
+
+/// Depth of the shared processor queue, in messages.
+const PROCESSOR_QUEUE: usize = 1_000;
+
+/// Tags the processor is given a copy of.
+///
+/// Copying a bounded set keeps the borrowed frame on the reader task, so the
+/// processor holds no reference into a network buffer.
+const FORWARDED_TAGS: [u32; 6] = [11, 34, 38, 54, 55, 112];
+
+/// A decoded message handed to the processor.
+#[derive(Debug)]
+struct IncomingMessage {
+    /// Which session it arrived on.
+    session_id: String,
+    /// Its `MsgType` (35).
+    msg_type: MsgType,
+    /// The subset of fields in [`FORWARDED_TAGS`] that were present.
+    fields: HashMap<u32, String>,
+    /// Where the decision goes back.
+    reply: oneshot::Sender<Decision>,
 }
 
-/// Outgoing FIX message
-#[derive(Debug, Clone)]
-pub struct OutgoingMessage {
-    /// Session identifier
-    pub session_id: String,
-    /// Encoded message bytes
-    pub data: Vec<u8>,
-    /// Whether to close connection after sending
-    pub close_after: bool,
-}
-
-/// Session state
-#[allow(dead_code)]
-struct Session {
-    seq: u64,
-    logged_in: bool,
-    response_tx: mpsc::Sender<OutgoingMessage>,
+/// What the processor decided to do about a message.
+#[derive(Debug)]
+enum Decision {
+    /// Reply with a `Logon`.
+    Logon,
+    /// Reply with a `Heartbeat`, echoing this `TestReqID`.
+    Heartbeat(Option<String>),
+    /// Acknowledge an order as `New`.
+    AcceptOrder {
+        /// `ClOrdID` (11) of the order.
+        cl_ord_id: String,
+        /// `Symbol` (55) of the order.
+        symbol: String,
+        /// `Side` (54) of the order, as received.
+        side: String,
+        /// `OrderQty` (38) of the order, as received.
+        order_qty: String,
+        /// Sequence number this acknowledgement counts.
+        order_number: u64,
+    },
+    /// Reject the message at the session level.
+    Reject {
+        /// `RefSeqNum` (45).
+        ref_seq_num: u64,
+        /// `Text` (58).
+        text: String,
+    },
+    /// Reply with a `Logout` and close.
+    Logout,
+    /// Say nothing.
+    Ignore,
 }
 
 #[tokio::main]
-async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     init_logging();
-    let cfg = ExampleConfig::server();
-    info!(
-        "Starting {} server with channels on {}",
-        FIX_VERSION,
-        cfg.addr()
-    );
+    let cfg = ExampleConfig::server(DEFAULT_PORT);
 
-    // Create the main message processing channel
-    let (msg_tx, msg_rx) = mpsc::channel::<IncomingMessage>(CHANNEL_BUFFER_SIZE);
+    let (processor_tx, processor_rx) = mpsc::channel::<IncomingMessage>(PROCESSOR_QUEUE);
+    tokio::spawn(process(processor_rx));
 
-    // Spawn the message processor
-    let processor_cfg = cfg.clone();
-    tokio::spawn(async move {
-        message_processor(msg_rx, processor_cfg).await;
-    });
-
-    // Start accepting connections
-    let listener: TcpListener = TcpListener::bind(&cfg.addr()).await?;
-    let sessions = Arc::new(Mutex::new(HashMap::<String, Session>::new()));
+    let listener = TcpListener::bind(cfg.addr())
+        .await
+        .with_context(|| format!("binding {}", cfg.addr()))?;
+    info!(version = %VERSION, addr = %cfg.addr(), "listening");
 
     loop {
-        let (socket, addr) = listener.accept().await?;
-        info!("Connection from {}", addr);
-
-        let msg_tx = msg_tx.clone();
-        let sessions = Arc::clone(&sessions);
+        let (stream, peer) = listener.accept().await.context("accepting a connection")?;
+        info!(%peer, "connection accepted");
         let cfg = cfg.clone();
-
+        let processor_tx = processor_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, msg_tx, sessions, cfg).await {
-                error!("Connection error: {}", e);
+            if let Err(error) = serve(stream, cfg, processor_tx).await {
+                error!(%peer, %error, "session ended");
             }
         });
     }
 }
 
-/// Handles a single client connection
-async fn handle_connection(
-    socket: TcpStream,
-    msg_tx: mpsc::Sender<IncomingMessage>,
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
+/// Reads a connection, forwards each message to the processor, and writes back
+/// whatever it decides.
+async fn serve(
+    stream: TcpStream,
     cfg: ExampleConfig,
-) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let session_id = format!("{}:{}", cfg.target_comp_id, cfg.sender_comp_id);
-
-    // Create response channel for this connection
-    let (response_tx, mut response_rx) = mpsc::channel::<OutgoingMessage>(100);
-
-    // Register session
-    sessions.lock().await.insert(
-        session_id.clone(),
-        Session {
-            seq: 1,
-            logged_in: false,
-            response_tx: response_tx.clone(),
-        },
+    processor_tx: mpsc::Sender<IncomingMessage>,
+) -> anyhow::Result<()> {
+    let session_id = format!("{}->{}", cfg.target_comp_id, cfg.sender_comp_id);
+    let mut connection = Framed::new(stream, FixCodec::new());
+    let mut session = DemoSession::new(
+        VERSION,
+        &cfg.sender_comp_id,
+        &cfg.target_comp_id,
+        cfg.heartbeat_interval,
     );
 
-    // Use into_split for 'static lifetime
-    let (mut read_half, mut write_half) = socket.into_split();
+    while let Some(frame) = connection.next().await {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(error) => {
+                warn!(%error, "malformed frame, closing");
+                return Ok(());
+            }
+        };
 
-    // Spawn writer task
-    let writer_session_id = session_id.clone();
-    let writer_handle = tokio::spawn(async move {
-        while let Some(msg) = response_rx.recv().await {
-            if let Err(e) = write_half.write_all(&msg.data).await {
-                error!("Write error for {}: {}", writer_session_id, e);
-                break;
-            }
-            if msg.close_after {
-                info!("Closing connection for {}", writer_session_id);
-                break;
-            }
+        let Some(incoming) = extract(&frame, &session_id, &session) else {
+            continue;
+        };
+        let (message, reply_rx) = incoming;
+
+        if processor_tx.send(message).await.is_err() {
+            warn!("the processor has stopped");
+            return Ok(());
         }
-    });
 
-    // Read loop
-    let mut buf = BytesMut::with_capacity(4096);
-    loop {
-        match read_half.read_buf(&mut buf).await {
-            Ok(0) => {
-                info!("Client disconnected: {}", session_id);
-                break;
-            }
-            Ok(_) => {
-                while let Some(len) = try_decode_message(&buf) {
-                    let msg_bytes = buf.split_to(len);
-                    let mut decoder = Decoder::new(&msg_bytes);
+        let Ok(decision) = reply_rx.await else {
+            warn!("the processor dropped a message without deciding");
+            continue;
+        };
 
-                    if let Ok(raw) = decoder.decode() {
-                        // Extract fields into a HashMap
-                        let mut fields = HashMap::new();
-                        for tag in [11, 35, 38, 49, 54, 55, 56, 112] {
-                            if let Some(val) = raw.get_field_str(tag) {
-                                fields.insert(tag, val.to_string());
-                            }
-                        }
-
-                        let incoming = IncomingMessage {
-                            session_id: session_id.clone(),
-                            msg_type: raw.msg_type().clone(),
-                            fields,
-                            response_tx: response_tx.clone(),
-                        };
-
-                        // Send to processor through channel
-                        if let Err(e) = msg_tx.send(incoming).await {
-                            error!("Failed to send message to processor: {}", e);
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Read error: {}", e);
-                break;
-            }
+        if apply(&mut connection, &mut session, decision).await? {
+            return Ok(());
         }
     }
-
-    // Cleanup
-    sessions.lock().await.remove(&session_id);
-    drop(response_tx);
-    let _ = writer_handle.await;
 
     Ok(())
 }
 
-/// Message processor - handles business logic
-/// Unwraps an encoded frame, dropping the response if the encoder refused it.
+/// Decodes a frame, checks its sequence number, and packages it for the
+/// processor.
 ///
-/// A rejected value has no legal wire form, so there is nothing to send; the
-/// processor logs it and carries on rather than taking the session down.
-fn encoded(session_id: &str, frame: Result<Vec<u8>, EncodeError>) -> Option<Vec<u8>> {
-    match frame {
-        Ok(frame) => Some(frame),
-        Err(err) => {
-            error!("cannot encode response for session {session_id}: {err}");
-            None
+/// Returns `None` when the message is undecodable or out of sequence; the
+/// connection carries on.
+fn extract(
+    frame: &BytesMut,
+    session_id: &str,
+    session: &DemoSession,
+) -> Option<(IncomingMessage, oneshot::Receiver<Decision>)> {
+    let mut decoder = Decoder::new(frame);
+    let raw = match decoder.decode() {
+        Ok(raw) => raw,
+        Err(error) => {
+            warn!(%error, "undecodable message, ignoring");
+            return None;
+        }
+    };
+
+    let received: u64 = raw.get_field_str(34)?.parse().ok()?;
+    match session.sequences().validate_incoming(received) {
+        SequenceResult::Ok => {}
+        SequenceResult::Gap { expected, received } => {
+            warn!(
+                expected,
+                received, "sequence gap: a real acceptor answers this with a ResendRequest"
+            );
+            session.sequences().set_target_seq(received);
+        }
+        SequenceResult::TooLow { expected, received } => {
+            warn!(expected, received, "MsgSeqNum too low, ignoring");
+            return None;
         }
     }
+    session.sequences().try_increment_target_seq().ok()?;
+
+    let mut fields = HashMap::new();
+    for tag in FORWARDED_TAGS {
+        if let Some(value) = raw.get_field_str(tag) {
+            fields.insert(tag, value.to_string());
+        }
+    }
+
+    let (reply, reply_rx) = oneshot::channel();
+    info!(msg_type = %raw.msg_type().as_str(), "received");
+
+    Some((
+        IncomingMessage {
+            session_id: session_id.to_string(),
+            msg_type: raw.msg_type().clone(),
+            fields,
+            reply,
+        },
+        reply_rx,
+    ))
 }
 
-async fn message_processor(mut rx: mpsc::Receiver<IncomingMessage>, cfg: ExampleConfig) {
-    info!("Message processor started");
+/// Encodes and writes the processor's decision.
+///
+/// Returns `true` when the session should close.
+async fn apply(
+    connection: &mut Framed<TcpStream, FixCodec>,
+    session: &mut DemoSession,
+    decision: Decision,
+) -> anyhow::Result<bool> {
+    let (frame, close) = match &decision {
+        Decision::Logon => (session.logon()?, false),
+        Decision::Heartbeat(test_req_id) => (session.heartbeat(test_req_id.as_deref())?, false),
+        Decision::AcceptOrder {
+            cl_ord_id,
+            symbol,
+            side,
+            order_qty,
+            order_number,
+        } => {
+            let order_id = format!("ORD{order_number}");
+            let exec_id = format!("EX{order_number}");
+            let Some(order) = IncomingOrder::from_parts(cl_ord_id, symbol, side, order_qty) else {
+                warn!("NewOrderSingle is missing or malforms a required field");
+                let frame = session.reject(0, None, "unusable Side or OrderQty")?;
+                connection.send(frame).await?;
+                return Ok(false);
+            };
+            let frame = session.execution_report(&order, &order_id, &exec_id)?;
+            connection.send(frame).await?;
+            return Ok(false);
+        }
+        Decision::Reject { ref_seq_num, text } => {
+            (session.reject(*ref_seq_num, None, text)?, false)
+        }
+        Decision::Logout => (session.logout(None)?, true),
+        Decision::Ignore => return Ok(false),
+    };
 
-    // This could be replaced with your own order management system,
-    // market data handler, or any other business logic
-    let mut order_counter: u64 = 0;
+    connection.send(frame).await?;
+    Ok(close)
+}
 
-    while let Some(msg) = rx.recv().await {
-        info!(
-            "Processing: session={} type={:?}",
-            msg.session_id, msg.msg_type
-        );
+/// The business logic: one task, no network, no session state.
+async fn process(mut rx: mpsc::Receiver<IncomingMessage>) {
+    info!("processor started");
+    let mut orders: u64 = 0;
 
-        let response = match msg.msg_type {
+    while let Some(message) = rx.recv().await {
+        let decision = match message.msg_type {
             MsgType::Logon => {
-                info!("Session {} logged in", msg.session_id);
-                encoded(&msg.session_id, build_logon(&cfg)).map(|data| OutgoingMessage {
-                    session_id: msg.session_id.clone(),
-                    data,
-                    close_after: false,
-                })
+                info!(session = %message.session_id, "logged in");
+                Decision::Logon
             }
-            MsgType::TestRequest => {
-                let test_req_id = msg.fields.get(&112).map(|s| s.as_str());
-                encoded(&msg.session_id, build_heartbeat(&cfg, test_req_id)).map(|data| {
-                    OutgoingMessage {
-                        session_id: msg.session_id.clone(),
-                        data,
-                        close_after: false,
+            MsgType::TestRequest => Decision::Heartbeat(message.fields.get(&112).cloned()),
+            MsgType::Heartbeat => Decision::Ignore,
+            MsgType::Logout => Decision::Logout,
+            MsgType::NewOrderSingle => match order_from(&message.fields) {
+                Some((cl_ord_id, symbol, side, order_qty)) => {
+                    orders = orders.checked_add(1).unwrap_or(1);
+                    info!(cl_ord_id, symbol, order = orders, "new order");
+                    Decision::AcceptOrder {
+                        cl_ord_id: cl_ord_id.to_string(),
+                        symbol: symbol.to_string(),
+                        side: side.to_string(),
+                        order_qty: order_qty.to_string(),
+                        order_number: orders,
                     }
-                })
-            }
-            MsgType::Heartbeat => {
-                // Just acknowledge, no response needed
-                None
-            }
-            MsgType::Logout => {
-                encoded(&msg.session_id, build_logout(&cfg)).map(|data| OutgoingMessage {
-                    session_id: msg.session_id.clone(),
-                    data,
-                    close_after: true,
-                })
-            }
-            MsgType::NewOrderSingle => {
-                order_counter += 1;
-                let clid = msg.fields.get(&11).map(|s| s.as_str()).unwrap_or("0");
-                let sym = msg.fields.get(&55).map(|s| s.as_str()).unwrap_or("N/A");
-                let side = msg.fields.get(&54).map(|s| s.as_str()).unwrap_or("1");
-                let qty = msg.fields.get(&38).map(|s| s.as_str()).unwrap_or("0");
-
-                info!(
-                    "New order: clOrdId={} symbol={} side={} qty={} (order #{})",
-                    clid, sym, side, qty, order_counter
-                );
-
-                encoded(
-                    &msg.session_id,
-                    build_exec(&cfg, clid, sym, side, qty, order_counter),
-                )
-                .map(|data| OutgoingMessage {
-                    session_id: msg.session_id.clone(),
-                    data,
-                    close_after: false,
-                })
-            }
-            _ => {
-                warn!("Unhandled message type: {:?}", msg.msg_type);
-                None
+                }
+                None => Decision::Reject {
+                    ref_seq_num: message
+                        .fields
+                        .get(&34)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0),
+                    text: "NewOrderSingle is missing a required field".to_string(),
+                },
+            },
+            other => {
+                warn!(msg_type = %other.as_str(), "message type not handled by this demo");
+                Decision::Ignore
             }
         };
 
-        // Send response back through the session's response channel
-        if let Some(resp) = response
-            && let Err(e) = msg.response_tx.send(resp).await
-        {
-            warn!("Failed to send response: {}", e);
-        }
+        // The reader task may have gone; that is not an error here.
+        let _ = message.reply.send(decision);
     }
 
-    info!("Message processor stopped");
+    info!("processor stopped");
 }
 
-fn build_logon(c: &ExampleConfig) -> Result<Vec<u8>, EncodeError> {
-    let mut e = Encoder::new(FIX_VERSION);
-    e.put_str(35, "A");
-    e.put_str(49, &c.sender_comp_id);
-    e.put_str(56, &c.target_comp_id);
-    e.put_str(34, "1");
-    e.put_str(52, &format_timestamp());
-    e.put_str(98, "0");
-    e.put_str(108, &c.heartbeat_interval.to_string());
-    Ok(e.finish()?.to_vec())
-}
-
-fn build_heartbeat(c: &ExampleConfig, test_req_id: Option<&str>) -> Result<Vec<u8>, EncodeError> {
-    let mut e = Encoder::new(FIX_VERSION);
-    e.put_str(35, "0");
-    e.put_str(49, &c.sender_comp_id);
-    e.put_str(56, &c.target_comp_id);
-    e.put_str(34, "1");
-    e.put_str(52, &format_timestamp());
-    if let Some(id) = test_req_id {
-        e.put_str(112, id);
-    }
-    Ok(e.finish()?.to_vec())
-}
-
-fn build_logout(c: &ExampleConfig) -> Result<Vec<u8>, EncodeError> {
-    let mut e = Encoder::new(FIX_VERSION);
-    e.put_str(35, "5");
-    e.put_str(49, &c.sender_comp_id);
-    e.put_str(56, &c.target_comp_id);
-    e.put_str(34, "1");
-    e.put_str(52, &format_timestamp());
-    Ok(e.finish()?.to_vec())
-}
-
-fn build_exec(
-    c: &ExampleConfig,
-    clid: &str,
-    sym: &str,
-    side: &str,
-    qty: &str,
-    order_id: u64,
-) -> Result<Vec<u8>, EncodeError> {
-    let mut e = Encoder::new(FIX_VERSION);
-    e.put_str(35, "8");
-    e.put_str(49, &c.sender_comp_id);
-    e.put_str(56, &c.target_comp_id);
-    e.put_str(34, "1");
-    e.put_str(52, &format_timestamp());
-    e.put_str(37, &format!("ORD{}", order_id));
-    e.put_str(11, clid);
-    e.put_str(17, &format!("EX{}", order_id));
-    e.put_str(150, "0"); // ExecType = New
-    e.put_str(39, "0"); // OrdStatus = New
-    e.put_str(55, sym);
-    e.put_str(54, side);
-    e.put_str(151, qty); // LeavesQty
-    e.put_str(14, "0"); // CumQty
-    e.put_str(6, "0"); // AvgPx
-    Ok(e.finish()?.to_vec())
+/// Pulls the four order fields out of the forwarded set.
+fn order_from(fields: &HashMap<u32, String>) -> Option<(&str, &str, &str, &str)> {
+    Some((
+        fields.get(&11)?.as_str(),
+        fields.get(&55)?.as_str(),
+        fields.get(&54)?.as_str(),
+        fields.get(&38)?.as_str(),
+    ))
 }
