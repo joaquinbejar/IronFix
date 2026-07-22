@@ -153,6 +153,69 @@ pub enum EngineError {
     #[error("store error: {0}")]
     Store(#[from] StoreError),
 
+    /// A write to the counterparty did not complete within the write timeout.
+    ///
+    /// A peer that stops reading parks a socket write forever once its receive
+    /// window closes, which would take the reactor's liveness timers with it.
+    /// The write is therefore bounded and its expiry closes the session, which
+    /// is the same verdict heartbeat detection would have reached.
+    #[error("write timed out after {0:?}")]
+    WriteTimeout(Duration),
+
+    /// An administrative MsgType was offered on the application send path.
+    ///
+    /// Logon (A), Logout (5), SequenceReset (4) and the rest of the
+    /// administrative set belong to the session state machine. One emitted
+    /// through [`Connection::send`](crate::Connection::send) would bypass the
+    /// typestate and the engine's phase tracking — a Logout sent that way, for
+    /// instance, never arms the logout timeout.
+    #[error("MsgType {msg_type} is administrative and belongs to the session layer")]
+    ReservedMsgType {
+        /// The offered MsgType (tag 35) value.
+        msg_type: String,
+    },
+
+    /// An outbound body carried a tag the engine stamps itself.
+    ///
+    /// See [`crate::outbound::RESERVED_TAGS`]. The frame would carry two
+    /// occurrences of the tag, which a conforming counterparty rejects or
+    /// misparses.
+    #[error(
+        "tag {tag} is stamped by the engine's standard header or trailer and must not be set on \
+         an outbound message"
+    )]
+    ReservedTag {
+        /// The offending tag.
+        tag: u32,
+    },
+
+    /// An outbound field value has no legal wire form.
+    ///
+    /// The reason never quotes the value: an outbound Logon body carries
+    /// `Password` (554) and `NewPassword` (925).
+    #[error("invalid outbound field {tag}: {reason}")]
+    InvalidField {
+        /// The offending tag.
+        tag: u32,
+        /// Why the value cannot be framed.
+        reason: String,
+    },
+
+    /// An administrative message lost a field its MsgType cannot go out without.
+    ///
+    /// A `to_admin` callback removed a required body field — `HeartBtInt` (108)
+    /// from a Logon, `TestReqID` (112) from a TestRequest, `NewSeqNo` (36) from
+    /// a SequenceReset, and the like. Emitting the message anyway would put a
+    /// malformed administrative frame on the wire that a conforming
+    /// counterparty rejects; the session refuses it instead.
+    #[error("administrative message {msg_type} is missing required field {tag}")]
+    MissingRequiredField {
+        /// The administrative MsgType (tag 35) value.
+        msg_type: String,
+        /// The required tag that is absent.
+        tag: u32,
+    },
+
     /// The connection is closed; no more messages can be sent.
     #[error("connection closed")]
     Closed,

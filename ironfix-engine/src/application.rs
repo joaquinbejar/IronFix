@@ -9,8 +9,9 @@
 //! This module defines the callback interface for handling FIX messages,
 //! following the QuickFIX pattern with async support.
 
+use crate::outbound::OutboundMessage;
 use async_trait::async_trait;
-use ironfix_core::message::{OwnedMessage, RawMessage};
+use ironfix_core::message::RawMessage;
 
 /// Session identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -103,6 +104,29 @@ impl RejectReason {
 ///
 /// Implement this trait to receive callbacks for session events
 /// and message processing.
+///
+/// # Where each callback runs
+///
+/// [`Application::to_admin`] and [`Application::to_app`] run **inline in the
+/// session reactor**, on the message the engine is about to encode and
+/// number. That is what makes their mutations effective, and it is why they
+/// cannot be moved off the reactor: the message they hand back is the one that
+/// gets a sequence number. A slow implementation delays the session's own
+/// timers.
+///
+/// [`Application::from_admin`] also runs inline, because its verdict decides
+/// what the session does next — whether a `SequenceReset` is applied, whether
+/// the Logon is accepted — and that decision cannot be taken before the
+/// verdict exists.
+///
+/// [`Application::from_app`] runs on a **separate dispatcher task** fed by a
+/// bounded queue, so a slow handler no longer stalls socket reads, heartbeat
+/// generation or timeout detection. Messages reach it in ascending
+/// `MsgSeqNum` order. The only consequence of a rejection — a session-level
+/// Reject carrying `RefSeqNum` — is emitted by the reactor when it next polls,
+/// so it may follow messages that arrived after the rejected one. See
+/// [`Initiator::with_app_queue_capacity`](crate::Initiator::with_app_queue_capacity)
+/// for the queue depth and what happens when it fills.
 #[async_trait]
 pub trait Application: Send + Sync {
     /// Called when a session is created.
@@ -123,14 +147,26 @@ pub trait Application: Send + Sync {
     /// * `session_id` - The session identifier
     async fn on_logout(&self, session_id: &SessionId);
 
-    /// Called before sending an admin message.
+    /// Called before an administrative message (Logon, Heartbeat, Logout, …)
+    /// is encoded.
     ///
-    /// Allows modification of outgoing admin messages (Logon, Heartbeat, etc.).
+    /// The body is mutable and the mutation is effective: the engine encodes
+    /// exactly the message this callback hands back. Fields appended here land
+    /// after the ones the session layer wrote, in insertion order. The
+    /// canonical use is stamping `Username` (553) and `Password` (554) onto the
+    /// outbound Logon.
+    ///
+    /// The standard header is not visible: it is stamped after this returns,
+    /// and `MsgSeqNum` (34) is not decided until the frame exists. A body that
+    /// carries a tag the engine stamps itself, or a value with no legal wire
+    /// form, is refused — the message is dropped with a warning and the session
+    /// continues, having spent no sequence number. See
+    /// [`crate::outbound::RESERVED_TAGS`].
     ///
     /// # Arguments
-    /// * `message` - The message to be sent (mutable)
+    /// * `message` - The message about to be encoded (mutable)
     /// * `session_id` - The session identifier
-    async fn to_admin(&self, message: &mut OwnedMessage, session_id: &SessionId);
+    async fn to_admin(&self, message: &mut OutboundMessage, session_id: &SessionId);
 
     /// Called when an admin message is received.
     ///
@@ -147,14 +183,16 @@ pub trait Application: Send + Sync {
         session_id: &SessionId,
     ) -> Result<(), RejectReason>;
 
-    /// Called before sending an application message.
+    /// Called before an application message is encoded.
     ///
-    /// Allows modification of outgoing application messages.
+    /// Same contract as [`Application::to_admin`]: the body is mutable, the
+    /// mutation is effective, and the header — including `MsgSeqNum` (34) — is
+    /// stamped afterwards.
     ///
     /// # Arguments
-    /// * `message` - The message to be sent (mutable)
+    /// * `message` - The message about to be encoded (mutable)
     /// * `session_id` - The session identifier
-    async fn to_app(&self, message: &mut OwnedMessage, session_id: &SessionId);
+    async fn to_app(&self, message: &mut OutboundMessage, session_id: &SessionId);
 
     /// Called when an application message is received.
     ///
@@ -184,7 +222,7 @@ impl Application for NoOpApplication {
 
     async fn on_logout(&self, _session_id: &SessionId) {}
 
-    async fn to_admin(&self, _message: &mut OwnedMessage, _session_id: &SessionId) {}
+    async fn to_admin(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
 
     async fn from_admin(
         &self,
@@ -194,7 +232,7 @@ impl Application for NoOpApplication {
         Ok(())
     }
 
-    async fn to_app(&self, _message: &mut OwnedMessage, _session_id: &SessionId) {}
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
 
     async fn from_app(
         &self,

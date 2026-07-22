@@ -63,7 +63,28 @@
 //! All sequence arithmetic goes through the checked
 //! [`SequenceManager::try_allocate_sender_seq`] /
 //! [`SequenceManager::try_increment_target_seq`]; an exhausted counter tears
-//! the session down rather than wrapping.
+//! the session down rather than wrapping. A sender number is spent only once
+//! the frame that carries it exists, so a body with no legal wire form is a
+//! dropped message rather than a hole the counterparty must resend over.
+//!
+//! # What blocks the reactor, and what does not
+//!
+//! The reactor is a single task owning the socket. Two things used to be able
+//! to park it indefinitely, and neither can now:
+//!
+//! - **A stalled peer.** A counterparty that stops reading closes its receive
+//!   window and parks a socket write forever. Every write is therefore bounded
+//!   by [`Initiator::with_write_timeout`], and its expiry closes the session —
+//!   the same verdict heartbeat detection would have reached, reached in
+//!   bounded time.
+//! - **A slow `from_app`.** Inbound application messages are handed to a
+//!   separate dispatcher task over a bounded queue
+//!   ([`Initiator::with_app_queue_capacity`]), so an application handler never
+//!   delays a socket read, a heartbeat, or timeout detection.
+//!
+//! `to_admin`, `to_app` and `from_admin` still run inline, because each one's
+//! result decides what the reactor does next. See [`Application`] for the
+//! ordering that buys and the ordering it costs.
 //!
 //! # Example
 //!
@@ -97,8 +118,9 @@
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Command, Connection, SessionRuntime};
 use crate::error::EngineError;
-use crate::wire::{self, MessageFactory, PeerIdentity, UnsupportedVersion};
-use bytes::BytesMut;
+use crate::outbound;
+use crate::wire::{self, MessageFactory, PeerIdentity, PendingMessage, UnsupportedVersion};
+use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use ironfix_core::error::{DecodeError, EncodeError};
 use ironfix_core::message::{MsgType, RawMessage};
@@ -117,6 +139,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::codec::Framed;
 
@@ -125,6 +148,27 @@ type FixFramed = Framed<TcpStream, FixCodec>;
 
 /// Default capacity of the outbound command queue.
 const DEFAULT_OUTBOUND_CAPACITY: usize = 1024;
+
+/// Default capacity of the inbound application queue, in messages.
+///
+/// The queue is bounded by message **count**, not bytes, and each entry retains
+/// its whole frame (a reference-counted [`Bytes`] up to
+/// [`SessionConfig::max_message_size`]). The worst-case retained memory is
+/// therefore `capacity * max_message_size`: with the defaults, 1024 * 1 MiB =
+/// 1 GiB, and up to 1024 * 64 MiB = 64 GiB if `max_message_size` is raised to
+/// its ceiling. See [`Initiator::with_app_queue_capacity`] to size it.
+const DEFAULT_APP_QUEUE_CAPACITY: usize = 1024;
+
+/// Default bound on a single socket write.
+const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the reactor waits for the application dispatcher to finish the
+/// messages already queued before it reports the session closed.
+///
+/// The dispatcher always terminates — its queue is closed when the reactor
+/// drops the sender — so this only bounds how long `on_logout` waits to follow
+/// the last `from_app` rather than run beside it.
+const APP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reactor tick granularity for heartbeat/timeout checks.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
@@ -159,10 +203,14 @@ pub struct Initiator<A: Application = NoOpApplication> {
     config_check: Result<(), SessionConfigError>,
     /// TCP connect timeout.
     connect_timeout: Duration,
+    /// Bound on a single socket write.
+    write_timeout: Duration,
     /// Initial (sender, target) sequence numbers for session continuity.
     initial_sequences: Option<(u64, u64)>,
     /// Capacity of the outbound command queue.
     outbound_capacity: usize,
+    /// Capacity of the inbound application queue.
+    app_queue_capacity: usize,
     /// Optional message store: outbound frames are filed here and replayed
     /// from here when the counterparty asks for a resend.
     store: Option<Arc<dyn MessageStore>>,
@@ -177,8 +225,10 @@ impl<A: Application> std::fmt::Debug for Initiator<A> {
             .field("session_id", &self.session_id)
             .field("version", &self.version)
             .field("connect_timeout", &self.connect_timeout)
+            .field("write_timeout", &self.write_timeout)
             .field("initial_sequences", &self.initial_sequences)
             .field("outbound_capacity", &self.outbound_capacity)
+            .field("app_queue_capacity", &self.app_queue_capacity)
             .field("store", &self.store.is_some())
             .finish_non_exhaustive()
     }
@@ -218,8 +268,10 @@ impl<A: Application + 'static> Initiator<A> {
             version,
             config_check,
             connect_timeout: Duration::from_secs(30),
+            write_timeout: DEFAULT_WRITE_TIMEOUT,
             initial_sequences: None,
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
+            app_queue_capacity: DEFAULT_APP_QUEUE_CAPACITY,
             store: None,
         }
     }
@@ -254,6 +306,54 @@ impl<A: Application + 'static> Initiator<A> {
     #[must_use]
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
+        self
+    }
+
+    /// Sets how long a single socket write may take before the session is
+    /// closed (default 10s).
+    ///
+    /// A counterparty that stops reading closes its TCP receive window, and a
+    /// write into a closed window never completes. Without a bound the reactor
+    /// parks inside that write with its liveness timers, so the session hangs
+    /// instead of being declared dead. Expiry closes the session with
+    /// [`EngineError::WriteTimeout`].
+    ///
+    /// A zero timeout is raised to one tick: a write that is given no time at
+    /// all can never succeed.
+    ///
+    /// # Arguments
+    /// * `timeout` - Maximum duration of one write
+    #[must_use]
+    pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = timeout.max(TICK_INTERVAL);
+        self
+    }
+
+    /// Sets the capacity of the inbound application queue (default 1024).
+    ///
+    /// Inbound application messages are handed to a dispatcher task over this
+    /// queue so that a slow [`Application::from_app`] cannot stall socket
+    /// reads or heartbeat generation. Messages are delivered in ascending
+    /// `MsgSeqNum` order.
+    ///
+    /// **Lag policy:** when the queue is full the session is closed rather than
+    /// the message silently dropped. The frame is offered to the dispatcher
+    /// *before* the inbound sequence expectation advances past it, so the close
+    /// leaves the counterparty free to resend from that number. Raise the
+    /// capacity for an application that legitimately bursts.
+    ///
+    /// **Memory:** the bound is on message count, not bytes, and each queued
+    /// frame retains up to [`SessionConfig::max_message_size`]. The worst-case
+    /// retained memory is `capacity * max_message_size` — with the default
+    /// capacity of 1024 that is 1 GiB at the default 1 MiB frame size and 64 GiB
+    /// at the 64 MiB ceiling — so raise this and `max_message_size` together
+    /// with that product in mind.
+    ///
+    /// # Arguments
+    /// * `capacity` - Queue depth in messages, at least 1
+    #[must_use]
+    pub fn with_app_queue_capacity(mut self, capacity: usize) -> Self {
+        self.app_queue_capacity = capacity.max(1);
         self
     }
 
@@ -368,6 +468,15 @@ impl<A: Application + 'static> Initiator<A> {
     /// owns the socket and handles heartbeats, TestRequests, sequence
     /// validation, and admin replies until the session closes.
     ///
+    /// # Dropping the handle logs out
+    ///
+    /// The reactor stops when the last [`Connection`] clone is dropped: it
+    /// reads that as "nobody can drive this session any more" and performs a
+    /// graceful Logout rather than leaving a task holding a socket forever.
+    /// A consumer that wants the session to outlive its handle must keep one
+    /// alive — typically by holding it until [`Connection::wait_closed`]
+    /// returns.
+    ///
     /// # Arguments
     /// * `addr` - The counterparty address to dial
     ///
@@ -461,38 +570,34 @@ impl<A: Application + 'static> Initiator<A> {
             sequences,
             heartbeat: Mutex::new(HeartbeatManager::new(self.config.heartbeat_interval)),
         });
-        let factory = MessageFactory::new(&self.config, version);
+        let mut factory = MessageFactory::new(&self.config, version);
         let identity = PeerIdentity::new(&self.config);
+        let write_timeout = self.write_timeout;
+        let store = self.store.as_ref();
 
         // Typestate: Connecting -> LogonSent.
-        let seq = match runtime.sequences.try_allocate_sender_seq() {
-            Ok(seq) => seq.value(),
-            Err(err) => {
-                let _ = session.disconnect();
-                return Err(err.into());
-            }
-        };
-        // Mirror the advanced sender counter into the store before the Logon —
-        // the first numbered frame of the session — reaches the wire, so a store
-        // reused across a reconnect cannot report a number the peer has seen.
-        mirror_sender_seq(self.store.as_ref(), &runtime.sequences);
+        //
+        // `to_admin` runs on the message before it is framed, so a stamped
+        // Username/Password reaches the wire — the callback's whole purpose.
         let logon = factory.logon(
-            seq,
             self.config.heartbeat_interval_secs(),
             self.config.reset_on_logon,
-        )?;
-        if let Ok(mut owned) = wire::owned_from_frame(&logon) {
-            self.application.to_admin(&mut owned, &session_id).await;
-        }
-        persist_outbound(
-            self.store.as_ref(),
+        );
+        if let Err(err) = send_handshake_admin(
+            self.application.as_ref(),
             &session_id,
-            seq,
-            &MsgType::Logon,
-            &logon,
+            &mut framed,
+            &mut factory,
+            &runtime.sequences,
+            store,
+            write_timeout,
+            logon,
         )
-        .await;
-        framed.send(logon).await?;
+        .await
+        {
+            let _ = session.disconnect();
+            return Err(err);
+        }
         lock_heartbeat(&runtime).on_message_sent();
         let session = session.send_logon();
 
@@ -565,45 +670,53 @@ impl<A: Application + 'static> Initiator<A> {
             if let Err(mismatch) = identity.validate(&raw) {
                 let detail = mismatch.to_string();
                 let reason = RejectReason::new(9, detail.clone()).with_ref_tag(mismatch.tag);
-                if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
-                    && let Ok(reject) = factory.session_reject(
-                        out_seq.value(),
-                        ack_seq,
-                        MsgType::Logon.as_str(),
-                        &reason,
-                    )
-                {
-                    mirror_sender_seq(self.store.as_ref(), &runtime.sequences);
-                    let _ = framed.send(reject).await;
-                }
-                if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
-                    && let Ok(logout) = factory.logout(out_seq.value(), Some(&detail))
-                {
-                    mirror_sender_seq(self.store.as_ref(), &runtime.sequences);
-                    let _ = framed.send(logout).await;
-                }
+                let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
+                let _ = send_handshake_admin(
+                    self.application.as_ref(),
+                    &session_id,
+                    &mut framed,
+                    &mut factory,
+                    &runtime.sequences,
+                    store,
+                    write_timeout,
+                    reject,
+                )
+                .await;
+                let logout = factory.logout(Some(&detail));
+                let _ = send_handshake_admin(
+                    self.application.as_ref(),
+                    &session_id,
+                    &mut framed,
+                    &mut factory,
+                    &runtime.sequences,
+                    store,
+                    write_timeout,
+                    logout,
+                )
+                .await;
                 let _ = session.on_logon_reject();
                 return Err(EngineError::IdentityMismatch { detail });
             }
 
             if let Err(reason) = self.application.from_admin(&raw, &session_id).await {
-                match runtime.sequences.try_allocate_sender_seq() {
-                    Ok(seq) => match factory.logout(seq.value(), Some(&reason.text)) {
-                        Ok(logout) => {
-                            mirror_sender_seq(self.store.as_ref(), &runtime.sequences);
-                            let _ = framed.send(logout).await;
-                        }
-                        Err(err) => tracing::warn!(
-                            session = %session_id,
-                            error = %err,
-                            "cannot encode Logout after from_admin rejection"
-                        ),
-                    },
-                    Err(err) => tracing::warn!(
+                let logout = factory.logout(Some(&reason.text));
+                if let Err(err) = send_handshake_admin(
+                    self.application.as_ref(),
+                    &session_id,
+                    &mut framed,
+                    &mut factory,
+                    &runtime.sequences,
+                    store,
+                    write_timeout,
+                    logout,
+                )
+                .await
+                {
+                    tracing::warn!(
                         session = %session_id,
                         error = %err,
                         "cannot send Logout after from_admin rejection"
-                    ),
+                    );
                 }
                 let _ = session.on_logon_reject();
                 return Err(EngineError::LogonRejected {
@@ -639,21 +752,30 @@ impl<A: Application + 'static> Initiator<A> {
                         (6, err.to_string())
                     };
                     let reason = RejectReason::new(code, detail.clone()).with_ref_tag(108);
-                    if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
-                        && let Ok(reject) = factory.session_reject(
-                            out_seq.value(),
-                            ack_seq,
-                            MsgType::Logon.as_str(),
-                            &reason,
-                        )
-                    {
-                        let _ = framed.send(reject).await;
-                    }
-                    if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
-                        && let Ok(logout) = factory.logout(out_seq.value(), Some(&detail))
-                    {
-                        let _ = framed.send(logout).await;
-                    }
+                    let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
+                    let _ = send_handshake_admin(
+                        self.application.as_ref(),
+                        &session_id,
+                        &mut framed,
+                        &mut factory,
+                        &runtime.sequences,
+                        store,
+                        write_timeout,
+                        reject,
+                    )
+                    .await;
+                    let logout = factory.logout(Some(&detail));
+                    let _ = send_handshake_admin(
+                        self.application.as_ref(),
+                        &session_id,
+                        &mut framed,
+                        &mut factory,
+                        &runtime.sequences,
+                        store,
+                        write_timeout,
+                        logout,
+                    )
+                    .await;
                     let _ = session.on_logon_reject();
                     return Err(EngineError::HeartbeatInterval { detail });
                 }
@@ -663,21 +785,30 @@ impl<A: Application + 'static> Initiator<A> {
                 Err(err) => {
                     let detail = err.to_string();
                     let reason = RejectReason::new(5, detail.clone()).with_ref_tag(108);
-                    if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
-                        && let Ok(reject) = factory.session_reject(
-                            out_seq.value(),
-                            ack_seq,
-                            MsgType::Logon.as_str(),
-                            &reason,
-                        )
-                    {
-                        let _ = framed.send(reject).await;
-                    }
-                    if let Ok(out_seq) = runtime.sequences.try_allocate_sender_seq()
-                        && let Ok(logout) = factory.logout(out_seq.value(), Some(&detail))
-                    {
-                        let _ = framed.send(logout).await;
-                    }
+                    let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
+                    let _ = send_handshake_admin(
+                        self.application.as_ref(),
+                        &session_id,
+                        &mut framed,
+                        &mut factory,
+                        &runtime.sequences,
+                        store,
+                        write_timeout,
+                        reject,
+                    )
+                    .await;
+                    let logout = factory.logout(Some(&detail));
+                    let _ = send_handshake_admin(
+                        self.application.as_ref(),
+                        &session_id,
+                        &mut framed,
+                        &mut factory,
+                        &runtime.sequences,
+                        store,
+                        write_timeout,
+                        logout,
+                    )
+                    .await;
                     let _ = session.on_logon_reject();
                     return Err(EngineError::HeartbeatInterval { detail });
                 }
@@ -747,26 +878,34 @@ impl<A: Application + 'static> Initiator<A> {
 
         // A gap in the Logon ack means we missed messages: request a resend.
         if let Some(expected) = pending_resend {
-            let seq = runtime.sequences.try_allocate_sender_seq()?.value();
-            mirror_sender_seq(self.store.as_ref(), &runtime.sequences);
-            let frame = factory.resend_request(seq, expected, 0)?;
-            if let Ok(mut owned) = wire::owned_from_frame(&frame) {
-                self.application.to_admin(&mut owned, &session_id).await;
-            }
-            persist_outbound(
-                self.store.as_ref(),
+            let request = factory.resend_request(expected, 0);
+            send_handshake_admin(
+                self.application.as_ref(),
                 &session_id,
-                seq,
-                &MsgType::ResendRequest,
-                &frame,
+                &mut framed,
+                &mut factory,
+                &runtime.sequences,
+                store,
+                write_timeout,
+                request,
             )
-            .await;
-            framed.send(frame).await?;
+            .await?;
             lock_heartbeat(&runtime).on_message_sent();
         }
 
         let (command_tx, command_rx) = mpsc::channel(self.outbound_capacity);
         let (closed_tx, closed_rx) = watch::channel(false);
+        let (app_tx, app_rx) = mpsc::channel(self.app_queue_capacity);
+        let (reject_tx, reject_rx) = mpsc::channel(self.app_queue_capacity);
+
+        // The dispatcher stops when the reactor drops `app_tx`, which
+        // `run_reactor` does on every exit path.
+        let dispatcher = tokio::spawn(run_app_dispatcher(
+            Arc::clone(&self.application),
+            session_id.clone(),
+            app_rx,
+            reject_tx,
+        ));
 
         let reactor = Reactor {
             factory,
@@ -777,9 +916,17 @@ impl<A: Application + 'static> Initiator<A> {
             session_id: session_id.clone(),
             store: self.store.clone(),
             pending_resend,
+            write_timeout,
+            app_tx,
         };
         reactor.sync_sequences();
-        tokio::spawn(run_reactor(framed, command_rx, closed_tx, reactor, session));
+        let channels = ReactorChannels {
+            commands: command_rx,
+            app_rejects: reject_rx,
+            closed: closed_tx,
+            dispatcher,
+        };
+        tokio::spawn(run_reactor(framed, channels, reactor, session));
 
         Ok(Connection {
             session_id,
@@ -790,6 +937,91 @@ impl<A: Application + 'static> Initiator<A> {
     }
 }
 
+/// Runs `to_admin`, checks the body, and writes one administrative frame
+/// during the handshake, before the reactor exists.
+///
+/// Every administrative message goes through the callback, including the ones
+/// on the failure paths: now that a mutation is effective, a counterparty that
+/// requires a stamped field requires it on the Reject and the Logout too. When
+/// a store is attached the frame is filed and the sender counter mirrored, the
+/// same as [`send_handshake`] does.
+///
+/// # Errors
+/// The same as [`send_handshake`], plus [`EngineError::ReservedTag`] /
+/// [`EngineError::InvalidField`] when the callback left a body the engine will
+/// not frame.
+#[allow(clippy::too_many_arguments)]
+async fn send_handshake_admin<A: Application>(
+    application: &A,
+    session_id: &SessionId,
+    framed: &mut FixFramed,
+    factory: &mut MessageFactory,
+    sequences: &SequenceManager,
+    store: Option<&Arc<dyn MessageStore>>,
+    write_timeout: Duration,
+    mut pending: PendingMessage,
+) -> Result<(), EngineError> {
+    application
+        .to_admin(pending.message_mut(), session_id)
+        .await;
+    outbound::check_body(pending.message())?;
+    send_handshake(
+        session_id,
+        framed,
+        factory,
+        sequences,
+        store,
+        write_timeout,
+        &pending,
+    )
+    .await
+}
+
+/// Encodes and writes one frame during the handshake, before the reactor
+/// exists.
+///
+/// The sequence number is peeked, the frame is built, and only then is the
+/// number spent — the same order the reactor uses. A body with no legal wire
+/// form therefore costs nothing, instead of leaving a hole the counterparty
+/// would have to resend over. When a store is attached the frame is filed under
+/// its `MsgSeqNum` and the sender counter mirrored into it before it goes on the
+/// wire, so a store reused across a reconnect can replay it and never reports a
+/// number the peer has already seen.
+///
+/// # Errors
+/// [`EngineError::Encode`] when the body has no legal wire form,
+/// [`EngineError::SequenceExhausted`] when the sender counter has reached
+/// `u64::MAX`, [`EngineError::WriteTimeout`] when the peer is not reading, and
+/// the transport's own error otherwise.
+async fn send_handshake(
+    session_id: &SessionId,
+    framed: &mut FixFramed,
+    factory: &mut MessageFactory,
+    sequences: &SequenceManager,
+    store: Option<&Arc<dyn MessageStore>>,
+    write_timeout: Duration,
+    pending: &PendingMessage,
+) -> Result<(), EngineError> {
+    let seq = sequences.next_sender_seq().value();
+    let frame = factory.encode(seq, pending)?;
+    let allocated = sequences.try_allocate_sender_seq()?.value();
+    if allocated != seq {
+        return Err(EngineError::Sequence(format!(
+            "sender sequence moved from {seq} to {allocated} while a frame was being built"
+        )));
+    }
+    // File the frame and mirror the sender counter before it reaches the wire:
+    // a message on the wire that was never stored is one this session can be
+    // asked to replay and cannot.
+    mirror_sender_seq(store, sequences);
+    persist_outbound(store, session_id, seq, pending.msg_type(), frame).await;
+    match timeout(write_timeout, framed.send(frame)).await {
+        Err(_) => Err(EngineError::WriteTimeout(write_timeout)),
+        Ok(Err(err)) => Err(err.into()),
+        Ok(Ok(())) => Ok(()),
+    }
+}
+
 /// Mirrors the sender sequence counter into the store, if one is attached.
 ///
 /// The reactor mirrors both counters after every event through
@@ -797,9 +1029,9 @@ impl<A: Application + 'static> Initiator<A> {
 /// Logon handshake. This closes the window: it is called after each handshake
 /// frame is numbered, before that frame reaches the wire, so a store reused
 /// across a reconnect never reports a sender counter behind a `MsgSeqNum` the
-/// counterparty has already seen — which would reuse that number on the next
-/// session. Only the sender counter is mirrored; the target counter advances
-/// only once an inbound message is accepted, which the reactor then mirrors.
+/// counterparty has already seen. Only the sender counter is mirrored; the
+/// target counter advances only once an inbound message is accepted, which the
+/// reactor then mirrors.
 fn mirror_sender_seq(store: Option<&Arc<dyn MessageStore>>, sequences: &SequenceManager) {
     if let Some(store) = store {
         store.set_next_sender_seq(sequences.next_sender_seq().value());
@@ -898,9 +1130,88 @@ fn exhausted(phase: Phase, err: SequenceExhausted) -> SessionClosed {
     closed(err.to_string(), false)
 }
 
+/// One inbound application message on its way to the dispatcher task.
+///
+/// Carries the frame as [`Bytes`], which the reactor already owns, so handing
+/// it over is a reference-count bump rather than a copy.
+#[derive(Debug)]
+struct AppFrame {
+    /// The complete frame.
+    frame: Bytes,
+    /// Its `MsgSeqNum` (34), already validated by the reactor.
+    seq: u64,
+}
+
+/// A rejection the application returned from `from_app`, on its way back to
+/// the reactor as a session-level Reject.
+#[derive(Debug)]
+struct AppRejection {
+    /// `RefSeqNum` (45): the MsgSeqNum of the rejected message.
+    ref_seq: u64,
+    /// `RefMsgType` (372).
+    ref_msg_type: MsgType,
+    /// The reason the application gave.
+    reason: RejectReason,
+}
+
+/// Runs `from_app` off the reactor.
+///
+/// Messages arrive in the order the reactor validated them, and this task is
+/// their only consumer, so the application sees them in ascending `MsgSeqNum`
+/// order. A rejection travels back to the reactor, which numbers and sends the
+/// session-level Reject; nothing here touches session state.
+///
+/// The task ends when the reactor drops the queue's sender, which every exit
+/// path of [`run_reactor`] does.
+async fn run_app_dispatcher<A: Application>(
+    application: Arc<A>,
+    session_id: SessionId,
+    mut frames: mpsc::Receiver<AppFrame>,
+    rejections: mpsc::Sender<AppRejection>,
+) {
+    while let Some(AppFrame { frame, seq }) = frames.recv().await {
+        // The reactor decoded this frame already; a failure here cannot
+        // happen, and inventing a session action for it is not this task's
+        // job.
+        let Ok(raw) = wire::decode_frame(&frame) else {
+            tracing::warn!(
+                session = %session_id,
+                seq,
+                "dropping an application message that no longer decodes"
+            );
+            continue;
+        };
+        if let Err(reason) = application.from_app(&raw, &session_id).await {
+            let rejection = AppRejection {
+                ref_seq: seq,
+                ref_msg_type: raw.msg_type().clone(),
+                reason,
+            };
+            if rejections.send(rejection).await.is_err() {
+                // The reactor is gone; the session it would have rejected
+                // into no longer exists.
+                break;
+            }
+        }
+    }
+}
+
+/// Everything the reactor loop owns besides the socket and the session.
+struct ReactorChannels {
+    /// Commands from [`Connection`] handles.
+    commands: mpsc::Receiver<Command>,
+    /// Rejections coming back from the application dispatcher.
+    app_rejects: mpsc::Receiver<AppRejection>,
+    /// Closed-flag channel observed by [`Connection::wait_closed`].
+    closed: watch::Sender<bool>,
+    /// The application dispatcher, joined on close so `on_logout` follows the
+    /// last `from_app` rather than racing it.
+    dispatcher: JoinHandle<()>,
+}
+
 /// Reactor state shared across event handlers.
 struct Reactor<A: Application> {
-    /// Outbound frame factory.
+    /// Outbound frame factory, holding the encoder reused for every message.
     factory: MessageFactory,
     /// Identity every inbound message must carry.
     identity: PeerIdentity,
@@ -920,19 +1231,30 @@ struct Reactor<A: Application> {
     /// carries the instant the Logout went out, so the phase itself is the
     /// deadline.
     pending_resend: Option<u64>,
+    /// Bound on a single socket write.
+    write_timeout: Duration,
+    /// Hand-off queue to the application dispatcher.
+    app_tx: mpsc::Sender<AppFrame>,
 }
 
 /// The session reactor: owns the socket, multiplexes inbound frames,
-/// outbound commands, and heartbeat timers until the session closes.
+/// outbound commands, application rejections, and heartbeat timers until the
+/// session closes.
 async fn run_reactor<A: Application + 'static>(
     mut framed: FixFramed,
-    mut commands: mpsc::Receiver<Command>,
-    closed_tx: watch::Sender<bool>,
+    channels: ReactorChannels,
     mut ctx: Reactor<A>,
     session: Session<Active>,
 ) {
+    let ReactorChannels {
+        mut commands,
+        mut app_rejects,
+        closed: closed_tx,
+        mut dispatcher,
+    } = channels;
     let mut phase = Some(Phase::Active(session));
     let mut commands_open = true;
+    let mut rejects_open = true;
     let mut tick = interval(TICK_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -963,6 +1285,24 @@ async fn run_reactor<A: Application + 'static>(
                     ctx.on_command(&mut framed, current, Command::Logout).await
                 }
             },
+            rejection = app_rejects.recv(), if rejects_open => match rejection {
+                Some(rejection) => {
+                    let ref_msg_type = rejection.ref_msg_type.as_str().to_string();
+                    ctx.send_session_reject(
+                        &mut framed,
+                        current,
+                        rejection.ref_seq,
+                        &ref_msg_type,
+                        &rejection.reason,
+                    )
+                    .await
+                }
+                None => {
+                    // The dispatcher stopped; nothing more can be rejected.
+                    rejects_open = false;
+                    Ok(current)
+                }
+            },
             _ = tick.tick() => ctx.on_tick(&mut framed, current).await,
         };
         match result {
@@ -990,6 +1330,22 @@ async fn run_reactor<A: Application + 'static>(
         }
     }
     ctx.sync_sequences();
+
+    // Closing the queue is what stops the dispatcher; joining it is what keeps
+    // `on_logout` from running beside a `from_app` still in flight. A wedged
+    // handler bounds the wait rather than the shutdown — and is then aborted, so
+    // it cannot outlive `on_logout`/`wait_closed`. Awaiting `&mut dispatcher`
+    // keeps ownership of the handle across the timeout: dropping it would only
+    // detach the task, leaving the stuck handler running.
+    drop(ctx.app_tx);
+    if timeout(APP_DRAIN_TIMEOUT, &mut dispatcher).await.is_err() {
+        dispatcher.abort();
+        tracing::warn!(
+            session = %ctx.session_id,
+            "application dispatcher did not drain before the session closed; aborting it"
+        );
+    }
+
     ctx.application.on_logout(&ctx.session_id).await;
     let _ = closed_tx.send(true);
     if outcome.graceful {
@@ -997,6 +1353,32 @@ async fn run_reactor<A: Application + 'static>(
     } else {
         tracing::warn!(session = %ctx.session_id, reason = %outcome.reason, "FIX session closed");
     }
+}
+
+/// Why an outbound message never reached the transport.
+enum WriteFailure {
+    /// The body has no legal wire form. **No sequence number was spent**, so
+    /// the session is intact and the message can simply be dropped.
+    Encode(EncodeError),
+    /// The session cannot continue.
+    Fatal(EngineError),
+}
+
+/// Whether an outbound message actually reached the transport.
+///
+/// [`Reactor::send`] returning `Ok` used to conflate "sent" with "dropped
+/// because a callback left the body unsendable". A caller that arms follow-on
+/// state — the logout deadline, a pending TestRequest, a pending resend — must
+/// distinguish the two, or it advances the session on a frame the peer never
+/// saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    /// The frame went out and a sequence number was spent.
+    Yes,
+    /// The message was dropped before the wire: `to_admin`/`to_app` left it
+    /// unframeable or dropped a required field. No sequence number was spent
+    /// and the session is intact.
+    Dropped,
 }
 
 impl<A: Application> Reactor<A> {
@@ -1013,66 +1395,200 @@ impl<A: Application> Reactor<A> {
         store.set_next_target_seq(self.runtime.sequences.next_target_seq().value());
     }
 
-    /// Sends an admin frame, running the `to_admin` callback and updating
-    /// heartbeat bookkeeping.
+    /// Frames `pending` under an explicit `seq` and writes it, bounded by the
+    /// write timeout. Spends no sequence number.
     ///
-    /// `seq` is the sender sequence number allocated for this frame, and the
-    /// key it is filed under. It is `None` only for a `SequenceReset`-GapFill,
-    /// which allocates no number of its own: it re-occupies the range it
-    /// replaces, and filing it would overwrite a message that is still
-    /// resendable.
+    /// When `persist` is set and a store is attached the frame is filed under
+    /// `seq` before it goes on the wire. A gap fill passes `false`: it
+    /// re-occupies a range it does not own, so filing it would overwrite a
+    /// message under `seq` that is still resendable.
     ///
-    /// The message is filed **before** it is written to the socket. A frame
-    /// stored but never sent is harmless — the counterparty never saw it and so
-    /// never asks for it — whereas a frame sent but never stored is a message
-    /// this session can be asked to replay and cannot produce.
-    async fn send_admin(
-        &self,
+    /// # Errors
+    /// [`WriteFailure::Encode`] leaves the session untouched — nothing was
+    /// written and nothing was spent. [`WriteFailure::Fatal`] does not: a
+    /// stalled or broken transport ends the session.
+    async fn write_at(
+        &mut self,
         framed: &mut FixFramed,
-        seq: Option<u64>,
-        frame: Result<BytesMut, EncodeError>,
-    ) -> Result<(), EngineError> {
-        // The frame arrives as the encoder's result so every caller reports an
-        // unencodable message through the path it already uses for a failed
-        // send, rather than each deciding for itself.
-        let frame = frame?;
-        let mut msg_type = None;
-        if let Ok(mut owned) = wire::owned_from_frame(&frame) {
-            msg_type = Some(owned.msg_type().clone());
+        seq: u64,
+        pending: &PendingMessage,
+        persist: bool,
+    ) -> Result<(), WriteFailure> {
+        let write_timeout = self.write_timeout;
+        let frame = match self.factory.encode(seq, pending) {
+            Ok(frame) => frame,
+            Err(err) => return Err(WriteFailure::Encode(err)),
+        };
+        if persist {
+            persist_outbound(
+                self.store.as_ref(),
+                &self.session_id,
+                seq,
+                pending.msg_type(),
+                frame,
+            )
+            .await;
+        }
+        // A peer that stops reading parks this write forever once its receive
+        // window closes, and the reactor's liveness timers park with it.
+        match timeout(write_timeout, framed.send(frame)).await {
+            Err(_) => Err(WriteFailure::Fatal(EngineError::WriteTimeout(
+                write_timeout,
+            ))),
+            Ok(Err(err)) => Err(WriteFailure::Fatal(err.into())),
+            Ok(Ok(())) => Ok(()),
+        }
+    }
+
+    /// Runs the outbound application callback, checks the body, files the
+    /// frame, frames the message under the next sender sequence number and
+    /// writes it.
+    ///
+    /// `to_admin` or `to_app` is chosen by the MsgType, and each runs on the
+    /// message **before** it is framed, so what the callback hands back is what
+    /// goes on the wire.
+    ///
+    /// The sequence number is peeked to frame the message and spent only once
+    /// the frame has actually gone out. A body with no legal wire form is
+    /// therefore dropped with a warning and [`Sent::Dropped`] is returned: the
+    /// session is intact and there is no hole for the counterparty to resend
+    /// over. A caller that arms follow-on state — the logout deadline, a
+    /// pending TestRequest, a pending resend — must act only on [`Sent::Yes`],
+    /// or it advances the session on a frame the peer never saw. Only the
+    /// reactor allocates sender sequence numbers and only this method writes, so
+    /// nothing can take the peeked number in between — the mismatch branch
+    /// exists so a wrong `MsgSeqNum` can never reach the wire, not because it is
+    /// reachable.
+    ///
+    /// # Errors
+    /// Every [`EngineError`] returned here is terminal for the session: an
+    /// exhausted sender counter, a write timeout, or a transport failure.
+    async fn send(
+        &mut self,
+        framed: &mut FixFramed,
+        mut pending: PendingMessage,
+    ) -> Result<Sent, EngineError> {
+        if !self.prepare(&mut pending).await {
+            return Ok(Sent::Dropped);
+        }
+        let seq = self.runtime.sequences.next_sender_seq().value();
+        match self.write_at(framed, seq, &pending, true).await {
+            Ok(()) => {}
+            Err(WriteFailure::Encode(err)) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    error = %err,
+                    "dropping outbound message with no legal wire form; no sequence number spent"
+                );
+                return Ok(Sent::Dropped);
+            }
+            Err(WriteFailure::Fatal(err)) => return Err(err),
+        }
+        let allocated = self.runtime.sequences.try_allocate_sender_seq()?.value();
+        if allocated != seq {
+            return Err(EngineError::Sequence(format!(
+                "sender sequence moved from {seq} to {allocated} while a frame was being built"
+            )));
+        }
+        mirror_sender_seq(self.store.as_ref(), &self.runtime.sequences);
+        lock_heartbeat(&self.runtime).on_message_sent();
+        Ok(Sent::Yes)
+    }
+
+    /// Runs `to_admin` / `to_app` on `pending` and rechecks its body.
+    ///
+    /// Returns `false` when the callback left a body the engine will not
+    /// frame — a tag the standard header already carries, or a value with no
+    /// wire form. The message is then dropped; the warning names the tag and
+    /// never the value, because an outbound Logon body carries `Password`
+    /// (554).
+    async fn prepare(&mut self, pending: &mut PendingMessage) -> bool {
+        if pending.msg_type().is_admin() {
             self.application
-                .to_admin(&mut owned, &self.session_id)
+                .to_admin(pending.message_mut(), &self.session_id)
+                .await;
+        } else {
+            self.application
+                .to_app(pending.message_mut(), &self.session_id)
                 .await;
         }
-        if let (Some(seq), Some(msg_type)) = (seq, msg_type.as_ref()) {
-            self.persist(seq, msg_type, &frame).await;
+        if let Err(err) = outbound::check_body(pending.message()) {
+            tracing::warn!(
+                session = %self.session_id,
+                msg_type = %pending.msg_type(),
+                error = %err,
+                "dropping outbound message rejected after the application callback"
+            );
+            return false;
         }
-        framed.send(frame).await?;
-        lock_heartbeat(&self.runtime).on_message_sent();
-        Ok(())
+        true
     }
 
-    /// Files one outbound frame in the store, if there is one.
-    async fn persist(&self, seq: u64, msg_type: &MsgType, frame: &[u8]) {
-        persist_outbound(self.store.as_ref(), &self.session_id, seq, msg_type, frame).await;
-    }
-
-    /// Writes an already-built replay frame to the socket.
+    /// Writes an already-built replay frame to the socket, bounded by the write
+    /// timeout.
     ///
-    /// A replayed message keeps the sequence number and the body it was first
-    /// sent with, so nothing is allocated and nothing is re-filed. `to_app`
-    /// still runs, because from the application's point of view this is another
-    /// transmission of one of its messages.
+    /// A replayed message keeps the sequence number and body it was first sent
+    /// with, so nothing is allocated and nothing is re-filed. It already
+    /// carries `PossDupFlag` (43) = Y and its original `OrigSendingTime` (122),
+    /// both stamped by [`wire::resend_frame`], so it is written verbatim rather
+    /// than run back through the callback path.
+    ///
+    /// # Errors
+    /// [`EngineError::WriteTimeout`] when the peer is not reading, and the
+    /// transport's own error otherwise. Both are terminal for the session.
     async fn send_replay(
         &self,
         framed: &mut FixFramed,
         frame: BytesMut,
     ) -> Result<(), EngineError> {
-        if let Ok(mut owned) = wire::owned_from_frame(&frame) {
-            self.application.to_app(&mut owned, &self.session_id).await;
+        let write_timeout = self.write_timeout;
+        match timeout(write_timeout, framed.send(frame)).await {
+            Err(_) => return Err(EngineError::WriteTimeout(write_timeout)),
+            Ok(Err(err)) => return Err(err.into()),
+            Ok(Ok(())) => {}
         }
-        framed.send(frame).await?;
         lock_heartbeat(&self.runtime).on_message_sent();
         Ok(())
+    }
+
+    /// Writes a SequenceReset-GapFill covering `at_seq..new_seq`, numbered with
+    /// `at_seq`, without spending a sender sequence number.
+    ///
+    /// A gap fill re-occupies the range it replaces, so it is written at
+    /// `at_seq` rather than through [`Reactor::send`], and is **not** filed:
+    /// filing it would overwrite a message under `at_seq` that is still
+    /// resendable.
+    ///
+    /// # Errors
+    /// Only a fatal transport failure ([`EngineError::WriteTimeout`] or a
+    /// transport error) is returned. A body the callback left unframeable is a
+    /// hole the peer will re-request and is dropped rather than closing the
+    /// session.
+    async fn send_gap_fill(
+        &mut self,
+        framed: &mut FixFramed,
+        at_seq: u64,
+        new_seq: u64,
+    ) -> Result<(), EngineError> {
+        let mut gap_fill = self.factory.sequence_reset_gap_fill(new_seq);
+        if !self.prepare(&mut gap_fill).await {
+            return Ok(());
+        }
+        match self.write_at(framed, at_seq, &gap_fill, false).await {
+            Ok(()) => {
+                lock_heartbeat(&self.runtime).on_message_sent();
+                Ok(())
+            }
+            Err(WriteFailure::Encode(err)) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    error = %err,
+                    "dropping SequenceReset-GapFill with no legal wire form"
+                );
+                Ok(())
+            }
+            Err(WriteFailure::Fatal(err)) => Err(err),
+        }
     }
 
     /// Handles a command from a [`Connection`] handle.
@@ -1092,68 +1608,35 @@ impl<A: Application> Reactor<A> {
                     );
                     return Ok(phase);
                 }
-                // Build the frame against the sequence number that *would* be
-                // allocated next, without consuming it. An application may hand
-                // us a message with no legal wire form — an ordinary field
-                // carrying SOH, an empty value, a DATA half without its LENGTH.
-                // Validating before allocation makes that a clean drop that
-                // leaves the session and the sequence counter intact, rather
-                // than a teardown over a spent number the counterparty would
-                // have to resend over. The reactor is the sole allocator of the
-                // sender counter and does not await between this peek and the
-                // commit below, so the number it commits is the one framed here.
-                let seq = self.runtime.sequences.next_sender_seq().value();
-                let frame = match self.factory.application_message(seq, &message) {
-                    Ok(frame) => frame,
-                    Err(err) => {
-                        // The message never reached the wire and no number was
-                        // spent. The value itself is not logged: it may carry a
-                        // credential (554/925) or RawData.
-                        tracing::warn!(
-                            session = %self.session_id,
-                            msg_type = %message.msg_type(),
-                            error = %err,
-                            "dropping outbound message: cannot encode"
-                        );
-                        return Ok(phase);
-                    }
-                };
-                // The frame encoded; commit the sequence number it carries.
-                if let Err(err) = self.runtime.sequences.try_allocate_sender_seq() {
-                    return Err(exhausted(phase, err));
-                }
-                if let Ok(mut owned) = wire::owned_from_frame(&frame) {
-                    self.application.to_app(&mut owned, &self.session_id).await;
-                }
-                // Filed before it is sent: this is the traffic a ResendRequest
-                // actually asks for, and a message on the wire that was never
-                // stored is one this session can be asked to replay and cannot.
-                self.persist(seq, message.msg_type(), &frame).await;
-                if let Err(err) = framed.send(frame).await {
+                if let Err(err) = self
+                    .send(framed, PendingMessage::application(message))
+                    .await
+                {
                     teardown(phase);
                     return Err(closed(format!("send failed: {err}"), false));
                 }
-                lock_heartbeat(&self.runtime).on_message_sent();
                 Ok(phase)
             }
             Command::Logout => match phase {
                 Phase::LogoutPending(_) => Ok(phase),
                 Phase::Active(session) => {
-                    let seq = match self.runtime.sequences.try_allocate_sender_seq() {
-                        Ok(seq) => seq.value(),
+                    let logout = self.factory.logout(None);
+                    match self.send(framed, logout).await {
                         Err(err) => {
                             let _ = session.disconnect();
-                            return Err(closed(err.to_string(), false));
+                            Err(closed(format!("send failed: {err}"), false))
                         }
-                    };
-                    let frame = self.factory.logout(seq, None);
-                    if let Err(err) = self.send_admin(framed, Some(seq), frame).await {
-                        let _ = session.disconnect();
-                        return Err(closed(format!("send failed: {err}"), false));
+                        // The Logout never reached the wire — a `to_admin`
+                        // callback left it unframeable. Staying Active is the
+                        // honest verdict: arming the logout deadline for a frame
+                        // the peer never saw would tear the session down over a
+                        // Logout it was never told about.
+                        Ok(Sent::Dropped) => Ok(Phase::Active(session)),
+                        // Typestate: Active -> LogoutPending. The new state
+                        // records when the Logout went out, which is what
+                        // on_tick times.
+                        Ok(Sent::Yes) => Ok(Phase::LogoutPending(session.initiate_logout())),
                     }
-                    // Typestate: Active -> LogoutPending. The new state records
-                    // when the Logout went out, which is what on_tick times.
-                    Ok(Phase::LogoutPending(session.initiate_logout()))
                 }
             },
         }
@@ -1193,23 +1676,21 @@ impl<A: Application> Reactor<A> {
         }
         if send_test_request {
             let test_req_id = generate_test_req_id();
-            let seq = match self.runtime.sequences.try_allocate_sender_seq() {
-                Ok(seq) => seq.value(),
-                Err(err) => return Err(exhausted(phase, err)),
-            };
-            let frame = self.factory.test_request(seq, &test_req_id);
-            if let Err(err) = self.send_admin(framed, Some(seq), frame).await {
-                teardown(phase);
-                return Err(closed(format!("send failed: {err}"), false));
+            let request = self.factory.test_request(&test_req_id);
+            match self.send(framed, request).await {
+                Err(err) => {
+                    teardown(phase);
+                    return Err(closed(format!("send failed: {err}"), false));
+                }
+                // Only a TestRequest that actually went out starts the timeout
+                // countdown. Arming it for a dropped probe would time the
+                // session out waiting for an answer to a frame never sent.
+                Ok(Sent::Yes) => lock_heartbeat(&self.runtime).on_test_request_sent(test_req_id),
+                Ok(Sent::Dropped) => {}
             }
-            lock_heartbeat(&self.runtime).on_test_request_sent(test_req_id);
         } else if send_heartbeat {
-            let seq = match self.runtime.sequences.try_allocate_sender_seq() {
-                Ok(seq) => seq.value(),
-                Err(err) => return Err(exhausted(phase, err)),
-            };
-            let frame = self.factory.heartbeat(seq, None);
-            if let Err(err) = self.send_admin(framed, Some(seq), frame).await {
+            let heartbeat = self.factory.heartbeat(None);
+            if let Err(err) = self.send(framed, heartbeat).await {
                 teardown(phase);
                 return Err(closed(format!("send failed: {err}"), false));
             }
@@ -1226,14 +1707,8 @@ impl<A: Application> Reactor<A> {
         ref_msg_type: &str,
         reason: &RejectReason,
     ) -> Result<Phase, SessionClosed> {
-        let out_seq = match self.runtime.sequences.try_allocate_sender_seq() {
-            Ok(seq) => seq.value(),
-            Err(err) => return Err(exhausted(phase, err)),
-        };
-        let frame = self
-            .factory
-            .session_reject(out_seq, ref_seq, ref_msg_type, reason);
-        if let Err(err) = self.send_admin(framed, Some(out_seq), frame).await {
+        let reject = self.factory.session_reject(ref_seq, ref_msg_type, reason);
+        if let Err(err) = self.send(framed, reject).await {
             teardown(phase);
             return Err(closed(format!("send failed: {err}"), false));
         }
@@ -1251,14 +1726,17 @@ impl<A: Application> Reactor<A> {
         if self.pending_resend == Some(expected) {
             return Ok(phase);
         }
-        let out_seq = match self.runtime.sequences.try_allocate_sender_seq() {
-            Ok(seq) => seq.value(),
-            Err(err) => return Err(exhausted(phase, err)),
-        };
-        let frame = self.factory.resend_request(out_seq, expected, 0);
-        if let Err(err) = self.send_admin(framed, Some(out_seq), frame).await {
-            teardown(phase);
-            return Err(closed(format!("send failed: {err}"), false));
+        let request = self.factory.resend_request(expected, 0);
+        match self.send(framed, request).await {
+            Err(err) => {
+                teardown(phase);
+                return Err(closed(format!("send failed: {err}"), false));
+            }
+            // The ResendRequest never went out; leaving the range unmarked lets
+            // the next frame on the same gap try again, instead of suppressing
+            // it as already-requested against a request the peer never received.
+            Ok(Sent::Dropped) => return Ok(phase),
+            Ok(Sent::Yes) => {}
         }
         self.pending_resend = Some(expected);
         Ok(phase)
@@ -1275,10 +1753,8 @@ impl<A: Application> Reactor<A> {
         received: u64,
     ) -> SessionClosed {
         let reason = format!("MsgSeqNum too low: expected {expected}, received {received}");
-        if let Ok(out_seq) = self.runtime.sequences.try_allocate_sender_seq() {
-            let frame = self.factory.logout(out_seq.value(), Some(&reason));
-            let _ = self.send_admin(framed, Some(out_seq.value()), frame).await;
-        }
+        let logout = self.factory.logout(Some(&reason));
+        let _ = self.send(framed, logout).await;
         teardown(phase);
         closed(reason, false)
     }
@@ -1301,16 +1777,10 @@ impl<A: Application> Reactor<A> {
         tracing::warn!(session = %self.session_id, detail = %detail, "inbound identity mismatch");
 
         let reason = RejectReason::new(9, detail.clone()).with_ref_tag(mismatch.tag);
-        if let Ok(out_seq) = self.runtime.sequences.try_allocate_sender_seq() {
-            let frame =
-                self.factory
-                    .session_reject(out_seq.value(), ref_seq, ref_msg_type, &reason);
-            let _ = self.send_admin(framed, Some(out_seq.value()), frame).await;
-        }
-        if let Ok(out_seq) = self.runtime.sequences.try_allocate_sender_seq() {
-            let frame = self.factory.logout(out_seq.value(), Some(&detail));
-            let _ = self.send_admin(framed, Some(out_seq.value()), frame).await;
-        }
+        let reject = self.factory.session_reject(ref_seq, ref_msg_type, &reason);
+        let _ = self.send(framed, reject).await;
+        let logout = self.factory.logout(Some(&detail));
+        let _ = self.send(framed, logout).await;
         teardown(phase);
         closed(detail, false)
     }
@@ -1583,12 +2053,11 @@ impl<A: Application> Reactor<A> {
         // Whatever the replay did not cover — a trailing run of admin messages,
         // holes, or the entire range when there is no store — is gap-filled, so
         // the counterparty's expectation always lands exactly on `new_seq`.
-        if cursor < new_seq {
-            let frame = self.factory.sequence_reset_gap_fill(cursor, new_seq);
-            if let Err(err) = self.send_admin(framed, None, frame).await {
-                teardown(phase);
-                return Err(closed(format!("send failed: {err}"), false));
-            }
+        if cursor < new_seq
+            && let Err(err) = self.send_gap_fill(framed, cursor, new_seq).await
+        {
+            teardown(phase);
+            return Err(closed(format!("send failed: {err}"), false));
         }
         Ok(phase)
     }
@@ -1614,12 +2083,15 @@ impl<A: Application> Reactor<A> {
     /// is then closed by the caller. Every other failure — an unreadable store,
     /// an unrebuildable frame — degrades to a gap fill.
     async fn replay_range(
-        &self,
+        &mut self,
         framed: &mut FixFramed,
         begin_seq: u64,
         new_seq: u64,
     ) -> Result<u64, EngineError> {
-        let Some(store) = &self.store else {
+        // Cloned so the loop does not hold a borrow of `self.store` across the
+        // `&mut self` replay/gap-fill calls below; an `Arc` clone is a
+        // reference-count bump.
+        let Some(store) = self.store.clone() else {
             return Ok(begin_seq);
         };
         // `new_seq` is the exclusive upper bound of the reply, so the last
@@ -1690,8 +2162,7 @@ impl<A: Application> Reactor<A> {
                 // Everything between the cursor and this message — holes, admin
                 // messages, frames that would not rebuild — is one fill.
                 if seq > reply_cursor {
-                    let fill = self.factory.sequence_reset_gap_fill(reply_cursor, seq);
-                    self.send_admin(framed, None, fill).await?;
+                    self.send_gap_fill(framed, reply_cursor, seq).await?;
                 }
                 self.send_replay(framed, frame).await?;
 
@@ -1731,6 +2202,9 @@ impl<A: Application> Reactor<A> {
         phase: Phase,
         frame: BytesMut,
     ) -> Result<Phase, SessionClosed> {
+        // Frozen once: handing an application message to the dispatcher is
+        // then a reference-count bump on this buffer, not a copy of it.
+        let frame = frame.freeze();
         let raw = match wire::decode_frame(&frame) {
             Ok(raw) => raw,
             Err(err) => {
@@ -1785,19 +2259,36 @@ impl<A: Application> Reactor<A> {
 
         match self.runtime.sequences.validate_incoming(seq) {
             SequenceResult::Ok => {
-                if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
-                    return Err(exhausted(phase, err));
+                if msg_type.is_admin() {
+                    // Consume the number before the admin handler runs: any
+                    // reply it sends is numbered against the advanced
+                    // expectation, and admin messages never queue.
+                    if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
+                        return Err(exhausted(phase, err));
+                    }
+                    self.pending_resend = None;
+                    self.dispatch_admin(framed, phase, &raw, seq).await
+                } else {
+                    // Hand the frame to the dispatcher *before* the inbound
+                    // expectation advances past it. A full queue is then a
+                    // session close with the sequence number unspent, never a
+                    // message dropped after its number was already consumed.
+                    let phase = self.enqueue_app(phase, seq, &frame)?;
+                    if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
+                        return Err(exhausted(phase, err));
+                    }
+                    self.pending_resend = None;
+                    Ok(phase)
                 }
-                self.pending_resend = None;
             }
             SequenceResult::TooLow { expected, received } => {
                 if raw.get_field_str(43) == Some("Y") {
                     // Duplicate delivery of an already-processed message.
                     return Ok(phase);
                 }
-                return Err(self
+                Err(self
                     .close_on_too_low(framed, phase, expected, received)
-                    .await);
+                    .await)
             }
             SequenceResult::Gap { expected, .. } => {
                 let phase = self.request_resend(framed, phase, expected).await?;
@@ -1807,32 +2298,54 @@ impl<A: Application> Reactor<A> {
                     // (without advancing the target sequence).
                     return Ok(phase);
                 }
-                return self.dispatch(framed, phase, &raw, &msg_type, seq).await;
+                self.dispatch_admin(framed, phase, &raw, seq).await
             }
         }
-
-        self.dispatch(framed, phase, &raw, &msg_type, seq).await
     }
 
-    /// Runs the application callback and the admin reply for a message whose
-    /// sequence number has already been validated.
-    async fn dispatch(
+    /// Hands one validated inbound application frame to the dispatcher task.
+    ///
+    /// The caller has not yet advanced the inbound expectation, so a full queue
+    /// closes the session with the sequence number intact — the counterparty
+    /// stays free to resend, rather than the message being silently lost past a
+    /// number already consumed.
+    fn enqueue_app(&self, phase: Phase, seq: u64, frame: &Bytes) -> Result<Phase, SessionClosed> {
+        let queued = AppFrame {
+            frame: frame.clone(),
+            seq,
+        };
+        match self.app_tx.try_send(queued) {
+            Ok(()) => Ok(phase),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                teardown(phase);
+                Err(closed(
+                    "application queue full: the application is not consuming inbound \
+                     messages fast enough",
+                    false,
+                ))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                teardown(phase);
+                Err(closed("application dispatcher stopped", false))
+            }
+        }
+    }
+
+    /// Runs `from_admin` and the admin reply for an administrative message whose
+    /// sequence number has already been validated (and, on the in-sequence
+    /// path, consumed).
+    ///
+    /// Application messages never reach here — they are handed to the dispatcher
+    /// task by [`Reactor::enqueue_app`], so a slow `from_app` cannot delay the
+    /// next socket read or the heartbeat clock.
+    async fn dispatch_admin(
         &mut self,
         framed: &mut FixFramed,
         phase: Phase,
         raw: &RawMessage<'_>,
-        msg_type: &MsgType,
         seq: u64,
     ) -> Result<Phase, SessionClosed> {
-        if !msg_type.is_admin() {
-            if let Err(reason) = self.application.from_app(raw, &self.session_id).await {
-                return self
-                    .send_session_reject(framed, phase, seq, msg_type.as_str(), &reason)
-                    .await;
-            }
-            return Ok(phase);
-        }
-
+        let msg_type = raw.msg_type();
         if let Err(reason) = self.application.from_admin(raw, &self.session_id).await {
             return self
                 .send_session_reject(framed, phase, seq, msg_type.as_str(), &reason)
@@ -1842,17 +2355,13 @@ impl<A: Application> Reactor<A> {
         match msg_type {
             MsgType::Heartbeat => Ok(phase),
             MsgType::TestRequest => {
-                let out_seq = match self.runtime.sequences.try_allocate_sender_seq() {
-                    Ok(out_seq) => out_seq.value(),
-                    Err(err) => return Err(exhausted(phase, err)),
-                };
                 // `112=` with no value is a malformed TestRequest. There is
                 // nothing to echo, and an empty field has no legal wire form,
                 // so the Heartbeat is sent without TestReqID rather than the
                 // session being torn down over the peer's mistake.
                 let test_req_id = raw.get_field_str(112).filter(|id| !id.is_empty());
-                let frame = self.factory.heartbeat(out_seq, test_req_id);
-                if let Err(err) = self.send_admin(framed, Some(out_seq), frame).await {
+                let heartbeat = self.factory.heartbeat(test_req_id);
+                if let Err(err) = self.send(framed, heartbeat).await {
                     teardown(phase);
                     return Err(closed(format!("send failed: {err}"), false));
                 }
@@ -1881,10 +2390,8 @@ impl<A: Application> Reactor<A> {
                     Err(closed("logout complete", true))
                 }
                 Phase::Active(session) => {
-                    if let Ok(out_seq) = self.runtime.sequences.try_allocate_sender_seq() {
-                        let frame = self.factory.logout(out_seq.value(), None);
-                        let _ = self.send_admin(framed, Some(out_seq.value()), frame).await;
-                    }
+                    let logout = self.factory.logout(None);
+                    let _ = self.send(framed, logout).await;
                     let _ = session.disconnect();
                     let text = raw
                         .get_field_str(58)
