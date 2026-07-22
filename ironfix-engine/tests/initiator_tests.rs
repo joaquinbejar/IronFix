@@ -2855,6 +2855,44 @@ async fn test_logon_ack_wrong_begin_string_fails_handshake() {
     ok(acceptor.await, "acceptor task");
 }
 
+/// A Logon ack whose MsgSeqNum (34) sits only after the body, not in the
+/// standard header, fails the handshake: the initiator reads 34 positionally,
+/// the same contract the Acceptor handshake and the in-session reactor use.
+#[tokio::test]
+async fn test_logon_ack_body_only_msg_seq_num_fails_handshake() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let _logon = next_frame(&mut framed).await;
+
+        // 98 (EncryptMethod) is a body field, so the standard-header run ends at
+        // it; the 34 placed after it is not the header MsgSeqNum. Built by hand
+        // to place 34 after that body field.
+        let ts = Timestamp::now().format_millis();
+        let body = format!(
+            "35=A\x0149=VENUE\x0156=CLIENT\x0152={}\x0198=0\x01108=30\x0134=1\x01",
+            ts.as_str()
+        );
+        ok(
+            framed.send(raw_frame(body.as_bytes())).await,
+            "send logon ack with a body-only MsgSeqNum",
+        );
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+
+    match initiator.connect(addr).await {
+        Err(EngineError::Sequence(detail)) => {
+            assert!(detail.contains("MsgSeqNum"), "got {detail}");
+        }
+        other => panic!("expected a Sequence error, got {other:?}"),
+    }
+
+    ok(acceptor.await, "acceptor task");
+}
+
 /// A zero initial sequence seed is refused before the socket is dialled: a
 /// seeded MsgSeqNum (34) of 0 would be rejected by every conforming
 /// counterparty, since FIX numbers messages from 1.

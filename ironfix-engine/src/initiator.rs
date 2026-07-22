@@ -640,7 +640,17 @@ impl<A: Application + 'static> Initiator<A> {
                 }
             }
 
-            let ack_seq: u64 = raw.get_field_as(34)?;
+            // Positional: MsgSeqNum (34) must be in the standard header, the
+            // same contract the CompID check enforces on 49/56 and the acceptor
+            // handshake already applies. A 34 that appears only after the body
+            // is treated as a missing header field rather than accepted as the
+            // ack sequence number.
+            let Some(ack_seq) = wire::header_seq_num(&raw) else {
+                let _ = session.on_logon_reject();
+                return Err(EngineError::Sequence(
+                    "Logon ack has no valid MsgSeqNum (34) in the standard header".to_string(),
+                ));
+            };
 
             // Identity before anything else: a cross-wired acceptor must not
             // be allowed to establish a session or move sequence state.

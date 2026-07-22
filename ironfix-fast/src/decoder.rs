@@ -292,6 +292,55 @@ impl FastDecoder {
         }
     }
 
+    /// Decodes a stop-bit signed integer into an `i128`.
+    ///
+    /// Identical to [`FastDecoder::decode_int`] but accumulates in `i128`, so it
+    /// can hold the biased `2^63` a nullable signed uses to denote `i64::MAX`.
+    /// The same [`MAX_INT_ENCODED_LEN`] ceiling bounds the read, so a hostile
+    /// over-long encoding is [`FastError::IntegerOverflow`] rather than an
+    /// unbounded loop.
+    ///
+    /// # Errors
+    /// [`FastError::UnexpectedEof`] if the input ends mid-value, or
+    /// [`FastError::IntegerOverflow`] if the encoding exceeds
+    /// [`MAX_INT_ENCODED_LEN`] bytes.
+    fn decode_int_i128(data: &[u8], offset: &mut usize) -> Result<i128, FastError> {
+        /// Value of one payload byte position.
+        const RADIX: i128 = 1 << PAYLOAD_BITS;
+
+        let first_byte = *data.get(*offset).ok_or(FastError::UnexpectedEof)?;
+        let negative = (first_byte & SIGN_BIT) != 0;
+
+        // Sign extension: a negative value starts from all-ones so the
+        // accumulated two's complement stays negative.
+        let mut result: i128 = if negative { -1 } else { 0 };
+        let mut consumed: usize = 0;
+
+        loop {
+            if consumed == MAX_INT_ENCODED_LEN {
+                return Err(FastError::IntegerOverflow);
+            }
+            let byte = read_byte(data, offset)?;
+            // Checked even though the ceiling above already bounds it, per the
+            // decoder checked-arithmetic rule.
+            consumed = consumed.checked_add(1).ok_or(FastError::IntegerOverflow)?;
+
+            // `checked_mul` rejects any value that would lose significant bits.
+            // The product is a multiple of `RADIX`, so its low seven bits are
+            // zero and the `|` below is exact.
+            result = result
+                .checked_mul(RADIX)
+                .ok_or(FastError::IntegerOverflow)?
+                | i128::from(byte & PAYLOAD_MASK);
+
+            if byte & STOP_BIT != 0 {
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Decodes a nullable signed integer.
     ///
     /// FAST biases only the non-negative half of the range: zero is NULL, a
@@ -301,7 +350,9 @@ impl FastDecoder {
     /// and the bias lives here rather than in every caller for the same reason
     /// it does for the unsigned form.
     ///
-    /// The representable domain is `i64::MIN..=i64::MAX - 1`.
+    /// The representable domain is the full `i64::MIN..=i64::MAX`: `i64::MAX`
+    /// biases to `2^63`, which does not fit `i64`, so the biased value is
+    /// decoded through `i128` and only the debiased result is narrowed back.
     ///
     /// # Arguments
     /// * `data` - The input bytes
@@ -313,20 +364,28 @@ impl FastDecoder {
     /// # Errors
     /// Returns [`FastError::UnexpectedEof`] if the input ends mid-value, or
     /// [`FastError::IntegerOverflow`] if the encoding is over-long or denotes a
-    /// value outside `i64`.
+    /// value outside `i64` — never a panic and never an unbounded read.
     pub fn decode_nullable_int(data: &[u8], offset: &mut usize) -> Result<Option<i64>, FastError> {
-        let raw = Self::decode_int(data, offset)?;
+        let raw = Self::decode_int_i128(data, offset)?;
 
         if raw == 0 {
             return Ok(None);
         }
 
         if raw < 0 {
-            // Negative values carry no bias.
-            return Ok(Some(raw));
+            // Negative values carry no bias; an over-long encoding could still
+            // land below i64::MIN, which the narrowing rejects.
+            return i64::try_from(raw)
+                .map(Some)
+                .map_err(|_| FastError::IntegerOverflow);
         }
 
+        // Positive values are biased by one; `2^63` debiases to i64::MAX, and
+        // anything larger overflows i64. `checked_sub` keeps the decode path
+        // free of bare arithmetic, matching the unsigned sibling, though the
+        // `raw > 0` branch already guarantees no underflow.
         raw.checked_sub(1)
+            .and_then(|value| i64::try_from(value).ok())
             .map(Some)
             .ok_or(FastError::IntegerOverflow)
     }
@@ -1141,6 +1200,9 @@ mod tests {
             Some(-65),
             Some(i64::MIN),
             Some(i64::MAX - 1),
+            // i64::MAX biases to 2^63, carried through i128: the domain now
+            // covers the full signed range, not i64::MIN..=i64::MAX-1.
+            Some(i64::MAX),
         ] {
             let mut encoder = FastEncoder::new();
             assert_eq!(encoder.encode_nullable_int(value), Ok(()));
@@ -1177,15 +1239,79 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_nullable_int_rejects_the_value_outside_its_domain() {
+    fn test_encode_nullable_int_max_is_representable() {
+        // i64::MAX biases to 2^63, which does not fit i64; it now encodes
+        // through i128 in ten stop-bit bytes instead of being rejected as
+        // IntegerOverflow. The round-trip is pinned in the round-trip test.
         let mut encoder = FastEncoder::new();
+        assert_eq!(encoder.encode_nullable_int(Some(i64::MAX)), Ok(()));
+        assert_eq!(encoder.len(), MAX_INT_ENCODED_LEN);
+    }
+
+    #[test]
+    fn test_decode_nullable_int_boundary_from_external_fixtures() {
+        // Hand-built stop-bit fixtures, independent of the encoder, that pin the
+        // i128 narrowing branch directly.
+        //
+        // Biased 2^63 (10 stop-bit bytes, MSB first, stop bit on the last):
+        // decodes to 2^63, debiases to i64::MAX. This is the accepted boundary.
+        let biased_two_pow_63 = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80];
+        let mut offset = 0;
         assert_eq!(
-            encoder.encode_nullable_int(Some(i64::MAX)),
+            FastDecoder::decode_nullable_int(&biased_two_pow_63, &mut offset),
+            Ok(Some(i64::MAX))
+        );
+        assert_eq!(offset, biased_two_pow_63.len());
+
+        // Biased 2^63 + 1: a valid, fully-stopped ten-byte encoding whose
+        // debiased value is 2^63, one past i64::MAX. This exercises the
+        // `i64::try_from` narrowing failure, not the byte-count ceiling.
+        let biased_two_pow_63_plus_one =
+            [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81];
+        let mut offset = 0;
+        assert_eq!(
+            FastDecoder::decode_nullable_int(&biased_two_pow_63_plus_one, &mut offset),
             Err(FastError::IntegerOverflow)
         );
-        assert!(
-            encoder.is_empty(),
-            "an overflowing value must not be biased into the NULL representation"
+    }
+
+    #[test]
+    fn test_decode_nullable_int_over_long_encoding_is_bounded_overflow() {
+        // A ten-byte run with no stop bit exhausts the ceiling on the next read:
+        // a bounded IntegerOverflow, never an unbounded loop or a panic.
+        let hostile = [0x00u8; MAX_INT_ENCODED_LEN];
+        let mut offset = 0;
+        assert_eq!(
+            FastDecoder::decode_nullable_int(&hostile, &mut offset),
+            Err(FastError::IntegerOverflow)
+        );
+    }
+
+    #[test]
+    fn test_decode_nullable_int_negative_below_i64_min_is_overflow() {
+        // The negative narrowing branch (raw < 0) has its own exit: a fully
+        // stopped ten-byte negative value whose magnitude is far below i64::MIN.
+        // The first byte's sign bit is set, so decode seeds -1 and accumulates a
+        // ~70-bit negative that i64::try_from rejects — distinct from the
+        // positive-overflow fixture and the byte-count ceiling.
+        let below_min = [0x7e, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0xff];
+        let mut offset = 0;
+        assert_eq!(
+            FastDecoder::decode_nullable_int(&below_min, &mut offset),
+            Err(FastError::IntegerOverflow)
+        );
+    }
+
+    #[test]
+    fn test_decode_nullable_int_truncated_input_is_unexpected_eof() {
+        // Truncated input through the new i128 path: a first byte with no stop
+        // bit and nothing after it ends mid-value. This exercises
+        // decode_nullable_int itself, not the old decode_int helper.
+        let truncated = [0x01u8];
+        let mut offset = 0;
+        assert_eq!(
+            FastDecoder::decode_nullable_int(&truncated, &mut offset),
+            Err(FastError::UnexpectedEof)
         );
     }
 
