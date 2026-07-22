@@ -536,22 +536,36 @@ impl Resolver<'_> {
     }
 }
 
-/// Traversal state of a component during cycle detection.
+/// Traversal state of a component during graph validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisitState {
     /// On the current depth-first path: reaching it again is a cycle.
     InProgress,
-    /// Fully expanded already, and acyclic.
-    Done,
+    /// Fully expanded and acyclic, carrying the height of its subtree — the
+    /// number of nested group/component levels reachable below it, counting
+    /// the component itself. Memoising the measured height rather than a bare
+    /// "done" flag makes the depth ceiling independent of declaration order:
+    /// a leaf-first chain is measured exactly like a root-first one.
+    Done(usize),
 }
 
-/// Rejects reference cycles and dangling references in the component graph.
+/// Rejects reference cycles, dangling references, and over-deep nesting in the
+/// component graph.
 ///
-/// Runs before any resolution, so the rest of the loader (and every consumer
-/// of the resulting [`Dictionary`]) can walk component references knowing the
-/// graph is a DAG of bounded depth. Components are visited in document order
-/// (`order`) and memoised, which keeps the walk linear in the number of
-/// references.
+/// Runs before any resolution, so the rest of the loader — and every consumer
+/// of the resulting [`Dictionary`], including codegen, whose descent has no
+/// ceiling of its own — can walk component references knowing the graph is a
+/// DAG whose depth is bounded by [`MAX_COMPONENT_DEPTH`]. Every component is
+/// entered at depth zero and its measured height is memoised, so the walk is
+/// linear in the number of references and the ceiling is enforced no matter
+/// what order the components are declared in.
+///
+/// # Errors
+///
+/// Returns [`DictionaryError::ComponentCycle`] for a reference cycle,
+/// [`DictionaryError::UnknownComponent`] for a dangling reference, and
+/// [`DictionaryError::NestingTooDeep`] when a component chain is longer than
+/// [`MAX_COMPONENT_DEPTH`].
 fn check_component_graph(
     components: &HashMap<String, Vec<Item>>,
     order: &[String],
@@ -563,15 +577,29 @@ fn check_component_graph(
     Ok(())
 }
 
-/// Depth-first visit of one component definition.
+/// Depth-first visit of one component definition, returning the height of its
+/// subtree: the deepest chain of nested groups and components below it,
+/// counting the component itself.
+///
+/// `depth` bounds the recursion so a long root-first chain from hostile XML is
+/// rejected before it can exhaust the stack. The returned height is memoised
+/// and range-checked, so a leaf-first chain — whose descent stays shallow
+/// because each child is already resolved — is rejected just the same.
+///
+/// # Errors
+///
+/// Returns [`DictionaryError::ComponentCycle`] on re-entry of an in-progress
+/// component, [`DictionaryError::UnknownComponent`] for a dangling reference,
+/// and [`DictionaryError::NestingTooDeep`] once the subtree height exceeds
+/// [`MAX_COMPONENT_DEPTH`].
 fn visit_component(
     name: &str,
     components: &HashMap<String, Vec<Item>>,
     state: &mut HashMap<String, VisitState>,
     depth: usize,
-) -> Result<(), DictionaryError> {
+) -> Result<usize, DictionaryError> {
     match state.get(name) {
-        Some(VisitState::Done) => return Ok(()),
+        Some(VisitState::Done(height)) => return Ok(*height),
         Some(VisitState::InProgress) => {
             return Err(DictionaryError::ComponentCycle(name.to_string()));
         }
@@ -581,32 +609,52 @@ fn visit_component(
         return Err(DictionaryError::UnknownComponent(name.to_string()));
     };
     state.insert(name.to_string(), VisitState::InProgress);
-    visit_items(items, components, state, depth + 1)?;
-    state.insert(name.to_string(), VisitState::Done);
-    Ok(())
+    let height = 1 + visit_items(items, components, state, depth + 1)?;
+    if height > MAX_COMPONENT_DEPTH {
+        return Err(DictionaryError::NestingTooDeep {
+            element: "component".to_string(),
+            limit: MAX_COMPONENT_DEPTH,
+        });
+    }
+    state.insert(name.to_string(), VisitState::Done(height));
+    Ok(height)
 }
 
-/// Depth-first visit of a member list, descending into groups and components.
+/// Depth-first visit of a member list, returning the height of its deepest
+/// nested group or component (zero when it holds only fields).
+///
+/// `depth` is checked on entry so recursion through nested groups or a
+/// root-first component chain cannot exhaust the stack.
+///
+/// # Errors
+///
+/// Propagates any error from [`visit_component`], and returns
+/// [`DictionaryError::NestingTooDeep`] if the recursion itself reaches past
+/// [`MAX_COMPONENT_DEPTH`].
 fn visit_items(
     items: &[Item],
     components: &HashMap<String, Vec<Item>>,
     state: &mut HashMap<String, VisitState>,
     depth: usize,
-) -> Result<(), DictionaryError> {
+) -> Result<usize, DictionaryError> {
     if depth > MAX_COMPONENT_DEPTH {
         return Err(DictionaryError::NestingTooDeep {
             element: "component".to_string(),
             limit: MAX_COMPONENT_DEPTH,
         });
     }
+    let mut height = 0;
     for item in items {
-        match item {
-            Item::Field { .. } => {}
-            Item::Group { items, .. } => visit_items(items, components, state, depth + 1)?,
+        let reach = match item {
+            Item::Field { .. } => 0,
+            Item::Group { items, .. } => 1 + visit_items(items, components, state, depth + 1)?,
             Item::Component { name, .. } => visit_component(name, components, state, depth)?,
+        };
+        if reach > height {
+            height = reach;
         }
     }
-    Ok(())
+    Ok(height)
 }
 
 fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
@@ -1189,6 +1237,66 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_long_component_chain_leaf_first_is_rejected() {
+        // The same over-long acyclic chain as the forward-order test, but with
+        // the leaf declared first and every parent after its child. Memoising
+        // a bare "done" flag would let this load at any length, because each
+        // parent finds its child already resolved at depth 1 and never
+        // descends — memoising the measured height rejects it regardless of
+        // declaration order.
+        let mut xml = String::from(
+            "<fix type='FIX' major='4' minor='4'><header></header><trailer></trailer>\
+             <messages></messages><components>",
+        );
+        let links = MAX_COMPONENT_DEPTH + 10;
+        xml.push_str(&format!(
+            "<component name='C{links}'><field name='TestReqID' required='N'/></component>"
+        ));
+        for index in (0..links).rev() {
+            xml.push_str(&format!("<component name='C{index}'>"));
+            xml.push_str(&format!("<component name='C{}' required='N'/>", index + 1));
+            xml.push_str("</component>");
+        }
+        xml.push_str(
+            "</components><fields><field number='112' name='TestReqID' type='STRING'/></fields></fix>",
+        );
+
+        assert!(matches!(
+            load_err(&xml),
+            DictionaryError::NestingTooDeep {
+                limit: MAX_COMPONENT_DEPTH,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_component_chain_at_ceiling_leaf_first_loads() {
+        // A leaf-first chain exactly at the ceiling must still load: the fix
+        // must not reject valid depth, only over-deep nesting.
+        let mut xml = String::from(
+            "<fix type='FIX' major='4' minor='4'><header></header><trailer></trailer>\
+             <messages></messages><components>",
+        );
+        // `links` components chained plus the leaf, giving a subtree height of
+        // exactly MAX_COMPONENT_DEPTH.
+        let links = MAX_COMPONENT_DEPTH - 1;
+        xml.push_str(&format!(
+            "<component name='C{links}'><field name='TestReqID' required='N'/></component>"
+        ));
+        for index in (0..links).rev() {
+            xml.push_str(&format!("<component name='C{index}'>"));
+            xml.push_str(&format!("<component name='C{}' required='N'/>", index + 1));
+            xml.push_str("</component>");
+        }
+        xml.push_str(
+            "</components><fields><field number='112' name='TestReqID' type='STRING'/></fields></fix>",
+        );
+
+        assert!(load(&xml).is_ok());
     }
 
     #[test]

@@ -348,14 +348,18 @@ fn is_month_year(value: &str) -> bool {
     }
 }
 
-/// Returns true for `HH:MM:SS` with an optional `.sss` fraction.
+/// Returns true for `HH:MM:SS` with an optional fractional second.
+///
+/// The fraction may carry 1 to 12 digits, spanning millisecond through
+/// picosecond precision — FIX 5.0 SP2 / FIXT.1.1 permit up to 12 fractional
+/// digits, so capping shorter would let the dictionary overrule the spec.
 fn is_time_of_day(value: &str) -> bool {
     let (clock, fraction) = match value.split_once('.') {
         Some((clock, fraction)) => (clock, Some(fraction)),
         None => (value, None),
     };
     if let Some(fraction) = fraction
-        && !(matches!(fraction.len(), 1..=9) && fraction.bytes().all(|b| b.is_ascii_digit()))
+        && !(matches!(fraction.len(), 1..=12) && fraction.bytes().all(|b| b.is_ascii_digit()))
     {
         return false;
     }
@@ -729,6 +733,20 @@ mod tests {
         assert!(FieldType::MonthYear.is_valid_value("20260712"));
         assert!(FieldType::MonthYear.is_valid_value("202607w3"));
         assert!(!FieldType::MonthYear.is_valid_value("202607w9"));
+    }
+
+    #[test]
+    fn test_field_type_is_valid_value_fractional_second_precision() {
+        // FIX 5.0 SP2 / FIXT.1.1 admit up to 12 fractional digits: milli (3),
+        // micro (6), nano (9), and picosecond (12) precision are all legal.
+        assert!(FieldType::UtcTimestamp.is_valid_value("20260712-10:00:00.123"));
+        assert!(FieldType::UtcTimestamp.is_valid_value("20260712-10:00:00.123456789"));
+        assert!(FieldType::UtcTimestamp.is_valid_value("20260712-10:00:00.123456789012"));
+        assert!(FieldType::UtcTimeOnly.is_valid_value("10:00:00.123456789012"));
+        // 13 digits exceeds picosecond precision and stays rejected.
+        assert!(!FieldType::UtcTimestamp.is_valid_value("20260712-10:00:00.1234567890123"));
+        // A fraction marker with no digits is still malformed.
+        assert!(!FieldType::UtcTimestamp.is_valid_value("20260712-10:00:00."));
     }
 
     #[test]
