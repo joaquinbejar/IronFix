@@ -379,10 +379,13 @@ impl FastDecoder {
         }
 
         // Positive values are biased by one; `2^63` debiases to i64::MAX, and
-        // anything larger overflows i64.
-        i64::try_from(raw - 1)
+        // anything larger overflows i64. `checked_sub` keeps the decode path
+        // free of bare arithmetic, matching the unsigned sibling, though the
+        // `raw > 0` branch already guarantees no underflow.
+        raw.checked_sub(1)
+            .and_then(|value| i64::try_from(value).ok())
             .map(Some)
-            .map_err(|_| FastError::IntegerOverflow)
+            .ok_or(FastError::IntegerOverflow)
     }
 
     /// Decodes a nullable ASCII string.

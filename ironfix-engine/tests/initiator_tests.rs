@@ -2868,7 +2868,7 @@ async fn test_logon_ack_body_only_msg_seq_num_fails_handshake() {
 
         // 98 (EncryptMethod) is a body field, so the standard-header run ends at
         // it; the 34 placed after it is not the header MsgSeqNum. Built by hand
-        // because the encoder refuses a non-standard header field order.
+        // to place 34 after that body field.
         let ts = Timestamp::now().format_millis();
         let body = format!(
             "35=A\x0149=VENUE\x0156=CLIENT\x0152={}\x0198=0\x01108=30\x0134=1\x01",
