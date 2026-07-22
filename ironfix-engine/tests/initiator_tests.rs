@@ -2348,6 +2348,59 @@ async fn test_logon_ack_wrong_begin_string_fails_handshake() {
     ok(acceptor.await, "acceptor task");
 }
 
+/// A zero initial sequence seed is refused before the socket is dialled: a
+/// seeded MsgSeqNum (34) of 0 would be rejected by every conforming
+/// counterparty, since FIX numbers messages from 1.
+#[tokio::test]
+async fn test_connect_with_zero_initial_sender_seq_is_rejected() {
+    let (listener, addr) = bind_listener().await;
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_initial_sequences(0, 9);
+
+    match initiator.connect(addr).await {
+        Err(EngineError::InvalidInitialSequence { counter }) => {
+            assert_eq!(counter, SequenceCounter::Sender);
+        }
+        Err(other) => panic!("expected an invalid-sequence error, got {other:?}"),
+        Ok(_) => panic!("a zero MsgSeqNum seed must not establish a session"),
+    }
+
+    assert!(
+        timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err(),
+        "the socket must never be dialled"
+    );
+}
+
+/// The target side of the zero-seed guard: a zero incoming seed is refused the
+/// same way, before the socket is dialled.
+#[tokio::test]
+async fn test_connect_with_zero_initial_target_seq_is_rejected() {
+    let (listener, addr) = bind_listener().await;
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_initial_sequences(7, 0);
+
+    match initiator.connect(addr).await {
+        Err(EngineError::InvalidInitialSequence { counter }) => {
+            assert_eq!(counter, SequenceCounter::Target);
+        }
+        Err(other) => panic!("expected an invalid-sequence error, got {other:?}"),
+        Ok(_) => panic!("a zero MsgSeqNum seed must not establish a session"),
+    }
+
+    assert!(
+        timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_err(),
+        "the socket must never be dialled"
+    );
+}
+
 /// A configuration knob that would corrupt the session's own messages is
 /// refused before the socket is dialled: an identity string carrying SOH would
 /// terminate tag 50 early in every outbound header.

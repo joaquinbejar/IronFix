@@ -215,6 +215,8 @@ pub(crate) struct MessageFactory {
     target_comp_id: String,
     sender_sub_id: Option<String>,
     target_sub_id: Option<String>,
+    sender_location_id: Option<String>,
+    target_location_id: Option<String>,
 }
 
 impl MessageFactory {
@@ -227,11 +229,18 @@ impl MessageFactory {
             target_comp_id: config.target_comp_id.as_str().to_string(),
             sender_sub_id: config.sender_sub_id.clone(),
             target_sub_id: config.target_sub_id.clone(),
+            sender_location_id: config.sender_location_id.clone(),
+            target_location_id: config.target_location_id.clone(),
         }
     }
 
     /// Starts an encoder with the standard header:
-    /// 35, [1128], 49, 56, [50], [57], 34, [43], 52, [122].
+    /// 35, [1128], 49, 56, [50], [142], [57], [143], 34, [43], 52, [122].
+    ///
+    /// `SenderLocationID` (142) follows `SenderSubID` (50) and
+    /// `TargetLocationID` (143) follows `TargetSubID` (57), the standard-header
+    /// pairing of the routing fields. Both are stamped only when configured;
+    /// an unset LocationID places nothing on the wire.
     ///
     /// `poss_dup` stamps both `PossDupFlag` (43) and `OrigSendingTime` (122):
     /// FIX requires 122 on every message carrying 43=Y, and
@@ -263,8 +272,14 @@ impl MessageFactory {
         if let Some(sub) = &self.sender_sub_id {
             encoder.put_str(50, sub);
         }
+        if let Some(location) = &self.sender_location_id {
+            encoder.put_str(142, location);
+        }
         if let Some(sub) = &self.target_sub_id {
             encoder.put_str(57, sub);
+        }
+        if let Some(location) = &self.target_location_id {
+            encoder.put_str(143, location);
         }
         encoder.put_uint(34, seq);
         if poss_dup {
@@ -521,6 +536,34 @@ mod tests {
         assert_eq!(raw.get_field_str(11), Some("ORDER-1"));
         assert_eq!(raw.get_field(95).map(|f| f.value), Some(b"5".as_slice()));
         assert_eq!(raw.get_field(96).map(|f| f.value), Some(payload));
+    }
+
+    #[test]
+    fn test_header_stamps_configured_location_ids() {
+        let mut config = config_for("FIX.4.4");
+        config.sender_location_id = Some("LON".to_string());
+        config.target_location_id = Some("NYC".to_string());
+        let version = match wire_version(&config.begin_string) {
+            Ok(version) => version,
+            Err(err) => panic!("test fixture uses an unsupported version: {err}"),
+        };
+        let factory = MessageFactory::new(&config, version);
+
+        let frame = framed(factory.logon(1, 30, false));
+        let raw = decode(&frame);
+        // SenderLocationID (142) and TargetLocationID (143) are routing fields
+        // of the standard header, so a configured value is stamped onto every
+        // outbound message.
+        assert_eq!(raw.get_field_str(142), Some("LON"));
+        assert_eq!(raw.get_field_str(143), Some("NYC"));
+    }
+
+    #[test]
+    fn test_header_omits_unset_location_ids() {
+        let frame = framed(factory().logon(1, 30, false));
+        let raw = decode(&frame);
+        assert_eq!(raw.get_field_str(142), None);
+        assert_eq!(raw.get_field_str(143), None);
     }
 
     #[test]

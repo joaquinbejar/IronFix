@@ -310,8 +310,6 @@ pub struct SessionConfig {
     pub logout_timeout: Duration,
     /// Whether to validate the `CheckSum` (10) of inbound messages.
     pub validate_checksum: bool,
-    /// Whether to validate the `BodyLength` (9) of inbound messages.
-    pub validate_length: bool,
     /// Optional sender sub ID (tag 50), 1..=[`MAX_ID_LEN`] bytes when set.
     pub sender_sub_id: Option<String>,
     /// Optional target sub ID (tag 57), 1..=[`MAX_ID_LEN`] bytes when set.
@@ -354,7 +352,6 @@ impl SessionConfig {
             logon_timeout: DEFAULT_TIMEOUT,
             logout_timeout: DEFAULT_TIMEOUT,
             validate_checksum: true,
-            validate_length: true,
             sender_sub_id: None,
             target_sub_id: None,
             sender_location_id: None,
@@ -538,8 +535,6 @@ pub struct SessionConfigBuilder {
     logout_timeout: Duration,
     /// Validate inbound `CheckSum` (10).
     validate_checksum: bool,
-    /// Validate inbound `BodyLength` (9).
-    validate_length: bool,
     /// Sender sub ID (tag 50).
     sender_sub_id: Option<String>,
     /// Target sub ID (tag 57).
@@ -564,7 +559,6 @@ impl Default for SessionConfigBuilder {
             logon_timeout: DEFAULT_TIMEOUT,
             logout_timeout: DEFAULT_TIMEOUT,
             validate_checksum: true,
-            validate_length: true,
             sender_sub_id: None,
             target_sub_id: None,
             sender_location_id: None,
@@ -684,13 +678,6 @@ impl SessionConfigBuilder {
         self
     }
 
-    /// Sets whether inbound `BodyLength` (9) is validated.
-    #[must_use = "builders do nothing unless .build() is called"]
-    pub const fn validate_length(mut self, validate: bool) -> Self {
-        self.validate_length = validate;
-        self
-    }
-
     /// Sets the sender sub ID (tag 50).
     ///
     /// 1..=[`MAX_ID_LEN`] bytes of printable ASCII except `=`.
@@ -768,7 +755,6 @@ impl SessionConfigBuilder {
             logon_timeout: self.logon_timeout,
             logout_timeout: self.logout_timeout,
             validate_checksum: self.validate_checksum,
-            validate_length: self.validate_length,
             sender_sub_id: self.sender_sub_id,
             target_sub_id: self.target_sub_id,
             sender_location_id: self.sender_location_id,
@@ -831,7 +817,6 @@ mod tests {
         assert_eq!(config.logout_timeout, Duration::from_secs(10));
         assert_eq!(config.max_message_size, 1024 * 1024);
         assert!(config.validate_checksum);
-        assert!(config.validate_length);
         assert!(!config.reset_on_logon);
         assert_eq!(config.validate(), Ok(()));
     }
@@ -847,7 +832,6 @@ mod tests {
         assert_eq!(built_config.logout_timeout, direct.logout_timeout);
         assert_eq!(built_config.max_message_size, direct.max_message_size);
         assert_eq!(built_config.validate_checksum, direct.validate_checksum);
-        assert_eq!(built_config.validate_length, direct.validate_length);
     }
 
     // --- Required fields -----------------------------------------------------
@@ -889,7 +873,6 @@ mod tests {
                 .logon_timeout(Duration::from_secs(5))
                 .logout_timeout(Duration::from_secs(7))
                 .validate_checksum(false)
-                .validate_length(false)
                 .sender_sub_id("SDESK")
                 .target_sub_id("TDESK")
                 .sender_location_id("LON")
@@ -907,7 +890,6 @@ mod tests {
         assert_eq!(config.logon_timeout, Duration::from_secs(5));
         assert_eq!(config.logout_timeout, Duration::from_secs(7));
         assert!(!config.validate_checksum);
-        assert!(!config.validate_length);
         assert_eq!(config.sender_sub_id.as_deref(), Some("SDESK"));
         assert_eq!(config.target_sub_id.as_deref(), Some("TDESK"));
         assert_eq!(config.sender_location_id.as_deref(), Some("LON"));

@@ -94,12 +94,13 @@ use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::version::FixVersion;
 use ironfix_session::config::SessionConfigError;
 use ironfix_session::heartbeat::{generate_test_req_id, negotiate_interval};
-use ironfix_session::sequence::{SequenceExhausted, SequenceResult};
+use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
 use ironfix_session::{
     Active, Disconnected, HeartbeatManager, LogoutPending, SequenceManager, Session, SessionConfig,
     TestRequestOutcome,
 };
 use ironfix_transport::FixCodec;
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -194,9 +195,15 @@ impl<A: Application + 'static> Initiator<A> {
     /// a previous session (e.g. after a reconnect supervised by the
     /// consumer). Ignored when `reset_on_logon` is set.
     ///
+    /// Both values must be at least 1: FIX numbers messages from 1, and a
+    /// seeded `MsgSeqNum` (34) of 0 would be rejected by every conforming
+    /// counterparty. A zero seed that would actually be used is refused by
+    /// [`Initiator::connect`] with [`EngineError::InvalidInitialSequence`],
+    /// before the socket is dialled.
+    ///
     /// # Arguments
-    /// * `sender_seq` - Next outgoing sequence number
-    /// * `target_seq` - Next expected incoming sequence number
+    /// * `sender_seq` - Next outgoing sequence number, `>= 1`
+    /// * `target_seq` - Next expected incoming sequence number, `>= 1`
     #[must_use]
     pub fn with_initial_sequences(mut self, sender_seq: u64, target_seq: u64) -> Self {
         self.initial_sequences = Some((sender_seq, target_seq));
@@ -241,8 +248,10 @@ impl<A: Application + 'static> Initiator<A> {
     /// sequence counter has reached `u64::MAX` and the session must be reset
     /// before it can number another message. A `BeginString` this engine
     /// cannot frame conformantly is refused up front with
-    /// [`EngineError::UnsupportedVersion`], and an unusable configuration with
-    /// [`EngineError::Config`], both before the socket is dialled.
+    /// [`EngineError::UnsupportedVersion`], an unusable configuration with
+    /// [`EngineError::Config`], and a zero initial sequence seed with
+    /// [`EngineError::InvalidInitialSequence`], all before the socket is
+    /// dialled.
     pub async fn connect(&self, addr: impl ToSocketAddrs) -> Result<Connection, EngineError> {
         // Refuse before dialling: a knob outside its documented range corrupts
         // the session's own messages — an identity string carrying SOH breaks
@@ -263,6 +272,25 @@ impl<A: Application + 'static> Initiator<A> {
                     detail: err.detail.clone(),
                 });
             }
+        };
+
+        // Refuse before dialling: a seeded sequence number of zero would put
+        // MsgSeqNum (34) = 0 on the wire, which every conforming counterparty
+        // rejects. The seed is ignored entirely when reset_on_logon is set, so
+        // a zero is only refused when it would actually be used.
+        let initial_sequences = match self.initial_sequences {
+            Some((sender, target)) if !self.config.reset_on_logon => {
+                let sender =
+                    NonZeroU64::new(sender).ok_or(EngineError::InvalidInitialSequence {
+                        counter: SequenceCounter::Sender,
+                    })?;
+                let target =
+                    NonZeroU64::new(target).ok_or(EngineError::InvalidInitialSequence {
+                        counter: SequenceCounter::Target,
+                    })?;
+                Some((sender, target))
+            }
+            _ => None,
         };
 
         let session_id = self.session_id.clone();
@@ -289,11 +317,9 @@ impl<A: Application + 'static> Initiator<A> {
             .with_checksum_validation(self.config.validate_checksum);
         let mut framed = Framed::new(stream, codec);
 
-        let sequences = match self.initial_sequences {
-            Some((sender, target)) if !self.config.reset_on_logon => {
-                SequenceManager::with_initial(sender, target)
-            }
-            _ => SequenceManager::new(),
+        let sequences = match initial_sequences {
+            Some((sender, target)) => SequenceManager::with_initial(sender, target),
+            None => SequenceManager::new(),
         };
         let runtime = Arc::new(SessionRuntime {
             sequences,
