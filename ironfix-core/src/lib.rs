@@ -25,9 +25,9 @@ pub mod message;
 pub mod types;
 
 pub use error::{
-    CompIdError, DecodeError, EncodeError, FixError, InvalidFieldTag, InvalidSide, Result,
-    SessionError, StoreError, TimestampError,
+    CompIdError, DecodeError, EncodeError, FixError, InvalidFieldTag, InvalidSide, MsgTypeError,
+    Result, SessionError, StoreError, TimestampError,
 };
 pub use field::{FieldRef, FieldTag, FieldValue, FixField, USER_DEFINED_TAG_MIN};
-pub use message::{FixMessage, MsgType, OwnedMessage, RawMessage};
+pub use message::{CustomMsgType, FixMessage, MSG_TYPE_MAX_LEN, MsgType, OwnedMessage, RawMessage};
 pub use types::{COMP_ID_MAX_LEN, CompId, SeqNum, Side, Timestamp};

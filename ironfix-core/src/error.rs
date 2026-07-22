@@ -140,6 +140,15 @@ pub enum DecodeError {
         /// Length of the buffer the range was applied to.
         buffer_len: usize,
     },
+
+    /// The MsgType value (tag 35) is not a representable message type.
+    ///
+    /// Raised when the bytes of tag 35 are empty, longer than
+    /// [`crate::message::MSG_TYPE_MAX_LEN`], or contain a byte that cannot
+    /// appear in a MsgType. The frame is rejected rather than routed under a
+    /// truncated or defaulted message type.
+    #[error("invalid msg type (tag 35): {0}")]
+    InvalidMsgType(#[from] MsgTypeError),
 }
 
 /// Errors that occur during FIX message encoding.
@@ -331,6 +340,45 @@ pub enum CompIdError {
     /// The value contains a byte outside printable ASCII (`0x20..=0x7e`).
     #[error(
         "comp id contains illegal byte {byte:#04x} at offset {position}: \
+         only printable ASCII (0x20..=0x7e) is allowed"
+    )]
+    IllegalByte {
+        /// The offending byte.
+        byte: u8,
+        /// Zero-based offset of the offending byte within the value.
+        position: usize,
+    },
+}
+
+/// Rejection reasons for [`crate::message::MsgType`] construction.
+///
+/// A MsgType decides which handler a message reaches and is written verbatim
+/// into tag 35 of every outbound message, so a value that cannot be
+/// represented exactly is rejected at construction. Truncating it would
+/// silently reroute the message to the handler for a different, shorter code.
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MsgTypeError {
+    /// The value is empty; tag 35 always carries at least one byte.
+    #[error("msg type is empty")]
+    Empty,
+
+    /// The value does not fit in the fixed inline storage.
+    #[error("msg type is {len} bytes, exceeding the {max_len}-byte inline storage bound")]
+    TooLong {
+        /// Length of the offered value in bytes.
+        len: usize,
+        /// Maximum length in bytes, [`crate::message::MSG_TYPE_MAX_LEN`].
+        max_len: usize,
+    },
+
+    /// The value contains a byte outside printable ASCII — a control byte
+    /// (SOH included) or a non-ASCII byte.
+    ///
+    /// `=` and space are **not** illegal here: both are legal inside a FIX
+    /// field value, so a bilaterally agreed MsgType carrying either is accepted.
+    #[error(
+        "msg type contains illegal byte {byte:#04x} at offset {position}: \
          only printable ASCII (0x20..=0x7e) is allowed"
     )]
     IllegalByte {

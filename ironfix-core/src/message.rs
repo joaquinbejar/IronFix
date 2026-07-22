@@ -12,13 +12,141 @@
 //! - [`MsgType`]: Enumeration of FIX message types
 //! - [`FixMessage`]: Trait for typed message access
 
-use crate::error::DecodeError;
+use crate::error::{DecodeError, MsgTypeError};
 use crate::field::FieldRef;
+use arrayvec::ArrayString;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::fmt;
 use std::ops::Range;
+
+/// Maximum length of a MsgType (tag 35) value in bytes.
+///
+/// # Why 8
+///
+/// Every MsgType the FIX specification defines is one or two bytes: in the
+/// vendored `spec/FIX44.xml` all 93 `msgtype` attributes and all 119 enum
+/// values of field 35 are at most two bytes long, the longest being the
+/// two-letter codes `AA`..`BH`. The remaining headroom is for bilaterally
+/// agreed codes, which counterparties conventionally prefix with `U` and
+/// number (`U1`, `U9999`), and for the two-letter codes later FIX versions
+/// keep adding.
+///
+/// Like [`crate::types::COMP_ID_MAX_LEN`], this bound is an IronFix
+/// engineering choice rather than a specification limit — the FIX
+/// specification types MsgType as an unbounded `String`. It is what keeps
+/// [`MsgType::Custom`] in inline [`ArrayString`] storage, so decoding a
+/// message whose MsgType this enum does not name allocates nothing. A value
+/// longer than this is [`MsgTypeError::TooLong`], never a truncation.
+pub const MSG_TYPE_MAX_LEN: usize = 8;
+
+/// Inline storage for a MsgType this enum does not name.
+///
+/// A validated newtype over an [`ArrayString`] bounded by [`MSG_TYPE_MAX_LEN`],
+/// so it lives in the enum itself and never on the heap. The inner buffer is
+/// **private** and reachable only through [`CustomMsgType::new`] (or the
+/// [`Deserialize`] impl, which routes the same constructor), so a
+/// [`MsgType::Custom`] can never be built around an empty code, an over-long
+/// code, or one carrying a byte that cannot appear in tag 35.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct CustomMsgType(ArrayString<MSG_TYPE_MAX_LEN>);
+
+impl CustomMsgType {
+    /// Copies an unrecognised MsgType code into inline storage, validating it.
+    ///
+    /// This is the **only** way to obtain a `CustomMsgType`: the inner buffer
+    /// is private, so a [`MsgType::Custom`] cannot wrap an unvalidated code,
+    /// and the [`Deserialize`] impl routes the same check. The bytes typically
+    /// reach here straight off the wire — every decoded MsgType is built
+    /// through [`MsgType::new`], which sends an unnamed code here — so this is
+    /// where an untrusted tag 35 value is either bounded, non-empty, and safe
+    /// to write back into a frame, or an error.
+    ///
+    /// SOH and any non-printable or non-ASCII byte are rejected because a
+    /// MsgType is echoed verbatim into tag 35 of an outbound message, where SOH
+    /// would terminate the field early and a non-printable byte would corrupt
+    /// the frame. `=` and space are **not** rejected: both are legal inside a
+    /// FIX field value — only SOH ends a field, and only the *first* `=` splits
+    /// a tag from its value — so a bilaterally agreed code carrying either must
+    /// round-trip unchanged. The accepted set is therefore printable ASCII,
+    /// `0x20..=0x7e`. The length bound is additionally enforced by
+    /// [`MSG_TYPE_MAX_LEN`], so it holds even for a code built by hand.
+    ///
+    /// # Errors
+    /// Returns [`MsgTypeError::Empty`] for an empty code,
+    /// [`MsgTypeError::TooLong`] if it exceeds [`MSG_TYPE_MAX_LEN`] bytes, or
+    /// [`MsgTypeError::IllegalByte`] if it carries a byte that cannot appear in
+    /// tag 35.
+    pub fn new(code: &str) -> Result<Self, MsgTypeError> {
+        if code.is_empty() {
+            return Err(MsgTypeError::Empty);
+        }
+        if code.len() > MSG_TYPE_MAX_LEN {
+            return Err(MsgTypeError::TooLong {
+                len: code.len(),
+                max_len: MSG_TYPE_MAX_LEN,
+            });
+        }
+        for (position, &byte) in code.as_bytes().iter().enumerate() {
+            if !(0x20..=0x7e).contains(&byte) {
+                return Err(MsgTypeError::IllegalByte { byte, position });
+            }
+        }
+        match ArrayString::<MSG_TYPE_MAX_LEN>::from(code) {
+            Ok(inner) => Ok(Self(inner)),
+            // Unreachable: the length was checked above.
+            Err(_) => Err(MsgTypeError::TooLong {
+                len: code.len(),
+                max_len: MSG_TYPE_MAX_LEN,
+            }),
+        }
+    }
+
+    /// Returns the code as a string slice, exactly as it appears in tag 35.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for CustomMsgType {
+    /// Deserializes a MsgType code, validating it through
+    /// [`CustomMsgType::new`] so a deserialized [`MsgType::Custom`] carries the
+    /// same guarantees as one built off the wire.
+    ///
+    /// # Errors
+    /// Fails with a deserialization error carrying the [`MsgTypeError`] message
+    /// when the code is empty, longer than [`MSG_TYPE_MAX_LEN`], or carries a
+    /// byte that cannot appear in tag 35.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CodeVisitor;
+
+        impl serde::de::Visitor<'_> for CodeVisitor {
+            type Value = CustomMsgType;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "a FIX MsgType code of 1..={MSG_TYPE_MAX_LEN} printable ASCII bytes"
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                CustomMsgType::new(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(CodeVisitor)
+    }
+}
 
 /// Declares [`MsgType`] and the three mappings that must agree about it.
 ///
@@ -38,12 +166,14 @@ macro_rules! define_msg_types {
         ///
         /// This enum covers the most common administrative and application
         /// messages. Custom or less common message types are represented as
-        /// `Custom(String)`.
+        /// [`MsgType::Custom`], whose payload is inline storage bounded by
+        /// [`MSG_TYPE_MAX_LEN`] — decoding a message with an unrecognised
+        /// MsgType therefore allocates nothing.
         ///
         /// # Equality follows the wire form
         ///
         /// [`PartialEq`] and [`Hash`] compare [`MsgType::as_str`], not the
-        /// variant: `MsgType::Custom("D".into()) == MsgType::NewOrderSingle`,
+        /// variant: a `Custom` holding `D` equals [`MsgType::NewOrderSingle`],
         /// because both put `35=D` on the wire. Without that, a `Custom` value
         /// reaching a `HashMap` keyed by `MsgType` would silently miss the
         /// entry its own wire form should have hit. Prefer [`MsgType::new`],
@@ -55,7 +185,12 @@ macro_rules! define_msg_types {
                 $variant,
             )*
             /// Custom or unknown message type.
-            Custom(String),
+            ///
+            /// The payload is a [`CustomMsgType`], so an over-long code is
+            /// unrepresentable rather than truncated. Build it with
+            /// [`MsgType::new`], which also rejects an empty code and one
+            /// carrying a byte that cannot appear in tag 35.
+            Custom(CustomMsgType),
         }
 
         impl MsgType {
@@ -72,15 +207,25 @@ macro_rules! define_msg_types {
             ///
             /// A code this enum names folds into that named variant, so the
             /// result is always in normal form; anything else becomes
-            /// [`MsgType::Custom`].
+            /// [`MsgType::Custom`], copied into inline storage without
+            /// allocating.
             ///
             /// # Arguments
             /// * `code` - The message type string (e.g., "D" for NewOrderSingle)
-            #[must_use]
-            pub fn new(code: &str) -> Self {
+            ///
+            /// # Errors
+            /// A named code never fails. Anything else returns
+            /// [`MsgTypeError::Empty`] for an empty code,
+            /// [`MsgTypeError::TooLong`] if it exceeds [`MSG_TYPE_MAX_LEN`]
+            /// bytes, or [`MsgTypeError::IllegalByte`] if it carries a byte
+            /// that cannot appear in tag 35. An over-long code is **never**
+            /// truncated: a truncated MsgType is a different, valid MsgType,
+            /// so it would route the message to the wrong handler instead of
+            /// failing.
+            pub fn new(code: &str) -> Result<Self, MsgTypeError> {
                 match code {
-                    $( $code => Self::$variant, )*
-                    other => Self::Custom(other.to_owned()),
+                    $( $code => Ok(Self::$variant), )*
+                    other => Ok(Self::Custom(CustomMsgType::new(other)?)),
                 }
             }
 
@@ -247,22 +392,26 @@ define_msg_types! {
 }
 
 impl std::str::FromStr for MsgType {
-    type Err = std::convert::Infallible;
+    type Err = MsgTypeError;
 
     /// Creates a MsgType from a string value.
     ///
-    /// Infallible: an unrecognised code becomes [`MsgType::Custom`], which is
-    /// how a private or newer message type reaches the application layer
-    /// without the decoder having to know it. Delegates to [`MsgType::new`],
-    /// so the result is always in normal form.
+    /// An unrecognised but representable code becomes [`MsgType::Custom`],
+    /// which is how a private or newer message type reaches the application
+    /// layer without the decoder having to know it. Delegates to
+    /// [`MsgType::new`], so the result is always in normal form.
     ///
     /// # Arguments
     /// * `s` - The message type string (e.g., "D" for NewOrderSingle)
     ///
     /// # Errors
-    /// Never returns an error.
+    /// Returns [`MsgTypeError::Empty`], [`MsgTypeError::TooLong`], or
+    /// [`MsgTypeError::IllegalByte`]. This was `Infallible` while `Custom`
+    /// held a heap `String`; bounding that storage makes an over-long code
+    /// unrepresentable, and rejecting it is the only alternative to a
+    /// truncation that would reroute the message.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(s))
+        Self::new(s)
     }
 }
 
@@ -683,9 +832,22 @@ pub trait FixMessage: Sized {
 mod tests {
     use super::*;
 
+    use serde::de::IntoDeserializer;
+    use serde::de::value::{Error as ValueError, StrDeserializer};
     use std::collections::hash_map::DefaultHasher;
     use std::collections::{HashMap, HashSet};
     use std::hash::{Hash, Hasher};
+
+    /// Builds a `Custom` variant directly, bypassing the normal-form folding
+    /// [`MsgType::new`] applies, so a `Custom` holding a named code can be
+    /// tested. Still routes the validating [`CustomMsgType::new`], so a test
+    /// code that could not appear in tag 35 is a test bug, not a fixture.
+    fn custom_variant(code: &str) -> MsgType {
+        match CustomMsgType::new(code) {
+            Ok(inner) => MsgType::Custom(inner),
+            Err(err) => panic!("test code {code:?} must be a valid custom MsgType: {err}"),
+        }
+    }
 
     #[test]
     fn test_msg_type_from_str() {
@@ -708,12 +870,12 @@ mod tests {
             let code = variant.as_str().to_owned();
             assert_eq!(
                 MsgType::new(&code),
-                variant,
+                Ok(variant.clone()),
                 "MsgType::new({code:?}) must recover {variant:?}"
             );
             // A named code must never fall through to Custom.
             assert!(
-                !matches!(MsgType::new(&code), MsgType::Custom(_)),
+                !matches!(MsgType::new(&code), Ok(MsgType::Custom(_))),
                 "{code:?} must map to a named variant, not Custom"
             );
         }
@@ -757,14 +919,14 @@ mod tests {
 
     #[test]
     fn test_msg_type_xml_message_is_admin() {
-        assert_eq!(MsgType::new("n"), MsgType::XmlMessage);
+        assert_eq!(MsgType::new("n"), Ok(MsgType::XmlMessage));
         assert!(MsgType::XmlMessage.is_admin());
         assert!(!MsgType::XmlMessage.is_app());
     }
 
     #[test]
     fn test_msg_type_custom() {
-        let custom = MsgType::Custom("XX".to_string());
+        let custom = custom_variant("XX");
         assert_eq!("XX".parse::<MsgType>(), Ok(custom.clone()));
         assert_eq!(custom.as_str(), "XX");
         assert!(!custom.is_admin());
@@ -773,14 +935,181 @@ mod tests {
 
     #[test]
     fn test_msg_type_new_normalises_known_code_out_of_custom() {
-        assert_eq!(MsgType::new("D"), MsgType::NewOrderSingle);
-        assert!(matches!(MsgType::new("D"), MsgType::NewOrderSingle));
-        assert!(matches!(MsgType::new("ZZ"), MsgType::Custom(_)));
+        assert_eq!(MsgType::new("D"), Ok(MsgType::NewOrderSingle));
+        assert!(matches!(MsgType::new("D"), Ok(MsgType::NewOrderSingle)));
+        assert!(matches!(MsgType::new("ZZ"), Ok(MsgType::Custom(_))));
+    }
+
+    #[test]
+    fn test_msg_type_custom_at_the_bound_round_trips() {
+        // MSG_TYPE_MAX_LEN bytes exactly: accepted, stored inline, and
+        // recovered byte for byte.
+        let code = "U9999999";
+        assert_eq!(code.len(), MSG_TYPE_MAX_LEN);
+        let parsed = code.parse::<MsgType>();
+        assert_eq!(parsed, Ok(custom_variant(code)));
+        match parsed {
+            Ok(msg_type) => assert_eq!(msg_type.as_str(), code),
+            Err(err) => panic!("a {MSG_TYPE_MAX_LEN}-byte code must be accepted, got {err}"),
+        }
+    }
+
+    #[test]
+    fn test_msg_type_one_byte_over_the_bound_is_too_long_not_truncated() {
+        // One byte over: rejected outright. Truncating to "U9999999" would
+        // silently route this message to a different, valid MsgType.
+        let code = "U99999999";
+        assert_eq!(code.len(), MSG_TYPE_MAX_LEN + 1);
+        assert_eq!(
+            code.parse::<MsgType>(),
+            Err(MsgTypeError::TooLong {
+                len: code.len(),
+                max_len: MSG_TYPE_MAX_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn test_msg_type_far_over_the_bound_is_too_long() {
+        let code = "A".repeat(4096);
+        assert_eq!(
+            MsgType::new(&code),
+            Err(MsgTypeError::TooLong {
+                len: 4096,
+                max_len: MSG_TYPE_MAX_LEN,
+            })
+        );
+    }
+
+    #[test]
+    fn test_msg_type_custom_owns_no_heap_allocation() {
+        // The regression guard for this whole change: a type that needs
+        // dropping owns something on the heap, and `MsgType` is built once per
+        // decoded message. With `Custom(String)` this held an allocation the
+        // decode success path paid for on every frame with an unrecognised
+        // MsgType.
+        assert!(
+            !std::mem::needs_drop::<MsgType>(),
+            "MsgType must own no heap allocation"
+        );
+        assert!(
+            !std::mem::needs_drop::<CustomMsgType>(),
+            "a custom MsgType code must live inline, not behind a pointer"
+        );
+    }
+
+    #[test]
+    fn test_msg_type_empty_code_is_rejected() {
+        assert_eq!("".parse::<MsgType>(), Err(MsgTypeError::Empty));
+    }
+
+    #[test]
+    fn test_msg_type_soh_byte_is_rejected() {
+        // SOH is the one byte that terminates a field: `35=A\x01B` would put
+        // `35=A` on the wire and then a bogus field starting `B`. It is
+        // rejected wherever it appears in the code.
+        assert_eq!(
+            MsgType::new("A\x01B"),
+            Err(MsgTypeError::IllegalByte {
+                byte: 0x01,
+                position: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn test_msg_type_control_or_non_ascii_byte_is_rejected() {
+        // DEL (0x7f) is a control byte just past the printable range; a
+        // non-ASCII byte lies entirely outside it. Neither can appear in a
+        // MsgType echoed into tag 35.
+        assert_eq!(
+            MsgType::new("A\x7fB"),
+            Err(MsgTypeError::IllegalByte {
+                byte: 0x7f,
+                position: 1,
+            })
+        );
+        // "é" is 0xC3 0xA9 in UTF-8; its first byte trips the check at offset 0.
+        assert_eq!(
+            MsgType::new("é"),
+            Err(MsgTypeError::IllegalByte {
+                byte: 0xc3,
+                position: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn test_msg_type_equals_and_space_are_accepted() {
+        // `=` and space are legal inside a FIX field value — only SOH ends a
+        // field and only the first `=` splits tag from value — so a bilateral
+        // code carrying either must round-trip unchanged, not be refused.
+        let with_equals = MsgType::new("U=1");
+        assert_eq!(with_equals, Ok(custom_variant("U=1")));
+        match with_equals {
+            Ok(msg_type) => assert_eq!(msg_type.as_str(), "U=1"),
+            Err(err) => panic!("`=` must be accepted in a custom code, got {err}"),
+        }
+
+        let with_space = MsgType::new("U 1");
+        assert_eq!(with_space, Ok(custom_variant("U 1")));
+        match with_space {
+            Ok(msg_type) => assert_eq!(msg_type.as_str(), "U 1"),
+            Err(err) => panic!("space must be accepted in a custom code, got {err}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_msg_type_new_validates_like_msg_type_new() {
+        // The public constructor is the single validation chokepoint the
+        // `Custom` variant and `Deserialize` both route through.
+        assert_eq!(CustomMsgType::new("").err(), Some(MsgTypeError::Empty));
+        assert_eq!(
+            CustomMsgType::new("U99999999").err(),
+            Some(MsgTypeError::TooLong {
+                len: 9,
+                max_len: MSG_TYPE_MAX_LEN,
+            })
+        );
+        assert_eq!(
+            CustomMsgType::new("A\x01B").err(),
+            Some(MsgTypeError::IllegalByte {
+                byte: 0x01,
+                position: 1,
+            })
+        );
+        match CustomMsgType::new("U=1") {
+            Ok(code) => assert_eq!(code.as_str(), "U=1"),
+            Err(err) => panic!("`U=1` must be a valid custom code, got {err}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_msg_type_deserialize_rejects_illegal_code() {
+        // The derived `MsgType` deserialization reaches the `Custom` field
+        // through this impl, so validation cannot be bypassed by deserializing.
+        let de: StrDeserializer<'_, ValueError> = "A\x01B".into_deserializer();
+        assert!(CustomMsgType::deserialize(de).is_err());
+    }
+
+    #[test]
+    fn test_custom_msg_type_deserialize_accepts_valid_code() {
+        let de: StrDeserializer<'_, ValueError> = "U=1".into_deserializer();
+        match CustomMsgType::deserialize(de) {
+            Ok(code) => assert_eq!(code.as_str(), "U=1"),
+            Err(err) => panic!("a valid code must deserialize, got {err}"),
+        }
+    }
+
+    #[test]
+    fn test_msg_type_error_converts_into_decode_error() {
+        let err: DecodeError = MsgTypeError::Empty.into();
+        assert_eq!(err, DecodeError::InvalidMsgType(MsgTypeError::Empty));
     }
 
     #[test]
     fn test_msg_type_custom_equals_named_variant_with_same_wire_form() {
-        let custom = MsgType::Custom("D".to_string());
+        let custom = custom_variant("D");
         assert_eq!(custom, MsgType::NewOrderSingle);
         assert_eq!(MsgType::NewOrderSingle, custom);
         assert_ne!(custom, MsgType::ExecutionReport);
@@ -792,7 +1121,7 @@ mod tests {
         // Custom("A") that routed as an application message while an equal
         // MsgType::Logon routed as admin would be a session-layer split brain.
         for variant in MsgType::all_named() {
-            let as_custom = MsgType::Custom(variant.as_str().to_owned());
+            let as_custom = custom_variant(variant.as_str());
             assert_eq!(as_custom, variant);
             assert_eq!(
                 as_custom.is_admin(),
@@ -802,7 +1131,7 @@ mod tests {
             );
         }
         // A code no variant names stays an application message.
-        assert!(!MsgType::Custom("ZZ".to_owned()).is_admin());
+        assert!(!custom_variant("ZZ").is_admin());
     }
 
     #[test]
@@ -812,7 +1141,7 @@ mod tests {
             value.hash(&mut hasher);
             hasher.finish()
         }
-        let custom = MsgType::Custom("D".to_string());
+        let custom = custom_variant("D");
         assert_eq!(hash_of(&custom), hash_of(&MsgType::NewOrderSingle));
 
         let mut map: HashMap<MsgType, u32> = HashMap::new();
