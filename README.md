@@ -32,17 +32,24 @@ separate, opt-in pass.
 - **Framing** over a Tokio codec (`FixCodec`) with a bounded read buffer and an
   unconditionally verified trailer.
 - **A client-side session** (`Initiator`): TCP dial, Logon handshake,
-  heartbeats and TestRequests, CompID validation, sequence-gap detection,
-  `ResendRequest` / `SequenceReset` / gap fill, `PossDupFlag` and
-  `OrigSendingTime` handling, `ResetSeqNumFlag`, session-level `Reject`, and
-  `FIXT.1.1` BeginString with `ApplVerID` for FIX 5.0 sessions.
+  heartbeats and TestRequests at the negotiated interval, CompID validation,
+  sequence-gap detection, `ResendRequest` / `SequenceReset` / gap fill,
+  `PossDupFlag` and `OrigSendingTime` handling, `ResetSeqNumFlag`,
+  session-level `Reject`, and `FIXT.1.1` BeginString with `ApplVerID` for FIX
+  5.0 sessions. Heartbeat/TestRequest handling is **partial**: `HeartBtInt = 0`
+  (legal FIX for "do not send heartbeats") is currently taken literally as a
+  zero-length interval, and a pending TestRequest is cleared only by a Heartbeat
+  echoing the matching `TestReqID` — see `doc/fix_operations.md`.
 - **A typestate session FSM** and checked sequence arithmetic in
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in
   `ironfix-dictionary`.
-- **FAST primitives** in `ironfix-fast`: stop-bit integers and strings, presence
-  maps, and the copy/delta/increment/tail/default operators, all round-trip
-  tested.
+- **FAST primitives** in `ironfix-fast`: stop-bit integer and string
+  encode/decode and presence maps, all round-trip tested. The
+  copy/delta/increment/tail/default operators are a classification vocabulary
+  (the `Operator` enum with predicates such as `uses_dictionary` /
+  `requires_pmap`), not wired-in codec operators — the decoder and encoder do
+  not apply them yet.
 
 ## What is not implemented yet
 
@@ -172,7 +179,7 @@ Here's a list of useful commands:
 ```sh
 make build         # Compile the project
 make release       # Build in release mode
-make run           # Run the main binary
+make run           # Bare 'cargo run'; the workspace has no default binary, so run an example instead
 ```
 
 ### 🧪 Test & Quality
@@ -194,7 +201,7 @@ make pre-push      # Run fix + fmt + lint-fix + test + readme + doc (recommended
 make doc           # Check for missing docs via clippy
 make doc-open      # Build and open Rust documentation
 make create-doc    # Generate internal docs
-make publish       # Prepare and publish a crate to crates.io
+make publish       # Print the dependency-ordered publish instructions (publishes nothing itself)
 make publish-all   # Publish all crates in dependency order
 ```
 

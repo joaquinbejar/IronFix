@@ -43,7 +43,7 @@ IronFix follows an OSI-layered architecture that strictly separates concerns, en
 The architecture prioritizes three often-competing goals through careful design choices:
 
 **Zero-allocation hot paths** ensure that the critical order-entry path never allocates heap memory. Every message uses pre-allocated buffers from arena allocators, and parsed fields reference the original byte buffer through zero-copy slices. This eliminates allocation jitter that plagues garbage-collected implementations.
-*Status: partially built. The tag=value decoder is zero-copy and allocation-free per message, and the encoder targets a pre-allocated buffer. Arena allocation is not implemented — there is no `bumpalo` dependency. Nothing is measured.*
+*Status: partially built. The tag=value decoder is zero-copy — parsed field values borrow the input buffer and are never copied — and the encoder targets a pre-allocated buffer. The decoder's field index is a `SmallVec<[FieldRef; 32]>` that stays inline for the first 32 fields and spills to the heap only for a message with more than 32 fields. Arena allocation is not implemented — there is no `bumpalo` dependency. Nothing is measured.*
 
 **Compile-time correctness** leverages Rust's type system for session state machines (typestate pattern), message validation, and field access. Generated code from FIX dictionaries provides type-safe field accessors, catching errors at compile time rather than runtime.
 *Status: partially built. The session FSM is a sealed typestate today. Generated field accessors are not: `ironfix-codegen` has no consumer and the `ironfix-derive` macros expand to `todo!()`, so field access is currently untyped tag lookup.*
@@ -922,6 +922,13 @@ impl MarketDataPipeline {
 ```
 
 ### Memory layout optimization
+
+**Illustrative layout sketch.** The `avg_px: f64` and `prices: [f64; 8]` fields
+below are plain `f64` only to keep the padding and SIMD-batch narrative legible;
+they contradict the Decimal-for-money rule and would not appear in production
+code. Real monetary values in IronFix are `rust_decimal::Decimal`, never `f64` —
+a production `OrderState` would carry `Decimal`, which changes this exact byte
+layout.
 
 ```rust
 // Cache-friendly structures for hot path

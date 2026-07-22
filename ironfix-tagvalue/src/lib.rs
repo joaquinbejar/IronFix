@@ -14,7 +14,9 @@
 //! ## Features
 //!
 //! - **Zero-copy decoding**: decoded fields are `FieldRef<'a>` slices that
-//!   borrow the input buffer; the decoder allocates nothing per message.
+//!   borrow the input buffer, so field values are never copied. The field index
+//!   is a `SmallVec<[FieldRef; 32]>`: it stays inline for the first 32 fields
+//!   and spills to the heap only for a message with more than 32 fields.
 //! - **Dictionary-free**: [`Decoder`] is a byte scanner and does not know what
 //!   a tag means, so no schema lookup happens on the decode path. Validating a
 //!   message against a schema is a separate, opt-in pass in

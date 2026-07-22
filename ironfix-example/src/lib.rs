@@ -9,8 +9,11 @@
 //! # IronFix
 //!
 //! Umbrella facade over the IronFix FIX/FAST workspace: this crate re-exports
-//! every other `ironfix-*` crate under a module of its own, plus a [`prelude`]
-//! of the types most programs need. It adds no protocol logic of its own.
+//! the runtime `ironfix-*` crates — `core`, `tagvalue`, `dictionary`,
+//! `session`, `store`, `transport`, `fast`, and `engine` — each under a module
+//! of its own, plus a [`prelude`] of the types most programs need. The
+//! code-generation crates `ironfix-codegen` and `ironfix-derive` are not
+//! re-exported. It adds no protocol logic of its own.
 //!
 //! IronFix implements FIX tag=value messaging and the FAST encoding primitives
 //! directly — there is no upstream protocol library beneath it. Decoding is
