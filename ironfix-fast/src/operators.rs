@@ -148,29 +148,47 @@ impl Operator {
     /// its value comes from.
     ///
     /// This is the pmap-consuming half of FAST field decoding: it advances the
-    /// map by exactly the number of bits [`Operator::requires_pmap`] says this
-    /// field owns — zero or one — so a sequence of calls stays aligned with the
+    /// map by the number of bits [`Operator::requires_pmap`] says this field
+    /// owns — zero or one — so a sequence of calls stays aligned with the
     /// sender. Reading the value itself is the caller's job, because it needs
     /// the field's type and initial value.
+    ///
+    /// Per FAST v1.1 §6.3.1 a presence map carries an infinite implied suffix
+    /// of zero bits: once the encoded bits are used up, every further
+    /// pmap-owning field reads a zero bit and is therefore absent. FAST has no
+    /// too-short presence map, so a map that ends before the template's last
+    /// pmap field is legal — it is the minimal form a conformant sender emits
+    /// when the trailing fields are absent — and decodes without error. A field
+    /// that reads the implied suffix does not advance the map, which stays at
+    /// its end and answers zero for every later field, keeping the sequence
+    /// aligned all the same.
     ///
     /// # Arguments
     /// * `optional` - Whether the field is optional (nullable) in its template
     /// * `pmap` - The message's presence map, positioned at this field's bit
     ///
     /// # Errors
-    /// Returns [`FastError::PresenceMapExhausted`] if this field owns a bit and
-    /// the map has none left. A map that runs out is a truncated map, and
-    /// treating the missing bits as "absent" would let a short message decode
-    /// as a valid one.
+    /// A presence map that ends before this field's bit is not an error: the
+    /// bit reads as absent per the zero-suffix rule above. The `Result` is
+    /// retained so that any other primitive-level presence-map failure can
+    /// propagate rather than be silently read as absent.
     pub fn transfer(
         &self,
         optional: bool,
         pmap: &mut PresenceMap,
     ) -> Result<FieldTransfer, FastError> {
         // Consume the bit first, and exactly once, so the map stays aligned
-        // whichever arm below answers.
+        // whichever arm below answers. FAST v1.1 §6.3.1 defines the presence
+        // map as carrying an infinite implied suffix of zero bits, so a field
+        // whose bit lies past the encoded map is absent (0), not a truncation —
+        // FAST has no too-short presence map. Only that exhaustion is read as
+        // absent; any other primitive-level error still propagates.
         let present = if self.requires_pmap(optional) {
-            Some(pmap.next_bit()?)
+            match pmap.next_bit() {
+                Ok(bit) => Some(bit),
+                Err(FastError::PresenceMapExhausted) => Some(false),
+                Err(other) => return Err(other),
+            }
         } else {
             None
         };
@@ -469,12 +487,27 @@ mod tests {
     }
 
     #[test]
-    fn test_operator_transfer_without_a_bit_is_presence_map_exhausted() {
-        // A truncated map must not read as "every remaining field is absent".
+    fn test_operator_transfer_past_the_encoded_map_reads_as_absent() {
+        // FAST v1.1 §6.3.1: a bit past the encoded presence map is the implied
+        // zero suffix — absent — not a truncation error. A Copy field with an
+        // empty map therefore falls back to the dictionary, without error, and
+        // the exhausted map does not advance.
         let mut pmap = PresenceMap::new();
         assert_eq!(
             Operator::Copy.transfer(false, &mut pmap),
-            Err(FastError::PresenceMapExhausted)
+            Ok(FieldTransfer::Dictionary)
+        );
+        assert_eq!(
+            pmap.position(),
+            0,
+            "the implied zero suffix does not advance the map"
+        );
+
+        // An optional constant past the end is likewise absent, not an error.
+        let mut pmap = PresenceMap::new();
+        assert_eq!(
+            Operator::Constant.transfer(true, &mut pmap),
+            Ok(FieldTransfer::Absent)
         );
 
         // The operators that own no bit are unaffected by an empty map.
@@ -483,6 +516,51 @@ mod tests {
             Operator::Delta.transfer(true, &mut pmap),
             Ok(FieldTransfer::Stream)
         );
+    }
+
+    #[test]
+    fn test_operator_transfer_eight_plus_fields_over_one_byte_map_honours_zero_suffix() {
+        // A conformant peer whose trailing pmap-owning fields are absent emits a
+        // legal one-byte (seven data-bit) presence map. A template with ten Copy
+        // fields must decode it: the seven encoded bits drive the first seven
+        // fields, and the remaining three read the implied zero suffix as absent
+        // — with no `PresenceMapExhausted`.
+        //
+        // 0b1101_0101: stop bit set, payload bits (6..0) = 1_0_1_0_1_0_1.
+        let data = [0b1101_0101];
+        let mut offset = 0;
+        let decoded = PresenceMap::decode(&data, &mut offset);
+        assert!(decoded.is_ok());
+
+        if let Ok(mut pmap) = decoded {
+            // A Copy field is `Stream` on a set bit and `Dictionary` on a clear
+            // or implied-zero bit. The first seven entries are the encoded bits;
+            // the last three are the implied zero suffix.
+            let expected = [
+                FieldTransfer::Stream,     // bit 1
+                FieldTransfer::Dictionary, // bit 0
+                FieldTransfer::Stream,     // bit 1
+                FieldTransfer::Dictionary, // bit 0
+                FieldTransfer::Stream,     // bit 1
+                FieldTransfer::Dictionary, // bit 0
+                FieldTransfer::Stream,     // bit 1
+                FieldTransfer::Dictionary, // implied zero
+                FieldTransfer::Dictionary, // implied zero
+                FieldTransfer::Dictionary, // implied zero
+            ];
+
+            for (index, want) in expected.iter().enumerate() {
+                assert_eq!(
+                    Operator::Copy.transfer(false, &mut pmap),
+                    Ok(*want),
+                    "field {index} on a legal one-byte map"
+                );
+            }
+
+            // Only the seven encoded bits were consumed; the implied suffix does
+            // not advance the map past its end.
+            assert_eq!(pmap.position(), 7, "only the encoded bits are consumed");
+        }
     }
 
     #[test]

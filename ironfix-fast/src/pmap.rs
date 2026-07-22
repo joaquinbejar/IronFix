@@ -10,10 +10,15 @@
 //! are present in a FAST message. It uses stop-bit encoding where the high
 //! bit of each byte indicates whether more bytes follow.
 //!
-//! Two hardening rules apply, because a presence map is attacker-controlled
-//! input: its encoded size is capped by [`MAX_PMAP_BYTES`], and running off
-//! the end of the map is an explicit [`FastError::PresenceMapExhausted`]
-//! rather than a fabricated "field absent" answer.
+//! Two rules apply, because a presence map is attacker-controlled input. Its
+//! encoded size is capped by [`MAX_PMAP_BYTES`], which bounds the work a hostile
+//! map can cost. Beyond that encoded size the map is not truncated: FAST v1.1
+//! §6.3.1 defines an infinite implied suffix of zero bits, so every field past
+//! the encoded bits is absent (0). The primitive [`PresenceMap::next_bit`]
+//! reports that the encoded bits are used up with
+//! [`FastError::PresenceMapExhausted`]; the operator layer
+//! ([`Operator::transfer`](crate::Operator::transfer)) applies the zero suffix
+//! by reading that exhaustion as absent.
 //!
 //! On the way out, [`PresenceMap::encode`] emits the minimal form — no
 //! trailing all-absent bytes — because that is what a conformant FAST receiver
@@ -114,34 +119,33 @@ impl PresenceMap {
         Ok(Self { bits, position: 0 })
     }
 
-    /// Consumes and returns the next bit from the presence map.
+    /// Consumes and returns the next encoded bit from the presence map.
     ///
     /// # Returns
     /// `true` if the corresponding field is present, `false` otherwise.
     ///
     /// # Errors
-    /// Returns [`FastError::PresenceMapExhausted`] once every decoded bit has
-    /// been consumed, rather than answering "absent" forever.
+    /// Returns [`FastError::PresenceMapExhausted`] once every encoded bit has
+    /// been consumed. This is a primitive-level signal, not a decode failure:
+    /// per FAST v1.1 §6.3.1 a presence map carries an infinite implied suffix of
+    /// zero bits, so reading past the encoded bits means the field is absent
+    /// (0). The primitive does not fabricate that zero itself; the operator
+    /// layer ([`Operator::transfer`](crate::Operator::transfer)) applies the
+    /// zero suffix by mapping this exhaustion to absent, so a caller that wants
+    /// the strict encoded length can still see where it ends. A failed read
+    /// does not advance the position.
     ///
     /// # Granularity
     ///
-    /// A decoded map always holds a multiple of seven bits, because that is
-    /// what the wire encoding carries: a sender meaning one present bit emits
-    /// a single byte, and this map then offers seven. Those six padding bits
-    /// read as "absent" and are indistinguishable here from real absent
-    /// fields — the primitive layer never sees the template, so it cannot know
-    /// how many bits were meant. Exhaustion therefore only fires at a
-    /// seven-bit boundary.
-    ///
-    /// The mirror of that is over-rejection: a sender that omits trailing
-    /// all-absent bytes — which is the minimal form, and what
-    /// [`PresenceMap::encode`] itself emits — produces a map shorter than the
-    /// template's field count, and reads past its end error here rather than
-    /// yielding "absent". A caller that knows how many fields to expect, and
-    /// therefore knows a short map is legal rather than truncated, reads with
-    /// [`PresenceMap::bit`] and treats `None` as absent. Resolving it inside
-    /// `next_bit` would need that field count, which belongs to the template
-    /// layer this crate does not yet implement — see the crate-level docs.
+    /// A decoded map always holds a multiple of seven bits, because that is what
+    /// the wire encoding carries: a sender meaning one present bit emits a
+    /// single byte, and this map then offers seven. Those six padding bits read
+    /// as absent and are indistinguishable here from the implied zero suffix —
+    /// the primitive layer never sees the template, so both simply mean the
+    /// field is absent. Exhaustion therefore fires only at a seven-bit boundary,
+    /// and everything past it is absent all the same. A caller that already
+    /// knows how many fields to expect may instead read with
+    /// [`PresenceMap::bit`], which answers `None` past the end.
     #[inline]
     pub fn next_bit(&mut self) -> Result<bool, FastError> {
         let bit = *self
@@ -207,10 +211,12 @@ impl PresenceMap {
     /// The consequence is that `encode` followed by
     /// [`PresenceMap::decode`] does not round-trip bit count: the decoded map
     /// is as short as the last set bit allows, and every bit past its end is
-    /// absent. A reader that knows how many fields to expect uses
-    /// [`PresenceMap::bit`], which answers `None` past the end, rather than
-    /// [`PresenceMap::next_bit`], which treats running off the end as the
-    /// protocol error it is for a reader that does not.
+    /// absent per the FAST zero-suffix rule. A reader consults
+    /// [`PresenceMap::bit`], which answers `None` past the end, or reads through
+    /// the operator layer, which treats a bit past the end as absent; the
+    /// primitive [`PresenceMap::next_bit`] instead reports
+    /// [`FastError::PresenceMapExhausted`] so a caller can still see where the
+    /// encoded bits end.
     ///
     /// # Returns
     /// The encoded bytes with stop-bit encoding.
@@ -398,6 +404,9 @@ mod tests {
 
     #[test]
     fn test_presence_map_next_bit_past_the_end_is_exhausted() {
+        // The primitive reports where the encoded bits end; it does not fabricate
+        // the FAST zero suffix. Applying that suffix — reading a bit past the end
+        // as absent — is the operator layer's job (see `Operator::transfer`).
         let mut pmap = PresenceMap::from_bits(vec![true]);
 
         assert!(!pmap.is_exhausted());
