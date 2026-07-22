@@ -310,6 +310,46 @@ pub struct SessionConfig {
     pub logout_timeout: Duration,
     /// Whether to validate the `CheckSum` (10) of inbound messages.
     pub validate_checksum: bool,
+    /// Whether to validate incoming message length.
+    pub validate_length: bool,
+    /// Largest difference tolerated, in either direction, between an inbound
+    /// message's `SendingTime` (52) and the local clock.
+    ///
+    /// Units: wall-clock duration. Range: any duration; `Duration::ZERO`
+    /// disables `SendingTime` validation entirely, including the presence and
+    /// format checks. Default: 120 seconds.
+    ///
+    /// The default matches the tolerance FIX engines have converged on
+    /// (QuickFIX's `MaxLatency`) and is the interval it is worth choosing:
+    /// a host synchronised by NTP stays within milliseconds of true time, so
+    /// two minutes is orders of magnitude more slack than a healthy peer ever
+    /// needs, while a host that is not synchronised at all drifts past two
+    /// minutes within days. Anything much tighter starts rejecting sessions
+    /// over ordinary drift and queueing latency; anything much looser stops
+    /// distinguishing a wrong clock from a right one.
+    pub sending_time_tolerance: Duration,
+    /// How long an outstanding `ResendRequest` (2) may make no progress before
+    /// it is retried, and eventually abandoned.
+    ///
+    /// Units: wall-clock duration, measured from the moment the request was
+    /// sent and restarted by every request that follows it. Any in-sequence
+    /// message clears the outstanding request altogether, so this measures a
+    /// gap that is not being filled at all, not a slow replay. Range: any
+    /// duration; a value below the engine's 100 ms reactor tick simply retries
+    /// on the next tick. Default: 10 seconds.
+    pub resend_timeout: Duration,
+    /// Maximum number of `ResendRequest` (2) messages sent for one gap,
+    /// counting the first.
+    ///
+    /// Once they are spent the session is ended with a Logout rather than left
+    /// waiting for a peer that is not answering. Range: 1 and above; 0 is read
+    /// as 1, because the first request is unconditional. Default: 3, which
+    /// with the default [`SessionConfig::resend_timeout`] bounds an
+    /// unrecoverable gap at 30 seconds plus the logout handshake.
+    ///
+    /// Read it through [`SessionConfig::resend_attempt_limit`], which applies
+    /// the lower bound.
+    pub max_resend_requests: u32,
     /// Optional sender sub ID (tag 50), 1..=[`MAX_ID_LEN`] bytes when set.
     pub sender_sub_id: Option<String>,
     /// Optional target sub ID (tag 57), 1..=[`MAX_ID_LEN`] bytes when set.
@@ -352,6 +392,10 @@ impl SessionConfig {
             logon_timeout: DEFAULT_TIMEOUT,
             logout_timeout: DEFAULT_TIMEOUT,
             validate_checksum: true,
+            validate_length: true,
+            sending_time_tolerance: Duration::from_secs(120),
+            resend_timeout: Duration::from_secs(10),
+            max_resend_requests: 3,
             sender_sub_id: None,
             target_sub_id: None,
             sender_location_id: None,
@@ -459,6 +503,40 @@ impl SessionConfig {
         self
     }
 
+    /// Sets the logout timeout.
+    #[must_use]
+    pub fn with_logout_timeout(mut self, timeout: Duration) -> Self {
+        self.logout_timeout = timeout;
+        self
+    }
+
+    /// Sets the tolerance applied to an inbound `SendingTime` (52).
+    ///
+    /// `Duration::ZERO` disables `SendingTime` validation. See
+    /// [`SessionConfig::sending_time_tolerance`] for the default and its
+    /// rationale.
+    #[must_use]
+    pub fn with_sending_time_tolerance(mut self, tolerance: Duration) -> Self {
+        self.sending_time_tolerance = tolerance;
+        self
+    }
+
+    /// Sets how long an outstanding `ResendRequest` (2) may make no progress
+    /// before it is retried.
+    #[must_use]
+    pub fn with_resend_timeout(mut self, timeout: Duration) -> Self {
+        self.resend_timeout = timeout;
+        self
+    }
+
+    /// Sets how many `ResendRequest` (2) messages may be sent for one gap,
+    /// counting the first. A value of 0 is read as 1.
+    #[must_use]
+    pub const fn with_max_resend_requests(mut self, attempts: u32) -> Self {
+        self.max_resend_requests = attempts;
+        self
+    }
+
     /// Returns the heartbeat interval as the whole seconds that go into
     /// `HeartBtInt` (108).
     ///
@@ -469,6 +547,17 @@ impl SessionConfig {
     #[must_use]
     pub const fn heartbeat_interval_secs(&self) -> u64 {
         self.heartbeat_interval.as_secs()
+    }
+
+    /// Returns how many `ResendRequest` (2) messages may be sent for one gap,
+    /// never less than the one that opens the recovery.
+    #[must_use]
+    pub const fn resend_attempt_limit(&self) -> u32 {
+        if self.max_resend_requests == 0 {
+            1
+        } else {
+            self.max_resend_requests
+        }
     }
 }
 
@@ -755,6 +844,13 @@ impl SessionConfigBuilder {
             logon_timeout: self.logon_timeout,
             logout_timeout: self.logout_timeout,
             validate_checksum: self.validate_checksum,
+            // Inbound-hardening knobs are not exposed on the builder; they take
+            // the same defaults as `SessionConfig::new` and are tuned through
+            // the fluent `SessionConfig::with_*` setters after `build()`.
+            validate_length: true,
+            sending_time_tolerance: Duration::from_secs(120),
+            resend_timeout: Duration::from_secs(10),
+            max_resend_requests: 3,
             sender_sub_id: self.sender_sub_id,
             target_sub_id: self.target_sub_id,
             sender_location_id: self.sender_location_id,
@@ -1217,5 +1313,51 @@ mod tests {
                 max: MAX_MESSAGE_SIZE_LIMIT,
             })
         );
+    }
+
+    fn config() -> SessionConfig {
+        SessionConfig::new(comp_id("SENDER"), comp_id("TARGET"), "FIX.4.4")
+    }
+
+    #[test]
+    fn test_session_config_recovery_defaults_are_bounded() {
+        let config = config();
+
+        // Two minutes of clock skew, the interval FIX engines have converged
+        // on; three resend attempts ten seconds apart.
+        assert_eq!(config.sending_time_tolerance, Duration::from_secs(120));
+        assert_eq!(config.resend_timeout, Duration::from_secs(10));
+        assert_eq!(config.max_resend_requests, 3);
+        assert_eq!(config.resend_attempt_limit(), 3);
+    }
+
+    #[test]
+    fn test_session_config_zero_resend_requests_still_allows_one() {
+        // The first ResendRequest is unconditional: it is what opens the
+        // recovery the limit governs, so zero cannot mean "never ask".
+        let config = config().with_max_resend_requests(0);
+
+        assert_eq!(config.resend_attempt_limit(), 1);
+    }
+
+    #[test]
+    fn test_session_config_zero_tolerance_disables_sending_time_check() {
+        let config = config().with_sending_time_tolerance(Duration::ZERO);
+
+        assert_eq!(config.sending_time_tolerance, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_session_config_recovery_setters_apply() {
+        let config = config()
+            .with_sending_time_tolerance(Duration::from_secs(5))
+            .with_resend_timeout(Duration::from_millis(250))
+            .with_max_resend_requests(7)
+            .with_logout_timeout(Duration::from_secs(3));
+
+        assert_eq!(config.sending_time_tolerance, Duration::from_secs(5));
+        assert_eq!(config.resend_timeout, Duration::from_millis(250));
+        assert_eq!(config.resend_attempt_limit(), 7);
+        assert_eq!(config.logout_timeout, Duration::from_secs(3));
     }
 }

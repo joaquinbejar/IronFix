@@ -129,6 +129,15 @@ pub enum EngineError {
         received: String,
     },
 
+    /// The counterparty's `SendingTime` (52) failed validation: absent,
+    /// unparseable, or further from the local clock than
+    /// `SessionConfig::sending_time_tolerance` allows.
+    #[error("SendingTime problem: {detail}")]
+    SendingTime {
+        /// Which check failed, with the offending value or the measured skew.
+        detail: String,
+    },
+
     /// The configured `BeginString` cannot be framed conformantly.
     ///
     /// An unknown version, or `FIXT.1.1` on its own — which names the

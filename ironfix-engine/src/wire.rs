@@ -39,6 +39,7 @@ use ironfix_core::types::Timestamp;
 use ironfix_core::version::FixVersion;
 use ironfix_session::SessionConfig;
 use ironfix_tagvalue::{Decoder, Encoder};
+use std::time::Duration;
 
 /// A configured `BeginString` the engine cannot frame conformantly.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -114,16 +115,90 @@ pub(crate) struct IdentityMismatch {
     pub(crate) expected: String,
     /// The value the counterparty sent, empty when the tag was absent.
     pub(crate) received: String,
+    /// True when the tag carried the right value but was found outside the
+    /// standard header, where it does not identify the counterparty.
+    pub(crate) misplaced: bool,
 }
 
 impl std::fmt::Display for IdentityMismatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.misplaced {
+            return write!(
+                f,
+                "CompID problem: tag {} appears outside the standard header",
+                self.tag
+            );
+        }
         write!(
             f,
             "CompID problem: tag {} expected '{}', received '{}'",
             self.tag, self.expected, self.received
         )
     }
+}
+
+/// Whether `tag` belongs to the FIX standard header.
+///
+/// The set is the standard header of FIX 4.0 through 5.0 SP2 taken together:
+/// the framing fields, the routing and CompID fields, `MsgSeqNum` (34), the
+/// PossDup/PossResend pair, `SendingTime` (52) and `OrigSendingTime` (122),
+/// the `NoHops` group (627 and its 628/629/630 entries), and the FIXT.1.1
+/// application-version fields (1128, 1129, 1156). A tag outside this set is
+/// the first field of the message body.
+const fn is_standard_header_tag(tag: u32) -> bool {
+    matches!(
+        tag,
+        8 | 9
+            | 34
+            | 35
+            | 43
+            | 49
+            | 50
+            | 52
+            | 56
+            | 57
+            | 90
+            | 91
+            | 97
+            | 115
+            | 116
+            | 122
+            | 128
+            | 129
+            | 142
+            | 143
+            | 144
+            | 145
+            | 212
+            | 213
+            | 347
+            | 369
+            | 627
+            | 628
+            | 629
+            | 630
+            | 1128
+            | 1129
+            | 1156
+    )
+}
+
+/// Whether `tag` occurs in the standard header of `raw`.
+///
+/// The header is the leading run of standard-header tags, so the scan stops at
+/// the first body field. Decoded fields keep their wire order, which is what
+/// makes the distinction available here at all — nothing else in a decoded
+/// message says where the header ended.
+fn in_standard_header(raw: &RawMessage<'_>, tag: u32) -> bool {
+    for field in raw.fields() {
+        if field.tag == tag {
+            return true;
+        }
+        if !is_standard_header_tag(field.tag) {
+            return false;
+        }
+    }
+    false
 }
 
 /// The identity every inbound message must carry, derived from the session
@@ -162,15 +237,13 @@ impl PeerIdentity {
     ///
     /// Sub IDs are only checked when configured; an unconfigured sub ID
     /// places no requirement on the counterparty.
-    /// # Positional caveat
     ///
-    /// Field lookup is by tag over the whole decoded message, not by position,
-    /// so CompIDs appearing anywhere in the frame satisfy the check. A message
-    /// that omits them from the standard header but carries them in the body is
-    /// therefore accepted. Enforcing header position needs positional
-    /// information the decoder does not currently retain; the practical impact
-    /// is small, since a peer able to place the tags in the body can equally
-    /// place them in the header.
+    /// Each field must both carry the expected value **and** occur in the
+    /// standard header. A CompID that appears only after the message body
+    /// identifies nothing: the standard header is where the counterparty is
+    /// named, and a message that omits it from there is missing a required
+    /// header field however many copies it carries elsewhere. Both failures
+    /// are `SessionRejectReason` 9.
     pub(crate) fn validate(&self, raw: &RawMessage<'_>) -> Result<(), IdentityMismatch> {
         check_field(raw, 49, &self.sender_comp_id)?;
         check_field(raw, 56, &self.target_comp_id)?;
@@ -184,18 +257,290 @@ impl PeerIdentity {
     }
 }
 
-/// Compares one inbound identity field against its required value.
+/// Compares one inbound identity field against its required value, and
+/// requires it to sit in the standard header.
+///
+/// The value is compared first so a cross-wired CompID keeps reporting the
+/// value it sent rather than its position.
 fn check_field(raw: &RawMessage<'_>, tag: u32, expected: &str) -> Result<(), IdentityMismatch> {
     let received = raw.get_field_str(tag).unwrap_or_default();
-    if received == expected {
-        Ok(())
-    } else {
-        Err(IdentityMismatch {
+    if received != expected {
+        return Err(IdentityMismatch {
             tag,
             expected: expected.to_string(),
             received: received.to_string(),
-        })
+            misplaced: false,
+        });
     }
+    if !in_standard_header(raw, tag) {
+        return Err(IdentityMismatch {
+            tag,
+            expected: expected.to_string(),
+            received: received.to_string(),
+            misplaced: true,
+        });
+    }
+    Ok(())
+}
+
+/// Why an inbound `SendingTime` (52) failed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SendingTimeProblem {
+    /// The field is absent. It is required in every standard header.
+    Missing,
+    /// The field is present but is not a FIX `UTCTimestamp`.
+    Malformed {
+        /// The offending value, truncated for the log and the Reject text.
+        value: String,
+    },
+    /// The field parses but lies outside the configured tolerance.
+    Skewed {
+        /// Absolute difference from the local clock, in milliseconds.
+        skew_millis: u64,
+        /// The configured tolerance, in milliseconds.
+        tolerance_millis: u64,
+    },
+}
+
+impl SendingTimeProblem {
+    /// The session-level Reject this problem produces.
+    ///
+    /// Reason 10 is "SendingTime accuracy problem"; a missing required field
+    /// is reason 1 and an unparseable one is reason 6, "incorrect data
+    /// format" (`doc/fix_operations.md`, "Session Reject Reasons").
+    #[must_use]
+    pub(crate) fn reject_reason(&self) -> RejectReason {
+        let code = match self {
+            Self::Missing => 1,
+            Self::Malformed { .. } => 6,
+            Self::Skewed { .. } => 10,
+        };
+        RejectReason::new(code, self.to_string()).with_ref_tag(52)
+    }
+}
+
+impl std::fmt::Display for SendingTimeProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "SendingTime (52) is missing"),
+            Self::Malformed { value } => {
+                write!(f, "SendingTime (52) '{value}' is not a UTC timestamp")
+            }
+            Self::Skewed {
+                skew_millis,
+                tolerance_millis,
+            } => write!(
+                f,
+                "SendingTime (52) differs from the local clock by {skew_millis}ms, \
+                 outside the {tolerance_millis}ms tolerance"
+            ),
+        }
+    }
+}
+
+/// Longest `SendingTime` value echoed back in a Reject or a log line.
+///
+/// The value is counterparty-controlled and lands in `Text` (58) on the wire,
+/// so it is bounded. A legal `UTCTimestamp` is at most 27 characters.
+const MAX_ECHOED_SENDING_TIME: usize = 32;
+
+/// Checks inbound `SendingTime` (52) against the local clock.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SendingTimeGuard {
+    /// Configured tolerance. `Duration::ZERO` — and only that — disables the
+    /// check; any nonzero value, including a sub-millisecond one, leaves it on.
+    tolerance: Duration,
+}
+
+impl SendingTimeGuard {
+    /// Builds the guard from the session configuration.
+    #[must_use]
+    pub(crate) const fn new(config: &SessionConfig) -> Self {
+        Self {
+            tolerance: config.sending_time_tolerance,
+        }
+    }
+
+    /// Whether the check is switched off.
+    ///
+    /// Only an exactly-zero tolerance disables it. The duration is compared as
+    /// a duration rather than flattened to whole milliseconds first, so a
+    /// sub-millisecond tolerance — which floors to zero milliseconds — cannot
+    /// masquerade as "disabled" and silently switch the whole check off, the
+    /// opposite of what the operator asked for.
+    #[must_use]
+    pub(crate) const fn is_disabled(&self) -> bool {
+        self.tolerance.is_zero()
+    }
+
+    /// Validates the `SendingTime` (52) of an inbound message.
+    ///
+    /// A zero tolerance disables the check entirely, including the presence
+    /// and format checks: the knob governs `SendingTime` validation as a
+    /// whole, so an operator who has switched it off for a peer with a known
+    /// clock problem does not get half of it back.
+    ///
+    /// Tag 52 must sit in the standard header: a copy appearing only after the
+    /// body opens names no sending time, exactly as a misplaced CompID names no
+    /// counterparty, so it is treated as absent. The binding spec assigns no
+    /// positional reject reason for 52 (reason 9 is CompID-only), so this is
+    /// inbound-acceptance hardening rather than a spec-mandated reject.
+    ///
+    /// # Errors
+    /// Returns [`SendingTimeProblem::Missing`] when tag 52 is absent from the
+    /// standard header, [`SendingTimeProblem::Malformed`] when it is present but
+    /// is not a UTF-8 `UTCTimestamp`, and [`SendingTimeProblem::Skewed`] when it
+    /// parses but lies further from the local clock than the configured
+    /// tolerance, in either direction.
+    pub(crate) fn validate(&self, raw: &RawMessage<'_>) -> Result<(), SendingTimeProblem> {
+        if self.is_disabled() {
+            return Ok(());
+        }
+        // Present AND in the standard header, in that order: the header copy is
+        // the one that counts, so a body-only 52 is as good as missing.
+        let Some(field) = raw.get_field(52).filter(|_| in_standard_header(raw, 52)) else {
+            return Err(SendingTimeProblem::Missing);
+        };
+        // A present-but-unreadable value is malformed (reason 6), not missing
+        // (reason 1). Invalid UTF-8 fails `as_str`, so it is folded into the
+        // same malformed path instead of being misreported as absent, per
+        // `doc/fix_operations.md`, "Session Reject Reasons".
+        let Ok(value) = field.as_str() else {
+            return Err(SendingTimeProblem::Malformed {
+                value: String::from_utf8_lossy(field.value)
+                    .chars()
+                    .take(MAX_ECHOED_SENDING_TIME)
+                    .collect(),
+            });
+        };
+        let Some(sent_millis) = parse_utc_timestamp_millis(value) else {
+            return Err(SendingTimeProblem::Malformed {
+                value: value.chars().take(MAX_ECHOED_SENDING_TIME).collect(),
+            });
+        };
+
+        let skew_millis = Timestamp::now().as_millis().abs_diff(sent_millis);
+        // Compared as a duration so the tolerance is never truncated to whole
+        // milliseconds: a sub-millisecond tolerance stays meaningful.
+        if Duration::from_millis(skew_millis) > self.tolerance {
+            return Err(SendingTimeProblem::Skewed {
+                skew_millis,
+                tolerance_millis: u64::try_from(self.tolerance.as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Parses a FIX `UTCTimestamp` into milliseconds since the Unix epoch.
+///
+/// Accepts `YYYYMMDD-HH:MM:SS` with an optional fractional part of one to nine
+/// digits, which covers every precision FIX 4.0 through 5.0 SP2 puts on the
+/// wire. Digits below the millisecond are truncated; the tolerance this feeds
+/// is measured in seconds.
+///
+/// Returns `None` for anything else, including a well-shaped string naming a
+/// date that does not exist and any year before 1970. There is no
+/// representable instant for those, and inventing one would let a malformed
+/// value pass the accuracy check.
+fn parse_utc_timestamp_millis(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    // "YYYYMMDD-HH:MM:SS" — the fractional part is optional.
+    if bytes.len() < 17 || bytes.get(8) != Some(&b'-') {
+        return None;
+    }
+    if bytes.get(11) != Some(&b':') || bytes.get(14) != Some(&b':') {
+        return None;
+    }
+
+    let year = parse_digits(bytes.get(0..4)?)?;
+    let month = parse_digits(bytes.get(4..6)?)?;
+    let day = parse_digits(bytes.get(6..8)?)?;
+    let hour = parse_digits(bytes.get(9..11)?)?;
+    let minute = parse_digits(bytes.get(12..14)?)?;
+    // 60 is a leap second, which FIX permits.
+    let second = parse_digits(bytes.get(15..17)?)?;
+
+    let fraction_millis = match bytes.get(17) {
+        None => 0,
+        Some(&b'.') => parse_fraction_millis(bytes.get(18..)?)?,
+        Some(_) => return None,
+    };
+
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year, month)?
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)?;
+    seconds.checked_mul(1_000)?.checked_add(fraction_millis)
+}
+
+/// Parses a run of ASCII digits into an integer.
+fn parse_digits(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for byte in bytes {
+        value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
+/// Parses the fractional-second digits of a `UTCTimestamp` into milliseconds,
+/// truncating anything below a millisecond.
+fn parse_fraction_millis(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() || bytes.len() > 9 || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut millis: u64 = 0;
+    for index in 0..3 {
+        let digit = bytes.get(index).map_or(0, |byte| u64::from(byte - b'0'));
+        millis = millis * 10 + digit;
+    }
+    Some(millis)
+}
+
+/// Days in `month` of `year`, Gregorian.
+fn days_in_month(year: u64, month: u64) -> Option<u64> {
+    const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    if month == 2 && leap {
+        return Some(29);
+    }
+    let index = usize::try_from(month.checked_sub(1)?).ok()?;
+    LENGTHS.get(index).copied()
+}
+
+/// Days from `1970-01-01` to the given Gregorian date.
+///
+/// Hinnant's `days_from_civil`, restricted to dates at or after the epoch so
+/// every intermediate stays non-negative. The caller has already range-checked
+/// the components.
+fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
+    let shifted = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
+    let era = shifted / 400;
+    let year_of_era = shifted - era * 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    (era * 146_097 + day_of_era).checked_sub(719_468)
 }
 
 /// Decodes a framed FIX message.
@@ -602,6 +947,7 @@ mod tests {
     use super::*;
     use ironfix_core::message::MsgType;
     use ironfix_core::types::CompId;
+    use std::time::Duration;
 
     fn config_for(begin_string: &str) -> SessionConfig {
         let Ok(sender) = CompId::new("CLIENT") else {
@@ -1102,6 +1448,7 @@ mod tests {
                 tag: 49,
                 expected: "VENUE".to_string(),
                 received: "OTHER".to_string(),
+                misplaced: false,
             })
         );
     }
@@ -1127,7 +1474,357 @@ mod tests {
                 tag: 57,
                 expected: "DESK".to_string(),
                 received: String::new(),
+                misplaced: false,
             })
+        );
+    }
+
+    /// Builds a frame with an explicit field order, bypassing the encoder's
+    /// header conformance so the body can carry the CompIDs.
+    fn frame_with_fields(fields: &[(u32, &str)]) -> Vec<u8> {
+        let fields: Vec<(u32, &[u8])> = fields
+            .iter()
+            .map(|(tag, value)| (*tag, value.as_bytes()))
+            .collect();
+        frame_with_raw_fields(&fields)
+    }
+
+    /// Builds a framed message from raw field bytes, so a value can carry a
+    /// sequence that is not valid UTF-8.
+    fn frame_with_raw_fields(fields: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (tag, value) in fields {
+            body.extend_from_slice(format!("{tag}=").as_bytes());
+            body.extend_from_slice(value);
+            body.push(0x01);
+        }
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"8=FIX.4.4\x01");
+        frame.extend_from_slice(format!("9={}\x01", body.len()).as_bytes());
+        frame.extend_from_slice(&body);
+        let sum: u64 = frame.iter().map(|&byte| u64::from(byte)).sum();
+        frame.extend_from_slice(format!("10={:03}\x01", sum % 256).as_bytes());
+        frame
+    }
+
+    #[test]
+    fn test_peer_identity_rejects_comp_ids_outside_the_standard_header() {
+        let identity = PeerIdentity::new(&config_for("FIX.4.4"));
+        // 11 (ClOrdID) opens the body; the CompIDs that follow it are not in
+        // the standard header and identify nothing.
+        let frame = frame_with_fields(&[
+            (35, "D"),
+            (34, "2"),
+            (52, "20260721-10:00:00.000"),
+            (11, "ORDER-1"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+        ]);
+
+        assert_eq!(
+            identity.validate(&decode(&frame)),
+            Err(IdentityMismatch {
+                tag: 49,
+                expected: "VENUE".to_string(),
+                received: "VENUE".to_string(),
+                misplaced: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_peer_identity_accepts_comp_ids_across_the_whole_standard_header() {
+        // 50/57/122 sit after MsgSeqNum in the standard header, so the run the
+        // scan walks must not stop before them.
+        let config = config_for("FIX.4.4")
+            .with_sender_sub_id("DESK")
+            .with_target_sub_id("MM");
+        let identity = PeerIdentity::new(&config);
+        let frame = frame_with_fields(&[
+            (35, "D"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "2"),
+            (50, "MM"),
+            (57, "DESK"),
+            (43, "Y"),
+            (52, "20260721-10:00:00.000"),
+            (122, "20260721-10:00:00.000"),
+            (11, "ORDER-1"),
+        ]);
+
+        assert_eq!(identity.validate(&decode(&frame)), Ok(()));
+    }
+
+    #[test]
+    fn test_parse_utc_timestamp_accepts_every_fix_precision() {
+        // 1970-01-01T00:00:00Z is 0; the fractional part only adds millis.
+        assert_eq!(parse_utc_timestamp_millis("19700101-00:00:00"), Some(0));
+        assert_eq!(parse_utc_timestamp_millis("19700101-00:00:00.000"), Some(0));
+        assert_eq!(
+            parse_utc_timestamp_millis("19700101-00:00:00.123456"),
+            Some(123)
+        );
+        assert_eq!(
+            parse_utc_timestamp_millis("19700101-00:00:00.123456789"),
+            Some(123)
+        );
+        assert_eq!(
+            parse_utc_timestamp_millis("19700102-00:00:01.500"),
+            Some(86_401_500)
+        );
+    }
+
+    /// The parser must agree with the formatter it validates against, for
+    /// dates on both sides of a leap day.
+    #[test]
+    fn test_parse_utc_timestamp_roundtrips_the_formatter() {
+        for millis in [
+            0,
+            951_782_400_000,   // 2000-02-29, a leap day in a leap century
+            1_078_012_800_000, // 2004-02-29
+            1_769_000_000_123,
+            4_102_444_800_999, // 2100-01-01, a common year divisible by 100
+        ] {
+            let Ok(timestamp) = Timestamp::from_millis(millis) else {
+                unreachable!("{millis} is representable")
+            };
+            assert_eq!(
+                parse_utc_timestamp_millis(timestamp.format_millis().as_str()),
+                Some(millis),
+                "{} did not round-trip",
+                timestamp.format_millis()
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_utc_timestamp_rejects_malformed_values() {
+        for value in [
+            "",
+            "not-a-timestamp",
+            "20260721",
+            "20260721-10:00",
+            "20260721 10:00:00",
+            "20260721-10-00-00",
+            "2026072a-10:00:00",
+            "20260721-10:00:00.",
+            "20260721-10:00:00.1234567890", // more than nanosecond precision
+            "20260721-10:00:00x000",
+            "20260231-10:00:00.000", // February has no 31st
+            "20260732-10:00:00.000",
+            "20261301-10:00:00.000",
+            "20260721-24:00:00.000",
+            "20260721-10:60:00.000",
+            "20260721-10:00:61.000",
+            "19690721-10:00:00.000", // before the epoch
+        ] {
+            assert_eq!(
+                parse_utc_timestamp_millis(value),
+                None,
+                "{value} must not parse"
+            );
+        }
+    }
+
+    /// A leap second is a legal UTCTimestamp and must not be refused.
+    #[test]
+    fn test_parse_utc_timestamp_accepts_leap_second() {
+        assert!(parse_utc_timestamp_millis("20261231-23:59:60.000").is_some());
+    }
+
+    fn guard_with(tolerance: Duration) -> SendingTimeGuard {
+        SendingTimeGuard::new(&config_for("FIX.4.4").with_sending_time_tolerance(tolerance))
+    }
+
+    fn frame_sent_at(sending_time: &str) -> Vec<u8> {
+        frame_with_fields(&[
+            (35, "0"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "2"),
+            (52, sending_time),
+        ])
+    }
+
+    #[test]
+    fn test_sending_time_guard_accepts_the_current_clock() {
+        let frame = frame_sent_at(Timestamp::now().format_millis().as_str());
+
+        assert_eq!(
+            guard_with(Duration::from_secs(120)).validate(&decode(&frame)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_sending_time_guard_rejects_a_stale_timestamp_with_reason_10() {
+        let frame = frame_sent_at("20200101-00:00:00.000");
+
+        let problem = match guard_with(Duration::from_secs(120)).validate(&decode(&frame)) {
+            Err(problem) => problem,
+            Ok(()) => panic!("a five-year-old SendingTime must not pass"),
+        };
+        assert!(matches!(problem, SendingTimeProblem::Skewed { .. }));
+        assert_eq!(problem.reject_reason().code, 10);
+        assert_eq!(problem.reject_reason().ref_tag, Some(52));
+    }
+
+    /// The window is symmetric: a peer whose clock runs fast is as broken as
+    /// one that runs slow.
+    #[test]
+    fn test_sending_time_guard_rejects_a_future_timestamp() {
+        let frame = frame_sent_at("21000101-00:00:00.000");
+
+        assert!(matches!(
+            guard_with(Duration::from_secs(120)).validate(&decode(&frame)),
+            Err(SendingTimeProblem::Skewed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_sending_time_guard_accepts_skew_inside_the_window() {
+        let Some(millis) = Timestamp::now().as_millis().checked_sub(60_000) else {
+            unreachable!("the system clock is at least a minute past the epoch")
+        };
+        let Ok(stale) = Timestamp::from_millis(millis) else {
+            unreachable!("a minute before now is representable")
+        };
+        let frame = frame_sent_at(stale.format_millis().as_str());
+
+        // A minute of skew inside a two-minute window is tolerated: the check
+        // is a broken-clock detector, not a latency budget.
+        assert_eq!(
+            guard_with(Duration::from_secs(120)).validate(&decode(&frame)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_sending_time_guard_reports_missing_and_malformed_fields() {
+        let missing = frame_with_fields(&[(35, "0"), (49, "VENUE"), (56, "CLIENT"), (34, "2")]);
+        let guard = guard_with(Duration::from_secs(120));
+        assert_eq!(
+            guard.validate(&decode(&missing)),
+            Err(SendingTimeProblem::Missing)
+        );
+        assert_eq!(
+            SendingTimeProblem::Missing.reject_reason().code,
+            1,
+            "a missing required header field is reason 1"
+        );
+
+        let malformed = frame_sent_at("yesterday");
+        assert_eq!(
+            guard.validate(&decode(&malformed)),
+            Err(SendingTimeProblem::Malformed {
+                value: "yesterday".to_string(),
+            })
+        );
+        assert_eq!(
+            SendingTimeProblem::Malformed {
+                value: "yesterday".to_string()
+            }
+            .reject_reason()
+            .code,
+            6,
+            "an unparseable timestamp is reason 6"
+        );
+    }
+
+    #[test]
+    fn test_sending_time_guard_zero_tolerance_disables_every_check() {
+        let guard = guard_with(Duration::ZERO);
+        assert!(guard.is_disabled());
+
+        // Neither a wildly skewed value nor an absent one is reported once the
+        // operator has switched the check off.
+        let stale = frame_sent_at("20200101-00:00:00.000");
+        assert_eq!(guard.validate(&decode(&stale)), Ok(()));
+        let missing = frame_with_fields(&[(35, "0"), (49, "VENUE"), (56, "CLIENT"), (34, "2")]);
+        assert_eq!(guard.validate(&decode(&missing)), Ok(()));
+    }
+
+    #[test]
+    fn test_sending_time_guard_echoes_a_bounded_value() {
+        let long = "9".repeat(200);
+        let frame = frame_sent_at(&long);
+
+        match guard_with(Duration::from_secs(120)).validate(&decode(&frame)) {
+            Err(SendingTimeProblem::Malformed { value }) => {
+                assert_eq!(value.chars().count(), MAX_ECHOED_SENDING_TIME);
+            }
+            other => panic!("a 200-character SendingTime must be malformed: {other:?}"),
+        }
+    }
+
+    /// A tag 52 that appears only after the body opens is not in the standard
+    /// header and names no sending time: it is treated as missing, mirroring the
+    /// positional guard the CompID check already applies.
+    #[test]
+    fn test_sending_time_guard_treats_a_body_only_sending_time_as_missing() {
+        // 11 (ClOrdID) opens the body; the 52 that follows it is not a header
+        // field however well-formed its value is.
+        let frame = frame_with_fields(&[
+            (35, "D"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "2"),
+            (11, "ORDER-1"),
+            (52, "20260721-10:00:00.000"),
+        ]);
+
+        assert_eq!(
+            guard_with(Duration::from_secs(120)).validate(&decode(&frame)),
+            Err(SendingTimeProblem::Missing)
+        );
+    }
+
+    /// A present tag 52 whose bytes are not valid UTF-8 is malformed (reason 6),
+    /// not missing (reason 1): the field is there, it is just unreadable.
+    #[test]
+    fn test_sending_time_guard_reports_invalid_utf8_as_malformed() {
+        let frame = frame_with_raw_fields(&[
+            (35, b"0"),
+            (49, b"VENUE"),
+            (56, b"CLIENT"),
+            (34, b"2"),
+            (52, &[0xFF, 0xFE, 0xFD]),
+        ]);
+
+        let problem = match guard_with(Duration::from_secs(120)).validate(&decode(&frame)) {
+            Err(problem) => problem,
+            Ok(()) => panic!("a non-UTF-8 SendingTime must not pass"),
+        };
+        assert!(matches!(problem, SendingTimeProblem::Malformed { .. }));
+        assert_eq!(
+            problem.reject_reason().code,
+            6,
+            "a present but unreadable timestamp is reason 6, not the reason 1 of an absent one"
+        );
+    }
+
+    /// A sub-millisecond tolerance floors to zero milliseconds, but the check
+    /// stays enabled: it must still validate rather than treating the truncated
+    /// value as the disabled sentinel.
+    #[test]
+    fn test_sending_time_guard_sub_millisecond_tolerance_stays_enabled() {
+        let guard = guard_with(Duration::from_micros(500));
+        assert!(!guard.is_disabled(), "a 500us tolerance is not disabled");
+
+        // A wildly stale timestamp is still rejected under the tiny tolerance.
+        let stale = frame_sent_at("20200101-00:00:00.000");
+        assert!(matches!(
+            guard.validate(&decode(&stale)),
+            Err(SendingTimeProblem::Skewed { .. })
+        ));
+
+        // And an absent field is still reported, proving the presence check was
+        // not switched off along with the skew check.
+        let missing = frame_with_fields(&[(35, "0"), (49, "VENUE"), (56, "CLIENT"), (34, "2")]);
+        assert_eq!(
+            guard.validate(&decode(&missing)),
+            Err(SendingTimeProblem::Missing)
         );
     }
 }

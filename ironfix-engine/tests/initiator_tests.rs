@@ -80,6 +80,22 @@ fn venue_msg_from(
     frame_of(&mut encoder)
 }
 
+/// Stub-acceptor frame with an explicit `SendingTime` (52), for clock-skew
+/// validation tests. Unlike [`venue_msg`], the timestamp is not overwritten
+/// with the current clock.
+fn venue_msg_at(msg_type: &str, seq: u64, sending_time: &str, extra: &[(u32, &str)]) -> BytesMut {
+    let mut encoder = Encoder::new("FIX.4.4");
+    encoder.put_str(35, msg_type);
+    encoder.put_str(49, "VENUE");
+    encoder.put_str(56, "CLIENT");
+    encoder.put_uint(34, seq);
+    encoder.put_str(52, sending_time);
+    for (tag, value) in extra {
+        encoder.put_str(*tag, value);
+    }
+    frame_of(&mut encoder)
+}
+
 /// Returns the finished frame, failing the test with the encoder's rejection.
 #[track_caller]
 fn frame_of(encoder: &mut Encoder) -> BytesMut {
@@ -2102,6 +2118,442 @@ async fn test_dropping_all_handles_logs_out() {
         ),
         "acceptor task",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Bounded resend recovery (issue #29, gap 1)
+// ---------------------------------------------------------------------------
+
+/// A peer that never satisfies a resend reaches a bounded outcome: the client
+/// retries the ResendRequest up to the configured limit, then logs out. A long
+/// heartbeat interval rules the heartbeat timeout out as the cause, so the
+/// close is attributable to the resend bound alone.
+#[tokio::test]
+async fn test_unsatisfied_resend_request_times_out_into_logout() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+
+        // Open a gap the acceptor will never fill: jump straight to seq 5.
+        ok(
+            framed
+                .send(venue_msg(
+                    "8",
+                    5,
+                    &[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "send gapped report",
+        );
+
+        // Read the client's frames until it gives up and logs out, counting
+        // the ResendRequests. The gap is never filled, so the only conforming
+        // outcomes are more requests and, finally, a Logout.
+        let mut resend_requests = 0;
+        loop {
+            let frame = next_frame(&mut framed).await;
+            match msg_type_of(&frame).as_str() {
+                "2" => {
+                    assert_eq!(field(&frame, 7).as_deref(), Some("2"));
+                    resend_requests += 1;
+                }
+                "5" => {
+                    // The Logout explains why, so a supervisor can tell a
+                    // stalled resend from an ordinary shutdown.
+                    let text = some(field(&frame, 58), "abandon Logout carries Text");
+                    assert!(
+                        text.contains("resend"),
+                        "Logout should name the stalled resend, got {text:?}"
+                    );
+                    break;
+                }
+                other => panic!("unexpected frame while stalled: {other}"),
+            }
+        }
+        // Three attempts total: the request the gap opens plus two retries.
+        assert_eq!(
+            resend_requests, 3,
+            "expected the initial request and two retries"
+        );
+    });
+
+    let (app, mut app_rx) = RecordingApp::new();
+    // A 30s heartbeat cannot fire inside this test, so only the resend bound
+    // can close the session; a 150ms resend timeout keeps it quick.
+    let config = client_config(Duration::from_secs(30))
+        .with_resend_timeout(Duration::from_millis(150))
+        .with_max_resend_requests(3);
+    let initiator = Initiator::new(config, Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the stalled session must close within 5s",
+    );
+    assert!(app.events().contains(&"logout".to_string()));
+    // Nothing ever satisfied the gap, so nothing was delivered.
+    assert!(
+        timeout(Duration::from_millis(200), app_rx.recv())
+            .await
+            .is_err(),
+        "a gapped, never-filled message must not be delivered"
+    );
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// A peer that fills only the *start* of a gap and then goes quiet — while
+/// spamming timely duplicates that keep the heartbeat clock alive — must still
+/// be escalated to Logout. The single in-order message that opens the fill used
+/// to wipe all knowledge of the still-open gap, after which neither the resend
+/// bound nor the heartbeat timeout could fire: a silent stall. Recovery now
+/// tracks the whole outstanding range, so the retries continue from the
+/// advanced expectation until the bound is spent.
+#[tokio::test]
+async fn test_partial_resend_then_duplicate_flood_escalates_to_logout() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+
+        // Open a gap 2..=4 by jumping straight to seq 5.
+        ok(
+            framed
+                .send(venue_msg(
+                    "8",
+                    5,
+                    &[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "send gapped report",
+        );
+
+        // The client requests the whole range from 2.
+        let first = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&first), "2");
+        assert_eq!(
+            field(&first, 7).as_deref(),
+            Some("2"),
+            "the first request covers the gap start"
+        );
+
+        // Fill only the START of the gap, in order: seq 2. Sequences 3 and 4
+        // (and the 5 that opened the gap) stay missing. Before the fix this
+        // single in-order message cleared all resend state.
+        ok(
+            framed
+                .send(venue_msg(
+                    "8",
+                    2,
+                    &[(43, "Y"), (37, "EX-2"), (17, "E-2"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "fill the gap start only",
+        );
+
+        // Now flood timely duplicate-2s (PossDup): they refresh the heartbeat
+        // but make no in-order progress. A correct client keeps chasing the
+        // still-open gap from the advanced expectation and finally logs out; a
+        // buggy one sits here forever, having forgotten the gap.
+        let mut resend_requests = 0;
+        loop {
+            ok(
+                framed
+                    .send(venue_msg(
+                        "8",
+                        2,
+                        &[(43, "Y"), (37, "EX-2"), (17, "E-2"), (150, "0"), (39, "0")],
+                    ))
+                    .await,
+                "flood a timely duplicate",
+            );
+            let frame = next_frame(&mut framed).await;
+            match msg_type_of(&frame).as_str() {
+                "2" => {
+                    // The retry targets the advanced gap start (3), never the
+                    // already-consumed 2.
+                    assert_eq!(
+                        field(&frame, 7).as_deref(),
+                        Some("3"),
+                        "the retry must start from the advanced expectation, not the consumed number"
+                    );
+                    resend_requests += 1;
+                }
+                "5" => {
+                    let text = some(field(&frame, 58), "abandon Logout carries Text");
+                    assert!(
+                        text.contains("resend"),
+                        "Logout should name the stalled resend, got {text:?}"
+                    );
+                    break;
+                }
+                // A 30s heartbeat cannot fire in this window, but tolerate an
+                // admin frame rather than racing on it.
+                "0" | "1" => {}
+                other => panic!("unexpected frame while stalled: {other}"),
+            }
+        }
+        assert_eq!(
+            resend_requests, 2,
+            "the partial fill must leave the gap armed: two retries then Logout"
+        );
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    // A 30s heartbeat cannot fire inside this test, so only the resend bound can
+    // close the session; a 150ms resend timeout keeps it quick.
+    let config = client_config(Duration::from_secs(30))
+        .with_resend_timeout(Duration::from_millis(150))
+        .with_max_resend_requests(3);
+    let initiator = Initiator::new(config, Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the partially-filled, then flooded, session must still close within 5s",
+    );
+    assert!(app.events().contains(&"logout".to_string()));
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// A GapFill that errors mid-recovery still consumes its sequence number, so the
+/// resend must advance with it: the next request starts from the new
+/// expectation, never re-requesting the number the errored fill already
+/// consumed. The reject paths used to advance the target without updating the
+/// resend, so a retry re-asked for an already-processed sequence.
+#[tokio::test]
+async fn test_errored_gap_fill_mid_recovery_advances_the_resend_request() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+
+        // Open a gap 2..=4 by jumping straight to seq 5.
+        ok(
+            framed
+                .send(venue_msg(
+                    "8",
+                    5,
+                    &[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "send gapped report",
+        );
+
+        // The client requests the whole range from 2.
+        let first = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&first), "2");
+        assert_eq!(field(&first, 7).as_deref(), Some("2"));
+
+        // Answer with an in-sequence GapFill for seq 2 that the app rejects.
+        // It still consumes seq 2, advancing the expectation to 3, so any later
+        // resend must start from 3 — never the already-consumed 2.
+        ok(
+            framed
+                .send(venue_msg("4", 2, &[(43, "Y"), (123, "Y"), (36, "3")]))
+                .await,
+            "send an in-sequence gap fill the app rejects",
+        );
+
+        loop {
+            let frame = next_frame(&mut framed).await;
+            match msg_type_of(&frame).as_str() {
+                "3" => {
+                    // The Reject for the errored fill references seq 2.
+                    assert_eq!(field(&frame, 45).as_deref(), Some("2"));
+                }
+                "2" => {
+                    assert_eq!(
+                        field(&frame, 7).as_deref(),
+                        Some("3"),
+                        "the resend after an errored fill must start from the advanced expectation, not the consumed number"
+                    );
+                    break;
+                }
+                "5" => panic!("the session must keep recovering, not log out here"),
+                "0" | "1" => {}
+                other => panic!("unexpected frame after an errored fill: {other}"),
+            }
+        }
+    });
+
+    let (app, _app_rx) = RecordingApp::rejecting_admin();
+    let config =
+        client_config(Duration::from_secs(30)).with_resend_timeout(Duration::from_millis(150));
+    let initiator = Initiator::new(config, Arc::clone(&app));
+    let _connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SendingTime accuracy (issue #29, gap 2)
+// ---------------------------------------------------------------------------
+
+/// A message whose SendingTime is far outside the tolerance is rejected with
+/// reason 10 and the session is logged out, mirroring an identity mismatch.
+#[tokio::test]
+async fn test_skewed_sending_time_rejects_with_reason_10_and_closes() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+
+        // A SendingTime years in the past, well outside any sane tolerance.
+        ok(
+            framed
+                .send(venue_msg_at(
+                    "8",
+                    2,
+                    "20200101-00:00:00.000",
+                    &[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "send stale report",
+        );
+
+        let reject = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reject), "3");
+        assert_eq!(field(&reject, 45).as_deref(), Some("2"));
+        assert_eq!(field(&reject, 373).as_deref(), Some("10"));
+        assert_eq!(field(&reject, 371).as_deref(), Some("52"));
+
+        let logout = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logout), "5");
+    });
+
+    let (app, mut app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the skewed session must close within 5s",
+    );
+    assert!(
+        timeout(Duration::from_millis(200), app_rx.recv())
+            .await
+            .is_err(),
+        "a message with a bad SendingTime must not be delivered"
+    );
+
+    ok(acceptor.await, "acceptor task");
+}
+
+/// With the tolerance switched off, the same stale SendingTime is accepted and
+/// the message is delivered.
+#[tokio::test]
+async fn test_zero_tolerance_accepts_any_sending_time() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        ok(
+            framed
+                .send(venue_msg_at(
+                    "8",
+                    2,
+                    "20200101-00:00:00.000",
+                    &[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "send stale report",
+        );
+    });
+
+    let (app, mut app_rx) = RecordingApp::new();
+    let config = client_config(Duration::from_secs(30)).with_sending_time_tolerance(Duration::ZERO);
+    let initiator = Initiator::new(config, Arc::clone(&app));
+    let _connection = ok(initiator.connect(addr).await, "connect");
+
+    let delivered = ok(
+        timeout(Duration::from_secs(5), app_rx.recv()).await,
+        "the message must be delivered with the check off",
+    );
+    assert_eq!(delivered.as_deref(), Some("8"));
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Positional CompID enforcement (issue #29, gap 3)
+// ---------------------------------------------------------------------------
+
+/// A frame that carries the CompIDs only after the message body, not in the
+/// standard header, is rejected with reason 9 and the session is closed. The
+/// tags are present and correct; only their placement is wrong.
+#[tokio::test]
+async fn test_comp_ids_outside_the_header_reject_and_close() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+
+        // 11 (ClOrdID) opens the body; the CompIDs sit after it, so they are
+        // no longer in the standard header. Hand-rolled, since the encoder
+        // stamps a conforming header.
+        let now = Timestamp::now().format_millis();
+        let body = format!(
+            "35=8\x0134=2\x0152={}\x0111=ORDER-1\x0149=VENUE\x0156=CLIENT\x01",
+            now.as_str()
+        );
+        ok(
+            framed.send(raw_frame(body.as_bytes())).await,
+            "send body-CompID frame",
+        );
+
+        let reject = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reject), "3");
+        assert_eq!(field(&reject, 45).as_deref(), Some("2"));
+        assert_eq!(field(&reject, 373).as_deref(), Some("9"));
+        assert_eq!(field(&reject, 371).as_deref(), Some("49"));
+
+        let logout = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logout), "5");
+    });
+
+    let (app, mut app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the misplaced-CompID session must close within 5s",
+    );
+    assert!(
+        timeout(Duration::from_millis(200), app_rx.recv())
+            .await
+            .is_err(),
+        "a frame missing header CompIDs must not be delivered"
+    );
+
+    ok(acceptor.await, "acceptor task");
 }
 
 /// with_initial_sequences seeds both counters for session continuity.
