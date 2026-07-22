@@ -280,12 +280,15 @@ impl FastDecoder {
         let biased = Self::decode_uint_u128(data, offset)?;
         match biased {
             0 => Ok(None),
-            // `biased >= 1` here, so the subtraction cannot underflow; the value
-            // may still exceed `u64::MAX` for an over-long encoding, which the
-            // narrowing rejects.
-            biased => u64::try_from(biased - 1)
+            // `checked_sub` keeps the decode path free of bare arithmetic even
+            // though the `0` arm above already guarantees `biased >= 1`; the
+            // debiased value may still exceed `u64::MAX` for an over-long
+            // encoding, which the narrowing rejects as `IntegerOverflow`.
+            biased => biased
+                .checked_sub(1)
+                .and_then(|value| u64::try_from(value).ok())
                 .map(Some)
-                .map_err(|_| FastError::IntegerOverflow),
+                .ok_or(FastError::IntegerOverflow),
         }
     }
 
