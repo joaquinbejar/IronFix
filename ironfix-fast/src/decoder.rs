@@ -216,6 +216,48 @@ impl FastDecoder {
         Ok(result)
     }
 
+    /// Decodes a stop-bit unsigned integer into a `u128`.
+    ///
+    /// Identical to [`FastDecoder::decode_uint`] but accumulates in `u128`, so
+    /// it can hold the biased `2^64` a nullable unsigned uses to denote
+    /// `u64::MAX`. The same [`MAX_INT_ENCODED_LEN`] ceiling bounds the read, so
+    /// a hostile over-long encoding is [`FastError::IntegerOverflow`] rather
+    /// than an unbounded loop.
+    ///
+    /// # Errors
+    /// [`FastError::UnexpectedEof`] if the input ends mid-value, or
+    /// [`FastError::IntegerOverflow`] if the encoding exceeds
+    /// [`MAX_INT_ENCODED_LEN`] bytes.
+    fn decode_uint_u128(data: &[u8], offset: &mut usize) -> Result<u128, FastError> {
+        /// Value of one payload byte position.
+        const RADIX: u128 = 1 << PAYLOAD_BITS;
+
+        let mut result: u128 = 0;
+        let mut consumed: usize = 0;
+
+        loop {
+            if consumed == MAX_INT_ENCODED_LEN {
+                return Err(FastError::IntegerOverflow);
+            }
+            let byte = read_byte(data, offset)?;
+            consumed += 1;
+
+            // `checked_mul` rejects any value that would lose significant bits.
+            // The product's low seven bits are zero, so the `|` below cannot
+            // carry and is exact.
+            result = result
+                .checked_mul(RADIX)
+                .ok_or(FastError::IntegerOverflow)?
+                | u128::from(byte & PAYLOAD_MASK);
+
+            if byte & STOP_BIT != 0 {
+                break;
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Decodes a nullable unsigned integer.
     ///
     /// FAST represents a nullable unsigned integer with a bias of one: a lone
@@ -225,20 +267,25 @@ impl FastDecoder {
     /// the two must agree, so the bias lives here rather than in every caller,
     /// which is where an off-by-one reappears.
     ///
-    /// The representable domain is therefore `0..=u64::MAX - 1`.
+    /// The representable domain is the full `0..=u64::MAX`: `u64::MAX` biases to
+    /// `2^64`, which does not fit `u64`, so the biased value is decoded through
+    /// `u128` and only the debiased result is narrowed back to `u64`.
     ///
     /// # Errors
     /// Returns [`FastError::UnexpectedEof`] if the input ends mid-value, or
-    /// [`FastError::IntegerOverflow`] if the encoded value exceeds the
-    /// representable domain.
+    /// [`FastError::IntegerOverflow`] if the debiased value exceeds `u64::MAX`
+    /// (a hostile over-long encoding) — never a panic and never an unbounded
+    /// read.
     pub fn decode_nullable_uint(data: &[u8], offset: &mut usize) -> Result<Option<u64>, FastError> {
-        let raw = Self::decode_uint(data, offset)?;
-        match raw {
+        let biased = Self::decode_uint_u128(data, offset)?;
+        match biased {
             0 => Ok(None),
-            biased => biased
-                .checked_sub(1)
+            // `biased >= 1` here, so the subtraction cannot underflow; the value
+            // may still exceed `u64::MAX` for an over-long encoding, which the
+            // narrowing rejects.
+            biased => u64::try_from(biased - 1)
                 .map(Some)
-                .ok_or(FastError::IntegerOverflow),
+                .map_err(|_| FastError::IntegerOverflow),
         }
     }
 
@@ -837,6 +884,9 @@ mod tests {
             Some(127),
             Some(128),
             Some(u64::MAX - 1),
+            // u64::MAX biases to 2^64, decoded through u128: the domain now
+            // covers the full unsigned range, not 0..=u64::MAX-1.
+            Some(u64::MAX),
         ] {
             let mut encoder = crate::FastEncoder::new();
             assert!(encoder.encode_nullable_uint(value).is_ok());
@@ -861,10 +911,15 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_nullable_uint_rejects_the_value_outside_its_domain() {
-        let mut encoder = crate::FastEncoder::new();
+    fn test_decode_nullable_uint_over_long_encoding_is_bounded_overflow() {
+        // The full u64 range now decodes, so the remaining hostile case is an
+        // encoding longer than MAX_INT_ENCODED_LEN bytes. A ten-byte run with
+        // no stop bit exhausts the ceiling on the next read: a bounded
+        // IntegerOverflow, never an unbounded loop or a panic.
+        let hostile = [0x00u8; MAX_INT_ENCODED_LEN];
+        let mut offset = 0;
         assert_eq!(
-            encoder.encode_nullable_uint(Some(u64::MAX)),
+            FastDecoder::decode_nullable_uint(&hostile, &mut offset),
             Err(FastError::IntegerOverflow)
         );
     }

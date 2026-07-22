@@ -176,24 +176,49 @@ impl FastEncoder {
         self.buffer.extend_from_slice(value);
     }
 
+    /// Encodes a `u128` using stop-bit encoding.
+    ///
+    /// Identical to [`FastEncoder::encode_uint`] but takes a `u128`, so it can
+    /// emit the biased `2^64` a nullable unsigned uses to denote `u64::MAX`.
+    /// `2^64` occupies ten payload bytes, within [`MAX_INT_ENCODED_LEN`].
+    fn encode_uint_u128(&mut self, value: u128) {
+        let mut bytes = IntScratch::new();
+        let mut remaining = value;
+
+        loop {
+            bytes.push((remaining & u128::from(PAYLOAD_MASK)) as u8);
+            remaining >>= PAYLOAD_BITS;
+
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        Self::flush_stop_bit_encoded(&mut self.buffer, &mut bytes);
+    }
+
     /// Encodes a nullable unsigned integer.
     ///
     /// A nullable unsigned integer is encoded with a bias of one so that the
-    /// single stop byte `0x80` is reserved for `None`. The representable
-    /// domain is therefore `0..=u64::MAX - 1`: `Some(u64::MAX)` has no
-    /// encoding and is rejected rather than silently biased into the `None`
-    /// representation.
+    /// single stop byte `0x80` is reserved for `None`. The full `0..=u64::MAX`
+    /// domain is representable: `Some(u64::MAX)` biases to `2^64`, which does
+    /// not fit `u64`, so the biased value is widened to `u128` and emitted in
+    /// ten stop-bit bytes — the same frame
+    /// [`FastDecoder::decode_nullable_uint`](crate::FastDecoder::decode_nullable_uint)
+    /// reads back.
     ///
     /// # Arguments
     /// * `value` - The optional value to encode
     ///
     /// # Errors
-    /// Returns [`FastError::IntegerOverflow`] for `Some(u64::MAX)`.
+    /// Never returns an error; the `Result` is kept for API stability and to
+    /// match the fallible signed and byte-vector encoders.
     pub fn encode_nullable_uint(&mut self, value: Option<u64>) -> Result<(), FastError> {
         match value {
             Some(v) => {
-                let biased = v.checked_add(1).ok_or(FastError::IntegerOverflow)?;
-                self.encode_uint(biased);
+                // The biased value is at most `2^64`, which fits `u128`, not `u64`.
+                let biased = u128::from(v) + 1;
+                self.encode_uint_u128(biased);
             }
             None => self.buffer.push(STOP_BIT),
         }
@@ -553,17 +578,13 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_nullable_uint_max_is_integer_overflow() {
+    fn test_encode_nullable_uint_max_is_representable() {
+        // u64::MAX biases to 2^64, which does not fit u64; it now encodes
+        // through u128 in ten stop-bit bytes instead of being rejected as
+        // IntegerOverflow. The round-trip is pinned in the decoder tests.
         let mut encoder = FastEncoder::new();
-        assert_eq!(
-            encoder.encode_nullable_uint(Some(u64::MAX)),
-            Err(FastError::IntegerOverflow),
-            "u64::MAX is outside the 0..=u64::MAX-1 nullable domain"
-        );
-        assert!(
-            encoder.is_empty(),
-            "an overflowing value must not be biased into the NULL representation"
-        );
+        assert_eq!(encoder.encode_nullable_uint(Some(u64::MAX)), Ok(()));
+        assert_eq!(encoder.len(), MAX_INT_ENCODED_LEN);
     }
 
     #[test]
