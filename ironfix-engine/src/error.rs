@@ -6,7 +6,7 @@
 
 //! Engine error types.
 
-use ironfix_core::error::{DecodeError, EncodeError};
+use ironfix_core::error::{DecodeError, EncodeError, StoreError};
 use ironfix_session::config::SessionConfigError;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_transport::CodecError;
@@ -141,6 +141,17 @@ pub enum EngineError {
         /// Why it cannot be framed.
         detail: String,
     },
+
+    /// A message-store operation the session depends on failed during setup.
+    ///
+    /// Raised by [`Initiator::connect`](crate::Initiator::connect) when the
+    /// store cannot be reset for a `ResetSeqNumFlag` (141) Logon, or refreshed to
+    /// recover its counters, before the session starts. Continuing anyway would
+    /// either file a new stream on top of a previous one's numbers or reuse a
+    /// `MsgSeqNum` the counterparty has already seen, so the session is refused
+    /// rather than started from a counter the store could not vouch for.
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
 
     /// The connection is closed; no more messages can be sent.
     #[error("connection closed")]

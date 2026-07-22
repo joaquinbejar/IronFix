@@ -278,12 +278,14 @@ sent and **nothing at all** arrived in the interval that followed.
 
 **What IronFix implements today**
 
-`ironfix-engine` **does not use a message store for replay**: although it
-declares `ironfix-store` in its `Cargo.toml`, no store is wired into the session
-path, so mandate items 1, 2 and 4 above are **not implemented** and the engine
-cannot replay a single stored message. What it does is answer the whole
-requested range with one SequenceReset-GapFill (item 3, generalized to every
-message type):
+All four mandate items are implemented, **provided a message store is attached**
+with `Initiator::with_store(Arc<dyn MessageStore>)`. Every sequenced outbound
+frame is then filed in the store under its `MsgSeqNum`, before it goes on the
+wire, and is available to be replayed. Without a store there is nothing to
+replay and the engine falls back to answering the whole range with one gap fill
+(see "Without a store" below).
+
+*Validation, identical in both modes:*
 
 - `BeginSeqNo` (7) absent or unparseable → session Reject, reason 1 (required
   tag missing), `RefTagID` = 7. There is deliberately **no** default value;
@@ -296,21 +298,60 @@ message type):
   have not sent.
 - `EndSeqNo` below `BeginSeqNo` (and not 0) → session Reject, reason 5,
   `RefTagID` = 16.
-- Otherwise the reply is `SequenceReset`-GapFill with `MsgSeqNum` = BeginSeqNo
-  and `NewSeqNo` = min(EndSeqNo + 1, next outbound sequence), or the next
-  outbound sequence when `EndSeqNo` = 0 (infinity). A bounded request therefore
-  never advances the counterparty past what it asked for.
 
-The GapFill carries `PossDupFlag` (43) = Y and `OrigSendingTime` (122). Absent
-a store there is no recorded original sending time, so 122 is stamped with the
-same value as `SendingTime` (52), which is the FIX handling for an unavailable
-OrigSendingTime. A GapFill's "original" messages are administrative filler
-rather than replayed traffic, so no information is lost by this.
+*The reply range.* The reply always covers exactly
+`BeginSeqNo .. NewSeqNo`, where `NewSeqNo` = min(EndSeqNo + 1, next outbound
+sequence), or the next outbound sequence when `EndSeqNo` = 0 (infinity). A
+bounded request therefore never advances the counterparty past what it asked
+for, and every sequence number inside the range is accounted for by either a
+replayed message or a gap fill — never skipped.
 
-Consequence for consumers: **application messages are never replayed.** A
-counterparty that requests a resend of business traffic receives a gap fill,
-not the traffic. Real replay requires wiring a `MessageStore` into the engine,
-which is separate, tracked work.
+*What is replayed.* An **application** message that is present in the store and
+can be rebuilt is resent with:
+
+- its **original `MsgSeqNum` (34)** — a resend re-occupies the number it was
+  first sent under, and allocates no new one;
+- its original body, field for field, in its original order;
+- `PossDupFlag` (43) = Y (mandate item 2);
+- `OrigSendingTime` (122) = the `SendingTime` (52) recorded on the original
+  frame, while 52 is restamped with the time of this retransmission (mandate
+  item 4);
+- `BodyLength` (9) and `CheckSum` (10) recomputed, since 43 and 122 change both.
+
+*What is gap-filled.* Everything else in the range is covered by
+`SequenceReset`-GapFill messages interleaved between the replayed messages,
+each carrying `MsgSeqNum` = the first number it covers, `GapFillFlag` (123) = Y,
+`NewSeqNo` (36) = the first number it does **not** cover, and `PossDupFlag`
+(43) = Y with `OrigSendingTime` (122). Specifically:
+
+- **administrative messages** in the range (mandate item 3) — a stale Heartbeat
+  or Logon says nothing true about the session now;
+- **sequence numbers the store never held or has evicted**;
+- **stored frames that cannot be rebuilt** — a frame that does not decode, or
+  that carries no `SendingTime` (52) to copy into `OrigSendingTime` and so
+  cannot be resent conformantly;
+- **the whole range**, if the store itself returns an error.
+
+A gap fill allocates no sender sequence number either: it occupies the range it
+replaces. So answering a resend never moves the session's own outbound
+numbering, whatever mix of replay and fill the reply turns out to be.
+
+A GapFill's "original" messages are administrative filler that was never sent,
+so there is no recorded original sending time for it and 122 is stamped with
+the same value as `SendingTime` (52) — the FIX handling for an unavailable
+OrigSendingTime. That substitution applies to gap fills only; a genuine replay
+always carries the real original time.
+
+**Without a store**, mandate items 1, 2 and 4 cannot be satisfied — the engine
+has nothing to replay from — and the whole requested range is answered with a
+single `SequenceReset`-GapFill with `MsgSeqNum` = BeginSeqNo and `NewSeqNo` as
+above. A counterparty asking for business traffic then receives a gap fill
+rather than the traffic.
+
+**Restart caveat.** `MemoryStore` is the only `MessageStore` implementation and
+is not persistent: it holds messages and sequence numbers in process memory
+only. Replay therefore works within a live process, but no message and no
+sequence number survives a restart. A durable store is separate, tracked work.
 
 **Outbound `EndSeqNo` sentinel — a version caveat.** When the engine detects an
 inbound gap it requests retransmission with `EndSeqNo` (16) = 0, the open-ended
@@ -941,9 +982,14 @@ Rationale for the two policies:
   `ironfix-engine`, so the server-side examples do their own heartbeating.
 - [x] Reject
 - [x] Sequence Reset
-- [ ] Resend Request — **partial**: inbound requests are validated and answered
-  with a correctly bounded SequenceReset-GapFill, but the engine has no message
-  store, so no message is ever actually replayed. See "Resend Request" above.
+- [x] Resend Request — inbound requests are validated, and with a
+  `MessageStore` attached (`Initiator::with_store`) the stored application
+  messages in the range are replayed with `PossDupFlag` (43) = Y and the
+  original `SendingTime` in `OrigSendingTime` (122), with administrative
+  messages and unavailable sequence numbers gap-filled. Two limits are worth
+  stating: the store is **opt-in**, and without one the whole range is still
+  answered with a single gap fill; and `MemoryStore` is not persistent, so
+  nothing is replayable after a restart. See "Resend Request" above.
 
 ### Phase 2: Order Entry (High Priority)
 - [ ] New Order Single
