@@ -16,10 +16,14 @@
 //!   (`Disconnected` → `Connecting` → `LogonSent`/`LogonReceived` → `Active` →
 //!   `Resending`/`LogoutPending`), so illegal transitions do not compile
 //! - **Sequence management**: [`SequenceManager`] with checked arithmetic —
-//!   exhaustion is a typed error, never a silent wrap
+//!   exhaustion is a typed error, never a silent wrap. Gap *detection*
+//!   ([`SequenceResult::Gap`]) lives here; the recovery that follows
+//!   (ResendRequest, SequenceReset, gap fill) is orchestrated by
+//!   `ironfix-engine`, which owns the socket
 //! - **Heartbeat handling**: [`HeartbeatManager`], `Instant`-based timing for
-//!   heartbeat and TestRequest deadlines
-//! - **Configuration**: [`SessionConfig`] and [`config::SessionConfigBuilder`]
+//!   heartbeat and TestRequest deadlines and `HeartBtInt` negotiation
+//! - **Configuration**: [`SessionConfig`] and its validating
+//!   [`config::SessionConfigBuilder`]
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
 //! progress". The actual `ResendRequest` / `SequenceReset` / gap-fill message
@@ -30,9 +34,12 @@ pub mod heartbeat;
 pub mod sequence;
 pub mod state;
 
-pub use config::SessionConfig;
-pub use heartbeat::{HeartbeatIntervalError, HeartbeatManager, TestRequestOutcome};
-pub use sequence::{SequenceCounter, SequenceExhausted, SequenceManager};
+pub use config::{SessionConfig, SessionConfigBuilder, SessionConfigError};
+pub use heartbeat::{
+    HeartbeatIntervalError, HeartbeatManager, MAX_HEARTBEAT_INTERVAL_SECS, TestRequestOutcome,
+    generate_test_req_id, negotiate_interval,
+};
+pub use sequence::{SequenceCounter, SequenceExhausted, SequenceManager, SequenceResult};
 pub use state::{
     Active, Connecting, Disconnected, LogonReceived, LogonSent, LogoutPending, Resending, Session,
     SessionState,

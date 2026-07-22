@@ -15,7 +15,7 @@ use ironfix_core::message::RawMessage;
 use ironfix_core::types::CompId;
 use ironfix_engine::application::{Application, NoOpApplication, RejectReason, SessionId};
 use ironfix_engine::{Initiator, OutboundMessage};
-use ironfix_session::SessionConfig;
+use ironfix_session::SessionConfigBuilder;
 
 mod common;
 use common::{ExampleConfig, init_logging};
@@ -83,12 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = ExampleConfig::client();
     info!("{FIX_VERSION} engine client connecting to {}", cfg.addr());
 
-    let config = SessionConfig::new(
-        CompId::new(&cfg.sender_comp_id).expect("valid sender"),
-        CompId::new(&cfg.target_comp_id).expect("valid target"),
-        FIX_VERSION,
-    )
-    .with_heartbeat_interval(Duration::from_secs(cfg.heartbeat_interval));
+    // The builder validates every knob, so a bad CompID or an out-of-range
+    // heartbeat is reported here rather than on the wire.
+    let config = SessionConfigBuilder::new()
+        .sender_comp_id(CompId::new(&cfg.sender_comp_id)?)
+        .target_comp_id(CompId::new(&cfg.target_comp_id)?)
+        .begin_string(FIX_VERSION)
+        .heartbeat_interval(Duration::from_secs(cfg.heartbeat_interval))
+        .build()?;
 
     let initiator = Initiator::new(config, Arc::new(LoggingApp::default()))
         .with_connect_timeout(Duration::from_secs(5));

@@ -9,6 +9,7 @@
 //! This module provides atomic sequence number management for FIX sessions.
 
 use ironfix_core::types::SeqNum;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Error returned when a sequence counter has reached its maximum value.
@@ -67,16 +68,22 @@ impl SequenceManager {
         }
     }
 
-    /// Creates a new sequence manager with specified starting values.
+    /// Creates a new sequence manager seeded with the given starting values.
+    ///
+    /// Both counters are [`NonZeroU64`]: FIX numbers messages from 1, and a
+    /// `MsgSeqNum` (34) of 0 is rejected by every conforming counterparty.
+    /// Taking [`NonZeroU64`] makes a zero seed unrepresentable at the type
+    /// level, so a `34=0` can never be seeded onto the wire — the invalid
+    /// state is refused at the call site rather than caught at runtime.
     ///
     /// # Arguments
-    /// * `sender_seq` - Initial sender sequence number
-    /// * `target_seq` - Initial target sequence number
+    /// * `sender_seq` - Next outgoing sequence number, `>= 1`
+    /// * `target_seq` - Next expected incoming sequence number, `>= 1`
     #[must_use]
-    pub fn with_initial(sender_seq: u64, target_seq: u64) -> Self {
+    pub const fn with_initial(sender_seq: NonZeroU64, target_seq: NonZeroU64) -> Self {
         Self {
-            next_sender_seq: AtomicU64::new(sender_seq),
-            next_target_seq: AtomicU64::new(target_seq),
+            next_sender_seq: AtomicU64::new(sender_seq.get()),
+            next_target_seq: AtomicU64::new(target_seq.get()),
         }
     }
 
@@ -103,6 +110,7 @@ impl SequenceManager {
     /// [`try_allocate_sender_seq`](Self::try_allocate_sender_seq) for
     /// venue-grade sessions where exhaustion must be an explicit error.
     #[inline]
+    #[must_use = "dropping the allocated sequence number leaves a gap in the outbound stream"]
     #[deprecated(
         since = "0.4.0",
         note = "wraps silently on overflow, which corrupts a live session; use try_allocate_sender_seq. Removed in the next breaking release."
@@ -174,7 +182,8 @@ impl SequenceManager {
     /// Sets the next sender sequence number.
     ///
     /// # Arguments
-    /// * `seq` - The new sequence number
+    /// * `seq` - The new sequence number, `>= 1` (see
+    ///   [`SequenceManager::with_initial`] for the contract)
     #[inline]
     pub fn set_sender_seq(&self, seq: u64) {
         self.next_sender_seq.store(seq, Ordering::SeqCst);
@@ -183,7 +192,8 @@ impl SequenceManager {
     /// Sets the next target sequence number.
     ///
     /// # Arguments
-    /// * `seq` - The new sequence number
+    /// * `seq` - The new sequence number, `>= 1` (see
+    ///   [`SequenceManager::with_initial`] for the contract)
     #[inline]
     pub fn set_target_seq(&self, seq: u64) {
         self.next_target_seq.store(seq, Ordering::SeqCst);
@@ -196,15 +206,20 @@ impl SequenceManager {
         self.next_target_seq.store(1, Ordering::SeqCst);
     }
 
-    /// Validates an incoming sequence number.
+    /// Validates an incoming `MsgSeqNum` (34) against the next expected
+    /// target sequence number.
+    ///
+    /// This only classifies; it moves no counter. Acting on the answer —
+    /// a ResendRequest for a gap, a `PossDupFlag` check for a duplicate — is
+    /// the engine's job.
     ///
     /// # Arguments
     /// * `received` - The received sequence number
     ///
     /// # Returns
-    /// - `Ok(())` if the sequence number matches expected
-    /// - `Err(SequenceResult::TooLow)` if it's a possible duplicate
-    /// - `Err(SequenceResult::Gap)` if there's a gap
+    /// - [`SequenceResult::Ok`] when it is exactly the expected number
+    /// - [`SequenceResult::TooLow`] when it is lower (a possible duplicate)
+    /// - [`SequenceResult::Gap`] when it is higher (messages were missed)
     #[must_use]
     pub fn validate_incoming(&self, received: u64) -> SequenceResult {
         let expected = self.next_target_seq.load(Ordering::SeqCst);
@@ -270,11 +285,30 @@ impl SequenceResult {
 mod tests {
     use super::*;
 
+    /// Builds a `NonZeroU64` for seeding, failing the test rather than the
+    /// session if the literal is zero.
+    #[track_caller]
+    fn nz(value: u64) -> NonZeroU64 {
+        match NonZeroU64::new(value) {
+            Some(value) => value,
+            None => panic!("test seed {value} must be non-zero"),
+        }
+    }
+
     #[test]
     fn test_sequence_manager_new() {
         let mgr = SequenceManager::new();
         assert_eq!(mgr.next_sender_seq().value(), 1);
         assert_eq!(mgr.next_target_seq().value(), 1);
+    }
+
+    #[test]
+    fn test_with_initial_seeds_the_given_nonzero_values() {
+        // A zero seed is unrepresentable: `with_initial` takes NonZeroU64, so
+        // `34=0` can never be seeded onto the wire.
+        let mgr = SequenceManager::with_initial(nz(7), nz(9));
+        assert_eq!(mgr.next_sender_seq().value(), 7);
+        assert_eq!(mgr.next_target_seq().value(), 9);
     }
 
     #[test]
@@ -326,7 +360,7 @@ mod tests {
 
     #[test]
     fn test_try_allocate_sender_seq_exhausted() {
-        let mgr = SequenceManager::with_initial(u64::MAX, 1);
+        let mgr = SequenceManager::with_initial(NonZeroU64::MAX, NonZeroU64::MIN);
 
         assert_eq!(
             mgr.try_allocate_sender_seq(),
@@ -354,7 +388,7 @@ mod tests {
 
     #[test]
     fn test_try_increment_target_seq_exhausted() {
-        let mgr = SequenceManager::with_initial(1, u64::MAX);
+        let mgr = SequenceManager::with_initial(NonZeroU64::MIN, NonZeroU64::MAX);
 
         assert_eq!(
             mgr.try_increment_target_seq(),
@@ -368,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_reset() {
-        let mgr = SequenceManager::with_initial(100, 200);
+        let mgr = SequenceManager::with_initial(nz(100), nz(200));
         assert_eq!(mgr.next_sender_seq().value(), 100);
         assert_eq!(mgr.next_target_seq().value(), 200);
 

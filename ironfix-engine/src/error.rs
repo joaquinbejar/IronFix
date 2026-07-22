@@ -7,7 +7,8 @@
 //! Engine error types.
 
 use ironfix_core::error::{DecodeError, EncodeError};
-use ironfix_session::sequence::SequenceExhausted;
+use ironfix_session::config::SessionConfigError;
+use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_transport::CodecError;
 use std::time::Duration;
 
@@ -35,6 +36,16 @@ pub enum EngineError {
     /// for corrupted bytes.
     #[error("encode error: {0}")]
     Encode(#[from] EncodeError),
+
+    /// The session configuration is not usable.
+    ///
+    /// Checked before the socket is dialled: an out-of-range knob — a
+    /// fractional `HeartBtInt`, an identity string carrying SOH or `=`, a zero
+    /// timeout — would otherwise corrupt the session's own messages.
+    /// [`ironfix_session::SessionConfigBuilder`] reports the same errors at
+    /// configuration time.
+    #[error("invalid session configuration: {0}")]
+    Config(#[from] SessionConfigError),
 
     /// TCP connect did not complete within the configured timeout.
     #[error("connect timed out after {0:?}")]
@@ -82,6 +93,18 @@ pub enum EngineError {
     /// numbered until the session performs a sequence reset.
     #[error(transparent)]
     SequenceExhausted(#[from] SequenceExhausted),
+
+    /// A seeded initial sequence number was zero.
+    ///
+    /// FIX numbers messages from 1; a seeded `MsgSeqNum` (34) of 0 would be
+    /// rejected by every conforming counterparty. Checked before the socket is
+    /// dialled. Set through
+    /// [`Initiator::with_initial_sequences`](crate::Initiator::with_initial_sequences).
+    #[error("initial {counter} sequence number must be at least 1, was 0")]
+    InvalidInitialSequence {
+        /// Which seeded counter was zero.
+        counter: SequenceCounter,
+    },
 
     /// The counterparty's identity fields (49/56, and 50/57 when
     /// configured) did not match the session configuration.
