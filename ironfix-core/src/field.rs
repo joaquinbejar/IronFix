@@ -21,18 +21,27 @@ use std::str::FromStr;
 
 /// The lowest tag number FIX reserves for user-defined fields.
 ///
-/// FIX reserves 5000-9999 for user-defined fields, so 4999 is the highest
-/// standard tag and 5000 the first user-defined one.
+/// FIX reserves 5000-9999 for bilateral user-defined fields, so 4999 is the
+/// highest standard tag below the range and 5000 the first user-defined one.
 pub const USER_DEFINED_TAG_MIN: u32 = 5000;
+
+/// The highest tag number in the FIX user-defined range.
+///
+/// The user-defined range is exactly 5000-9999. Tags at or above 10000 —
+/// including the Extension Pack tags assigned at 40000+ — are *not*
+/// user-defined; they are assigned by the specification, and the loaded
+/// dictionary (not this type) is what says what an individual high tag means.
+pub const USER_DEFINED_TAG_MAX: u32 = 9999;
 
 /// FIX field tag number.
 ///
 /// Tags are positive integers that identify fields within a FIX message.
-/// Standard tags are defined in the FIX specification (1-4999), while FIX
-/// reserves 5000-9999 for user-defined fields. Tags at or above
-/// [`USER_DEFINED_TAG_MIN`] are treated as user-defined; venues do assign
-/// beyond 9999 in practice, and a dictionary — not this type — is what says
-/// whether a given tag is known.
+/// Standard tags are defined in the FIX specification (1-4999), FIX reserves
+/// the bilateral user-defined range 5000-9999, and the specification also
+/// assigns tags above 9999 (the Extension Pack range at 40000+). Only
+/// [`USER_DEFINED_TAG_MIN`]..=[`USER_DEFINED_TAG_MAX`] is user-defined; every
+/// other value, high ones included, is standard or unassigned, and a
+/// dictionary — not this type — is what says whether a given tag is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
 #[serde(transparent)]
@@ -77,18 +86,28 @@ impl FieldTag {
         self.0 >= 1
     }
 
-    /// Returns true if this is a standard FIX tag (1-4999).
+    /// Returns true if this is a standard FIX tag below the user-defined range
+    /// (1-4999).
+    ///
+    /// This does not cover assigned tags above 9999 (the Extension Pack range
+    /// at 40000+): those are standard too, but the dictionary — not this
+    /// predicate — classifies an individual high tag.
     #[inline]
     #[must_use]
     pub const fn is_standard(self) -> bool {
         self.0 >= 1 && self.0 < USER_DEFINED_TAG_MIN
     }
 
-    /// Returns true if this is a user-defined tag (5000+).
+    /// Returns true if this is a user-defined tag, i.e. in the bilateral range
+    /// [`USER_DEFINED_TAG_MIN`]..=[`USER_DEFINED_TAG_MAX`] (5000-9999).
+    ///
+    /// A tag at or above 10000 — including an assigned Extension Pack tag at
+    /// 40000+ — is deliberately *not* user-defined: it is assigned by the FIX
+    /// specification, not agreed bilaterally.
     #[inline]
     #[must_use]
     pub const fn is_user_defined(self) -> bool {
-        self.0 >= USER_DEFINED_TAG_MIN
+        self.0 >= USER_DEFINED_TAG_MIN && self.0 <= USER_DEFINED_TAG_MAX
     }
 }
 
@@ -423,6 +442,35 @@ mod tests {
         assert!(!tag.is_standard());
         assert!(tag.is_user_defined());
         assert_eq!(tag.value(), USER_DEFINED_TAG_MIN);
+    }
+
+    #[test]
+    fn test_field_tag_boundary_9999_is_user_defined() {
+        let tag = ok(FieldTag::try_new(9999), "9999 is a legal tag");
+        assert!(!tag.is_standard());
+        assert!(tag.is_user_defined());
+        assert_eq!(tag.value(), USER_DEFINED_TAG_MAX);
+    }
+
+    #[test]
+    fn test_field_tag_boundary_10000_is_not_user_defined() {
+        // The bilateral user-defined range ends at 9999; 10000 is outside it.
+        let tag = ok(FieldTag::try_new(10000), "10000 is a legal tag");
+        assert!(!tag.is_user_defined());
+        assert!(!tag.is_standard());
+    }
+
+    #[test]
+    fn test_field_tag_assigned_extension_pack_is_not_user_defined() {
+        // Extension Pack tags assigned at 40000+ are standard, not user-defined:
+        // the earlier `>= 5000` predicate misclassified them.
+        for tag_num in [40000, 40001] {
+            let tag = ok(FieldTag::try_new(tag_num), "assigned high tag is legal");
+            assert!(
+                !tag.is_user_defined(),
+                "assigned tag {tag_num} must not be user-defined"
+            );
+        }
     }
 
     #[test]
