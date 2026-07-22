@@ -833,18 +833,17 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_msg_type_with_embedded_equals_is_typed_error() {
-        // `35=A=B` scans as the value "A=B"; it must not survive as a MsgType
-        // that could be written back into a frame verbatim.
+    fn test_decode_msg_type_with_embedded_equals_is_accepted() {
+        // `35=A=B` scans as the value "A=B": a field splits on its *first* `=`
+        // only, and `=` is legal inside a FIX value, so this is a valid
+        // (bilateral) MsgType that must round-trip verbatim rather than be
+        // rejected. It is written back into tag 35 unchanged.
         let body = b"35=A=B\x0149=A\x0156=B\x0134=1\x01";
         let msg = build_frame(body);
-        assert_eq!(
-            Decoder::new(&msg).decode().err(),
-            Some(DecodeError::InvalidMsgType(MsgTypeError::IllegalByte {
-                byte: b'=',
-                position: 1,
-            }))
-        );
+        let Ok(decoded) = Decoder::new(&msg).decode() else {
+            panic!("a MsgType containing `=` must decode");
+        };
+        assert_eq!(decoded.msg_type().as_str(), "A=B");
     }
 
     #[test]

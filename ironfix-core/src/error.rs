@@ -372,11 +372,14 @@ pub enum MsgTypeError {
         max_len: usize,
     },
 
-    /// The value contains a byte outside printable ASCII, or the `=`
-    /// tag/value separator.
+    /// The value contains a byte outside printable ASCII — a control byte
+    /// (SOH included) or a non-ASCII byte.
+    ///
+    /// `=` and space are **not** illegal here: both are legal inside a FIX
+    /// field value, so a bilaterally agreed MsgType carrying either is accepted.
     #[error(
         "msg type contains illegal byte {byte:#04x} at offset {position}: \
-         only printable ASCII (0x21..=0x7e) except '=' is allowed"
+         only printable ASCII (0x20..=0x7e) is allowed"
     )]
     IllegalByte {
         /// The offending byte.

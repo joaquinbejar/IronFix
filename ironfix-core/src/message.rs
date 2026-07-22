@@ -43,46 +43,108 @@ pub const MSG_TYPE_MAX_LEN: usize = 8;
 
 /// Inline storage for a MsgType this enum does not name.
 ///
-/// Bounded by [`MSG_TYPE_MAX_LEN`], so it lives in the enum itself and never
-/// on the heap.
-pub type CustomMsgType = ArrayString<MSG_TYPE_MAX_LEN>;
+/// A validated newtype over an [`ArrayString`] bounded by [`MSG_TYPE_MAX_LEN`],
+/// so it lives in the enum itself and never on the heap. The inner buffer is
+/// **private** and reachable only through [`CustomMsgType::new`] (or the
+/// [`Deserialize`] impl, which routes the same constructor), so a
+/// [`MsgType::Custom`] can never be built around an empty code, an over-long
+/// code, or one carrying a byte that cannot appear in tag 35.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct CustomMsgType(ArrayString<MSG_TYPE_MAX_LEN>);
 
-/// Copies an unrecognised MsgType code into inline storage, validating it.
-///
-/// The bytes reach here straight off the wire — every decoded MsgType is built
-/// through [`MsgType::new`] — so this is where an untrusted tag 35 value is
-/// either bounded, non-empty, and safe to write back into a frame, or an
-/// error. `=` and SOH are rejected because a MsgType is echoed verbatim into
-/// tag 35 of an outbound message, where either byte would open a new tag/value
-/// pair or terminate the field early. The length bound is additionally
-/// enforced by [`CustomMsgType`] itself, so it holds even for a `Custom` built
-/// by hand.
-///
-/// # Errors
-/// Returns [`MsgTypeError::Empty`], [`MsgTypeError::TooLong`], or
-/// [`MsgTypeError::IllegalByte`].
-fn make_custom(code: &str) -> Result<CustomMsgType, MsgTypeError> {
-    if code.is_empty() {
-        return Err(MsgTypeError::Empty);
-    }
-    if code.len() > MSG_TYPE_MAX_LEN {
-        return Err(MsgTypeError::TooLong {
-            len: code.len(),
-            max_len: MSG_TYPE_MAX_LEN,
-        });
-    }
-    for (position, &byte) in code.as_bytes().iter().enumerate() {
-        if !byte.is_ascii_graphic() || byte == b'=' {
-            return Err(MsgTypeError::IllegalByte { byte, position });
+impl CustomMsgType {
+    /// Copies an unrecognised MsgType code into inline storage, validating it.
+    ///
+    /// This is the **only** way to obtain a `CustomMsgType`: the inner buffer
+    /// is private, so a [`MsgType::Custom`] cannot wrap an unvalidated code,
+    /// and the [`Deserialize`] impl routes the same check. The bytes typically
+    /// reach here straight off the wire — every decoded MsgType is built
+    /// through [`MsgType::new`], which sends an unnamed code here — so this is
+    /// where an untrusted tag 35 value is either bounded, non-empty, and safe
+    /// to write back into a frame, or an error.
+    ///
+    /// SOH and any non-printable or non-ASCII byte are rejected because a
+    /// MsgType is echoed verbatim into tag 35 of an outbound message, where SOH
+    /// would terminate the field early and a non-printable byte would corrupt
+    /// the frame. `=` and space are **not** rejected: both are legal inside a
+    /// FIX field value — only SOH ends a field, and only the *first* `=` splits
+    /// a tag from its value — so a bilaterally agreed code carrying either must
+    /// round-trip unchanged. The accepted set is therefore printable ASCII,
+    /// `0x20..=0x7e`. The length bound is additionally enforced by
+    /// [`MSG_TYPE_MAX_LEN`], so it holds even for a code built by hand.
+    ///
+    /// # Errors
+    /// Returns [`MsgTypeError::Empty`] for an empty code,
+    /// [`MsgTypeError::TooLong`] if it exceeds [`MSG_TYPE_MAX_LEN`] bytes, or
+    /// [`MsgTypeError::IllegalByte`] if it carries a byte that cannot appear in
+    /// tag 35.
+    pub fn new(code: &str) -> Result<Self, MsgTypeError> {
+        if code.is_empty() {
+            return Err(MsgTypeError::Empty);
+        }
+        if code.len() > MSG_TYPE_MAX_LEN {
+            return Err(MsgTypeError::TooLong {
+                len: code.len(),
+                max_len: MSG_TYPE_MAX_LEN,
+            });
+        }
+        for (position, &byte) in code.as_bytes().iter().enumerate() {
+            if !(0x20..=0x7e).contains(&byte) {
+                return Err(MsgTypeError::IllegalByte { byte, position });
+            }
+        }
+        match ArrayString::<MSG_TYPE_MAX_LEN>::from(code) {
+            Ok(inner) => Ok(Self(inner)),
+            // Unreachable: the length was checked above.
+            Err(_) => Err(MsgTypeError::TooLong {
+                len: code.len(),
+                max_len: MSG_TYPE_MAX_LEN,
+            }),
         }
     }
-    match CustomMsgType::from(code) {
-        Ok(inner) => Ok(inner),
-        // Unreachable: the length was checked above.
-        Err(_) => Err(MsgTypeError::TooLong {
-            len: code.len(),
-            max_len: MSG_TYPE_MAX_LEN,
-        }),
+
+    /// Returns the code as a string slice, exactly as it appears in tag 35.
+    #[inline]
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl<'de> Deserialize<'de> for CustomMsgType {
+    /// Deserializes a MsgType code, validating it through
+    /// [`CustomMsgType::new`] so a deserialized [`MsgType::Custom`] carries the
+    /// same guarantees as one built off the wire.
+    ///
+    /// # Errors
+    /// Fails with a deserialization error carrying the [`MsgTypeError`] message
+    /// when the code is empty, longer than [`MSG_TYPE_MAX_LEN`], or carries a
+    /// byte that cannot appear in tag 35.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct CodeVisitor;
+
+        impl serde::de::Visitor<'_> for CodeVisitor {
+            type Value = CustomMsgType;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "a FIX MsgType code of 1..={MSG_TYPE_MAX_LEN} printable ASCII bytes"
+                )
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                CustomMsgType::new(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(CodeVisitor)
     }
 }
 
@@ -163,7 +225,7 @@ macro_rules! define_msg_types {
             pub fn new(code: &str) -> Result<Self, MsgTypeError> {
                 match code {
                     $( $code => Ok(Self::$variant), )*
-                    other => Ok(Self::Custom(make_custom(other)?)),
+                    other => Ok(Self::Custom(CustomMsgType::new(other)?)),
                 }
             }
 
@@ -770,17 +832,20 @@ pub trait FixMessage: Sized {
 mod tests {
     use super::*;
 
+    use serde::de::IntoDeserializer;
+    use serde::de::value::{Error as ValueError, StrDeserializer};
     use std::collections::hash_map::DefaultHasher;
     use std::collections::{HashMap, HashSet};
     use std::hash::{Hash, Hasher};
 
     /// Builds a `Custom` variant directly, bypassing the normal-form folding
     /// [`MsgType::new`] applies, so a `Custom` holding a named code can be
-    /// tested.
+    /// tested. Still routes the validating [`CustomMsgType::new`], so a test
+    /// code that could not appear in tag 35 is a test bug, not a fixture.
     fn custom_variant(code: &str) -> MsgType {
-        match CustomMsgType::from(code) {
+        match CustomMsgType::new(code) {
             Ok(inner) => MsgType::Custom(inner),
-            Err(_) => panic!("test code {code:?} must fit MSG_TYPE_MAX_LEN"),
+            Err(err) => panic!("test code {code:?} must be a valid custom MsgType: {err}"),
         }
     }
 
@@ -939,16 +1004,10 @@ mod tests {
     }
 
     #[test]
-    fn test_msg_type_code_carrying_field_separator_is_rejected() {
-        // `35=A=B` decodes to the value "A=B"; accepting it would let the
-        // value open a new tag/value pair when written back into tag 35.
-        assert_eq!(
-            MsgType::new("A=B"),
-            Err(MsgTypeError::IllegalByte {
-                byte: b'=',
-                position: 1,
-            })
-        );
+    fn test_msg_type_soh_byte_is_rejected() {
+        // SOH is the one byte that terminates a field: `35=A\x01B` would put
+        // `35=A` on the wire and then a bogus field starting `B`. It is
+        // rejected wherever it appears in the code.
         assert_eq!(
             MsgType::new("A\x01B"),
             Err(MsgTypeError::IllegalByte {
@@ -956,13 +1015,90 @@ mod tests {
                 position: 1,
             })
         );
+    }
+
+    #[test]
+    fn test_msg_type_control_or_non_ascii_byte_is_rejected() {
+        // DEL (0x7f) is a control byte just past the printable range; a
+        // non-ASCII byte lies entirely outside it. Neither can appear in a
+        // MsgType echoed into tag 35.
         assert_eq!(
-            MsgType::new("A B"),
+            MsgType::new("A\x7fB"),
             Err(MsgTypeError::IllegalByte {
-                byte: b' ',
+                byte: 0x7f,
                 position: 1,
             })
         );
+        // "é" is 0xC3 0xA9 in UTF-8; its first byte trips the check at offset 0.
+        assert_eq!(
+            MsgType::new("é"),
+            Err(MsgTypeError::IllegalByte {
+                byte: 0xc3,
+                position: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn test_msg_type_equals_and_space_are_accepted() {
+        // `=` and space are legal inside a FIX field value — only SOH ends a
+        // field and only the first `=` splits tag from value — so a bilateral
+        // code carrying either must round-trip unchanged, not be refused.
+        let with_equals = MsgType::new("U=1");
+        assert_eq!(with_equals, Ok(custom_variant("U=1")));
+        match with_equals {
+            Ok(msg_type) => assert_eq!(msg_type.as_str(), "U=1"),
+            Err(err) => panic!("`=` must be accepted in a custom code, got {err}"),
+        }
+
+        let with_space = MsgType::new("U 1");
+        assert_eq!(with_space, Ok(custom_variant("U 1")));
+        match with_space {
+            Ok(msg_type) => assert_eq!(msg_type.as_str(), "U 1"),
+            Err(err) => panic!("space must be accepted in a custom code, got {err}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_msg_type_new_validates_like_msg_type_new() {
+        // The public constructor is the single validation chokepoint the
+        // `Custom` variant and `Deserialize` both route through.
+        assert_eq!(CustomMsgType::new("").err(), Some(MsgTypeError::Empty));
+        assert_eq!(
+            CustomMsgType::new("U99999999").err(),
+            Some(MsgTypeError::TooLong {
+                len: 9,
+                max_len: MSG_TYPE_MAX_LEN,
+            })
+        );
+        assert_eq!(
+            CustomMsgType::new("A\x01B").err(),
+            Some(MsgTypeError::IllegalByte {
+                byte: 0x01,
+                position: 1,
+            })
+        );
+        match CustomMsgType::new("U=1") {
+            Ok(code) => assert_eq!(code.as_str(), "U=1"),
+            Err(err) => panic!("`U=1` must be a valid custom code, got {err}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_msg_type_deserialize_rejects_illegal_code() {
+        // The derived `MsgType` deserialization reaches the `Custom` field
+        // through this impl, so validation cannot be bypassed by deserializing.
+        let de: StrDeserializer<'_, ValueError> = "A\x01B".into_deserializer();
+        assert!(CustomMsgType::deserialize(de).is_err());
+    }
+
+    #[test]
+    fn test_custom_msg_type_deserialize_accepts_valid_code() {
+        let de: StrDeserializer<'_, ValueError> = "U=1".into_deserializer();
+        match CustomMsgType::deserialize(de) {
+            Ok(code) => assert_eq!(code.as_str(), "U=1"),
+            Err(err) => panic!("a valid code must deserialize, got {err}"),
+        }
     }
 
     #[test]
