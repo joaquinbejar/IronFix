@@ -314,7 +314,7 @@ impl Encoder {
     /// # Arguments
     /// * `length_tag` - The `LENGTH` field tag (e.g., 95 `RawDataLength`)
     /// * `data_tag` - The paired `DATA` field tag (e.g., 96 `RawData`)
-    /// * `value` - The raw payload, which may be empty
+    /// * `value` - The raw payload; at least one byte
     #[inline]
     pub fn put_data(&mut self, length_tag: u32, data_tag: u32, value: &[u8]) {
         if let Err(err) = self.try_put_data(length_tag, data_tag, value) {
@@ -329,15 +329,17 @@ impl Encoder {
     /// # Arguments
     /// * `length_tag` - The `LENGTH` field tag (e.g., 95 `RawDataLength`)
     /// * `data_tag` - The paired `DATA` field tag (e.g., 96 `RawData`)
-    /// * `value` - The raw payload, which may be empty
+    /// * `value` - The raw payload; at least one byte
     ///
     /// # Errors
     /// [`EncodeError::InvalidFieldValue`] if either tag is `0`, if `data_tag`
     /// is not the `DATA` field the FIX specification pairs with `length_tag`,
-    /// or if the frame is already finished. An unpaired combination is refused
-    /// because a decoder frames a `DATA` value by the count in *its own* paired
-    /// `LENGTH` field: under any other tag the payload's SOH bytes are read as
-    /// field terminators.
+    /// if `value` is empty, or if the frame is already finished. An unpaired
+    /// combination is refused because a decoder frames a `DATA` value by the
+    /// count in *its own* paired `LENGTH` field: under any other tag the
+    /// payload's SOH bytes are read as field terminators. An empty payload is
+    /// refused for the same reason an ordinary empty value is — FIX treats a
+    /// tag specified without a value as malformed.
     pub fn try_put_data(
         &mut self,
         length_tag: u32,
@@ -349,6 +351,9 @@ impl Encoder {
         check_tag(data_tag)?;
         if paired_data_tag(length_tag) != Some(data_tag) {
             return Err(unpaired_data_tag(length_tag, data_tag));
+        }
+        if value.is_empty() {
+            return Err(empty_value(data_tag));
         }
 
         let mut len_buf = itoa::Buffer::new();
@@ -1202,19 +1207,30 @@ mod tests {
     }
 
     #[test]
-    fn test_encoder_put_data_empty_payload_round_trips() {
+    fn test_encoder_put_data_empty_payload_is_rejected() {
+        // `96=<SOH>` (empty-valued DATA) is malformed FIX and inconsistent with
+        // the encoder rejecting an empty ordinary value; the rejection names the
+        // DATA tag, as an empty ordinary value names its own tag.
         let mut encoder = Encoder::new("FIX.4.4");
         encoder.put_str(35, "A");
         encoder.put_data(95, 96, b"");
-        encoder.put_str(58, "after");
-        let frame = frame_of(&mut encoder);
+        assert_rejected(&mut encoder, 96);
+    }
 
-        let Ok(decoded) = Decoder::new(&frame).decode() else {
-            panic!("frame with an empty RawData must decode");
-        };
-        assert_eq!(decoded.get_field(95).map(|f| f.value), Some(&b"0"[..]));
-        assert_eq!(decoded.get_field(96).map(|f| f.value), Some(&b""[..]));
-        assert_eq!(decoded.get_field_str(58), Some("after"));
+    #[test]
+    fn test_encoder_try_put_data_empty_payload_reports_immediately() {
+        let mut encoder = Encoder::new("FIX.4.4");
+        encoder.put_str(35, "A");
+        let before = encoder.body_len();
+
+        let result = encoder.try_put_data(95, 96, b"");
+        assert!(matches!(
+            result,
+            Err(EncodeError::InvalidFieldValue { tag: 96, .. })
+        ));
+        // Nothing written, and the caller took delivery of the rejection.
+        assert_eq!(encoder.body_len(), before);
+        assert!(encoder.error().is_none());
     }
 
     #[test]

@@ -678,26 +678,36 @@ impl<A: Application> Reactor<A> {
                     );
                     return Ok(phase);
                 }
-                let seq = match self.runtime.sequences.try_allocate_sender_seq() {
-                    Ok(seq) => seq.value(),
-                    Err(err) => return Err(exhausted(phase, err)),
-                };
+                // Build the frame against the sequence number that *would* be
+                // allocated next, without consuming it. An application may hand
+                // us a message with no legal wire form — an ordinary field
+                // carrying SOH, an empty value, a DATA half without its LENGTH.
+                // Validating before allocation makes that a clean drop that
+                // leaves the session and the sequence counter intact, rather
+                // than a teardown over a spent number the counterparty would
+                // have to resend over. The reactor is the sole allocator of the
+                // sender counter and does not await between this peek and the
+                // commit below, so the number it commits is the one framed here.
+                let seq = self.runtime.sequences.next_sender_seq().value();
                 let frame = match self.factory.application_message(seq, &message) {
                     Ok(frame) => frame,
                     Err(err) => {
-                        // The application handed us a value with no legal wire
-                        // form. The session is unharmed — the frame simply
-                        // never existed — but the sequence number allocated for
-                        // it is now spent, so the session cannot continue
-                        // without a gap the counterparty would have to resend
-                        // over.
-                        teardown(phase);
-                        return Err(closed(
-                            format!("cannot encode outbound message: {err}"),
-                            false,
-                        ));
+                        // The message never reached the wire and no number was
+                        // spent. The value itself is not logged: it may carry a
+                        // credential (554/925) or RawData.
+                        tracing::warn!(
+                            session = %self.session_id,
+                            msg_type = %message.msg_type(),
+                            error = %err,
+                            "dropping outbound message: cannot encode"
+                        );
+                        return Ok(phase);
                     }
                 };
+                // The frame encoded; commit the sequence number it carries.
+                if let Err(err) = self.runtime.sequences.try_allocate_sender_seq() {
+                    return Err(exhausted(phase, err));
+                }
                 if let Ok(mut owned) = wire::owned_from_frame(&frame) {
                     self.application.to_app(&mut owned, &self.session_id).await;
                 }

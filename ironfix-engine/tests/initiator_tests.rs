@@ -362,6 +362,104 @@ async fn test_logon_exchange_and_logout() {
     ok(acceptor.await, "acceptor task");
 }
 
+/// A `RawData` (95/96) field carrying an embedded SOH and a non-UTF-8 byte is
+/// sent through `OutboundMessage::push_data`, arrives byte-exact, and neither
+/// tears the session down nor spends a sequence number on a legal message.
+#[tokio::test]
+async fn test_send_raw_data_field_round_trips_byte_exact() {
+    let (listener, addr) = bind_listener().await;
+    // A payload the encoder refuses as an ordinary field: it carries the SOH
+    // delimiter, `=`, and a non-UTF-8 byte, none of which survive outside a
+    // counted DATA field.
+    const PAYLOAD: &[u8] = b"sig\x01\xff=part2\x01end";
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+
+        let order = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&order), "D");
+        // First app message after the Logon (seq 1) is seq 2: encoding the
+        // RawData field spent no number and opened no gap.
+        assert_eq!(field(&order, 34).as_deref(), Some("2"));
+        assert_eq!(field(&order, 11).as_deref(), Some("ORDER-1"));
+        assert_eq!(field(&order, 95), Some(PAYLOAD.len().to_string()));
+
+        let mut decoder = Decoder::new(&order);
+        let decoded = ok(decoder.decode(), "order carrying RawData must decode");
+        // Byte-exact, including the embedded SOH and the non-UTF-8 byte.
+        assert_eq!(decoded.get_field(96).map(|f| f.value), Some(PAYLOAD));
+        // 8, 9, 35, 49, 56, 34, 52, 11, 95, 96 — no phantom field split out of
+        // the payload's SOH.
+        assert_eq!(decoded.field_count(), 10);
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+    order
+        .push_str(11, "ORDER-1")
+        .push_data(95, 96, PAYLOAD.to_vec());
+    // The send path must not error and must not tear the session down.
+    ok(connection.send(order).await, "send order carrying RawData");
+
+    // The acceptor drops the socket after asserting; the session closes on that
+    // transport drop, not on an encode teardown.
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s",
+    );
+    assert!(app.events().contains(&"logon".to_string()));
+
+    ok(acceptor.await, "acceptor task");
+}
+
+/// An `OutboundMessage` with no legal wire form is dropped cleanly: it spends
+/// no sequence number and does not tear the session down, so a following
+/// encodable message still flows with an unbroken sequence.
+#[tokio::test]
+async fn test_unencodable_outbound_message_is_dropped_without_teardown() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+
+        // Only the encodable message reaches the wire, and it carries seq 2:
+        // the rejected one before it neither reached the wire nor spent a
+        // number, so there is no gap for the peer to resend over.
+        let good = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&good), "D");
+        assert_eq!(field(&good, 34).as_deref(), Some("2"));
+        assert_eq!(field(&good, 11).as_deref(), Some("GOOD"));
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    // An ordinary field carrying SOH has no legal wire form; the encoder
+    // refuses it. This used to allocate a sender seq and then tear the session
+    // down on the encode failure.
+    let mut bad = OutboundMessage::new(MsgType::NewOrderSingle);
+    bad.push_str(11, "BAD").push_str(58, "text\x0149=EVIL");
+    ok(connection.send(bad).await, "queue unencodable message");
+
+    let mut good = OutboundMessage::new(MsgType::NewOrderSingle);
+    good.push_str(11, "GOOD");
+    ok(connection.send(good).await, "queue encodable message");
+
+    // The session is closed by the acceptor's transport drop after it reads the
+    // good frame, not by a teardown from the rejected message.
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s",
+    );
+    assert!(app.events().contains(&"logon".to_string()));
+
+    ok(acceptor.await, "acceptor task");
+}
+
 /// Transport drop after logon fires wait_closed and on_logout.
 #[tokio::test]
 async fn test_transport_drop_fires_wait_closed() {

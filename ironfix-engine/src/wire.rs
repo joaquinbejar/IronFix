@@ -12,7 +12,7 @@
 //! consumers via [`OutboundMessage`] get the same header treatment.
 
 use crate::application::RejectReason;
-use crate::outbound::OutboundMessage;
+use crate::outbound::{OutboundField, OutboundMessage};
 use bytes::BytesMut;
 use ironfix_core::error::{DecodeError, EncodeError};
 use ironfix_core::message::{OwnedMessage, RawMessage};
@@ -395,8 +395,15 @@ impl MessageFactory {
             false,
             self.version.appl_ver_id(),
         );
-        for (tag, value) in message.fields() {
-            encoder.put_raw(*tag, value);
+        for field in message.fields() {
+            match field {
+                OutboundField::Raw { tag, value } => encoder.put_raw(*tag, value),
+                OutboundField::Data {
+                    length_tag,
+                    data_tag,
+                    value,
+                } => encoder.put_data(*length_tag, *data_tag, value),
+            }
         }
         into_frame(&mut encoder)
     }
@@ -496,6 +503,24 @@ mod tests {
         assert_eq!(raw.get_field_str(11), Some("ORDER-1"));
         assert_eq!(raw.get_field_str(54), Some("1"));
         assert_eq!(raw.get_field_str(1128), None);
+    }
+
+    #[test]
+    fn test_application_message_encodes_raw_data_as_a_counted_pair() {
+        // A RawData payload carrying SOH is routed through the encoder's
+        // LENGTH/DATA path, not put_raw, so the frame encodes and the payload
+        // survives byte-exact instead of the message being refused.
+        let payload: &[u8] = b"a\x01b=c";
+        let mut message = OutboundMessage::new(MsgType::NewOrderSingle);
+        message
+            .push_str(11, "ORDER-1")
+            .push_data(95, 96, payload.to_vec());
+
+        let frame = framed(factory().application_message(7, &message));
+        let raw = decode(&frame);
+        assert_eq!(raw.get_field_str(11), Some("ORDER-1"));
+        assert_eq!(raw.get_field(95).map(|f| f.value), Some(b"5".as_slice()));
+        assert_eq!(raw.get_field(96).map(|f| f.value), Some(payload));
     }
 
     #[test]
