@@ -6,7 +6,7 @@
 mod common;
 
 use common::{ExampleConfig, format_timestamp, init_logging};
-use ironfix_fast::FastEncoder;
+use ironfix_fast::{FastEncoder, FastError};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, interval};
@@ -63,7 +63,13 @@ async fn handle_client(mut socket: TcpStream) -> anyhow::Result<()> {
                 let size: u64 = 100 + (seq_num % 900);
 
                 // Build FAST message
-                let msg = build_market_data(seq_num, symbol, price, size);
+                let msg = match build_market_data(seq_num, symbol, price, size) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        error!("Failed to encode market data: {}", e);
+                        break;
+                    }
+                };
 
                 if let Err(e) = socket.write_all(&msg).await {
                     warn!("Write error: {}", e);
@@ -110,7 +116,16 @@ async fn handle_client(mut socket: TcpStream) -> anyhow::Result<()> {
 /// - Symbol (string)
 /// - Price (scaled decimal as uint64, scale 2)
 /// - Size (uint64)
-fn build_market_data(seq_num: u64, symbol: &str, price: f64, size: u64) -> Vec<u8> {
+///
+/// # Errors
+/// Returns `FastError::InvalidString` if the timestamp or symbol is not
+/// representable as a FAST ASCII string.
+fn build_market_data(
+    seq_num: u64,
+    symbol: &str,
+    price: f64,
+    size: u64,
+) -> Result<Vec<u8>, FastError> {
     let mut encoder = FastEncoder::new();
 
     // Presence map: all fields present (6 bits set + stop bit)
@@ -125,10 +140,10 @@ fn build_market_data(seq_num: u64, symbol: &str, price: f64, size: u64) -> Vec<u
     encoder.encode_uint(seq_num);
 
     // Timestamp
-    encoder.encode_ascii(&format_timestamp());
+    encoder.encode_ascii(&format_timestamp())?;
 
     // Symbol
-    encoder.encode_ascii(symbol);
+    encoder.encode_ascii(symbol)?;
 
     // Price as scaled integer (price * 100)
     let scaled_price = (price * 100.0) as u64;
@@ -137,5 +152,5 @@ fn build_market_data(seq_num: u64, symbol: &str, price: f64, size: u64) -> Vec<u
     // Size
     encoder.encode_uint(size);
 
-    encoder.finish()
+    Ok(encoder.finish())
 }
