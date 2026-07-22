@@ -67,6 +67,21 @@ pub enum EngineError {
         detail: String,
     },
 
+    /// The Logon acknowledgement carried a `BeginString` (8) that does not
+    /// match the configured session version.
+    ///
+    /// For a FIX 5.0 / FIXT.1.1 session the configured transport
+    /// `BeginString` is `FIXT.1.1`, so an ack tagged `FIX.5.0*` — or any
+    /// other version — is not this session's acknowledgement and aborts the
+    /// handshake.
+    #[error("begin string mismatch: expected {expected}, received {received}")]
+    BeginStringMismatch {
+        /// The configured transport `BeginString`.
+        expected: String,
+        /// The `BeginString` the counterparty sent on the Logon ack.
+        received: String,
+    },
+
     /// The configured `BeginString` cannot be framed conformantly.
     ///
     /// An unknown version, or `FIXT.1.1` on its own — which names the

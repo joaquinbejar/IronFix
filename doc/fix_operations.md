@@ -197,10 +197,12 @@ Outbound `ResetSeqNumFlag` is driven by `SessionConfig::reset_on_logon`.
 
 **What IronFix implements today**
 
-`ironfix-engine` has **no message store dependency**, so mandate items 1, 2 and
-4 above are **not implemented**: the engine cannot replay a single stored
-message. What it does is answer the whole requested range with one
-SequenceReset-GapFill (item 3, generalized to every message type):
+`ironfix-engine` **does not use a message store for replay**: although it
+declares `ironfix-store` in its `Cargo.toml`, no store is wired into the session
+path, so mandate items 1, 2 and 4 above are **not implemented** and the engine
+cannot replay a single stored message. What it does is answer the whole
+requested range with one SequenceReset-GapFill (item 3, generalized to every
+message type):
 
 - `BeginSeqNo` (7) absent or unparseable → session Reject, reason 1 (required
   tag missing), `RefTagID` = 7. There is deliberately **no** default value;
@@ -228,6 +230,20 @@ Consequence for consumers: **application messages are never replayed.** A
 counterparty that requests a resend of business traffic receives a gap fill,
 not the traffic. Real replay requires wiring a `MessageStore` into the engine,
 which is separate, tracked work.
+
+**Outbound `EndSeqNo` sentinel — a version caveat.** When the engine detects an
+inbound gap it requests retransmission with `EndSeqNo` (16) = 0, the open-ended
+"to infinity" sentinel. That `16=0` convention was introduced in FIX 4.2; FIX
+4.0 and 4.1 instead use `999999` for an open-ended request and read `16=0` as an
+empty range. IronFix emits `16=0` for **every** configured version — the
+sentinel is not selected by `BeginString` — so an open-ended resend request sent
+to a strict FIX 4.0/4.1 counterparty is not framed the way that version expects.
+This is recorded here as a **known limitation** rather than fixed with a
+version-aware sentinel; selecting the sentinel by `BeginString` is small,
+isolated follow-up work. (The inbound direction is unaffected in practice: a
+`16=999999` request from such a peer resolves to the same range as `16=0`,
+because the GapFill's `NewSeqNo` is capped at our next outbound sequence
+regardless.)
 
 ---
 
@@ -274,6 +290,7 @@ which is separate, tracked work.
 |---|---|
 | 1 | `SequenceReset` without `NewSeqNo` (36); `ResendRequest` without `BeginSeqNo` (7) or `EndSeqNo` (16) |
 | 5 | `SequenceReset` whose `NewSeqNo` would rewind or fails to advance; `ResendRequest` whose range is outside what we have sent |
+| 6 | `SequenceReset` with a malformed `GapFillFlag` (123) that is present but neither `Y` nor `N` |
 | 9 | Inbound `SenderCompID`/`TargetCompID` (and `SenderSubID`/`TargetSubID` when configured) do not match the session configuration |
 | any | Whatever an `Application::from_admin` / `from_app` implementation returns in its `RejectReason` |
 
@@ -328,11 +345,12 @@ arbitrary limit is invented here.
 
 | Condition | Behavior |
 |---|---|
-| `from_admin` rejects the message | session Reject with the application's reason; `NewSeqNo` not applied |
-| `NewSeqNo` (36) absent or unparseable | session Reject, reason 1, `RefTagID` = 36; MsgSeqNum is **not** validated and **not** consumed, matching QuickFIX/J, which excludes SequenceReset from its increment-on-reject rule. For a GapFill this leaves the peer's next in-order message looking gapped, so expect a ResendRequest to follow |
-| `123=Y`, MsgSeqNum gapped | ResendRequest for the missing range; `NewSeqNo` **not** applied |
-| `123=Y`, MsgSeqNum too low with `PossDupFlag` = Y | dropped as an already-applied duplicate |
+| `123` present but neither `Y` nor `N` (malformed GapFillFlag) | session Reject, reason 6 (incorrect data format), `RefTagID` = 123; the mode is not guessed from an uninterpretable field. An **absent** 123 stays Reset mode |
+| `123=Y`, MsgSeqNum gapped | ResendRequest for the missing range; `NewSeqNo` **not** applied. Classified **before** `from_admin`, so a rejecting application cannot suppress the required ResendRequest |
+| `123=Y`, MsgSeqNum too low with `PossDupFlag` = Y | dropped as an already-applied duplicate, **without** reaching `from_admin` |
 | `123=Y`, MsgSeqNum too low without `PossDupFlag` | Logout and disconnect, as for any other too-low message |
+| `from_admin` rejects an in-sequence fill or a Reset | session Reject with the application's reason; `NewSeqNo` not applied. An in-sequence GapFill still **consumes** its own MsgSeqNum — a rejected fill left unconsumed would wedge the inbound stream — while a Reset consumes nothing |
+| `NewSeqNo` (36) absent or unparseable | session Reject, reason 1, `RefTagID` = 36. An in-sequence GapFill (`123=Y`) still **consumes** its own MsgSeqNum, since it occupies that number even though its NewSeqNo is unusable; Reset mode (`123=N` or absent) consumes nothing. A gapped or too-low fill never reaches this branch — it is classified first (rows above) |
 | `123=Y`, MsgSeqNum in sequence, `NewSeqNo` ≤ MsgSeqNum | session Reject, reason 5, `RefTagID` = 36; the fill message itself is consumed so the session does not deadlock on that number |
 | `123=Y`, MsgSeqNum in sequence, `NewSeqNo` > MsgSeqNum | applied: inbound expectation becomes `NewSeqNo` |
 | `123=N` or 123 absent (Reset mode), `NewSeqNo` < expected | session Reject, reason 5, `RefTagID` = 36; not applied |

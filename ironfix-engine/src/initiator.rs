@@ -29,8 +29,9 @@
 //! `GapFillFlag` (123) = Y is an ordinary sequenced message and is validated
 //! against its own `MsgSeqNum`, while Reset mode alone may ignore it; an
 //! inbound `ResendRequest` is answered with a `SequenceReset`-GapFill bounded
-//! by `EndSeqNo`. **The engine has no message store, so no message is ever
-//! actually replayed** — a resend request is always answered with a gap fill.
+//! by `EndSeqNo`. **The engine does not use a message store for replay, so no
+//! message is ever actually replayed** — a resend request is always answered
+//! with a gap fill.
 //!
 //! All sequence arithmetic goes through the checked
 //! [`SequenceManager::try_allocate_sender_seq`] /
@@ -315,6 +316,31 @@ impl<A: Application + 'static> Initiator<A> {
                     let msg_type = other.as_str().to_string();
                     let _ = session.on_logon_reject();
                     return Err(EngineError::UnexpectedMessage { msg_type });
+                }
+            }
+
+            // BeginString before anything else the ack claims: an
+            // acknowledgement in a different FIX dialect than this session was
+            // configured for is not our acknowledgement, no matter what its
+            // CompIDs or MsgSeqNum say. The configured transport BeginString is
+            // the value used for outbound framing -- FIXT.1.1 for a 5.0
+            // session -- so that, not FIX.5.0*, is what a conforming ack
+            // carries. A mismatch aborts the handshake with a typed error
+            // rather than taking the session Active under the wrong protocol
+            // version.
+            match raw.begin_string() {
+                Ok(begin_string) if begin_string == version.begin_string => {}
+                Ok(begin_string) => {
+                    let received = begin_string.to_string();
+                    let _ = session.on_logon_reject();
+                    return Err(EngineError::BeginStringMismatch {
+                        expected: version.begin_string.to_string(),
+                        received,
+                    });
+                }
+                Err(err) => {
+                    let _ = session.on_logon_reject();
+                    return Err(err.into());
                 }
             }
 
@@ -827,15 +853,6 @@ impl<A: Application> Reactor<A> {
         closed(detail, false)
     }
 
-    /// Handles an inbound SequenceReset (35=4).
-    ///
-    /// `GapFillFlag` (123) selects the mode (`doc/fix_operations.md`,
-    /// "Sequence Reset"): `123=Y` is a Gap Fill, which is an ordinary
-    /// sequenced message and is validated against MsgSeqNum like any other;
-    /// `123=N` or an absent 123 is a Reset, the only mode allowed to ignore
-    /// MsgSeqNum. Treating a Gap Fill as a Reset would let a gapped fill
-    /// jump the target expectation past messages that were never received
-    /// and will now never be requested.
     /// Consumes the MsgSeqNum of a `SequenceReset` that is being rejected.
     ///
     /// A Gap Fill participates in normal sequencing: it occupies the number it
@@ -854,6 +871,24 @@ impl<A: Application> Reactor<A> {
             .map(|_| ())
     }
 
+    /// Handles an inbound SequenceReset (35=4).
+    ///
+    /// `GapFillFlag` (123) selects the mode (`doc/fix_operations.md`,
+    /// "Sequence Reset"): `123=Y` is a Gap Fill, which is an ordinary
+    /// sequenced message and is validated against MsgSeqNum like any other;
+    /// `123=N` or an absent 123 is a Reset, the only mode allowed to ignore
+    /// MsgSeqNum. A present-but-malformed 123 (neither `Y` nor `N`) is a
+    /// data-format error, rejected with reason 6 rather than silently taken as
+    /// a Reset. Treating a Gap Fill as a Reset would let a gapped fill jump the
+    /// target expectation past messages that were never received and will now
+    /// never be requested.
+    ///
+    /// A Gap Fill's own MsgSeqNum is classified (gap / too-low duplicate / in
+    /// sequence) **before** the `from_admin` callback runs, exactly as every
+    /// other inbound message is sequence-checked before it reaches the
+    /// application: a gapped fill must produce a ResendRequest even if the
+    /// application would reject it, and a too-low duplicate must be dropped
+    /// without the callback ever seeing it.
     async fn on_sequence_reset(
         &mut self,
         framed: &mut FixFramed,
@@ -861,8 +896,61 @@ impl<A: Application> Reactor<A> {
         raw: &RawMessage<'_>,
         seq: u64,
     ) -> Result<Phase, SessionClosed> {
-        let gap_fill = raw.get_field_str(123) == Some("Y");
+        // Only Y and N are valid GapFillFlag Booleans. An absent 123 is Reset
+        // mode per spec, but a present-but-malformed value is rejected with
+        // reason 6 (incorrect data format) rather than guessing a mode from an
+        // uninterpretable field. Reset mode's target jump is defined behaviour,
+        // so a malformed value gains no extra power by being read as a Reset --
+        // it is simply not a value we are entitled to interpret.
+        let gap_fill = match raw.get_field_str(123) {
+            Some("Y") => true,
+            Some("N") | None => false,
+            Some(other) => {
+                let reason = RejectReason::new(
+                    6,
+                    format!("GapFillFlag (123) must be Y or N, got '{other}'"),
+                )
+                .with_ref_tag(123);
+                return self
+                    .send_session_reject(
+                        framed,
+                        phase,
+                        seq,
+                        MsgType::SequenceReset.as_str(),
+                        &reason,
+                    )
+                    .await;
+            }
+        };
 
+        // Classify a Gap Fill's MsgSeqNum before the application sees it. A
+        // gapped fill cannot be trusted to describe the missing range, so it
+        // triggers a ResendRequest -- never a Reject the application asked for
+        // -- and a too-low duplicate is dropped without reaching from_admin.
+        // Reset mode carries no meaningful MsgSeqNum and is not classified.
+        if gap_fill {
+            match self.runtime.sequences.validate_incoming(seq) {
+                SequenceResult::Gap { expected, .. } => {
+                    // The fill is itself gapped: it cannot be trusted to
+                    // describe the missing range, so NewSeqNo is not applied
+                    // and the range is requested instead.
+                    return self.request_resend(framed, phase, expected).await;
+                }
+                SequenceResult::TooLow { expected, received } => {
+                    if raw.get_field_str(43) == Some("Y") {
+                        // Duplicate delivery of an already-applied fill.
+                        return Ok(phase);
+                    }
+                    return Err(self
+                        .close_on_too_low(framed, phase, expected, received)
+                        .await);
+                }
+                SequenceResult::Ok => {}
+            }
+        }
+
+        // The fill is in sequence (or this is Reset mode): the application may
+        // now inspect it.
         if let Err(reason) = self.application.from_admin(raw, &self.session_id).await {
             // An in-sequence GapFill occupies its own MsgSeqNum. Rejecting it
             // without consuming that number leaves the inbound expectation
@@ -892,26 +980,8 @@ impl<A: Application> Reactor<A> {
         };
 
         if gap_fill {
-            match self.runtime.sequences.validate_incoming(seq) {
-                SequenceResult::Gap { expected, .. } => {
-                    // The fill is itself gapped: it cannot be trusted to
-                    // describe the missing range, so NewSeqNo is not applied
-                    // and the range is requested instead.
-                    return self.request_resend(framed, phase, expected).await;
-                }
-                SequenceResult::TooLow { expected, received } => {
-                    if raw.get_field_str(43) == Some("Y") {
-                        // Duplicate delivery of an already-applied fill.
-                        return Ok(phase);
-                    }
-                    return Err(self
-                        .close_on_too_low(framed, phase, expected, received)
-                        .await);
-                }
-                SequenceResult::Ok => {}
-            }
-
-            // A Gap Fill must advance past the number it occupies itself.
+            // The fill was classified as in sequence above; a Gap Fill must
+            // advance past the number it occupies itself.
             if new_seq <= seq {
                 // The fill was in sequence, so consume it: repeating the
                 // same number would deadlock the session on this message.

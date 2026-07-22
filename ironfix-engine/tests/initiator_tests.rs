@@ -1693,3 +1693,209 @@ async fn test_with_initial_sequences_seeds_counters() {
         "acceptor task",
     );
 }
+
+// ---------------------------------------------------------------------------
+// SequenceReset classification runs before the application callback
+// ---------------------------------------------------------------------------
+
+/// A GapFill whose own MsgSeqNum is gapped must trigger a ResendRequest even
+/// when the application would reject it: sequence classification runs before
+/// `from_admin`, so the rejection cannot turn the required ResendRequest into a
+/// session Reject.
+#[tokio::test]
+async fn test_gapped_gap_fill_rejected_by_app_requests_resend_not_reject() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        // Expecting 2, but the GapFill claims 34=7 and jumps to 20.
+        ok(
+            framed
+                .send(venue_msg("4", 7, &[(123, "Y"), (36, "20")]))
+                .await,
+            "send gapped gap fill",
+        );
+
+        // The reply must be a ResendRequest (35=2), never a session Reject.
+        let reply = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reply), "2");
+        assert_eq!(field(&reply, 7).as_deref(), Some("2"));
+        assert_eq!(field(&reply, 16).as_deref(), Some("0"));
+    });
+
+    // rejecting_admin makes from_admin reject every non-Logon admin message: if
+    // it were reached for the gapped fill the reply would be a 35=3 Reject.
+    let (app, _app_rx) = RecordingApp::rejecting_admin();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+    // NewSeqNo must NOT have been applied.
+    assert_eq!(connection.next_target_seq(), 2);
+}
+
+/// A too-low GapFill flagged PossDup is an already-applied duplicate: it is
+/// dropped before `from_admin` runs. With a from_admin that rejects every admin
+/// message, the discriminator is that NO session Reject comes back for the
+/// duplicate -- the callback was never reached.
+#[tokio::test]
+async fn test_too_low_duplicate_gap_fill_dropped_without_from_admin() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+
+        // Advance the client's target past 2 with an in-order report at 34=2.
+        ok(
+            framed
+                .send(venue_msg(
+                    "8",
+                    2,
+                    &[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "send report at 2",
+        );
+        // Too-low GapFill (34=2) flagged PossDup: an already-applied duplicate.
+        ok(
+            framed
+                .send(venue_msg("4", 2, &[(123, "Y"), (43, "Y"), (36, "3")]))
+                .await,
+            "send too-low duplicate gap fill",
+        );
+        // The next in-order report at 34=3 proves the session survived and the
+        // duplicate consumed nothing.
+        ok(
+            framed
+                .send(venue_msg(
+                    "8",
+                    3,
+                    &[(37, "EX-2"), (17, "E-2"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "send report at 3",
+        );
+
+        // No session Reject may come back for the dropped duplicate.
+        assert!(
+            timeout(Duration::from_millis(300), framed.next())
+                .await
+                .is_err(),
+            "a too-low duplicate must be dropped, not rejected via from_admin"
+        );
+    });
+
+    let (app, mut app_rx) = RecordingApp::rejecting_admin();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    // Both reports (application messages) are delivered; the duplicate GapFill
+    // is not.
+    for expected in ["8", "8"] {
+        let received = some(
+            ok(
+                timeout(Duration::from_secs(5), app_rx.recv()).await,
+                "app message within 5s",
+            ),
+            "app channel must stay open",
+        );
+        assert_eq!(received, expected);
+    }
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+    // Target advanced 2 -> 3 -> 4; the duplicate at 2 consumed nothing.
+    assert_eq!(connection.next_target_seq(), 4);
+}
+
+/// A GapFillFlag (123) that is present but neither Y nor N is a data-format
+/// error: session Reject with reason 6 and RefTagID 123, not a silent Reset.
+#[tokio::test]
+async fn test_sequence_reset_malformed_gap_fill_flag_is_rejected() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        ok(
+            framed
+                .send(venue_msg("4", 2, &[(123, "X"), (36, "10")]))
+                .await,
+            "send malformed gap fill flag",
+        );
+
+        let reject = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reject), "3");
+        assert_eq!(field(&reject, 45).as_deref(), Some("2"));
+        assert_eq!(field(&reject, 372).as_deref(), Some("4"));
+        assert_eq!(field(&reject, 373).as_deref(), Some("6"));
+        assert_eq!(field(&reject, 371).as_deref(), Some("123"));
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+    // The malformed reset was rejected without touching sequence state.
+    assert_eq!(connection.next_target_seq(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Logon ack BeginString validation
+// ---------------------------------------------------------------------------
+
+/// A Logon ack whose BeginString differs from the configured session version
+/// aborts the handshake: an ack in a different FIX dialect is not this
+/// session's acknowledgement, whatever its CompIDs say.
+#[tokio::test]
+async fn test_logon_ack_wrong_begin_string_fails_handshake() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let _logon = next_frame(&mut framed).await;
+        // The client is configured FIX.4.4; ack with FIX.4.2.
+        let mut encoder = Encoder::new("FIX.4.2");
+        encoder.put_str(35, "A");
+        encoder.put_str(49, "VENUE");
+        encoder.put_str(56, "CLIENT");
+        encoder.put_uint(34, 1);
+        encoder.put_str(52, Timestamp::now().format_millis().as_str());
+        encoder.put_str(98, "0");
+        encoder.put_str(108, "30");
+        ok(
+            framed.send(encoder.finish()).await,
+            "send wrong-version logon ack",
+        );
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+
+    match initiator.connect(addr).await {
+        Err(EngineError::BeginStringMismatch { expected, received }) => {
+            assert_eq!(expected, "FIX.4.4");
+            assert_eq!(received, "FIX.4.2");
+        }
+        other => panic!("expected BeginStringMismatch, got {other:?}"),
+    }
+
+    ok(acceptor.await, "acceptor task");
+}
