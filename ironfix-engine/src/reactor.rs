@@ -1653,11 +1653,16 @@ impl<A: Application> Reactor<A> {
         };
         let msg_type = raw.msg_type().clone();
 
-        let Some(seq) = raw.get_field_str(34).and_then(|s| s.parse::<u64>().ok()) else {
+        // Positional read: MsgSeqNum (34) must be in the standard header, the
+        // same contract the CompID/SendingTime paths enforce. A 34 that appears
+        // only after the body is treated as missing rather than smuggled in as
+        // the session sequence number. Both Initiator and Acceptor share this
+        // reactor, so this closes the gap for in-session traffic on both.
+        let Some(seq) = wire::header_seq_num(&raw) else {
             tracing::warn!(
                 session = %self.session_id,
                 msg_type = %msg_type,
-                "dropping message without valid MsgSeqNum (34)"
+                "dropping message without a valid header MsgSeqNum (34)"
             );
             return Ok(phase);
         };

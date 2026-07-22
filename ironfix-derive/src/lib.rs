@@ -11,8 +11,8 @@
 //! This crate derives the two `ironfix-core` traits that give a Rust struct a
 //! FIX wire form:
 //!
-//! - `#[derive(FixMessage)]` implements [`ironfix_core::message::FixMessage`]
-//! - `#[derive(FixField)]` implements [`ironfix_core::field::FixField`]
+//! - `#[derive(FixMessage)]` implements `ironfix_core::message::FixMessage`
+//! - `#[derive(FixField)]` implements `ironfix_core::field::FixField`
 //!
 //! Both expansions name every type, trait, and enum variant by absolute path
 //! (`::ironfix_core::…`, `::core::…`, `::std::…`), so a derived type compiles
@@ -25,8 +25,7 @@
 //!   is a compile error naming what is missing. A MsgType is never assumed to
 //!   be `0` (Heartbeat) and a tag is never assumed to be `0`.
 //! - **Nothing panics.** The generated bodies return
-//!   [`DecodeError`](ironfix_core::error::DecodeError) /
-//!   [`EncodeError`](ironfix_core::error::EncodeError); there is no `unwrap`,
+//!   `DecodeError` / `EncodeError`; there is no `unwrap`,
 //!   no indexing, and no `todo!()` in the expansion.
 //!
 //! ## `#[derive(FixMessage)]`
@@ -54,7 +53,7 @@
 //!   `MSG_TYPE`, so decoding an `ExecutionReport` as a `NewOrderSingle` is a
 //!   typed error rather than a half-populated struct. A field typed `Option<T>`
 //!   is optional; any other type is required and its absence is
-//!   [`DecodeError::MissingRequiredField`](ironfix_core::error::DecodeError::MissingRequiredField).
+//!   `DecodeError::MissingRequiredField`.
 //! - `encode` appends `tag=value<SOH>` for each field **in declaration order**
 //!   and writes nothing else: no BeginString (8), no BodyLength (9), no
 //!   MsgType (35), no CheckSum (10). It produces the *body* fields, matching
@@ -104,7 +103,7 @@
 //!   encoding/decoding is not implemented.
 //! - **No `Length`/`Data` pairing.** A `Vec<u8>` field is written raw; if its
 //!   bytes contain SOH, `encode` fails with
-//!   [`EncodeError::InvalidFieldValue`](ironfix_core::error::EncodeError::InvalidFieldValue)
+//!   `EncodeError::InvalidFieldValue`
 //!   rather than emitting a frame that cannot be parsed back. Emitting the
 //!   paired `Length` field is the caller's job.
 //! - **No `skip`.** Every field of a derived `FixMessage` must map to a tag.
@@ -133,7 +132,7 @@ const SOH: u8 = 0x01;
 /// a message type that can never match into a compile error.
 const MSG_TYPE_MAX_LEN: usize = 8;
 
-/// Derives [`ironfix_core::message::FixMessage`] for a struct with named
+/// Derives `ironfix_core::message::FixMessage` for a struct with named
 /// fields.
 ///
 /// # Attributes
@@ -169,7 +168,7 @@ pub fn derive_fix_message(input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Derives [`ironfix_core::field::FixField`] for a single-field struct.
+/// Derives `ironfix_core::field::FixField` for a single-field struct.
 ///
 /// # Attributes
 ///

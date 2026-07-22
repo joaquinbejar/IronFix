@@ -68,8 +68,15 @@ impl ServerApp {
     }
 
     /// Publishes the outbound handle for the established session.
+    ///
+    /// Uses `send_replace`, not `send`: the initial receiver is dropped in
+    /// `new`, so when `set_connection` wins the race against `from_app`'s
+    /// `subscribe`, a plain `send` would have no receivers, discard the value,
+    /// and leave every later subscriber seeing `None` forever. `send_replace`
+    /// stores the handle unconditionally, so a task that subscribes afterwards
+    /// still observes it.
     fn set_connection(&self, connection: Connection) {
-        let _ = self.connection.send(Some(connection));
+        let _ = self.connection.send_replace(Some(connection));
     }
 
     /// A receiver a spawned task can await the connection handle on.

@@ -59,9 +59,11 @@
 //!
 //! The encoders are the mirror image: they only ever emit encodings the
 //! decoders accept. Values that have no legal FAST representation — a
-//! non-ASCII string, a string that begins with a NUL and continues, or
-//! `Some(u64::MAX)` in a nullable unsigned field — are refused with a typed
-//! error rather than written to the wire in a corrupt form.
+//! non-ASCII string, or a string that begins with a NUL and continues — are
+//! refused with a typed error rather than written to the wire in a corrupt
+//! form. The nullable unsigned codec covers the full `0..=u64::MAX` domain:
+//! `Some(u64::MAX)` biases to 2^64 and round-trips through a `u128` path
+//! rather than being rejected.
 
 pub mod decoder;
 pub mod encoder;

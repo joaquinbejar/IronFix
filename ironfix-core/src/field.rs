@@ -19,20 +19,42 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-/// The lowest tag number FIX reserves for user-defined fields.
+/// The lowest tag number in the original FIX bilateral user-defined range.
 ///
-/// FIX reserves 5000-9999 for user-defined fields, so 4999 is the highest
-/// standard tag and 5000 the first user-defined one.
+/// FIX reserves 5000-9999 for bilateral user-defined fields, so 4999 is the
+/// highest standard tag below the range and 5000 the first user-defined one.
 pub const USER_DEFINED_TAG_MIN: u32 = 5000;
+
+/// The highest tag number in the original FIX bilateral user-defined range.
+///
+/// The first user-defined range is 5000-9999. Tags 10000-19999 are reserved
+/// for internal use within a single firm and are not the bilateral range.
+pub const USER_DEFINED_TAG_MAX: u32 = 9999;
+
+/// The lowest tag number in the extended FIX bilateral user-defined range.
+///
+/// The Global Technical Committee approved 20000-39999 as a second bilateral
+/// user-defined range in December 2009, once the 5000-9999 range filled up;
+/// tags here are used bilaterally and do not need to be registered.
+pub const USER_DEFINED_EXT_TAG_MIN: u32 = 20000;
+
+/// The highest tag number in the extended FIX bilateral user-defined range.
+///
+/// The extended user-defined range is 20000-39999. Tags at or above 40000 are
+/// reserved (GTC / internal use), not user-defined; the loaded dictionary, not
+/// this type, is what says what an individual high tag means.
+pub const USER_DEFINED_EXT_TAG_MAX: u32 = 39999;
 
 /// FIX field tag number.
 ///
 /// Tags are positive integers that identify fields within a FIX message.
-/// Standard tags are defined in the FIX specification (1-4999), while FIX
-/// reserves 5000-9999 for user-defined fields. Tags at or above
-/// [`USER_DEFINED_TAG_MIN`] are treated as user-defined; venues do assign
-/// beyond 9999 in practice, and a dictionary — not this type — is what says
-/// whether a given tag is known.
+/// Standard tags are defined in the FIX specification (1-4999). FIX reserves
+/// **two** disjoint bilateral user-defined ranges: 5000-9999, and 20000-39999
+/// (approved by the GTC in December 2009 once the first filled up). Tags
+/// 10000-19999 are internal-use, and tags at or above 40000 are reserved, so
+/// neither is user-defined. Only the two user-defined ranges classify as such
+/// here; a dictionary — not this type — is what says whether a given tag is
+/// known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[repr(transparent)]
 #[serde(transparent)]
@@ -77,18 +99,29 @@ impl FieldTag {
         self.0 >= 1
     }
 
-    /// Returns true if this is a standard FIX tag (1-4999).
+    /// Returns true if this is a standard FIX tag below the user-defined range
+    /// (1-4999).
+    ///
+    /// This does not cover assigned tags above 9999: the dictionary — not this
+    /// predicate — classifies an individual high tag.
     #[inline]
     #[must_use]
     pub const fn is_standard(self) -> bool {
         self.0 >= 1 && self.0 < USER_DEFINED_TAG_MIN
     }
 
-    /// Returns true if this is a user-defined tag (5000+).
+    /// Returns true if this is a bilateral user-defined tag.
+    ///
+    /// FIX defines **two** disjoint user-defined ranges:
+    /// [`USER_DEFINED_TAG_MIN`]..=[`USER_DEFINED_TAG_MAX`] (5000-9999) and
+    /// [`USER_DEFINED_EXT_TAG_MIN`]..=[`USER_DEFINED_EXT_TAG_MAX`]
+    /// (20000-39999). A tag in the 10000-19999 internal-use range, or at or
+    /// above 40000, is deliberately *not* user-defined.
     #[inline]
     #[must_use]
     pub const fn is_user_defined(self) -> bool {
-        self.0 >= USER_DEFINED_TAG_MIN
+        (self.0 >= USER_DEFINED_TAG_MIN && self.0 <= USER_DEFINED_TAG_MAX)
+            || (self.0 >= USER_DEFINED_EXT_TAG_MIN && self.0 <= USER_DEFINED_EXT_TAG_MAX)
     }
 }
 
@@ -423,6 +456,60 @@ mod tests {
         assert!(!tag.is_standard());
         assert!(tag.is_user_defined());
         assert_eq!(tag.value(), USER_DEFINED_TAG_MIN);
+    }
+
+    #[test]
+    fn test_field_tag_boundary_9999_is_user_defined() {
+        let tag = ok(FieldTag::try_new(9999), "9999 is a legal tag");
+        assert!(!tag.is_standard());
+        assert!(tag.is_user_defined());
+        assert_eq!(tag.value(), USER_DEFINED_TAG_MAX);
+    }
+
+    #[test]
+    fn test_field_tag_boundary_10000_is_not_user_defined() {
+        // 10000-19999 is internal-use, between the two bilateral ranges.
+        let tag = ok(FieldTag::try_new(10000), "10000 is a legal tag");
+        assert!(!tag.is_user_defined());
+        assert!(!tag.is_standard());
+    }
+
+    #[test]
+    fn test_field_tag_extended_user_defined_range_boundaries() {
+        // The GTC approved 20000-39999 as a second bilateral user-defined range
+        // in 2009; the earlier `<= 9999` bound regressed all of it to false.
+        // 19999 is still internal-use; 40000+ is reserved.
+        let cases = [
+            (19999u32, false),
+            (20000, true),
+            (USER_DEFINED_EXT_TAG_MIN, true),
+            (30000, true),
+            (39999, true),
+            (USER_DEFINED_EXT_TAG_MAX, true),
+            (40000, false),
+        ];
+        for (tag_num, expected) in cases {
+            let tag = ok(FieldTag::try_new(tag_num), "high tag is legal");
+            assert_eq!(
+                tag.is_user_defined(),
+                expected,
+                "is_user_defined({tag_num}) should be {expected}"
+            );
+            assert!(!tag.is_standard(), "{tag_num} is not a standard low tag");
+        }
+    }
+
+    #[test]
+    fn test_field_tag_reserved_high_range_is_not_user_defined() {
+        // Tags at or above 40000 are reserved (GTC / internal use), not
+        // user-defined; the original `>= 5000` predicate misclassified them.
+        for tag_num in [40000, 40001, 49999, 50000] {
+            let tag = ok(FieldTag::try_new(tag_num), "reserved high tag is legal");
+            assert!(
+                !tag.is_user_defined(),
+                "reserved tag {tag_num} must not be user-defined"
+            );
+        }
     }
 
     #[test]
