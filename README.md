@@ -168,8 +168,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Or terminate an [`EngineBuilder`] directly: `into_initiator()` produces the
+client above, and `into_acceptor()` produces a server-side [`Acceptor`] that
+establishes sessions on inbound connections. Both engines hand the socket to the
+same session reactor once the Logon handshake completes.
+
+```rust,no_run
+use ironfix_core::types::CompId;
+use ironfix_engine::EngineBuilder;
+use ironfix_session::SessionConfig;
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+// Create a session configuration (sender = you, target = the counterparty).
+let config = SessionConfig::new(
+    CompId::new("CLIENT")?,
+    CompId::new("VENUE")?,
+    "FIX.4.4",
+);
+
+// The builder terminates in a runnable engine. `into_initiator` produces a
+// client that dials the counterparty; `into_acceptor` produces a server that
+// establishes sessions on inbound connections.
+let initiator = EngineBuilder::new()
+    .add_session(config)
+    .into_initiator()?;
+
+let connection = initiator.connect("127.0.0.1:9876").await?;
+connection.logout().await?;
+connection.wait_closed().await;
+# Ok(())
+# }
+```
+
 See `ironfix-example/examples/fix44_engine_client.rs` for the same flow with a
-real `Application` implementation.
+real `Application` implementation, and `fix44_server.rs` for the matching
+`Acceptor`-based server.
+
 
 ## 🛠 Makefile Commands
 

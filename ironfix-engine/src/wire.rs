@@ -29,7 +29,7 @@
 //! is a replay of real traffic, not a freshly numbered message, so it does not
 //! go through the factory's sequence-numbering `encode`.
 
-use crate::application::RejectReason;
+use crate::application::{RejectReason, SessionId};
 use crate::outbound::{OutboundField, OutboundMessage};
 use bytes::BytesMut;
 use ironfix_core::error::{DecodeError, EncodeError};
@@ -40,6 +40,27 @@ use ironfix_core::version::FixVersion;
 use ironfix_session::SessionConfig;
 use ironfix_tagvalue::{Decoder, Encoder};
 use std::time::Duration;
+
+/// Derives the [`SessionId`] from a session configuration.
+///
+/// The identity is taken sender-first from the configuration, so both the
+/// [`Initiator`](crate::Initiator) and the [`Acceptor`](crate::Acceptor) name a
+/// session the same way: `begin_string:sender_comp_id->target_comp_id`, with
+/// the optional sub IDs attached when configured.
+pub(crate) fn session_id_from_config(config: &SessionConfig) -> SessionId {
+    let mut session_id = SessionId::new(
+        config.begin_string.clone(),
+        config.sender_comp_id.as_str(),
+        config.target_comp_id.as_str(),
+    );
+    if let Some(sub) = &config.sender_sub_id {
+        session_id = session_id.with_sender_sub_id(sub.clone());
+    }
+    if let Some(sub) = &config.target_sub_id {
+        session_id = session_id.with_target_sub_id(sub.clone());
+    }
+    session_id
+}
 
 /// A configured `BeginString` the engine cannot frame conformantly.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -199,6 +220,105 @@ fn in_standard_header(raw: &RawMessage<'_>, tag: u32) -> bool {
         }
     }
     false
+}
+
+/// Reads `MsgSeqNum` (34) from the standard header of `raw`.
+///
+/// A tag 34 that appears only in the message body is treated as **absent**: it
+/// is not the standard-header field the session sequences against, and the same
+/// positional contract the identity check enforces on 49/56 applies here.
+/// Accepting a body-only 34 would let a peer smuggle a sequence number past a
+/// Logon that is, in fact, missing its header `MsgSeqNum`.
+///
+/// Returns `None` when 34 is absent from the header or is not a valid `u64`.
+pub(crate) fn header_seq_num(raw: &RawMessage<'_>) -> Option<u64> {
+    if !in_standard_header(raw, 34) {
+        return None;
+    }
+    raw.get_field_str(34)
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+/// Upper bound, in seconds, on a `HeartBtInt` (108) accepted from a
+/// counterparty.
+///
+/// One day. FIX types `HeartBtInt` as an unbounded non-negative int, and
+/// `108 = 0` is legal ("do not send heartbeats"), so the *lower* end is left
+/// open. The upper end is not: a [`Duration`](std::time::Duration) built from a
+/// counterparty-controlled value must stay finite, because the heartbeat clock
+/// adds a grace period to it (`interval + grace`), and
+/// `Duration::from_secs(u64::MAX) + _` overflows and panics — which, under the
+/// release profile's `panic = "abort"`, takes the whole process down. A single
+/// crafted Logon carrying `108 = u64::MAX` would otherwise be a remote abort. A
+/// day is orders of magnitude beyond any real interval while leaving enormous
+/// headroom below that overflow.
+pub(crate) const MAX_HEARTBEAT_INTERVAL_SECS: u64 = 86_400;
+
+/// Longest `HeartBtInt` (108) value echoed back in a log line or a Logout
+/// `Text` (58). The field is counterparty-controlled, so it is bounded.
+const MAX_ECHOED_HEARTBEAT: usize = 32;
+
+/// Why an inbound `HeartBtInt` (108) was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeartBtIntProblem {
+    /// The field is absent. FIX requires it on every Logon.
+    Missing,
+    /// The field is present but is not a non-negative integer.
+    Malformed {
+        /// The offending value, truncated for the log and the Logout text.
+        value: String,
+    },
+    /// The field parses but exceeds [`MAX_HEARTBEAT_INTERVAL_SECS`].
+    OutOfRange {
+        /// The requested interval, in seconds.
+        secs: u64,
+    },
+}
+
+impl std::fmt::Display for HeartBtIntProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(f, "HeartBtInt (108) is missing"),
+            Self::Malformed { value } => {
+                write!(
+                    f,
+                    "HeartBtInt (108) '{value}' is not a non-negative integer"
+                )
+            }
+            Self::OutOfRange { secs } => write!(
+                f,
+                "HeartBtInt (108) {secs}s exceeds the {MAX_HEARTBEAT_INTERVAL_SECS}s maximum"
+            ),
+        }
+    }
+}
+
+/// Parses and bounds the `HeartBtInt` (108) of an inbound Logon.
+///
+/// The value is adopted by the acceptor and drives a
+/// [`HeartbeatManager`](ironfix_session::HeartbeatManager), so it is validated
+/// at the handshake rather than trusted onto the heartbeat clock. `108 = 0` is
+/// accepted (it is legal FIX and is not specially handled today); anything above
+/// [`MAX_HEARTBEAT_INTERVAL_SECS`] is refused so a crafted value can never
+/// overflow the clock's `interval + grace` arithmetic.
+///
+/// # Errors
+/// Returns [`HeartBtIntProblem::Missing`] when tag 108 is absent,
+/// [`HeartBtIntProblem::Malformed`] when it is not a non-negative integer, and
+/// [`HeartBtIntProblem::OutOfRange`] when it exceeds the maximum.
+pub(crate) fn parse_heartbeat_interval(raw: &RawMessage<'_>) -> Result<u64, HeartBtIntProblem> {
+    let Some(value) = raw.get_field_str(108) else {
+        return Err(HeartBtIntProblem::Missing);
+    };
+    let Ok(secs) = value.parse::<u64>() else {
+        return Err(HeartBtIntProblem::Malformed {
+            value: value.chars().take(MAX_ECHOED_HEARTBEAT).collect(),
+        });
+    };
+    if secs > MAX_HEARTBEAT_INTERVAL_SECS {
+        return Err(HeartBtIntProblem::OutOfRange { secs });
+    }
+    Ok(secs)
 }
 
 /// The identity every inbound message must carry, derived from the session
@@ -1826,5 +1946,119 @@ mod tests {
             guard.validate(&decode(&missing)),
             Err(SendingTimeProblem::Missing)
         );
+    }
+
+    #[test]
+    fn test_header_seq_num_reads_the_header_field() {
+        let frame = frame_with_fields(&[
+            (35, "A"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "7"),
+            (52, "20260721-10:00:00.000"),
+        ]);
+        assert_eq!(header_seq_num(&decode(&frame)), Some(7));
+    }
+
+    #[test]
+    fn test_header_seq_num_ignores_a_body_only_seq_num() {
+        // 11 (ClOrdID) opens the body; the 34 that follows it is not the
+        // standard-header MsgSeqNum and must read as absent.
+        let frame = frame_with_fields(&[
+            (35, "A"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (52, "20260721-10:00:00.000"),
+            (11, "ORDER-1"),
+            (34, "7"),
+        ]);
+        assert_eq!(header_seq_num(&decode(&frame)), None);
+    }
+
+    #[test]
+    fn test_header_seq_num_rejects_a_non_numeric_value() {
+        let frame = frame_with_fields(&[
+            (35, "A"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "not-a-number"),
+        ]);
+        assert_eq!(header_seq_num(&decode(&frame)), None);
+    }
+
+    /// Reads a `HeartBtInt` (108) into a Logon fixture.
+    fn logon_with_heartbeat(heartbeat: &str) -> Vec<u8> {
+        frame_with_fields(&[
+            (35, "A"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "1"),
+            (52, "20260721-10:00:00.000"),
+            (98, "0"),
+            (108, heartbeat),
+        ])
+    }
+
+    #[test]
+    fn test_parse_heartbeat_interval_accepts_a_sane_value() {
+        assert_eq!(
+            parse_heartbeat_interval(&decode(&logon_with_heartbeat("30"))),
+            Ok(30)
+        );
+    }
+
+    #[test]
+    fn test_parse_heartbeat_interval_accepts_zero() {
+        // 108=0 is legal FIX ("do not send heartbeats") and is not specially
+        // handled today; the bound only refuses values that would overflow.
+        assert_eq!(
+            parse_heartbeat_interval(&decode(&logon_with_heartbeat("0"))),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn test_parse_heartbeat_interval_rejects_u64_max() {
+        // The remote-abort case: Duration::from_secs(u64::MAX) overflows the
+        // heartbeat clock's interval + grace, which aborts under panic=abort.
+        match parse_heartbeat_interval(&decode(&logon_with_heartbeat(&u64::MAX.to_string()))) {
+            Err(HeartBtIntProblem::OutOfRange { secs }) => assert_eq!(secs, u64::MAX),
+            other => panic!("u64::MAX HeartBtInt must be out of range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_heartbeat_interval_rejects_over_one_day() {
+        let over = MAX_HEARTBEAT_INTERVAL_SECS + 1;
+        match parse_heartbeat_interval(&decode(&logon_with_heartbeat(&over.to_string()))) {
+            Err(HeartBtIntProblem::OutOfRange { secs }) => assert_eq!(secs, over),
+            other => panic!("an over-a-day HeartBtInt must be out of range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_heartbeat_interval_rejects_missing_and_malformed() {
+        let missing = frame_with_fields(&[(35, "A"), (49, "VENUE"), (56, "CLIENT"), (34, "1")]);
+        assert_eq!(
+            parse_heartbeat_interval(&decode(&missing)),
+            Err(HeartBtIntProblem::Missing)
+        );
+
+        match parse_heartbeat_interval(&decode(&logon_with_heartbeat("thirty"))) {
+            Err(HeartBtIntProblem::Malformed { value }) => assert_eq!(value, "thirty"),
+            other => panic!("a non-numeric HeartBtInt must be malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_heartbeat_interval_echoes_a_bounded_value() {
+        let long = "9".repeat(200);
+        match parse_heartbeat_interval(&decode(&logon_with_heartbeat(&long))) {
+            // 200 nines parse as u64 overflow -> Malformed, echoed bounded.
+            Err(HeartBtIntProblem::Malformed { value }) => {
+                assert_eq!(value.chars().count(), MAX_ECHOED_HEARTBEAT);
+            }
+            other => panic!("a 200-digit HeartBtInt must be malformed, got {other:?}"),
+        }
     }
 }
