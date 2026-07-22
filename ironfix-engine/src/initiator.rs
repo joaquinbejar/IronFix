@@ -330,12 +330,12 @@ impl<A: Application + 'static> Initiator<A> {
             // rather than taking the session Active under the wrong protocol
             // version.
             match raw.begin_string() {
-                Ok(begin_string) if begin_string == version.begin_string => {}
+                Ok(begin_string) if begin_string == version.begin_string() => {}
                 Ok(begin_string) => {
                     let received = begin_string.to_string();
                     let _ = session.on_logon_reject();
                     return Err(EngineError::BeginStringMismatch {
-                        expected: version.begin_string.to_string(),
+                        expected: version.begin_string().to_string(),
                         received,
                     });
                 }
