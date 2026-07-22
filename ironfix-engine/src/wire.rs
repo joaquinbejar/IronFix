@@ -15,6 +15,7 @@ use crate::application::RejectReason;
 use crate::outbound::{OutboundField, OutboundMessage};
 use bytes::BytesMut;
 use ironfix_core::error::{DecodeError, EncodeError};
+use ironfix_core::field::FieldRef;
 use ironfix_core::message::{OwnedMessage, RawMessage};
 use ironfix_core::types::Timestamp;
 use ironfix_core::version::FixVersion;
@@ -194,6 +195,119 @@ pub(crate) fn owned_from_frame(frame: &[u8]) -> Result<OwnedMessage, DecodeError
     Ok(decode_frame(frame)?.to_owned())
 }
 
+/// Why a stored message could not be rebuilt as a resend.
+///
+/// Every variant means the same thing to the reactor — this particular message
+/// cannot be replayed and its sequence number must be gap-filled instead — but
+/// they are kept apart so the log line says which defect was hit.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ResendError {
+    /// The stored frame does not decode.
+    #[error("stored frame does not decode: {0}")]
+    Decode(#[from] DecodeError),
+
+    /// The rebuilt frame has no legal wire form.
+    #[error("resend frame cannot be encoded: {0}")]
+    Encode(#[from] EncodeError),
+
+    /// The stored frame carries no `SendingTime` (52).
+    ///
+    /// FIX requires `OrigSendingTime` (122) on a message carrying
+    /// `PossDupFlag` (43) = Y. On the first resend that original time is the
+    /// frame's own 52 (a resend-of-a-resend keeps it in its own 122 instead —
+    /// see [`resend_frame`]). With no 52 recorded there is no header position to
+    /// re-stamp and nothing truthful to put in 122, and inventing one would
+    /// misreport when the message was first sent.
+    #[error("stored frame carries no SendingTime (52) to copy into OrigSendingTime (122)")]
+    MissingSendingTime,
+}
+
+/// Rebuilds a stored frame as a resend of itself.
+///
+/// The message keeps its original `MsgSeqNum` (34) — a resend re-occupies the
+/// number it was first sent under and allocates nothing — and gains
+/// `PossDupFlag` (43) = Y with `OrigSendingTime` (122) set to when the message
+/// was *first* sent, while 52 is restamped with the time of *this* transmission
+/// (`doc/fix_operations.md`, "Resend Request", items 2 and 4). Both are written
+/// in their standard-header positions: 43 immediately before 52, 122 immediately
+/// after it.
+///
+/// On a plain resend the first-sent time is the frame's own `SendingTime` (52).
+/// On a **resend of a resend** the frame already carries that original in its
+/// own 122 — its 52 by then is only the prior transmission's time — so an
+/// existing 122 is preferred and copied through unchanged. Overwriting it with
+/// 52 would silently move `OrigSendingTime` forward to the last replay.
+///
+/// Every other field is copied through verbatim in its original order, so the
+/// business content of the replayed message is byte-identical to what was
+/// sent. `BodyLength` (9) and `CheckSum` (10) are restamped by the encoder,
+/// because both change with the two inserted fields.
+///
+/// # Errors
+/// Returns [`ResendError`] if the stored frame does not decode, carries no
+/// `SendingTime` (52), or cannot be re-encoded. The caller must gap-fill the
+/// sequence number instead of skipping it.
+pub(crate) fn resend_frame(stored: &[u8]) -> Result<BytesMut, ResendError> {
+    let raw = decode_frame(stored)?;
+    let begin_string = raw.begin_string()?;
+    // 52 is both the emission trigger below and the fallback source for 122, so
+    // its absence is the terminal error: our own stored frames always carry it.
+    let sending_time_52 = raw
+        .get_field_str(52)
+        .ok_or(ResendError::MissingSendingTime)?;
+    // Prefer an existing OrigSendingTime (122): on a resend-of-a-resend it holds
+    // the *first* transmission's time, whereas 52 by then is the prior replay's.
+    // Falling back to 52 covers the first resend, where no 122 is present yet.
+    let orig_sending_time = raw.get_field_str(122).unwrap_or(sending_time_52);
+    let sending_time = Timestamp::now().format_millis();
+
+    // The rebuilt frame is the original plus 43 and 122; the extra headroom
+    // keeps the encoder from reallocating while it copies the body across.
+    let mut encoder = Encoder::with_capacity(begin_string, stored.len() + RESEND_HEADROOM);
+
+    // Collected so a LENGTH field can look ahead to its DATA field. This is
+    // the resend path, not the hot path: one allocation per replayed message
+    // is the right trade for handling every spec-defined field shape.
+    let fields: Vec<&FieldRef<'_>> = raw.fields().collect();
+    let mut index = 0;
+    while let Some(field) = fields.get(index) {
+        index += 1;
+        match field.tag {
+            // BeginString and BodyLength are stamped by `finish`.
+            8 | 9 => {}
+            // Re-emitted below, in their standard-header positions. A frame
+            // already carrying them is being replayed a second time.
+            43 | 122 => {}
+            52 => {
+                encoder.try_put_raw(43, b"Y")?;
+                encoder.try_put_raw(52, sending_time.as_str().as_bytes())?;
+                encoder.try_put_raw(122, orig_sending_time.as_bytes())?;
+            }
+            tag => {
+                if let Err(err) = encoder.try_put_raw(tag, field.value) {
+                    // The encoder refuses a LENGTH or DATA tag on its own,
+                    // because it derives the declared count from the payload
+                    // so the two cannot disagree. Pair it with the field that
+                    // follows and write both together.
+                    let paired = fields.get(index).is_some_and(|data| {
+                        encoder.try_put_data(tag, data.tag, data.value).is_ok()
+                    });
+                    if !paired {
+                        return Err(err.into());
+                    }
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    Ok(into_frame(&mut encoder)?)
+}
+
+/// Extra bytes reserved for the `PossDupFlag` (43) and `OrigSendingTime` (122)
+/// a resend inserts, plus the framing fields the encoder restamps.
+const RESEND_HEADROOM: usize = 64;
+
 /// Stamps the frame and moves it into a buffer the transport owns.
 ///
 /// # Errors
@@ -242,14 +356,14 @@ impl MessageFactory {
     /// pairing of the routing fields. Both are stamped only when configured;
     /// an unset LocationID places nothing on the wire.
     ///
-    /// `poss_dup` stamps both `PossDupFlag` (43) and `OrigSendingTime` (122):
-    /// FIX requires 122 on every message carrying 43=Y, and
-    /// `doc/fix_operations.md` mandates it for resends. The engine has no
-    /// message store, so the original sending time of the replaced messages
-    /// is not recoverable; per the spec's handling of an unavailable
-    /// OrigSendingTime the current time is used, which is also what a
-    /// SequenceReset-GapFill (whose "original" messages are administrative
-    /// filler, not replayed traffic) needs.
+    /// `poss_dup` stamps both `PossDupFlag` (43) and `OrigSendingTime` (122),
+    /// because FIX requires 122 on every message carrying 43=Y. Its only user
+    /// is [`MessageFactory::sequence_reset_gap_fill`], which is not a replay of
+    /// anything: a gap fill's "original" is administrative filler that was
+    /// never sent, so there is no recorded sending time to copy and 122 takes
+    /// the same value as `SendingTime` (52) — the FIX handling for an
+    /// unavailable OrigSendingTime. A genuine replay of a stored message goes
+    /// through [`resend_frame`], which copies the real original 52 into 122.
     ///
     /// `appl_ver_id` stamps `ApplVerID` (1128) immediately after MsgType,
     /// its position in the FIXT.1.1 standard header. It is passed only for
@@ -468,6 +582,22 @@ mod tests {
         }
     }
 
+    /// Fails the test with context instead of `.unwrap()` / `.expect()`.
+    #[track_caller]
+    fn some<T>(value: Option<T>, what: &str) -> T {
+        match value {
+            Some(value) => value,
+            None => panic!("{what}"),
+        }
+    }
+
+    /// Reads a field out of a finished frame as an owned `String`.
+    fn field_of(frame: &[u8], tag: u32) -> Option<String> {
+        decode_frame(frame)
+            .ok()
+            .and_then(|raw| raw.get_field_str(tag).map(str::to_string))
+    }
+
     #[test]
     fn test_logon_frame_roundtrip() {
         let frame = framed(factory().logon(1, 30, true));
@@ -670,6 +800,133 @@ mod tests {
         let raw = decode(&frame);
         assert_eq!(raw.begin_string(), Ok("FIXT.1.1"));
         assert_eq!(raw.get_field_str(1128), Some("9"));
+    }
+
+    #[test]
+    fn test_resend_frame_preserves_body_and_stamps_poss_dup() {
+        let mut message = OutboundMessage::new(MsgType::NewOrderSingle);
+        message.push_str(11, "ORDER-1").push_char(54, '1');
+        let original = framed(factory().application_message(7, &message));
+        let original_sending_time = some(
+            field_of(&original, 52),
+            "the original must carry SendingTime",
+        );
+
+        let resent = match resend_frame(&original) {
+            Ok(frame) => frame,
+            Err(err) => panic!("a factory frame must rebuild as a resend: {err}"),
+        };
+        let raw = decode(&resent);
+
+        // Same message, same number: a resend re-occupies the sequence number
+        // it was first sent under.
+        assert_eq!(raw.msg_type(), &MsgType::NewOrderSingle);
+        assert_eq!(raw.get_field_str(34), Some("7"));
+        assert_eq!(raw.get_field_str(11), Some("ORDER-1"));
+        assert_eq!(raw.get_field_str(54), Some("1"));
+        assert_eq!(raw.get_field_str(49), Some("CLIENT"));
+        assert_eq!(raw.get_field_str(56), Some("VENUE"));
+
+        // The whole point: 122 is the *original* sending time, not a fresh one.
+        assert_eq!(raw.get_field_str(43), Some("Y"));
+        assert_eq!(raw.get_field_str(122), Some(original_sending_time.as_str()));
+    }
+
+    #[test]
+    fn test_resend_frame_of_a_resend_preserves_the_first_sending_time() {
+        // The intermediate frame is built by hand so its SendingTime (52, the
+        // *prior* replay) and OrigSendingTime (122, the *first* transmission)
+        // are deterministically different. Chaining two `resend_frame` calls
+        // would let both land in the same millisecond — SendingTime is
+        // millisecond-resolution — and hide a 122 overwritten with 52.
+        const FIRST_SENT: &str = "20260721-10:00:00.000";
+        const PRIOR_REPLAY: &str = "20260721-11:30:45.500";
+
+        let mut encoder = Encoder::new("FIX.4.4");
+        encoder.put_str(35, "D");
+        encoder.put_str(49, "CLIENT");
+        encoder.put_str(56, "VENUE");
+        encoder.put_uint(34, 3);
+        encoder.put_bool(43, true);
+        encoder.put_str(52, PRIOR_REPLAY);
+        encoder.put_str(122, FIRST_SENT);
+        encoder.put_str(11, "ORDER-1");
+        let once = framed(into_frame(&mut encoder));
+
+        let twice = match resend_frame(&once) {
+            Ok(frame) => frame,
+            Err(err) => panic!("second resend must build: {err}"),
+        };
+        let raw = decode(&twice);
+
+        // The prior 43/122 are re-emitted once in their header positions, never
+        // duplicated.
+        assert_eq!(raw.fields().filter(|field| field.tag == 43).count(), 1);
+        assert_eq!(raw.fields().filter(|field| field.tag == 122).count(), 1);
+        // The whole point: 122 still names the *first* transmission, not the
+        // prior replay's SendingTime.
+        assert_eq!(raw.get_field_str(122), Some(FIRST_SENT));
+        assert_ne!(raw.get_field_str(122), Some(PRIOR_REPLAY));
+        // 52 is this transmission's time, distinct from both, and the body and
+        // number survive.
+        assert_eq!(raw.get_field_str(34), Some("3"));
+        assert_eq!(raw.get_field_str(11), Some("ORDER-1"));
+        assert_eq!(raw.get_field_str(43), Some("Y"));
+    }
+
+    #[test]
+    fn test_resend_frame_without_sending_time_is_a_typed_error() {
+        // Built by hand: the factory always stamps 52.
+        let mut encoder = Encoder::new("FIX.4.4");
+        encoder.put_str(35, "D");
+        encoder.put_str(49, "CLIENT");
+        encoder.put_str(56, "VENUE");
+        encoder.put_uint(34, 4);
+        let frame = framed(into_frame(&mut encoder));
+
+        match resend_frame(&frame) {
+            Err(ResendError::MissingSendingTime) => {}
+            Err(err) => panic!("expected MissingSendingTime, got {err}"),
+            Ok(_) => panic!("a frame with no SendingTime must not be replayed"),
+        }
+    }
+
+    #[test]
+    fn test_resend_frame_of_undecodable_bytes_is_a_typed_error() {
+        match resend_frame(b"not a fix message") {
+            Err(ResendError::Decode(_)) => {}
+            Err(err) => panic!("expected a decode error, got {err}"),
+            Ok(_) => panic!("garbage must not rebuild into a frame"),
+        }
+    }
+
+    #[test]
+    fn test_resend_frame_preserves_a_length_data_pair() {
+        // RawData (96) is framed by the count in RawDataLength (95), so the two
+        // have to be rebuilt together or the frame is corrupt. The payload
+        // carries SOH deliberately: that is what the pair exists for.
+        let mut encoder = Encoder::new("FIX.4.4");
+        encoder.put_str(35, "D");
+        encoder.put_str(49, "CLIENT");
+        encoder.put_str(56, "VENUE");
+        encoder.put_uint(34, 9);
+        encoder.put_str(52, "20260721-10:00:00.000");
+        encoder.put_data(95, 96, b"opaque\x01payload");
+        let original = framed(into_frame(&mut encoder));
+
+        let resent = match resend_frame(&original) {
+            Ok(frame) => frame,
+            Err(err) => panic!("a frame with a LENGTH/DATA pair must rebuild: {err}"),
+        };
+        let raw = decode(&resent);
+
+        assert_eq!(raw.get_field_str(95), Some("14"));
+        assert_eq!(
+            some(raw.get_field(96), "RawData must survive the rebuild").value,
+            b"opaque\x01payload"
+        );
+        assert_eq!(raw.get_field_str(43), Some("Y"));
+        assert_eq!(raw.get_field_str(122), Some("20260721-10:00:00.000"));
     }
 
     #[test]

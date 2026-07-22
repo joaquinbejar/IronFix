@@ -9,7 +9,6 @@
 //! This module provides a unified error hierarchy using `thiserror` for typed,
 //! domain-specific errors across all IronFix operations.
 
-use std::ops::Range;
 use thiserror::Error;
 
 /// Result type alias using [`FixError`] as the error type.
@@ -293,11 +292,34 @@ pub enum StoreError {
         seq_num: u64,
     },
 
-    /// Range of messages not available.
-    #[error("messages not available for range: {range:?}")]
+    /// No message is available anywhere in the requested range.
+    ///
+    /// The bounds are **inclusive**, which is how a FIX `ResendRequest`
+    /// expresses them. A half-open `Range<u64>` cannot represent an upper
+    /// bound of `u64::MAX` — the "to infinity" case a `ResendRequest` with
+    /// `EndSeqNo` (16) = 0 asks for — without an `end + 1` that overflows, so
+    /// the bounds are carried as two numbers and no arithmetic is performed on
+    /// them.
+    #[error("messages not available for range: {begin}..={end}")]
     RangeNotAvailable {
-        /// The requested range of sequence numbers.
-        range: Range<u64>,
+        /// First requested sequence number, inclusive.
+        begin: u64,
+        /// Last requested sequence number, inclusive.
+        end: u64,
+    },
+
+    /// The requested range is inverted: `begin` is above `end`.
+    ///
+    /// This is a caller error, not an empty result. It is reported rather than
+    /// normalised because a store cannot tell an inverted range apart from a
+    /// range that happens to hold nothing, and silently answering "empty"
+    /// hides the bug that produced it.
+    #[error("invalid range: begin {begin} is above end {end}")]
+    InvalidRange {
+        /// First requested sequence number, inclusive.
+        begin: u64,
+        /// Last requested sequence number, inclusive.
+        end: u64,
     },
 
     /// Store is corrupted.

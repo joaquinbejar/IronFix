@@ -11,6 +11,7 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
+use ironfix_core::error::StoreError;
 use ironfix_core::message::MsgType;
 use ironfix_core::message::RawMessage;
 use ironfix_core::types::{CompId, Timestamp};
@@ -18,6 +19,7 @@ use ironfix_engine::application::{Application, RejectReason, SessionId};
 use ironfix_engine::{EngineError, Initiator, OutboundMessage};
 use ironfix_session::sequence::SequenceCounter;
 use ironfix_session::{SessionConfig, SessionConfigError};
+use ironfix_store::{MemoryStore, MessageStore, StoredMessage};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
 use std::sync::{Arc, Mutex};
@@ -2457,5 +2459,740 @@ async fn test_connect_refuses_a_fractional_heartbeat_interval() {
             .await
             .is_err(),
         "the socket must never be dialled"
+    );
+}
+// ---------------------------------------------------------------------------
+// Resend from a message store
+// ---------------------------------------------------------------------------
+
+/// Wraps a [`MemoryStore`] and silently forgets one sequence number, standing
+/// in for a store that has evicted a message the counterparty still asks for.
+///
+/// The engine must gap-fill the forgotten number rather than skip it: a skipped
+/// number leaves the counterparty expecting a message that will never arrive.
+#[derive(Debug)]
+struct ForgetfulStore {
+    inner: MemoryStore,
+    forget: u64,
+}
+
+impl ForgetfulStore {
+    fn new(forget: u64) -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            forget,
+        }
+    }
+}
+
+#[async_trait]
+impl MessageStore for ForgetfulStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), StoreError> {
+        if seq_num == self.forget {
+            return Ok(());
+        }
+        self.inner.store(seq_num, msg_type, message).await
+    }
+
+    async fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        self.inner.get_range(begin, end).await
+    }
+
+    fn next_sender_seq(&self) -> u64 {
+        self.inner.next_sender_seq()
+    }
+
+    fn next_target_seq(&self) -> u64 {
+        self.inner.next_target_seq()
+    }
+
+    fn set_next_sender_seq(&self, seq: u64) {
+        self.inner.set_next_sender_seq(seq);
+    }
+
+    fn set_next_target_seq(&self, seq: u64) {
+        self.inner.set_next_target_seq(seq);
+    }
+
+    async fn reset(&self) -> Result<(), StoreError> {
+        self.inner.reset().await
+    }
+
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.inner.creation_time()
+    }
+}
+
+/// One original send, as the stub acceptor observed it.
+struct SentOrder {
+    /// ClOrdID (11), so the replay can be matched to the original.
+    cl_ord_id: String,
+    /// SendingTime (52), which must reappear as OrigSendingTime (122).
+    sending_time: String,
+}
+
+/// Drains `count` orders starting at sequence `first`, recording what the
+/// acceptor saw so a later replay can be compared against it.
+async fn drain_orders(
+    framed: &mut Framed<TcpStream, FixCodec>,
+    first: u64,
+    count: u64,
+) -> Vec<SentOrder> {
+    let mut sent = Vec::new();
+    for offset in 0..count {
+        let frame = next_frame(framed).await;
+        assert_eq!(msg_type_of(&frame), "D");
+        assert_eq!(field(&frame, 34), Some((first + offset).to_string()));
+        assert_eq!(
+            field(&frame, 43),
+            None,
+            "an original send is not a possible duplicate"
+        );
+        sent.push(SentOrder {
+            cl_ord_id: some(field(&frame, 11), "order must carry ClOrdID (11)"),
+            sending_time: some(field(&frame, 52), "order must carry SendingTime (52)"),
+        });
+    }
+    sent
+}
+
+/// Asserts that `frame` is `original` replayed under sequence number `seq`.
+#[track_caller]
+fn assert_replay_of(frame: &[u8], seq: u64, original: &SentOrder) {
+    assert_eq!(msg_type_of(frame), "D");
+    assert_eq!(field(frame, 34), Some(seq.to_string()));
+    assert_eq!(
+        field(frame, 11).as_deref(),
+        Some(original.cl_ord_id.as_str()),
+        "the replayed body must be the original body"
+    );
+    assert_eq!(
+        field(frame, 43).as_deref(),
+        Some("Y"),
+        "a resend must carry PossDupFlag"
+    );
+    assert_eq!(
+        field(frame, 122).as_deref(),
+        Some(original.sending_time.as_str()),
+        "OrigSendingTime must be the original SendingTime, not a fresh one"
+    );
+}
+
+/// Asserts that `frame` is a SequenceReset-GapFill occupying `seq` and
+/// advancing the counterparty to `new_seq`.
+#[track_caller]
+fn assert_gap_fill(frame: &[u8], seq: u64, new_seq: u64) {
+    assert_eq!(msg_type_of(frame), "4");
+    assert_eq!(field(frame, 123).as_deref(), Some("Y"));
+    assert_eq!(field(frame, 34), Some(seq.to_string()));
+    assert_eq!(field(frame, 36), Some(new_seq.to_string()));
+    assert_eq!(field(frame, 43).as_deref(), Some("Y"));
+    assert!(field(frame, 122).is_some(), "PossDup requires 122");
+}
+
+/// Sends `count` orders on the connection.
+async fn send_orders(connection: &ironfix_engine::Connection, count: usize) {
+    for index in 0..count {
+        let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+        order.push_str(11, &format!("ORDER-{index}"));
+        ok(connection.send(order).await, "send order");
+    }
+}
+
+/// With a store attached, a bounded ResendRequest replays the real application
+/// messages — same bodies, same sequence numbers — carrying PossDupFlag (43)
+/// and the original SendingTime in OrigSendingTime (122).
+#[tokio::test]
+async fn test_resend_request_replays_stored_application_messages() {
+    let (listener, addr) = bind_listener().await;
+    let (replay_seen_tx, replay_seen_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let sent = drain_orders(&mut framed, 2, 3).await;
+
+        ok(
+            framed.send(venue_msg("2", 2, &[(7, "2"), (16, "4")])).await,
+            "send bounded resend request",
+        );
+
+        for (seq, original) in (2..).zip(sent.iter()) {
+            let replayed = next_frame(&mut framed).await;
+            assert_replay_of(&replayed, seq, original);
+        }
+
+        let _ = replay_seen_tx.send(());
+
+        // A replay re-occupies the numbers it replaces and allocates nothing,
+        // so the next real message still goes out at 5.
+        let next = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&next), "D");
+        assert_eq!(field(&next, 34).as_deref(), Some("5"));
+        assert_eq!(field(&next, 43), None);
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::new(MemoryStore::new()));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    send_orders(&connection, 3).await;
+
+    ok(
+        timeout(Duration::from_secs(5), replay_seen_rx).await,
+        "replay observed within 5s",
+    )
+    .ok();
+    let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+    order.push_str(11, "ORDER-AFTER-REPLAY");
+    ok(connection.send(order).await, "send order after replay");
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// Administrative messages inside the requested range are gap-filled rather
+/// than replayed: sequence 1 is the Logon, so the reply opens with a gap fill
+/// advancing to the first application message.
+#[tokio::test]
+async fn test_resend_request_gap_fills_admin_messages_before_replaying_orders() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let sent = drain_orders(&mut framed, 2, 3).await;
+
+        ok(
+            framed.send(venue_msg("2", 2, &[(7, "1"), (16, "4")])).await,
+            "send resend request covering the Logon",
+        );
+
+        // Sequence 1 is our Logon: administrative, so it is filled, not resent.
+        let fill = next_frame(&mut framed).await;
+        assert_gap_fill(&fill, 1, 2);
+
+        for (seq, original) in (2..).zip(sent.iter()) {
+            let replayed = next_frame(&mut framed).await;
+            assert_replay_of(&replayed, seq, original);
+        }
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::new(MemoryStore::new()));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    send_orders(&connection, 3).await;
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// A sequence number the store cannot produce is gap-filled in place, between
+/// the messages either side of it, so the counterparty is never desynchronised
+/// by a hole in the replay.
+#[tokio::test]
+async fn test_resend_request_gap_fills_a_message_the_store_lost() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let sent = drain_orders(&mut framed, 2, 3).await;
+
+        ok(
+            framed.send(venue_msg("2", 2, &[(7, "2"), (16, "4")])).await,
+            "send bounded resend request",
+        );
+
+        let first = next_frame(&mut framed).await;
+        let [second, _, fourth] = sent.as_slice() else {
+            panic!("three orders must have been recorded, got {}", sent.len());
+        };
+        assert_replay_of(&first, 2, second);
+
+        // 3 was never filed, so it is covered by a fill that stops at 4.
+        let fill = next_frame(&mut framed).await;
+        assert_gap_fill(&fill, 3, 4);
+
+        let last = next_frame(&mut framed).await;
+        assert_replay_of(&last, 4, fourth);
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::new(ForgetfulStore::new(3)));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    send_orders(&connection, 3).await;
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// A hole at the end of the requested range is covered by a trailing gap fill,
+/// so the counterparty's expectation still lands exactly on EndSeqNo + 1.
+#[tokio::test]
+async fn test_resend_request_trailing_hole_is_gap_filled_to_the_bound() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let sent = drain_orders(&mut framed, 2, 3).await;
+
+        ok(
+            framed.send(venue_msg("2", 2, &[(7, "2"), (16, "4")])).await,
+            "send bounded resend request",
+        );
+
+        let [second, third, _] = sent.as_slice() else {
+            panic!("three orders must have been recorded, got {}", sent.len());
+        };
+        let first_replay = next_frame(&mut framed).await;
+        assert_replay_of(&first_replay, 2, second);
+        let second_replay = next_frame(&mut framed).await;
+        assert_replay_of(&second_replay, 3, third);
+
+        // 4 was never filed: the trailing fill still advances to EndSeqNo + 1.
+        let fill = next_frame(&mut framed).await;
+        assert_gap_fill(&fill, 4, 5);
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::new(ForgetfulStore::new(4)));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    send_orders(&connection, 3).await;
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// EndSeqNo = 0 with a store replays everything from BeginSeqNo up to the
+/// last message actually sent.
+#[tokio::test]
+async fn test_resend_request_unbounded_replays_to_the_last_sent_message() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let sent = drain_orders(&mut framed, 2, 3).await;
+
+        ok(
+            framed.send(venue_msg("2", 2, &[(7, "2"), (16, "0")])).await,
+            "send unbounded resend request",
+        );
+
+        for (seq, original) in (2..).zip(sent.iter()) {
+            let replayed = next_frame(&mut framed).await;
+            assert_replay_of(&replayed, seq, original);
+        }
+
+        // Everything up to next-sender-1 was replayed, so there is nothing
+        // left to fill: the next frame is the client's Logout.
+        ok(
+            framed.send(venue_msg("5", 3, &[])).await,
+            "send logout to end the test deterministically",
+        );
+        let reply = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reply), "5");
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::new(MemoryStore::new()));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    send_orders(&connection, 3).await;
+    connection.wait_closed().await;
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// A store carries sequence numbers as well as messages: a session started
+/// against a store holding counters resumes from them, and mirrors its own
+/// counters back into it.
+#[tokio::test]
+async fn test_initiator_seeds_and_mirrors_sequence_numbers_through_the_store() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logon), "A");
+        // Seeded from the store, not from 1.
+        assert_eq!(field(&logon, 34).as_deref(), Some("7"));
+        ok(
+            framed
+                .send(venue_msg("A", 4, &[(98, "0"), (108, "30")]))
+                .await,
+            "send logon ack",
+        );
+
+        let order = next_frame(&mut framed).await;
+        assert_eq!(field(&order, 34).as_deref(), Some("8"));
+    });
+
+    let store = Arc::new(MemoryStore::new());
+    store.set_next_sender_seq(7);
+    store.set_next_target_seq(4);
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    send_orders(&connection, 1).await;
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+
+    // The counters advanced in the session are visible in the store: 7 (Logon)
+    // and 8 (the order) were sent, and the Logon ack at 4 was consumed.
+    assert_eq!(connection.next_sender_seq(), 9);
+    assert_eq!(store.next_sender_seq(), 9);
+    assert_eq!(store.next_target_seq(), 5);
+
+    // And the frames themselves are filed under the numbers they went out with.
+    let stored = ok(store.get_range(7, 8).await, "the store must hold 7..=8");
+    assert_eq!(
+        stored
+            .iter()
+            .map(|message| (message.seq_num(), message.msg_type().as_str().to_string()))
+            .collect::<Vec<_>>(),
+        vec![(7, "A".to_string()), (8, "D".to_string())]
+    );
+}
+
+/// A session that resets its counters when it closes must clear the store with
+/// them: otherwise the next session, numbering from 1 again, would file its
+/// messages on top of this one's and could answer a resend with the wrong
+/// session's traffic.
+#[tokio::test]
+async fn test_reset_on_disconnect_clears_the_store() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let _ = drain_orders(&mut framed, 2, 1).await;
+        // Dropping the socket closes the session abnormally.
+        drop(framed);
+    });
+
+    let store = Arc::new(MemoryStore::new());
+    let mut config = client_config(Duration::from_secs(30));
+    config.reset_on_disconnect = true;
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(config, Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    send_orders(&connection, 1).await;
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+    connection.wait_closed().await;
+
+    assert_eq!(store.message_count(), 0);
+    assert_eq!(store.next_sender_seq(), 1);
+    assert_eq!(store.next_target_seq(), 1);
+}
+
+/// A Logon declaring ResetSeqNumFlag starts both counters at 1 and clears the
+/// store, so the numbers the new session hands out cannot collide with
+/// messages an earlier one filed under them.
+#[tokio::test]
+async fn test_reset_on_logon_clears_a_populated_store() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logon), "A");
+        assert_eq!(field(&logon, 141).as_deref(), Some("Y"));
+        // Numbered from 1 despite the store reporting 42.
+        assert_eq!(field(&logon, 34).as_deref(), Some("1"));
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]))
+                .await,
+            "send logon ack",
+        );
+
+        let order = next_frame(&mut framed).await;
+        assert_eq!(field(&order, 34).as_deref(), Some("2"));
+    });
+
+    let store = Arc::new(MemoryStore::new());
+    ok(
+        store.store(41, &MsgType::NewOrderSingle, b"stale").await,
+        "seed the store with a previous session's message",
+    );
+    store.set_next_sender_seq(42);
+    store.set_next_target_seq(17);
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(
+        client_config(Duration::from_secs(30)).with_reset_on_logon(true),
+        Arc::clone(&app),
+    )
+    .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    assert!(!store.contains(41), "the stale message must be gone");
+
+    send_orders(&connection, 1).await;
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// A store whose `reset` and/or `refresh` fail, standing in for a persistent
+/// backend that cannot vouch for its counters when the session starts.
+#[derive(Debug)]
+struct FailingStore {
+    inner: MemoryStore,
+    fail_reset: bool,
+    fail_refresh: bool,
+}
+
+impl FailingStore {
+    fn failing_reset() -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            fail_reset: true,
+            fail_refresh: false,
+        }
+    }
+
+    fn failing_refresh() -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            fail_reset: false,
+            fail_refresh: true,
+        }
+    }
+}
+
+#[async_trait]
+impl MessageStore for FailingStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), StoreError> {
+        self.inner.store(seq_num, msg_type, message).await
+    }
+
+    async fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        self.inner.get_range(begin, end).await
+    }
+
+    fn next_sender_seq(&self) -> u64 {
+        self.inner.next_sender_seq()
+    }
+
+    fn next_target_seq(&self) -> u64 {
+        self.inner.next_target_seq()
+    }
+
+    fn set_next_sender_seq(&self, seq: u64) {
+        self.inner.set_next_sender_seq(seq);
+    }
+
+    fn set_next_target_seq(&self, seq: u64) {
+        self.inner.set_next_target_seq(seq);
+    }
+
+    async fn reset(&self) -> Result<(), StoreError> {
+        if self.fail_reset {
+            return Err(StoreError::Io("reset failed".to_string()));
+        }
+        self.inner.reset().await
+    }
+
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.inner.creation_time()
+    }
+
+    async fn refresh(&self) -> Result<(), StoreError> {
+        if self.fail_refresh {
+            return Err(StoreError::Io("refresh failed".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// A ResetSeqNumFlag Logon whose store cannot be cleared must abort the
+/// handshake with a typed error, not start at 1 with the previous stream still
+/// filed — which a later ResendRequest could then replay as this session's.
+#[tokio::test]
+async fn test_reset_on_logon_aborts_when_the_store_cannot_be_reset() {
+    // The connection is dialled before the store is seeded, so a listener must
+    // be bound; the handshake never gets far enough to send a Logon.
+    let (_listener, addr) = bind_listener().await;
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(
+        client_config(Duration::from_secs(30)).with_reset_on_logon(true),
+        Arc::clone(&app),
+    )
+    .with_store(Arc::new(FailingStore::failing_reset()) as Arc<dyn MessageStore>);
+
+    match initiator.connect(addr).await {
+        Err(EngineError::Store(_)) => {}
+        Err(other) => panic!("expected a store error, got {other:?}"),
+        Ok(_) => panic!("connect must fail when the store cannot be reset"),
+    }
+}
+
+/// A session seeding its counters from the store must abort the handshake if the
+/// store cannot be refreshed, rather than start against unknown counters and
+/// risk reusing a MsgSeqNum the counterparty has already seen.
+#[tokio::test]
+async fn test_connect_aborts_when_the_store_cannot_be_refreshed() {
+    let (_listener, addr) = bind_listener().await;
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::new(FailingStore::failing_refresh()) as Arc<dyn MessageStore>);
+
+    match initiator.connect(addr).await {
+        Err(EngineError::Store(_)) => {}
+        Err(other) => panic!("expected a store error, got {other:?}"),
+        Ok(_) => panic!("connect must fail when the store cannot be refreshed"),
+    }
+}
+
+/// The store's sender counter must advance to reflect the Logon before the
+/// handshake completes: if the ack never arrives, a reconnect reusing the store
+/// must still see the Logon's MsgSeqNum spent, never hand out 1 again.
+#[tokio::test]
+async fn test_handshake_mirrors_the_sender_counter_before_the_logon_is_acked() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logon), "A");
+        assert_eq!(field(&logon, 34).as_deref(), Some("1"));
+        // Drop without acking: the handshake fails after the Logon is on the
+        // wire but before any acknowledgement.
+        drop(framed);
+    });
+
+    let store = Arc::new(MemoryStore::new());
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+
+    assert!(
+        initiator.connect(addr).await.is_err(),
+        "the handshake must fail when the ack never arrives"
+    );
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+
+    // The Logon went out under MsgSeqNum 1, so the store must already read 2
+    // even though the handshake failed before any ack. Without the handshake
+    // mirroring the counter, the store would still report 1 and a reconnect
+    // would reuse the number the counterparty has already seen.
+    assert_eq!(store.next_sender_seq(), 2);
+}
+
+/// A ResendRequest spanning more messages than one store page replays every one
+/// of them, in order, across page boundaries — the paged read must not truncate
+/// the reply at the first page.
+#[tokio::test]
+async fn test_resend_request_replays_across_store_pages() {
+    // 260 exceeds the 256-message page size, so the replay must page at least
+    // twice; every order still comes back exactly once, in sequence order.
+    const ORDERS: u64 = 260;
+
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let sent = drain_orders(&mut framed, 2, ORDERS).await;
+
+        ok(
+            framed.send(venue_msg("2", 2, &[(7, "2"), (16, "0")])).await,
+            "send unbounded resend request",
+        );
+
+        for (seq, original) in (2..).zip(sent.iter()) {
+            let replayed = next_frame(&mut framed).await;
+            assert_replay_of(&replayed, seq, original);
+        }
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::new(MemoryStore::new()));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    send_orders(&connection, ORDERS as usize).await;
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
     );
 }
