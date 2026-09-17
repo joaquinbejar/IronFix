@@ -357,3 +357,17 @@ maintainer:
 We appreciate your interest and look forward to your contributions!
 
 **License**: MIT
+
+<!-- related-projects:start -->
+## Related projects
+
+Repositories by the same author that this project depends on, and repositories that depend on it.
+
+### Used by
+
+| Repository | Description |
+|------------|-------------|
+| [fauxchange](https://github.com/joaquinbejar/fauxchange) | Exchange-in-a-box: local options exchange simulator with realistic matching, FIX/WS/REST APIs and historical replay. |
+| [otc-rfq](https://github.com/joaquinbejar/otc-rfq) | OTC Request-for-Quote engine with REST, SBE streaming and FIX/WebSocket/gRPC venue connectivity. |
+
+<!-- related-projects:end -->
