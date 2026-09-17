@@ -31,7 +31,7 @@
 //! - **[`EngineBuilder`]**: fluent configuration that terminates in a
 //!   ready-to-run [`Initiator`] or [`Acceptor`].
 //!
-//! Both engines share the same internal session reactor ([`mod@reactor`]): once
+//! Both engines share the same internal session reactor (`reactor`): once
 //! a Logon handshake completes, the inbound-frame contract — sequence
 //! validation, gap recovery, identity and clock checks, heartbeating, and the
 //! Logout handshake — is identical for the two roles.

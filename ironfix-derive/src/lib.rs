@@ -144,7 +144,7 @@ const MSG_TYPE_MAX_LEN: usize = 8;
 ///
 /// Emitted, rather than a defaulted value, when: the struct attribute is
 /// missing or is not a string literal; the value is empty, longer than
-/// [`MSG_TYPE_MAX_LEN`] bytes, or carries a byte that cannot appear in tag 35;
+/// `MSG_TYPE_MAX_LEN` bytes, or carries a byte that cannot appear in tag 35;
 /// the type is not a struct with named fields; a field has no `tag`; a tag is
 /// `0`; or two fields declare the same tag.
 ///
@@ -610,7 +610,7 @@ fn generics_with_bounds(
 
 /// Tokens converting `__field` (a `&ironfix_core::field::FieldRef`) into `ty`.
 ///
-/// Every arm propagates a [`DecodeError`](ironfix_core::error::DecodeError)
+/// Every arm propagates a `ironfix_core::error::DecodeError`
 /// with `?`, so the expansion never panics on a malformed value.
 fn decode_expr(ty: &Type) -> TokenStream2 {
     match classify(ty) {
@@ -631,7 +631,7 @@ fn decode_expr(ty: &Type) -> TokenStream2 {
 /// The `char` arm rejects a non-ASCII value rather than writing it as
 /// multi-byte UTF-8: the FIX `Char` datatype is a single ASCII byte, and the
 /// decode side reads exactly one byte through
-/// [`FieldRef::as_char`](ironfix_core::field::FieldRef::as_char), so a value
+/// `ironfix_core::field::FieldRef::as_char`, so a value
 /// like `'é'` could never round-trip. On rejection the field written so far is
 /// rolled back to `__field_start`, the marker `write_field` sets around it.
 fn write_value(ty: &Type, tag: u32) -> TokenStream2 {
@@ -670,7 +670,7 @@ fn write_value(ty: &Type, tag: u32) -> TokenStream2 {
 /// A value whose bytes carry SOH would split into two fields on the wire, and a
 /// zero-length value would produce the `tag=<SOH>` form that a FIX decoder
 /// rejects as "tag specified without a value". Both are rejected with
-/// [`EncodeError::InvalidFieldValue`](ironfix_core::error::EncodeError::InvalidFieldValue)
+/// `ironfix_core::error::EncodeError::InvalidFieldValue`
 /// and the partially written field is rolled back, leaving `__buf` exactly as
 /// it was.
 fn write_field(ty: &Type, tag: u32) -> TokenStream2 {

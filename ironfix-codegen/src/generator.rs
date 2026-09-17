@@ -76,7 +76,7 @@ use thiserror::Error;
 ///
 /// Emitted once per file as `pub type FixDecimal = rust_decimal::Decimal;`, so
 /// every FIX `Price` / `Qty` / `Amt` / `Percentage` field resolves to
-/// [`rust_decimal::Decimal`] through a single declaration — and never to
+/// `rust_decimal::Decimal` through a single declaration — and never to
 /// `f64`.
 const DECIMAL_ALIAS: &str = "FixDecimal";
 
@@ -158,7 +158,7 @@ pub enum GeneratorError {
         name: String,
     },
 
-    /// Components and groups nested deeper than [`MAX_NESTING_DEPTH`] without
+    /// Components and groups nested deeper than `MAX_NESTING_DEPTH` without
     /// closing a cycle.
     ///
     /// A dictionary this deep is treated as pathological rather than expanded,
@@ -415,13 +415,13 @@ impl CodeGenerator {
     /// they are emitted as optional.
     ///
     /// `depth` is the current component-and-group nesting; it grows across every
-    /// recursive descent (a component here, a group entry in [`build_struct`])
+    /// recursive descent (a component here, a group entry in `build_struct`)
     /// and is checked against [`MAX_NESTING_DEPTH`] so a deep but acyclic
     /// dictionary cannot overflow the stack.
     ///
     /// `stack` is the chain of component names reached so far, threaded so a
     /// cycle that closes across a group boundary is still caught: each deferred
-    /// [`Member::Group`] captures it, and [`build_struct`] seeds the group
+    /// [`Member::Group`] captures it, and `build_struct` seeds the group
     /// body's own `collect` with it rather than starting fresh.
     #[allow(clippy::too_many_arguments)]
     fn collect<'d>(

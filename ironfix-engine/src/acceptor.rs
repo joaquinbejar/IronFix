@@ -11,7 +11,7 @@
 //! [`ironfix_transport::FixCodec`], drives the [`ironfix_session`] typestate
 //! machine through `accept() -> on_logon_received() -> accept_logon()`, and
 //! hands the socket to the same background session reactor the
-//! [`Initiator`](crate::Initiator) uses (see [`crate::reactor`]). The returned
+//! [`Initiator`](crate::Initiator) uses (see `crate::reactor`). The returned
 //! [`Connection`] handle is the outbound message sink and exposes
 //! `wait_closed()` / `is_timed_out()`. [`Acceptor::accept`] is the convenience
 //! wrapper that pulls the next connection off a [`TcpListener`] and hands it to
@@ -53,7 +53,7 @@
 //! lockstep instead of silently desyncing.
 //!
 //! Every handshake frame goes through the same peek-then-spend path the reactor
-//! uses ([`send_handshake_admin`](crate::reactor)): the `to_admin` callback runs
+//! uses (`send_handshake_admin`): the `to_admin` callback runs
 //! on the message before it is framed, the body is re-checked, and the sender
 //! sequence number is spent only once the frame has been built. Once the session
 //! is Active the shared session reactor runs identically for both roles. All
