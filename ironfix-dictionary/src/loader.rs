@@ -237,7 +237,7 @@ fn attr_map(e: &BytesStart<'_>) -> Result<HashMap<String, String>, DictionaryErr
     let mut map = HashMap::new();
     for attr in e.attributes() {
         let attr = attr.map_err(xml_err)?;
-        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+        let key = attr.key.as_ref().to_owned();
         let value = attr
             .normalized_value(XmlVersion::Implicit1_0)
             .map_err(xml_err)?
@@ -294,12 +294,12 @@ fn parse_version(attrs: &HashMap<String, String>) -> Result<Version, DictionaryE
 /// of nested `<group>` elements from exhausting the stack.
 fn parse_items(
     reader: &mut Reader<&[u8]>,
-    end: &[u8],
+    end: &str,
     depth: usize,
 ) -> Result<Vec<Item>, DictionaryError> {
     if depth > MAX_NESTING_DEPTH {
         return Err(DictionaryError::NestingTooDeep {
-            element: String::from_utf8_lossy(end).into_owned(),
+            element: end.to_owned(),
             limit: MAX_NESTING_DEPTH,
         });
     }
@@ -309,15 +309,15 @@ fn parse_items(
             Event::Empty(e) => {
                 let attrs = attr_map(&e)?;
                 match e.name().as_ref() {
-                    b"field" => items.push(Item::Field {
+                    "field" => items.push(Item::Field {
                         name: required_attr(&attrs, "field", "name")?,
                         required: is_required(&attrs),
                     }),
-                    b"component" => items.push(Item::Component {
+                    "component" => items.push(Item::Component {
                         name: required_attr(&attrs, "component", "name")?,
                         required: is_required(&attrs),
                     }),
-                    b"group" => items.push(Item::Group {
+                    "group" => items.push(Item::Group {
                         name: required_attr(&attrs, "group", "name")?,
                         required: is_required(&attrs),
                         items: Vec::new(),
@@ -328,24 +328,24 @@ fn parse_items(
             Event::Start(e) => {
                 let attrs = attr_map(&e)?;
                 match e.name().as_ref() {
-                    b"group" => {
-                        let inner = parse_items(reader, b"group", depth + 1)?;
+                    "group" => {
+                        let inner = parse_items(reader, "group", depth + 1)?;
                         items.push(Item::Group {
                             name: required_attr(&attrs, "group", "name")?,
                             required: is_required(&attrs),
                             items: inner,
                         });
                     }
-                    b"field" => {
+                    "field" => {
                         // Field references never have meaningful children here.
-                        parse_items(reader, b"field", depth + 1)?;
+                        parse_items(reader, "field", depth + 1)?;
                         items.push(Item::Field {
                             name: required_attr(&attrs, "field", "name")?,
                             required: is_required(&attrs),
                         });
                     }
-                    b"component" => {
-                        parse_items(reader, b"component", depth + 1)?;
+                    "component" => {
+                        parse_items(reader, "component", depth + 1)?;
                         items.push(Item::Component {
                             name: required_attr(&attrs, "component", "name")?,
                             required: is_required(&attrs),
@@ -366,22 +366,22 @@ fn parse_field_defs(reader: &mut Reader<&[u8]>) -> Result<Vec<FieldDef>, Diction
     let mut defs = Vec::new();
     loop {
         match reader.read_event().map_err(xml_err)? {
-            Event::Empty(e) if e.name().as_ref() == b"field" => {
+            Event::Empty(e) if e.name().as_ref() == "field" => {
                 defs.push(field_def(&attr_map(&e)?, HashMap::new())?);
             }
-            Event::Start(e) if e.name().as_ref() == b"field" => {
+            Event::Start(e) if e.name().as_ref() == "field" => {
                 let attrs = attr_map(&e)?;
                 let mut values = HashMap::new();
                 loop {
                     match reader.read_event().map_err(xml_err)? {
-                        Event::Empty(v) | Event::Start(v) if v.name().as_ref() == b"value" => {
+                        Event::Empty(v) | Event::Start(v) if v.name().as_ref() == "value" => {
                             let value_attrs = attr_map(&v)?;
                             let enum_value = required_attr(&value_attrs, "value", "enum")?;
                             let description =
                                 value_attrs.get("description").cloned().unwrap_or_default();
                             values.insert(enum_value, description);
                         }
-                        Event::End(v) if v.name().as_ref() == b"field" => break,
+                        Event::End(v) if v.name().as_ref() == "field" => break,
                         Event::Eof => {
                             return Err(DictionaryError::Xml("unexpected end of file".to_string()));
                         }
@@ -390,7 +390,7 @@ fn parse_field_defs(reader: &mut Reader<&[u8]>) -> Result<Vec<FieldDef>, Diction
                 }
                 defs.push(field_def(&attrs, values)?);
             }
-            Event::End(e) if e.name().as_ref() == b"fields" => return Ok(defs),
+            Event::End(e) if e.name().as_ref() == "fields" => return Ok(defs),
             Event::Eof => return Err(DictionaryError::Xml("unexpected end of file".to_string())),
             _ => {}
         }
@@ -671,10 +671,10 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
     loop {
         match reader.read_event().map_err(xml_err)? {
             Event::Start(e) => match e.name().as_ref() {
-                b"fix" => version = Some(parse_version(&attr_map(&e)?)?),
-                b"header" => header_items = parse_items(&mut reader, b"header", 1)?,
-                b"trailer" => trailer_items = parse_items(&mut reader, b"trailer", 1)?,
-                b"message" => {
+                "fix" => version = Some(parse_version(&attr_map(&e)?)?),
+                "header" => header_items = parse_items(&mut reader, "header", 1)?,
+                "trailer" => trailer_items = parse_items(&mut reader, "trailer", 1)?,
+                "message" => {
                     let attrs = attr_map(&e)?;
                     let category = if attrs.get("msgcat").map(String::as_str) == Some("admin") {
                         MessageCategory::Admin
@@ -685,13 +685,13 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
                         name: required_attr(&attrs, "message", "name")?,
                         msg_type: required_attr(&attrs, "message", "msgtype")?,
                         category,
-                        items: parse_items(&mut reader, b"message", 1)?,
+                        items: parse_items(&mut reader, "message", 1)?,
                     });
                 }
-                b"component" => {
+                "component" => {
                     let attrs = attr_map(&e)?;
                     let name = required_attr(&attrs, "component", "name")?;
-                    let items = parse_items(&mut reader, b"component", 1)?;
+                    let items = parse_items(&mut reader, "component", 1)?;
                     if component_irs.contains_key(&name) {
                         return Err(DictionaryError::DuplicateDefinition {
                             kind: DefinitionKind::Component,
@@ -701,7 +701,7 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
                     component_order.push(name.clone());
                     component_irs.insert(name, items);
                 }
-                b"fields" => field_defs = parse_field_defs(&mut reader)?,
+                "fields" => field_defs = parse_field_defs(&mut reader)?,
                 _ => {}
             },
             Event::Eof => break,

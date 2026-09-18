@@ -386,11 +386,11 @@ async fn run_app_dispatcher<A: Application>(
 
 /// Everything the reactor loop owns besides the socket and the session.
 struct ReactorChannels {
-    /// Commands from [`Connection`] handles.
+    /// Commands from [`Connection`](crate::Connection) handles.
     commands: mpsc::Receiver<Command>,
     /// Rejections coming back from the application dispatcher.
     app_rejects: mpsc::Receiver<AppRejection>,
-    /// Closed-flag channel observed by [`Connection::wait_closed`].
+    /// Closed-flag channel observed by [`Connection::wait_closed`](crate::Connection::wait_closed).
     closed: watch::Sender<bool>,
     /// The application dispatcher, joined on close so `on_logout` follows the
     /// last `from_app` rather than racing it.
@@ -857,7 +857,7 @@ impl<A: Application> Reactor<A> {
         }
     }
 
-    /// Handles a command from a [`Connection`] handle.
+    /// Handles a command from a [`Connection`](crate::Connection) handle.
     async fn on_command(
         &mut self,
         framed: &mut FixFramed,
@@ -1409,7 +1409,7 @@ impl<A: Application> Reactor<A> {
 
     /// Answers an inbound ResendRequest (35=2).
     ///
-    /// With a store attached (see [`Initiator::with_store`]) the reply is the
+    /// With a store attached (see [`Initiator::with_store`](crate::Initiator::with_store)) the reply is the
     /// requested **application** messages, replayed from the store with
     /// `PossDupFlag` (43) = Y and their original `SendingTime` in
     /// `OrigSendingTime` (122), interleaved with `SequenceReset`-GapFill

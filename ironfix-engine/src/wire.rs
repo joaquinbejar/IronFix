@@ -244,7 +244,7 @@ pub(crate) fn header_seq_num(raw: &RawMessage<'_>) -> Option<u64> {
 ///
 /// One day. FIX types `HeartBtInt` as an unbounded non-negative int, and
 /// `108 = 0` is legal ("do not send heartbeats"), so the *lower* end is left
-/// open. The upper end is not: a [`Duration`](std::time::Duration) built from a
+/// open. The upper end is not: a [`Duration`] built from a
 /// counterparty-controlled value must stay finite, because the heartbeat clock
 /// adds a grace period to it (`interval + grace`), and
 /// `Duration::from_secs(u64::MAX) + _` overflows and panics — which, under the
@@ -885,7 +885,7 @@ impl MessageFactory {
     /// borrows the factory's own buffer until the next call.
     ///
     /// The standard header is stamped first —
-    /// 35, [1128], 49, 56, [50], [142], [57], [143], 34, [43], 52, [122] —
+    /// 35, \[1128\], 49, 56, \[50\], \[142\], \[57\], \[143\], 34, \[43\], 52, \[122\] —
     /// then the body fields in insertion order.
     ///
     /// `SenderLocationID` (142) follows `SenderSubID` (50) and
