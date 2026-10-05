@@ -132,7 +132,7 @@ impl SequenceManager {
     #[inline]
     pub fn try_allocate_sender_seq(&self) -> Result<SeqNum, SequenceExhausted> {
         self.next_sender_seq
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_add(1)
             })
             .map(SeqNum::new)
@@ -170,7 +170,7 @@ impl SequenceManager {
     #[inline]
     pub fn try_increment_target_seq(&self) -> Result<SeqNum, SequenceExhausted> {
         self.next_target_seq
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_add(1)
             })
             .map(|previous| SeqNum::new(previous + 1))
