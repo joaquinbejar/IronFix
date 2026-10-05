@@ -218,9 +218,15 @@ publish-all: require-token readme
 		echo "Done: all $$total crates are on crates.io at $$version."; \
 	fi
 
+# cargo-tarpaulin < 0.37.5 cannot read coverage data from Rust 1.99+, so a
+# stale local install is upgraded rather than reused.
 .PHONY: check-cargo-tarpaulin
 check-cargo-tarpaulin:
-	@command -v cargo-tarpaulin > /dev/null || (echo "Installing cargo-tarpaulin..."; cargo install cargo-tarpaulin)
+	@v=$$(cargo tarpaulin --version 2>/dev/null | awk '{print $$NF}'); \
+	if [ -z "$$v" ] || [ "$$(printf '%s\n' 0.37.5 "$$v" | sort -V | head -n1)" != "0.37.5" ]; then \
+		echo "Installing cargo-tarpaulin >= 0.37.5..."; \
+		cargo install cargo-tarpaulin --locked --version '>=0.37.5'; \
+	fi
 
 # Each recipe line runs in its own shell, so LOGLEVEL has to be set on the same
 # line as the command that reads it.

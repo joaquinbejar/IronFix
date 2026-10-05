@@ -27,15 +27,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Guarded so a warm cache does not recompile tarpaulin from source on
-      # every run.
+      # every run, but a cached binary older than 0.37.5 (which cannot read
+      # Rust 1.99+ coverage data) is replaced.
       - name: Install Tarpaulin
-        run: command -v cargo-tarpaulin > /dev/null || cargo install cargo-tarpaulin
+        run: |
+          v=$(cargo tarpaulin --version 2>/dev/null | awk '{print $NF}')
+          if [ -z "$v" ] || [ "$(printf '%s\n' 0.37.5 "$v" | sort -V | head -n1)" != "0.37.5" ]; then
+            cargo install cargo-tarpaulin --locked --version '>=0.37.5'
+          fi
 
       # `benches/**` is excluded: the criterion harness is measurement code, not
       # library code, and counting it would inflate the coverage figure.
+      # The llvm engine is explicit: with Rust 1.99 and tarpaulin 0.37.5 the
+      # Linux default (ptrace) produces spurious test failures and a segfault;
+      # llvm is also what `make coverage` uses on macOS.
       - name: Generate code coverage report
         run: >
           LOGLEVEL=WARN cargo tarpaulin
+          --engine llvm
           --exclude-files 'benches/**'
           --all-features
           --workspace
