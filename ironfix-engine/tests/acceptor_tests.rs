@@ -31,6 +31,7 @@ use ironfix_engine::{Acceptor, Connection, EngineError, Initiator, OutboundMessa
 use ironfix_session::{GarbledFrameLimit, SessionConfig};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -768,6 +769,16 @@ fn with_wrong_checksum(frame: &[u8]) -> BytesMut {
     garbled
 }
 
+/// A garbled-frame bound of `max` frames within `window`.
+#[track_caller]
+fn garbled_limit(max: u32, window: Duration) -> GarbledFrameLimit {
+    let max = some(NonZeroU32::new(max), "test frame count must be non-zero");
+    ok(
+        GarbledFrameLimit::try_new(max, window),
+        "test limit must be valid",
+    )
+}
+
 /// Extracts a field from a framed message.
 fn field(frame: &[u8], tag: u32) -> Option<String> {
     let mut decoder = Decoder::new(frame);
@@ -994,10 +1005,7 @@ async fn test_acceptor_oversized_frame_still_closes_the_session() {
 #[tokio::test]
 async fn test_acceptor_garbled_frame_limit_closes_the_session() {
     let (venue_app, _venue_rx) = RecordingApp::new();
-    let limit = ok(
-        GarbledFrameLimit::try_new(3, Duration::from_secs(60)),
-        "test limit must be valid",
-    );
+    let limit = garbled_limit(3, Duration::from_secs(60));
     let config = venue_config(Duration::from_secs(30)).with_garbled_frame_limit(Some(limit));
     let acceptor = Acceptor::new(config, Arc::clone(&venue_app));
     let (mut framed, connection) = establish(acceptor, 30).await;

@@ -22,6 +22,7 @@ use ironfix_session::{GarbledFrameLimit, SessionConfig, SessionConfigError};
 use ironfix_store::{MemoryStore, MessageStore, StoredMessage};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -4535,6 +4536,7 @@ fn with_wrong_checksum(frame: &[u8]) -> BytesMut {
 /// A garbled-frame bound of `max` frames within `window`.
 #[track_caller]
 fn garbled_limit(max: u32, window: Duration) -> GarbledFrameLimit {
+    let max = some(NonZeroU32::new(max), "test frame count must be non-zero");
     ok(
         GarbledFrameLimit::try_new(max, window),
         "test limit must be valid",

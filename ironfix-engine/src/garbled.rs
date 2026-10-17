@@ -50,13 +50,17 @@ pub(crate) struct GarbledFrameWindow {
 }
 
 impl GarbledFrameWindow {
-    /// Creates an empty window for `limit`.
+    /// Creates an empty window for `limit`, with room for every timestamp it
+    /// can ever hold, so recording never reallocates.
+    ///
+    /// The capacity is a hint: on a target where the count does not fit in
+    /// `usize` (none that Tokio supports) the deque starts empty and grows,
+    /// still never past `max` entries.
     #[must_use]
-    pub(crate) const fn new(limit: GarbledFrameLimit) -> Self {
-        Self {
-            limit,
-            seen: VecDeque::new(),
-        }
+    pub(crate) fn new(limit: GarbledFrameLimit) -> Self {
+        let seen = usize::try_from(limit.max().get())
+            .map_or_else(|_| VecDeque::new(), VecDeque::with_capacity);
+        Self { limit, seen }
     }
 
     /// Returns the bound this window enforces.
@@ -77,6 +81,7 @@ impl GarbledFrameWindow {
     /// `now` is the driver's monotonic time. An instant earlier than one
     /// already recorded cannot age that frame out, so a clock that steps back
     /// never shrinks the count.
+    #[must_use = "a reached limit must close the session"]
     pub(crate) fn record(&mut self, now: Instant, frames: u64) -> GarbledVerdict {
         let window = self.limit.window();
         while self.seen.front().is_some_and(|&arrived| {
@@ -86,7 +91,7 @@ impl GarbledFrameWindow {
             self.seen.pop_front();
         }
 
-        let max = u64::from(self.limit.max());
+        let max = u64::from(self.limit.max().get());
         for _ in 0..frames {
             if self.is_full(max) {
                 break;
@@ -118,6 +123,9 @@ mod tests {
     /// A window for `max` frames within `window_secs` seconds.
     #[track_caller]
     fn window(max: u32, window_secs: u64) -> GarbledFrameWindow {
+        let Some(max) = std::num::NonZeroU32::new(max) else {
+            panic!("test frame count must be non-zero");
+        };
         match GarbledFrameLimit::try_new(max, Duration::from_secs(window_secs)) {
             Ok(limit) => GarbledFrameWindow::new(limit),
             Err(err) => panic!("test limit must be valid: {err}"),
@@ -231,7 +239,23 @@ mod tests {
     #[test]
     fn test_limit_reports_the_configured_bound() {
         let garbled = window(7, 30);
-        assert_eq!(garbled.limit().max(), 7);
+        assert_eq!(garbled.limit().max().get(), 7);
         assert_eq!(garbled.limit().window(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_new_reserves_room_for_every_timestamp_up_front() {
+        let mut garbled = window(16, 30);
+        assert!(garbled.seen.capacity() >= 16);
+        let before = garbled.seen.capacity();
+        assert_eq!(
+            garbled.record(Instant::now(), 16),
+            GarbledVerdict::LimitReached
+        );
+        assert_eq!(
+            garbled.seen.capacity(),
+            before,
+            "recording never reallocates"
+        );
     }
 }
