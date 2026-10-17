@@ -61,12 +61,20 @@ exists yet.
 - **A typestate session FSM** and checked sequence arithmetic in
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in
-  `ironfix-dictionary`.
+  `ironfix-dictionary`, with four QuickFIX dictionaries embedded verbatim:
+  FIX 4.2 (`Dictionary::fix42()`), FIX 4.4 (`Dictionary::fix44()`), the
+  FIXT 1.1 transport dictionary (`Dictionary::fixt11()`) and the FIX 5.0 SP2
+  application dictionary (`Dictionary::fix50sp2()`). `SessionDictionary`
+  composes FIXT 1.1 with a FIX 5.0 family application dictionary, and
+  `Validator::for_session` validates against the pair: header and trailer
+  from the transport, body from the application, admin messages entirely
+  from the transport.
 - **Code generation.** `#[derive(FixMessage)]` and `#[derive(FixField)]` in
   `ironfix-derive` implement the `ironfix-core` traits with typed
   `DecodeError` / `EncodeError` paths (compile-tested in
   `ironfix-derive/tests/`), and `ironfix-codegen` emits Rust from a loaded
-  `Dictionary` (a golden sample is compile-tested in `ironfix-codegen/tests/`).
+  `Dictionary` (a golden sample and the full FIX 4.2 and FIXT 1.1 outputs are
+  compile-tested in `ironfix-codegen/tests/`).
 - **FAST primitives** in `ironfix-fast`: stop-bit encode/decode of unsigned
   and signed integers, ASCII strings and byte vectors, each in nullable and
   non-nullable form, plus presence maps, all round-trip tested. The `Operator`
@@ -98,11 +106,15 @@ around it.
   sans-IO session core with Tokio as one driver is the accepted direction
   (`doc/adr/0002-session-driver.md`, tracked in #90 to #93); none of it exists
   yet.
-- **Only FIX 4.4 has an embedded dictionary** (`ironfix-dictionary/spec/FIX44.xml`,
-  vendored from QuickFIX). Other versions require
+- **Only four dictionaries are embedded**: FIX 4.2, FIX 4.4, FIXT 1.1 and
+  FIX 5.0 SP2 (`ironfix-dictionary/spec/`, vendored verbatim from QuickFIX).
+  FIX 4.0, 4.1, 4.3, 5.0 and 5.0 SP1 require
   `Dictionary::from_quickfix_xml` with your own XML
-  (`ironfix-dictionary/src/loader.rs`). The `Validator` is *not* invoked by the
-  engine or the codec; you call it yourself (`ironfix-engine/src/lib.rs`).
+  (`ironfix-dictionary/src/loader.rs`). `SessionDictionary` does not read
+  `ApplVerID(1128)`: you choose the application dictionary when you build it,
+  and FIX 4.x application dictionaries over FIXT 1.1 are rejected. The
+  `Validator` is *not* invoked by the engine or the codec; you call it yourself
+  (`ironfix-engine/src/lib.rs`).
 - **Generated code has no consumer.** Nothing in the workspace uses the
   derives or `ironfix-codegen` output, so field access on the session path is
   untyped tag lookup (`ironfix-codegen/src/lib.rs`).
@@ -120,19 +132,29 @@ around it.
 ## FIX version support
 
 The session layer is version-parameterised by `BeginString`, and there is a
-runnable client/server example pair for each version below. "Dictionary" means a
-dictionary is embedded in the crate and loadable without extra files.
+runnable client/server example pair for each version below. "Dictionary
+embedded" means a dictionary is embedded in `ironfix-dictionary` and loadable
+without extra files. The FIX 5.0 family runs over a FIXT 1.1 session, so it
+needs two dictionaries: the FIXT 1.1 transport dictionary (`Dictionary::fixt11()`,
+embedded) and the application dictionary for the version, composed with
+`SessionDictionary`.
 
 | Version | BeginString | Example pair | Dictionary embedded |
 |---------|-------------|--------------|---------------------|
 | FIX 4.0 | `FIX.4.0` | yes | no |
 | FIX 4.1 | `FIX.4.1` | yes | no |
-| FIX 4.2 | `FIX.4.2` | yes | no |
+| FIX 4.2 | `FIX.4.2` | yes | **yes** (`Dictionary::fix42()`) |
 | FIX 4.3 | `FIX.4.3` | yes | no |
-| FIX 4.4 | `FIX.4.4` | yes | **yes** |
-| FIX 5.0 | `FIXT.1.1` | yes | no |
-| FIX 5.0 SP1 | `FIXT.1.1` | yes | no |
-| FIX 5.0 SP2 | `FIXT.1.1` | yes | no |
+| FIX 4.4 | `FIX.4.4` | yes | **yes** (`Dictionary::fix44()`) |
+| FIX 5.0 | `FIXT.1.1` | yes | transport only (FIXT 1.1); application no |
+| FIX 5.0 SP1 | `FIXT.1.1` | yes | transport only (FIXT 1.1); application no |
+| FIX 5.0 SP2 | `FIXT.1.1` | yes | **yes** (`Dictionary::fixt11()` + `Dictionary::fix50sp2()`) |
+
+The embedded dictionaries are the QuickFIX data dictionaries, redistributed
+under the QuickFIX Software License, Version 1.0
+(`ironfix-dictionary/spec/LICENSE-QUICKFIX`; provenance and checksums in
+`ironfix-dictionary/spec/README.md`). This product includes software developed
+by quickfixengine.org (<http://www.quickfixengine.org/>).
 
 ## Crate Organization
 
@@ -416,7 +438,9 @@ maintainer:
 
 We appreciate your interest and look forward to your contributions!
 
-**License**: MIT
+**License**: MIT. The QuickFIX data dictionaries vendored in
+`ironfix-dictionary/spec/` remain under the QuickFIX Software License,
+Version 1.0 (`ironfix-dictionary/spec/LICENSE-QUICKFIX`).
 
 <!-- related-projects:start -->
 ## Related projects

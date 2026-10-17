@@ -1146,6 +1146,18 @@ distinction the type draws: `FixVersion::as_str` is the version's own name
 kind. The `ApplVerID` values are stamped, not enforced, and the engine never
 consults a dictionary.
 
+**Dictionary side, standalone.** `ironfix-dictionary` embeds the QuickFIX
+FIXT 1.1 transport dictionary (`Dictionary::fixt11()`) and the FIX 5.0 SP2
+application dictionary (`Dictionary::fix50sp2()`), alongside FIX 4.2 and FIX
+4.4. `SessionDictionary` composes the two and `Validator::for_session`
+validates a message against the pair the way QuickFIX does: an admin message
+the transport defines (Logon, Heartbeat, ...) is checked against FIXT 1.1
+alone, so a Logon must carry `DefaultApplVerID` (1137); an application message
+takes its header and trailer from FIXT 1.1 and its body from FIX 5.0 SP2. The
+validator does not read `ApplVerID` (1128) to choose the application
+dictionary (the pair names it), and neither the engine nor the codec calls it.
+See ADR-0010.
+
 ---
 
 ## References

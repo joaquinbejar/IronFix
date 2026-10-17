@@ -46,9 +46,9 @@
 //!   answered with a gap fill. [`store::MemoryStore`] is the only store.
 //! - [`transport`] contains only a framing codec — no TCP connector or
 //!   acceptor and no TLS.
-//! - Only FIX 4.4 has an embedded dictionary; other versions need
-//!   `Dictionary::from_quickfix_xml`. The validator is never invoked
-//!   automatically.
+//! - Only FIX 4.2, FIX 4.4, FIXT 1.1 and FIX 5.0 SP2 have embedded
+//!   dictionaries; other versions need `Dictionary::from_quickfix_xml`. The
+//!   validator is never invoked automatically.
 //! - [`fast`] is standalone: no template XML parser, no UDP multicast, and no
 //!   wiring into the session path.
 //! - A criterion harness exists (`benches/` in `ironfix-tagvalue`,
