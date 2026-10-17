@@ -10,14 +10,14 @@
 # on any build artefact change.
 
 # Build stage
-FROM rust:1.92.0-alpine3.23 AS builder
+FROM rust:1.99.1-alpine3.23 AS builder
 
 # rust-toolchain.toml pins `channel = "stable"`, which rustup resolves to
 # whatever "stable" means on the day of the build — silently overriding the
 # version in the FROM line above and downloading a second toolchain mid-build.
 # RUSTUP_TOOLCHAIN takes precedence over the file and keeps the image
 # reproducible.
-ENV RUSTUP_TOOLCHAIN=1.92.0
+ENV RUSTUP_TOOLCHAIN=1.99.1
 
 RUN apk add --no-cache musl-dev
 
