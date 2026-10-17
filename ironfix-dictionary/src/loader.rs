@@ -140,7 +140,7 @@ impl fmt::Display for DefinitionKind {
     }
 }
 
-/// Errors produced while loading a dictionary from XML.
+/// Errors produced while loading or composing dictionaries.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum DictionaryError {
@@ -210,10 +210,11 @@ pub enum DictionaryError {
     /// A transport and an application dictionary cannot be composed into a
     /// [`SessionDictionary`](crate::SessionDictionary).
     ///
-    /// The transport side must be a FIXT.1.1 dictionary and the application
-    /// side a FIX 5.0 or later one (a version with an `ApplVerID`).
+    /// The transport side must be a FIXT.1.1 dictionary, and the application
+    /// side any version FIXT.1.1 carries (FIX 4.0 through 5.0 SP2), which is
+    /// every version except FIXT.1.1 itself.
     #[error(
-        "cannot compose a {transport} transport dictionary with a {application} application dictionary: the transport must be FIXT.1.1 and the application FIX 5.0 or later"
+        "cannot compose a {transport} transport dictionary with a {application} application dictionary: the transport must be FIXT.1.1 and the application must not be"
     )]
     IncompatibleComposition {
         /// Version of the dictionary offered as the transport.
@@ -268,11 +269,15 @@ impl Dictionary {
     /// [`Dictionary::fix50sp2`] through
     /// [`SessionDictionary`](crate::SessionDictionary).
     ///
-    /// The vendored file defines the `MsgTypeGrp` component (used by Logon)
-    /// with no members and does not define `NoMsgTypes(384)` at all, so the
-    /// validator reports a Logon carrying it as
-    /// [`ValidationError::UnknownTag`](crate::ValidationError::UnknownTag).
-    /// That is what the QuickFIX dictionary says; it is not patched here.
+    /// **Upstream deviation.** FIXT 1.1 defines the Logon `MsgTypeGrp`
+    /// component as the `NoMsgTypes(384)` group (`RefMsgType(372)`,
+    /// `MsgDirection(385)`, `RefApplVerID(1130)`, `RefApplExtID(1406)`,
+    /// `RefCstmApplVerID(1131)`, `DefaultVerIndicator(1410)`). The vendored
+    /// QuickFIX file defines `MsgTypeGrp` with no members and does not define
+    /// tags 384 or 385, so the validator reports a Logon carrying the group
+    /// ([`ValidationError::UnknownTag`](crate::ValidationError::UnknownTag)
+    /// for 384). The file is not patched; to accept the group, load a FIXT 1.1
+    /// dictionary that defines it with [`Dictionary::from_quickfix_xml`].
     ///
     /// # Errors
     /// Returns [`DictionaryError`] if the bundled specification fails to
