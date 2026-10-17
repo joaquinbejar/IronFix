@@ -16,7 +16,10 @@
 //! non-Logon first frame, the `ResetSeqNumFlag` reset handshake, and the
 //! handshake hardening — a `HeartBtInt` overflow, a wrong `BeginString`, a
 //! body-only `MsgSeqNum`, a duplicate concurrent connection, and a locally
-//! driven reset that must signal `141=Y`.
+//! driven reset that must signal `141=Y`. The last group covers garbled inbound
+//! frames on the acceptor's codec: skipped without consuming a `MsgSeqNum` or
+//! refreshing the heartbeat, recovered through `ResendRequest`, bounded by the
+//! optional garbled-frame limit, and never masking a fatal oversized frame.
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -24,8 +27,8 @@ use futures_util::{SinkExt, StreamExt};
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::{CompId, Timestamp};
 use ironfix_engine::application::{Application, RejectReason, SessionId};
-use ironfix_engine::{Acceptor, EngineError, Initiator, OutboundMessage};
-use ironfix_session::SessionConfig;
+use ironfix_engine::{Acceptor, Connection, EngineError, Initiator, OutboundMessage};
+use ironfix_session::{GarbledFrameLimit, SessionConfig};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
 use std::sync::{Arc, Mutex};
@@ -723,4 +726,384 @@ async fn test_acceptor_reset_on_logon_signals_the_reset() {
     // Drop the client so the session closes out cleanly.
     drop(framed);
     let _ = timeout(Duration::from_secs(5), connection.wait_closed()).await;
+}
+
+// ---------------------------------------------------------------------------
+// Garbled inbound frames
+// ---------------------------------------------------------------------------
+
+/// Stub-initiator frame builder (CLIENT -> VENUE).
+#[track_caller]
+fn client_msg(msg_type: &str, seq: u64, extra: &[(u32, &str)]) -> BytesMut {
+    let mut encoder = Encoder::new("FIX.4.4");
+    encoder.put_str(35, msg_type);
+    encoder.put_str(49, "CLIENT");
+    encoder.put_str(56, "VENUE");
+    encoder.put_uint(34, seq);
+    encoder.put_str(52, Timestamp::now().format_millis().as_str());
+    for (tag, value) in extra {
+        encoder.put_str(*tag, value);
+    }
+    let mut frame = BytesMut::new();
+    ok(
+        encoder.finish_into(&mut frame),
+        "test fixture frame must encode",
+    );
+    frame
+}
+
+/// Returns `frame` with its CheckSum (10) value off by one: it still frames,
+/// but fails checksum validation, which FIX classes as garbled.
+#[track_caller]
+fn with_wrong_checksum(frame: &[u8]) -> BytesMut {
+    // The trailer is `10=NNN<SOH>`: the digits are the four bytes before the
+    // end, less the final SOH.
+    let digits_at = some(frame.len().checked_sub(4), "frame must carry a trailer");
+    let (head, trailer) = frame.split_at(digits_at);
+    let digits = some(trailer.get(..3), "trailer must carry three digits");
+    let text = ok(std::str::from_utf8(digits), "checksum digits are ASCII");
+    let declared: u16 = ok(text.parse(), "checksum digits are decimal");
+    let mut garbled = BytesMut::from(head);
+    garbled.extend_from_slice(format!("{:03}\x01", (declared + 1) % 256).as_bytes());
+    garbled
+}
+
+/// Extracts a field from a framed message.
+fn field(frame: &[u8], tag: u32) -> Option<String> {
+    let mut decoder = Decoder::new(frame);
+    match decoder.decode() {
+        Ok(raw) => raw.get_field_str(tag).map(str::to_string),
+        Err(_) => None,
+    }
+}
+
+/// Returns the MsgType (35) of a framed message.
+#[track_caller]
+fn msg_type_of(frame: &[u8]) -> String {
+    some(field(frame, 35), "frame must carry MsgType (35)")
+}
+
+/// Reads the next frame the acceptor sends, within 5 s.
+async fn next_frame(framed: &mut Framed<TcpStream, FixCodec>) -> BytesMut {
+    let polled = ok(
+        timeout(Duration::from_secs(5), framed.next()).await,
+        "frame must arrive within 5s",
+    );
+    ok(some(polled, "stream must stay open"), "frame must decode")
+}
+
+/// Reads until the acceptor hangs up, so a close is the acceptor's verdict
+/// and never this side dropping the socket first.
+async fn read_until_closed(framed: &mut Framed<TcpStream, FixCodec>) {
+    while let Ok(Some(Ok(_))) = timeout(Duration::from_secs(5), framed.next()).await {}
+}
+
+/// Runs the Logon handshake from a stub initiator against `acceptor` and
+/// returns the stub's socket together with the acceptor's live connection.
+///
+/// The Logon asks for `HeartBtInt` (108) = `heartbeat_secs`, which the
+/// acceptor honours.
+async fn establish(
+    acceptor: Acceptor<RecordingApp>,
+    heartbeat_secs: u64,
+) -> (Framed<TcpStream, FixCodec>, Connection) {
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+
+    let stream = ok(TcpStream::connect(addr).await, "client connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    let heartbeat = heartbeat_secs.to_string();
+    ok(
+        framed
+            .send(client_msg("A", 1, &[(98, "0"), (108, heartbeat.as_str())]))
+            .await,
+        "client sends its logon",
+    );
+    let ack = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&ack), "A");
+
+    let connection = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), venue).await,
+                "handshake within 5s",
+            ),
+            "venue task joins",
+        ),
+        "acceptor establishes the session",
+    );
+    (framed, connection)
+}
+
+/// A garbled frame in the acceptor's session between two valid frames is
+/// ignored: the session stays Active, the garbled frame consumes no MsgSeqNum,
+/// the next valid frame is a gap answered with a ResendRequest for the garbled
+/// number, and the usual GapFill recovers the session.
+#[tokio::test]
+async fn test_acceptor_garbled_checksum_frame_is_skipped_and_its_gap_resent() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    );
+    let (mut framed, connection) = establish(acceptor, 30).await;
+
+    ok(
+        framed.send(client_msg("1", 2, &[(112, "BEFORE")])).await,
+        "send in-sequence TestRequest",
+    );
+    let reply = next_frame(&mut framed).await;
+    assert_eq!(field(&reply, 112).as_deref(), Some("BEFORE"));
+
+    // Seq 3 is garbled and seq 4 follows it in the same write.
+    let mut burst = with_wrong_checksum(&client_msg("1", 3, &[(112, "GARBLED")]));
+    burst.extend_from_slice(&client_msg("1", 4, &[(112, "AFTER")]));
+    ok(framed.send(burst).await, "send garbled + valid frames");
+
+    let resend = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&resend), "2", "the gap must be requested");
+    assert_eq!(field(&resend, 7).as_deref(), Some("3"));
+    assert_eq!(field(&resend, 16).as_deref(), Some("0"));
+    let reply = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&reply), "0");
+    assert_eq!(field(&reply, 112).as_deref(), Some("AFTER"));
+
+    // The acceptor answered seq 4 after requesting the gap, so it has
+    // processed both: the garbled seq 3 consumed nothing.
+    assert_eq!(connection.next_target_seq(), 3);
+    assert!(
+        !connection.is_closed(),
+        "a garbled frame must not end the session"
+    );
+
+    // Recover the gap the usual way.
+    ok(
+        framed
+            .send(client_msg("4", 3, &[(123, "Y"), (36, "5")]))
+            .await,
+        "send gap fill",
+    );
+    ok(
+        framed.send(client_msg("1", 5, &[(112, "RECOVERED")])).await,
+        "send in-sequence TestRequest after the fill",
+    );
+    let reply = next_frame(&mut framed).await;
+    assert_eq!(field(&reply, 112).as_deref(), Some("RECOVERED"));
+    assert_eq!(connection.next_target_seq(), 6);
+    assert!(!connection.is_closed());
+
+    drop(framed);
+    let _ = timeout(Duration::from_secs(5), connection.wait_closed()).await;
+}
+
+/// Bytes before a frame's `8=` are skipped by the acceptor and the frame
+/// behind them is processed normally: no gap, no ResendRequest.
+#[tokio::test]
+async fn test_acceptor_garbage_before_a_frame_is_skipped_and_the_frame_processed() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    );
+    let (mut framed, connection) = establish(acceptor, 30).await;
+
+    let mut burst = BytesMut::from(&b"\x00\x7fline noise before the frame\xff"[..]);
+    burst.extend_from_slice(&client_msg("1", 2, &[(112, "PING")]));
+    ok(framed.send(burst).await, "send garbage + TestRequest");
+
+    let reply = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&reply), "0", "no ResendRequest may come first");
+    assert_eq!(field(&reply, 112).as_deref(), Some("PING"));
+    assert_eq!(connection.next_target_seq(), 3);
+    assert!(!connection.is_closed());
+
+    drop(framed);
+    let _ = timeout(Duration::from_secs(5), connection.wait_closed()).await;
+}
+
+/// A garbled frame before the Logon is skipped too: the acceptor waits for
+/// the valid Logon behind it (within the logon timeout) instead of failing
+/// the handshake.
+#[tokio::test]
+async fn test_acceptor_garbled_frame_before_the_logon_is_skipped() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    );
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+
+    let stream = ok(TcpStream::connect(addr).await, "client connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    let mut burst = with_wrong_checksum(&client_msg("A", 1, &[(98, "0"), (108, "30")]));
+    burst.extend_from_slice(&client_msg("A", 1, &[(98, "0"), (108, "30")]));
+    ok(framed.send(burst).await, "send garbled + valid Logon");
+
+    let ack = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&ack), "A");
+    let connection = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), venue).await,
+                "handshake within 5s",
+            ),
+            "venue task joins",
+        ),
+        "the valid Logon behind the garbled one establishes the session",
+    );
+    assert_eq!(connection.next_target_seq(), 2);
+
+    drop(framed);
+    let _ = timeout(Duration::from_secs(5), connection.wait_closed()).await;
+}
+
+/// A frame declaring more than `max_message_size` is fatal, recovery or not:
+/// the acceptor closes the session while the client still holds its socket.
+#[tokio::test]
+async fn test_acceptor_oversized_frame_still_closes_the_session() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    );
+    let (mut framed, connection) = establish(acceptor, 30).await;
+
+    // 2 MiB declared against the default 1 MiB ceiling.
+    ok(
+        framed
+            .send(BytesMut::from(
+                &b"8=FIX.4.4\x019=2097152\x0135=0\x0149=CLIENT\x01"[..],
+            ))
+            .await,
+        "send oversized header",
+    );
+
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s",
+    );
+    assert!(connection.is_closed());
+    assert!(!connection.is_timed_out());
+    assert!(venue_app.events().contains(&"logout".to_string()));
+    read_until_closed(&mut framed).await;
+}
+
+/// With a garbled-frame limit of 3 within a minute, two garbled frames are
+/// tolerated by the acceptor; the third logs the session out.
+#[tokio::test]
+async fn test_acceptor_garbled_frame_limit_closes_the_session() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let limit = ok(
+        GarbledFrameLimit::try_new(3, Duration::from_secs(60)),
+        "test limit must be valid",
+    );
+    let config = venue_config(Duration::from_secs(30)).with_garbled_frame_limit(Some(limit));
+    let acceptor = Acceptor::new(config, Arc::clone(&venue_app));
+    let (mut framed, connection) = establish(acceptor, 30).await;
+
+    let mut burst = with_wrong_checksum(&client_msg("0", 2, &[]));
+    burst.extend_from_slice(&with_wrong_checksum(&client_msg("0", 3, &[])));
+    burst.extend_from_slice(&client_msg("1", 4, &[(112, "STILL-UP")]));
+    ok(
+        framed.send(burst).await,
+        "send two garbled frames + one valid",
+    );
+
+    let resend = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&resend), "2");
+    assert_eq!(field(&resend, 7).as_deref(), Some("2"));
+    let reply = next_frame(&mut framed).await;
+    assert_eq!(field(&reply, 112).as_deref(), Some("STILL-UP"));
+    assert!(
+        !connection.is_closed(),
+        "two garbled frames are under the limit"
+    );
+
+    ok(
+        framed
+            .send(with_wrong_checksum(&client_msg("0", 5, &[])))
+            .await,
+        "send the third garbled frame",
+    );
+    let logout = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&logout), "5");
+    assert!(
+        some(field(&logout, 58), "logout must carry Text").contains("garbled"),
+        "the logout should explain the garbled-frame limit"
+    );
+
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s",
+    );
+    assert!(!connection.is_timed_out());
+    read_until_closed(&mut framed).await;
+}
+
+/// Garbled bytes are not proof of life on the acceptor either: a peer that
+/// sends nothing but garbled frames is probed with a TestRequest and timed
+/// out.
+#[tokio::test]
+async fn test_acceptor_garbled_frames_do_not_refresh_the_heartbeat() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    );
+    // The acceptor honours the 1 s HeartBtInt the Logon asks for.
+    let (mut framed, connection) = establish(acceptor, 1).await;
+
+    let client = tokio::spawn(async move {
+        let mut saw_test_request = false;
+        let mut seq = 2u64;
+        let mut pace = tokio::time::interval(Duration::from_millis(200));
+        let deadline = tokio::time::sleep(Duration::from_secs(10));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = pace.tick() => {
+                    let garbled = with_wrong_checksum(&client_msg("0", seq, &[]));
+                    seq += 1;
+                    if framed.send(garbled).await.is_err() {
+                        break;
+                    }
+                }
+                inbound = framed.next() => match inbound {
+                    Some(Ok(frame)) => {
+                        if msg_type_of(&frame) == "1" {
+                            saw_test_request = true;
+                        }
+                    }
+                    _ => break,
+                },
+                () = &mut deadline => break,
+            }
+        }
+        saw_test_request
+    });
+
+    ok(
+        timeout(Duration::from_secs(8), connection.wait_closed()).await,
+        "closed within 8s despite the garbled stream",
+    );
+    assert!(
+        connection.is_timed_out(),
+        "the session must time out: garbled frames are not proof of life"
+    );
+    assert_eq!(
+        connection.next_target_seq(),
+        2,
+        "no garbled frame may consume a MsgSeqNum"
+    );
+    assert!(
+        ok(
+            ok(
+                timeout(Duration::from_secs(15), client).await,
+                "client done within 15s",
+            ),
+            "client task",
+        ),
+        "the acceptor should have probed with a TestRequest"
+    );
 }

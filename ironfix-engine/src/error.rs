@@ -20,7 +20,13 @@ pub enum EngineError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Framing or checksum failure at the codec layer.
+    /// Fatal failure at the codec layer.
+    ///
+    /// Both engines frame with garbled-frame recovery on, so a garbled frame
+    /// (a bad CheckSum or BodyLength, bytes before `8=`) is skipped rather than
+    /// reported here. What remains is fatal: a frame above
+    /// [`SessionConfig::max_message_size`](ironfix_session::SessionConfig::max_message_size),
+    /// or an I/O failure inside the codec.
     #[error("codec error: {0}")]
     Codec(#[from] CodecError),
 

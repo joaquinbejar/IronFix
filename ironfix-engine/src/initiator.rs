@@ -31,6 +31,12 @@
 //! both are systemic rather than per-message: a peer that is cross-wired, or
 //! whose clock is two minutes out, will be so on its next message too.
 //!
+//! A *garbled* frame, by contrast, is per-message and is ignored: the codec
+//! skips it (see the crate-level docs), it consumes no `MsgSeqNum`, and the gap
+//! is recovered by `ResendRequest`. That applies while waiting for the Logon ack
+//! too: a garbled ack is skipped and the wait continues, bounded by
+//! [`SessionConfig::logon_timeout`].
+//!
 //! # Bounded recovery
 //!
 //! A gap is answered with a `ResendRequest` (2), and a request that goes
@@ -137,7 +143,8 @@ use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
 use crate::reactor::{
     DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, ResendState,
-    SessionParams, TICK_INTERVAL, lock_heartbeat, send_handshake_admin, spawn_session,
+    SessionParams, TICK_INTERVAL, lock_heartbeat, send_handshake_admin, session_codec,
+    spawn_session,
 };
 use crate::wire::{self, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion};
 use futures_util::StreamExt;
@@ -149,7 +156,6 @@ use ironfix_session::heartbeat::negotiate_interval;
 use ironfix_session::sequence::{SequenceCounter, SequenceResult};
 use ironfix_session::{Disconnected, HeartbeatManager, SequenceManager, Session, SessionConfig};
 use ironfix_store::MessageStore;
-use ironfix_transport::FixCodec;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -525,10 +531,7 @@ impl<A: Application + 'static> Initiator<A> {
         };
         let _ = stream.set_nodelay(true);
 
-        let codec = FixCodec::new()
-            .with_max_message_size(self.config.max_message_size)
-            .with_checksum_validation(self.config.validate_checksum);
-        let mut framed = Framed::new(stream, codec);
+        let mut framed = Framed::new(stream, session_codec(&self.config));
 
         // Seeding fails closed: a store that cannot be reset or refreshed leaves
         // the session unable to vouch for its own counters, so it is refused

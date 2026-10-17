@@ -41,8 +41,10 @@
 //! identity, the `SendingTime` reason for a clock problem) and/or a Logout,
 //! drives the typestate to `reject_logon`, and drops the connection without ever
 //! reaching Active. Waiting for the inbound Logon is bounded by
-//! [`SessionConfig::logon_timeout`]. A gap in the Logon completes the handshake
-//! and immediately issues a `ResendRequest` (2).
+//! [`SessionConfig::logon_timeout`]; a garbled frame that arrives first (a bad
+//! CheckSum or BodyLength, bytes before `8=`) is skipped and the wait goes on.
+//! A gap in the Logon completes the handshake and immediately issues a
+//! `ResendRequest` (2).
 //!
 //! `HeartBtInt` (108) is counterparty-controlled and drives a `Duration` on the
 //! heartbeat clock, so it is bounded at the handshake: a value large enough to
@@ -99,7 +101,7 @@ use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
 use crate::reactor::{
     DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, ResendState,
-    SessionParams, lock_heartbeat, send_handshake_admin, spawn_session,
+    SessionParams, lock_heartbeat, send_handshake_admin, session_codec, spawn_session,
 };
 use crate::wire::{self, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion};
 use futures_util::StreamExt;
@@ -107,7 +109,6 @@ use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
 use ironfix_session::sequence::SequenceResult;
 use ironfix_session::{Disconnected, HeartbeatManager, SequenceManager, Session, SessionConfig};
-use ironfix_transport::FixCodec;
 use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -318,10 +319,7 @@ impl<A: Application + 'static> Acceptor<A> {
         let session = Session::<Disconnected>::new(session_id.to_string()).accept();
 
         let _ = stream.set_nodelay(true);
-        let codec = FixCodec::new()
-            .with_max_message_size(self.config.max_message_size)
-            .with_checksum_validation(self.config.validate_checksum);
-        let mut framed = Framed::new(stream, codec);
+        let mut framed = Framed::new(stream, session_codec(&self.config));
 
         let sequences = match self.initial_sequences {
             Some((sender, target)) if !self.config.reset_on_logon => {

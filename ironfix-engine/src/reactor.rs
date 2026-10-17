@@ -34,6 +34,22 @@
 //! [`SessionConfig::resend_attempt_limit`] attempts, after which the session is
 //! logged out.
 //!
+//! # Garbled inbound frames
+//!
+//! Both engines frame the socket with
+//! [`FixCodec::with_garbled_recovery`] enabled, so a garbled frame (a wrong
+//! `CheckSum` (10), a `BodyLength` (9) that does not match the frame, bytes
+//! before `8=`) never reaches this loop as an error: the codec skips it and
+//! counts it, and the reactor drains the count before each inbound frame and on
+//! every tick. A garbled frame is ignored, as FIX requires. It consumes no
+//! `MsgSeqNum` (34), so the next valid frame with a higher number is a gap and
+//! gets the usual `ResendRequest`. It does not refresh the heartbeat clock,
+//! because garbled bytes are not proof of life. It is logged as a count, never
+//! as bytes, since it may carry `Password` (554). With
+//! [`SessionConfig::garbled_frame_limit`] set, reaching the limit inside the
+//! window logs the session out. Only fatal codec errors (a frame above
+//! `max_message_size`, an I/O error) still close the session directly.
+//!
 //! # Resend and the message store
 //!
 //! When a [`MessageStore`] is attached, every sequenced outbound frame is filed
@@ -62,6 +78,7 @@
 use crate::application::{Application, RejectReason, SessionId};
 use crate::connection::{Command, SessionRuntime};
 use crate::error::EngineError;
+use crate::garbled::{GarbledFrameWindow, GarbledVerdict};
 use crate::outbound;
 use crate::wire::{
     self, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard, SendingTimeProblem,
@@ -88,6 +105,28 @@ use tokio_util::codec::Framed;
 
 /// Framed TCP stream carrying FIX messages.
 pub(crate) type FixFramed = Framed<TcpStream, FixCodec>;
+
+/// Builds the codec both engines frame their socket with.
+///
+/// Garbled-frame recovery is always on: FIX ignores a garbled message instead
+/// of ending the session over it, and `Framed` cannot resume after a decoder
+/// error, so the skip has to happen inside the codec. The message-size ceiling
+/// and checksum validation come from the session configuration.
+#[must_use]
+pub(crate) const fn session_codec(config: &SessionConfig) -> FixCodec {
+    FixCodec::new()
+        .with_max_message_size(config.max_message_size)
+        .with_checksum_validation(config.validate_checksum)
+        .with_garbled_recovery(true)
+}
+
+/// The driver's monotonic time, for the decision logic that takes `now`.
+///
+/// Read from Tokio's clock and converted at this boundary, per ADR-0002, so a
+/// paused-clock test drives the decisions deterministically.
+fn driver_now() -> Instant {
+    tokio::time::Instant::now().into_std()
+}
 
 /// Default capacity of the outbound command queue.
 pub(crate) const DEFAULT_OUTBOUND_CAPACITY: usize = 1024;
@@ -501,6 +540,9 @@ struct Reactor<A: Application> {
     write_timeout: Duration,
     /// Hand-off queue to the application dispatcher.
     app_tx: mpsc::Sender<AppFrame>,
+    /// Garbled-frame count against [`SessionConfig::garbled_frame_limit`], or
+    /// `None` when no limit is configured.
+    garbled: Option<GarbledFrameWindow>,
 }
 
 /// The session reactor: owns the socket, multiplexes inbound frames,
@@ -524,6 +566,18 @@ async fn run_reactor<A: Application + 'static>(
     let mut tick = interval(TICK_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    // Garbled frames skipped while the Logon handshake was reading are
+    // reported, not counted against the limit: the handshake is bounded by
+    // the logon timeout, and the limit governs the Active session.
+    let during_handshake = framed.codec_mut().take_garbled_count();
+    if during_handshake > 0 {
+        tracing::warn!(
+            session = %ctx.session_id,
+            skipped = during_handshake,
+            "ignored garbled inbound frame(s) during the Logon handshake"
+        );
+    }
+
     let outcome = loop {
         // The phase is put back by every handler that does not close the
         // session, so it is always present here. Treating its absence as a
@@ -533,7 +587,17 @@ async fn run_reactor<A: Application + 'static>(
         };
         let result = tokio::select! {
             inbound = framed.next() => match inbound {
-                Some(Ok(frame)) => ctx.on_frame(&mut framed, current, frame).await,
+                // The garbled frames the codec skipped on the way to this one
+                // are accounted for first, so a limit reached by them closes
+                // the session before the frame behind them is acted on.
+                Some(Ok(frame)) => match ctx.on_garbled(&mut framed, current, driver_now()).await {
+                    Ok(current) => ctx.on_frame(&mut framed, current, frame).await,
+                    Err(outcome) => Err(outcome),
+                },
+                // With recovery on, only a fatal error reaches here: an I/O
+                // failure or a frame above `max_message_size`. `Framed` ends
+                // the stream after any decoder error, so there is nothing to
+                // resume either way.
                 Some(Err(err)) => {
                     teardown(current);
                     Err(closed(format!("codec error: {err}"), false))
@@ -569,7 +633,12 @@ async fn run_reactor<A: Application + 'static>(
                     Ok(current)
                 }
             },
-            _ = tick.tick() => ctx.on_tick(&mut framed, current).await,
+            // A garbled frame with nothing valid behind it is only seen here:
+            // the codec counted it while `Framed` went on waiting for bytes.
+            _ = tick.tick() => match ctx.on_garbled(&mut framed, current, driver_now()).await {
+                Ok(current) => ctx.on_tick(&mut framed, current).await,
+                Err(outcome) => Err(outcome),
+            },
         };
         match result {
             Ok(next) => phase = Some(next),
@@ -1138,6 +1207,76 @@ impl<A: Application> Reactor<A> {
         let reason = format!("MsgSeqNum too low: expected {expected}, received {received}");
         let logout = self.factory.logout(Some(&reason));
         let _ = self.send(framed, logout).await;
+        teardown(phase);
+        closed(reason, false)
+    }
+
+    /// Accounts for the garbled frames the codec skipped since the last check,
+    /// observed at `now`.
+    ///
+    /// FIX ignores a garbled message, and so does this: no sequence number is
+    /// consumed, the heartbeat clock is not touched (garbled bytes are not
+    /// proof of life), and nothing reaches the application. The gap a skipped
+    /// frame leaves is found by the next valid frame and recovered by the
+    /// usual `ResendRequest`. The log line carries the count only, never the
+    /// frame bytes: a garbled Logon can still hold `Password` (554).
+    ///
+    /// With a [`SessionConfig::garbled_frame_limit`], the count is fed to the
+    /// sliding window, and reaching the limit closes the session through
+    /// [`Reactor::close_on_garbled_limit`].
+    async fn on_garbled(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        now: Instant,
+    ) -> Result<Phase, SessionClosed> {
+        let skipped = framed.codec_mut().take_garbled_count();
+        if skipped == 0 {
+            return Ok(phase);
+        }
+        tracing::warn!(
+            session = %self.session_id,
+            skipped,
+            "ignored garbled inbound frame(s): no MsgSeqNum consumed, heartbeat clock not refreshed"
+        );
+        let Some(window) = self.garbled.as_mut() else {
+            return Ok(phase);
+        };
+        match window.record(now, skipped) {
+            GarbledVerdict::Tolerated => Ok(phase),
+            GarbledVerdict::LimitReached => {
+                // Whole milliseconds rather than `Duration`'s Debug form, which
+                // can print `µs`: this text goes out in Logout `Text` (58).
+                let limit = window.limit();
+                let reason = format!(
+                    "garbled frame limit reached: {} garbled inbound frames within {} ms",
+                    limit.max(),
+                    limit.window().as_millis()
+                );
+                Err(self.close_on_garbled_limit(framed, phase, reason).await)
+            }
+        }
+    }
+
+    /// Ends a session whose inbound link has garbled
+    /// [`SessionConfig::garbled_frame_limit`] frames within its window.
+    ///
+    /// An Active session sends a Logout carrying the reason in `Text` (58)
+    /// first, so the counterparty learns why, and is then torn down without
+    /// waiting for the acknowledgement: the very link that keeps garbling
+    /// frames is the one the acknowledgement would have to cross. A session
+    /// already waiting on its own Logout is simply torn down.
+    async fn close_on_garbled_limit(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        reason: String,
+    ) -> SessionClosed {
+        tracing::warn!(session = %self.session_id, reason = %reason, "closing the session");
+        if matches!(phase, Phase::Active(_)) {
+            let logout = self.factory.logout(Some(&reason));
+            let _ = self.send(framed, logout).await;
+        }
         teardown(phase);
         closed(reason, false)
     }
@@ -1947,6 +2086,7 @@ where
     let (closed_tx, closed_rx) = watch::channel(false);
     let (app_tx, app_rx) = mpsc::channel(app_queue_capacity);
     let (reject_tx, reject_rx) = mpsc::channel(app_queue_capacity);
+    let garbled = config.garbled_frame_limit.map(GarbledFrameWindow::new);
 
     // The dispatcher stops when the reactor drops `app_tx`, which `run_reactor`
     // does on every exit path.
@@ -1969,6 +2109,7 @@ where
         resend,
         write_timeout,
         app_tx,
+        garbled,
     };
     reactor.sync_sequences();
 
