@@ -87,4 +87,6 @@ pub use schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef,
     MessageCategory, MessageDef, UnknownFieldType, Version,
 };
-pub use validator::{MAX_SCOPE_DEPTH, MAX_SCOPE_NODES, ValidationError, Validator};
+pub use validator::{
+    MAX_SCOPE_DEPTH, MAX_SCOPE_NODES, MAX_VALIDATION_ERRORS, ValidationError, Validator,
+};

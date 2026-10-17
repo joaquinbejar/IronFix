@@ -56,10 +56,30 @@
 //!   would look it up in the application dictionary.
 //! - **Every error is returned.** QuickFIX stops at the first rejection
 //!   (an unsupported `BeginString` included); [`Validator::validate`]
-//!   collects all of them.
+//!   collects all of them, up to [`MAX_VALIDATION_ERRORS`].
 //! - **Field order is not enforced.** QuickFIX rejects a header field after
 //!   the body or a body field after the trailer ("tag specified out of
 //!   required order"); this validator does not check position.
+//! - **Group entries are checked more strictly.** QuickFIX (C++ and Java,
+//!   `addXMLGroup`) enforces an entry's required fields only when the group
+//!   itself is `required='Y'`, and QuickFIX C++ ignores the required fields
+//!   of components referenced inside a group. This validator applies the FIX
+//!   rule instead: a required member is required in every entry of every
+//!   group instance present, required group or not, components included.
+//!   A message a QuickFIX counterparty accepts can therefore be rejected
+//!   here, for example FIX 4.4 `PosUndInstrmtGrp` / `NoUnderlyings(711)`
+//!   entries without `UnderlyingSettlPrice(732)`, FIX 4.2 Allocation
+//!   `NoAllocs(78)` entries without `AllocShares(80)`, and in FIX 5.0 SP2 the
+//!   ten optional groups (fifteen group definitions) that declare required
+//!   fields directly, `NoOrders(73)` and `NoSides(552)` among them.
+//! - **Structural errors come first.** QuickFIX checks required fields, per
+//!   entry included, before group counts, so for a message with both
+//!   problems it rejects with `SessionRejectReason(373)=1` (required tag
+//!   missing); this validator reports the group's structural error and
+//!   suppresses that group's per-entry errors.
+//! - **Missing tags are reported in dictionary order.** QuickFIX reports the
+//!   lowest missing tag number first; this validator reports them in the
+//!   order the dictionary declares them (see the error order below).
 //!
 //! # How groups are checked
 //!
@@ -77,8 +97,10 @@
 //! Every entry of a group instance is also checked for its required
 //! members, reported as [`ValidationError::MissingRequiredFieldInGroupEntry`]
 //! with the entry's **0-based** index (the first entry after the count field
-//! is entry `0`). An entry's required set is computed from the dictionary the
-//! way QuickFIX computes a group's required set:
+//! is entry `0`). An entry's required set is what the dictionary marks
+//! required, applied per the FIX rule that a required member is required in
+//! every entry of every group instance present, whether or not the group
+//! itself is required (stricter than QuickFIX, see above):
 //!
 //! - every member field marked `required='Y'`;
 //! - every nested group marked `required='Y'`, reported with the nested
@@ -86,19 +108,38 @@
 //!   entry by entry in turn, within the existing [`MAX_SCOPE_DEPTH`] bound;
 //! - the required members of a component referenced as `required='Y'`, at
 //!   any depth of component nesting. The required members of a component
-//!   referenced as `required='N'` are **not** enforced, even when another
-//!   member of that component appears in the entry.
+//!   referenced as `required='N'`, nested groups included, are **not**
+//!   enforced, even when another member of that component appears in the
+//!   entry.
 //!
-//! The delimiter is never reported missing, since it is what opens an entry.
-//! A group instance that is already malformed (a delimiter mismatch, a tag
-//! repeated within an entry, an unparseable count, or a count that does not
-//! match the entries found) gets no per-entry errors, its nested groups'
-//! included: its entry boundaries cannot be trusted, and it already carries a
-//! structural error. A count of `0` with no entries checks nothing.
+//! A tag required more than once (directly and through a component) is
+//! reported once per entry. The delimiter is never reported missing, since it
+//! is what opens an entry; when the delimiter is itself a nested group's
+//! count tag, that nested group counts as present. A group instance with a
+//! structural error (a delimiter mismatch, a tag repeated within an entry, an
+//! unparseable count, or a count that does not match the entries found) gets
+//! no per-entry errors, its nested groups' included: the group already
+//! carries a structural error. A malformed *nested* group suppresses only its
+//! own per-entry errors, not those of the entry that encloses it. A count of
+//! `0` with no entries checks nothing.
+//!
+//! Error order: within an entry, missing fields in dictionary order, then
+//! missing nested groups by count tag; across entries, in the order entries
+//! close, so a nested group's entries come before the entry that encloses
+//! them. All per-entry errors follow the message's structural errors.
 //!
 //! **Behaviour change.** Before per-entry checking existed, a message whose
 //! group entries lacked required members validated; it is now rejected, so
-//! validation is stricter than it was.
+//! validation is stricter than it was, and stricter than QuickFIX: a message
+//! a QuickFIX counterparty accepts can be rejected here (see "Differences
+//! from QuickFIX").
+//!
+//! # Bounded output
+//!
+//! A single call collects at most [`MAX_VALIDATION_ERRORS`] errors. When the
+//! limit is reached, collection stops and a final
+//! [`ValidationError::ErrorLimitReached`] is appended, so a hostile message
+//! cannot turn validation into an allocation proportional to its size.
 //!
 //! Notes:
 //! - `CheckSum(10)` presence is not re-checked: the tag-value decoder
@@ -126,6 +167,16 @@ pub const MAX_SCOPE_DEPTH: usize = 32;
 /// Bounds the total work of expanding a pathological schema, independently of
 /// [`MAX_SCOPE_DEPTH`].
 pub const MAX_SCOPE_NODES: usize = 4096;
+
+/// Maximum number of errors one [`Validator::validate`] call collects.
+///
+/// Past this many, collection stops and the list ends with
+/// [`ValidationError::ErrorLimitReached`]. Without a cap, a hostile message
+/// within the codec's default 1 MiB frame limit can fail a check on almost
+/// every field: a ListStatus (35=N) of 200,000 one-field `NoOrders` entries
+/// yields a million per-entry errors. 1024 still lists every problem of any
+/// realistic message, while a reject or a log line needs only the first few.
+pub const MAX_VALIDATION_ERRORS: usize = 1024;
 
 /// A single validation failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -293,8 +344,7 @@ pub enum ValidationError {
     ///
     /// Only a structurally sound group instance is checked entry by entry
     /// (its count matches the entries found and every entry is led by the
-    /// delimiter). A malformed group already carries a structural error, and
-    /// its entry boundaries cannot be trusted to attribute a missing field.
+    /// delimiter): a malformed group already carries a structural error.
     #[error("missing required field {name}({tag}) in entry {entry} of group {group}({count_tag})")]
     MissingRequiredFieldInGroupEntry {
         /// Count field tag (NumInGroup) of the group.
@@ -307,6 +357,16 @@ pub enum ValidationError {
         tag: u32,
         /// Name of the missing field or nested group.
         name: String,
+    },
+    /// The validation stopped collecting errors at [`MAX_VALIDATION_ERRORS`].
+    ///
+    /// When present it is the last element of the returned list, after at
+    /// most `limit` other errors; the message has further errors that were
+    /// not recorded.
+    #[error("validation stopped after {limit} errors; further errors were not recorded")]
+    ErrorLimitReached {
+        /// The error ceiling that was reached.
+        limit: usize,
     },
 }
 
@@ -470,12 +530,14 @@ impl<'d> ScopeBuilder<'d> {
     /// The group's component references resolve against `self.dict`.
     /// `required` and `collect_required` decide only whether the group itself
     /// must appear at `level`. The entry level always collects its members'
-    /// required flags, because they apply to every entry that is present:
+    /// required flags, because per the FIX rule they apply to every entry of
+    /// every group instance present, whether or not the group is required:
     /// required fields, nested groups marked required, and the required
     /// members of components referenced as required. The required members of
     /// a component referenced as *optional* are never collected, even when
-    /// some other member of that component appears in the entry, which is how
-    /// QuickFIX computes a group's required set too.
+    /// some other member of that component appears in the entry. This is
+    /// stricter than QuickFIX, which collects an entry's required fields only
+    /// for a required group, and (in C++) none from components inside a group.
     fn add_group(
         &mut self,
         level: &mut Level,
@@ -501,6 +563,13 @@ impl<'d> ScopeBuilder<'d> {
         for component in &group.components {
             self.add_component(&mut entry, component, true, depth + 1, path);
         }
+        // Each required tag is kept once, in its first (dictionary) position,
+        // so the per-entry check is linear in the required set. The delimiter
+        // is dropped: it opens every entry, so it can never be missing.
+        let mut unique: HashSet<u32> = HashSet::with_capacity(entry.required.len());
+        entry
+            .required
+            .retain(|(tag, _)| *tag != group.delimiter_tag && unique.insert(*tag));
 
         // A group already present at this level keeps its first expansion;
         // two groups sharing a count tag at one level is a schema defect,
@@ -690,20 +759,22 @@ impl<'d> Validator<'d> {
     /// * `msg` - The decoded message to validate
     ///
     /// # Errors
-    /// Returns every [`ValidationError`] found; `Ok(())` means the message
-    /// passed all checks.
+    /// Returns every [`ValidationError`] found, up to
+    /// [`MAX_VALIDATION_ERRORS`]; past that, collection stops and the list
+    /// ends with [`ValidationError::ErrorLimitReached`]. `Ok(())` means the
+    /// message passed all checks.
     pub fn validate(&self, msg: &RawMessage<'_>) -> Result<(), Vec<ValidationError>> {
         let fields: Vec<_> = msg.fields().collect();
+        let mut sink = ErrorSink::default();
 
         // A missing BeginString(8) is reported as a missing required header
         // field below; only a present, wrong value is a mismatch.
-        let mut errors = Vec::new();
         if let Some(expected) = self.begin_string
             && let Some(begin_string) = fields.iter().find(|field| field.tag == 8)
         {
             let found = String::from_utf8_lossy(begin_string.value);
             if found != expected {
-                errors.push(ValidationError::BeginStringMismatch {
+                sink.push(ValidationError::BeginStringMismatch {
                     expected: expected.to_string(),
                     found: found.into_owned(),
                 });
@@ -712,13 +783,15 @@ impl<'d> Validator<'d> {
 
         let msg_type = msg.msg_type().as_str().to_string();
         let Some((msg_def, body)) = self.resolve(&msg_type) else {
-            errors.push(ValidationError::UnknownMsgType { msg_type });
-            return Err(errors);
+            sink.push(ValidationError::UnknownMsgType { msg_type });
+            return sink.finish();
         };
 
         let (Scope { level, envelope }, scope_errors) =
             ScopeBuilder::expand(self.transport, body, msg_def);
-        errors.extend(scope_errors);
+        for error in scope_errors {
+            sink.push(error);
+        }
         let tags = TagResolver {
             transport: self.transport,
             body,
@@ -727,7 +800,7 @@ impl<'d> Validator<'d> {
 
         // Value-level checks apply wherever a field sits.
         for field in &fields {
-            check_value(&tags, field, &mut errors);
+            check_value(&tags, field, &mut sink);
         }
 
         // Structural walk over the message level. Per-entry errors of every
@@ -744,30 +817,30 @@ impl<'d> Validator<'d> {
                 continue;
             };
             if !seen.insert(tag) {
-                errors.push(ValidationError::DuplicateTag {
+                sink.push(ValidationError::DuplicateTag {
                     tag,
                     name: def.name.clone(),
                 });
             }
             if let Some(group) = level.groups.get(&tag) {
-                index = walk_group(&tags, &fields, index, group, &mut errors, &mut entry_errors);
+                index = walk_group(&tags, &fields, index, group, &mut sink, &mut entry_errors);
                 continue;
             }
             if !level.allowed.contains(&tag) {
-                errors.push(ValidationError::FieldNotAllowedForMessage {
+                sink.push(ValidationError::FieldNotAllowedForMessage {
                     tag,
                     msg_type: msg_type.clone(),
                 });
             }
             index += 1;
         }
-        errors.append(&mut entry_errors);
+        sink.accept(&mut entry_errors);
 
         // Required fields. CheckSum(10) is consumed by the decoder and never
         // appears among the parsed fields, so it is skipped here.
         for (tag, name) in &level.required {
             if *tag != 10 && !seen.contains(tag) {
-                errors.push(ValidationError::MissingRequiredField {
+                sink.push(ValidationError::MissingRequiredField {
                     tag: *tag,
                     name: name.clone(),
                 });
@@ -776,17 +849,86 @@ impl<'d> Validator<'d> {
 
         for group in level.groups.values() {
             if group.required && !seen.contains(&group.count_tag) {
-                errors.push(ValidationError::MissingRequiredGroup {
+                sink.push(ValidationError::MissingRequiredGroup {
                     count_tag: group.count_tag,
                     name: group.name.clone(),
                 });
             }
         }
 
-        if errors.is_empty() {
+        sink.finish()
+    }
+}
+
+/// Collects the errors of one [`Validator::validate`] call, up to
+/// [`MAX_VALIDATION_ERRORS`].
+///
+/// Per-entry errors wait in pending buffers until their group instance is
+/// known to be well-formed. They count against the limit while they wait, and
+/// give their room back if their group turns out malformed and they are
+/// dropped. Once an error has been refused, collection stops for good, so the
+/// result is a prefix of what an unbounded run would report.
+#[derive(Debug, Default)]
+struct ErrorSink {
+    /// Errors accepted into the result.
+    errors: Vec<ValidationError>,
+    /// Errors counted against the limit: accepted ones plus pending ones not
+    /// yet accepted or dropped.
+    held: usize,
+    /// Whether an error has been refused because the limit was reached.
+    truncated: bool,
+}
+
+impl ErrorSink {
+    /// Takes room for one more error, or records that the limit is reached.
+    fn reserve(&mut self) -> bool {
+        if self.truncated || self.held >= MAX_VALIDATION_ERRORS {
+            self.truncated = true;
+            return false;
+        }
+        self.held += 1;
+        true
+    }
+
+    /// Records an error directly in the result.
+    fn push(&mut self, error: ValidationError) {
+        if self.reserve() {
+            self.errors.push(error);
+        }
+    }
+
+    /// Records a per-entry error in a pending buffer.
+    fn hold(&mut self, pending: &mut Vec<ValidationError>, error: ValidationError) {
+        if self.reserve() {
+            pending.push(error);
+        }
+    }
+
+    /// Moves pending errors into the result; they already hold their room.
+    fn accept(&mut self, pending: &mut Vec<ValidationError>) {
+        self.errors.append(pending);
+    }
+
+    /// Drops pending errors and gives their room back.
+    fn release(&mut self, pending: Vec<ValidationError>) {
+        debug_assert!(self.held >= pending.len(), "pending errors were counted");
+        if let Some(held) = self.held.checked_sub(pending.len()) {
+            self.held = held;
+        }
+    }
+
+    /// Ends the call: `Ok` when nothing was found, otherwise the errors,
+    /// closed by [`ValidationError::ErrorLimitReached`] if any was refused.
+    fn finish(mut self) -> Result<(), Vec<ValidationError>> {
+        if self.truncated {
+            self.errors.push(ValidationError::ErrorLimitReached {
+                limit: MAX_VALIDATION_ERRORS,
+            });
+        }
+        if self.errors.is_empty() {
             Ok(())
         } else {
-            Err(errors)
+            Err(self.errors)
         }
     }
 }
@@ -796,7 +938,7 @@ impl<'d> Validator<'d> {
 fn check_value(
     tags: &TagResolver<'_, '_>,
     field: &ironfix_core::field::FieldRef<'_>,
-    errors: &mut Vec<ValidationError>,
+    errors: &mut ErrorSink,
 ) {
     let Some(def) = tags.field(field.tag) else {
         errors.push(ValidationError::UnknownTag { tag: field.tag });
@@ -835,14 +977,13 @@ fn check_value(
 /// Walks one group instance, starting at its count field.
 ///
 /// Structural errors (count, delimiter, a tag repeated inside an entry) go
-/// straight to `errors`. Per-entry errors, the required members missing from
-/// an entry of this group or of any group nested in it, are produced by
+/// straight to `sink`. Per-entry errors, the required members missing from an
+/// entry of this group or of any group nested in it, are produced by
 /// [`check_entry_required`] at every entry boundary and held back: they are
 /// appended to `entry_errors` only if this group instance turns out
 /// well-formed (every entry delimiter-led, no tag repeated within an entry,
 /// and the declared count equal to the entries found). Otherwise they are
-/// dropped, because the entry boundaries they would be attributed to cannot
-/// be trusted, and the group already carries its structural error.
+/// dropped, because the group already carries a structural error.
 ///
 /// Nothing here is sized from the declared count: entries are counted as
 /// they are found, so a count of `99999999999` costs no more than the fields
@@ -854,7 +995,7 @@ fn walk_group(
     fields: &[&ironfix_core::field::FieldRef<'_>],
     index: usize,
     group: &GroupNode,
-    errors: &mut Vec<ValidationError>,
+    sink: &mut ErrorSink,
     entry_errors: &mut Vec<ValidationError>,
 ) -> usize {
     let Some(count_field) = fields.get(index) else {
@@ -864,7 +1005,7 @@ fn walk_group(
     let declared = match count_value.parse::<u64>() {
         Ok(declared) => Some(declared),
         Err(_) => {
-            errors.push(ValidationError::InvalidGroupCount {
+            sink.push(ValidationError::InvalidGroupCount {
                 tag: group.count_tag,
                 name: group.name.clone(),
                 value: count_value.into_owned(),
@@ -888,7 +1029,9 @@ fn walk_group(
             // The delimiter closes the entry in progress, if any, and opens
             // the next one.
             if let Some(closed) = entries.checked_sub(1) {
-                check_entry_required(group, closed, &seen_in_entry, &mut pending);
+                check_entry_required(group, closed, &seen_in_entry, &mut |error| {
+                    sink.hold(&mut pending, error);
+                });
             }
             entries = next;
             seen_in_entry.clear();
@@ -901,7 +1044,7 @@ fn walk_group(
             // as seen above, so a required nested group that is the delimiter
             // counts as present in the entry it opens.
             cursor = match group.entry.groups.get(&tag) {
-                Some(nested) => walk_group(tags, fields, cursor, nested, errors, &mut pending),
+                Some(nested) => walk_group(tags, fields, cursor, nested, sink, &mut pending),
                 None => cursor + 1,
             };
             continue;
@@ -915,7 +1058,7 @@ fn walk_group(
             // Members appear before any delimiter, so the first entry is
             // not delimiter-led and the group cannot be split into
             // entries unambiguously.
-            errors.push(ValidationError::GroupDelimiterMismatch {
+            sink.push(ValidationError::GroupDelimiterMismatch {
                 count_tag: group.count_tag,
                 name: group.name.clone(),
                 expected: group.delimiter_tag,
@@ -926,7 +1069,7 @@ fn walk_group(
             seen_in_entry.clear();
         }
         if !seen_in_entry.insert(tag) {
-            errors.push(ValidationError::RepeatedTagInGroupEntry {
+            sink.push(ValidationError::RepeatedTagInGroupEntry {
                 count_tag: group.count_tag,
                 group: group.name.clone(),
                 tag,
@@ -938,22 +1081,25 @@ fn walk_group(
         }
         cursor = match group.entry.groups.get(&tag) {
             // A nested group's per-entry errors join this group's pending
-            // ones, so they are dropped too if this group is malformed.
-            Some(nested) => walk_group(tags, fields, cursor, nested, errors, &mut pending),
+            // ones, so they are dropped too if this group is malformed. A
+            // malformed nested group drops only its own.
+            Some(nested) => walk_group(tags, fields, cursor, nested, sink, &mut pending),
             None => cursor + 1,
         };
     }
 
     // The run has ended: close the last entry, if one was opened.
     if let Some(closed) = entries.checked_sub(1) {
-        check_entry_required(group, closed, &seen_in_entry, &mut pending);
+        check_entry_required(group, closed, &seen_in_entry, &mut |error| {
+            sink.hold(&mut pending, error);
+        });
     }
 
     if let Some(declared) = declared
         && !unparseable
         && declared != entries
     {
-        errors.push(ValidationError::GroupCountMismatch {
+        sink.push(ValidationError::GroupCountMismatch {
             count_tag: group.count_tag,
             name: group.name.clone(),
             declared,
@@ -964,30 +1110,33 @@ fn walk_group(
 
     if !unparseable && declared == Some(entries) {
         entry_errors.append(&mut pending);
+    } else {
+        sink.release(pending);
     }
 
     cursor
 }
 
-/// End-of-entry hook: reports the required members missing from one closed
-/// entry of `group`.
+/// End-of-entry hook: reports, through `report`, the required members
+/// missing from one closed entry of `group`.
 ///
 /// `entry` is the closed entry's 0-based index and `seen` the tags that
 /// appeared in it at its own level (a nested group's count tag included, its
 /// members not). Reported, in this order: every required field of the entry
-/// level (fields of the group itself and of components referenced as
-/// required), then every nested group marked required whose count tag is
-/// absent, by ascending count tag. The delimiter is never reported: an entry
-/// is only ever opened by it.
+/// level in dictionary order (fields of the group itself and of components
+/// referenced as required, each tag once, the delimiter excluded when the
+/// scope was built), then every nested group marked required whose count tag
+/// is absent, by ascending count tag.
 ///
 /// [`walk_group`] calls this at every entry boundary. It is kept apart from
-/// the walk so that another reader of group entries can apply the same check
+/// the walk, and reports through a callback rather than into a collector of
+/// its own, so that another reader of group entries can apply the same check
 /// at its own entry boundaries.
 fn check_entry_required(
     group: &GroupNode,
     entry: u64,
     seen: &HashSet<u32>,
-    out: &mut Vec<ValidationError>,
+    report: &mut dyn FnMut(ValidationError),
 ) {
     let missing = |tag: u32, name: &str| ValidationError::MissingRequiredFieldInGroupEntry {
         count_tag: group.count_tag,
@@ -997,15 +1146,10 @@ fn check_entry_required(
         name: name.to_string(),
     };
 
-    // The same tag can be required twice (directly and through a component);
-    // it is reported once.
-    let mut reported: Vec<u32> = Vec::new();
     for (tag, name) in &group.entry.required {
-        if *tag == group.delimiter_tag || seen.contains(tag) || reported.contains(tag) {
-            continue;
+        if !seen.contains(tag) {
+            report(missing(*tag, name));
         }
-        reported.push(*tag);
-        out.push(missing(*tag, name));
     }
 
     let mut absent: Vec<&GroupNode> = group
@@ -1016,7 +1160,7 @@ fn check_entry_required(
         .collect();
     absent.sort_by_key(|nested| nested.count_tag);
     for nested in absent {
-        out.push(missing(nested.count_tag, &nested.name));
+        report(missing(nested.count_tag, &nested.name));
     }
 }
 
@@ -2664,6 +2808,15 @@ mod tests {
                     <field name='OuterField' required='N'/>
                 </group>
             </message>
+            <message name='Led' msgtype='U8' msgcat='app'>
+                <group name='NoLed' required='N'>
+                    <group name='NoLead' required='Y'>
+                        <field name='LeadKey' required='Y'/>
+                        <field name='LeadReq' required='Y'/>
+                    </group>
+                    <field name='LedReq' required='Y'/>
+                </group>
+            </message>
         </messages>
         <components>
             <component name='Lead'>
@@ -2680,8 +2833,13 @@ mod tests {
             <field number='100' name='NoOuter' type='NUMINGROUP'/>
             <field number='110' name='NoInner' type='NUMINGROUP'/>
             <field number='120' name='NoWrapped' type='NUMINGROUP'/>
+            <field number='140' name='NoLed' type='NUMINGROUP'/>
+            <field number='150' name='NoLead' type='NUMINGROUP'/>
             <field number='201' name='OuterField' type='STRING'/>
             <field number='210' name='InnerKey' type='STRING'/>
+            <field number='250' name='LeadKey' type='STRING'/>
+            <field number='251' name='LeadReq' type='STRING'/>
+            <field number='252' name='LedReq' type='STRING'/>
         </fields>
     </fix>";
 
@@ -2792,9 +2950,11 @@ mod tests {
     }
 
     // The issue suggests NewOrderSingle with NoPartyIDs missing PartyID, but
-    // every member of NoPartyIDs is optional in the vendored FIX44.xml
-    // (`Parties`, lines 2508-2514), so no NoPartyIDs entry can fail this
-    // check. NewOrderList (35=E) is the real case: its NoOrders(73) entries
+    // no NoPartyIDs entry can fail this check, for two reasons. Every member
+    // of NoPartyIDs is optional in the vendored FIX44.xml (`Parties`, lines
+    // 2508-2514). And PartyID(448) is the group's delimiter: an entry without
+    // it is a GroupDelimiterMismatch, and the delimiter is never reported
+    // missing. NewOrderList (35=E) is the real case: its NoOrders(73) entries
     // (`ListOrdGrp`, FIX44.xml lines 2943-2981) require ClOrdID(11), which is
     // also the delimiter, ListSeqNo(67) and Side(54).
 
@@ -2973,7 +3133,11 @@ mod tests {
     #[test]
     fn test_validate_for_session_group_entry_missing_required_field_is_reported() {
         // FIX 5.0 SP2 NoOrders entries require ListSeqNo(67) as well; the
-        // body is answered by FIX 5.0 SP2 under a FIXT 1.1 header.
+        // body is answered by FIX 5.0 SP2 under a FIXT 1.1 header. NoOrders
+        // is required='N' in FIX50SP2.xml, so QuickFIX, which enforces entry
+        // fields only for a required group, would not raise this; IronFix
+        // applies the FIX rule (a required member is required in every entry
+        // of a present group).
         let mut fields = fixt11_header("35=E");
         fields.extend([
             "1128=9",
@@ -3011,15 +3175,17 @@ mod tests {
     /// for. Message `U5` carries the optional group NoOuter(100), delimited by
     /// OuterKey(200). Each entry requires:
     ///
-    /// - OuterReq(201) directly;
+    /// - OuterReq(201) directly, and again through `ReqBlock` (so it must be
+    ///   reported once);
     /// - ReqField(300), through the component `ReqBlock`, referenced as
     ///   required;
     /// - the nested group NoReqNested(120), delimited by NestedKey(220),
     ///   itself marked required.
     ///
     /// It may also carry the component `OptBlock`, referenced as optional,
-    /// whose OptReq(301) is required inside it and OptOther(302) is not, and
-    /// the optional nested group NoInner(110), delimited by InnerKey(210),
+    /// whose OptReq(301) and nested group NoOptNested(130) (delimited by
+    /// OptNestedKey(230)) are required inside it and OptOther(302) is not,
+    /// and the optional nested group NoInner(110), delimited by InnerKey(210),
     /// whose entries require InnerReq(211).
     fn dialect_with_group_entry_rules() -> Dictionary {
         let mut dict = dialect_with_optional_component();
@@ -3027,11 +3193,13 @@ mod tests {
             (100, "NoOuter", FieldType::NumInGroup),
             (110, "NoInner", FieldType::NumInGroup),
             (120, "NoReqNested", FieldType::NumInGroup),
+            (130, "NoOptNested", FieldType::NumInGroup),
             (200, "OuterKey", FieldType::String),
             (201, "OuterReq", FieldType::String),
             (210, "InnerKey", FieldType::String),
             (211, "InnerReq", FieldType::String),
             (220, "NestedKey", FieldType::String),
+            (230, "OptNestedKey", FieldType::String),
             (300, "ReqField", FieldType::String),
             (301, "OptReq", FieldType::String),
             (302, "OptOther", FieldType::String),
@@ -3045,7 +3213,10 @@ mod tests {
         };
         dict.add_component(ComponentDef {
             name: "ReqBlock".to_string(),
-            fields: vec![field_ref(300, "ReqField", true)],
+            fields: vec![
+                field_ref(300, "ReqField", true),
+                field_ref(201, "OuterReq", true),
+            ],
             groups: Vec::new(),
             components: Vec::new(),
         });
@@ -3055,7 +3226,15 @@ mod tests {
                 field_ref(301, "OptReq", true),
                 field_ref(302, "OptOther", false),
             ],
-            groups: Vec::new(),
+            groups: vec![GroupDef {
+                count_tag: 130,
+                name: "NoOptNested".to_string(),
+                delimiter_tag: 230,
+                fields: vec![field_ref(230, "OptNestedKey", true)],
+                groups: Vec::new(),
+                components: Vec::new(),
+                required: true,
+            }],
             components: Vec::new(),
         });
         let inner = GroupDef {
@@ -3159,7 +3338,7 @@ mod tests {
     fn test_validate_group_entry_optional_component_is_not_enforced() {
         // OptBlock is referenced as optional: its OptReq(301) is not
         // required, whether OptBlock is absent or partly present (OptOther
-        // without OptReq), as in QuickFIX.
+        // without OptReq). QuickFIX does not enforce it either.
         assert_eq!(
             validate_u5(&["100=1", "200=A", "201=x", "300=y", "120=1", "220=k"]),
             Ok(())
@@ -3228,6 +3407,151 @@ mod tests {
                 tag: 201,
                 name: "OuterReq".to_string(),
             }])
+        );
+    }
+
+    // --- Review follow-ups for #74 -------------------------------------------
+
+    #[test]
+    fn test_validate_required_nested_group_in_optional_component_is_not_reported() {
+        // NoOptNested(130) is required inside OptBlock, but OptBlock is
+        // referenced as optional, so the entry does not need it.
+        assert_eq!(
+            validate_u5(&[
+                "100=1", "200=A", "201=x", "300=y", "301=o", "120=1", "220=k"
+            ]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_malformed_nested_group_keeps_its_enclosing_entry_errors() {
+        // NoInner(110) declares two entries and carries one, a structural
+        // error of its own; the enclosing NoOuter entry, which lacks
+        // ReqField(300), is still checked and reported.
+        assert_eq!(
+            validate_u5(&[
+                "100=1", "200=A", "201=x", "110=2", "210=a", "211=b", "120=1", "220=k",
+            ]),
+            Err(vec![
+                ValidationError::GroupCountMismatch {
+                    count_tag: 110,
+                    name: "NoInner".to_string(),
+                    declared: 2,
+                    actual: 1,
+                    delimiter_tag: 210,
+                },
+                entry_missing(100, "NoOuter", 0, 300, "ReqField"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_validate_tag_required_directly_and_through_a_component_is_reported_once() {
+        // OuterReq(201) is required by NoOuter itself and again by ReqBlock;
+        // an entry lacking it reports it once, in dictionary order before
+        // ReqField(300).
+        assert_eq!(
+            validate_u5(&["100=1", "200=A", "120=1", "220=k"]),
+            Err(vec![
+                entry_missing(100, "NoOuter", 0, 201, "OuterReq"),
+                entry_missing(100, "NoOuter", 0, 300, "ReqField"),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_validate_required_nested_group_that_is_the_delimiter_counts_as_present() {
+        // NoLed(140) entries open with the required nested group NoLead(150),
+        // so 150 is NoLed's delimiter. It is never reported missing, and the
+        // nested entries are still checked: a nested entry's error comes
+        // before its enclosing entry's (entries are reported as they close).
+        assert_eq!(
+            validate_nested_delimiter("35=U8", &["140=1", "150=1", "250=a", "251=b", "252=c"]),
+            Ok(())
+        );
+        assert_eq!(
+            validate_nested_delimiter(
+                "35=U8",
+                &[
+                    "140=2", "150=1", "250=a", "251=b", "252=c", "150=1", "250=d"
+                ],
+            ),
+            Err(vec![
+                ValidationError::MissingRequiredFieldInGroupEntry {
+                    count_tag: 150,
+                    group: "NoLead".to_string(),
+                    entry: 0,
+                    tag: 251,
+                    name: "LeadReq".to_string(),
+                },
+                ValidationError::MissingRequiredFieldInGroupEntry {
+                    count_tag: 140,
+                    group: "NoLed".to_string(),
+                    entry: 1,
+                    tag: 252,
+                    name: "LedReq".to_string(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn test_validate_hostile_list_status_stops_at_the_error_limit() {
+        // A ListStatus (35=N) of 200,000 NoOrders(73) entries carrying only
+        // the delimiter ClOrdID(11), about 1 MB: the default FixCodec frame
+        // limit. Each entry lacks five required members (14, 39, 151, 84, 6),
+        // a million errors uncapped; the report stops at the limit.
+        let mut body: Vec<&str> = vec![
+            "66=LIST-1",
+            "429=1",
+            "82=1",
+            "431=1",
+            "83=1",
+            "68=200000",
+            "73=200000",
+        ];
+        body.extend(std::iter::repeat_n("11=a", 200_000));
+        let found = errors(validate(&fix44_message("35=N", &body)));
+
+        assert_eq!(found.len(), MAX_VALIDATION_ERRORS + 1);
+        assert_eq!(
+            found.last(),
+            Some(&ValidationError::ErrorLimitReached {
+                limit: MAX_VALIDATION_ERRORS,
+            })
+        );
+        assert_eq!(found.first(), Some(&no_orders_missing(0, 14, "CumQty")));
+        assert!(
+            found
+                .iter()
+                .take(MAX_VALIDATION_ERRORS)
+                .all(|error| matches!(
+                    error,
+                    ValidationError::MissingRequiredFieldInGroupEntry { count_tag: 73, .. }
+                ))
+        );
+    }
+
+    #[test]
+    fn test_validate_below_the_error_limit_reports_no_limit_marker() {
+        // Twenty entries, five missing members each: well under the limit.
+        let mut body: Vec<&str> = vec![
+            "66=LIST-1",
+            "429=1",
+            "82=1",
+            "431=1",
+            "83=1",
+            "68=20",
+            "73=20",
+        ];
+        body.extend(std::iter::repeat_n("11=a", 20));
+        let found = errors(validate(&fix44_message("35=N", &body)));
+        assert_eq!(found.len(), 100);
+        assert!(
+            !found
+                .iter()
+                .any(|error| matches!(error, ValidationError::ErrorLimitReached { .. }))
         );
     }
 }
