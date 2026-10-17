@@ -22,6 +22,9 @@
 //! - `ironfix-engine`, before it dials, so an out-of-range knob assembled by
 //!   hand through the public fields still cannot reach the wire.
 //!
+//! [`GarbledFrameLimit`] goes one step further and is valid by construction,
+//! like [`CompId`]: [`GarbledFrameLimit::try_new`] is its only constructor.
+//!
 //! # Ranges
 //!
 //! | Knob | Unit | Range | Default |
@@ -31,6 +34,7 @@
 //! | `heartbeat_interval` | whole seconds | 0 (disabled) or [`MIN_HEARTBEAT_INTERVAL_SECS`]..=[`MAX_HEARTBEAT_INTERVAL_SECS`] | 30 s |
 //! | `logon_timeout` / `logout_timeout` | duration | non-zero, at most [`MAX_TIMEOUT`] | 10 s |
 //! | `max_message_size` | bytes | [`MIN_MESSAGE_SIZE_LIMIT`]..=[`MAX_MESSAGE_SIZE_LIMIT`] | 1 MiB |
+//! | `garbled_frame_limit` | frames within a duration | unset, or 1..=[`MAX_GARBLED_FRAME_LIMIT`] frames within a non-zero window of at most [`MAX_GARBLED_FRAME_WINDOW`] | unset |
 //! | `sender_sub_id` / `target_sub_id` | ASCII | unset, or 1..=[`MAX_ID_LEN`] bytes, printable ASCII except `=` | unset |
 //! | `sender_location_id` / `target_location_id` | ASCII | as above | unset |
 //! | `reset_on_*`, `validate_*` | flag | any | see [`SessionConfig::new`] |
@@ -98,6 +102,19 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `max_message_size` used when the builder is not told otherwise (1 MiB).
 const DEFAULT_MESSAGE_SIZE_LIMIT: usize = 1024 * 1024;
+
+/// Largest number of garbled frames a [`GarbledFrameLimit`] may allow within
+/// its window.
+///
+/// The engine remembers when each garbled frame in the window arrived, so this
+/// is also a per-session memory ceiling (1024 timestamps). It is far above any
+/// bound worth configuring: a link that garbles a thousand frames inside one
+/// window is not one a session should stay on.
+pub const MAX_GARBLED_FRAME_LIMIT: u32 = 1024;
+
+/// Longest window a [`GarbledFrameLimit`] may count garbled frames over (24
+/// hours, one trading day).
+pub const MAX_GARBLED_FRAME_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Reason a session configuration cannot be used.
 ///
@@ -201,6 +218,103 @@ pub enum SessionConfigError {
         /// The largest limit accepted, in bytes.
         max: usize,
     },
+
+    /// A [`GarbledFrameLimit`] is outside its supported range.
+    #[error(
+        "garbled_frame_limit of {max} frames within {window:?} is outside the supported range (1..={max_frames} frames within a non-zero window of at most {max_window:?})"
+    )]
+    GarbledFrameLimitOutOfRange {
+        /// The configured number of garbled frames.
+        max: u32,
+        /// The configured window.
+        window: Duration,
+        /// The largest number of frames accepted, [`MAX_GARBLED_FRAME_LIMIT`].
+        max_frames: u32,
+        /// The longest window accepted, [`MAX_GARBLED_FRAME_WINDOW`].
+        max_window: Duration,
+    },
+}
+
+/// Bound on garbled inbound frames: the session is closed once
+/// [`GarbledFrameLimit::max`] garbled frames arrive within any
+/// [`GarbledFrameLimit::window`].
+///
+/// FIX ignores a garbled message, meaning one whose BeginString (8), BodyLength
+/// (9) or CheckSum (10) cannot be trusted. It consumes no `MsgSeqNum` (34) and does not
+/// count as proof that the peer is alive, so the gap it leaves is recovered by
+/// the usual `ResendRequest` (2). The specification sets no limit on how many
+/// may be ignored. This bound is the opt-in limit: a link that keeps garbling
+/// frames while its valid traffic keeps the session alive is logged out rather
+/// than left to recover gap after gap.
+///
+/// Valid by construction: [`GarbledFrameLimit::try_new`] is the only
+/// constructor and enforces the range, so a configuration holding one never
+/// needs it re-checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GarbledFrameLimit {
+    /// Garbled frames tolerated within `window`, minus one: the frame that
+    /// reaches this count closes the session.
+    max: u32,
+    /// The sliding window the frames are counted over.
+    window: Duration,
+}
+
+impl GarbledFrameLimit {
+    /// Creates a bound of `max` garbled frames within `window`.
+    ///
+    /// The session closes on the garbled frame that brings the count inside
+    /// the window to `max`; `max = 1` therefore closes it on the first one.
+    ///
+    /// # Arguments
+    /// * `max` - Garbled frames, 1..=[`MAX_GARBLED_FRAME_LIMIT`]
+    /// * `window` - Wall-clock duration, non-zero and at most
+    ///   [`MAX_GARBLED_FRAME_WINDOW`]
+    ///
+    /// # Errors
+    /// [`SessionConfigError::GarbledFrameLimitOutOfRange`] when `max` or
+    /// `window` is outside its range.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironfix_session::config::GarbledFrameLimit;
+    /// use std::time::Duration;
+    ///
+    /// # fn main() -> Result<(), ironfix_session::SessionConfigError> {
+    /// let limit = GarbledFrameLimit::try_new(5, Duration::from_secs(60))?;
+    /// assert_eq!(limit.max(), 5);
+    /// assert!(GarbledFrameLimit::try_new(0, Duration::from_secs(60)).is_err());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn try_new(max: u32, window: Duration) -> Result<Self, SessionConfigError> {
+        if !(1..=MAX_GARBLED_FRAME_LIMIT).contains(&max)
+            || window.is_zero()
+            || window > MAX_GARBLED_FRAME_WINDOW
+        {
+            return Err(SessionConfigError::GarbledFrameLimitOutOfRange {
+                max,
+                window,
+                max_frames: MAX_GARBLED_FRAME_LIMIT,
+                max_window: MAX_GARBLED_FRAME_WINDOW,
+            });
+        }
+        Ok(Self { max, window })
+    }
+
+    /// Returns how many garbled frames within the window close the session,
+    /// 1..=[`MAX_GARBLED_FRAME_LIMIT`].
+    #[must_use]
+    pub const fn max(&self) -> u32 {
+        self.max
+    }
+
+    /// Returns the sliding window garbled frames are counted over: non-zero,
+    /// at most [`MAX_GARBLED_FRAME_WINDOW`].
+    #[must_use]
+    pub const fn window(&self) -> Duration {
+        self.window
+    }
 }
 
 /// Validates one identity string written verbatim into the standard header.
@@ -267,11 +381,17 @@ fn validate_heartbeat_interval(interval: Duration) -> Result<(), SessionConfigEr
 
 /// Configuration for a FIX session.
 ///
-/// Construct one with [`SessionConfigBuilder`], which validates every knob.
-/// The fields are public so a configuration can also be assembled or adjusted
-/// directly; [`SessionConfig::validate`] then says whether the result is
-/// usable, and `ironfix-engine` calls it before dialling.
+/// Construct one with [`SessionConfigBuilder`], which validates every knob, or
+/// start from [`SessionConfig::new`]. The fields are public so a configuration
+/// can be read and adjusted directly; [`SessionConfig::validate`] then says
+/// whether the result is usable, and `ironfix-engine` calls it before
+/// dialling.
+///
+/// The struct is `#[non_exhaustive]`: outside this crate it cannot be built
+/// with a struct literal, so a new knob can be added without breaking callers.
+/// Every field keeps its public read and write access.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SessionConfig {
     /// Sender CompID (tag 49).
     pub sender_comp_id: CompId,
@@ -350,6 +470,24 @@ pub struct SessionConfig {
     /// Read it through [`SessionConfig::resend_attempt_limit`], which applies
     /// the lower bound.
     pub max_resend_requests: u32,
+    /// Bound on garbled inbound frames, or `None` for no bound.
+    ///
+    /// A garbled frame (a wrong CheckSum (10), a BodyLength (9) that does not
+    /// match the frame, bytes before `8=`) is always ignored, as FIX requires:
+    /// it consumes no `MsgSeqNum` (34) and does not refresh the heartbeat
+    /// clock, and the gap it leaves is recovered by the usual `ResendRequest`
+    /// (2). With a bound, the session is logged out once
+    /// [`GarbledFrameLimit::max`] garbled frames arrive within
+    /// [`GarbledFrameLimit::window`]. Units and range: see
+    /// [`GarbledFrameLimit::try_new`]. Default: `None`.
+    ///
+    /// No bound is the default because the specification sets none, and the
+    /// heartbeat already bounds a peer that sends nothing but garbage: garbled
+    /// bytes are not proof of life, so such a peer is timed out by the
+    /// TestRequest cycle. The bound is for a link that garbles intermittently
+    /// while its valid traffic keeps the session alive, and for
+    /// `HeartBtInt = 0`, where there is no heartbeat to fall back on.
+    pub garbled_frame_limit: Option<GarbledFrameLimit>,
     /// Optional sender sub ID (tag 50), 1..=[`MAX_ID_LEN`] bytes when set.
     pub sender_sub_id: Option<String>,
     /// Optional target sub ID (tag 57), 1..=[`MAX_ID_LEN`] bytes when set.
@@ -396,6 +534,7 @@ impl SessionConfig {
             sending_time_tolerance: Duration::from_secs(120),
             resend_timeout: Duration::from_secs(10),
             max_resend_requests: 3,
+            garbled_frame_limit: None,
             sender_sub_id: None,
             target_sub_id: None,
             sender_location_id: None,
@@ -406,7 +545,9 @@ impl SessionConfig {
     /// Checks every knob against the ranges documented on the module.
     ///
     /// The CompIDs are not re-checked: [`CompId`] validates its charset and
-    /// length at construction, so an illegal one is unrepresentable.
+    /// length at construction, so an illegal one is unrepresentable. The same
+    /// holds for `garbled_frame_limit`: [`GarbledFrameLimit::try_new`] is the
+    /// only way to obtain one.
     ///
     /// [`Duration::ZERO`] passes as a heartbeat interval — it is the legal
     /// `HeartBtInt = 0`. Only [`SessionConfigBuilder`] requires that case to
@@ -537,6 +678,16 @@ impl SessionConfig {
         self
     }
 
+    /// Sets the bound on garbled inbound frames; `None` removes it.
+    ///
+    /// See [`SessionConfig::garbled_frame_limit`] for what the bound does and
+    /// why there is none by default.
+    #[must_use]
+    pub const fn with_garbled_frame_limit(mut self, limit: Option<GarbledFrameLimit>) -> Self {
+        self.garbled_frame_limit = limit;
+        self
+    }
+
     /// Returns the heartbeat interval as the whole seconds that go into
     /// `HeartBtInt` (108).
     ///
@@ -624,6 +775,8 @@ pub struct SessionConfigBuilder {
     logout_timeout: Duration,
     /// Validate inbound `CheckSum` (10).
     validate_checksum: bool,
+    /// Garbled-frame bound as given, `(max, window)`; checked by `build()`.
+    garbled_frame_limit: Option<(u32, Duration)>,
     /// Sender sub ID (tag 50).
     sender_sub_id: Option<String>,
     /// Target sub ID (tag 57).
@@ -648,6 +801,7 @@ impl Default for SessionConfigBuilder {
             logon_timeout: DEFAULT_TIMEOUT,
             logout_timeout: DEFAULT_TIMEOUT,
             validate_checksum: true,
+            garbled_frame_limit: None,
             sender_sub_id: None,
             target_sub_id: None,
             sender_location_id: None,
@@ -767,6 +921,20 @@ impl SessionConfigBuilder {
         self
     }
 
+    /// Closes the session once `max` garbled inbound frames arrive within
+    /// `window`.
+    ///
+    /// `max` is a frame count, 1..=[`MAX_GARBLED_FRAME_LIMIT`]; `window` is a
+    /// wall-clock duration, non-zero and at most [`MAX_GARBLED_FRAME_WINDOW`].
+    /// An out-of-range pair is refused by [`SessionConfigBuilder::build`]. See
+    /// [`SessionConfig::garbled_frame_limit`]; without this call there is no
+    /// bound.
+    #[must_use = "builders do nothing unless .build() is called"]
+    pub const fn garbled_frame_limit(mut self, max: u32, window: Duration) -> Self {
+        self.garbled_frame_limit = Some((max, window));
+        self
+    }
+
     /// Sets the sender sub ID (tag 50).
     ///
     /// 1..=[`MAX_ID_LEN`] bytes of printable ASCII except `=`.
@@ -807,10 +975,12 @@ impl SessionConfigBuilder {
     ///
     /// # Errors
     /// Returns [`SessionConfigError::MissingField`] if either CompID was never
-    /// set, and [`SessionConfigError::HeartbeatDisabledWithoutOptIn`] if
+    /// set, [`SessionConfigError::HeartbeatDisabledWithoutOptIn`] if
     /// [`SessionConfigBuilder::heartbeat_interval`] was given
     /// [`Duration::ZERO`] instead of calling
-    /// [`SessionConfigBuilder::disable_heartbeats`]. Everything else is the
+    /// [`SessionConfigBuilder::disable_heartbeats`], and
+    /// [`SessionConfigError::GarbledFrameLimitOutOfRange`] for an out-of-range
+    /// [`SessionConfigBuilder::garbled_frame_limit`]. Everything else is the
     /// first violation reported by [`SessionConfig::validate`].
     pub fn build(self) -> Result<SessionConfig, SessionConfigError> {
         let sender_comp_id = self
@@ -832,6 +1002,11 @@ impl SessionConfigBuilder {
             HeartbeatSetting::Interval(interval) => interval,
         };
 
+        let garbled_frame_limit = self
+            .garbled_frame_limit
+            .map(|(max, window)| GarbledFrameLimit::try_new(max, window))
+            .transpose()?;
+
         let config = SessionConfig {
             sender_comp_id,
             target_comp_id,
@@ -851,6 +1026,7 @@ impl SessionConfigBuilder {
             sending_time_tolerance: Duration::from_secs(120),
             resend_timeout: Duration::from_secs(10),
             max_resend_requests: 3,
+            garbled_frame_limit,
             sender_sub_id: self.sender_sub_id,
             target_sub_id: self.target_sub_id,
             sender_location_id: self.sender_location_id,
@@ -1359,5 +1535,109 @@ mod tests {
         assert_eq!(config.resend_timeout, Duration::from_millis(250));
         assert_eq!(config.resend_attempt_limit(), 7);
         assert_eq!(config.logout_timeout, Duration::from_secs(3));
+    }
+
+    // --- Garbled-frame limit -------------------------------------------------
+
+    /// The out-of-range error for a given `(max, window)`.
+    fn garbled_out_of_range(max: u32, window: Duration) -> SessionConfigError {
+        SessionConfigError::GarbledFrameLimitOutOfRange {
+            max,
+            window,
+            max_frames: MAX_GARBLED_FRAME_LIMIT,
+            max_window: MAX_GARBLED_FRAME_WINDOW,
+        }
+    }
+
+    #[test]
+    fn test_session_config_garbled_frame_limit_defaults_to_none() {
+        assert_eq!(config().garbled_frame_limit, None);
+        assert_eq!(built(required()).garbled_frame_limit, None);
+    }
+
+    #[test]
+    fn test_builder_garbled_frame_limit_lands_in_the_built_config() {
+        let config = built(required().garbled_frame_limit(5, Duration::from_secs(60)));
+        let Some(limit) = config.garbled_frame_limit else {
+            panic!("the limit must be set");
+        };
+        assert_eq!(limit.max(), 5);
+        assert_eq!(limit.window(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_build_with_zero_garbled_frames_is_rejected() {
+        let window = Duration::from_secs(60);
+        assert_eq!(
+            build_error(required().garbled_frame_limit(0, window)),
+            garbled_out_of_range(0, window)
+        );
+    }
+
+    #[test]
+    fn test_build_with_too_many_garbled_frames_is_rejected() {
+        let max = MAX_GARBLED_FRAME_LIMIT + 1;
+        let window = Duration::from_secs(60);
+        assert_eq!(
+            build_error(required().garbled_frame_limit(max, window)),
+            garbled_out_of_range(max, window)
+        );
+    }
+
+    #[test]
+    fn test_build_with_zero_garbled_window_is_rejected() {
+        assert_eq!(
+            build_error(required().garbled_frame_limit(3, Duration::ZERO)),
+            garbled_out_of_range(3, Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn test_build_with_excessive_garbled_window_is_rejected() {
+        let window = MAX_GARBLED_FRAME_WINDOW + Duration::from_nanos(1);
+        assert_eq!(
+            build_error(required().garbled_frame_limit(3, window)),
+            garbled_out_of_range(3, window)
+        );
+    }
+
+    #[test]
+    fn test_garbled_frame_limit_try_new_accepts_the_bounds() {
+        for (max, window) in [
+            (1, Duration::from_nanos(1)),
+            (MAX_GARBLED_FRAME_LIMIT, MAX_GARBLED_FRAME_WINDOW),
+        ] {
+            match GarbledFrameLimit::try_new(max, window) {
+                Ok(limit) => {
+                    assert_eq!(limit.max(), max);
+                    assert_eq!(limit.window(), window);
+                }
+                Err(err) => panic!("({max}, {window:?}) is in range: {err}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_garbled_frame_limit_try_new_rejects_out_of_range_values() {
+        assert_eq!(
+            GarbledFrameLimit::try_new(0, Duration::from_secs(1)),
+            Err(garbled_out_of_range(0, Duration::from_secs(1)))
+        );
+        assert_eq!(
+            GarbledFrameLimit::try_new(1, Duration::ZERO),
+            Err(garbled_out_of_range(1, Duration::ZERO))
+        );
+    }
+
+    #[test]
+    fn test_with_garbled_frame_limit_sets_and_clears_the_bound() {
+        let limit = match GarbledFrameLimit::try_new(2, Duration::from_secs(5)) {
+            Ok(limit) => limit,
+            Err(err) => panic!("limit must be valid: {err}"),
+        };
+        let set = config().with_garbled_frame_limit(Some(limit));
+        assert_eq!(set.garbled_frame_limit, Some(limit));
+        assert_eq!(set.validate(), Ok(()));
+        assert_eq!(set.with_garbled_frame_limit(None).garbled_frame_limit, None);
     }
 }

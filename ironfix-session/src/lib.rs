@@ -23,7 +23,9 @@
 //! - **Heartbeat handling**: [`HeartbeatManager`], `Instant`-based timing for
 //!   heartbeat and TestRequest deadlines and `HeartBtInt` negotiation
 //! - **Configuration**: [`SessionConfig`] and its validating
-//!   [`config::SessionConfigBuilder`]
+//!   [`config::SessionConfigBuilder`], including the opt-in
+//!   [`GarbledFrameLimit`] on garbled inbound frames (enforced by
+//!   `ironfix-engine`)
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
 //! progress". The actual `ResendRequest` / `SequenceReset` / gap-fill message
@@ -34,7 +36,7 @@ pub mod heartbeat;
 pub mod sequence;
 pub mod state;
 
-pub use config::{SessionConfig, SessionConfigBuilder, SessionConfigError};
+pub use config::{GarbledFrameLimit, SessionConfig, SessionConfigBuilder, SessionConfigError};
 pub use heartbeat::{
     HeartbeatIntervalError, HeartbeatManager, MAX_HEARTBEAT_INTERVAL_SECS, TestRequestOutcome,
     generate_test_req_id, negotiate_interval,
