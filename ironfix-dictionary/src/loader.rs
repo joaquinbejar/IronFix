@@ -7,11 +7,31 @@
 //! QuickFIX XML dictionary loader.
 //!
 //! This module parses QuickFIX-format XML specifications (e.g. `FIX44.xml`)
-//! into a [`Dictionary`], and exposes the embedded standard FIX 4.4
-//! dictionary via [`Dictionary::fix44`].
+//! into a [`Dictionary`], and exposes four embedded dictionaries, each
+//! vendored verbatim from QuickFIX (see `spec/README.md` for provenance and
+//! `spec/LICENSE-QUICKFIX` for the license):
 //!
-//! Venue-specific dialects can be loaded from their own QuickFIX XML files
-//! with [`Dictionary::from_quickfix_xml`].
+//! | Constructor | Vendored file | [`Version`] |
+//! |---|---|---|
+//! | [`Dictionary::fix42`] | `FIX42.xml` | [`Version::Fix42`] |
+//! | [`Dictionary::fix44`] | `FIX44.xml` | [`Version::Fix44`] |
+//! | [`Dictionary::fixt11`] | `FIXT11.xml` | [`Version::Fixt11`] |
+//! | [`Dictionary::fix50sp2`] | `FIX50SP2.xml` | [`Version::Fix50Sp2`] |
+//!
+//! `FIXT11.xml` is a *transport* dictionary (session header, trailer, and
+//! admin messages) and `FIX50SP2.xml` an *application* dictionary with an
+//! empty header and trailer; QuickFIX ships FIX 5.0 that way, and
+//! [`SessionDictionary`](crate::SessionDictionary) composes the two.
+//!
+//! Every other version (FIX 4.0, 4.1, 4.3, 5.0, 5.0 SP1), and any
+//! venue-specific dialect, is loaded from caller-supplied QuickFIX XML with
+//! [`Dictionary::from_quickfix_xml`].
+//!
+//! The QuickFIX Software License, Version 1.0, requires this
+//! acknowledgement wherever the embedded files are redistributed:
+//!
+//! > This product includes software developed by quickfixengine.org
+//! > (<http://www.quickfixengine.org/>).
 //!
 //! # Untrusted input
 //!
@@ -58,12 +78,45 @@ pub const MAX_COMPONENT_DEPTH: usize = 32;
 /// overflowing the stack.
 pub const MAX_NESTING_DEPTH: usize = 32;
 
-/// Embedded QuickFIX FIX 4.4 specification.
-///
-/// Source: <https://github.com/quickfix/quickfix/blob/master/spec/FIX44.xml>
+// Every embedded specification below is a byte-for-byte copy of
+// `spec/<FILE>` from quickfix/quickfix at commit
+// 386ce46e917ae494ab6e90b1be90fd421cdbe3f9; `spec/README.md` records each
+// file's SHA-256. Never edit them to make a test pass.
+
+/// Embedded QuickFIX FIX 4.2 specification (`spec/FIX42.xml`).
+const FIX42_XML: &str = include_str!("../spec/FIX42.xml");
+
+/// Embedded QuickFIX FIX 4.4 specification (`spec/FIX44.xml`).
 const FIX44_XML: &str = include_str!("../spec/FIX44.xml");
 
-static FIX44_DICT: OnceLock<Result<Dictionary, DictionaryError>> = OnceLock::new();
+/// Embedded QuickFIX FIXT 1.1 transport specification (`spec/FIXT11.xml`).
+const FIXT11_XML: &str = include_str!("../spec/FIXT11.xml");
+
+/// Embedded QuickFIX FIX 5.0 SP2 application specification
+/// (`spec/FIX50SP2.xml`).
+const FIX50SP2_XML: &str = include_str!("../spec/FIX50SP2.xml");
+
+/// Parse-once cache of one embedded specification.
+///
+/// The load result, error included, is cached: an embedded file that failed
+/// once would fail identically on every retry.
+type EmbeddedCell = OnceLock<Result<Dictionary, DictionaryError>>;
+
+static FIX42_DICT: EmbeddedCell = OnceLock::new();
+static FIX44_DICT: EmbeddedCell = OnceLock::new();
+static FIXT11_DICT: EmbeddedCell = OnceLock::new();
+static FIX50SP2_DICT: EmbeddedCell = OnceLock::new();
+
+/// Returns the dictionary cached in `cell`, parsing `xml` on first use.
+fn embedded(
+    cell: &'static EmbeddedCell,
+    xml: &str,
+) -> Result<&'static Dictionary, DictionaryError> {
+    match cell.get_or_init(|| load(xml)) {
+        Ok(dict) => Ok(dict),
+        Err(err) => Err(err.clone()),
+    }
+}
 
 /// The kind of definition a [`DictionaryError::DuplicateDefinition`] refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,29 +207,104 @@ pub enum DictionaryError {
         /// Name of the field that claimed it again.
         duplicate: String,
     },
+    /// A transport and an application dictionary cannot be composed into a
+    /// [`SessionDictionary`](crate::SessionDictionary).
+    ///
+    /// The transport side must be a FIXT.1.1 dictionary and the application
+    /// side a FIX 5.0 or later one (a version with an `ApplVerID`).
+    #[error(
+        "cannot compose a {transport} transport dictionary with a {application} application dictionary: the transport must be FIXT.1.1 and the application FIX 5.0 or later"
+    )]
+    IncompatibleComposition {
+        /// Version of the dictionary offered as the transport.
+        transport: Version,
+        /// Version of the dictionary offered as the application.
+        application: Version,
+    },
 }
 
 impl Dictionary {
-    /// Returns the embedded standard FIX 4.4 dictionary.
+    /// Returns the embedded standard FIX 4.2 dictionary.
     ///
-    /// The dictionary is parsed from the bundled QuickFIX `FIX44.xml`
-    /// specification on first use and cached for the lifetime of the
-    /// process.
-    ///
-    /// FIX 4.4 is the only embedded dictionary. Every other version has to be
-    /// supplied by the caller through [`Dictionary::from_quickfix_xml`].
+    /// Parsed from the vendored QuickFIX `FIX42.xml` on first use and cached
+    /// for the lifetime of the process; every call returns the same
+    /// instance.
     ///
     /// # Errors
     /// Returns [`DictionaryError`] if the bundled specification fails to
-    /// load. That cannot happen for an unmodified checkout — `cargo test`
-    /// loads it — so the result is a guarantee rather than a case callers
+    /// load. That cannot happen for an unmodified checkout (`cargo test`
+    /// loads it), so the result is a guarantee rather than a case callers
+    /// are expected to recover from; it exists so that the crate has no
+    /// panicking path at all.
+    pub fn fix42() -> Result<&'static Self, DictionaryError> {
+        embedded(&FIX42_DICT, FIX42_XML)
+    }
+
+    /// Returns the embedded standard FIX 4.4 dictionary.
+    ///
+    /// Parsed from the vendored QuickFIX `FIX44.xml` on first use and cached
+    /// for the lifetime of the process; every call returns the same
+    /// instance.
+    ///
+    /// # Errors
+    /// Returns [`DictionaryError`] if the bundled specification fails to
+    /// load. That cannot happen for an unmodified checkout (`cargo test`
+    /// loads it), so the result is a guarantee rather than a case callers
     /// are expected to recover from; it exists so that the crate has no
     /// panicking path at all.
     pub fn fix44() -> Result<&'static Self, DictionaryError> {
-        match FIX44_DICT.get_or_init(|| load(FIX44_XML)) {
-            Ok(dict) => Ok(dict),
-            Err(err) => Err(err.clone()),
-        }
+        embedded(&FIX44_DICT, FIX44_XML)
+    }
+
+    /// Returns the embedded FIXT 1.1 transport dictionary.
+    ///
+    /// Parsed from the vendored QuickFIX `FIXT11.xml` on first use and cached
+    /// for the lifetime of the process; every call returns the same
+    /// instance.
+    ///
+    /// This is a *transport* dictionary: it defines the FIXT.1.1 standard
+    /// header and trailer and the session-level (admin) messages, but no
+    /// application messages. Pair it with an application dictionary such as
+    /// [`Dictionary::fix50sp2`] through
+    /// [`SessionDictionary`](crate::SessionDictionary).
+    ///
+    /// The vendored file defines the `MsgTypeGrp` component (used by Logon)
+    /// with no members and does not define `NoMsgTypes(384)` at all, so the
+    /// validator reports a Logon carrying it as
+    /// [`ValidationError::UnknownTag`](crate::ValidationError::UnknownTag).
+    /// That is what the QuickFIX dictionary says; it is not patched here.
+    ///
+    /// # Errors
+    /// Returns [`DictionaryError`] if the bundled specification fails to
+    /// load. That cannot happen for an unmodified checkout (`cargo test`
+    /// loads it), so the result is a guarantee rather than a case callers
+    /// are expected to recover from; it exists so that the crate has no
+    /// panicking path at all.
+    pub fn fixt11() -> Result<&'static Self, DictionaryError> {
+        embedded(&FIXT11_DICT, FIXT11_XML)
+    }
+
+    /// Returns the embedded FIX 5.0 SP2 application dictionary.
+    ///
+    /// Parsed from the vendored QuickFIX `FIX50SP2.xml` on first use and
+    /// cached for the lifetime of the process; every call returns the same
+    /// instance.
+    ///
+    /// This is an *application* dictionary: its header and trailer are
+    /// empty and it defines no session-level messages, because FIX 5.0 runs
+    /// over a FIXT.1.1 session. Validating a complete message against it
+    /// alone therefore reports every header tag as not allowed; compose it
+    /// with [`Dictionary::fixt11`] through
+    /// [`SessionDictionary`](crate::SessionDictionary) instead.
+    ///
+    /// # Errors
+    /// Returns [`DictionaryError`] if the bundled specification fails to
+    /// load. That cannot happen for an unmodified checkout (`cargo test`
+    /// loads it), so the result is a guarantee rather than a case callers
+    /// are expected to recover from; it exists so that the crate has no
+    /// panicking path at all.
+    pub fn fix50sp2() -> Result<&'static Self, DictionaryError> {
+        embedded(&FIX50SP2_DICT, FIX50SP2_XML)
     }
 
     /// Loads a dictionary from a QuickFIX-format XML specification.
@@ -227,6 +355,48 @@ struct MessageIr {
     msg_type: String,
     category: MessageCategory,
     items: Vec<Item>,
+}
+
+impl MessageIr {
+    /// Builds a message from its element attributes and parsed members.
+    fn new(attrs: &HashMap<String, String>, items: Vec<Item>) -> Result<Self, DictionaryError> {
+        let category = if attrs.get("msgcat").map(String::as_str) == Some("admin") {
+            MessageCategory::Admin
+        } else {
+            MessageCategory::App
+        };
+        Ok(Self {
+            name: required_attr(attrs, "message", "name")?,
+            msg_type: required_attr(attrs, "message", "msgtype")?,
+            category,
+            items,
+        })
+    }
+}
+
+/// Component definitions collected from the `<components>` section, in
+/// declaration order.
+#[derive(Default)]
+struct ComponentIrs {
+    /// Members of each component, keyed by name.
+    items: HashMap<String, Vec<Item>>,
+    /// Component names in declaration order.
+    order: Vec<String>,
+}
+
+impl ComponentIrs {
+    /// Registers one component definition, rejecting a duplicate name.
+    fn define(&mut self, name: String, items: Vec<Item>) -> Result<(), DictionaryError> {
+        if self.items.contains_key(&name) {
+            return Err(DictionaryError::DuplicateDefinition {
+                kind: DefinitionKind::Component,
+                name,
+            });
+        }
+        self.order.push(name.clone());
+        self.items.insert(name, items);
+        Ok(())
+    }
 }
 
 fn xml_err(e: impl std::fmt::Display) -> DictionaryError {
@@ -664,8 +834,7 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
     let mut header_items: Vec<Item> = Vec::new();
     let mut trailer_items: Vec<Item> = Vec::new();
     let mut message_irs: Vec<MessageIr> = Vec::new();
-    let mut component_irs: HashMap<String, Vec<Item>> = HashMap::new();
-    let mut component_order: Vec<String> = Vec::new();
+    let mut component_defs = ComponentIrs::default();
     let mut field_defs: Vec<FieldDef> = Vec::new();
 
     loop {
@@ -676,32 +845,34 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
                 "trailer" => trailer_items = parse_items(&mut reader, "trailer", 1)?,
                 "message" => {
                     let attrs = attr_map(&e)?;
-                    let category = if attrs.get("msgcat").map(String::as_str) == Some("admin") {
-                        MessageCategory::Admin
-                    } else {
-                        MessageCategory::App
-                    };
-                    message_irs.push(MessageIr {
-                        name: required_attr(&attrs, "message", "name")?,
-                        msg_type: required_attr(&attrs, "message", "msgtype")?,
-                        category,
-                        items: parse_items(&mut reader, "message", 1)?,
-                    });
+                    let items = parse_items(&mut reader, "message", 1)?;
+                    message_irs.push(MessageIr::new(&attrs, items)?);
                 }
                 "component" => {
                     let attrs = attr_map(&e)?;
                     let name = required_attr(&attrs, "component", "name")?;
                     let items = parse_items(&mut reader, "component", 1)?;
-                    if component_irs.contains_key(&name) {
-                        return Err(DictionaryError::DuplicateDefinition {
-                            kind: DefinitionKind::Component,
-                            name,
-                        });
-                    }
-                    component_order.push(name.clone());
-                    component_irs.insert(name, items);
+                    component_defs.define(name, items)?;
                 }
                 "fields" => field_defs = parse_field_defs(&mut reader)?,
+                _ => {}
+            },
+            // A self-closing definition is a definition with no members, not
+            // an element to skip. QuickFIX writes them: `FIXT11.xml` defines
+            // `<component name='MsgTypeGrp' />` (referenced by Logon), and
+            // `FIXT11.xml` / `FIX44.xml` define
+            // `<message name='XMLnonFIX' msgtype='n' msgcat='admin' />`.
+            // Skipping the first made every reference to it a dangling
+            // `UnknownComponent`; skipping the second dropped a message the
+            // dictionary defines. Member references never reach this loop:
+            // `parse_items` consumes everything inside a message, component,
+            // group, header, or trailer.
+            Event::Empty(e) => match e.name().as_ref() {
+                "message" => message_irs.push(MessageIr::new(&attr_map(&e)?, Vec::new())?),
+                "component" => {
+                    let name = required_attr(&attr_map(&e)?, "component", "name")?;
+                    component_defs.define(name, Vec::new())?;
+                }
                 _ => {}
             },
             Event::Eof => break,
@@ -712,6 +883,10 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
     let version =
         version.ok_or_else(|| DictionaryError::Xml("missing root <fix> element".to_string()))?;
 
+    let ComponentIrs {
+        items: component_irs,
+        order: component_order,
+    } = component_defs;
     check_component_graph(&component_irs, &component_order)?;
 
     let mut dict = Dictionary::new(version);
@@ -835,6 +1010,243 @@ mod tests {
 
         // Cached: same instance on every call.
         assert!(std::ptr::eq(dict, fix44()));
+    }
+
+    /// One of the embedded-dictionary constructors.
+    type EmbeddedConstructor = fn() -> Result<&'static Dictionary, DictionaryError>;
+
+    #[test]
+    fn test_embedded_dictionaries_load_with_their_version_and_are_cached() {
+        let constructors: [(EmbeddedConstructor, Version); 4] = [
+            (Dictionary::fix42, Version::Fix42),
+            (Dictionary::fix44, Version::Fix44),
+            (Dictionary::fixt11, Version::Fixt11),
+            (Dictionary::fix50sp2, Version::Fix50Sp2),
+        ];
+        for (constructor, version) in constructors {
+            let first = ok(constructor(), "embedded dictionary loads");
+            assert_eq!(first.version, version);
+            // Parsed once: every call hands out the same instance.
+            let second = ok(constructor(), "embedded dictionary loads again");
+            assert!(std::ptr::eq(first, second), "{version} was parsed twice");
+        }
+    }
+
+    #[test]
+    fn test_embedded_dictionaries_are_distinct_instances() {
+        let all = [
+            ok(Dictionary::fix42(), "FIX 4.2 loads"),
+            ok(Dictionary::fix44(), "FIX 4.4 loads"),
+            ok(Dictionary::fixt11(), "FIXT 1.1 loads"),
+            ok(Dictionary::fix50sp2(), "FIX 5.0 SP2 loads"),
+        ];
+        for (index, dict) in all.iter().enumerate() {
+            for other in all.iter().skip(index + 1) {
+                assert!(!std::ptr::eq(*dict, *other));
+            }
+        }
+    }
+
+    #[test]
+    fn test_fix42_utcdate_field_loads_as_utc_date_only() {
+        // The vendored FIX 4.2 file declares MDEntryDate(272) `UTCDATE`, the
+        // FIX 4.2 spelling of UTCDateOnly.
+        let dict = ok(Dictionary::fix42(), "FIX 4.2 loads");
+        let def = some(dict.get_field(272), "MDEntryDate defined");
+        assert_eq!(def.name, "MDEntryDate");
+        assert_eq!(def.field_type, FieldType::UtcDateOnly);
+    }
+
+    #[test]
+    fn test_fix42_header_messages_and_group_count_fields() {
+        let dict = ok(Dictionary::fix42(), "FIX 4.2 loads");
+        assert!(dict.header.iter().any(|f| f.tag == 49 && f.required));
+        assert!(dict.trailer.iter().any(|f| f.tag == 10 && f.required));
+        let nos = some(dict.get_message("D"), "NewOrderSingle defined");
+        assert!(
+            nos.fields
+                .iter()
+                .any(|f| f.name == "HandlInst" && f.required)
+        );
+        let er = some(dict.get_message("8"), "ExecutionReport defined");
+        assert!(
+            er.fields
+                .iter()
+                .any(|f| f.name == "ExecTransType" && f.required)
+        );
+        // FIX 4.2 has no components; its groups hang off the message.
+        assert!(dict.components.is_empty());
+        let allocs = some(
+            nos.groups.iter().find(|g| g.name == "NoAllocs"),
+            "NoAllocs group on NewOrderSingle",
+        );
+        assert_eq!(allocs.count_tag, 78);
+        assert_eq!(allocs.delimiter_tag, 79);
+    }
+
+    #[test]
+    fn test_fix50sp2_xid_and_xidref_fields_load_as_string() {
+        let dict = ok(Dictionary::fix50sp2(), "FIX 5.0 SP2 loads");
+        for (tag, name) in [
+            (40039, "CashSettlTermXID"),
+            (41314, "UnderlyingProtectionTermXIDRef"),
+        ] {
+            let def = some(dict.get_field(tag), "XID-typed field defined");
+            assert_eq!(def.name, name);
+            assert_eq!(def.field_type, FieldType::String);
+        }
+    }
+
+    #[test]
+    fn test_fix50sp2_is_an_application_dictionary() {
+        // QuickFIX ships FIX 5.0 SP2 with an empty header and trailer and no
+        // session-level messages: those come from FIXT 1.1.
+        let dict = ok(Dictionary::fix50sp2(), "FIX 5.0 SP2 loads");
+        assert!(dict.header.is_empty());
+        assert!(dict.header_groups.is_empty());
+        assert!(dict.trailer.is_empty());
+        assert!(dict.trailer_groups.is_empty());
+        assert!(dict.messages().all(|m| m.category == MessageCategory::App));
+        let nos = some(dict.get_message("D"), "NewOrderSingle defined");
+        assert!(
+            nos.components
+                .iter()
+                .any(|c| c.name == "Instrument" && c.required)
+        );
+    }
+
+    #[test]
+    fn test_fixt11_is_a_transport_dictionary() {
+        let dict = ok(Dictionary::fixt11(), "FIXT 1.1 loads");
+        let appl_ver_id = some(
+            dict.header.iter().find(|f| f.name == "ApplVerID"),
+            "ApplVerID in the FIXT 1.1 header",
+        );
+        assert_eq!(appl_ver_id.tag, 1128);
+        assert!(!appl_ver_id.required);
+        assert!(dict.header_groups.iter().any(|g| g.count_tag == 627));
+        assert!(dict.trailer.iter().any(|f| f.tag == 10 && f.required));
+        // Only session-level messages.
+        assert!(
+            dict.messages()
+                .all(|m| m.category == MessageCategory::Admin)
+        );
+        let logon = some(dict.get_message("A"), "Logon defined");
+        assert!(
+            logon
+                .fields
+                .iter()
+                .any(|f| f.name == "DefaultApplVerID" && f.required)
+        );
+    }
+
+    #[test]
+    fn test_fixt11_empty_component_definition_loads() {
+        // The vendored FIXT 1.1 file defines `<component name='MsgTypeGrp' />`
+        // with no members, and Logon references it. Skipping the self-closing
+        // definition made that reference a dangling UnknownComponent.
+        let dict = ok(Dictionary::fixt11(), "FIXT 1.1 loads");
+        let group = some(dict.get_component("MsgTypeGrp"), "MsgTypeGrp defined");
+        assert!(group.fields.is_empty());
+        assert!(group.groups.is_empty());
+        assert!(group.components.is_empty());
+        let logon = some(dict.get_message("A"), "Logon defined");
+        assert!(logon.components.iter().any(|c| c.name == "MsgTypeGrp"));
+    }
+
+    #[test]
+    fn test_self_closing_message_definition_loads() {
+        // FIX 4.4 and FIXT 1.1 both define
+        // `<message name='XMLnonFIX' msgtype='n' msgcat='admin' />`.
+        for dict in [fix44(), ok(Dictionary::fixt11(), "FIXT 1.1 loads")] {
+            let message = some(dict.get_message("n"), "XMLnonFIX defined");
+            assert_eq!(message.name, "XMLnonFIX");
+            assert_eq!(message.category, MessageCategory::Admin);
+            assert!(message.fields.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_empty_component_definition_loads() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header><trailer></trailer>
+            <messages>
+                <message name='Ping' msgtype='U1' msgcat='app'>
+                    <field name='TestReqID' required='Y'/>
+                    <component name='Nothing' required='Y'/>
+                </message>
+            </messages>
+            <components>
+                <component name='Nothing' />
+            </components>
+            <fields><field number='112' name='TestReqID' type='STRING'/></fields>
+        </fix>";
+        let dict = ok(Dictionary::from_quickfix_xml(xml), "empty component loads");
+        let nothing = some(dict.get_component("Nothing"), "empty component defined");
+        assert!(nothing.fields.is_empty());
+        let ping = some(dict.get_message("U1"), "Ping defined");
+        assert!(ping.components.iter().any(|c| c.name == "Nothing"));
+    }
+
+    #[test]
+    fn test_group_with_only_an_empty_component_is_rejected() {
+        // Accepting empty component definitions must not let a group without
+        // any reachable field through: it still has no delimiter.
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header><trailer></trailer>
+            <messages>
+                <message name='Ping' msgtype='U1' msgcat='app'>
+                    <group name='NoPartyIDs' required='N'>
+                        <component name='Nothing' required='N'/>
+                    </group>
+                </message>
+            </messages>
+            <components>
+                <component name='Nothing' />
+            </components>
+            <fields><field number='453' name='NoPartyIDs' type='NUMINGROUP'/></fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::EmptyGroup("NoPartyIDs".to_string())
+        );
+    }
+
+    #[test]
+    fn test_duplicate_empty_component_definition_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header><trailer></trailer><messages></messages>
+            <components>
+                <component name='Twice'>
+                    <field name='TestReqID' required='N'/>
+                </component>
+                <component name='Twice' />
+            </components>
+            <fields><field number='112' name='TestReqID' type='STRING'/></fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::DuplicateDefinition {
+                kind: DefinitionKind::Component,
+                name: "Twice".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_self_closing_message_without_msgtype_is_rejected() {
+        let xml = r"<fix type='FIX' major='4' minor='4'>
+            <header></header><trailer></trailer>
+            <messages><message name='Ping' msgcat='app' /></messages>
+            <fields></fields>
+        </fix>";
+        assert_eq!(
+            load_err(xml),
+            DictionaryError::MissingAttribute {
+                element: "message".to_string(),
+                attribute: "msgtype".to_string(),
+            }
+        );
     }
 
     #[test]

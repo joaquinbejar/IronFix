@@ -6,7 +6,9 @@
 
 //! Dictionary-driven message validation.
 //!
-//! [`Validator`] checks a parsed [`RawMessage`] against a [`Dictionary`]:
+//! [`Validator`] checks a parsed [`RawMessage`] against a [`Dictionary`], or
+//! against a [`SessionDictionary`] that composes a FIXT.1.1 transport
+//! dictionary with a FIX 5.0 family application dictionary:
 //!
 //! - the message type must be defined
 //! - every tag must be defined in the dictionary, and must be allowed at the
@@ -19,6 +21,24 @@
 //!   count field contiguously, each entry starts with the group's delimiter
 //!   tag, no tag repeats inside one entry, and the number of entries actually
 //!   present matches the declared count
+//!
+//! # Which dictionary answers which tag
+//!
+//! A validator built with [`Validator::new`] answers everything from its one
+//! dictionary. One built with [`Validator::for_session`] follows QuickFIX's
+//! FIXT.1.1 semantics:
+//!
+//! - a message type the transport dictionary defines with `msgcat='admin'`
+//!   (Logon, Heartbeat, ...) is validated entirely against the transport
+//!   dictionary;
+//! - every other message type must be defined by the application dictionary.
+//!   The tags of the transport dictionary's header and trailer (members of
+//!   header and trailer groups included) resolve against the transport
+//!   dictionary; every other tag resolves against the application
+//!   dictionary.
+//!
+//! `ApplVerID(1128)` is not consulted to pick the application dictionary:
+//! the [`SessionDictionary`] already names it.
 //!
 //! # How groups are checked
 //!
@@ -40,7 +60,10 @@
 //! - The validator is a standalone, opt-in facility. It is not invoked by
 //!   the codec or by the engine.
 
-use crate::schema::{ComponentRef, Dictionary, FieldType, GroupDef, MessageDef};
+use crate::composition::SessionDictionary;
+use crate::schema::{
+    ComponentRef, Dictionary, FieldDef, FieldType, GroupDef, MessageCategory, MessageDef,
+};
 use ironfix_core::message::RawMessage;
 use std::collections::{HashMap, HashSet};
 
@@ -223,6 +246,21 @@ impl Level {
             self.required.push((tag, name.to_string()));
         }
     }
+
+    /// Returns every tag that may appear at this level or inside any group
+    /// entry below it.
+    ///
+    /// Iterative, so its depth is not bounded by the call stack; the tree it
+    /// walks is itself bounded by [`MAX_SCOPE_DEPTH`] and [`MAX_SCOPE_NODES`].
+    fn all_tags(&self) -> HashSet<u32> {
+        let mut tags = HashSet::new();
+        let mut pending: Vec<&Self> = vec![self];
+        while let Some(level) = pending.pop() {
+            tags.extend(level.allowed.iter().copied());
+            pending.extend(level.groups.values().map(|group| &group.entry));
+        }
+        tags
+    }
 }
 
 /// A repeating group and the level formed by one of its entries.
@@ -235,17 +273,26 @@ struct GroupNode {
     entry: Level,
 }
 
+/// The expanded schema of one message.
+#[derive(Debug)]
+struct Scope {
+    /// The message level: header, trailer, and body merged.
+    level: Level,
+    /// Every tag the header and trailer contribute, members of header and
+    /// trailer groups included. These resolve against the transport
+    /// dictionary.
+    envelope: HashSet<u32>,
+}
+
 /// Expands a [`MessageDef`] into the level tree the walker validates against.
-struct ScopeBuilder<'d> {
-    dict: &'d Dictionary,
+struct ScopeBuilder {
     budget: usize,
     errors: Vec<ValidationError>,
 }
 
-impl<'d> ScopeBuilder<'d> {
-    fn new(dict: &'d Dictionary) -> Self {
+impl ScopeBuilder {
+    fn new() -> Self {
         Self {
-            dict,
             budget: MAX_SCOPE_NODES,
             errors: Vec::new(),
         }
@@ -278,44 +325,69 @@ impl<'d> ScopeBuilder<'d> {
         }
     }
 
-    /// Builds the message level: header, trailer, body fields, groups, and
-    /// directly referenced components.
-    fn build(&mut self, msg_def: &MessageDef) -> Level {
+    /// Builds the message level: header and trailer from `transport`, then
+    /// body fields, groups, and directly referenced components, whose
+    /// components resolve against `body`.
+    ///
+    /// For a single-dictionary validator `transport` and `body` are the same
+    /// dictionary.
+    fn build(&mut self, transport: &Dictionary, body: &Dictionary, msg_def: &MessageDef) -> Scope {
         let mut level = Level::default();
         let mut path = HashSet::new();
 
-        for field in &self.dict.header {
+        for field in &transport.header {
             level.add_field(field.tag, &field.name, field.required);
         }
-        for group in &self.dict.header_groups {
-            self.add_group(&mut level, group, group.required, true, 0, &mut path);
+        for group in &transport.header_groups {
+            self.add_group(
+                transport,
+                &mut level,
+                group,
+                group.required,
+                true,
+                0,
+                &mut path,
+            );
         }
-        for field in &self.dict.trailer {
+        for field in &transport.trailer {
             level.add_field(field.tag, &field.name, field.required);
         }
-        for group in &self.dict.trailer_groups {
-            self.add_group(&mut level, group, group.required, true, 0, &mut path);
+        for group in &transport.trailer_groups {
+            self.add_group(
+                transport,
+                &mut level,
+                group,
+                group.required,
+                true,
+                0,
+                &mut path,
+            );
         }
+        let envelope = level.all_tags();
 
         for field in &msg_def.fields {
             level.add_field(field.tag, &field.name, field.required);
         }
         for group in &msg_def.groups {
-            self.add_group(&mut level, group, group.required, true, 0, &mut path);
+            self.add_group(body, &mut level, group, group.required, true, 0, &mut path);
         }
         for component in &msg_def.components {
-            self.add_component(&mut level, component, true, 0, &mut path);
+            self.add_component(body, &mut level, component, true, 0, &mut path);
         }
 
-        level
+        Scope { level, envelope }
     }
 
     /// Adds a group to `level` and builds the level formed by one entry.
     ///
-    /// `collect_required` is false inside group entries: a member's required
-    /// flag applies per entry, which is deliberately not validated.
+    /// `dict` is the dictionary that defines the group, and so the one its
+    /// component references resolve against. `collect_required` is false
+    /// inside group entries: a member's required flag applies per entry,
+    /// which is deliberately not validated.
+    #[allow(clippy::too_many_arguments)]
     fn add_group(
         &mut self,
+        dict: &Dictionary,
         level: &mut Level,
         group: &GroupDef,
         required: bool,
@@ -334,10 +406,18 @@ impl<'d> ScopeBuilder<'d> {
             entry.allowed.insert(field.tag);
         }
         for nested in &group.groups {
-            self.add_group(&mut entry, nested, nested.required, false, depth + 1, path);
+            self.add_group(
+                dict,
+                &mut entry,
+                nested,
+                nested.required,
+                false,
+                depth + 1,
+                path,
+            );
         }
         for component in &group.components {
-            self.add_component(&mut entry, component, false, depth + 1, path);
+            self.add_component(dict, &mut entry, component, false, depth + 1, path);
         }
 
         // A group already present at this level keeps its first expansion;
@@ -354,6 +434,7 @@ impl<'d> ScopeBuilder<'d> {
 
     /// Expands a component reference into `level`.
     ///
+    /// `dict` is the dictionary the reference resolves against.
     /// `collect_required` says whether requiredness is meaningful where the
     /// reference sits; combined with the reference's own flag it gives the
     /// effective requiredness, so a component's required members can only
@@ -361,6 +442,7 @@ impl<'d> ScopeBuilder<'d> {
     /// itself required.
     fn add_component(
         &mut self,
+        dict: &Dictionary,
         level: &mut Level,
         reference: &ComponentRef,
         collect_required: bool,
@@ -370,7 +452,7 @@ impl<'d> ScopeBuilder<'d> {
         if !self.spend(&reference.name, depth) {
             return;
         }
-        let Some(component) = self.dict.get_component(&reference.name) else {
+        let Some(component) = dict.get_component(&reference.name) else {
             self.errors.push(ValidationError::UnknownComponent {
                 name: reference.name.clone(),
             });
@@ -388,27 +470,113 @@ impl<'d> ScopeBuilder<'d> {
             level.add_field(field.tag, &field.name, required && field.required);
         }
         for group in &component.groups {
-            self.add_group(level, group, group.required, required, depth + 1, path);
+            self.add_group(
+                dict,
+                level,
+                group,
+                group.required,
+                required,
+                depth + 1,
+                path,
+            );
         }
         for nested in &component.components {
-            self.add_component(level, nested, required, depth + 1, path);
+            self.add_component(dict, level, nested, required, depth + 1, path);
         }
 
         path.remove(&reference.name);
     }
 }
 
-/// Validates parsed messages against a [`Dictionary`].
+/// Answers which [`FieldDef`] a tag of the message being validated has.
+///
+/// Envelope tags (the header and trailer of the transport dictionary)
+/// resolve against `transport`; every other tag against `body`, the
+/// dictionary that defines the message type.
+struct TagResolver<'d, 's> {
+    transport: &'d Dictionary,
+    body: &'d Dictionary,
+    envelope: &'s HashSet<u32>,
+}
+
+impl<'d> TagResolver<'d, '_> {
+    /// Returns the definition of `tag`, or `None` if the dictionary that
+    /// answers it does not define it.
+    fn field(&self, tag: u32) -> Option<&'d FieldDef> {
+        if self.envelope.contains(&tag) {
+            self.transport.get_field(tag)
+        } else {
+            self.body.get_field(tag)
+        }
+    }
+}
+
+/// Validates parsed messages against a [`Dictionary`], or against a
+/// [`SessionDictionary`] composing a transport and an application dictionary.
 #[derive(Debug, Clone, Copy)]
 pub struct Validator<'d> {
-    dict: &'d Dictionary,
+    /// Answers the standard header and trailer and the admin messages.
+    transport: &'d Dictionary,
+    /// Answers application message bodies. The same dictionary as
+    /// `transport` for a validator built with [`Validator::new`].
+    application: &'d Dictionary,
 }
 
 impl<'d> Validator<'d> {
     /// Creates a validator for the given dictionary.
+    ///
+    /// The one dictionary answers the header, the trailer, and every message
+    /// body. Use it for a FIX 4.x dictionary, which carries all three; for a
+    /// FIX 5.0 family application dictionary, whose header and trailer are
+    /// empty, use [`Validator::for_session`].
     #[must_use]
     pub const fn new(dict: &'d Dictionary) -> Self {
-        Self { dict }
+        Self {
+            transport: dict,
+            application: dict,
+        }
+    }
+
+    /// Creates a validator for a FIXT.1.1 transport dictionary composed with
+    /// a FIX 5.0 family application dictionary.
+    ///
+    /// Admin messages the transport dictionary defines are validated against
+    /// it alone; application messages take their header and trailer from the
+    /// transport dictionary and their body from the application dictionary.
+    /// See the [module docs](crate::validator) for the exact resolution rules.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironfix_dictionary::{Dictionary, SessionDictionary, Validator};
+    ///
+    /// let session = SessionDictionary::new(Dictionary::fixt11()?, Dictionary::fix50sp2()?)?;
+    /// let validator = Validator::for_session(&session);
+    /// # let _ = validator;
+    /// # Ok::<(), ironfix_dictionary::DictionaryError>(())
+    /// ```
+    #[must_use]
+    pub const fn for_session(session: &SessionDictionary<'d>) -> Self {
+        Self {
+            transport: session.transport(),
+            application: session.application(),
+        }
+    }
+
+    /// Resolves a message type to its definition and to the dictionary that
+    /// answers its body.
+    ///
+    /// An admin message the transport dictionary defines wins; otherwise the
+    /// application dictionary must define the message type.
+    fn resolve(&self, msg_type: &str) -> Option<(&'d MessageDef, &'d Dictionary)> {
+        if let Some(def) = self.transport.get_message(msg_type)
+            && def.category == MessageCategory::Admin
+        {
+            return Some((def, self.transport));
+        }
+        self.application
+            .get_message(msg_type)
+            .map(|def| (def, self.application))
     }
 
     /// Validates a parsed message against the dictionary.
@@ -421,19 +589,24 @@ impl<'d> Validator<'d> {
     /// passed all checks.
     pub fn validate(&self, msg: &RawMessage<'_>) -> Result<(), Vec<ValidationError>> {
         let msg_type = msg.msg_type().as_str().to_string();
-        let Some(msg_def) = self.dict.get_message(&msg_type) else {
+        let Some((msg_def, body)) = self.resolve(&msg_type) else {
             return Err(vec![ValidationError::UnknownMsgType { msg_type }]);
         };
 
-        let mut builder = ScopeBuilder::new(self.dict);
-        let level = builder.build(msg_def);
+        let mut builder = ScopeBuilder::new();
+        let Scope { level, envelope } = builder.build(self.transport, body, msg_def);
         let mut errors = builder.errors;
+        let tags = TagResolver {
+            transport: self.transport,
+            body,
+            envelope: &envelope,
+        };
 
         let fields: Vec<_> = msg.fields().collect();
 
         // Value-level checks apply wherever a field sits.
         for field in &fields {
-            self.check_value(field, &mut errors);
+            check_value(&tags, field, &mut errors);
         }
 
         // Structural walk over the message level.
@@ -441,7 +614,7 @@ impl<'d> Validator<'d> {
         let mut index = 0;
         while let Some(field) = fields.get(index) {
             let tag = field.tag;
-            let Some(def) = self.dict.get_field(tag) else {
+            let Some(def) = tags.field(tag) else {
                 // Already reported as UnknownTag by the value pass.
                 index += 1;
                 continue;
@@ -453,7 +626,7 @@ impl<'d> Validator<'d> {
                 });
             }
             if let Some(group) = level.groups.get(&tag) {
-                index = self.walk_group(&fields, index, group, &mut errors);
+                index = walk_group(&tags, &fields, index, group, &mut errors);
                 continue;
             }
             if !level.allowed.contains(&tag) {
@@ -491,143 +664,142 @@ impl<'d> Validator<'d> {
             Err(errors)
         }
     }
+}
 
-    /// Checks that a field is defined, well-formed for its type, and — when
-    /// enumerated — carries a defined value.
-    fn check_value(
-        &self,
-        field: &ironfix_core::field::FieldRef<'_>,
-        errors: &mut Vec<ValidationError>,
-    ) {
-        let Some(def) = self.dict.get_field(field.tag) else {
-            errors.push(ValidationError::UnknownTag { tag: field.tag });
-            return;
-        };
-        let value = String::from_utf8_lossy(field.value);
-        if !def.field_type.is_valid_value(&value) {
-            errors.push(ValidationError::InvalidFieldFormat {
-                tag: field.tag,
-                name: def.name.clone(),
-                value: value.into_owned(),
-                field_type: def.field_type,
-            });
-            return;
-        }
-        let Some(values) = &def.values else {
-            return;
-        };
-        // A multi-value field carries a space-separated list, and every
-        // token has to be in the enumeration. The form check above already
-        // guarantees the tokens are non-empty.
-        let valid = if def.field_type.is_multi_value() {
-            value.split(' ').all(|token| values.contains_key(token))
-        } else {
-            values.contains_key(value.as_ref())
-        };
-        if !valid {
-            errors.push(ValidationError::InvalidEnumValue {
-                tag: field.tag,
-                name: def.name.clone(),
-                value: value.into_owned(),
-            });
-        }
+/// Checks that a field is defined, well-formed for its type, and — when
+/// enumerated — carries a defined value.
+fn check_value(
+    tags: &TagResolver<'_, '_>,
+    field: &ironfix_core::field::FieldRef<'_>,
+    errors: &mut Vec<ValidationError>,
+) {
+    let Some(def) = tags.field(field.tag) else {
+        errors.push(ValidationError::UnknownTag { tag: field.tag });
+        return;
+    };
+    let value = String::from_utf8_lossy(field.value);
+    if !def.field_type.is_valid_value(&value) {
+        errors.push(ValidationError::InvalidFieldFormat {
+            tag: field.tag,
+            name: def.name.clone(),
+            value: value.into_owned(),
+            field_type: def.field_type,
+        });
+        return;
     }
+    let Some(values) = &def.values else {
+        return;
+    };
+    // A multi-value field carries a space-separated list, and every
+    // token has to be in the enumeration. The form check above already
+    // guarantees the tokens are non-empty.
+    let valid = if def.field_type.is_multi_value() {
+        value.split(' ').all(|token| values.contains_key(token))
+    } else {
+        values.contains_key(value.as_ref())
+    };
+    if !valid {
+        errors.push(ValidationError::InvalidEnumValue {
+            tag: field.tag,
+            name: def.name.clone(),
+            value: value.into_owned(),
+        });
+    }
+}
 
-    /// Walks one group instance, starting at its count field.
-    ///
-    /// Returns the index of the first field after the group.
-    fn walk_group(
-        &self,
-        fields: &[&ironfix_core::field::FieldRef<'_>],
-        index: usize,
-        group: &GroupNode,
-        errors: &mut Vec<ValidationError>,
-    ) -> usize {
-        let Some(count_field) = fields.get(index) else {
-            return index;
-        };
-        let count_value = String::from_utf8_lossy(count_field.value);
-        let declared = match count_value.parse::<u64>() {
-            Ok(declared) => Some(declared),
-            Err(_) => {
-                errors.push(ValidationError::InvalidGroupCount {
-                    tag: group.count_tag,
-                    name: group.name.clone(),
-                    value: count_value.into_owned(),
-                });
-                None
-            }
-        };
-
-        let mut cursor = index + 1;
-        let mut entries: u64 = 0;
-        let mut unparseable = false;
-        let mut seen_in_entry: HashSet<u32> = HashSet::new();
-
-        while let Some(field) = fields.get(cursor) {
-            let tag = field.tag;
-            if tag == group.delimiter_tag {
-                let Some(next) = entries.checked_add(1) else {
-                    break;
-                };
-                entries = next;
-                seen_in_entry.clear();
-                seen_in_entry.insert(tag);
-                cursor += 1;
-                continue;
-            }
-            if !group.entry.allowed.contains(&tag) {
-                // First field that is not a member of this group: the group
-                // ends here, and whatever follows belongs to the outer level.
-                break;
-            }
-            if entries == 0 {
-                // Members appear before any delimiter, so the first entry is
-                // not delimiter-led and the group cannot be split into
-                // entries unambiguously.
-                errors.push(ValidationError::GroupDelimiterMismatch {
-                    count_tag: group.count_tag,
-                    name: group.name.clone(),
-                    expected: group.delimiter_tag,
-                    found: tag,
-                });
-                unparseable = true;
-                entries = 1;
-                seen_in_entry.clear();
-            }
-            if !seen_in_entry.insert(tag) {
-                errors.push(ValidationError::RepeatedTagInGroupEntry {
-                    count_tag: group.count_tag,
-                    group: group.name.clone(),
-                    tag,
-                    name: self
-                        .dict
-                        .get_field(tag)
-                        .map_or_else(String::new, |def| def.name.clone()),
-                });
-                unparseable = true;
-            }
-            cursor = match group.entry.groups.get(&tag) {
-                Some(nested) => self.walk_group(fields, cursor, nested, errors),
-                None => cursor + 1,
-            };
+/// Walks one group instance, starting at its count field.
+///
+/// Returns the index of the first field after the group.
+fn walk_group(
+    tags: &TagResolver<'_, '_>,
+    fields: &[&ironfix_core::field::FieldRef<'_>],
+    index: usize,
+    group: &GroupNode,
+    errors: &mut Vec<ValidationError>,
+) -> usize {
+    let Some(count_field) = fields.get(index) else {
+        return index;
+    };
+    let count_value = String::from_utf8_lossy(count_field.value);
+    let declared = match count_value.parse::<u64>() {
+        Ok(declared) => Some(declared),
+        Err(_) => {
+            errors.push(ValidationError::InvalidGroupCount {
+                tag: group.count_tag,
+                name: group.name.clone(),
+                value: count_value.into_owned(),
+            });
+            None
         }
+    };
 
-        if let Some(declared) = declared
-            && !unparseable
-            && declared != entries
-        {
-            errors.push(ValidationError::GroupCountMismatch {
+    let mut cursor = index + 1;
+    let mut entries: u64 = 0;
+    let mut unparseable = false;
+    let mut seen_in_entry: HashSet<u32> = HashSet::new();
+
+    while let Some(field) = fields.get(cursor) {
+        let tag = field.tag;
+        if tag == group.delimiter_tag {
+            let Some(next) = entries.checked_add(1) else {
+                break;
+            };
+            entries = next;
+            seen_in_entry.clear();
+            seen_in_entry.insert(tag);
+            cursor += 1;
+            continue;
+        }
+        if !group.entry.allowed.contains(&tag) {
+            // First field that is not a member of this group: the group
+            // ends here, and whatever follows belongs to the outer level.
+            break;
+        }
+        if entries == 0 {
+            // Members appear before any delimiter, so the first entry is
+            // not delimiter-led and the group cannot be split into
+            // entries unambiguously.
+            errors.push(ValidationError::GroupDelimiterMismatch {
                 count_tag: group.count_tag,
                 name: group.name.clone(),
-                declared,
-                actual: entries,
-                delimiter_tag: group.delimiter_tag,
+                expected: group.delimiter_tag,
+                found: tag,
             });
+            unparseable = true;
+            entries = 1;
+            seen_in_entry.clear();
         }
-
-        cursor
+        if !seen_in_entry.insert(tag) {
+            errors.push(ValidationError::RepeatedTagInGroupEntry {
+                count_tag: group.count_tag,
+                group: group.name.clone(),
+                tag,
+                name: tags
+                    .field(tag)
+                    .map_or_else(String::new, |def| def.name.clone()),
+            });
+            unparseable = true;
+        }
+        cursor = match group.entry.groups.get(&tag) {
+            Some(nested) => walk_group(tags, fields, cursor, nested, errors),
+            None => cursor + 1,
+        };
     }
+
+    if let Some(declared) = declared
+        && !unparseable
+        && declared != entries
+    {
+        errors.push(ValidationError::GroupCountMismatch {
+            count_tag: group.count_tag,
+            name: group.name.clone(),
+            declared,
+            actual: entries,
+            delimiter_tag: group.delimiter_tag,
+        });
+    }
+
+    cursor
 }
 
 #[cfg(test)]
@@ -666,6 +838,46 @@ mod tests {
         ok(Dictionary::fix44(), "embedded FIX 4.4 dictionary loads")
     }
 
+    #[track_caller]
+    fn fix42() -> &'static Dictionary {
+        ok(Dictionary::fix42(), "embedded FIX 4.2 dictionary loads")
+    }
+
+    #[track_caller]
+    fn fixt11() -> &'static Dictionary {
+        ok(Dictionary::fixt11(), "embedded FIXT 1.1 dictionary loads")
+    }
+
+    #[track_caller]
+    fn fix50sp2() -> &'static Dictionary {
+        ok(
+            Dictionary::fix50sp2(),
+            "embedded FIX 5.0 SP2 dictionary loads",
+        )
+    }
+
+    /// The embedded FIXT 1.1 transport composed with FIX 5.0 SP2.
+    #[track_caller]
+    fn fixt11_fix50sp2() -> SessionDictionary<'static> {
+        ok(
+            SessionDictionary::new(fixt11(), fix50sp2()),
+            "FIXT 1.1 + FIX 5.0 SP2 compose",
+        )
+    }
+
+    /// Decodes a message built from `fields` and validates it with
+    /// `validator`.
+    #[track_caller]
+    fn validate_using(
+        validator: Validator<'_>,
+        fields: &[&str],
+    ) -> Result<(), Vec<ValidationError>> {
+        let msg = build(fields);
+        let mut decoder = Decoder::new(msg.as_bytes()).with_checksum_validation(false);
+        let raw = ok(decoder.decode(), "test message decodes");
+        validator.validate(&raw)
+    }
+
     /// Builds a message, recomputing BodyLength (9) from the actual body so the
     /// decoder's declared-vs-actual length check passes.
     fn build(fields: &[&str]) -> String {
@@ -698,10 +910,7 @@ mod tests {
 
     #[track_caller]
     fn validate_with(dict: &Dictionary, fields: &[&str]) -> Result<(), Vec<ValidationError>> {
-        let msg = build(fields);
-        let mut decoder = Decoder::new(msg.as_bytes()).with_checksum_validation(false);
-        let raw = ok(decoder.decode(), "test message decodes");
-        Validator::new(dict).validate(&raw)
+        validate_using(Validator::new(dict), fields)
     }
 
     #[track_caller]
@@ -1216,22 +1425,45 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn test_scope_expansion_fits_every_fix44_message() {
-        // The ceilings must accommodate the real dictionary: no message in
-        // FIX 4.4 may hit the depth or budget limit, or its own schema would
-        // be reported as an error against every message of that type.
-        let dict = fix44();
-        for msg_def in dict.messages() {
-            let mut builder = ScopeBuilder::new(dict);
-            let _ = builder.build(msg_def);
+    /// Expands every message `body` defines, with its header and trailer
+    /// from `transport`, and asserts no expansion reaches a validator
+    /// ceiling: a message whose own schema exhausted the depth or node
+    /// budget would be reported as invalid on every occurrence.
+    #[track_caller]
+    fn assert_scope_expansion_fits(transport: &Dictionary, body: &Dictionary) {
+        for msg_def in body.messages() {
+            let mut builder = ScopeBuilder::new();
+            let _ = builder.build(transport, body, msg_def);
             assert_eq!(
                 builder.errors,
                 Vec::new(),
-                "expanding {} exhausted a validator ceiling",
-                msg_def.name
+                "expanding {} ({}) exhausted a validator ceiling",
+                msg_def.name,
+                body.version
             );
         }
+    }
+
+    #[test]
+    fn test_scope_expansion_fits_every_fix44_message() {
+        assert_scope_expansion_fits(fix44(), fix44());
+    }
+
+    #[test]
+    fn test_scope_expansion_fits_every_fix42_message() {
+        assert_scope_expansion_fits(fix42(), fix42());
+    }
+
+    #[test]
+    fn test_scope_expansion_fits_every_fixt11_message() {
+        assert_scope_expansion_fits(fixt11(), fixt11());
+    }
+
+    #[test]
+    fn test_scope_expansion_fits_every_fix50sp2_message_under_fixt11() {
+        // The FIX 5.0 SP2 bodies are expanded with the FIXT 1.1 header and
+        // trailer, exactly as `Validator::for_session` expands them.
+        assert_scope_expansion_fits(fixt11(), fix50sp2());
     }
 
     #[test]
@@ -1533,5 +1765,358 @@ mod tests {
             ],
         );
         assert_eq!(result, Ok(()));
+    }
+
+    // --- FIX 4.2 -----------------------------------------------------------
+
+    /// The FIX 4.2 standard header for a message of type `msg_type`.
+    fn fix42_header(msg_type: &'static str) -> Vec<&'static str> {
+        vec![
+            "8=FIX.4.2",
+            "9=100",
+            msg_type,
+            "49=SENDER",
+            "56=TARGET",
+            "34=1",
+            "52=20260712-10:00:00",
+        ]
+    }
+
+    #[test]
+    fn test_validate_fix42_new_order_single_passes() {
+        let mut fields = fix42_header("35=D");
+        fields.extend([
+            "11=ORDER-1",
+            "21=1",
+            "55=EURUSD",
+            "54=1",
+            "60=20260712-10:00:00",
+            "38=100",
+            "40=2",
+            "44=1.2345",
+            "10=000",
+        ]);
+        assert_eq!(validate_with(fix42(), &fields), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_fix42_new_order_single_missing_handl_inst_is_reported() {
+        // HandlInst(21) is required in FIX 4.2 NewOrderSingle (it is not in
+        // FIX 4.4), so the answer has to come from the FIX 4.2 dictionary.
+        let mut fields = fix42_header("35=D");
+        fields.extend([
+            "11=ORDER-1",
+            "55=EURUSD",
+            "54=1",
+            "60=20260712-10:00:00",
+            "40=1",
+            "10=000",
+        ]);
+        let found = errors(validate_with(fix42(), &fields));
+        assert_eq!(
+            found,
+            vec![ValidationError::MissingRequiredField {
+                tag: 21,
+                name: "HandlInst".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_validate_fix42_execution_report_passes() {
+        let mut fields = fix42_header("35=8");
+        fields.extend([
+            "37=ORDER-1",
+            "17=EXEC-1",
+            "20=0",
+            "150=0",
+            "39=0",
+            "55=EURUSD",
+            "54=1",
+            "38=100",
+            "151=100",
+            "14=0",
+            "6=0",
+            "10=000",
+        ]);
+        assert_eq!(validate_with(fix42(), &fields), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_fix42_utcdate_field_is_checked_as_a_date() {
+        // MDEntryDate(272) is declared `UTCDATE` in the FIX 4.2 dictionary,
+        // loaded as UtcDateOnly: YYYYMMDD passes, an ISO date does not.
+        let snapshot = |date: &'static str| {
+            let mut fields = fix42_header("35=W");
+            fields.extend(["55=EURUSD", "268=1", "269=0", "270=1.2345", date, "10=000"]);
+            fields
+        };
+        assert_eq!(validate_with(fix42(), &snapshot("272=20260712")), Ok(()));
+        let found = errors(validate_with(fix42(), &snapshot("272=2026-07-12")));
+        assert_eq!(
+            found,
+            vec![ValidationError::InvalidFieldFormat {
+                tag: 272,
+                name: "MDEntryDate".to_string(),
+                value: "2026-07-12".to_string(),
+                field_type: FieldType::UtcDateOnly,
+            }]
+        );
+    }
+
+    // --- FIXT 1.1 + FIX 5.0 SP2 ----------------------------------------------
+
+    /// The FIXT 1.1 standard header for a message of type `msg_type`.
+    fn fixt11_header(msg_type: &'static str) -> Vec<&'static str> {
+        vec![
+            "8=FIXT.1.1",
+            "9=100",
+            msg_type,
+            "49=SENDER",
+            "56=TARGET",
+            "34=1",
+            "52=20260712-10:00:00.123456",
+        ]
+    }
+
+    /// A FIX 5.0 SP2 NewOrderSingle carried in a FIXT 1.1 header.
+    fn fix50sp2_new_order_single() -> Vec<&'static str> {
+        let mut fields = fixt11_header("35=D");
+        fields.extend([
+            "1128=9",
+            "11=ORDER-1",
+            "55=EURUSD",
+            "54=1",
+            "60=20260712-10:00:00.123456",
+            "38=100",
+            "40=2",
+            "44=1.2345",
+            "10=000",
+        ]);
+        fields
+    }
+
+    /// Validates `fields` against the embedded FIXT 1.1 + FIX 5.0 SP2 pair.
+    #[track_caller]
+    fn validate_session(fields: &[&str]) -> Result<(), Vec<ValidationError>> {
+        validate_using(Validator::for_session(&fixt11_fix50sp2()), fields)
+    }
+
+    #[test]
+    fn test_validate_for_session_fixt_logon_with_default_appl_ver_id_passes() {
+        let mut fields = fixt11_header("35=A");
+        fields.extend(["98=0", "108=30", "1137=9", "10=000"]);
+        assert_eq!(validate_session(&fields), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_for_session_fixt_logon_without_default_appl_ver_id_is_reported() {
+        // DefaultApplVerID(1137) is required by the FIXT 1.1 Logon.
+        let mut fields = fixt11_header("35=A");
+        fields.extend(["98=0", "108=30", "10=000"]);
+        let found = errors(validate_session(&fields));
+        assert_eq!(
+            found,
+            vec![ValidationError::MissingRequiredField {
+                tag: 1137,
+                name: "DefaultApplVerID".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_validate_for_session_logon_with_no_msg_types_follows_the_vendored_file() {
+        // The vendored FIXT 1.1 file defines MsgTypeGrp with no members and
+        // never defines NoMsgTypes(384). The dictionary answers, unpatched:
+        // a Logon carrying the group is reported, member tags included.
+        let mut fields = fixt11_header("35=A");
+        fields.extend(["98=0", "108=30", "384=1", "372=D", "1137=9", "10=000"]);
+        let found = errors(validate_session(&fields));
+        assert_eq!(
+            found,
+            vec![
+                ValidationError::UnknownTag { tag: 384 },
+                ValidationError::FieldNotAllowedForMessage {
+                    tag: 372,
+                    msg_type: "A".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_validate_for_session_admin_message_resolves_against_the_transport_only() {
+        // Heartbeat is a FIXT 1.1 admin message, so its body is answered by
+        // FIXT 1.1: ClOrdID(11) exists only in FIX 5.0 SP2 and is unknown
+        // here, even though the application dictionary defines it.
+        let mut fields = fixt11_header("35=0");
+        fields.push("10=000");
+        assert_eq!(validate_session(&fields), Ok(()));
+
+        let mut fields = fixt11_header("35=0");
+        fields.extend(["11=ORDER-1", "10=000"]);
+        let found = errors(validate_session(&fields));
+        assert_eq!(found, vec![ValidationError::UnknownTag { tag: 11 }]);
+    }
+
+    #[test]
+    fn test_validate_for_session_fix50sp2_new_order_single_passes() {
+        // Header and trailer from FIXT 1.1, body from FIX 5.0 SP2.
+        assert_eq!(validate_session(&fix50sp2_new_order_single()), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_for_session_missing_transport_header_field_is_reported() {
+        // SendingTime(52) is required by the FIXT 1.1 header; FIX 5.0 SP2
+        // has no header of its own to require it.
+        let fields: Vec<&str> = fix50sp2_new_order_single()
+            .into_iter()
+            .filter(|field| !field.starts_with("52="))
+            .collect();
+        let found = errors(validate_session(&fields));
+        assert_eq!(
+            found,
+            vec![ValidationError::MissingRequiredField {
+                tag: 52,
+                name: "SendingTime".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_validate_for_session_missing_application_body_field_is_reported() {
+        let fields: Vec<&str> = fix50sp2_new_order_single()
+            .into_iter()
+            .filter(|field| !field.starts_with("40="))
+            .collect();
+        let found = errors(validate_session(&fields));
+        assert_eq!(
+            found,
+            vec![ValidationError::MissingRequiredField {
+                tag: 40,
+                name: "OrdType".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_validate_for_session_unknown_application_msg_type_is_rejected() {
+        let mut fields = fixt11_header("35=U9");
+        fields.push("10=000");
+        let found = errors(validate_session(&fields));
+        assert_eq!(
+            found,
+            vec![ValidationError::UnknownMsgType {
+                msg_type: "U9".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_validate_fix50sp2_alone_flags_the_header_tags() {
+        // FIX 5.0 SP2 has an empty header and trailer: on its own it cannot
+        // place a single header tag, which is why it has to be composed.
+        let found = errors(validate_with(fix50sp2(), &fix50sp2_new_order_single()));
+        for tag in [8, 9, 35, 49, 56, 34, 52, 1128] {
+            assert!(
+                found.contains(&ValidationError::FieldNotAllowedForMessage {
+                    tag,
+                    msg_type: "D".to_string(),
+                }),
+                "header tag {tag} was not flagged: {found:?}"
+            );
+        }
+    }
+
+    /// Builds a hand-made transport/application pair in which tag 9000 is a
+    /// header field typed INT by the transport and STRING by the application,
+    /// and tag 9001 a body field typed STRING by the transport and INT by the
+    /// application. Which dictionary answered is then visible in the result.
+    fn dialects_with_conflicting_definitions() -> (Dictionary, Dictionary) {
+        let field_ref = |tag: u32, name: &str, required: bool| SchemaFieldRef {
+            tag,
+            name: name.to_string(),
+            required,
+        };
+
+        let mut transport = Dictionary::new(crate::schema::Version::Fixt11);
+        for (tag, name, field_type) in [
+            (8, "BeginString", FieldType::String),
+            (9, "BodyLength", FieldType::Length),
+            (10, "CheckSum", FieldType::String),
+            (35, "MsgType", FieldType::String),
+            (9000, "EnvelopeTag", FieldType::Int),
+            (9001, "BodyTag", FieldType::String),
+        ] {
+            transport.add_field(FieldDef::new(tag, name, field_type));
+        }
+        transport.header = vec![
+            field_ref(8, "BeginString", true),
+            field_ref(9, "BodyLength", true),
+            field_ref(35, "MsgType", true),
+            field_ref(9000, "EnvelopeTag", false),
+        ];
+        transport.trailer = vec![field_ref(10, "CheckSum", true)];
+
+        let mut application = Dictionary::new(crate::schema::Version::Fix50Sp2);
+        for (tag, name, field_type) in [
+            (9000, "EnvelopeTag", FieldType::String),
+            (9001, "BodyTag", FieldType::Int),
+        ] {
+            application.add_field(FieldDef::new(tag, name, field_type));
+        }
+        application.add_message(MessageDef {
+            msg_type: "U1".to_string(),
+            name: "Probe".to_string(),
+            category: MessageCategory::App,
+            fields: vec![field_ref(9001, "BodyTag", false)],
+            groups: Vec::new(),
+            components: Vec::new(),
+        });
+        (transport, application)
+    }
+
+    #[test]
+    fn test_validate_for_session_header_tag_resolves_against_the_transport() {
+        let (transport, application) = dialects_with_conflicting_definitions();
+        let session = ok(
+            SessionDictionary::new(&transport, &application),
+            "hand-built pair composes",
+        );
+        let found = errors(validate_using(
+            Validator::for_session(&session),
+            &["8=FIXT.1.1", "9=100", "35=U1", "9000=abc", "10=000"],
+        ));
+        assert_eq!(
+            found,
+            vec![ValidationError::InvalidFieldFormat {
+                tag: 9000,
+                name: "EnvelopeTag".to_string(),
+                value: "abc".to_string(),
+                field_type: FieldType::Int,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_validate_for_session_body_tag_resolves_against_the_application() {
+        let (transport, application) = dialects_with_conflicting_definitions();
+        let session = ok(
+            SessionDictionary::new(&transport, &application),
+            "hand-built pair composes",
+        );
+        let found = errors(validate_using(
+            Validator::for_session(&session),
+            &["8=FIXT.1.1", "9=100", "35=U1", "9001=abc", "10=000"],
+        ));
+        assert_eq!(
+            found,
+            vec![ValidationError::InvalidFieldFormat {
+                tag: 9001,
+                name: "BodyTag".to_string(),
+                value: "abc".to_string(),
+                field_type: FieldType::Int,
+            }]
+        );
     }
 }
