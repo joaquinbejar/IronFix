@@ -159,8 +159,12 @@ impl std::str::FromStr for FieldType {
     ///   what FIX 4.3 renamed `UTCDateOnly`: a `YYYYMMDD` date, so it maps to
     ///   [`FieldType::UtcDateOnly`].
     /// - `XID` and `XIDREF` (FIX 5.0 SP2) are an element identifier and a
-    ///   reference to one. The FIX specification derives both from `String`
-    ///   with no further format, so they map to [`FieldType::String`].
+    ///   reference to one. On the wire they have the same form as `String`,
+    ///   so they map to [`FieldType::String`]. This is a documented loosening:
+    ///   what makes them more than a string is **not** validated, namely that
+    ///   an `XID` is unique within the message, that an `XIDREF` refers to an
+    ///   `XID` that is present (reference integrity), and the `xs:ID` /
+    ///   `NCName` lexical rules (for example, no leading digit).
     ///
     /// # Arguments
     /// * `s` - The type name from the FIX dictionary
@@ -184,7 +188,9 @@ impl std::str::FromStr for FieldType {
             "CHAR" => Self::Char,
             "BOOLEAN" => Self::Boolean,
             // `XID` / `XIDREF` are the FIX 5.0 SP2 identifier and
-            // identifier-reference types; the spec derives both from String.
+            // identifier-reference types. Same wire form as String; their
+            // uniqueness, reference integrity, and xs:ID / NCName lexical
+            // rules are not validated (a documented loosening).
             "STRING" | "XID" | "XIDREF" => Self::String,
             "MULTIPLECHARVALUE" => Self::MultipleCharValue,
             // `MULTIPLEVALUESTRING` is the spelling the vendored FIX 4.4

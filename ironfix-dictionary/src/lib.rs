@@ -30,10 +30,13 @@
 //!   | [`Dictionary::fix50sp2`] | FIX 5.0 SP2 | application (messages only) |
 //!
 //! - **Transport plus application composition**: [`SessionDictionary`] pairs
-//!   a FIXT.1.1 transport dictionary with a FIX 5.0 family application
-//!   dictionary, and [`Validator::for_session`] validates against the pair
-//!   (header and trailer from the transport side, body from the application
-//!   side, admin messages entirely from the transport side)
+//!   a FIXT.1.1 transport dictionary with an application dictionary of any
+//!   version FIXT.1.1 carries (FIX 4.0 through 5.0 SP2), and
+//!   [`Validator::for_session`] validates against the pair with
+//!   QuickFIX-like semantics: `BeginString(8)` must be `FIXT.1.1`, header
+//!   and trailer come from the transport side, the body from the application
+//!   side, and admin messages entirely from the transport side (see the
+//!   [`validator`] module docs for the differences from QuickFIX)
 //!
 //! This product includes software developed by quickfixengine.org
 //! (<http://www.quickfixengine.org/>).
@@ -49,6 +52,18 @@
 //! the application dictionary when building the pair; a message whose
 //! `ApplVerID` names a different application version is still validated
 //! against that one.
+//!
+//! **The embedded FIXT 1.1 dictionary deviates from FIXT 1.1 upstream.** The
+//! vendored QuickFIX `FIXT11.xml` defines the Logon `MsgTypeGrp` component
+//! with no members and does not define `NoMsgTypes(384)` or
+//! `MsgDirection(385)`, where FIXT 1.1 defines the `NoMsgTypes` group
+//! (`372`, `385`, `1130`, `1406`, `1131`, `1410`). A Logon carrying the group
+//! is therefore reported as invalid against [`Dictionary::fixt11`]. The file
+//! stays unpatched; to accept the group, load a FIXT 1.1 dictionary that
+//! defines it with [`Dictionary::from_quickfix_xml`] and compose that.
+//!
+//! **[`Validator::new`] does not check `BeginString(8)`**; only
+//! [`Validator::for_session`] does.
 //!
 //! **[`Validator`] is opt-in and is never invoked automatically.** Neither
 //! `ironfix-engine` nor `ironfix-transport` validates against a dictionary; a
