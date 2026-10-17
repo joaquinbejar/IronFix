@@ -1141,22 +1141,63 @@ entries found equals the declared count. And, for a structurally sound group,
 the **required members of every entry**, reported as
 `ValidationError::MissingRequiredFieldInGroupEntry { count_tag, group, entry,
 tag, name }` with a **0-based** `entry` index. An entry's required set is what
-the dictionary says, computed the way QuickFIX computes it:
+the dictionary marks required, applied per the FIX rule that a required member
+is required in every entry of every group instance present, whether or not the
+group itself is required:
 
 - member fields marked `required='Y'`;
 - nested groups marked `required='Y'` (reported with the nested group's count
   tag), whose own entries are checked the same way;
 - the required members of components referenced as `required='Y'`. A component
-  referenced as `required='N'` contributes no required members, even when some
-  of its fields are present.
+  referenced as `required='N'` contributes no required members, nested groups
+  included, even when some of its fields are present.
 
-The delimiter is never reported missing. A group that is already structurally
-malformed gets no per-entry errors, nested groups included, because its entry
-boundaries cannot be trusted. Example from the vendored FIX 4.4 dictionary:
-each `NoOrders` (73) entry of a NewOrderList (35=E) requires `ClOrdID` (11),
-`ListSeqNo` (67) and `Side` (54); an entry without 67 is reported with its
-index. This check is newer than the structural one, so validation is stricter
-than it was: messages whose entries lacked required members used to pass.
+A tag required twice (directly and through a component) is reported once. The
+delimiter is never reported missing; when it is a nested group's count tag,
+that nested group counts as present. A group that already carries a structural
+error gets no per-entry errors, nested groups included; a malformed nested
+group suppresses only its own. Errors come in dictionary order within an entry,
+then missing nested groups by count tag, with entries in the order they close
+(a nested group's entries before the entry that encloses them). Example from
+the vendored FIX 4.4 dictionary: each `NoOrders` (73) entry of a NewOrderList
+(35=E) requires `ClOrdID` (11), `ListSeqNo` (67) and `Side` (54); an entry
+without 67 is reported with its index.
+
+Conditional requirements are not enforced. FIX 4.4 says `PartyIDSource` (447)
+and `PartyRole` (452) are "Required if NoPartyIDs > 0", but QuickFIX XML cannot
+express a condition, and the vendored dictionary marks both `required='N'`;
+with the dictionary as the authority, they are not enforced.
+
+One validation call collects at most `MAX_VALIDATION_ERRORS` (1024) errors;
+past that it stops and appends `ValidationError::ErrorLimitReached`, so a
+hostile message (for example a ListStatus of 200,000 one-field entries, which
+fits the codec's 1 MiB frame limit) cannot make the report grow with the
+message.
+
+**Differences from QuickFIX.**
+
+- **Stricter.** QuickFIX (C++ and Java, `addXMLGroup`) enforces an entry's
+  required fields only when the group itself is `required='Y'`, and QuickFIX
+  C++ ignores the required fields of components referenced inside a group.
+  IronFix enforces them in every entry of every present group, so a message a
+  QuickFIX counterparty accepts can be rejected here: for example FIX 4.4
+  `PosUndInstrmtGrp` `NoUnderlyings` (711) entries without
+  `UnderlyingSettlPrice` (732), FIX 4.2 Allocation `NoAllocs` (78) entries
+  without `AllocShares` (80), and in FIX 5.0 SP2 the ten optional groups
+  (fifteen group definitions) that declare required fields directly, such as
+  `NoOrders` (73) and `NoSides` (552).
+- **Structural errors first.** QuickFIX checks required fields, per entry
+  included, before group counts, so for a message with both problems it
+  rejects with `SessionRejectReason` (373) = 1 (required tag missing); IronFix
+  reports the group's structural error and suppresses that group's per-entry
+  errors.
+- **Dictionary order.** QuickFIX reports the lowest missing tag first; IronFix
+  reports missing tags in the order the dictionary declares them.
+
+**Behaviour change.** This check is newer than the structural one, so
+validation is stricter than it was, and stricter than QuickFIX: messages whose
+entries lacked required members used to pass, and some still pass at a
+QuickFIX counterparty.
 
 ---
 
@@ -1322,7 +1363,11 @@ Where it differs from QuickFIX:
   1.1. QuickFIX's `Message::isAdminMsgType` covers only `0`, `A` and `1` to `5`,
   so it treats 35=n as an application message.
 - **All errors, no ordering check.** Every error is returned rather than the
-  first, and header/body/trailer field order is not enforced.
+  first (up to `MAX_VALIDATION_ERRORS`), and header/body/trailer field order is
+  not enforced.
+- **Group entries.** Required members are enforced in every entry of every
+  present group, stricter than QuickFIX; see "Repeating groups in dictionary
+  validation" under Error Handling.
 - **`DefaultApplVerID` (1137) values are not checked.** `FIXT11.xml` declares it
   as a STRING with no enumeration, so any value passes.
 
