@@ -81,8 +81,8 @@ The FIX servers are the same shape on their own ports; point the matching
 
 ## Image Details
 
-- **Build stage**: `rust:1.92.0-alpine3.23`, toolchain pinned via
-  `RUSTUP_TOOLCHAIN=1.92.0` so rustup does not resolve the repo's `stable`
+- **Build stage**: `rust:1.99.1-alpine3.23`, toolchain pinned via
+  `RUSTUP_TOOLCHAIN=1.99.1` so rustup does not resolve the repo's `stable`
   channel to a different version mid-build.
 - **Runtime stage**: `alpine:3.23`
 - **Binary**: Statically linked with musl libc
