@@ -24,6 +24,21 @@ spelling such as `UTCDATE` or `XID`, a self-closing component definition), the
 loader changes, not the file. To refresh a file, fetch it from a named upstream
 commit and update the commit and checksum above.
 
+## Known upstream deviation: `FIXT11.xml` Logon `MsgTypeGrp`
+
+FIXT 1.1 defines the Logon component `MsgTypeGrp` as the `NoMsgTypes(384)`
+repeating group: `RefMsgType(372)`, `MsgDirection(385)`, `RefApplVerID(1130)`,
+`RefApplExtID(1406)`, `RefCstmApplVerID(1131)`, `DefaultVerIndicator(1410)`.
+The QuickFIX `FIXT11.xml` vendored here defines `<component name='MsgTypeGrp' />`
+with no members and does not define tags 384 or 385 at all. As a result, a
+Logon that carries `NoMsgTypes` is reported as invalid when validated against
+`Dictionary::fixt11()` (tag 384 is an unknown tag).
+
+The file is deliberately left unpatched, because this directory holds verbatim
+upstream copies. If your counterparties send `NoMsgTypes`, load a FIXT 1.1
+dictionary that defines the group with `Dictionary::from_quickfix_xml` and
+compose that with the application dictionary through `SessionDictionary`.
+
 ## License
 
 The QuickFIX data dictionaries are distributed under the QuickFIX Software

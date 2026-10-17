@@ -75,13 +75,21 @@ still `DictionaryError::EmptyGroup`.
 
 **Composition.** A new `SessionDictionary<'d>` (module `composition`, private
 fields) borrows a transport and an application dictionary.
-`SessionDictionary::new(transport, application)` accepts the pair only when the
-transport is `Version::Fixt11` and the application version has an `ApplVerID`
-(FIX 5.0, 5.0 SP1, 5.0 SP2); anything else, a swapped pair included, is the new
+`SessionDictionary::new(transport, application)` accepts the pair when the
+transport is `Version::Fixt11` and the application is any version FIXT.1.1
+carries: FIX 4.0 through 4.4 (ApplVerID `2` to `6`) and FIX 5.0 through 5.0 SP2
+(`7` to `9`), that is, every version except `Fixt11`. The rule is an explicit,
+exhaustive `match` on `Version`, deliberately not derived from
+`Version::appl_ver_id`, which answers a different question (what to stamp on
+the wire for a configured session) and has no value for FIX 4.x. Anything
+else, a swapped pair or FIXT.1.1 as the application included, is the new
 `DictionaryError::IncompatibleComposition { transport, application }`.
-`Validator::for_session(&SessionDictionary)` validates with QuickFIX's
+`Validator::for_session(&SessionDictionary)` validates with QuickFIX-like
 semantics:
 
+- `BeginString(8)` must equal the transport's `begin_string` (`FIXT.1.1`);
+  anything else is the new `ValidationError::BeginStringMismatch { expected,
+  found }`;
 - a message type the transport defines with `msgcat='admin'` is validated
   entirely against the transport (so a Logon must carry `DefaultApplVerID(1137)`
   and an application-only tag in a Heartbeat is `UnknownTag`);
@@ -90,18 +98,35 @@ semantics:
   included) resolve against the transport, every other tag against the
   application dictionary.
 
+Where it differs from QuickFIX, stated so nobody assumes parity:
+
+- no `ApplVerID`-based dictionary selection: QuickFIX picks the application
+  dictionary per message from `ApplVerID(1128)`, falling back to the
+  counterparty's `DefaultApplVerID(1137)`; here the pair names one
+  application dictionary and neither tag is consulted;
+- admin routing follows the transport's `msgcat`, so `XMLnonFIX` (35=n,
+  `msgcat='admin'` in `FIXT11.xml`) goes to the transport, whereas QuickFIX's
+  `Message::isAdminMsgType` (`0`, `A`, `1` to `5`) treats it as application;
+- every error is returned rather than the first, and header/body/trailer
+  field order is not enforced;
+- a tag the pair defines but the answering dictionary does not is
+  `UnknownTag`, which a session reject would map to `373=0` where `373=2` is
+  more accurate; mapping validation errors to `SessionRejectReason` is future
+  work (#84).
+
 `Validator::new(&Dictionary)` is the degenerate case of the same code, both
-roles played by one dictionary, so its behaviour is unchanged. The composition
-does **not** read `ApplVerID(1128)` or `DefaultApplVerID(1137)` to choose the
-application dictionary: the pair already names it.
+roles played by one dictionary, so its behaviour is unchanged; in particular it
+still does not check `BeginString(8)`, a pre-existing gap now documented on the
+constructor.
 
 ## Consequences
 
 - **Semver: additive (minor bump).** New `pub` items:
   `Dictionary::{fix42, fixt11, fix50sp2}`, the `composition` module and its
   `SessionDictionary` (re-exported at the crate root), `Validator::for_session`,
-  and the `DictionaryError::IncompatibleComposition` variant (`DictionaryError`
-  is `#[non_exhaustive]`). No `pub` item is renamed or removed; `FieldType` and
+  the `DictionaryError::IncompatibleComposition` variant and the
+  `ValidationError::BeginStringMismatch` variant (both enums are
+  `#[non_exhaustive]`). No `pub` item is renamed or removed; `FieldType` and
   `Dictionary` are untouched; `Validator`'s fields were already private.
   Observable behaviour changes, all toward what the files say:
   `FieldType::from_str` accepts three more spellings; a self-closing component
@@ -109,10 +134,27 @@ application dictionary: the pair already names it.
   FIX 4.4 dictionary now defines msg type `n` (XMLnonFIX), so validating `35=n`
   against it is no longer `UnknownMsgType`, and `CodeGenerator` output for FIX
   4.4 gains an empty `XMLnonFIX` struct.
-- **The dictionary answers, unpatched.** `FIXT11.xml` defines `MsgTypeGrp` with
-  no members and never defines `NoMsgTypes(384)`, so a Logon carrying that group
-  is reported (`UnknownTag { tag: 384 }`). That is the QuickFIX file's answer and
-  is tested as such.
+- **Stricter loading of self-closing definitions.** A top-level self-closing
+  `<message/>` or `<component/>` used to be skipped silently, whatever it
+  contained. It is now a definition, so one that lacks `msgtype` / `name` is
+  `DictionaryError::MissingAttribute`, and one that repeats another
+  definition's message type or component name is
+  `DictionaryError::DuplicateDefinition`. A caller-supplied XML that loaded
+  before only because such an element was ignored is now rejected.
+- **The dictionary answers, unpatched: an upstream deviation.** FIXT 1.1
+  defines the Logon `MsgTypeGrp` component as the `NoMsgTypes(384)` group
+  (`RefMsgType(372)`, `MsgDirection(385)`, `RefApplVerID(1130)`,
+  `RefApplExtID(1406)`, `RefCstmApplVerID(1131)`, `DefaultVerIndicator(1410)`).
+  The vendored QuickFIX `FIXT11.xml` defines `MsgTypeGrp` with no members and
+  does not define 384 or 385, so a Logon carrying the group is reported
+  (`UnknownTag { tag: 384 }`). The file stays verbatim; the workaround is to
+  load a FIXT 1.1 dictionary that defines the group with
+  `Dictionary::from_quickfix_xml` and compose that. Both the deviation and the
+  workaround are tested. Likewise `FIXT11.xml` gives `DefaultApplVerID(1137)` no
+  enumeration, so any value passes (pinned by a test).
+- **XID / XIDREF are a documented loosening.** Mapping them to `String` checks
+  only their wire form; `XID` uniqueness, `XIDREF` reference integrity and the
+  `xs:ID` / `NCName` lexical rules are not validated.
 - **Crate size.** `spec/` grows from about 0.3 MB to about 1.9 MB uncompressed
   (about 174 KB more compressed; `FIX50SP2.xml` is 1.47 MB of it). The packaged
   `ironfix-dictionary` crate is 2.0 MiB, 249.6 KiB compressed. A binary carries
@@ -130,10 +172,11 @@ application dictionary: the pair already names it.
   golden files; the FIX 5.0 SP2 output (about 50 MB) is generated and inspected
   in a unit test but not compiled.
 - **Not done, stated rather than implied.** FIX 4.0, 4.1, 4.3, 5.0 and 5.0 SP1
-  are not embedded. A FIX 4.x application dictionary over FIXT.1.1 (ApplVerID
-  `2` to `6`) is rejected by `SessionDictionary::new`. Nothing selects the
-  application dictionary from `ApplVerID`. The `Validator` is still not invoked
-  by the engine or the codec.
+  are not embedded (a caller-supplied dictionary of any of them composes with
+  the embedded FIXT 1.1; FIX 4.4 over FIXT.1.1 is tested with the embedded
+  files). Nothing selects the application dictionary from `ApplVerID`.
+  `Validator::new` does not check `BeginString`. The `Validator` is still not
+  invoked by the engine or the codec.
 - **Unchanged.** No new dependency, no feature flag, no `unsafe`, no change to
   the release profile, and no change to the crate DAG: `ironfix-dictionary`
   still depends on `ironfix-core` only, with `ironfix-tagvalue` as a

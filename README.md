@@ -65,10 +65,11 @@ exists yet.
   FIX 4.2 (`Dictionary::fix42()`), FIX 4.4 (`Dictionary::fix44()`), the
   FIXT 1.1 transport dictionary (`Dictionary::fixt11()`) and the FIX 5.0 SP2
   application dictionary (`Dictionary::fix50sp2()`). `SessionDictionary`
-  composes FIXT 1.1 with a FIX 5.0 family application dictionary, and
-  `Validator::for_session` validates against the pair: header and trailer
-  from the transport, body from the application, admin messages entirely
-  from the transport.
+  composes FIXT 1.1 with an application dictionary of any version FIXT 1.1
+  carries (FIX 4.0 through 5.0 SP2), and `Validator::for_session` validates
+  against the pair with QuickFIX-like semantics: `BeginString` must be
+  `FIXT.1.1`, header and trailer come from the transport, the body from the
+  application, and admin messages entirely from the transport.
 - **Code generation.** `#[derive(FixMessage)]` and `#[derive(FixField)]` in
   `ironfix-derive` implement the `ironfix-core` traits with typed
   `DecodeError` / `EncodeError` paths (compile-tested in
@@ -111,10 +112,17 @@ around it.
   FIX 4.0, 4.1, 4.3, 5.0 and 5.0 SP1 require
   `Dictionary::from_quickfix_xml` with your own XML
   (`ironfix-dictionary/src/loader.rs`). `SessionDictionary` does not read
-  `ApplVerID(1128)`: you choose the application dictionary when you build it,
-  and FIX 4.x application dictionaries over FIXT 1.1 are rejected. The
-  `Validator` is *not* invoked by the engine or the codec; you call it yourself
-  (`ironfix-engine/src/lib.rs`).
+  `ApplVerID(1128)`: you choose the application dictionary when you build it.
+  `Validator::new` does not check `BeginString`; only `Validator::for_session`
+  does. The `Validator` is *not* invoked by the engine or the codec; you call
+  it yourself (`ironfix-engine/src/lib.rs`).
+- **The embedded FIXT 1.1 dictionary deviates from FIXT 1.1 on Logon.** The
+  vendored QuickFIX `FIXT11.xml` defines the `MsgTypeGrp` component with no
+  members and does not define `NoMsgTypes(384)` or `MsgDirection(385)`, so a
+  Logon carrying the `NoMsgTypes` group is reported as invalid. The file is
+  kept verbatim; to accept the group, load a FIXT 1.1 dictionary that defines
+  it with `Dictionary::from_quickfix_xml` and compose that
+  (`ironfix-dictionary/spec/README.md`).
 - **Generated code has no consumer.** Nothing in the workspace uses the
   derives or `ironfix-codegen` output, so field access on the session path is
   untyped tag lookup (`ironfix-codegen/src/lib.rs`).
@@ -137,7 +145,9 @@ embedded" means a dictionary is embedded in `ironfix-dictionary` and loadable
 without extra files. The FIX 5.0 family runs over a FIXT 1.1 session, so it
 needs two dictionaries: the FIXT 1.1 transport dictionary (`Dictionary::fixt11()`,
 embedded) and the application dictionary for the version, composed with
-`SessionDictionary`.
+`SessionDictionary`. The same composition accepts a FIX 4.x application
+dictionary, for a counterparty that carries FIX 4.x messages over FIXT 1.1
+(ApplVerID 2 to 6).
 
 | Version | BeginString | Example pair | Dictionary embedded |
 |---------|-------------|--------------|---------------------|
