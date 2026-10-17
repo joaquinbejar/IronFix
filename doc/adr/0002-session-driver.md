@@ -1,6 +1,6 @@
 # ADR-0002 — Sans-IO session core with the Tokio reactor as one driver
 
-- **Status:** Proposed (awaiting the owner's decision on issue #64)
+- **Status:** Accepted (owner decision on issue #64, 2026-10-17)
 - **Date:** 2026-10-17
 
 ## Context
@@ -46,7 +46,7 @@ performance claim without a measured baseline (ADR-0001).
 3. **A second, synchronous engine** next to the async one, duplicating the
    reactor and both handshakes.
 
-## Proposed decision
+## Decision
 
 Option 2, adopted now and built in stages:
 
@@ -87,11 +87,7 @@ converted at the boundary so paused-clock tests stay deterministic.
 - The crate DAG is unchanged: the core lives in `ironfix-session` (or a new
   crate depending on `core` only, decided in the stage-2 issue), and encoding
   stays in the driver.
-- Follow-up issues to file on acceptance: (a) inject the clock into
-  `ironfix-session`; (b) extract the reactor decision logic into the core;
-  (c) synchronous `Application` / store traits for the sans-IO path; (d) a
-  non-Tokio driver example.
-
-If the owner chooses option 1 instead, this ADR is rewritten as "Tokio is the
-only session driver", the README's "Async only" entry becomes a stated
-non-goal, and no follow-up issues are filed.
+- Follow-up issues: #90 (inject the clock into `ironfix-session`), #91
+  (extract the reactor decision logic into the core), #92 (synchronous
+  `Application` / store traits for the sans-IO path), #93 (a poll-driven,
+  non-Tokio driver example).
