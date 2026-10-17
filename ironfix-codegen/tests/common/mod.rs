@@ -12,8 +12,14 @@
 //! field names that collapse onto one identifier, a component-contributed
 //! field, a repeating group, a group nested inside a group, and a message with
 //! no fields at all.
+//!
+//! Alongside it, two of the embedded QuickFIX dictionaries are generated in
+//! full: FIX 4.2 and FIXT 1.1. FIX 5.0 SP2 is deliberately not among them:
+//! its generated source is roughly 50 MB, too large to commit as a golden
+//! file or to compile in CI.
 
 use ironfix_codegen::{CodeGenerator, GeneratorConfig};
+use ironfix_dictionary::DictionaryError;
 use ironfix_dictionary::schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef as SchemaFieldRef, FieldType,
     GroupDef, MessageCategory, MessageDef, Version,
@@ -116,4 +122,31 @@ pub fn generate_sample() -> String {
         Ok(code) => code,
         Err(err) => panic!("the sample dictionary must generate: {err}"),
     }
+}
+
+/// Generates from an embedded dictionary, failing the test on a load or a
+/// generator error rather than unwrapping.
+#[track_caller]
+fn generate_embedded(loaded: Result<&'static Dictionary, DictionaryError>, what: &str) -> String {
+    let dict = match loaded {
+        Ok(dict) => dict,
+        Err(err) => panic!("the embedded {what} dictionary must load: {err}"),
+    };
+    let generator = CodeGenerator::with_config(GeneratorConfig::default());
+    match generator.generate(dict) {
+        Ok(code) => code,
+        Err(err) => panic!("the embedded {what} dictionary must generate: {err}"),
+    }
+}
+
+/// Generates from the embedded FIX 4.2 dictionary (`golden/fix42.rs`).
+#[track_caller]
+pub fn generate_fix42() -> String {
+    generate_embedded(Dictionary::fix42(), "FIX 4.2")
+}
+
+/// Generates from the embedded FIXT 1.1 dictionary (`golden/fixt11.rs`).
+#[track_caller]
+pub fn generate_fixt11() -> String {
+    generate_embedded(Dictionary::fixt11(), "FIXT 1.1")
 }
