@@ -25,9 +25,10 @@ field slices that borrow the input buffer, with schema validation available as a
 separate, opt-in pass.
 
 **Scope.** IronFix covers the FIX tag=value layer (FIX 4.0 to FIX 5.0 SP2 over
-FIXT.1.1) and FAST. Binary order-entry stacks, SBE over SOFH with a FIXP
-session, are outside it and belong next to an SBE codec (see
-`doc/adr/0003-fixp-sofh-placement.md`).
+FIXT.1.1) and FAST. A binary order-entry stack, SOFH framing and a FIXP session
+over SBE (via `ironsbe-core`), is planned inside the workspace
+(`doc/adr/0003-fixp-sofh-in-workspace.md`, tracked in #94 to #97); none of it
+exists yet.
 
 **What works today**, end to end:
 
