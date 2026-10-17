@@ -70,11 +70,12 @@ use tokio_util::codec::{Decoder, Encoder};
 /// [`Decoder::decode`] consumes bytes on the recoverable paths so that a caller
 /// that keeps reading is not stuck re-parsing the same garbage. *Resync* means:
 /// discard up to the next candidate frame start, so the buffer restarts there.
-/// Without recovery a candidate is the `8` of a `<SOH>8` pair; with
-/// [`FixCodec::with_garbled_recovery`] it is also any `8=FIX` (see that method
-/// for why). When there is no candidate the whole buffer is discarded, except a
+/// Without recovery a candidate is the `8` of a `<SOH>8` pair. With
+/// [`FixCodec::with_garbled_recovery`] it is a complete header opening
+/// (`8=<BeginString><SOH>9=`) after a plausible boundary (see that method for
+/// why). When there is no candidate the whole buffer is discarded, except a
 /// tail that may still become one: a trailing `<SOH>` without recovery, a
-/// trailing prefix of `8=FIX` with it.
+/// partial header opening with it.
 ///
 /// | Variant | Recoverable | Bytes consumed |
 /// |---|---|---|
@@ -208,11 +209,20 @@ const SOH: u8 = 0x01;
 /// The two bytes every FIX frame starts with.
 const BEGIN_STRING_PREFIX: &[u8] = b"8=";
 
-/// The bytes recovery mode also accepts as a frame start.
+/// The header openings recovery mode accepts as a frame start.
 ///
-/// `8=` followed by the `FIX` that opens every BeginString in the family
-/// (`FIX.4.0` … `FIX.4.4`, `FIXT.1.1`). See [`recovery_resync_offset`].
-const RECOVERY_ANCHOR: &[u8] = b"8=FIX";
+/// `8=`, a BeginString of the FIX family (`FIX.4.0` to `FIX.4.4`, and
+/// `FIXT.1.1` for every 5.0 session), SOH, then the `9=` that must follow. A
+/// resync only lands on one of these exact openings; see
+/// [`recovery_resync_offset`].
+const RECOVERY_ANCHORS: [&[u8]; 6] = [
+    b"8=FIX.4.0\x019=",
+    b"8=FIX.4.1\x019=",
+    b"8=FIX.4.2\x019=",
+    b"8=FIX.4.3\x019=",
+    b"8=FIX.4.4\x019=",
+    b"8=FIXT.1.1\x019=",
+];
 
 /// The two bytes that open the BodyLength field.
 const BODY_LENGTH_PREFIX: &[u8] = b"9=";
@@ -320,25 +330,76 @@ fn resync_offset(src: &[u8]) -> usize {
     src.len()
 }
 
+/// How the bytes at a candidate frame start compare with [`RECOVERY_ANCHORS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorShape {
+    /// The bytes open with one of the accepted headers.
+    Complete,
+    /// The buffer ends inside what could still become an accepted header.
+    Partial,
+    /// The bytes cannot open an accepted header.
+    Rejected,
+}
+
+/// Classifies `rest`, which starts at a candidate `8`, against every accepted
+/// header opening. At most a dozen bytes are compared per opening, and a
+/// mismatch is normally found within the first two.
+#[must_use]
+fn anchor_shape(rest: &[u8]) -> AnchorShape {
+    let mut shape = AnchorShape::Rejected;
+    for anchor in RECOVERY_ANCHORS {
+        if rest.starts_with(anchor) {
+            return AnchorShape::Complete;
+        }
+        if rest.len() < anchor.len() && anchor.starts_with(rest) {
+            shape = AnchorShape::Partial;
+        }
+    }
+    shape
+}
+
+/// Returns whether a frame may start right after `prev`, the byte before a
+/// candidate `8` (`None` at the start of the buffer).
+///
+/// A frame follows an SOH, or garbage. It never follows an ASCII digit or `=`:
+/// that `8` is part of a tag (`448=`, `18=`) or the first byte of a field value
+/// (`96=8=FIX…`, `213=8=FIX…`), which is exactly where a data field can carry a
+/// complete embedded frame.
+#[must_use]
+const fn boundary_before(prev: Option<u8>) -> bool {
+    match prev {
+        None => true,
+        Some(byte) => !byte.is_ascii_digit() && byte != b'=',
+    }
+}
+
 /// Recovery-mode counterpart of [`resync_offset`]: returns how many bytes to
 /// discard so the buffer restarts at the next candidate frame.
 ///
-/// A candidate is any `8` at offset 1 or later that is either preceded by SOH
-/// (the [`resync_offset`] anchor) or starts [`RECOVERY_ANCHOR`] (`8=FIX`).
-/// The second anchor is what lets a well-formed frame that arrives straight
-/// after garbage survive: its `8=` follows the garbage, not an SOH. `8=FIX`
-/// can also occur inside a field value (`58=8=FIX…`), and such a false
-/// candidate is not trusted: it still has to pass the full header and trailer
-/// checks, and a false one fails them and is skipped in turn.
+/// A candidate is an `8` at offset 1 or later that passes two checks before it
+/// is returned. The byte before it must be a plausible frame boundary (see
+/// [`boundary_before`]), and the bytes from it must open a real header: `8=`, a
+/// FIX-family BeginString, SOH, `9=` ([`RECOVERY_ANCHORS`]). Checking the shape
+/// here, rather than letting the decoder find out, means a false start such as
+/// a tag `851=` after an SOH, `58=8=FIX`, or `448=FIX.4.4` costs about a dozen
+/// byte comparisons and is never counted as a garbled frame. The boundary check
+/// is what keeps a complete frame embedded in a data field (`96=`, `213=`,
+/// `355=`) of a garbled outer frame from being resynchronised onto and handed
+/// up as a phantom inbound message.
+///
+/// The anchor is also what lets a well-formed frame that arrives straight
+/// after garbage survive: its opening follows the garbage, not an SOH, which
+/// [`resync_offset`] would miss. What it cannot see is a frame whose preceding
+/// byte is an ASCII digit or `=`, for example after garbage that ends in a
+/// digit; that frame is skipped and its gap recovered like any other.
 ///
 /// Offset 0 is never a candidate (it is the frame that just failed), so the
 /// result is at least 1 for any buffer of two or more bytes, which is what
 /// guarantees that recovery makes progress. When there is no candidate the
-/// whole buffer is garbage, except a trailing proper prefix of `8=FIX` that the
-/// next read may complete. Unlike [`resync_offset`], a trailing SOH is not
-/// kept: every real frame start matches `8=FIX` on its own, and a kept SOH
-/// would only make the next read's frame start look garbled and count the same
-/// garbage twice.
+/// whole buffer is garbage, except a tail that is a partial header opening the
+/// next read may complete. Unlike [`resync_offset`], a lone trailing SOH is not
+/// kept: it would only make the next read's frame start look garbled and count
+/// the same garbage twice.
 ///
 /// One forward pass that stops at the first candidate, so the cost is linear
 /// in the bytes discarded; the result never exceeds `src.len()`.
@@ -349,46 +410,24 @@ fn recovery_resync_offset(src: &[u8]) -> usize {
         let Some(candidate) = from.checked_add(relative) else {
             return src.len();
         };
-        let after_soh = candidate
+        let prev = candidate
             .checked_sub(1)
             .and_then(|index| src.get(index))
-            .copied()
-            == Some(SOH);
-        let starts_anchor = src
-            .get(candidate..)
-            .is_some_and(|rest| rest.starts_with(RECOVERY_ANCHOR));
-        if after_soh || starts_anchor {
-            return candidate;
+            .copied();
+        if boundary_before(prev) {
+            let shape = src
+                .get(candidate..)
+                .map_or(AnchorShape::Rejected, anchor_shape);
+            if shape != AnchorShape::Rejected {
+                return candidate;
+            }
         }
         let Some(next) = candidate.checked_add(1) else {
             return src.len();
         };
         from = next;
     }
-    retained_tail_start(src)
-}
-
-/// Returns where the tail worth keeping starts in a buffer with no candidate
-/// frame, or `src.len()` when nothing is worth keeping.
-///
-/// The tail is a proper prefix of [`RECOVERY_ANCHOR`] (`8`, `8=`, `8=F`,
-/// `8=FI`), which the next read may complete into a frame start. It never
-/// starts at offset 0, so keeping it still makes progress.
-#[must_use]
-fn retained_tail_start(src: &[u8]) -> usize {
-    let len = src.len();
-    // Longest proper prefix first, so `8=FI` is kept whole.
-    for prefix_len in (1..RECOVERY_ANCHOR.len()).rev() {
-        if let (Some(start), Some(prefix)) = (
-            len.checked_sub(prefix_len),
-            RECOVERY_ANCHOR.get(..prefix_len),
-        ) && start >= 1
-            && src.ends_with(prefix)
-        {
-            return start;
-        }
-    }
-    len
+    src.len()
 }
 
 /// Where a frame's body ends and the frame itself ends, as implied by its
@@ -473,10 +512,18 @@ impl FixCodec {
     /// - `MissingBodyLength`, `InvalidBodyLength` and `HeaderTooLong`, which
     ///   consume nothing without recovery, resynchronise instead, so the skip
     ///   makes progress.
-    /// - The resync also anchors on `8=FIX`, not only on `<SOH>8`, so a valid
-    ///   frame that arrives straight after garbage is not lost with it. A
-    ///   false match inside a field value must still pass the header and
-    ///   trailer checks, and is skipped in turn when it does not.
+    /// - The resync anchors on a complete header opening instead of a bare
+    ///   `<SOH>8`: `8=`, a FIX-family BeginString (`FIX.4.0` to `FIX.4.4`,
+    ///   `FIXT.1.1`), SOH, `9=`, preceded by SOH, the start of the buffer, or
+    ///   any byte that is neither an ASCII digit nor `=`. A valid frame that
+    ///   arrives straight after garbage is therefore not lost with it, a tag
+    ///   such as `851=` inside a skipped frame is not mistaken for a frame
+    ///   start, and a complete frame embedded in a data field (`96=8=FIX…`) is
+    ///   never resynchronised onto. A false start is rejected inside the scan,
+    ///   so it is never counted. The residual risk is a data field whose value
+    ///   itself contains `<SOH>8=FIX.4.x<SOH>9=` inside a frame that is already
+    ///   garbled: the resync can land there. A stream whose BeginString is not
+    ///   in the family still frames, but a resync never lands on it.
     /// - In the header phase, the 64-byte header ceiling is checked before the
     ///   frame ceiling, so whether malformed header bytes are skipped never
     ///   depends on how many good frames happen to be buffered behind them.
@@ -499,10 +546,13 @@ impl FixCodec {
     /// call, and resets the count to zero.
     ///
     /// Each skip is one recoverable framing error the codec resynchronised
-    /// past. That is normally one per garbled frame; a frame garbled so badly
-    /// that its remains contain a false frame start (`8=FIX` inside a field
-    /// value) counts once per false start as well. Always zero when recovery
-    /// is off, because every malformed frame is then returned as an error.
+    /// past, which is one per garbled frame: false frame starts inside it are
+    /// rejected by the resync scan and never counted. The exception is a
+    /// partial header opening cut off by the end of the buffer, which is kept
+    /// for the next read; if that read shows it was garbage, it counts once.
+    /// Separately delivered chunks of garbage count separately. Always zero
+    /// when recovery is off, because every malformed frame is then returned as
+    /// an error.
     #[must_use = "the count is reset by this call; dropping it loses the skips it reports"]
     pub const fn take_garbled_count(&mut self) -> u64 {
         std::mem::replace(&mut self.garbled_count, 0)
@@ -630,6 +680,7 @@ impl FixCodec {
     /// The anchor depends on the mode: [`resync_offset`] without recovery,
     /// [`recovery_resync_offset`] with it. Both return an offset within
     /// `src`, so the advance is always in bounds.
+    #[cold]
     fn resync(&self, src: &mut BytesMut) -> usize {
         let discarded = if self.garbled_recovery {
             recovery_resync_offset(src)
@@ -640,20 +691,66 @@ impl FixCodec {
         discarded
     }
 
-    /// Logs a resynchronisation, naming how many bytes it discarded and never
-    /// the bytes themselves.
+    /// Logs a resynchronisation without recovery, naming how many bytes it
+    /// discarded and never the bytes themselves.
     ///
     /// Without recovery a resync accompanies a returned error, so it is a
-    /// warning. With recovery it is routine, and one warning per skip would let
-    /// a peer streaming garbage flood the log; the caller aggregates the skips
-    /// through [`FixCodec::take_garbled_count`] instead, and this drops to
-    /// debug.
+    /// warning. With recovery it is routine and is reported once per skip, at
+    /// debug, by [`FixCodec::record_skip`]; logging here too would double it,
+    /// and a warning per skip would let a peer streaming garbage flood the log.
+    #[cold]
     fn log_resync(&self, discarded: usize, cause: &'static str) {
-        if self.garbled_recovery {
-            tracing::debug!(discarded, cause, "garbled FIX frame: resynchronised");
-        } else {
+        if !self.garbled_recovery {
             tracing::warn!(discarded, cause, "garbled FIX frame: resynchronised");
         }
+    }
+
+    /// Bookkeeping for one skipped garbled frame in recovery mode: count it,
+    /// guarantee progress, and emit the single debug event for the skip.
+    ///
+    /// `before` is the buffer length before the failed framing attempt, so
+    /// `before - src.len()` is what the skip discarded.
+    ///
+    /// # Errors
+    /// Returns `error` itself when the counter cannot represent another skip,
+    /// rather than hiding the frame. Unreachable in practice: every skip
+    /// consumes at least one byte, so it takes 2^64 bytes.
+    #[cold]
+    #[inline(never)]
+    fn record_skip(
+        &mut self,
+        src: &mut BytesMut,
+        before: usize,
+        error: CodecError,
+    ) -> Result<(), CodecError> {
+        let Some(count) = self.garbled_count.checked_add(1) else {
+            return Err(error);
+        };
+        self.garbled_count = count;
+
+        // Every recoverable path consumes at least one byte in recovery mode,
+        // and that is what bounds the decode loop by the buffer length. It is
+        // enforced rather than assumed: a path that consumed nothing would
+        // otherwise spin forever on the same bytes.
+        debug_assert!(
+            src.len() < before,
+            "a recoverable framing error must consume input"
+        );
+        if src.len() >= before && !src.is_empty() {
+            src.advance(1);
+        }
+        // The buffer never grows inside a framing attempt, so the subtraction
+        // always succeeds; the other arm still emits the one event per skip.
+        match before.checked_sub(src.len()) {
+            Some(discarded) => tracing::debug!(
+                cause = %error,
+                discarded,
+                skipped = count,
+                "skipped a garbled FIX frame"
+            ),
+            None => tracing::debug!(cause = %error, skipped = count, "skipped a garbled FIX frame"),
+        }
+        Ok(())
     }
 
     /// Reports a header that cannot frame a legal message.
@@ -662,6 +759,7 @@ impl FixCodec {
     /// the error is the caller's to act on. With recovery a recoverable header
     /// error is about to be skipped, so the codec resynchronises first and the
     /// skip makes progress. A fatal error is never resynchronised.
+    #[cold]
     fn reject_header(
         &self,
         src: &mut BytesMut,
@@ -813,26 +911,7 @@ impl Decoder for FixCodec {
             if !self.garbled_recovery || !error.is_recoverable() {
                 return Err(error);
             }
-            // A counter that cannot represent another skip reports this one as
-            // the error it is rather than hiding it. Unreachable in practice:
-            // every skip consumes at least one byte, so it takes 2^64 bytes.
-            let Some(count) = self.garbled_count.checked_add(1) else {
-                return Err(error);
-            };
-            self.garbled_count = count;
-            tracing::debug!(error = %error, skipped = count, "skipped a garbled FIX frame");
-
-            // Every recoverable path consumes at least one byte in recovery
-            // mode, and that is what bounds this loop by the buffer length. It
-            // is enforced rather than assumed: a path that consumed nothing
-            // would otherwise spin forever on the same bytes.
-            debug_assert!(
-                src.len() < before,
-                "a recoverable framing error must consume input"
-            );
-            if src.len() >= before && !src.is_empty() {
-                src.advance(1);
-            }
+            self.record_skip(src, before, error)?;
         }
     }
 }
@@ -1800,10 +1879,11 @@ mod tests {
     }
 
     #[test]
-    fn test_recovery_false_anchor_inside_a_field_is_rejected_and_skipped() {
-        // The garbled frame's Text (58) carries `8=FIX`, so the resync lands on
-        // it. That false start has no BodyLength and is skipped in turn; the
-        // real frame after it is still returned in the same call.
+    fn test_recovery_false_anchor_inside_a_field_is_not_an_anchor() {
+        // The garbled frame's Text (58) carries `8=FIX`. The resync scan
+        // rejects it (it follows `=` and is not a complete header opening), so
+        // it is never counted, and the real frame after it is still returned in
+        // the same call.
         let mut codec = recovering();
         let good = make_fix_message("35=0\x0149=A\x01");
         let mut buf =
@@ -1813,7 +1893,57 @@ mod tests {
         let frame = decode_frame(&mut codec, &mut buf);
         assert_eq!(&frame[..], &good[..]);
         assert!(buf.is_empty());
-        assert_eq!(codec.take_garbled_count(), 2);
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_execution_report_with_8xx_tags_counts_once() {
+        // One ExecutionReport whose BodyLength is wrong, carrying tags 851, 828
+        // and 880. Each of them is an `8` after an SOH; a bare `<SOH>8` anchor
+        // resynchronised onto every one and counted it, so a limit of 3 logged
+        // the session out over a single garbled fill.
+        let mut codec = recovering();
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut buf = BytesMut::from(
+            &b"8=FIX.4.4\x019=3\x0135=8\x0137=1\x01851=1\x01828=0\x01880=X\x0110=000\x01"[..],
+        );
+        buf.extend_from_slice(&good);
+
+        let mut frames = Vec::new();
+        assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+        let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+        assert_eq!(got, vec![&good[..]]);
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_frame_embedded_in_a_data_field_is_not_delivered() {
+        // A complete, checksum-valid frame inside RawData (96) or XmlData (213)
+        // of a garbled outer frame. The outer BodyLength is wrong, so the codec
+        // resyncs through the outer body; the embedded frame follows `=` and
+        // must never be resynchronised onto and handed up as a phantom.
+        let inner = make_fix_message("35=0\x0149=X\x0156=Y\x0134=99\x01");
+        for (length_tag, data_tag) in [(95u32, 96u32), (212, 213)] {
+            let mut outer = format!(
+                "8=FIX.4.4\x019=5\x0135=D\x01{length_tag}={}\x01",
+                inner.len()
+            )
+            .into_bytes();
+            outer.extend_from_slice(format!("{data_tag}=").as_bytes());
+            outer.extend_from_slice(&inner);
+            outer.extend_from_slice(b"\x0110=000\x01");
+            let good = make_fix_message("35=1\x0149=A\x01112=PING\x01");
+
+            let mut codec = recovering();
+            let mut buf = BytesMut::from(&outer[..]);
+            buf.extend_from_slice(&good);
+            let mut frames = Vec::new();
+            assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+
+            let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+            assert_eq!(got, vec![&good[..]], "data tag {data_tag}");
+            assert_eq!(codec.take_garbled_count(), 1, "data tag {data_tag}");
+        }
     }
 
     #[test]
@@ -1854,23 +1984,59 @@ mod tests {
 
     #[test]
     fn test_recovery_resync_offset_anchors() {
-        // A bare `8=FIX` after garbage is a candidate.
-        assert_eq!(recovery_resync_offset(b"xx8=FIX.4.4\x01"), 2);
-        // So is the `8` of a `<SOH>8` pair, and the earliest candidate wins.
-        assert_eq!(recovery_resync_offset(b"x\x0189=1\x01 8=FIX"), 2);
-        // Offset 0 is the frame that failed and is never a candidate.
-        assert_eq!(recovery_resync_offset(b"8=FIX8=FIX"), 5);
-        // A `8` that starts neither anchor is skipped.
-        assert_eq!(recovery_resync_offset(b"58=1 18=2 8=FIX"), 10);
-        // No candidate: keep a partial anchor, else nothing. A trailing SOH is
-        // not kept in recovery mode; `8=FIX` finds the next frame without it.
+        // A complete header opening after garbage, after an SOH, or for every
+        // BeginString in the family is a candidate.
+        assert_eq!(recovery_resync_offset(b"xx8=FIX.4.4\x019=5\x01"), 2);
+        assert_eq!(recovery_resync_offset(b"x\x018=FIX.4.0\x019=5\x01"), 2);
+        assert_eq!(recovery_resync_offset(b"x 8=FIXT.1.1\x019=5\x01"), 2);
+        // None of the following holds a candidate, so all of it goes:
+        let no_candidate: [&[u8]; 7] = [
+            // tags that start with 8 after an SOH, however many;
+            b"x\x01851=1\x01828=0\x01880=X\x01",
+            // an opening inside a field value or a tag (`=` or a digit before);
+            b"x\x01213=8=FIX.4.4\x019=5\x01",
+            b"x\x01448=FIX.4.4\x019=5\x01",
+            b"x 58=1 18=2\x01",
+            // an unknown BeginString, or an opening without `<SOH>9=`;
+            b"x 8=FIX.9.9\x019=5\x01",
+            b"x 8=FIX.4.4\x0135=0\x01",
+            // offset 0, which is the frame that failed.
+            b"8=FIX.4.4\x019=5\x01",
+        ];
+        for input in no_candidate {
+            assert_eq!(recovery_resync_offset(input), input.len(), "{input:?}");
+        }
+        // A partial opening cut off by the end of the buffer is kept for the
+        // next read; anything else goes. A trailing SOH is not kept.
         assert_eq!(recovery_resync_offset(b"abc8="), 3);
+        assert_eq!(recovery_resync_offset(b"abc 8=FIX.4.4\x01"), 4);
+        assert_eq!(recovery_resync_offset(b"abc8=FOO"), 8);
         assert_eq!(recovery_resync_offset(b"abc\x01"), 4);
         assert_eq!(recovery_resync_offset(b"abcdef"), 6);
         // Progress is guaranteed for every buffer of two or more bytes.
         for input in [&b"8="[..], b"8\x01", b"\x01\x01", b"88", b"8=FIX", b"8=FI"] {
             assert!(recovery_resync_offset(input) >= 1, "{input:?}");
         }
+    }
+
+    #[test]
+    fn test_anchor_shape_and_boundary_classify_candidates() {
+        assert_eq!(
+            anchor_shape(b"8=FIX.4.2\x019=12\x01"),
+            AnchorShape::Complete
+        );
+        assert_eq!(anchor_shape(b"8=FIXT.1.1\x019="), AnchorShape::Complete);
+        assert_eq!(anchor_shape(b"8=FIX.4"), AnchorShape::Partial);
+        assert_eq!(anchor_shape(b"8"), AnchorShape::Partial);
+        assert_eq!(anchor_shape(b"851=1"), AnchorShape::Rejected);
+        assert_eq!(anchor_shape(b"8=FIX.4.4\x0135="), AnchorShape::Rejected);
+
+        assert!(boundary_before(None));
+        assert!(boundary_before(Some(SOH)));
+        assert!(boundary_before(Some(b'!')));
+        assert!(boundary_before(Some(0xff)));
+        assert!(!boundary_before(Some(b'=')));
+        assert!(!boundary_before(Some(b'4')));
     }
 
     #[test]
@@ -1936,9 +2102,13 @@ mod tests {
         // Property sweep: corrupt every byte of the first frame with every byte
         // that matters to the framer. Whatever the corruption, the codec must
         // not panic, must not report an error, must settle, must never hand up
-        // the corrupted frame, and must deliver every frame after it intact.
-        // B is long enough that no single-byte change to A's BodyLength can
-        // reach B's trailer, so B's survival is part of the property.
+        // the corrupted frame, must count it exactly once, and must deliver
+        // every frame after it intact. B is long enough that no single-byte
+        // change to A's BodyLength can reach B's trailer, so B's survival is
+        // part of the property, with one designed exception: when A's final
+        // SOH becomes a digit or `=`, B's opening no longer follows a plausible
+        // frame boundary, so the resync passes over it (B's gap is then
+        // recovered by ResendRequest like any other).
         let a = make_fix_message("35=0\x0149=A\x0156=B\x01");
         let b = make_fix_message(&format!("35=0\x0149=B\x0158={}\x01", "t".repeat(120)));
         let c = make_fix_message("35=1\x0149=C\x01112=PING\x01");
@@ -1974,13 +2144,20 @@ mod tests {
                 let context = format!("byte {index} -> 0x{replacement:02x}");
                 assert_eq!(first, None, "{context}: recovery must not error");
                 assert_eq!(second, None, "{context}: recovery must not error");
-                let mut expected: Vec<&[u8]> = vec![&b[..], &c[..]];
+                let b_hidden =
+                    index + 1 == a.len() && (replacement.is_ascii_digit() || replacement == b'=');
+                let mut expected: Vec<&[u8]> = if b_hidden {
+                    vec![&c[..]]
+                } else {
+                    vec![&b[..], &c[..]]
+                };
                 expected.extend(std::iter::repeat_n(&filler[..], 8));
                 let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
                 assert_eq!(got, expected, "{context}");
-                assert!(
-                    codec.take_garbled_count() >= 1,
-                    "{context}: A must be skipped"
+                assert_eq!(
+                    codec.take_garbled_count(),
+                    1,
+                    "{context}: A is skipped exactly once"
                 );
                 assert!(buf.is_empty(), "{context}: {} bytes left", buf.len());
             }
@@ -2083,9 +2260,11 @@ mod tests {
 
     #[test]
     fn test_recovery_anchor_floods_settle_in_one_call_and_stay_bounded() {
-        // Every `8=FIX` and every `<SOH>8` is a candidate, so these buffers are
-        // worst cases for the number of skips. One call must settle, leave a
-        // bounded remainder, and return nothing.
+        // Buffers dense in near-anchors: every `8=FIX`, every `<SOH>8`, every
+        // `8=FIX.4.4<SOH>` without its `9=`. Each one is rejected inside the
+        // resync scan, so one call settles, leaves a bounded remainder (the
+        // final partial opening), returns nothing, and counts the whole buffer
+        // as a single garbled span.
         for unit in [&b"8=FIX"[..], b"\x018", b"8=FIX.4.4\x01"] {
             let mut codec = recovering();
             let mut buf = BytesMut::new();
@@ -2098,7 +2277,7 @@ mod tests {
                 "{unit:?}: {} bytes left",
                 buf.len()
             );
-            assert!(codec.take_garbled_count() >= 1_000, "{unit:?}");
+            assert_eq!(codec.take_garbled_count(), 1, "{unit:?}");
         }
     }
 
@@ -2119,11 +2298,22 @@ mod tests {
 
         let mut stream = Vec::new();
         let rounds = 300;
+        // Frames whose opening follows a plausible boundary: no noise before
+        // them, or noise that ends in neither a digit nor `=`. A frame after a
+        // digit or `=` is passed over by design (it is indistinguishable from
+        // `448=FIX…` or `96=8=FIX…`), so only these can be expected back.
+        let mut eligible = 0usize;
         for _ in 0..rounds {
             let noise_len = next() % 48;
+            let mut last = None;
             for _ in 0..noise_len {
                 let pick = usize::try_from(next() % 15).unwrap_or(0);
-                stream.push(alphabet.get(pick).copied().unwrap_or(b'X'));
+                let byte = alphabet.get(pick).copied().unwrap_or(b'X');
+                stream.push(byte);
+                last = Some(byte);
+            }
+            if last.is_none_or(|byte| boundary_before(Some(byte))) {
+                eligible += 1;
             }
             stream.extend_from_slice(&good);
         }
@@ -2133,15 +2323,20 @@ mod tests {
         let mut frames = Vec::new();
         assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
         assert!(frames.iter().all(|frame| frame[..] == good[..]));
-        // Not every frame can survive: noise that happens to spell a header
-        // whose declared BodyLength lands exactly on the next frame's
-        // `<SOH>10=NNN<SOH>` has a corroborated boundary, and a checksum error
-        // consumes that whole declared span, frame included. With this seed 297
-        // of the 300 frames survive; the bound leaves room for that policy
-        // without letting a resync regression go unnoticed.
+        assert!(frames.len() <= rounds);
         assert!(
-            frames.len() * 10 >= rounds * 9,
-            "only {} of {rounds} frames survived the noise",
+            eligible * 4 >= rounds,
+            "the seed must leave enough eligible frames to mean something"
+        );
+        // Not every eligible frame need survive either: noise that happens to
+        // spell a header whose declared BodyLength lands exactly on the next
+        // frame's `<SOH>10=NNN<SOH>` has a corroborated boundary, and a checksum
+        // error consumes that whole declared span, frame included. With this
+        // seed all 117 eligible frames (of 300) survive; the bound leaves room
+        // for that policy without letting a resync regression go unnoticed.
+        assert!(
+            frames.len() * 10 >= eligible * 9,
+            "only {} of {eligible} eligible frames survived the noise",
             frames.len()
         );
     }
