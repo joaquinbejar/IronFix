@@ -810,7 +810,15 @@ fn walk_group(
             entries = next;
             seen_in_entry.clear();
             seen_in_entry.insert(tag);
-            cursor += 1;
+            // The delimiter is the entry's first field, and that field can
+            // itself be the count tag of a nested group: FIX 5.0 SP2
+            // NoAsgnReqs(1499) entries open with NoPartyIDs(453). The nested
+            // group's members follow it, so it has to be walked from here,
+            // not stepped over like a plain field.
+            cursor = match group.entry.groups.get(&tag) {
+                Some(nested) => walk_group(tags, fields, cursor, nested, errors),
+                None => cursor + 1,
+            };
             continue;
         }
         if !group.entry.allowed.contains(&tag) {
@@ -2409,6 +2417,206 @@ mod tests {
         assert_eq!(
             validate_using(Validator::for_session(&session), &fields),
             Ok(())
+        );
+    }
+
+    // --- A group whose delimiter is a nested group's count tag ---------------
+
+    /// A FIX 5.0 SP2 StreamAssignmentRequest (35=CC) under a FIXT 1.1 header.
+    ///
+    /// Its NoAsgnReqs(1499) entries open with the `Parties` component, whose
+    /// first member is the NoPartyIDs(453) group, so the loader derives 453
+    /// as the NoAsgnReqs delimiter: every entry starts with a nested group.
+    fn stream_assignment_request<'a>(groups: &[&'a str]) -> Vec<&'a str> {
+        let mut fields = fixt11_header("35=CC");
+        fields.extend(["1128=9", "1497=REQ-1", "1498=1"]);
+        fields.extend_from_slice(groups);
+        fields.push("10=000");
+        fields
+    }
+
+    #[test]
+    fn test_fix50sp2_no_asgn_reqs_is_delimited_by_a_nested_group() {
+        let session = fixt11_fix50sp2();
+        let message = match session.application().get_message("CC") {
+            Some(message) => message,
+            None => panic!("StreamAssignmentRequest is defined"),
+        };
+        let component = match message.components.first() {
+            Some(reference) => reference.name.as_str(),
+            None => panic!("StreamAssignmentRequest references StrmAsgnReqGrp"),
+        };
+        let group = session
+            .application()
+            .get_component(component)
+            .and_then(|def| def.groups.iter().find(|group| group.count_tag == 1499));
+        match group {
+            Some(group) => assert_eq!(group.delimiter_tag, 453),
+            None => panic!("NoAsgnReqs(1499) is defined in {component}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_for_session_group_led_by_a_nested_group_passes() {
+        // Before the fix the delimiter 453 was stepped over like a plain
+        // field, so the party fields fell outside the group and were
+        // reported as not allowed for the message.
+        let fields = stream_assignment_request(&["1499=1", "453=1", "448=P", "447=D", "452=1"]);
+        assert_eq!(validate_session(&fields), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_for_session_group_led_by_a_nested_group_with_two_entries_passes() {
+        let fields = stream_assignment_request(&[
+            "1499=2", "453=1", "448=P1", "447=D", "452=1", "453=2", "448=P2", "447=D", "452=1",
+            "448=P3", "447=D", "452=3",
+        ]);
+        assert_eq!(validate_session(&fields), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_for_session_nested_group_delimiter_count_mismatch_is_reported() {
+        // `453=1` declares one party entry and none follows. Before the fix
+        // the nested group was never walked, so the mismatch went unseen.
+        let fields = stream_assignment_request(&["1499=1", "453=1"]);
+        assert_eq!(
+            validate_session(&fields),
+            Err(vec![ValidationError::GroupCountMismatch {
+                count_tag: 453,
+                name: "NoPartyIDs".to_string(),
+                declared: 1,
+                actual: 0,
+                delimiter_tag: 448,
+            }])
+        );
+    }
+
+    /// A minimal QuickFIX dialect whose groups are delimited by a nested
+    /// group, directly (`U6`: NoOuter(100) opens with NoInner(110)) and
+    /// through a component (`U7`: NoWrapped(120) opens with the component
+    /// `Lead`, whose first member is NoInner(110)).
+    const NESTED_DELIMITER_XML: &str = r"<fix type='FIX' major='4' minor='4'>
+        <header>
+            <field name='BeginString' required='Y'/>
+            <field name='BodyLength' required='Y'/>
+            <field name='MsgType' required='Y'/>
+        </header>
+        <trailer><field name='CheckSum' required='Y'/></trailer>
+        <messages>
+            <message name='Direct' msgtype='U6' msgcat='app'>
+                <group name='NoOuter' required='N'>
+                    <group name='NoInner' required='N'>
+                        <field name='InnerKey' required='N'/>
+                    </group>
+                    <field name='OuterField' required='N'/>
+                </group>
+            </message>
+            <message name='Wrapped' msgtype='U7' msgcat='app'>
+                <group name='NoWrapped' required='N'>
+                    <component name='Lead' required='N'/>
+                    <field name='OuterField' required='N'/>
+                </group>
+            </message>
+        </messages>
+        <components>
+            <component name='Lead'>
+                <group name='NoInner' required='N'>
+                    <field name='InnerKey' required='N'/>
+                </group>
+            </component>
+        </components>
+        <fields>
+            <field number='8' name='BeginString' type='STRING'/>
+            <field number='9' name='BodyLength' type='LENGTH'/>
+            <field number='10' name='CheckSum' type='STRING'/>
+            <field number='35' name='MsgType' type='STRING'/>
+            <field number='100' name='NoOuter' type='NUMINGROUP'/>
+            <field number='110' name='NoInner' type='NUMINGROUP'/>
+            <field number='120' name='NoWrapped' type='NUMINGROUP'/>
+            <field number='201' name='OuterField' type='STRING'/>
+            <field number='210' name='InnerKey' type='STRING'/>
+        </fields>
+    </fix>";
+
+    /// Validates `body` as a message of type `msg_type` in the dialect.
+    #[track_caller]
+    fn validate_nested_delimiter(
+        msg_type: &str,
+        body: &[&str],
+    ) -> Result<(), Vec<ValidationError>> {
+        let dict = ok(
+            Dictionary::from_quickfix_xml(NESTED_DELIMITER_XML),
+            "nested-delimiter dialect loads",
+        );
+        let mut fields = vec!["8=FIX.4.4", "9=100", msg_type];
+        fields.extend_from_slice(body);
+        fields.push("10=000");
+        validate_with(&dict, &fields)
+    }
+
+    #[test]
+    fn test_nested_delimiter_dialect_derives_the_nested_count_tag_as_delimiter() {
+        let dict = ok(
+            Dictionary::from_quickfix_xml(NESTED_DELIMITER_XML),
+            "nested-delimiter dialect loads",
+        );
+        for (msg_type, count_tag) in [("U6", 100), ("U7", 120)] {
+            let group = dict
+                .get_message(msg_type)
+                .and_then(|message| message.groups.iter().find(|g| g.count_tag == count_tag));
+            match group {
+                Some(group) => assert_eq!(group.delimiter_tag, 110, "{msg_type}"),
+                None => panic!("{msg_type} carries group {count_tag}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_group_led_by_a_nested_group_passes() {
+        for (msg_type, count) in [("35=U6", "100=2"), ("35=U7", "120=2")] {
+            assert_eq!(
+                validate_nested_delimiter(
+                    msg_type,
+                    &[count, "110=1", "210=a", "201=x", "110=2", "210=b", "210=c"],
+                ),
+                Ok(()),
+                "{msg_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_group_led_by_a_nested_group_reports_the_nested_mismatch() {
+        // The outer entry is sound; the nested NoInner(110) declares two
+        // entries and carries one.
+        for (msg_type, count) in [("35=U6", "100=1"), ("35=U7", "120=1")] {
+            assert_eq!(
+                validate_nested_delimiter(msg_type, &[count, "110=2", "210=a", "201=x"]),
+                Err(vec![ValidationError::GroupCountMismatch {
+                    count_tag: 110,
+                    name: "NoInner".to_string(),
+                    declared: 2,
+                    actual: 1,
+                    delimiter_tag: 210,
+                }]),
+                "{msg_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_group_led_by_a_nested_group_counts_its_own_entries() {
+        // Two outer entries declared, one present: the nested group's fields
+        // are inside the single entry, not extra outer entries.
+        assert_eq!(
+            validate_nested_delimiter("35=U6", &["100=2", "110=2", "210=a", "210=b"]),
+            Err(vec![ValidationError::GroupCountMismatch {
+                count_tag: 100,
+                name: "NoOuter".to_string(),
+                declared: 2,
+                actual: 1,
+                delimiter_tag: 110,
+            }])
         );
     }
 }
