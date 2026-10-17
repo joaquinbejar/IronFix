@@ -1128,6 +1128,36 @@ ends a `Framed` stream.
   socket with unread input can make the kernel send RST, and the peer may then
   lose the Logout. This holds until a graceful drain exists.
 
+### Repeating groups in dictionary validation
+
+**Scope**: `ironfix-dictionary::Validator`, the standalone, opt-in validator.
+Neither the codec nor the engine calls it, so nothing below is enforced on the
+session path today.
+
+A repeating group is checked in two layers. Its **structure**: the entries
+follow the count field contiguously, each entry starts with the delimiter (the
+group's first field), no tag repeats inside one entry, and the number of
+entries found equals the declared count. And, for a structurally sound group,
+the **required members of every entry**, reported as
+`ValidationError::MissingRequiredFieldInGroupEntry { count_tag, group, entry,
+tag, name }` with a **0-based** `entry` index. An entry's required set is what
+the dictionary says, computed the way QuickFIX computes it:
+
+- member fields marked `required='Y'`;
+- nested groups marked `required='Y'` (reported with the nested group's count
+  tag), whose own entries are checked the same way;
+- the required members of components referenced as `required='Y'`. A component
+  referenced as `required='N'` contributes no required members, even when some
+  of its fields are present.
+
+The delimiter is never reported missing. A group that is already structurally
+malformed gets no per-entry errors, nested groups included, because its entry
+boundaries cannot be trusted. Example from the vendored FIX 4.4 dictionary:
+each `NoOrders` (73) entry of a NewOrderList (35=E) requires `ClOrdID` (11),
+`ListSeqNo` (67) and `Side` (54); an entry without 67 is reported with its
+index. This check is newer than the structural one, so validation is stricter
+than it was: messages whose entries lacked required members used to pass.
+
 ---
 
 ### Business Message Reject (MsgType = j)
