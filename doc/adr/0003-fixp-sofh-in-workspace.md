@@ -17,9 +17,10 @@ What exists today:
   stack listed in the root `Cargo.toml`; `ironfix-fast` is FAST only.
 - Almost nothing in the tag=value session stack carries over: `SessionConfig`
   is built around `BeginString` and CompIDs (`ironfix-session/src/config.rs`),
-  the typestate models tag=value Logon/Logout, `MessageStore::store` keys
-  records on `MsgType` (`ironfix-store/src/traits.rs`), and the reactor is
-  framed by `FixCodec`.
+  the typestate models tag=value Logon/Logout, `MessageStore` files records
+  by sequence number but requires a tag=value `MsgType` as metadata and the
+  complete tag=value frame (`BeginString` through `CheckSum`) as the payload
+  (`ironfix-store/src/traits.rs`), and the reactor is framed by `FixCodec`.
 - FIXP's session messages are defined in SBE. The SBE codec `ironsbe-core`
   (0.7.x, same author, repository `joaquinbejar/IronSBE`) depends only on
   `crossbeam-queue` and `thiserror`, both already workspace dependencies.
