@@ -25,9 +25,9 @@
 //! specific to 5.0, SP1 or SP2, and this example is not evidence of any.
 //!
 //! The accept loop lives in [`common::run_demo_server`] and the message layouts
-//! in [`ironfix_example::demo`]. Note that `ironfix-engine` has no acceptor yet:
-//! this is a demonstration server, not a session engine — it keeps no message
-//! store and cannot answer a `ResendRequest`.
+//! in [`ironfix_example::demo`]. This is a demonstration server, not a session
+//! engine: it keeps no message store and cannot answer a `ResendRequest`. For a
+//! real session, use the engine's `Acceptor` as `fix44_server` does.
 //!
 //! ```text
 //! FIX_HOST=0.0.0.0 FIX_PORT=9881 cargo run --example fix50sp1_server

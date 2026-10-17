@@ -1047,18 +1047,22 @@ Rationale for the two policies:
   plus a derived grace, and the silent-peer timeout stops the moment any
   accepted inbound message arrives. See "Heartbeat" and "Test Request" above for
   the negotiation bound, the grace rule, and the definition of "a response".
-  Note this covers the **initiator** only: there is no Acceptor in
-  `ironfix-engine`, so the server-side examples do their own heartbeating.
+  This covers **both roles**: `Initiator` and `Acceptor` hand the socket to the
+  same session reactor once Logon completes. Of the example servers only
+  `fix44_server` runs on the `Acceptor`; the other `fixNN_server` examples
+  hand-roll their accept loop and do their own heartbeating.
 - [x] Reject
 - [x] Sequence Reset
 - [x] Resend Request — inbound requests are validated, and with a
   `MessageStore` attached (`Initiator::with_store`) the stored application
   messages in the range are replayed with `PossDupFlag` (43) = Y and the
   original `SendingTime` in `OrigSendingTime` (122), with administrative
-  messages and unavailable sequence numbers gap-filled. Two limits are worth
+  messages and unavailable sequence numbers gap-filled. Three limits are worth
   stating: the store is **opt-in**, and without one the whole range is still
-  answered with a single gap fill; and `MemoryStore` is not persistent, so
-  nothing is replayable after a restart. An *outbound* request the peer never
+  answered with a single gap fill; the store can be attached to the
+  **initiator only**, since the `Acceptor` attaches none and so answers every
+  resend with gap fill; and `MemoryStore` is not persistent, so nothing is
+  replayable after a restart. An *outbound* request the peer never
   satisfies is also bounded — retried every `SessionConfig::resend_timeout` and
   then escalated to Logout after `SessionConfig::max_resend_requests` attempts,
   rather than stalling the session forever. See "Resend Request" above.

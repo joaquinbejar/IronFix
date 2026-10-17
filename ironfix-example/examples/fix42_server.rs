@@ -19,9 +19,9 @@
 //!   through 4.2, and `ExecType` (150) / `LeavesQty` (151), introduced in 4.1.
 //!
 //! The accept loop lives in [`common::run_demo_server`] and the message layouts
-//! in [`ironfix_example::demo`]. Note that `ironfix-engine` has no acceptor yet:
-//! this is a demonstration server, not a session engine — it keeps no message
-//! store and cannot answer a `ResendRequest`.
+//! in [`ironfix_example::demo`]. This is a demonstration server, not a session
+//! engine: it keeps no message store and cannot answer a `ResendRequest`. For a
+//! real session, use the engine's `Acceptor` as `fix44_server` does.
 //!
 //! ```text
 //! FIX_HOST=0.0.0.0 FIX_PORT=9872 cargo run --example fix42_server
