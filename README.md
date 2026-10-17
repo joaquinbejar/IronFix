@@ -88,7 +88,10 @@ around it.
   calls `TcpStream::connect`, `Acceptor` serves a `TcpStream`). See "Current
   limitations" in `ironfix-engine/src/lib.rs`.
 - **Async only.** Everything that touches a socket runs on Tokio. There is no
-  synchronous mode, no kernel-bypass path, and no busy-polling transport.
+  synchronous mode, no kernel-bypass path, and no busy-polling transport. A
+  sans-IO session core with Tokio as one driver is the accepted direction
+  (`doc/adr/0002-session-driver.md`, tracked in #90 to #93); none of it exists
+  yet.
 - **Only FIX 4.4 has an embedded dictionary** (`ironfix-dictionary/spec/FIX44.xml`,
   vendored from QuickFIX). Other versions require
   `Dictionary::from_quickfix_xml` with your own XML
