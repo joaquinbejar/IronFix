@@ -160,8 +160,8 @@ pub mod fast {
 }
 
 pub mod engine {
-    //! The composition root: `Initiator`, `Connection`, and the `Application`
-    //! callback trait. Client-side only — there is no acceptor.
+    //! The composition root: `Initiator` and `Acceptor` (both built by
+    //! `EngineBuilder`), `Connection`, and the `Application` callback trait.
     pub use ironfix_engine::*;
 }
 

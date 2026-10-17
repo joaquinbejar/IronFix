@@ -33,10 +33,11 @@ separate, opt-in pass.
   unconditionally verified trailer.
 - **A client engine and a server engine** in `ironfix-engine`. `Initiator`
   dials over TCP and runs the initiator half of the Logon handshake. `Acceptor`
-  serves inbound connections and runs the acceptor half: CompID
-  authentication, a logon timeout, honouring the counterparty's `HeartBtInt`,
-  and mirroring `ResetSeqNumFlag`. `EngineBuilder` terminates in either one via
-  `into_initiator()` / `into_acceptor()`.
+  serves inbound connections for one configured counterparty and runs the
+  acceptor half: CompID authentication, a logon timeout, honouring the
+  counterparty's `HeartBtInt`, and mirroring `ResetSeqNumFlag`.
+  `EngineBuilder` terminates in either one via `into_initiator()` /
+  `into_acceptor()`.
 - **One session reactor shared by both roles.** Once Logon completes, the
   engine owns the socket: heartbeats and TestRequests at the negotiated
   interval, CompID and `SendingTime` validation, sequence-gap detection with
@@ -55,6 +56,11 @@ separate, opt-in pass.
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in
   `ironfix-dictionary`.
+- **Code generation.** `#[derive(FixMessage)]` and `#[derive(FixField)]` in
+  `ironfix-derive` implement the `ironfix-core` traits with typed
+  `DecodeError` / `EncodeError` paths (compile-tested in
+  `ironfix-derive/tests/`), and `ironfix-codegen` emits Rust from a loaded
+  `Dictionary` (a golden sample is compile-tested in `ironfix-codegen/tests/`).
 - **FAST primitives** in `ironfix-fast`: stop-bit encode/decode of unsigned
   and signed integers, ASCII strings and byte vectors, each in nullable and
   non-nullable form, plus presence maps, all round-trip tested. The `Operator`
@@ -70,28 +76,32 @@ around it.
 
 - **No persistent store.** `MemoryStore` is the only `MessageStore`; there is
   no `FileStore` and no memory-mapped store, so stored messages and sequence
-  numbers do not survive a restart. The store is opt-in on `Initiator` only:
-  `Acceptor` attaches none, so every resend it answers is a gap fill.
+  numbers do not survive a restart (`ironfix-store/src/lib.rs`). The store is
+  opt-in on `Initiator` only: `Acceptor` attaches none, so every resend it
+  answers is a gap fill (`ironfix-engine/src/acceptor.rs`).
 - **One session per engine.** `EngineBuilder` takes exactly one
   `SessionConfig`; `into_initiator()` and `into_acceptor()` return
-  `EngineError::Configuration` for zero or several.
-- **No TLS.** `ironfix-transport` contains `FixCodec` and nothing else — no TCP
-  connector, no acceptor, no `rustls`. `Initiator` calls `TcpStream::connect`
-  directly.
+  `EngineError::Configuration` for zero or several
+  (`ironfix-engine/src/builder.rs`).
+- **No TLS.** There is no `rustls` dependency anywhere. `ironfix-transport`
+  contains `FixCodec` only; the engines open plain TCP themselves (`Initiator`
+  calls `TcpStream::connect`, `Acceptor` serves a `TcpStream`). See "Current
+  limitations" in `ironfix-engine/src/lib.rs`.
 - **Async only.** Everything that touches a socket runs on Tokio. There is no
   synchronous mode, no kernel-bypass path, and no busy-polling transport.
 - **Only FIX 4.4 has an embedded dictionary** (`ironfix-dictionary/spec/FIX44.xml`,
   vendored from QuickFIX). Other versions require
-  `Dictionary::from_quickfix_xml` with your own XML. The `Validator` is *not*
-  invoked by the engine or the codec; you call it yourself.
-- **The derive macros are stubs.** `#[derive(FixMessage)]` and
-  `#[derive(FixField)]` both expand to `todo!()`. Neither `ironfix-derive` nor
-  `ironfix-codegen` has an in-workspace consumer.
+  `Dictionary::from_quickfix_xml` with your own XML
+  (`ironfix-dictionary/src/loader.rs`). The `Validator` is *not* invoked by the
+  engine or the codec; you call it yourself (`ironfix-engine/src/lib.rs`).
+- **Generated code has no consumer.** Nothing in the workspace uses the
+  derives or `ironfix-codegen` output, so field access on the session path is
+  untyped tag lookup (`ironfix-codegen/src/lib.rs`).
 - **FAST has no template layer.** There is no FAST template XML parser, no
   operator application (copy, delta, increment, tail), no decimal codec and no
   sequence decoding, so `ironfix-fast` decodes the fields of a message only when
   something else supplies their order. There is also no UDP multicast receiver
-  and no wiring into the session or engine path.
+  and no wiring into the session or engine path (`ironfix-fast/src/lib.rs`).
 - **No recorded benchmark baseline.** A criterion harness now exists (see
   Benchmarks below): `ironfix-tagvalue`, `ironfix-fast` and `ironfix-transport`
   each carry a `benches/` target run by `make bench`. It ships no saved baseline
@@ -127,7 +137,7 @@ dictionary is embedded in the crate and loadable without extra files.
 | `ironfix-transport` | `FixCodec`, a Tokio codec that frames FIX messages. No TCP helpers, no TLS |
 | `ironfix-fast` | FAST encoding/decoding primitives: stop-bit, presence maps, the operator table. No template layer |
 | `ironfix-codegen` | Build-time Rust generation from a `Dictionary` (no in-workspace consumer) |
-| `ironfix-derive` | Procedural macros, currently stubs that expand to `todo!()` |
+| `ironfix-derive` | `#[derive(FixMessage)]` / `#[derive(FixField)]` for the `ironfix-core` traits (no in-workspace consumer) |
 | `ironfix-engine` | The composition root: `Initiator`, `Acceptor`, `EngineBuilder`, `Connection`, the `Application` trait |
 | `ironfix-example` | Umbrella facade (`prelude`) plus the runnable examples |
 
@@ -164,9 +174,10 @@ use ironfix_core::types::CompId;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Sender is this client; target is the venue (the server below).
     let config = SessionConfig::new(
-        CompId::new("SENDER")?,
-        CompId::new("TARGET")?,
+        CompId::new("CLIENT")?,
+        CompId::new("VENUE")?,
         "FIX.4.4",
     )
     .with_heartbeat_interval(Duration::from_secs(30));

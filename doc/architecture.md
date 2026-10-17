@@ -16,18 +16,17 @@
 > - **The module tree below does not match the repository.** It names files and
 >   crates that do not exist (`ironfix/` facade crate, `transport/tcp/`,
 >   `transport/tls.rs`, `transport/multicast.rs`, `store/file.rs`,
->   `store/mmap.rs`, `engine/acceptor.rs`, `fast/template.rs`,
->   `session/recovery.rs`, `dictionary/versions/`).
+>   `store/mmap.rs`, `fast/template.rs`, `session/recovery.rs`,
+>   `dictionary/versions/`).
 > - **Several "decisions" below are unbuilt.** There is no synchronous or
 >   kernel-bypass mode, no arena allocator (`bumpalo` is not a dependency), no
->   compiled FAST templates, no code generation in use, no TLS, and no acceptor.
+>   compiled FAST templates, no code generation in use, and no TLS.
 > - **Code blocks are illustrative sketches, not extracts from the codebase.**
 >   Most do not compile against the current crates.
 >
 > For what actually exists today, the authorities are, in order: the code
-> itself, the "What is not implemented yet" section of `README.md`, the
-> "Design canon vs. as-built" table in `CLAUDE.md`, and the implementation
-> checklist in `doc/fix_operations.md`.
+> itself, the "What is not implemented yet" section of `README.md`, and the
+> implementation checklist in `doc/fix_operations.md`.
 
 **The design target: a Rust implementation supporting FIX 4.0 through 5.0 SP2 with microsecond-scale latency and high message throughput.**
 
@@ -47,7 +46,7 @@ The architecture prioritizes three often-competing goals through careful design 
 *Status: partially built. The tag=value decoder is zero-copy — parsed field values borrow the input buffer and are never copied — and the encoder targets a pre-allocated buffer. The decoder's field index is a `SmallVec<[FieldRef; 32]>` that stays inline for the first 32 fields and spills to the heap only for a message with more than 32 fields. Arena allocation is not implemented — there is no `bumpalo` dependency. Nothing is measured.*
 
 **Compile-time correctness** leverages Rust's type system for session state machines (typestate pattern), message validation, and field access. Generated code from FIX dictionaries provides type-safe field accessors, catching errors at compile time rather than runtime.
-*Status: partially built. The session FSM is a sealed typestate today. Generated field accessors are not: `ironfix-codegen` has no consumer and the `ironfix-derive` macros expand to `todo!()`, so field access is currently untyped tag lookup.*
+*Status: partially built. The session FSM is a sealed typestate today. The `ironfix-derive` macros generate real `FixMessage` / `FixField` implementations and `ironfix-codegen` emits message structs from a `Dictionary`, but nothing in the workspace consumes either, so field access on the session path is still untyped tag lookup.*
 
 **Flexible deployment** supports both ultra-low-latency synchronous modes (kernel bypass, busy-polling) and standard async Tokio patterns for applications where operational simplicity matters more than tail latency.
 *Status: not built. IronFix is async-only. There is no synchronous mode, no kernel bypass and no busy-polling path.*
@@ -57,13 +56,14 @@ The architecture prioritizes three often-competing goals through careful design 
 ## Crate organization and module structure
 
 > **Target tree, not the current one.** The workspace has 11 member crates and
-> roughly 30 source files; the tree below names files and directories that do
-> not exist. For the real layout, run `make tree` or read the crate map in
-> `CLAUDE.md`. Notable differences: there is no `ironfix/` facade crate (the
-> umbrella re-exports live in `ironfix-example`); `ironfix-transport` contains
-> only `codec.rs`; `ironfix-store` contains only `traits.rs` and `memory.rs`;
-> `ironfix-engine` has no `acceptor.rs` but does have `connection.rs`,
-> `outbound.rs`, `error.rs` and a private `wire.rs`; `ironfix-session` has no
+> roughly 47 source files; the tree below names files and directories that do
+> not exist. For the real layout, run `make tree`. Notable differences: there
+> is no `ironfix/` facade crate (the umbrella re-exports live in
+> `ironfix-example`); `ironfix-transport` contains only `codec.rs`;
+> `ironfix-store` contains only `traits.rs` and `memory.rs`; `ironfix-engine`
+> has the `initiator.rs`, `acceptor.rs`, `application.rs` and `builder.rs`
+> shown below plus `connection.rs`, `outbound.rs`, `error.rs` and the private
+> `reactor.rs` / `wire.rs`; `ironfix-session` has no
 > `recovery.rs` and its FSM lives in `state.rs`; `ironfix-fast` has no
 > `template.rs` or `dictionary.rs`; `ironfix-dictionary` has `loader.rs` /
 > `schema.rs` / `validator.rs` and a single vendored `spec/FIX44.xml`.
@@ -646,7 +646,7 @@ impl MessageProcessor {
 
 ### Decision 4: Code generation with runtime fallback
 
-**Status: only the fallback is built.** The runtime dictionary path (`ironfix-dictionary`) works, but nothing consumes generated code: `ironfix-codegen` has no in-workspace consumer and the `ironfix-derive` macros expand to `todo!()`. The `#[derive(FixMessage)]` example below therefore does not work today.
+**Status: only the fallback is in use.** The runtime dictionary path (`ironfix-dictionary`) works. The generators exist (`ironfix-derive` implements `#[derive(FixMessage)]` / `#[derive(FixField)]`, and `ironfix-codegen` emits data-only message structs that carry no trait impls), but nothing in the workspace consumes them. The code below is a design sketch, not the shipped generator; see the `ironfix-derive` and `ironfix-codegen` crate docs for the real attribute syntax and output.
 
 **Rationale**: Generated code provides type safety and compile-time validation, but runtime dictionary support enables flexibility for custom tags and exchange-specific variations.
 
@@ -1449,10 +1449,11 @@ fn configure_thread_affinity() {
 > **Historical plan, not a schedule and not a status report.** The week ranges
 > below were the original estimate and have no bearing on when anything will
 > land; do not quote them as commitments. Work has not followed this order —
-> for example, `ironfix-engine`'s `Initiator` (listed under Phase 6) exists
-> while file-based stores (Phase 2), TLS and the TCP connector/acceptor
-> (Phase 3), the FAST template parser and multicast (Phase 4) and the code
-> generation consumers (Phase 5) do not.
+> for example, `ironfix-engine`'s `Initiator` and `Acceptor` (listed under
+> Phase 6) exist while file-based stores (Phase 2), TLS and a transport-level
+> TCP connector/acceptor (Phase 3; the engines open TCP themselves), the FAST
+> template parser and multicast (Phase 4) and the code generation consumers
+> (Phase 5) do not.
 >
 > The living checklist is the "Implementation Priority" section of
 > `doc/fix_operations.md`. There is no `doc/ROADMAP.md`.
