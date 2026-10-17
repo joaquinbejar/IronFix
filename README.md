@@ -1,4 +1,4 @@
-[![Dual License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/ironfix-core.svg)](https://crates.io/crates/ironfix-core)
 [![Downloads](https://img.shields.io/crates/d/ironfix-core.svg)](https://crates.io/crates/ironfix-core)
 [![Stars](https://img.shields.io/github/stars/joaquinbejar/IronFix.svg)](https://github.com/joaquinbejar/IronFix/stargazers)
@@ -14,7 +14,7 @@
 # IronFix
 
 A FIX/FAST protocol engine for Rust, built as a Cargo workspace of focused
-crates: the wire layer, the session layer, and a client-side engine.
+crates: the wire layer, the session layer, and a client and server engine.
 
 ## Overview
 
@@ -31,25 +31,36 @@ separate, opt-in pass.
   pairs. Every malformed-input path is a typed error, never a panic.
 - **Framing** over a Tokio codec (`FixCodec`) with a bounded read buffer and an
   unconditionally verified trailer.
-- **A client-side session** (`Initiator`): TCP dial, Logon handshake,
-  heartbeats and TestRequests at the negotiated interval, CompID validation,
-  sequence-gap detection, `ResendRequest` / `SequenceReset` / gap fill,
-  `PossDupFlag` and `OrigSendingTime` handling, `ResetSeqNumFlag`,
-  session-level `Reject`, and `FIXT.1.1` BeginString with `ApplVerID` for FIX
-  5.0 sessions. Heartbeat/TestRequest handling is **partial**: `HeartBtInt = 0`
-  (legal FIX for "do not send heartbeats") is currently taken literally as a
-  zero-length interval, and a pending TestRequest is cleared only by a Heartbeat
-  echoing the matching `TestReqID` — see `doc/fix_operations.md`.
+- **A client engine and a server engine** in `ironfix-engine`. `Initiator`
+  dials over TCP and runs the initiator half of the Logon handshake. `Acceptor`
+  serves inbound connections and runs the acceptor half: CompID
+  authentication, a logon timeout, honouring the counterparty's `HeartBtInt`,
+  and mirroring `ResetSeqNumFlag`. `EngineBuilder` terminates in either one via
+  `into_initiator()` / `into_acceptor()`.
+- **One session reactor shared by both roles.** Once Logon completes, the
+  engine owns the socket: heartbeats and TestRequests at the negotiated
+  interval, CompID and `SendingTime` validation, sequence-gap detection with
+  bounded `ResendRequest` recovery, `SequenceReset` / gap fill, `PossDupFlag`
+  and `OrigSendingTime` handling, session-level `Reject`, a socket write
+  timeout, the Logout handshake, and `FIXT.1.1` BeginString with `ApplVerID`
+  for FIX 5.0 sessions. `HeartBtInt = 0` disables heartbeating (ask for it
+  with `SessionConfigBuilder::disable_heartbeats`), and any inbound message
+  clears a pending TestRequest.
+- **Resend from store** on the initiator. Attach a `MessageStore` with
+  `Initiator::with_store` and an inbound `ResendRequest` replays the stored
+  application messages with `PossDupFlag = Y` and the original `SendingTime`
+  in `OrigSendingTime`; administrative messages, and anything the store cannot
+  produce, are covered by gap fill.
 - **A typestate session FSM** and checked sequence arithmetic in
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in
   `ironfix-dictionary`.
-- **FAST primitives** in `ironfix-fast`: stop-bit integer and string
-  encode/decode and presence maps, all round-trip tested. The
-  copy/delta/increment/tail/default operators are a classification vocabulary
-  (the `Operator` enum with predicates such as `uses_dictionary` /
-  `requires_pmap`), not wired-in codec operators — the decoder and encoder do
-  not apply them yet.
+- **FAST primitives** in `ironfix-fast`: stop-bit encode/decode of unsigned
+  and signed integers, ASCII strings and byte vectors, each in nullable and
+  non-nullable form, plus presence maps, all round-trip tested. The `Operator`
+  table and `Operator::transfer` (which decides, from the operator, the field's
+  optionality and the presence map, where a field's value comes from) are
+  implemented; *applying* an operator to produce a value is not.
 
 ## What is not implemented yet
 
@@ -57,15 +68,13 @@ This list is deliberately explicit. If a capability is not named under "What
 works today" and appears below, it does not exist in the code — do not plan
 around it.
 
-- **No Acceptor.** `ironfix-engine` has `Initiator` only. The server-side
-  examples hand-roll their own accept loop with `Decoder` / `Encoder` directly.
-- **`EngineBuilder` has no terminal method.** It collects sessions and timeouts
-  but there is no `build()`; the working entry point is
-  `Initiator::new(config, app).connect(addr)`.
-- **The engine never uses `MessageStore`.** Resend-from-store is not wired up —
-  an inbound `ResendRequest` is answered with a gap fill, not with the original
-  messages. `MemoryStore` is the only store implementation; there is no
-  `FileStore` and no memory-mapped store.
+- **No persistent store.** `MemoryStore` is the only `MessageStore`; there is
+  no `FileStore` and no memory-mapped store, so stored messages and sequence
+  numbers do not survive a restart. The store is opt-in on `Initiator` only:
+  `Acceptor` attaches none, so every resend it answers is a gap fill.
+- **One session per engine.** `EngineBuilder` takes exactly one
+  `SessionConfig`; `into_initiator()` and `into_acceptor()` return
+  `EngineError::Configuration` for zero or several.
 - **No TLS.** `ironfix-transport` contains `FixCodec` and nothing else — no TCP
   connector, no acceptor, no `rustls`. `Initiator` calls `TcpStream::connect`
   directly.
@@ -78,8 +87,11 @@ around it.
 - **The derive macros are stubs.** `#[derive(FixMessage)]` and
   `#[derive(FixField)]` both expand to `todo!()`. Neither `ironfix-derive` nor
   `ironfix-codegen` has an in-workspace consumer.
-- **FAST is standalone.** There is no FAST template XML parser, no UDP multicast
-  receiver, and no wiring into the session or engine path.
+- **FAST has no template layer.** There is no FAST template XML parser, no
+  operator application (copy, delta, increment, tail), no decimal codec and no
+  sequence decoding, so `ironfix-fast` decodes the fields of a message only when
+  something else supplies their order. There is also no UDP multicast receiver
+  and no wiring into the session or engine path.
 - **No recorded benchmark baseline.** A criterion harness now exists (see
   Benchmarks below): `ironfix-tagvalue`, `ironfix-fast` and `ironfix-transport`
   each carry a `benches/` target run by `make bench`. It ships no saved baseline
@@ -113,16 +125,29 @@ dictionary is embedded in the crate and loadable without extra files.
 | `ironfix-session` | Session-layer protocol logic: typestate FSM, sequences, heartbeats. No I/O |
 | `ironfix-store` | The `MessageStore` trait and `MemoryStore` |
 | `ironfix-transport` | `FixCodec`, a Tokio codec that frames FIX messages. No TCP helpers, no TLS |
-| `ironfix-fast` | FAST encoding/decoding primitives: stop-bit, presence maps, operators |
+| `ironfix-fast` | FAST encoding/decoding primitives: stop-bit, presence maps, the operator table. No template layer |
 | `ironfix-codegen` | Build-time Rust generation from a `Dictionary` (no in-workspace consumer) |
-| `ironfix-derive` | Procedural macros — currently stubs that expand to `todo!()` |
-| `ironfix-engine` | The composition root: `Initiator`, `Connection`, the `Application` trait |
+| `ironfix-derive` | Procedural macros, currently stubs that expand to `todo!()` |
+| `ironfix-engine` | The composition root: `Initiator`, `Acceptor`, `EngineBuilder`, `Connection`, the `Application` trait |
 | `ironfix-example` | Umbrella facade (`prelude`) plus the runnable examples |
 
 There is no `ironfix` facade crate. The umbrella re-exports live in
 `ironfix-example`.
 
+## Installation
+
+Each crate is published separately on crates.io. For the engine:
+
+```toml
+[dependencies]
+ironfix-core = "0.4"
+ironfix-engine = "0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+```
+
 ## Quick Start
+
+### Client
 
 Connect as an initiator, send a `NewOrderSingle`, then log out. The engine owns
 the socket: it dials, frames, performs the Logon handshake, and stamps the
@@ -168,41 +193,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Or terminate an [`EngineBuilder`] directly: `into_initiator()` produces the
-client above, and `into_acceptor()` produces a server-side [`Acceptor`] that
-establishes sessions on inbound connections. Both engines hand the socket to the
-same session reactor once the Logon handshake completes.
+### Server
+
+`EngineBuilder` terminates in either engine: `into_initiator()` produces the
+client above, and `into_acceptor()` produces an `Acceptor` that establishes
+sessions on inbound connections. Both engines hand the socket to the same
+session reactor once the Logon handshake completes.
 
 ```rust,no_run
 use ironfix_core::types::CompId;
-use ironfix_engine::EngineBuilder;
-use ironfix_session::SessionConfig;
+use ironfix_engine::{EngineBuilder, SessionConfig};
+use tokio::net::TcpListener;
 
-# async fn run() -> Result<(), Box<dyn std::error::Error>> {
-// Create a session configuration (sender = you, target = the counterparty).
-let config = SessionConfig::new(
-    CompId::new("CLIENT")?,
-    CompId::new("VENUE")?,
-    "FIX.4.4",
-);
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Sender is this venue; target is the client it expects to log on.
+    let config = SessionConfig::new(
+        CompId::new("VENUE")?,
+        CompId::new("CLIENT")?,
+        "FIX.4.4",
+    );
 
-// The builder terminates in a runnable engine. `into_initiator` produces a
-// client that dials the counterparty; `into_acceptor` produces a server that
-// establishes sessions on inbound connections.
-let initiator = EngineBuilder::new()
-    .add_session(config)
-    .into_initiator()?;
+    // Add `.with_application(your_app)` to receive the session callbacks.
+    let acceptor = EngineBuilder::new()
+        .add_session(config)
+        .into_acceptor()?;
 
-let connection = initiator.connect("127.0.0.1:9876").await?;
-connection.logout().await?;
-connection.wait_closed().await;
-# Ok(())
-# }
+    let listener = TcpListener::bind("0.0.0.0:9876").await?;
+    let connection = acceptor.accept(&listener).await?;
+    connection.wait_closed().await;
+    Ok(())
+}
 ```
 
-See `ironfix-example/examples/fix44_engine_client.rs` for the same flow with a
+See `ironfix-example/examples/fix44_engine_client.rs` for the client flow with a
 real `Application` implementation, and `fix44_server.rs` for the matching
-`Acceptor`-based server.
+`Acceptor`-based server that answers each `NewOrderSingle` with an
+`ExecutionReport`.
 
 
 ## 🛠 Makefile Commands
@@ -303,8 +330,10 @@ cargo run --example fix44_server
 cargo run --example fix44_client
 ```
 
-Per-version pairs — note that the servers hand-roll their accept loop and
-session handling, because there is no `Acceptor` in `ironfix-engine`:
+Per-version pairs. Only `fix44_server` runs on the engine's `Acceptor`; the
+other servers hand-roll their accept loop with a raw `Decoder` / `Encoder` and
+implement no real session behaviour, so treat them as wire-format demos rather
+than templates:
 
 - `fix40_server` / `fix40_client` — FIX 4.0 (port 9870)
 - `fix41_server` / `fix41_client` — FIX 4.1 (port 9871)
@@ -317,14 +346,25 @@ session handling, because there is no `Acceptor` in `ironfix-engine`:
 
 Engine and concurrency examples:
 
-- `fix44_engine_client` — the same client flow driven by `Initiator`, which owns
-  the socket, framing, Logon and heartbeats. Pairs with `fix44_server`.
-- `fix44_server_channel` — server-side message hand-off over a channel.
+- `fix44_engine_client`: the client flow driven by `Initiator`, which owns the
+  socket, framing, Logon and heartbeats. Pairs with `fix44_server`.
+- `fix44_server_channel`: per-connection reader tasks hand decoded messages to
+  a single processor task over an mpsc channel, keeping business logic off the
+  read path.
 
 FAST examples:
 
-- `fast_server` / `fast_client` — FAST encode/decode over a socket
-- `fast_server_spsc` — FAST server with single-producer/single-consumer hand-off
+- `fast_server` / `fast_client`: FAST encode/decode over a socket (port 9890)
+- `fast_server_lockfree`: a generator thread and an encoding broadcaster
+  thread joined by a bounded lock-free `crossbeam-channel`, both outside the
+  Tokio runtime
+
+## Docker
+
+`Docker/` holds a Dockerfile per example server (the eight FIX versions plus
+FAST), each a static musl build on Alpine. Build and run commands are in
+`Docker/README.md`; CI builds the images through `docker.yml` when they or the
+examples change.
 
 ## Documentation
 
