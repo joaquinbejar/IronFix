@@ -18,3 +18,11 @@ quick-xml.workspace = true
 
 [dev-dependencies]
 ironfix-tagvalue.workspace = true
+dhat.workspace = true
+
+# Installs dhat as the global allocator, so it runs as its own binary without
+# the libtest harness: no other test or harness thread allocates while it
+# measures.
+[[test]]
+name = "group_reader_allocations"
+harness = false

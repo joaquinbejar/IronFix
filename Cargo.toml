@@ -63,6 +63,10 @@ quick-xml = "0.42"
 # Benchmark harness (dev-dependency only; never linked into a published library)
 criterion = { version = "0.8", features = ["html_reports"] }
 
+# Heap profiler used as a counting allocator by ironfix-dictionary's
+# zero-allocation test (dev-dependency only; never linked into a library)
+dhat = "=0.3.3"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
