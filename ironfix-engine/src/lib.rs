@@ -102,6 +102,7 @@ pub mod connection;
 pub mod error;
 mod garbled;
 pub mod initiator;
+mod next_expected;
 pub mod outbound;
 pub mod persistence;
 mod reactor;

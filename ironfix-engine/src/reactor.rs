@@ -789,18 +789,31 @@ struct Reactor<A: Application> {
     garbled: Option<GarbledFrameWindow>,
 }
 
+/// What the Logon exchange left for the reactor to do before anything else.
+#[derive(Debug, Clone, Copy, Default)]
+struct Opening {
+    /// A gap the Logon exchange found, as (first missing number, highest
+    /// number seen); its `ResendRequest` is the reactor's first act.
+    gap: Option<(u64, u64)>,
+    /// Messages the counterparty's `NextExpectedMsgSeqNum` (789) said it
+    /// missed, as (first number, first number not resent); resent right after
+    /// the gap is requested.
+    replay: Option<(u64, u64)>,
+}
+
 /// The session reactor: owns the socket, multiplexes inbound frames,
 /// outbound commands, application rejections, and heartbeat timers until the
 /// session closes.
 ///
-/// `opening_gap` is a gap the Logon exchange found, as (first missing number,
-/// highest number seen); its `ResendRequest` is the reactor's first act.
+/// `opening` is what the Logon exchange left to do first: request a gap it
+/// found, then resend what the counterparty's `NextExpectedMsgSeqNum` (789)
+/// said it missed.
 async fn run_reactor<A: Application + 'static>(
     mut framed: FixFramed,
     channels: ReactorChannels,
     mut ctx: Reactor<A>,
     session: Session<Active>,
-    opening_gap: Option<(u64, u64)>,
+    opening: Opening,
 ) {
     let ReactorChannels {
         mut commands,
@@ -809,24 +822,18 @@ async fn run_reactor<A: Application + 'static>(
         mut dispatcher,
         app_completed,
     } = channels;
-    // The gap is requested here rather than by the handshake: `on_logon` has
-    // already run, so a failure to send the request (a store refusal under the
-    // fail-closed policy, a peer that stopped reading) has to close the
-    // session through the path below, which runs `on_logout`, the close-time
-    // reset and the last counter writes. A failure leaves no phase, and the
-    // first pass of the loop ends the session with it.
-    let (mut phase, mut opening_failure) = match opening_gap {
-        Some((expected, high_water)) => {
-            let opened = ctx
-                .request_resend(&mut framed, Phase::Active(session), expected, high_water)
-                .await;
-            match opened {
-                Ok(phase) => (Some(phase), None),
-                Err(outcome) => (None, Some(outcome)),
-            }
-        }
-        None => (Some(Phase::Active(session)), None),
-    };
+    // The gap is requested, and the 789 replay sent, here rather than by the
+    // handshake: `on_logon` has already run, so a failure to send either (a
+    // store refusal under the fail-closed policy, a store that reports itself
+    // corrupted, a peer that stopped reading) has to close the session through
+    // the path below, which runs `on_logout`, the close-time reset and the
+    // last counter writes. A failure leaves no phase, and the first pass of
+    // the loop ends the session with it.
+    let (mut phase, mut opening_failure) =
+        match ctx.open(&mut framed, Phase::Active(session), opening).await {
+            Ok(phase) => (Some(phase), None),
+            Err(outcome) => (None, Some(outcome)),
+        };
     let mut commands_open = true;
     let mut rejects_open = true;
     let mut tick = interval(TICK_INTERVAL);
@@ -2137,6 +2144,28 @@ impl<A: Application> Reactor<A> {
                 .map_or(next_sender, |bound| bound.min(next_sender)),
         };
 
+        self.resend_range(framed, phase, begin_seq, new_seq).await
+    }
+
+    /// Resends `begin_seq..new_seq` (`new_seq` exclusive): the stored
+    /// application messages are replayed, and everything else is gap-filled,
+    /// so the counterparty's expectation lands exactly on `new_seq`.
+    ///
+    /// The answer to an inbound `ResendRequest` (2), and the resend a
+    /// counterparty's `NextExpectedMsgSeqNum` (789) on the Logon exchange asks
+    /// for. Nothing here allocates a sender sequence number.
+    ///
+    /// # Errors
+    /// The session is closed when the replay fails ([`Reactor::replay_range`]:
+    /// a write that fails, a store that reports itself corrupted) or the
+    /// trailing gap fill cannot be written.
+    async fn resend_range(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        begin_seq: u64,
+        new_seq: u64,
+    ) -> Result<Phase, SessionClosed> {
         let cursor = match self.replay_range(framed, begin_seq, new_seq).await {
             Ok(cursor) => cursor,
             Err(err) => {
@@ -2153,6 +2182,55 @@ impl<A: Application> Reactor<A> {
         {
             teardown(phase);
             return Err(closed(format!("send failed: {err}"), false));
+        }
+        Ok(phase)
+    }
+
+    /// The reactor's first acts, left by the Logon exchange: request a gap it
+    /// found in the counterparty's Logon or acknowledgement, then resend the
+    /// messages the counterparty's `NextExpectedMsgSeqNum` (789) said it
+    /// missed.
+    ///
+    /// The resend is the one a `ResendRequest` for exactly that range would
+    /// get ([`Reactor::resend_range`]). Its range was decided by the handshake
+    /// against the counters of the Logon exchange and lies below this
+    /// session's own Logon or acknowledgement, so it is within what this
+    /// session has sent; it is checked again here, and a range that is empty
+    /// or reaches past the next sender number is not sent.
+    ///
+    /// # Errors
+    /// Whatever closes the session while requesting the gap or resending.
+    async fn open(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        opening: Opening,
+    ) -> Result<Phase, SessionClosed> {
+        let mut phase = phase;
+        if let Some((expected, high_water)) = opening.gap {
+            phase = self
+                .request_resend(framed, phase, expected, high_water)
+                .await?;
+        }
+        if let Some((begin_seq, new_seq)) = opening.replay {
+            let next_sender = self.runtime.sequences.next_sender_seq().value();
+            if begin_seq == 0 || begin_seq >= new_seq || new_seq > next_sender {
+                tracing::warn!(
+                    session = %self.session_id,
+                    begin_seq,
+                    new_seq,
+                    next_sender,
+                    "not resending a NextExpectedMsgSeqNum range outside what was sent"
+                );
+                return Ok(phase);
+            }
+            tracing::info!(
+                session = %self.session_id,
+                begin_seq,
+                up_to_before = new_seq,
+                "resending what the counterparty's NextExpectedMsgSeqNum (789) says it missed"
+            );
+            phase = self.resend_range(framed, phase, begin_seq, new_seq).await?;
         }
         Ok(phase)
     }
@@ -2762,6 +2840,11 @@ pub(crate) struct SessionParams<A: Application> {
     /// number seen). The reactor's first act is to request it, so a failure to
     /// send that request closes the session through the normal close path.
     pub(crate) opening_gap: Option<(u64, u64)>,
+    /// Messages the counterparty's `NextExpectedMsgSeqNum` (789) said it
+    /// missed, as (first number, first number not resent). The reactor resends
+    /// them once Active, right after requesting any `opening_gap`, through the
+    /// same replay a `ResendRequest` (2) gets.
+    pub(crate) opening_replay: Option<(u64, u64)>,
     /// Bound on a single socket write.
     pub(crate) write_timeout: Duration,
     /// Capacity of the outbound command queue.
@@ -2809,6 +2892,7 @@ where
         persisted,
         reset_owed,
         opening_gap,
+        opening_replay,
         write_timeout,
         outbound_capacity,
         app_queue_capacity,
@@ -2859,9 +2943,13 @@ where
         dispatcher,
         app_completed,
     };
+    let opening = Opening {
+        gap: opening_gap,
+        replay: opening_replay,
+    };
     tokio::spawn(async move {
         let _guard = guard;
-        run_reactor(framed, channels, reactor, session, opening_gap).await;
+        run_reactor(framed, channels, reactor, session, opening).await;
     });
 
     (command_tx, closed_rx)

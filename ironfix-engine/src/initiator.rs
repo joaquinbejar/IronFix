@@ -169,6 +169,7 @@
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
+use crate::next_expected::{self, NextExpectedPlan};
 use crate::persistence::{
     PersistedCounters, SeedPlan, Seeded, StoreAttachment, StoreFailurePolicy, seed_session,
 };
@@ -653,7 +654,20 @@ impl<A: Application + 'static> Initiator<A> {
         // A reset the store owes is declared like a configured one, so the
         // counterparty restarts the sequence with us instead of reading our
         // MsgSeqNum 1 as too low.
-        let logon = factory.logon(self.config.heartbeat_interval_secs(), reset_logon);
+        //
+        // With NextExpectedMsgSeqNum (789) on, the Logon declares the next
+        // number expected from the acceptor: the seeded target counter, which
+        // is 1 when the Logon declares a reset.
+        let logon_seq = runtime.sequences.next_sender_seq().value();
+        let next_expected = self
+            .config
+            .send_next_expected_msg_seq_num
+            .then(|| runtime.sequences.next_target_seq().value());
+        let logon = factory.logon(
+            self.config.heartbeat_interval_secs(),
+            reset_logon,
+            next_expected,
+        );
         if let Err(err) = send_handshake_admin(
             self.application.as_ref(),
             &session_id,
@@ -694,6 +708,9 @@ impl<A: Application + 'static> Initiator<A> {
 
         // (gap start, high-water) of a gap detected in the Logon ack itself.
         let mut pending_resend: Option<(u64, u64)> = None;
+        // (first, first not resent) of what the ack's NextExpectedMsgSeqNum
+        // (789) says the acceptor missed.
+        let mut opening_replay: Option<(u64, u64)> = None;
         {
             let raw = wire::decode_frame(&ack)?;
             match raw.msg_type() {
@@ -952,19 +969,95 @@ impl<A: Application + 'static> Initiator<A> {
             // reset and must be honored before MsgSeqNum is validated,
             // otherwise the ack's 34=1 reads as fatally too low against
             // continuity-seeded counters.
-            if raw.get_field_str(141) == Some("Y") {
-                // FIX requires MsgSeqNum = 1 on a Logon carrying
-                // ResetSeqNumFlag = Y: the reset and the number it arrives
-                // under have to agree. A peer that declares a reset and then
-                // numbers the message anything else is describing two
-                // different streams, so the handshake fails rather than
-                // guessing which half to believe.
-                if ack_seq != 1 {
-                    let _ = session.on_logon_reject();
-                    return Err(EngineError::Sequence(format!(
-                        "Logon ack set ResetSeqNumFlag=Y but carried MsgSeqNum {ack_seq}, not 1"
-                    )));
+            let ack_resets = raw.get_field_str(141) == Some("Y");
+            // FIX requires MsgSeqNum = 1 on a Logon carrying ResetSeqNumFlag =
+            // Y: the reset and the number it arrives under have to agree. A
+            // peer that declares a reset and then numbers the message anything
+            // else is describing two different streams, so the handshake fails
+            // rather than guessing which half to believe.
+            if ack_resets && ack_seq != 1 {
+                let _ = session.on_logon_reject();
+                return Err(EngineError::Sequence(format!(
+                    "Logon ack set ResetSeqNumFlag=Y but carried MsgSeqNum {ack_seq}, not 1"
+                )));
+            }
+
+            // NextExpectedMsgSeqNum (789), when this session uses it: the
+            // next number the acceptor expects from us, computed once it had
+            // our Logon. Compared with the counters the ack's own reset sets,
+            // if it declares one (our Logon is then message 1 of the new
+            // stream, and 2 goes next), and decided before that reset is made,
+            // so a refused ack never resets the store. A value above the next
+            // number we send claims messages never sent: Logout, and no
+            // session. A value below our Logon names messages the acceptor
+            // missed: resent once Active. 789 moves no counter.
+            if self.config.send_next_expected_msg_seq_num {
+                let (own_logon_seq, next_outbound) = if ack_resets {
+                    (1, 2)
+                } else {
+                    (logon_seq, runtime.sequences.next_sender_seq().value())
+                };
+                let decided = next_expected::read_next_expected(&raw).and_then(|declared| {
+                    declared
+                        .map(|declared| next_expected::plan(declared, own_logon_seq, next_outbound))
+                        .transpose()
+                });
+                match decided {
+                    Ok(plan) => opening_replay = plan.and_then(NextExpectedPlan::replay_range),
+                    Err(problem) => {
+                        let detail = problem.to_string();
+                        tracing::warn!(
+                            session = %session_id,
+                            detail = %detail,
+                            "refusing the Logon ack's NextExpectedMsgSeqNum"
+                        );
+                        let logout = factory.logout(Some(&detail));
+                        // A malformed 789 is Rejected like the ack's other
+                        // malformed fields; one above what was sent gets the
+                        // Logout alone.
+                        let refused = match problem.reject_reason() {
+                            Some(reason) => {
+                                let reject = factory.session_reject(
+                                    ack_seq,
+                                    MsgType::Logon.as_str(),
+                                    &reason,
+                                );
+                                refuse_handshake(
+                                    self.application.as_ref(),
+                                    &session_id,
+                                    &mut framed,
+                                    &mut factory,
+                                    &runtime.sequences,
+                                    store.as_mut(),
+                                    write_timeout,
+                                    &detail,
+                                    [reject, logout],
+                                )
+                                .await
+                            }
+                            None => {
+                                refuse_handshake(
+                                    self.application.as_ref(),
+                                    &session_id,
+                                    &mut framed,
+                                    &mut factory,
+                                    &runtime.sequences,
+                                    store.as_mut(),
+                                    write_timeout,
+                                    &detail,
+                                    [logout],
+                                )
+                                .await
+                            }
+                        };
+                        let _ = session.on_logon_reject();
+                        refused?;
+                        return Err(EngineError::NextExpectedMsgSeqNum { detail });
+                    }
                 }
+            }
+
+            if ack_resets {
                 tracing::info!(
                     session = %session_id,
                     "counterparty set ResetSeqNumFlag on the Logon ack: resetting sequence numbers"
@@ -1085,6 +1178,7 @@ impl<A: Application + 'static> Initiator<A> {
                 .map_or_else(PersistedCounters::default, |handshake| handshake.persisted),
             reset_owed: self.store.owed_record(),
             opening_gap: pending_resend,
+            opening_replay,
             write_timeout,
             outbound_capacity: self.outbound_capacity,
             app_queue_capacity: self.app_queue_capacity,

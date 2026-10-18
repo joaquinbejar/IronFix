@@ -118,6 +118,25 @@ pub enum EngineError {
         detail: String,
     },
 
+    /// The `NextExpectedMsgSeqNum` (789) the counterparty declared on its
+    /// Logon (acceptor) or Logon acknowledgement (initiator) cannot be
+    /// honoured, and the Logon exchange was refused.
+    ///
+    /// Raised only on a session with
+    /// [`SessionConfig::send_next_expected_msg_seq_num`](ironfix_session::SessionConfig::send_next_expected_msg_seq_num)
+    /// set: for a 789 above the next `MsgSeqNum` this session sends (the
+    /// counterparty claims messages that were never sent, which no resend can
+    /// repair), and for one that occurs more than once, is 0, or is not a
+    /// number. The counterparty is sent a Logout whose `Text` (58) says why
+    /// (the initiator precedes it with a session Reject, `RefTagID` 789, for a
+    /// malformed value), `on_logon` never runs, and the session never reaches
+    /// Active.
+    #[error("NextExpectedMsgSeqNum problem: {detail}")]
+    NextExpectedMsgSeqNum {
+        /// Why the declared `NextExpectedMsgSeqNum` was refused.
+        detail: String,
+    },
+
     /// An unexpected message type arrived while awaiting the Logon
     /// acknowledgement.
     #[error("unexpected message during logon: 35={msg_type}")]
