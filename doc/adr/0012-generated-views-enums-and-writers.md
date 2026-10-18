@@ -59,8 +59,14 @@ file has four modules:
   and one `GroupSet<'static>` per message, holding its header, trailer and
   body groups, exactly as `MessageLayout` expands them (components
   flattened, members sorted, the first of two groups sharing a count tag
-  kept). Each constant matches the constructor's `SpecError` to `panic!`, so a
-  bad table is a compile error.
+  kept). A message's set is built with `GroupSet::with_level_tags` and every
+  tag its message level accepts (header, body and trailer fields and count
+  tags), so it reads group boundaries as `MessageLayout` reads them: after a
+  top-level group that holds every entry it declares, a tag the message level
+  also accepts ends the group (`453=0|58=X`); a set built with
+  `GroupSet::new` would read that `58` as the group's. Each constant matches
+  the constructor's `SpecError` to `panic!`, so a bad table is a compile
+  error.
 - **`views`**: `XxxView<'m, 'a>` per message, a `Copy` wrapper over
   `&'m RawMessage<'a>` built with `from_message` (which checks the MsgType),
   and one `XxxView<'m, 'a>` per group definition over a `GroupEntry`.
@@ -78,9 +84,13 @@ file has four modules:
 - **`writers`**: `XxxFields<'v>` per message and group definition, a
   `Copy + Default` struct of `Option` fields and slices (one item per group
   entry, or per multi-value token). `write` checks everything before writing
-  anything (see below), then sends the body in dictionary order: fields,
-  groups, components (the loader does not keep the XML interleaving), a group
-  as its count and then each entry with its delimiter first.
+  anything (see below), then sends the body in XML order: the order the
+  dictionary records (ADR-0016, `members()`), a component's members in its
+  place, a group as its count and then each entry with its delimiter first
+  and its other members in XML order, as FIX requires inside a repeating
+  group. Views list their accessors in the same order. Of two groups sharing
+  a count tag at one level (a schema defect), the one kept is the one
+  `MessageLayout` keeps, though members are listed in XML order.
 
 **Views read what the validator accepts, and nothing else.** Before
 converting, every value except an enumeration's and a `data` field's is
@@ -187,8 +197,12 @@ that release is cut.
 
 - **Semver: additive (minor).** New `pub` items: `CodeGenerator::generate_views`
   and the variant `GeneratorError::UnpairedDataField` (the enum is
-  `#[non_exhaustive]`) in `ironfix-codegen`, and `GroupSet::field` in
-  `ironfix-dictionary`. Nothing is renamed or removed. `UnnameableItem` can
+  `#[non_exhaustive]`) in `ironfix-codegen`; `GroupSet::field`,
+  `GroupSet::with_level_tags`, `GroupSet::level_tags` and the variants
+  `SpecError::UnsortedLevelTags` and `SpecError::GroupNotAtLevel` (the enum
+  is `#[non_exhaustive]`) in `ironfix-dictionary`. Nothing is renamed or
+  removed. The XML member order the writers rely on is ADR-0016's change,
+  breaking on its own. `UnnameableItem` can
   now carry `what: "component"`, a value, not a variant.
 - **Dev-dependencies, approved:** `ironfix-core`, `ironfix-tagvalue` and
   `rust_decimal` (all workspace dependencies) for `ironfix-codegen`'s tests
@@ -209,16 +223,29 @@ that release is cut.
   the FIX 4.4 and sample dictionaries with `Validator`.
 - **What is checked from the generated text.** For every message of the four
   embedded dictionaries, the `layouts` constants are parsed back and compared
-  group by group with `MessageLayout`, and every emitted LENGTH/DATA pair and
-  plain field is checked against the encoder. That checks the tables and tags
-  the generator emits, not that the full outputs compile.
-- **What is verified out of tree only.** The full FIX 4.4 (about 4.2 MB),
-  FIX 4.2 (about 1 MB) and FIX 5.0 SP2 (about 26 MB) views are too large to
-  commit. They were compiled as a library with `#![deny(missing_docs)]` under
-  `cargo clippy -- -D warnings` in edition 2024 and 2021, and documented with
-  `RUSTDOCFLAGS="-D warnings"`, from a scratch crate. That is not a CI gate.
-  The generator's unit tests generate all four, check determinism and that
-  they carry no `#[allow]` and no binary float.
+  group by group, and the message level's tags, with `MessageLayout`, and
+  every emitted LENGTH/DATA pair and plain field is checked against the
+  encoder. A test also reads an empty top-level group followed by a tag the
+  message level accepts through a generated view and through `MessageLayout`,
+  with the same result.
+- **The full FIX 4.4 views compile in CI.** The unpublished workspace member
+  `ironfix-codegen-check` (`publish = false`, left out of `make publish-all`,
+  the semver matrix and the coverage report) generates the views of the
+  embedded FIX 4.4, FIX 4.2 and FIXT 1.1 dictionaries from its build script
+  into `OUT_DIR` and includes them in a library with `#![deny(missing_docs)]`,
+  so `make lint` (`clippy --all-targets -D warnings`) and `make doc` check the
+  full outputs, with no golden file and no `#[allow]`; a test there reads an
+  ExecutionReport, which no golden carries. On the machine this was written
+  on, the crate builds in about 20 s (debug, cold), clippy in about 9 s and a
+  release build in about 23 s, all three dictionaries together. The
+  three-message FIX 4.4 golden stays: the behavioural tests in
+  `ironfix-codegen` use it, and that crate cannot depend on the check crate.
+- **What is verified out of tree only.** The FIX 5.0 SP2 views (about
+  26 MB) are too large to build in CI. They were compiled as a library with
+  `#![deny(missing_docs)]` under `cargo clippy -- -D warnings` in edition 2024
+  and 2021 from a scratch crate. The generator's unit tests generate all four
+  outputs, check determinism and that they carry no `#[allow]` and no binary
+  float.
 - **No performance or allocation claim.** Views delegate to the group
   reader (whose read path is proved allocation-free, `GroupSet::field`
   included) and to `ironfix_core`'s conversions and the grammar check, which
@@ -229,14 +256,13 @@ that release is cut.
   input, so views generated from a FIX 5.0 application dictionary know no
   header group; group presence is not enforced by views (it is by writers and
   by the `Validator`); the data-struct output's size (#98) is unchanged.
-- **Open: group-entry member order.** Writers emit an entry's delimiter
-  first and then its members in the order the loader keeps (fields, nested
-  groups, components), not the order the XML lists them, which FIX expects
-  inside a repeating group. Keeping the XML order needs the dictionary schema
-  to record it; that change is pending an owner decision and is not made
-  here.
-- **No consumer.** Nothing in the workspace consumes either output; the
-  engine and the codec still read fields by tag.
-- **Unchanged.** No `unsafe`, no new runtime dependency, and the crate DAG
-  is as before: `ironfix-codegen` depends on `ironfix-dictionary` only;
-  `ironfix-tagvalue` does not depend on `ironfix-dictionary`.
+- **No consumer.** Nothing in the workspace consumes either output at run
+  time (`ironfix-codegen-check` only compiles the views); the engine and the
+  codec still read fields by tag.
+- **Unchanged.** No `unsafe`, no new runtime dependency, and the published
+  crate DAG is as before: `ironfix-codegen` depends on `ironfix-dictionary`
+  only; `ironfix-tagvalue` does not depend on `ironfix-dictionary`. The new
+  workspace member `ironfix-codegen-check` is not published; it depends on
+  `ironfix-core`, `ironfix-dictionary` and `rust_decimal` (what the generated
+  views name), builds with `ironfix-codegen`, and tests with
+  `ironfix-tagvalue`.
