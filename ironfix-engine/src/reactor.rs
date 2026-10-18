@@ -238,7 +238,7 @@ pub(crate) async fn send_handshake_admin<A: Application>(
 /// its `MsgSeqNum` and the next sender number persisted **before** the frame
 /// goes on the wire, so a store reused across a reconnect can replay it and
 /// never reports a number the peer has already seen. Under
-/// [`StoreFailurePolicy::CloseSession`](crate::StoreFailurePolicy::CloseSession)
+/// [`StoreFailurePolicy::CloseSession`]
 /// a failed write stops here and nothing is written.
 ///
 /// # Errors
@@ -2247,8 +2247,8 @@ impl<A: Application> Reactor<A> {
     /// sequence number has already been validated (and, on the in-sequence
     /// path, consumed).
     ///
-    /// Application messages never reach here — they are handed to the dispatcher
-    /// task by [`Reactor::enqueue_app`], so a slow `from_app` cannot delay the
+    /// Application messages never reach here: they are handed to the dispatcher
+    /// task by [`Reactor::deliver_app`], so a slow `from_app` cannot delay the
     /// next socket read or the heartbeat clock.
     async fn dispatch_admin(
         &mut self,
