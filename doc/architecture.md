@@ -316,13 +316,17 @@ pub trait Application: Send + Sync {
 
 ### Message store abstraction
 
-> The `MessageStore` trait and `MemoryStore` exist in `ironfix-store`, and the
-> `Initiator` uses an attached store: it files every sequenced outbound frame,
-> persists both sequence counters in the order ADR-0005
-> (`doc/adr/0005-fallible-store-writes.md`) sets out, and answers an inbound
-> `ResendRequest` from it. `MemoryStore` is the only implementation and is not
-> persistent, so nothing survives a restart yet; the `Acceptor` attaches no
-> store. There is no file-backed or memory-mapped store.
+> The `MessageStore` trait and `MemoryStore` exist in `ironfix-store`, and both
+> engines use an attached store (`Initiator::with_store`,
+> `Acceptor::with_store`, `EngineBuilder::with_store`): they file every
+> sequenced outbound frame, persist both sequence counters in the order
+> ADR-0005 (`doc/adr/0005-fallible-store-writes.md`) sets out, seed each
+> session from it, and answer an inbound `ResendRequest` from it. The acceptor
+> touches its store only once the peer is authenticated (`from_admin`
+> accepted it), and resets it only for a Logon that passes every check
+> (`doc/adr/0017-acceptor-message-store.md`).
+> `MemoryStore` is the only implementation and is not persistent, so nothing
+> survives a restart yet. There is no file-backed or memory-mapped store.
 
 ```rust
 // ironfix-store/src/traits.rs (abridged)

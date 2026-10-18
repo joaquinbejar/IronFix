@@ -56,9 +56,10 @@ pub enum EngineError {
 
     /// The session configuration is not usable.
     ///
-    /// Checked before the socket is dialled: an out-of-range knob — a
-    /// fractional `HeartBtInt`, an identity string carrying SOH or `=`, a zero
-    /// timeout — would otherwise corrupt the session's own messages.
+    /// Checked before the socket is dialled by the initiator, and before the
+    /// handshake by the acceptor: an out-of-range knob — a fractional
+    /// `HeartBtInt`, an identity string carrying SOH or `=`, a zero timeout —
+    /// would otherwise corrupt the session's own messages.
     /// [`ironfix_session::SessionConfigBuilder`] reports the same errors at
     /// configuration time.
     #[error("invalid session configuration: {0}")]
@@ -136,9 +137,11 @@ pub enum EngineError {
     /// The store has frames filed at the numbers in between, so the
     /// counterparty has seen them; reusing one would send a different message
     /// under a `MsgSeqNum` it already holds. Checked by
-    /// [`Initiator::connect`](crate::Initiator::connect) after the store is
+    /// [`Initiator::connect`](crate::Initiator::connect) and
+    /// [`Acceptor::serve`](crate::Acceptor::serve) after the store is
     /// refreshed and before anything is written. Set through
-    /// [`Initiator::with_initial_sequences`](crate::Initiator::with_initial_sequences).
+    /// [`Initiator::with_initial_sequences`](crate::Initiator::with_initial_sequences)
+    /// or [`Acceptor::with_initial_sequences`](crate::Acceptor::with_initial_sequences).
     #[error(
         "initial sender sequence number {seeded} is below the store's next sender sequence \
          number {stored}"
@@ -207,13 +210,19 @@ pub enum EngineError {
     /// counter the store could not vouch for. A failed reset for the ack is
     /// owed to the next connect, whose Logon then declares the reset itself.
     ///
+    /// Raised the same way by [`Acceptor::serve`](crate::Acceptor::serve),
+    /// once the inbound Logon is authenticated, when the store cannot be reset
+    /// (the Logon carries `ResetSeqNumFlag`, `reset_on_logon` is set, or a
+    /// reset is owed) or refreshed, whatever the policy.
+    ///
     /// Under [`StoreFailurePolicy::CloseSession`](crate::StoreFailurePolicy::CloseSession)
-    /// it is also raised when a handshake store call fails: filing the Logon
-    /// together with the next sender number, persisting the target number the
-    /// Logon ack consumed, and filing a Reject or Logout that refuses the ack
-    /// (this error then replaces the refusal's own). The frame concerned is
-    /// never written. Once `on_logon` has run, the same failure closes the
-    /// session instead, through `on_logout`.
+    /// it is also raised when a handshake store call fails, in either role:
+    /// filing the Logon or its acknowledgement together with the next sender
+    /// number, persisting the target number the inbound Logon or ack consumed,
+    /// and filing a Reject or Logout that refuses it (this error then replaces
+    /// the refusal's own). The frame concerned is never written. Once
+    /// `on_logon` has run, the same failure closes the session instead,
+    /// through `on_logout`.
     ///
     /// A store call that overruns the store timeout fails with
     /// [`StoreError::Timeout`].

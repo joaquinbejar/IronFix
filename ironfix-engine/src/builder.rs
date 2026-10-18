@@ -16,13 +16,15 @@
 //! [`Initiator`] establishes a single session per `connect`, and a supervisor
 //! calls it again). The connect timeout applies to the initiator only; an
 //! acceptor waits for inbound connections and bounds the Logon handshake with
-//! [`SessionConfig::logon_timeout`] instead.
+//! [`SessionConfig::logon_timeout`] instead. A [`MessageStore`] set with
+//! [`EngineBuilder::with_store`] is attached by both terminal methods.
 
 use crate::acceptor::Acceptor;
 use crate::application::{Application, NoOpApplication};
 use crate::error::EngineError;
 use crate::initiator::Initiator;
 use ironfix_session::config::SessionConfig;
+use ironfix_store::MessageStore;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +33,6 @@ use std::time::Duration;
 /// Set the [`Application`] and add exactly one [`SessionConfig`], then call
 /// [`EngineBuilder::into_initiator`] or [`EngineBuilder::into_acceptor`] to
 /// obtain a runnable engine.
-#[derive(Debug)]
 pub struct EngineBuilder<A: Application = NoOpApplication> {
     /// Application callback handler.
     application: Arc<A>,
@@ -39,6 +40,20 @@ pub struct EngineBuilder<A: Application = NoOpApplication> {
     sessions: Vec<SessionConfig>,
     /// TCP connect timeout applied by [`EngineBuilder::into_initiator`].
     connect_timeout: Duration,
+    /// Message store attached by both terminal methods, if any.
+    store: Option<Arc<dyn MessageStore>>,
+}
+
+/// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
+/// requiring it of every implementation to print one field is the wrong trade.
+impl<A: Application> std::fmt::Debug for EngineBuilder<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngineBuilder")
+            .field("sessions", &self.sessions)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("store", &self.store.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for EngineBuilder<NoOpApplication> {
@@ -55,6 +70,7 @@ impl EngineBuilder<NoOpApplication> {
             application: Arc::new(NoOpApplication),
             sessions: Vec::new(),
             connect_timeout: Duration::from_secs(30),
+            store: None,
         }
     }
 }
@@ -67,6 +83,7 @@ impl<A: Application + 'static> EngineBuilder<A> {
             application: Arc::new(application),
             sessions: self.sessions,
             connect_timeout: self.connect_timeout,
+            store: self.store,
         }
     }
 
@@ -89,6 +106,25 @@ impl<A: Application + 'static> EngineBuilder<A> {
         self
     }
 
+    /// Attaches a message store to the engine either terminal method
+    /// produces.
+    ///
+    /// [`EngineBuilder::into_initiator`] passes it to
+    /// [`Initiator::with_store`] and [`EngineBuilder::into_acceptor`] to
+    /// [`Acceptor::with_store`]; see those for what a store changes. The store
+    /// failure policy and the store timeout are set on the engine itself.
+    #[must_use]
+    pub fn with_store(mut self, store: Arc<dyn MessageStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Returns whether a message store has been set.
+    #[must_use]
+    pub const fn has_store(&self) -> bool {
+        self.store.is_some()
+    }
+
     /// Returns the configured sessions.
     #[must_use]
     pub fn sessions(&self) -> &[SessionConfig] {
@@ -108,25 +144,36 @@ impl<A: Application + 'static> EngineBuilder<A> {
     }
 
     /// Consumes the builder and produces a client-side [`Initiator`] for the
-    /// single configured session, applying the configured connect timeout.
+    /// single configured session, applying the configured connect timeout and
+    /// attaching the message store, if one was set.
     ///
     /// # Errors
     /// Returns [`EngineError::Configuration`] unless exactly one session has
     /// been added.
     pub fn into_initiator(self) -> Result<Initiator<A>, EngineError> {
         let config = self.single_session()?;
-        Ok(Initiator::new(config, self.application).with_connect_timeout(self.connect_timeout))
+        let initiator =
+            Initiator::new(config, self.application).with_connect_timeout(self.connect_timeout);
+        Ok(match self.store {
+            Some(store) => initiator.with_store(store),
+            None => initiator,
+        })
     }
 
     /// Consumes the builder and produces a server-side [`Acceptor`] for the
-    /// single configured session.
+    /// single configured session, attaching the message store, if one was
+    /// set.
     ///
     /// # Errors
     /// Returns [`EngineError::Configuration`] unless exactly one session has
     /// been added.
     pub fn into_acceptor(self) -> Result<Acceptor<A>, EngineError> {
         let config = self.single_session()?;
-        Ok(Acceptor::new(config, self.application))
+        let acceptor = Acceptor::new(config, self.application);
+        Ok(match self.store {
+            Some(store) => acceptor.with_store(store),
+            None => acceptor,
+        })
     }
 
     /// Extracts the single configured session, or explains why there is not
@@ -168,6 +215,17 @@ mod tests {
         let builder = EngineBuilder::new();
         assert_eq!(builder.connect_timeout(), Duration::from_secs(30));
         assert!(builder.sessions().is_empty());
+        assert!(!builder.has_store());
+    }
+
+    #[test]
+    fn test_engine_builder_store_survives_with_application() {
+        let store: Arc<dyn MessageStore> = Arc::new(ironfix_store::MemoryStore::new());
+        let builder = EngineBuilder::new()
+            .with_store(store)
+            .with_application(NoOpApplication);
+        assert!(builder.has_store());
+        assert!(format!("{builder:?}").contains("store: true"));
     }
 
     #[test]

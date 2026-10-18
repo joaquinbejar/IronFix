@@ -24,14 +24,21 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
+use ironfix_core::error::StoreError;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::{CompId, Timestamp};
 use ironfix_engine::application::{Application, RejectReason, SessionId};
-use ironfix_engine::{Acceptor, Connection, EngineError, Initiator, OutboundMessage};
+use ironfix_engine::{
+    Acceptor, Connection, EngineBuilder, EngineError, Initiator, OutboundMessage,
+    StoreFailurePolicy,
+};
+use ironfix_session::sequence::SequenceCounter;
 use ironfix_session::{GarbledFrameLimit, SessionConfig};
+use ironfix_store::{MemoryStore, MessageStore, StoredMessage};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -589,6 +596,22 @@ async fn test_acceptor_refuses_second_concurrent_logon() {
             "serve B in 5s",
         ),
         "serve B joins",
+    );
+
+    // The duplicate is closed without a reply, with or without a store: the
+    // live session owns the sequence stream.
+    let refused_framed = if res_a.is_err() {
+        &mut framed_a
+    } else {
+        &mut framed_b
+    };
+    assert!(
+        timeout(Duration::from_secs(5), refused_framed.next())
+            .await
+            .ok()
+            .flatten()
+            .is_none(),
+        "the duplicate gets no reply"
     );
 
     // Exactly one session established; the other was refused as a duplicate.
@@ -1289,4 +1312,1123 @@ async fn test_acceptor_garbled_frames_during_the_handshake_do_not_count_toward_t
         "closed within 5s",
     );
     read_until_closed(&mut framed).await;
+}
+
+// ---------------------------------------------------------------------------
+// The acceptor's message store
+// ---------------------------------------------------------------------------
+
+/// A store that counts every call the engine makes on it and fails on demand.
+///
+/// `calls` counts every trait call, the counter reads included, so a test can
+/// assert that the engine never touched the store at all. A test seeds history
+/// through `inner` directly, which is not counted.
+#[derive(Debug)]
+struct ProbeStore {
+    inner: MemoryStore,
+    calls: AtomicU64,
+    fail_refresh: AtomicBool,
+    fail_store: AtomicBool,
+    fail_reset: AtomicBool,
+    hold_reset: AtomicBool,
+    stall_target: AtomicBool,
+}
+
+impl ProbeStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            calls: AtomicU64::new(0),
+            fail_refresh: AtomicBool::new(false),
+            fail_store: AtomicBool::new(false),
+            fail_reset: AtomicBool::new(false),
+            hold_reset: AtomicBool::new(false),
+            stall_target: AtomicBool::new(false),
+        }
+    }
+
+    fn touched(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn count(&self) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl MessageStore for ProbeStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), StoreError> {
+        self.count();
+        if self.fail_store.load(Ordering::SeqCst) {
+            return Err(StoreError::Io(
+                "store refused by the test store".to_string(),
+            ));
+        }
+        self.inner.store(seq_num, msg_type, message).await
+    }
+
+    async fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        self.count();
+        self.inner.get_range(begin, end).await
+    }
+
+    fn next_sender_seq(&self) -> u64 {
+        self.count();
+        self.inner.next_sender_seq()
+    }
+
+    fn next_target_seq(&self) -> u64 {
+        self.count();
+        self.inner.next_target_seq()
+    }
+
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.count();
+        self.inner.set_next_sender_seq(seq).await
+    }
+
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.count();
+        if self.stall_target.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        self.inner.set_next_target_seq(seq).await
+    }
+
+    async fn reset(&self) -> Result<(), StoreError> {
+        self.count();
+        if self.hold_reset.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        if self.fail_reset.load(Ordering::SeqCst) {
+            return Err(StoreError::Io(
+                "reset refused by the test store".to_string(),
+            ));
+        }
+        self.inner.reset().await
+    }
+
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.count();
+        self.inner.creation_time()
+    }
+
+    async fn refresh(&self) -> Result<(), StoreError> {
+        self.count();
+        if self.fail_refresh.load(Ordering::SeqCst) {
+            return Err(StoreError::Io(
+                "refresh refused by the test store".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Logs a stub initiator on to a shared `acceptor` with a Logon numbered `seq`
+/// that also carries `extra`, and returns the stub's socket, the acceptor's
+/// connection and the acknowledgement it received.
+async fn establish_shared(
+    acceptor: &Arc<Acceptor<RecordingApp>>,
+    seq: u64,
+    extra: &[(u32, &str)],
+) -> (Framed<TcpStream, FixCodec>, Connection, BytesMut) {
+    let (listener, addr) = bind_listener().await;
+    let shared = Arc::clone(acceptor);
+    let venue = tokio::spawn(async move { shared.accept(&listener).await });
+
+    let stream = ok(TcpStream::connect(addr).await, "client connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    let mut fields = vec![(98, "0"), (108, "30")];
+    fields.extend_from_slice(extra);
+    ok(
+        framed.send(client_msg("A", seq, &fields)).await,
+        "client sends its logon",
+    );
+    let ack = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&ack), "A");
+
+    let connection = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), venue).await,
+                "handshake within 5s",
+            ),
+            "venue task joins",
+        ),
+        "acceptor establishes the session",
+    );
+    (framed, connection, ack)
+}
+
+/// Sends `count` execution reports from the acceptor, numbered from `first`
+/// in their `ExecID` (17).
+async fn send_reports(connection: &Connection, first: usize, count: usize) {
+    for index in first..first + count {
+        let mut exec = OutboundMessage::new(MsgType::ExecutionReport);
+        exec.push_str(37, &format!("EX-{index}"))
+            .push_str(17, &format!("E-{index}"))
+            .push_char(150, '0')
+            .push_char(39, '0');
+        ok(connection.send(exec).await, "venue sends a report");
+    }
+}
+
+/// Runs a first session on `acceptor`: Logon 1 and its ack 1, one report at 2,
+/// then a Logout from the stub (2) answered by the acceptor (3). The store then
+/// holds frames 1 to 3, next sender 4 and next target 3.
+async fn run_first_session(acceptor: &Arc<Acceptor<RecordingApp>>) {
+    let (mut framed, connection, ack) = establish_shared(acceptor, 1, &[]).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("1"));
+    send_reports(&connection, 1, 1).await;
+    let report = next_frame(&mut framed).await;
+    assert_eq!(field(&report, 34).as_deref(), Some("2"));
+    ok(
+        framed.send(client_msg("5", 2, &[])).await,
+        "client logs out",
+    );
+    let reply = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&reply), "5");
+    assert_eq!(field(&reply, 34).as_deref(), Some("3"));
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+}
+
+/// With a store, the acceptor answers a `ResendRequest` for a sub-range by
+/// replaying the application messages under their original `MsgSeqNum`, with
+/// `PossDupFlag` (43) = Y and `OrigSendingTime` (122) equal to the original
+/// `SendingTime` (52), and gap-fills the administrative message in the range.
+#[tokio::test]
+async fn test_acceptor_with_store_replays_a_resend_sub_range() {
+    let store = Arc::new(MemoryStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    )
+    .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let (mut framed, connection) = establish(acceptor, 30).await;
+
+    // Reports at 2 and 3, a Heartbeat answering a TestRequest at 4, reports at
+    // 5 and 6. The stub keeps what it first received, by MsgSeqNum.
+    let mut originals = std::collections::HashMap::new();
+    send_reports(&connection, 1, 2).await;
+    for _ in 0..2 {
+        let frame = next_frame(&mut framed).await;
+        originals.insert(field(&frame, 34), (field(&frame, 52), field(&frame, 17)));
+    }
+    ok(
+        framed.send(client_msg("1", 2, &[(112, "PING")])).await,
+        "send TestRequest",
+    );
+    let heartbeat = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&heartbeat), "0");
+    assert_eq!(field(&heartbeat, 34).as_deref(), Some("4"));
+    send_reports(&connection, 3, 2).await;
+    for _ in 0..2 {
+        let frame = next_frame(&mut framed).await;
+        originals.insert(field(&frame, 34), (field(&frame, 52), field(&frame, 17)));
+    }
+
+    ok(
+        framed
+            .send(client_msg("2", 3, &[(7, "3"), (16, "5")]))
+            .await,
+        "send ResendRequest for 3..=5",
+    );
+
+    for seq in ["3", "5"] {
+        if seq == "5" {
+            let fill = next_frame(&mut framed).await;
+            assert_eq!(msg_type_of(&fill), "4", "the Heartbeat at 4 is gap-filled");
+            assert_eq!(field(&fill, 34).as_deref(), Some("4"));
+            assert_eq!(field(&fill, 123).as_deref(), Some("Y"));
+            assert_eq!(field(&fill, 36).as_deref(), Some("5"));
+        }
+        let replay = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&replay), "8");
+        assert_eq!(field(&replay, 34).as_deref(), Some(seq));
+        assert_eq!(field(&replay, 43).as_deref(), Some("Y"));
+        let (sending_time, exec_id) = some(
+            originals.get(&Some(seq.to_string())),
+            "the replayed number was sent before",
+        );
+        assert_eq!(
+            &field(&replay, 122),
+            sending_time,
+            "OrigSendingTime is the original 52"
+        );
+        assert_eq!(
+            &field(&replay, 17),
+            exec_id,
+            "the replay carries the original body"
+        );
+    }
+    assert!(store.contains(6));
+}
+
+/// The same store reused across two accepted connections continues the
+/// numbering when neither side sets `ResetSeqNumFlag` (141): the second
+/// session's ack follows the first session's last frame.
+#[tokio::test]
+async fn test_acceptor_store_continues_numbering_across_connections() {
+    let store = Arc::new(MemoryStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)),
+            Arc::clone(&venue_app),
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    run_first_session(&acceptor).await;
+    assert_eq!(store.next_sender_seq(), 4);
+    assert_eq!(store.next_target_seq(), 3);
+
+    // The stub's own stream continues at 3.
+    let (_framed, _connection, ack) = establish_shared(&acceptor, 3, &[]).await;
+    assert_eq!(
+        field(&ack, 34).as_deref(),
+        Some("4"),
+        "numbered from the store"
+    );
+    assert_eq!(field(&ack, 141), None);
+    assert_eq!(
+        store.next_target_seq(),
+        4,
+        "the Logon at 3 is in the cursor"
+    );
+    assert!(
+        store.contains(2),
+        "the first session's frames are still filed"
+    );
+}
+
+/// A `ResetSeqNumFlag` (141) Logon restarts both counters at 1, and the store
+/// is reset before the acknowledgement is filed: afterwards it holds the new
+/// ack alone, at 1.
+#[tokio::test]
+async fn test_acceptor_reset_logon_clears_the_store_before_the_ack_is_filed() {
+    let store = Arc::new(MemoryStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)),
+            Arc::clone(&venue_app),
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    run_first_session(&acceptor).await;
+
+    let (_framed, _connection, ack) = establish_shared(&acceptor, 1, &[(141, "Y")]).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("1"));
+    assert_eq!(field(&ack, 141).as_deref(), Some("Y"));
+    assert_eq!(
+        store.message_count(),
+        1,
+        "the previous stream is gone and the new ack is filed"
+    );
+    let filed = ok(store.get_range(1, 1).await, "read the filed ack");
+    assert_eq!(
+        filed.first().map(|message| message.msg_type().clone()),
+        Some(MsgType::Logon)
+    );
+    assert_eq!(store.next_sender_seq(), 2);
+    assert_eq!(store.next_target_seq(), 2);
+}
+
+/// A store that cannot be refreshed makes `serve` fail with
+/// `EngineError::Store` before the session goes Active: `on_logon` never runs
+/// and nothing is written to the peer.
+#[tokio::test]
+async fn test_acceptor_failing_store_refresh_fails_serve() {
+    let (listener, addr) = bind_listener().await;
+    let store = Arc::new(ProbeStore::new());
+    store.fail_refresh.store(true, Ordering::SeqCst);
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    )
+    .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+
+    let stream = ok(TcpStream::connect(addr).await, "client connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    send_client_logon(&mut framed).await;
+
+    match ok(
+        timeout(Duration::from_secs(5), venue).await,
+        "venue task finishes within 5s",
+    ) {
+        Ok(Err(EngineError::Store(_))) => {}
+        other => panic!("expected a store error, got {other:?}"),
+    }
+    assert!(
+        timeout(Duration::from_secs(5), framed.next())
+            .await
+            .ok()
+            .flatten()
+            .is_none(),
+        "no frame reaches the peer"
+    );
+    assert!(!venue_app.events().contains(&"logon".to_string()));
+}
+
+/// `EngineBuilder::with_store` reaches both roles: the initiator files its
+/// Logon and its order, the acceptor its acknowledgement.
+#[tokio::test]
+async fn test_engine_builder_store_files_frames_in_both_roles() {
+    let (listener, addr) = bind_listener().await;
+    let venue_store = Arc::new(MemoryStore::new());
+    let client_store = Arc::new(MemoryStore::new());
+
+    let acceptor = ok(
+        EngineBuilder::new()
+            .add_session(venue_config(Duration::from_secs(30)))
+            .with_store(Arc::clone(&venue_store) as Arc<dyn MessageStore>)
+            .into_acceptor(),
+        "build the acceptor",
+    );
+    let initiator = ok(
+        EngineBuilder::new()
+            .add_session(client_config(Duration::from_secs(30)))
+            .with_store(Arc::clone(&client_store) as Arc<dyn MessageStore>)
+            .into_initiator(),
+        "build the initiator",
+    );
+
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+    let client = ok(initiator.connect(addr).await, "client connects and logs on");
+    let venue_connection = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), venue).await,
+                "handshake within 5s",
+            ),
+            "venue task joins",
+        ),
+        "acceptor establishes the session",
+    );
+
+    let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+    order.push_str(11, "ORDER-1");
+    ok(client.send(order).await, "client sends an order");
+    let filed = timeout(Duration::from_secs(5), async {
+        while !client_store.contains(2) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    ok(filed, "the order is filed within 5s");
+
+    assert!(client_store.contains(1), "the initiator filed its Logon");
+    assert!(venue_store.contains(1), "the acceptor filed its ack");
+    drop(venue_connection);
+}
+
+/// A Logon whose CompIDs are not the configured counterparty's never touches
+/// the store, and with a store attached it is refused without a reply.
+#[tokio::test]
+async fn test_acceptor_identity_refusal_never_touches_the_store() {
+    let (listener, addr) = bind_listener().await;
+    let store = Arc::new(ProbeStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    )
+    .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+
+    let stream = ok(TcpStream::connect(addr).await, "stranger connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    let mut encoder = Encoder::new("FIX.4.4");
+    encoder.put_str(35, "A");
+    encoder.put_str(49, "STRANGER");
+    encoder.put_str(56, "VENUE");
+    encoder.put_uint(34, 1);
+    encoder.put_str(52, Timestamp::now().format_millis().as_str());
+    encoder.put_uint(98, 0);
+    encoder.put_uint(108, 30);
+    encoder.put_str(141, "Y");
+    let mut logon = BytesMut::new();
+    ok(
+        encoder.finish_into(&mut logon),
+        "stranger logon must encode",
+    );
+    ok(framed.send(logon).await, "stranger sends its logon");
+
+    match ok(
+        timeout(Duration::from_secs(5), venue).await,
+        "venue task finishes within 5s",
+    ) {
+        Ok(Err(EngineError::IdentityMismatch { .. })) => {}
+        other => panic!("expected IdentityMismatch, got {other:?}"),
+    }
+    assert!(
+        timeout(Duration::from_secs(5), framed.next())
+            .await
+            .ok()
+            .flatten()
+            .is_none(),
+        "no Reject and no Logout with a store attached"
+    );
+    assert_eq!(store.touched(), 0, "the store was never touched");
+}
+
+/// An application that refuses every Logon in `from_admin`.
+#[derive(Debug)]
+struct RefusingApp;
+
+#[async_trait]
+impl Application for RefusingApp {
+    async fn on_create(&self, _session_id: &SessionId) {}
+
+    async fn on_logon(&self, _session_id: &SessionId) {}
+
+    async fn on_logout(&self, _session_id: &SessionId) {}
+
+    async fn to_admin(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_admin(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Err(RejectReason::new(99, "bad credentials"))
+    }
+
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_app(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+}
+
+/// Files three frames of a previous stream in `store` and moves its counters
+/// past them: next sender 4, next target 3.
+async fn seed_history(store: &MemoryStore) {
+    for seq in 1..=3u64 {
+        let frame = client_msg("8", seq, &[(17, "OLD")]);
+        ok(
+            store.store(seq, &MsgType::ExecutionReport, &frame).await,
+            "seed the journal",
+        );
+    }
+    ok(
+        store.set_next_sender_seq(4).await,
+        "seed the sender counter",
+    );
+    ok(
+        store.set_next_target_seq(3).await,
+        "seed the target counter",
+    );
+}
+
+/// Sends `logon` to `acceptor` from a stub initiator, and returns what the
+/// acceptor's `accept` returned and every frame the stub received before the
+/// acceptor hung up, as (MsgType, MsgSeqNum, Text) triples.
+async fn refused_logon<A: Application + 'static>(
+    acceptor: Arc<Acceptor<A>>,
+    logon: BytesMut,
+) -> (
+    Result<Connection, EngineError>,
+    Vec<(String, Option<String>, Option<String>)>,
+) {
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+    let stream = ok(TcpStream::connect(addr).await, "client connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    ok(framed.send(logon).await, "client sends its logon");
+    let result = ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue task finishes within 5s",
+        ),
+        "venue task joins",
+    );
+    let mut frames = Vec::new();
+    while let Ok(Some(Ok(frame))) = timeout(Duration::from_secs(2), framed.next()).await {
+        frames.push((msg_type_of(&frame), field(&frame, 34), field(&frame, 58)));
+    }
+    (result, frames)
+}
+
+/// A store-backed acceptor with a previous stream filed (next sender 4, next
+/// target 3), and the store.
+async fn acceptor_with_history<A: Application + 'static>(
+    application: Arc<A>,
+) -> (Arc<Acceptor<A>>, Arc<ProbeStore>) {
+    let store = Arc::new(ProbeStore::new());
+    seed_history(&store.inner).await;
+    let acceptor = Arc::new(
+        Acceptor::new(venue_config(Duration::from_secs(30)), application)
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    (acceptor, store)
+}
+
+/// The previous stream survived a refused Logon: frames 1 to 3 are still
+/// filed.
+#[track_caller]
+fn assert_history_kept(store: &ProbeStore) {
+    for seq in 1..=3u64 {
+        assert!(
+            store.inner.contains(seq),
+            "the refused Logon must not reset the store (frame {seq})"
+        );
+    }
+}
+
+/// Matching CompIDs authenticate nobody. A Logon that `from_admin` refuses, with
+/// a store attached, gets no reply and never touches the store: a peer that
+/// knows the CompIDs but not the credentials can neither append to the
+/// journal, advance the session's counters, nor (with `ResetSeqNumFlag`)
+/// clear it.
+#[tokio::test]
+async fn test_acceptor_from_admin_refusal_has_no_reply_and_no_store_access() {
+    let (acceptor, store) = acceptor_with_history(Arc::new(RefusingApp)).await;
+    let (result, frames) = refused_logon(
+        acceptor,
+        client_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]),
+    )
+    .await;
+
+    match result {
+        Err(EngineError::LogonRejected { reason }) => assert_eq!(reason, "bad credentials"),
+        other => panic!("expected LogonRejected, got {other:?}"),
+    }
+    assert!(frames.is_empty(), "no reply: {frames:?}");
+    assert_eq!(store.touched(), 0, "the store was never touched");
+    assert_history_kept(&store);
+    assert_eq!(
+        store.inner.next_sender_seq(),
+        4,
+        "the counters did not move"
+    );
+}
+
+/// Without a store there is no journal to protect, and a Logon that
+/// `from_admin` refuses still gets a Logout with the refusal's text.
+#[tokio::test]
+async fn test_acceptor_from_admin_refusal_without_a_store_gets_a_logout() {
+    let acceptor = Arc::new(Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::new(RefusingApp),
+    ));
+    let (result, frames) =
+        refused_logon(acceptor, client_msg("A", 1, &[(98, "0"), (108, "30")])).await;
+
+    assert!(
+        matches!(result, Err(EngineError::LogonRejected { .. })),
+        "expected LogonRejected, got {result:?}"
+    );
+    assert_eq!(
+        frames,
+        vec![(
+            "5".to_string(),
+            Some("1".to_string()),
+            Some("bad credentials".to_string())
+        )]
+    );
+}
+
+/// A Logon whose `SendingTime` (52) is out of tolerance is refused before the
+/// peer is authenticated: with a store attached it gets no reply and the store
+/// is not touched.
+#[tokio::test]
+async fn test_acceptor_sending_time_refusal_has_no_reply_and_no_store_access() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let (acceptor, store) = acceptor_with_history(venue_app).await;
+
+    let mut encoder = Encoder::new("FIX.4.4");
+    encoder.put_str(35, "A");
+    encoder.put_str(49, "CLIENT");
+    encoder.put_str(56, "VENUE");
+    encoder.put_uint(34, 3);
+    encoder.put_str(52, "20200101-00:00:00.000");
+    encoder.put_uint(98, 0);
+    encoder.put_uint(108, 30);
+    let mut logon = BytesMut::new();
+    ok(encoder.finish_into(&mut logon), "stale logon must encode");
+
+    let (result, frames) = refused_logon(acceptor, logon).await;
+    assert!(
+        matches!(result, Err(EngineError::SendingTime { .. })),
+        "expected a SendingTime error, got {result:?}"
+    );
+    assert!(frames.is_empty(), "no reply: {frames:?}");
+    assert_eq!(store.touched(), 0, "the store was never touched");
+    assert_history_kept(&store);
+}
+
+/// A `HeartBtInt` (108) that cannot be honoured is refused after
+/// authentication with a filed Logout numbered from the store, and a
+/// `ResetSeqNumFlag` (141) on that Logon does not reset the store.
+#[tokio::test]
+async fn test_acceptor_heartbeat_refusal_is_filed_and_never_resets() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let (acceptor, store) = acceptor_with_history(venue_app).await;
+    let (result, frames) = refused_logon(
+        acceptor,
+        client_msg("A", 1, &[(98, "0"), (108, "abc"), (141, "Y")]),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(EngineError::LogonRejected { .. })),
+        "expected LogonRejected, got {result:?}"
+    );
+    assert_eq!(frames.len(), 1, "one Logout: {frames:?}");
+    assert_eq!(frames[0].0, "5");
+    assert_eq!(frames[0].1.as_deref(), Some("4"));
+    assert!(store.inner.contains(4), "the Logout is filed");
+    assert_history_kept(&store);
+}
+
+/// A Logon numbered below what the store expects is refused with a Logout
+/// numbered from the store and filed.
+#[tokio::test]
+async fn test_acceptor_too_low_logon_refusal_is_filed() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let (acceptor, store) = acceptor_with_history(venue_app).await;
+    let (result, frames) =
+        refused_logon(acceptor, client_msg("A", 2, &[(98, "0"), (108, "30")])).await;
+
+    assert!(
+        matches!(result, Err(EngineError::Sequence(ref detail)) if detail.contains("too low")),
+        "expected a too-low Sequence error, got {result:?}"
+    );
+    assert_eq!(frames.len(), 1, "one Logout: {frames:?}");
+    assert_eq!(frames[0].0, "5");
+    assert_eq!(frames[0].1.as_deref(), Some("4"));
+    assert!(store.inner.contains(4), "the Logout is filed");
+    assert_eq!(store.inner.next_sender_seq(), 5);
+    assert_eq!(
+        store.inner.next_target_seq(),
+        3,
+        "the refused Logon is not consumed"
+    );
+}
+
+/// A `ResetSeqNumFlag` (141) Logon not numbered 1 is refused with a filed
+/// Logout that says why, and does not reset the store.
+#[tokio::test]
+async fn test_acceptor_reset_logon_not_numbered_one_is_refused_and_filed() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let (acceptor, store) = acceptor_with_history(venue_app).await;
+    let (result, frames) = refused_logon(
+        acceptor,
+        client_msg("A", 5, &[(98, "0"), (108, "30"), (141, "Y")]),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(EngineError::Sequence(_))),
+        "expected a Sequence error, got {result:?}"
+    );
+    assert_eq!(frames.len(), 1, "one Logout: {frames:?}");
+    assert_eq!(frames[0].0, "5");
+    assert_eq!(frames[0].1.as_deref(), Some("4"));
+    assert!(
+        frames[0]
+            .2
+            .as_deref()
+            .is_some_and(|text| text.contains("ResetSeqNumFlag")),
+        "the Logout says why: {frames:?}"
+    );
+    assert_history_kept(&store);
+}
+
+/// A zero sender seed that would be used is refused once the Logon is
+/// authenticated, instead of being raised to 1, and nothing is sent.
+#[tokio::test]
+async fn test_acceptor_refuses_a_zero_initial_seed() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)),
+            Arc::clone(&venue_app),
+        )
+        .with_initial_sequences(0, 1),
+    );
+    let (result, frames) =
+        refused_logon(acceptor, client_msg("A", 1, &[(98, "0"), (108, "30")])).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(EngineError::InvalidInitialSequence {
+                counter: SequenceCounter::Sender
+            })
+        ),
+        "expected InvalidInitialSequence, got {result:?}"
+    );
+    assert!(frames.is_empty(), "nothing is sent: {frames:?}");
+    assert!(!venue_app.events().contains(&"logon".to_string()));
+}
+
+/// The reset rule both roles share: after a reset the acceptor drives
+/// (`reset_on_logon`), the peer's Logon is its message 1 whatever its
+/// `MsgSeqNum`. A Logon at 5 without `ResetSeqNumFlag` gets an ack at 1 with
+/// `141=Y`, no `ResendRequest` follows it for the old stream's numbers, and
+/// the peer's next message, at 2, is accepted.
+#[tokio::test]
+async fn test_acceptor_driven_reset_takes_the_logon_as_message_one() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(Acceptor::new(
+        venue_config(Duration::from_secs(30)).with_reset_on_logon(true),
+        Arc::clone(&venue_app),
+    ));
+    let (mut framed, connection, ack) = establish_shared(&acceptor, 5, &[]).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("1"));
+    assert_eq!(field(&ack, 141).as_deref(), Some("Y"));
+    assert_eq!(connection.next_target_seq(), 2);
+
+    // Past the ack: nothing, in particular no ResendRequest for 1..5.
+    assert!(
+        timeout(Duration::from_millis(500), framed.next())
+            .await
+            .is_err(),
+        "no frame follows the ack"
+    );
+
+    // The peer, having reset as the ack told it to, continues at 2.
+    ok(
+        framed
+            .send(client_msg("1", 2, &[(112, "AFTER-RESET")]))
+            .await,
+        "send TestRequest",
+    );
+    let heartbeat = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&heartbeat), "0");
+    assert_eq!(field(&heartbeat, 34).as_deref(), Some("2"));
+    assert_eq!(field(&heartbeat, 112).as_deref(), Some("AFTER-RESET"));
+    assert!(!connection.is_closed());
+    assert_eq!(connection.next_target_seq(), 3);
+}
+
+/// A second concurrent Logon for a live session is refused without touching
+/// the store the live session is writing to, and the live session is
+/// unaffected.
+#[tokio::test]
+async fn test_acceptor_duplicate_logon_never_touches_the_store() {
+    let store = Arc::new(ProbeStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)),
+            Arc::clone(&venue_app),
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    let (_framed, live, _ack) = establish_shared(&acceptor, 1, &[]).await;
+    // Let the live session's reactor finish its first pass.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let before = store.touched();
+
+    let (listener, addr) = bind_listener().await;
+    let shared = Arc::clone(&acceptor);
+    let venue = tokio::spawn(async move { shared.accept(&listener).await });
+    let stream = ok(TcpStream::connect(addr).await, "second client connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    send_client_logon(&mut framed).await;
+
+    match ok(
+        timeout(Duration::from_secs(5), venue).await,
+        "venue task finishes within 5s",
+    ) {
+        Ok(Err(EngineError::LogonRejected { reason })) => {
+            assert!(reason.contains("already active"), "got {reason}");
+        }
+        other => panic!("expected LogonRejected, got {other:?}"),
+    }
+    assert!(
+        timeout(Duration::from_secs(5), framed.next())
+            .await
+            .ok()
+            .flatten()
+            .is_none(),
+        "no Logout with a store attached"
+    );
+    assert_eq!(
+        store.touched(),
+        before,
+        "the refusal did not touch the store"
+    );
+    assert!(!live.is_closed(), "the live session is unaffected");
+}
+
+/// Under `CloseSession`, a frame the acceptor's store refuses is never
+/// written and the session closes, without a Logout.
+#[tokio::test]
+async fn test_acceptor_close_session_closes_on_a_store_failure() {
+    let store = Arc::new(ProbeStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    )
+    .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+    .with_store_failure_policy(StoreFailurePolicy::CloseSession);
+    let (mut framed, connection) = establish(acceptor, 30).await;
+
+    store.fail_store.store(true, Ordering::SeqCst);
+    send_reports(&connection, 1, 1).await;
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s",
+    );
+
+    let mut seen = Vec::new();
+    while let Ok(Some(Ok(frame))) = timeout(Duration::from_secs(5), framed.next()).await {
+        seen.push(msg_type_of(&frame));
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|msg_type| msg_type == "8" || msg_type == "5"),
+        "neither the report nor a Logout is written: {seen:?}"
+    );
+    assert!(!store.inner.contains(2));
+    assert!(venue_app.events().contains(&"logout".to_string()));
+}
+
+/// A store call that overruns the acceptor's store timeout is a failed write:
+/// under `CloseSession` the TestRequest whose number could not be persisted
+/// gets no Heartbeat, and the session closes.
+#[tokio::test]
+async fn test_acceptor_store_timeout_is_a_failed_write() {
+    let store = Arc::new(ProbeStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    )
+    .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+    .with_store_failure_policy(StoreFailurePolicy::CloseSession)
+    .with_store_timeout(Duration::from_millis(200));
+    let (mut framed, connection) = establish(acceptor, 30).await;
+
+    store.stall_target.store(true, Ordering::SeqCst);
+    ok(
+        framed.send(client_msg("1", 2, &[(112, "PING")])).await,
+        "send TestRequest",
+    );
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s",
+    );
+    let mut seen = Vec::new();
+    while let Ok(Some(Ok(frame))) = timeout(Duration::from_secs(5), framed.next()).await {
+        seen.push(msg_type_of(&frame));
+    }
+    assert!(
+        !seen.iter().any(|msg_type| msg_type == "0"),
+        "the TestRequest is not answered: {seen:?}"
+    );
+}
+
+/// An unusable configuration is refused before a connection is taken off the
+/// listener, as the initiator refuses it before dialling: `accept` returns at
+/// once, with nobody connected.
+#[tokio::test]
+async fn test_acceptor_refuses_an_invalid_configuration() {
+    let (listener, _addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    // A fractional HeartBtInt has no wire form.
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_millis(1500)),
+        Arc::clone(&venue_app),
+    );
+
+    match ok(
+        timeout(Duration::from_secs(1), acceptor.accept(&listener)).await,
+        "accept refuses without waiting for a connection",
+    ) {
+        Err(EngineError::Config(_)) => {}
+        other => panic!("expected a configuration error, got {other:?}"),
+    }
+    assert!(!venue_app.events().contains(&"create".to_string()));
+}
+
+/// When the acceptor's close-time reset of `reset_on_disconnect` fails, the
+/// reset is owed: the next authenticated Logon fails `serve` while the store
+/// still cannot be reset, and once it can, the session restarts at 1 and the
+/// acknowledgement declares `ResetSeqNumFlag` (141) = Y, though the peer's
+/// Logon did not ask for it.
+#[tokio::test]
+async fn test_acceptor_failed_close_time_reset_is_owed_to_the_next_logon() {
+    let store = Arc::new(ProbeStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let mut config = venue_config(Duration::from_secs(30));
+    config.reset_on_disconnect = true;
+    let acceptor = Arc::new(
+        Acceptor::new(config, Arc::clone(&venue_app))
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+
+    // First session: the store breaks, then the peer drops the connection.
+    let (framed, connection, _ack) = establish_shared(&acceptor, 1, &[]).await;
+    store.fail_reset.store(true, Ordering::SeqCst);
+    drop(framed);
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+    assert!(
+        store.inner.contains(1),
+        "the failed reset left the ack filed"
+    );
+
+    // Second Logon, while the store still cannot be reset: refused.
+    let (listener, addr) = bind_listener().await;
+    let shared = Arc::clone(&acceptor);
+    let venue = tokio::spawn(async move { shared.accept(&listener).await });
+    let stream = ok(TcpStream::connect(addr).await, "client reconnects");
+    let mut refused = Framed::new(stream, FixCodec::new());
+    ok(
+        refused
+            .send(client_msg("A", 2, &[(98, "0"), (108, "30")]))
+            .await,
+        "client sends its logon",
+    );
+    match ok(
+        timeout(Duration::from_secs(5), venue).await,
+        "venue task finishes within 5s",
+    ) {
+        Ok(Err(EngineError::Store(_))) => {}
+        other => panic!("expected a store error, got {other:?}"),
+    }
+
+    // Third Logon, with a working store: the owed reset is made.
+    store.fail_reset.store(false, Ordering::SeqCst);
+    let (_framed, _connection, ack) = establish_shared(&acceptor, 2, &[]).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("1"));
+    assert_eq!(field(&ack, 141).as_deref(), Some("Y"));
+}
+
+/// A `serve` dropped while the reset for a `ResetSeqNumFlag` (141) Logon is
+/// still pending leaves the reset owed: the next accepted Logon, which does not
+/// ask for one, still gets the store reset and an acknowledgement at 1 that
+/// declares it.
+#[tokio::test]
+async fn test_acceptor_serve_dropped_during_the_reset_leaves_it_owed() {
+    let store = Arc::new(ProbeStore::new());
+    seed_history(&store.inner).await;
+    store.hold_reset.store(true, Ordering::SeqCst);
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)),
+            Arc::clone(&venue_app),
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+
+    // First Logon asks for a reset; the caller drops `accept` while the store
+    // reset hangs.
+    let (listener, addr) = bind_listener().await;
+    let stream = ok(TcpStream::connect(addr).await, "client connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    ok(
+        framed
+            .send(client_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]))
+            .await,
+        "client sends a resetting logon",
+    );
+    assert!(
+        timeout(Duration::from_millis(500), acceptor.accept(&listener))
+            .await
+            .is_err(),
+        "accept must still be inside the store reset"
+    );
+    drop(framed);
+    assert!(store.inner.contains(1), "the held reset changed nothing");
+    store.hold_reset.store(false, Ordering::SeqCst);
+
+    // Second Logon continues the peer's old stream without asking for a reset:
+    // the reset is still owed, so it is made and declared.
+    let (_framed, _connection, ack) = establish_shared(&acceptor, 3, &[]).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("1"));
+    assert_eq!(field(&ack, 141).as_deref(), Some("Y"));
+    assert!(!store.inner.contains(3), "the previous stream is gone");
+}
+
+/// A store write that overruns the acceptor's store timeout may still land
+/// later, so it leaves a reset owed: the next accepted Logon gets the store
+/// reset and an acknowledgement at 1 that declares it.
+#[tokio::test]
+async fn test_acceptor_timed_out_store_write_leaves_a_reset_owed() {
+    let store = Arc::new(ProbeStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)),
+            Arc::clone(&venue_app),
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+        .with_store_timeout(Duration::from_millis(200)),
+    );
+
+    let (mut framed, connection, _ack) = establish_shared(&acceptor, 1, &[]).await;
+    store.stall_target.store(true, Ordering::SeqCst);
+    ok(
+        framed.send(client_msg("1", 2, &[(112, "PING")])).await,
+        "send TestRequest",
+    );
+    // Continue: answered once the overrun has been logged.
+    let heartbeat = next_frame(&mut framed).await;
+    assert_eq!(field(&heartbeat, 112).as_deref(), Some("PING"));
+    drop(framed);
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+    store.stall_target.store(false, Ordering::SeqCst);
+
+    let (_framed, _connection, ack) = establish_shared(&acceptor, 3, &[]).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("1"), "a new stream starts");
+    assert_eq!(field(&ack, 141).as_deref(), Some("Y"), "and is declared");
+}
+
+/// A Logon numbered 0 names no message. With a reset the acceptor drives
+/// (`reset_on_logon`), it must not slip through the reset rule, which takes a
+/// positive old-stream number as message 1: it is refused like a missing
+/// `MsgSeqNum`, without a reply and before the store is touched.
+#[tokio::test]
+async fn test_acceptor_refuses_a_logon_numbered_zero_before_any_reset() {
+    let store = Arc::new(ProbeStore::new());
+    seed_history(&store.inner).await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)).with_reset_on_logon(true),
+            Arc::clone(&venue_app),
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    let (result, frames) =
+        refused_logon(acceptor, client_msg("A", 0, &[(98, "0"), (108, "30")])).await;
+
+    assert!(
+        matches!(result, Err(EngineError::Sequence(_))),
+        "expected a Sequence error, got {result:?}"
+    );
+    assert!(frames.is_empty(), "no reply: {frames:?}");
+    assert_eq!(store.touched(), 0, "the store was never touched");
+    assert_history_kept(&store);
+    assert!(!venue_app.events().contains(&"logon".to_string()));
 }

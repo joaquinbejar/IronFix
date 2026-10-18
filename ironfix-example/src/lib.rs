@@ -36,14 +36,13 @@
 //!
 //! Read these before designing around the crate:
 //!
-//! - `ironfix-engine` provides an [`engine::Initiator`] only — there is **no
-//!   Acceptor**. The server-side examples hand-roll their accept loop.
-//! - [`engine::EngineBuilder`] collects configuration but has **no terminal
-//!   `build()` method**; the working entry point is
-//!   `Initiator::new(config, app).connect(addr)`.
-//! - The engine never reads or writes a [`store::MessageStore`], so
-//!   resend-from-store is not implemented; an inbound `ResendRequest` is
-//!   answered with a gap fill. [`store::MemoryStore`] is the only store.
+//! - `ironfix-engine` provides an [`engine::Initiator`] and an
+//!   [`engine::Acceptor`], and [`engine::EngineBuilder`] terminates in either
+//!   (`into_initiator()` / `into_acceptor()`). Only `fix44_server` runs on the
+//!   `Acceptor`; the other server-side examples hand-roll their accept loop.
+//! - Both engines file outbound frames in an attached [`store::MessageStore`]
+//!   and replay them on a `ResendRequest`, but [`store::MemoryStore`] is the
+//!   only store and it is not persistent: nothing survives a restart.
 //! - [`transport`] contains only a framing codec — no TCP connector or
 //!   acceptor and no TLS.
 //! - Only FIX 4.2, FIX 4.4, FIXT 1.1 and FIX 5.0 SP2 have embedded
@@ -141,7 +140,8 @@ pub mod session {
 pub mod store {
     //! The `MessageStore` trait and its in-memory implementation.
     //!
-    //! Note that the engine does not currently read from or write to a store.
+    //! Both engines use a store attached with `with_store`; `MemoryStore` is
+    //! the only implementation and is not persistent.
     pub use ironfix_store::*;
 }
 

@@ -98,20 +98,27 @@ and stops at the first failure:
    rather than having one half of the contradiction guessed for it. It is
    honored **before** MsgSeqNum is validated — otherwise the ack's
    `34=1` reads as fatally too low against continuity-seeded counters. The
-   inbound counter is reset to 1. The outbound counter is set to 2, not 1.
-   That is an interpretive choice, not a derivation: it is exact when
-   `reset_on_logon` was set (the Logon on the wire really was message 1 of the
-   reset stream, and rewinding would re-emit a number the peer has seen), but
-   with continuity-seeded counters the Logon went out under its seeded number
-   and nothing numbered 1 was ever sent. QuickFIX/J's two halves disagree here
-   — its initiator would set 1, its acceptor 2 — and IronFix matches the
-   acceptor. The mismatch self-heals: the peer sees a gap at 2, requests a
-   resend of 1, and receives a GapFill that resynchronises it.
+   inbound counter is reset to 1 and the outbound counter set to 2, under the
+   reset rule below. With continuity-seeded counters the Logon went out under
+   its seeded number and nothing numbered 1 was ever sent; QuickFIX/J's two
+   halves disagree here — its initiator would set 1, its acceptor 2 — and
+   IronFix matches the acceptor. The mismatch self-heals: the peer sees a gap
+   at 2, requests a resend of 1, and receives a GapFill that resynchronises it.
 7. **`MsgSeqNum` (34).** The header 34 is read positionally, *before* identity —
    the same standard-header contract step 2 applies to the CompIDs — so a 34 that
    occurs only after the body is treated as missing and fails the handshake. The
    value read there is then validated at this step: too low fails the handshake,
    and a gap completes the handshake and immediately issues a ResendRequest.
+   After a reset the initiator declared (`reset_on_logon`, or a reset an
+   earlier session owes), the ack is not validated: under the reset rule it is
+   the acceptor's message 1 whatever its number, and 2 is expected next.
+
+**The reset rule, both roles.** In a Logon exchange that resets the sequence,
+each side's Logon or acknowledgement is message 1 of its new stream: its next
+sender number is 2, and the next number it expects from the other side is 2.
+The side that drives the reset therefore takes the other side's Logon or ack as
+message 1 whatever `MsgSeqNum` it carries, and opens no gap for the numbers of
+the old stream; a message that declares `141=Y` itself must still carry 1.
 
 The same identity and `SendingTime` checks (steps 2 and 3) run on every inbound
 frame once the session is established; there a failure produces the Reject and
@@ -119,21 +126,23 @@ Logout and then tears the session down. An unsatisfied ResendRequest from step 7
 does not stall forever — it is retried and then escalated to Logout; see "Resend
 Request".
 
-Outbound `ResetSeqNumFlag` is driven by `SessionConfig::reset_on_logon`.
+Outbound `ResetSeqNumFlag` is driven by `SessionConfig::reset_on_logon`, and by a
+store reset an earlier session owes.
 
 **What IronFix implements today (acceptor side)**
 
 `ironfix-engine::Acceptor` is the mirror of the above. It waits for the inbound
-Logon (bounded by `SessionConfig::logon_timeout`) and validates it in the same
+Logon (bounded by `SessionConfig::logon_timeout`) and validates it in this
 order — it must decode and be a Logon; its `BeginString` (8) must match this
 session's version and its `EncryptMethod` (98) must be 0 (None); it must carry
 `MsgSeqNum` (34) **in the standard header** (a body-only 34 is treated as
 missing, exactly as for the CompIDs); then identity (49/56, plus 50/57 when
 configured), after which the acceptor claims its single admission slot;
 then `SendingTime` (52), and the `from_admin` authentication hook (where
-`Username` (553) / `Password` (554) are inspected); then `HeartBtInt` (108) and
-`ResetSeqNumFlag` (141); then `MsgSeqNum`. The differences from the initiator
-are role-symmetric:
+`Username` (553) / `Password` (554) are inspected); then a `ResetSeqNumFlag`
+(141) Logon must carry `MsgSeqNum = 1`; then `HeartBtInt` (108); only then is
+an attached store reset or refreshed; then `MsgSeqNum` is validated and the
+acknowledgement sent. The differences from the initiator are role-symmetric:
 
 - **`HeartBtInt` (108).** The acceptor *adopts* the interval the initiator
   requested and echoes it back on its Logon reply, rather than proposing one.
@@ -144,20 +153,57 @@ are role-symmetric:
   `interval + grace` and abort the process under `panic = "abort"`. `108 = 0`
   remains legal and is not specially handled today.
 - **`ResetSeqNumFlag` (141).** The acceptor resets when the peer asks (`141=Y`,
-  which must arrive under `MsgSeqNum = 1`) **or** when it is locally configured
-  with `reset_on_logon`. Whichever drives the reset, both counters go to 1 and
-  the reply Logon carries `141=Y` at its own `MsgSeqNum = 1`: a locally driven
-  reset that acked without the flag would silently desync the peer.
+  which must arrive under `MsgSeqNum = 1`), when it is locally configured with
+  `reset_on_logon`, or when an earlier session left a store reset owed.
+  Whichever drives the reset, both counters go to 1 and the reply Logon carries
+  `141=Y` at its own `MsgSeqNum = 1`: a locally driven reset that acked without
+  the flag would silently desync the peer. Under the reset rule the peer's
+  Logon is its message 1 whatever its number: a Logon at `34=N`, `N > 1`,
+  without 141 opens no gap and draws no `ResendRequest`, and 2 is expected
+  next.
 - **Duplicate connections.** An `Acceptor` is one configured session, so it
   admits one live session at a time for its counterparty. A second concurrent
-  Logon while a session is established is refused with a Logout ("session
-  already active") rather than allowed to fork the session into two independent
-  sequence streams; the slot frees when the live session closes.
+  Logon while a session is established is refused **without a reply**, with or
+  without a store, rather than allowed to fork the session into two
+  independent sequence streams: the live session owns the stream, and nothing
+  the newcomer could be sent belongs to it. The slot is held until the live
+  session's task has ended, past its close-time store writes, the drain of its
+  application queue (up to 5 s) and `on_logout`; a Logon arriving before then
+  is refused the same way.
+- **The message store.** With `Acceptor::with_store`, the store is touched only
+  once the peer is authenticated (after identity, admission, `SendingTime` and
+  `from_admin`), and reset only for a Logon that passes every check (for `141=Y`,
+  `reset_on_logon`, or a reset an earlier session owes; one `reset_to` call,
+  before the acknowledgement is filed, failing closed whatever the policy).
+  Otherwise the session starts from the store's refreshed counters, or the
+  `with_initial_sequences` seed. A refused `141=Y` Logon therefore never clears
+  the outbound journal. Every frame the acceptor sends to its counterparty is
+  filed, and the Logon's number is persisted before the session goes Active.
 
-A failure at any step sends a session Reject (reason 9 for identity, the
-`SendingTime` reason for a clock problem) and/or a Logout, drives the typestate
-through `reject_logon`, and drops the connection without ever reaching Active. A
-gap in the inbound Logon completes the handshake and immediately issues a
+A refused Logon drives the typestate through `reject_logon` and the connection
+is dropped without ever reaching Active. What is sent first depends on who sent
+the Logon:
+
+1. **An unauthenticated peer** — wrong `BeginString` or `EncryptMethod`, wrong
+   CompIDs, a `SendingTime` out of tolerance, or credentials that `from_admin`
+   refuses. Matching CompIDs authenticate nobody: they are caller-supplied.
+   With a store attached, nothing is sent and the store is not touched: a frame
+   could neither be filed (that would let a peer that knows the CompIDs but not
+   the credentials append to the outbound journal and advance the session's
+   counters) nor be numbered without reusing, with different content, a number
+   the session's stream already holds. Without a store, a Reject (reason 9 for
+   identity, 10 for the clock) and/or a Logout, numbered from the seed or 1, as
+   before.
+2. **A Logon without a valid `MsgSeqNum`** — absent, outside the header, or 0
+   (which names no message): nothing, in either mode.
+3. **A duplicate Logon** — nothing, in either mode (above).
+4. **An authenticated peer** (`from_admin` accepted it) — refused by a `141=Y`
+   Logon not numbered 1, by its `HeartBtInt`, or by a `MsgSeqNum` too low: a
+   Logout saying why, sent like every session frame, numbered from the store's
+   refreshed counters (or the seed), never from a reset, and filed when a store
+   is attached.
+
+A gap in the inbound Logon completes the handshake and immediately issues a
 `ResendRequest` (2). Once Active, the session runs the same reactor as the
 initiator, so every inbound-frame rule below applies identically to both roles.
 
@@ -329,12 +375,15 @@ sent and **nothing at all** arrived in the interval that followed.
 
 **What IronFix implements today**
 
-All four mandate items are implemented, **provided a message store is attached**
-with `Initiator::with_store(Arc<dyn MessageStore>)`. Every sequenced outbound
-frame is then filed in the store under its `MsgSeqNum`, before it goes on the
-wire, and is available to be replayed. Without a store there is nothing to
-replay and the engine falls back to answering the whole range with one gap fill
-(see "Without a store" below).
+All four mandate items are implemented in **both roles**, **provided a message
+store is attached**: `Initiator::with_store(Arc<dyn MessageStore>)`,
+`Acceptor::with_store(Arc<dyn MessageStore>)`, or `EngineBuilder::with_store`,
+which both terminal methods honour. Every sequenced outbound frame, the Logon
+and its acknowledgement included, is then filed in the store under its
+`MsgSeqNum`, before it goes on the wire, and is available to be replayed. Both
+roles run the same reactor, so the replay below is identical for them. Without
+a store there is nothing to replay and the engine falls back to answering the
+whole range with one gap fill (see "Without a store" below).
 
 *Validation, identical in both modes:*
 
@@ -409,10 +458,11 @@ sequence number survives a restart. A durable store is separate, tracked work.
 `get_page`)
 is asynchronous and can fail, and the session awaits each one inline: a slow
 store delays the session for as long as the call takes. Each call is bounded
-by the store timeout (`Initiator::with_store_timeout`, default: the write
-timeout), and an overrun is `StoreError::Timeout`. With a store attached the
-engine writes in this order, in the Logon handshake and in the session reactor
-alike, through one shared step (`doc/adr/0005-fallible-store-writes.md`):
+by the store timeout (`with_store_timeout` on the `Initiator` or the
+`Acceptor`, default: the write timeout), and an overrun is
+`StoreError::Timeout`. With a store attached the engine writes in this order,
+in both roles' Logon handshakes and in the session reactor alike, through one
+shared step (`doc/adr/0005-fallible-store-writes.md`):
 
 1. *Outbound:* the frame is filed under its `MsgSeqNum` N and N+1 persisted as
    the next sender number, in one `file_outbound` call; then N is spent in
@@ -467,8 +517,9 @@ method) and a typed report at restart; at-least-once delivery additionally
 needs an inbound journal or redelivery through a `ResendRequest`. Both are
 tracked in #105.
 
-**Store failure policy.** `Initiator::with_store_failure_policy` chooses what a
-failed write (or one that overran the store timeout) means:
+**Store failure policy.** `with_store_failure_policy` (on the `Initiator` or
+the `Acceptor`) chooses what a failed write (or one that overran the store
+timeout) means:
 
 - `StoreFailurePolicy::Continue` (the default, and the behaviour before writes
   were fallible): log a warning without frame bytes and carry on as if the
@@ -499,13 +550,22 @@ close-time reset of `reset_on_logout` / `reset_on_disconnect` fails (no
 counter is then written) or when the reset for the counterparty's
 `ResetSeqNumFlag` fails. The `Initiator`'s next `connect` then resets the
 store before anything else, and its Logon declares `ResetSeqNumFlag` (141) = Y
-at `MsgSeqNum` 1, so the counterparty restarts the sequence with it. The
-record is cleared once that Logon is acknowledged, and lives in the
-`Initiator`, so a process restart forgets it.
+at `MsgSeqNum` 1, so the counterparty restarts the sequence with it; the
+record is cleared once that Logon is acknowledged. On the `Acceptor` (whose
+reset fails closed the same way for a session that resets), the next accepted
+Logon resets the store and its acknowledgement declares `141=Y` at 1; the
+record is cleared once that acknowledgement is sent. The record lives in the
+engine, in memory, so a process restart forgets it (#78, #89). For the same
+reason a store must belong to exactly one engine instance.
 
 With a store attached, call `Initiator::connect` again only once the previous
 session's `Connection::wait_closed` has returned: until then the closing
 session still writes to the store and may record a reset owed to the next one.
+The `Acceptor` enforces this itself: its admission slot is held until a
+session's task has ended (past its close-time store writes, the drain of its
+application queue and `on_logout`), so the next Logon cannot share the store
+with a closing session; one that arrives before then is refused as a duplicate,
+without a reply.
 
 *Cancellation and timeouts.* Every reset is recorded as owed before it is
 awaited and cleared only once it has succeeded, so a connect dropped while a
@@ -522,9 +582,7 @@ crash between them leaves the store cleared with its initial counters, and the
 next Logon goes out at 1 without `ResetSeqNumFlag`. A durable store should
 override it.
 
-The `Acceptor` attaches no store yet, so the policy has nothing to act on
-there. Not done: inbound frames are not filed (only the target counter is
-kept).
+Not done: inbound frames are not filed (only the target counter is kept).
 
 **Outbound `EndSeqNo` sentinel — a version caveat.** When the engine detects an
 inbound gap it requests retransmission with `EndSeqNo` (16) = 0, the open-ended
