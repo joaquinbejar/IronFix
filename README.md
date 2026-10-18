@@ -66,7 +66,15 @@ exists yet.
   bounded `ResendRequest` recovery, `SequenceReset` / gap fill, `PossDupFlag`
   and `OrigSendingTime` handling, session-level `Reject`, a socket write
   timeout, the Logout handshake, and `FIXT.1.1` BeginString with `ApplVerID`
-  for FIX 5.0 sessions. `HeartBtInt = 0` disables heartbeating (ask for it
+  for FIX 5.0 sessions. A FIX 5.0 session also checks the application version
+  its counterparty declares and uses against its own version plus
+  `SessionConfig::allowed_appl_versions`: `DefaultApplVerID` is required by
+  the acceptor on the Logon, and checked on the acknowledgement when present
+  (or required, in strict mode); `ApplVerID` is checked on each application
+  message, which is rejected (`SessionRejectReason` 18) if it names another
+  version. The declared default is exposed as
+  `Connection::counterparty_default_appl_version`; no dictionary is selected
+  by it. `HeartBtInt = 0` disables heartbeating (ask for it
   with `SessionConfigBuilder::disable_heartbeats`), and any inbound message
   clears a pending TestRequest.
 - **Resend from store** in both roles. Attach a `MessageStore` with

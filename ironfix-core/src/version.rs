@@ -31,6 +31,13 @@
 //! Consequently [`FixVersion::as_str`] (the version's own name, e.g.
 //! `FIX.5.0SP2`) and [`FixVersion::begin_string`] (what goes in tag 8, e.g.
 //! `FIXT.1.1`) are different questions and must not be confused.
+//!
+//! The application version is read back from the same table it is stamped
+//! from: [`FixVersion::from_appl_ver_id`] decodes every code of the
+//! `ApplVerID` enumeration that names a variant (FIX 4.0 through 5.0 SP2),
+//! and every code [`FixVersion::appl_ver_id`] stamps decodes back to its
+//! version. Decoding a code says which version it names, not whether a
+//! session accepts it.
 
 use crate::error::UnknownFixVersion;
 use serde::{Deserialize, Serialize};
@@ -144,6 +151,60 @@ impl FixVersion {
             Self::Fix40 | Self::Fix41 | Self::Fix42 | Self::Fix43 | Self::Fix44 | Self::Fixt11 => {
                 None
             }
+        }
+    }
+
+    /// Decodes an `ApplVerID` code, the value of `DefaultApplVerID` (1137) or
+    /// `ApplVerID` (1128), into the version it names, or `None` when it names
+    /// no variant of this type.
+    ///
+    /// The whole `ApplVerID` enumeration is decoded, so this table stays the
+    /// workspace's single authority for it: `2` = FIX.4.0, `3` = FIX.4.1,
+    /// `4` = FIX.4.2, `5` = FIX.4.3, `6` = FIX.4.4, `7` = FIX.5.0, `8` =
+    /// FIX.5.0SP1, `9` = FIX.5.0SP2. The codes `2` to `6` are how a
+    /// counterparty says it carries FIX 4.x application messages over
+    /// FIXT.1.1. Three codes name no variant and are `None`: `0` (FIX.2.7) and
+    /// `1` (FIX.3.0), versions this workspace does not model, and `10`
+    /// (FIX_LATEST in later editions of the enumeration), which names no fixed
+    /// version. Anything else is `None` too.
+    ///
+    /// Decoding is not acceptance. Only the 5.0 family is *stamped* by this
+    /// workspace ([`FixVersion::appl_ver_id`] is `None` for a 4.x version,
+    /// which is framed as its own pre-FIXT session), so the inverse holds one
+    /// way only: every code [`FixVersion::appl_ver_id`] returns decodes back
+    /// to its version, but `6` decodes to [`FixVersion::Fix44`], which stamps
+    /// no code. Whether a session accepts a decoded version is the session's
+    /// question (`ironfix-session`'s `SessionConfig::accepts_appl_version`).
+    ///
+    /// Matching is exact, as for [`FromStr`]: the value travels on the wire
+    /// verbatim, so `09`, ` 9` or `9.0` name no version.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironfix_core::FixVersion;
+    ///
+    /// assert_eq!(FixVersion::from_appl_ver_id("9"), Some(FixVersion::Fix50Sp2));
+    /// assert_eq!(FixVersion::from_appl_ver_id("6"), Some(FixVersion::Fix44));
+    /// assert_eq!(FixVersion::from_appl_ver_id("10"), None);
+    /// for version in FixVersion::ALL {
+    ///     if let Some(code) = version.appl_ver_id() {
+    ///         assert_eq!(FixVersion::from_appl_ver_id(code), Some(version));
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub const fn from_appl_ver_id(value: &str) -> Option<Self> {
+        match value.as_bytes() {
+            [b'2'] => Some(Self::Fix40),
+            [b'3'] => Some(Self::Fix41),
+            [b'4'] => Some(Self::Fix42),
+            [b'5'] => Some(Self::Fix43),
+            [b'6'] => Some(Self::Fix44),
+            [b'7'] => Some(Self::Fix50),
+            [b'8'] => Some(Self::Fix50Sp1),
+            [b'9'] => Some(Self::Fix50Sp2),
+            _ => None,
         }
     }
 
@@ -268,6 +329,67 @@ mod tests {
     fn test_fix_version_from_str_is_case_sensitive() {
         assert!("fix.4.4".parse::<FixVersion>().is_err());
         assert!("FIX.5.0sp2".parse::<FixVersion>().is_err());
+    }
+
+    #[test]
+    fn test_fix_version_from_appl_ver_id_decodes_every_stamped_code() {
+        // One direction only: every code `appl_ver_id` stamps decodes back to
+        // its version. The other direction does not hold (6 decodes to
+        // FIX.4.4, which stamps no code).
+        for version in FixVersion::ALL {
+            if let Some(code) = version.appl_ver_id() {
+                assert_eq!(FixVersion::from_appl_ver_id(code), Some(version));
+            }
+        }
+    }
+
+    #[test]
+    fn test_fix_version_from_appl_ver_id_decodes_the_whole_enumeration() {
+        let expected = [
+            ("2", FixVersion::Fix40),
+            ("3", FixVersion::Fix41),
+            ("4", FixVersion::Fix42),
+            ("5", FixVersion::Fix43),
+            ("6", FixVersion::Fix44),
+            ("7", FixVersion::Fix50),
+            ("8", FixVersion::Fix50Sp1),
+            ("9", FixVersion::Fix50Sp2),
+        ];
+        for (code, version) in expected {
+            assert_eq!(FixVersion::from_appl_ver_id(code), Some(version));
+        }
+        // Every variant except bare FIXT.1.1, which is a transport version and
+        // has no ApplVerID code, is named by exactly one code.
+        for version in FixVersion::ALL {
+            let named = expected.iter().filter(|(_, v)| *v == version).count();
+            let wanted = usize::from(version != FixVersion::Fixt11);
+            assert_eq!(named, wanted, "{version:?}");
+        }
+    }
+
+    #[test]
+    fn test_fix_version_from_appl_ver_id_refuses_every_other_value() {
+        // 0 (FIX.2.7) and 1 (FIX.3.0) name versions this type does not model,
+        // 10 (FIX_LATEST) names no fixed version, and matching is exact.
+        for value in [
+            "0",
+            "1",
+            "10",
+            "",
+            "07",
+            "09",
+            " 9",
+            "9 ",
+            "9.0",
+            "FIX.5.0SP2",
+            "x",
+        ] {
+            assert_eq!(
+                FixVersion::from_appl_ver_id(value),
+                None,
+                "'{value}' must name no version"
+            );
+        }
     }
 
     #[test]

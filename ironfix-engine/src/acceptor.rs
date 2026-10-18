@@ -37,6 +37,9 @@
 //! configured) is checked and the single admission slot is claimed — a second concurrent Logon
 //! for the same counterparty is refused rather than allowed to fork the session;
 //! then `SendingTime` (52) accuracy and the `from_admin` authentication hook;
+//! then, on a FIX 5.0 session (framed as FIXT.1.1), the Logon must declare
+//! once, in `DefaultApplVerID` (1137), an application version the session
+//! accepts ([`SessionConfig::accepts_appl_version`]);
 //! then a `ResetSeqNumFlag` (141) Logon must carry `MsgSeqNum` 1; then the
 //! `HeartBtInt` (108) the initiator requested is bounded; only then is an
 //! attached store reset (for 141, the local `reset_on_logon`, or an owed
@@ -68,8 +71,9 @@
 //!   0): nothing, in either mode.
 //! - **A duplicate Logon** for a session already live: nothing, in either
 //!   mode. The live session owns the sequence stream.
-//! - **An authenticated peer** (`from_admin` accepted it) refused by a 141
-//!   Logon not numbered 1, by its `HeartBtInt`, or by a `MsgSeqNum` too low: a
+//! - **An authenticated peer** (`from_admin` accepted it) refused by its
+//!   `DefaultApplVerID` (1137: missing, repeated, not a code, or not accepted),
+//!   a 141 Logon not numbered 1, its `HeartBtInt`, or a `MsgSeqNum` too low: a
 //!   Logout carrying the reason, sent like every session frame, numbered from
 //!   the store's refreshed counters (or the seed) and filed when a store is
 //!   attached. Such a refusal never resets the store.
@@ -170,7 +174,8 @@ use crate::reactor::{
     refuse_handshake, send_handshake_admin, session_codec, spawn_session,
 };
 use crate::wire::{
-    self, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard, UnsupportedVersion,
+    self, ApplVersionGuard, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard,
+    UnsupportedVersion,
 };
 use bytes::BytesMut;
 use ironfix_core::message::MsgType;
@@ -387,9 +392,10 @@ impl<A: Application + 'static> Acceptor<A> {
     /// `MsgSeqNum`, CompIDs, `SendingTime` or credentials) or for a session
     /// already live gets no reply and never touches the store: matching
     /// CompIDs authenticate nobody. A Logon refused after authentication (a
-    /// malformed `ResetSeqNumFlag` or `HeartBtInt`, a `MsgSeqNum` too low) is
-    /// answered with a filed Logout, numbered from the store's counters, and
-    /// never resets the store; see [`Acceptor::serve`].
+    /// `DefaultApplVerID` the session does not accept, a malformed
+    /// `ResetSeqNumFlag` or `HeartBtInt`, a `MsgSeqNum` too low) is answered
+    /// with a filed Logout, numbered from the store's counters, and never
+    /// resets the store; see [`Acceptor::serve`].
     ///
     /// **One session at a time.** The admission slot is held until a session's
     /// task has ended: past its close-time store writes, the drain of its
@@ -653,8 +659,8 @@ impl<A: Application + 'static> Acceptor<A> {
         .await;
     }
 
-    /// Refuses a Logon that `from_admin` has accepted: its `ResetSeqNumFlag`
-    /// or `HeartBtInt` check failed.
+    /// Refuses a Logon that `from_admin` has accepted: its `DefaultApplVerID`,
+    /// `ResetSeqNumFlag` or `HeartBtInt` check failed.
     ///
     /// The peer is authenticated, so it gets the refusal (the Logout's text),
     /// sent like every frame of the session: numbered from a seed that never
@@ -740,12 +746,14 @@ impl<A: Application + 'static> Acceptor<A> {
     /// - **A second Logon for a session already live** is closed without a
     ///   reply, with or without a store: the live session owns the sequence
     ///   stream, and nothing the newcomer could be sent belongs to it.
-    /// - **An authenticated peer** (`from_admin` accepted it), refused by a
-    ///   `ResetSeqNumFlag` (141) Logon not numbered 1, a missing or out of
-    ///   range `HeartBtInt` (108), or a `MsgSeqNum` below the expected one: the
-    ///   Logout is sent like every session frame, numbered from the store's
-    ///   refreshed counters (or the seed) and filed when a store is attached.
-    ///   Such a refusal never resets the store.
+    /// - **An authenticated peer** (`from_admin` accepted it), refused, on a
+    ///   FIX 5.0 session, by a `DefaultApplVerID` (1137) that is missing,
+    ///   repeated, not an application-version code, or not a version the
+    ///   session accepts; by a `ResetSeqNumFlag` (141) Logon not numbered 1; a
+    ///   missing or out of range `HeartBtInt` (108); or a `MsgSeqNum` below the
+    ///   expected one: the Logout is sent like every session frame, numbered
+    ///   from the store's refreshed counters (or the seed) and filed when a
+    ///   store is attached. Such a refusal never resets the store.
     ///
     /// An attached store is touched first once the Logon is authenticated.
     /// From then on every frame the handshake sends is filed, and the Logon's
@@ -767,7 +775,9 @@ impl<A: Application + 'static> Acceptor<A> {
     /// refusals: the `from_admin` authentication hook, a `BeginString` (8) that
     /// does not match this session's version, an unsupported `EncryptMethod`
     /// (98), a `HeartBtInt` (108) that is missing, non-numeric, or out of range,
-    /// and a second concurrent Logon for a session already established. A
+    /// and a second concurrent Logon for a session already established.
+    /// [`EngineError::ApplVersion`] is a FIX 5.0 Logon's `DefaultApplVerID`
+    /// (1137) refused as above. A
     /// `BeginString` this engine cannot frame *at all* is refused up front with
     /// [`EngineError::UnsupportedVersion`], an unusable configuration with
     /// [`EngineError::Config`], and a zero initial seed that would be used with
@@ -894,6 +904,7 @@ impl<A: Application + 'static> Acceptor<A> {
         let mut factory = MessageFactory::new(&self.config, version);
         let identity = PeerIdentity::new(&self.config);
         let sending_time = SendingTimeGuard::new(&self.config);
+        let appl_version = ApplVersionGuard::new(&self.config, version);
         let write_timeout = self.write_timeout;
         let store_timeout = self.store.timeout(write_timeout);
 
@@ -1087,6 +1098,48 @@ impl<A: Application + 'static> Acceptor<A> {
                 authenticated.store(true, Ordering::Release);
             }
 
+            // DefaultApplVerID (1137): on a FIXT.1.1 session the Logon must
+            // declare, once, a default application version this session
+            // accepts (its own, or one in `allowed_appl_versions`); it is a
+            // required field of the FIXT.1.1 Logon. Otherwise every
+            // application message without ApplVerID (1128) would reach the
+            // application in a version nobody agreed to. The peer is
+            // authenticated, so the refusal is a Logout saying why, filed
+            // like the other authenticated refusals; it is checked before the
+            // store is reset, so a refused Logon never resets it. A FIX 4.x
+            // Logon carries no 1137 and is not checked.
+            // The declared version is kept for the session's runtime once it
+            // exists (`Connection::counterparty_default_appl_version`).
+            let declared_appl_version = match appl_version.check_logon(&raw, true) {
+                Ok(declared) => {
+                    if let Some(declared) = declared {
+                        tracing::debug!(
+                            session = %session_id,
+                            default_appl_version = %declared,
+                            "counterparty declared its default application version"
+                        );
+                    }
+                    declared
+                }
+                Err(problem) => {
+                    let detail = problem.to_string();
+                    tracing::warn!(session = %session_id, detail = %detail, "rejecting Logon DefaultApplVerID");
+                    let logout = factory.logout(Some(&detail));
+                    let refused = self
+                        .refuse_authenticated(
+                            &session_id,
+                            &mut framed,
+                            &mut factory,
+                            &detail,
+                            [logout],
+                        )
+                        .await;
+                    let _ = session.reject_logon();
+                    refused?;
+                    return Err(EngineError::ApplVersion { detail });
+                }
+            };
+
             // ResetSeqNumFlag (141): FIX requires MsgSeqNum = 1 on a Logon that
             // itself carries ResetSeqNumFlag = Y: the reset and the number
             // carrying it have to describe the same stream. Checked before the
@@ -1163,10 +1216,13 @@ impl<A: Application + 'static> Acceptor<A> {
                     "resetting sequence numbers on Logon"
                 );
             }
-            runtime = Arc::new(SessionRuntime {
+            runtime = Arc::new(SessionRuntime::new(
                 sequences,
-                heartbeat: Mutex::new(HeartbeatManager::new(self.config.heartbeat_interval)),
-            });
+                HeartbeatManager::new(self.config.heartbeat_interval),
+            ));
+            if let Some(declared) = declared_appl_version {
+                runtime.record_counterparty_default_appl_version(declared);
+            }
             // Every frame from here on goes through this binding: filed, and its
             // number persisted, before it is written.
             store = self.store.handshake(persisted, write_timeout);
@@ -1300,6 +1356,7 @@ impl<A: Application + 'static> Acceptor<A> {
             factory,
             identity,
             sending_time,
+            appl_version,
             config: self.config.clone(),
             application: Arc::clone(&self.application),
             session_id: session_id.clone(),

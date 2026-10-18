@@ -26,6 +26,13 @@
 //! whose clock is wrong, must not keep the session alive, reach the
 //! [`Application`], or move sequence state.
 //!
+//! An application message that is next in sequence takes one more check on a
+//! FIX 5.0 session (framed as FIXT.1.1) before it reaches `from_app`: an
+//! `ApplVerID` (1128) naming a version the session does not accept is
+//! answered with a session Reject (`SessionRejectReason` 18, `RefTagID` 1128),
+//! and its number is consumed as for any rejected message. A message without
+//! 1128 is in the counterparty's default version, checked at the handshake.
+//!
 //! # Bounded recovery
 //!
 //! A gap is answered with a `ResendRequest` (2), and a request that goes
@@ -111,7 +118,8 @@ use crate::persistence::{
     timed,
 };
 use crate::wire::{
-    self, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard, SendingTimeProblem,
+    self, ApplVersionGuard, ApplVersionProblem, MessageFactory, PeerIdentity, PendingMessage,
+    SendingTimeGuard, SendingTimeProblem,
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
@@ -742,6 +750,9 @@ struct Reactor<A: Application> {
     identity: PeerIdentity,
     /// Clock-skew check applied to every inbound `SendingTime` (52).
     sending_time: SendingTimeGuard,
+    /// Application-version check applied to every application message
+    /// released to the application on a FIXT.1.1 session (`ApplVerID` 1128).
+    appl_version: ApplVersionGuard,
     /// Shared session runtime (sequences + heartbeat).
     runtime: Arc<SessionRuntime>,
     /// Session configuration.
@@ -1488,6 +1499,16 @@ impl<A: Application> Reactor<A> {
         reason: &RejectReason,
     ) -> Result<Phase, SessionClosed> {
         let reject = self.factory.session_reject(ref_seq, ref_msg_type, reason);
+        self.send_reject(framed, phase, reject).await
+    }
+
+    /// Sends a Reject the caller has built and keeps the session running.
+    async fn send_reject(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        reject: PendingMessage,
+    ) -> Result<Phase, SessionClosed> {
         if let Err(err) = self.send(framed, reject).await {
             teardown(phase);
             return Err(closed(format!("send failed: {err}"), false));
@@ -2419,14 +2440,8 @@ impl<A: Application> Reactor<A> {
                     self.note_inbound_progress();
                     self.dispatch_admin(framed, phase, &raw, seq).await
                 } else {
-                    let phase = self.deliver_app(phase, seq, &frame).await?;
-                    if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
-                        return Err(exhausted(phase, err));
-                    }
-                    // In-order progress, as above: reconcile recovery rather
-                    // than clearing it on the first message back.
-                    self.note_inbound_progress();
-                    Ok(phase)
+                    self.on_app_in_sequence(framed, phase, &raw, seq, &frame)
+                        .await
                 }
             }
             SequenceResult::TooLow { expected, received } => {
@@ -2451,6 +2466,103 @@ impl<A: Application> Reactor<A> {
                 self.dispatch_admin(framed, phase, &raw, seq).await
             }
         }
+    }
+
+    /// Acts on an application message that is next in sequence: checks its
+    /// application version, then hands it to the dispatcher or rejects it.
+    ///
+    /// This is the one path an application message takes to `from_app`, so
+    /// every check that decides whether the application may see it lives
+    /// here. A path that releases application messages later (a queue of
+    /// messages held across a gap, #71) must release each through this
+    /// method, in order, rather than calling [`Reactor::deliver_app`]
+    /// directly.
+    ///
+    /// On a FIXT.1.1 session, an `ApplVerID` (1128) that names a version the
+    /// session does not accept ([`ApplVersionGuard::check_application`], a
+    /// synchronous decision over the message alone) is answered with a
+    /// session-level Reject, `SessionRejectReason` 18 and `RefTagID` 1128 (13
+    /// for a 1128 repeated in the header, 14 for one outside it); see
+    /// [`Reactor::reject_appl_version`]. A message
+    /// without 1128 is in the counterparty's default application version,
+    /// which the handshake checked, and passes.
+    async fn on_app_in_sequence(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        raw: &RawMessage<'_>,
+        seq: u64,
+        frame: &Bytes,
+    ) -> Result<Phase, SessionClosed> {
+        if let Err(problem) = self.appl_version.check_application(raw) {
+            return self
+                .reject_appl_version(framed, phase, raw.msg_type().as_str(), seq, &problem)
+                .await;
+        }
+        let phase = self.deliver_app(phase, seq, frame).await?;
+        if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
+            return Err(exhausted(phase, err));
+        }
+        // In-order progress: reconcile recovery rather than clearing it on
+        // the first message back.
+        self.note_inbound_progress();
+        Ok(phase)
+    }
+
+    /// Rejects an in-sequence application message whose application version
+    /// the session does not accept.
+    ///
+    /// The message's number is consumed, as for any message answered with a
+    /// session-level Reject: `MsgSeqNum + 1` is persisted as the next target
+    /// number before the expectation moves, exactly as when the message is
+    /// delivered, so the counterparty does not resend it and the stream goes
+    /// on. The message never reaches `from_app`. The Reject is sent like any
+    /// other session frame, and the session stays up: the version is a
+    /// property of this message, not of the session, whose default the
+    /// handshake already checked. When the rejected 1128 names a version
+    /// (`2` to `9`), the Reject echoes it in `RefApplVerID` (1130).
+    async fn reject_appl_version(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        ref_msg_type: &str,
+        seq: u64,
+        problem: &ApplVersionProblem,
+    ) -> Result<Phase, SessionClosed> {
+        tracing::warn!(
+            session = %self.session_id,
+            seq,
+            msg_type = ref_msg_type,
+            tag = problem.tag(),
+            detail = %problem,
+            "rejecting an application message: its application version is not accepted"
+        );
+        let Some(next) = seq.checked_add(1) else {
+            return Err(exhausted(
+                phase,
+                SequenceExhausted {
+                    counter: SequenceCounter::Target,
+                },
+            ));
+        };
+        if let Err(err) = self.persist_target(next).await {
+            return Err(self.close_on_store_failure(phase, &err));
+        }
+        if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
+            return Err(exhausted(phase, err));
+        }
+        self.note_inbound_progress();
+        // A 1128 that names a version the session refuses is echoed in
+        // RefApplVerID (1130), so the counterparty sees which version the
+        // Reject is about.
+        let reason = problem.reject_reason();
+        let reject = self.factory.session_reject_with_appl_ver(
+            seq,
+            ref_msg_type,
+            &reason,
+            problem.ref_appl_ver_id(),
+        );
+        self.send_reject(framed, phase, reject).await
     }
 
     /// Hands one validated, in-sequence inbound application frame to the
@@ -2625,6 +2737,9 @@ pub(crate) struct SessionParams<A: Application> {
     pub(crate) identity: PeerIdentity,
     /// Clock-skew check applied to every inbound `SendingTime` (52).
     pub(crate) sending_time: SendingTimeGuard,
+    /// Application-version check (`ApplVerID` 1128) for a FIXT.1.1 session;
+    /// the same guard the handshake checked `DefaultApplVerID` (1137) with.
+    pub(crate) appl_version: ApplVersionGuard,
     /// Session configuration.
     pub(crate) config: SessionConfig,
     /// Application callbacks.
@@ -2684,6 +2799,7 @@ where
         factory,
         identity,
         sending_time,
+        appl_version,
         config,
         application,
         session_id,
@@ -2719,6 +2835,7 @@ where
         factory,
         identity,
         sending_time,
+        appl_version,
         runtime,
         config,
         application,

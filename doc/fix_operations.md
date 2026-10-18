@@ -78,7 +78,22 @@ and stops at the first failure:
    reason 10). A skew beyond the tolerance, an absent field, or an unparseable
    one Rejects and fails the handshake, before the heartbeat clock is set.
 4. **`from_admin`.** A rejection sends a Logout and fails the handshake.
-5. **`HeartBtInt` (108).** 108 is a *required* field of the Logon, so an ack
+5. **`DefaultApplVerID` (1137), FIX 5.0 only.** On a FIXT.1.1 session an ack
+   that carries 1137 must carry it once, naming an application version the
+   session accepts: its own configured version or one in
+   `SessionConfig::allowed_appl_versions` (`SessionConfig::accepts_appl_version`).
+   A value that names no version (anything but the `ApplVerID` codes `2` to
+   `9`) or names one outside that set (every FIX 4.x code does) draws a
+   session Reject with reason 18 (Invalid/Unsupported Application
+   Version), a repeated 1137 one with reason 13, `RefTagID` = 1137 in both
+   cases, followed by a Logout; the handshake fails with
+   `EngineError::ApplVersion`. By default an ack **without** 1137 is
+   accepted: the initiator checks the acknowledgement's 1137 only when present
+   (issue #67), although FIXT.1.1 makes it required on every Logon. Strict mode
+   (`SessionConfig::require_ack_default_appl_ver_id`, default `false`) requires
+   it: an ack without 1137 then draws a Reject with reason 1 (required tag
+   missing), `RefTagID` = 1137, and a Logout. A FIX 4.x ack is not checked.
+6. **`HeartBtInt` (108).** 108 is a *required* field of the Logon, so an ack
    that omits it (session Reject, reason 1 — required tag missing) or carries a
    non-numeric value (session Reject, reason 6 — incorrect data format for
    value), `RefTagID` = 108 in both cases and each followed by a Logout, fails
@@ -96,7 +111,7 @@ and stops at the first failure:
    requested: echoing our own configuration back is our choice, not the
    counterparty pushing us past the ceiling. `108=0` is legal and always
    accepted; see "Heartbeat" below for what it means.
-6. **`ResetSeqNumFlag` (141).** `141=Y` on the ack must arrive under
+7. **`ResetSeqNumFlag` (141).** `141=Y` on the ack must arrive under
    `MsgSeqNum = 1` — the reset and the number carrying it have to describe the
    same stream — and a peer that sends any other number fails the handshake
    rather than having one half of the contradiction guessed for it. It is
@@ -108,7 +123,7 @@ and stops at the first failure:
    halves disagree here — its initiator would set 1, its acceptor 2 — and
    IronFix matches the acceptor. The mismatch self-heals: the peer sees a gap
    at 2, requests a resend of 1, and receives a GapFill that resynchronises it.
-7. **`MsgSeqNum` (34).** The header 34 is read positionally, *before* identity —
+8. **`MsgSeqNum` (34).** The header 34 is read positionally, *before* identity —
    the same standard-header contract step 2 applies to the CompIDs — so a 34 that
    occurs only after the body is treated as missing and fails the handshake. The
    value read there is then validated at this step: too low fails the handshake,
@@ -126,7 +141,7 @@ the old stream; a message that declares `141=Y` itself must still carry 1.
 
 The same identity and `SendingTime` checks (steps 2 and 3) run on every inbound
 frame once the session is established; there a failure produces the Reject and
-Logout and then tears the session down. An unsatisfied ResendRequest from step 7
+Logout and then tears the session down. An unsatisfied ResendRequest from step 8
 does not stall forever — it is retried and then escalated to Logout; see "Resend
 Request".
 
@@ -144,10 +159,22 @@ missing, exactly as for the CompIDs); then identity (49/56, plus 50/57 and
 142/143 when configured), after which the acceptor claims its single admission
 slot;
 then `SendingTime` (52), and the `from_admin` authentication hook (where
-`Username` (553) / `Password` (554) are inspected); then a `ResetSeqNumFlag`
-(141) Logon must carry `MsgSeqNum = 1`; then `HeartBtInt` (108); only then is
-an attached store reset or refreshed; then `MsgSeqNum` is validated and the
-acknowledgement sent. The differences from the initiator are role-symmetric:
+`Username` (553) / `Password` (554) are inspected); then, on a FIX 5.0 session,
+`DefaultApplVerID` (1137); then a `ResetSeqNumFlag` (141) Logon must carry
+`MsgSeqNum = 1`; then `HeartBtInt` (108); only then is an attached store reset
+or refreshed; then `MsgSeqNum` is validated and the acknowledgement sent. The
+differences from the initiator are role-symmetric:
+
+- **`DefaultApplVerID` (1137).** 1137 is a required field of the FIXT.1.1
+  Logon, so on a FIX 5.0 session the acceptor requires it, exactly once, naming
+  an application version the session accepts (its own configured version or
+  one in `SessionConfig::allowed_appl_versions`). A Logon without it, with it
+  twice, with a value that names no version, or naming a version outside the
+  set (a FIX 4.x code `2` to `6` always is) is refused with a Logout whose `Text` says
+  why and lists the accepted versions (`EngineError::ApplVersion`). The check
+  runs after `from_admin`, so the refusal belongs to the authenticated group
+  below. The acknowledgement declares the acceptor's own version in 1137
+  whatever the peer declared. A FIX 4.x Logon is not checked.
 
 - **`HeartBtInt` (108).** The acceptor *adopts* the interval the initiator
   requested and echoes it back on its Logon reply, rather than proposing one.
@@ -206,8 +233,9 @@ the Logon:
 2. **A Logon without a valid `MsgSeqNum`** — absent, outside the header, or 0
    (which names no message): nothing, in either mode.
 3. **A duplicate Logon** — nothing, in either mode (above).
-4. **An authenticated peer** (`from_admin` accepted it) — refused by a `141=Y`
-   Logon not numbered 1, by its `HeartBtInt`, or by a `MsgSeqNum` too low: a
+4. **An authenticated peer** (`from_admin` accepted it) — refused by its
+   `DefaultApplVerID` (FIX 5.0), by a `141=Y` Logon not numbered 1, by its
+   `HeartBtInt`, or by a `MsgSeqNum` too low: a
    Logout saying why, sent like every session frame, numbered from the store's
    refreshed counters (or the seed), never from a reset, and filed when a store
    is attached.
@@ -743,6 +771,7 @@ timer measures a gap that is making no progress at all, not a slow replay.
 |-----|------------|-------------|
 | 371 | RefTagID | Tag number causing rejection |
 | 372 | RefMsgType | Message type of rejected message |
+| 1130 | RefApplVerID | FIXT.1.1 only: `ApplVerID` of the rejected message |
 | 373 | SessionRejectReason | Reason code |
 | 58 | Text | Human-readable explanation |
 
@@ -761,17 +790,35 @@ timer measures a gap that is making no progress at all, not a slow replay.
 | 9 | CompID problem |
 | 10 | SendingTime accuracy problem |
 | 11 | Invalid MsgType |
+| 12 | XML validation error |
+| 13 | Tag appears more than once |
+| 14 | Tag specified out of required order |
+| 15 | Repeating group fields out of order |
+| 16 | Incorrect NumInGroup count for repeating group |
+| 17 | Non "data" value includes field delimiter (SOH) |
+| 18 | Invalid/Unsupported application version |
 | 99 | Other |
+
+Codes 12 to 18 are listed as the vendored FIXT.1.1 session dictionary
+(`ironfix-dictionary/spec/FIXT11.xml`, `SessionRejectReason` (373)) defines
+them; a FIX 4.x dictionary defines a shorter list (FIX 4.4: 0 to 17 and 99).
+Code 18 belongs to the FIXT.1.1 session layer, which governs the Reject
+message on every FIXT.1.1 session whatever application version it carries, so
+IronFix uses it on FIX 5.0, 5.0 SP1 and 5.0 SP2 sessions alike, and never on a
+FIX 4.x session (which carries no `ApplVerID` to reject).
 
 **Reason codes IronFix emits today**
 
 | Code | Emitted when |
 |---|---|
-| 1 | `SequenceReset` without `NewSeqNo` (36); `ResendRequest` without `BeginSeqNo` (7) or `EndSeqNo` (16); inbound `SendingTime` (52) absent |
+| 1 | `SequenceReset` without `NewSeqNo` (36); `ResendRequest` without `BeginSeqNo` (7) or `EndSeqNo` (16); inbound `SendingTime` (52) absent; FIX 5.0, initiator in strict mode only: a Logon acknowledgement without `DefaultApplVerID` (1137), `RefTagID` = 1137, followed by a Logout |
 | 5 | `SequenceReset` whose `NewSeqNo` would rewind or fails to advance; `ResendRequest` whose range is outside what we have sent |
 | 6 | `SequenceReset` with a malformed `GapFillFlag` (123) that is present but neither `Y` nor `N`; inbound `SendingTime` (52) present but not a `UTCTimestamp` |
 | 9 | Inbound `SenderCompID`/`TargetCompID` (and `SenderSubID`/`TargetSubID` when configured) do not match the session configuration, **or** appear outside the standard header |
 | 10 | Inbound `SendingTime` (52) differs from the local clock by more than the configured tolerance |
+| 13 | FIX 5.0 only: `ApplVerID` (1128) more than once in the standard header of an inbound application message, or `DefaultApplVerID` (1137) more than once on the Logon acknowledgement (initiator); `RefTagID` = the repeated tag |
+| 14 | FIX 5.0 only: `ApplVerID` (1128), a standard-header field, after the header of an inbound application message has ended; `RefTagID` = 1128, the number is consumed and the message never reaches `from_app` |
+| 18 | FIX 5.0 only: an inbound application message whose `ApplVerID` (1128) names no version or a version the session does not accept (`RefTagID` = 1128, and `RefApplVerID` (1130) = the refused code when it names a version, `2` to `9`; the message's number is consumed and it never reaches `from_app`), or a Logon acknowledgement whose `DefaultApplVerID` (1137) fails the same rule (`RefTagID` = 1137, followed by a Logout; initiator) |
 | any | Whatever an `Application::from_admin` / `from_app` implementation returns in its `RejectReason` |
 
 **Reason 10 (SendingTime accuracy) is implemented.** Every inbound frame's
@@ -1694,9 +1741,58 @@ This table exists exactly once in the workspace, as `ironfix_core::FixVersion`
 distinction the type draws: `FixVersion::as_str` is the version's own name
 (`FIX.5.0SP2`), `FixVersion::begin_string` is what goes in tag 8 (`FIXT.1.1`).
 
-**Not implemented for 5.0:** no application-version-driven validation of any
-kind. The `ApplVerID` values are stamped, not enforced, and the engine never
-consults a dictionary.
+**Application-version checks (issue #67, ADR-0020).** A FIX 5.0 session
+accepts from its counterparty its own configured version (the one it declares
+in its own 1137 and stamps in its own 1128) and any version in
+`SessionConfig::allowed_appl_versions`; `SessionConfig::accepts_appl_version`
+is the rule, and the default (an empty set) accepts the configured version
+only. The set may name only FIX.5.0, FIX.5.0SP1 and FIX.5.0SP2, and only on a
+FIX 5.0 session: anything else is `SessionConfigError::UnusableApplVersion`,
+reported by the builder, by `SessionConfig::validate` and by both engines before
+a connection is taken or dialled. Values are decoded by
+`FixVersion::from_appl_ver_id`, which reads the whole `ApplVerID` list as far
+as `FixVersion` has variants (`2` to `6` = FIX 4.0 to 4.4, `7` to `9` = FIX
+5.0 to 5.0 SP2); decoding is not acceptance. A code that decodes to a version
+the session does not accept (any FIX 4.x code, or a 5.0 one outside the set)
+is refused as "not an application version this session accepts"; `0`
+(FIX 2.7), `1` (FIX 3.0), `10` (FIX_LATEST) and anything else name no version
+and are refused as unknown. Both are reason 18.
+
+| Where | Rule | Refusal |
+|---|---|---|
+| Acceptor, inbound Logon | 1137 required, once, naming an accepted version | Logout with the reason and the accepted versions, after `from_admin` (filed when a store is attached; never resets it); `EngineError::ApplVersion` |
+| Initiator, Logon ack | 1137, when present (required in strict mode, `require_ack_default_appl_ver_id`), once and naming an accepted version | Reject (18; 13 when repeated; 1 when missing in strict mode; `RefTagID` 1137) and Logout, filed when a store is attached; `EngineError::ApplVersion` |
+| Both roles, in session | 1128 on an application message, when present, in the standard header, once, naming an accepted version | Reject (18; 13 when repeated in the header; 14 when outside it; `RefTagID` 1128; `RefApplVerID` (1130) = the code, on an 18 for a code that names a version); the number is consumed and persisted, `from_app` is not called, the session stays up |
+
+1128 is a standard-header field (`FIXT11.xml`), so it is read positionally,
+as the CompIDs are: one in the header (the leading run of standard-header
+tags) is the message's version, and one after the header has ended is out of
+order (reason 14) whatever its value, so no 1128 that
+`RawMessage::get_field_str(1128)` could hand the application escapes the
+check. 1137 is a body field of the Logon and is read across the whole message.
+A message without 1128 is in the counterparty's default version, which the
+Logon exchange checked. FIX 4.x sessions carry neither field and are not
+checked.
+
+**Not implemented for 5.0:**
+
+- No dictionary is consulted: an accepted `ApplVerID` selects nothing, and the
+  engine never validates a message body against an application dictionary.
+- The counterparty's declared default is not adopted for outbound traffic:
+  the session always declares and stamps its own configured version. It is
+  kept and exposed as `Connection::counterparty_default_appl_version` (the
+  version of every inbound message without 1128; `None` on FIX 4.x and on an
+  initiator whose ack declared none), and the application can also read 1137
+  off the Logon in `from_admin`.
+- Per-message-type versions declared on the Logon are not honoured: the
+  `NoMsgTypes` (384) group, with `RefMsgType` (372), `RefApplVerID` (1130) and
+  `DefaultVerIndicator` (1410), is neither read nor sent, so a counterparty
+  that declares a different default version for some message types has each
+  such message checked against its 1128 and the Logon's single default only.
+- FIX 4.x messages carried over FIXT.1.1 (`ApplVerID` `2` to `6`) are refused:
+  the engine frames a FIX 4.x version only as a FIX 4.x session.
+- `CstmApplVerID` (1129), `ApplExtID` (1156), `DefaultApplExtID` (1407) and
+  `DefaultCstmApplVerID` (1408) are not checked.
 
 **Dictionary side, standalone.** `ironfix-dictionary` embeds the QuickFIX
 FIXT 1.1 transport dictionary (`Dictionary::fixt11()`) and the FIX 5.0 SP2
@@ -1727,8 +1823,9 @@ Where it differs from QuickFIX:
 - **Group entries.** Required members are enforced in every entry of every
   present group, stricter than QuickFIX; see "Repeating groups in dictionary
   validation" under Error Handling.
-- **`DefaultApplVerID` (1137) values are not checked.** `FIXT11.xml` declares it
-  as a STRING with no enumeration, so any value passes.
+- **`DefaultApplVerID` (1137) values are not checked** by the `Validator`.
+  `FIXT11.xml` declares it as a STRING with no enumeration, so any value
+  passes. (The engine checks it on the Logon exchange; see above.)
 
 **Known upstream deviation.** FIXT 1.1 defines the Logon `MsgTypeGrp` component
 as the `NoMsgTypes` (384) group (`RefMsgType` 372, `MsgDirection` 385,

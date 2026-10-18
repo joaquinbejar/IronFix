@@ -223,16 +223,18 @@ fn in_standard_header(raw: &RawMessage<'_>, tag: u32) -> bool {
     false
 }
 
-/// How often a tag occurs in the standard header of a message.
+/// How often a tag occurs in the part of a message a read covers: the
+/// standard header for [`header_field`], the whole message for the
+/// message-wide read of a body field such as `DefaultApplVerID` (1137).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HeaderField<'a> {
-    /// The header does not carry the tag.
+pub(crate) enum FieldOccurrence<'a> {
+    /// The part read does not carry the tag.
     Absent,
-    /// The header carries the tag once, with this raw value.
+    /// The part read carries the tag once, with this raw value.
     Once(&'a [u8]),
-    /// The header carries the tag more than once (`SessionRejectReason` 13,
-    /// "tag appears more than once"): no occurrence can be trusted over the
-    /// others.
+    /// The part read carries the tag more than once (`SessionRejectReason`
+    /// 13, "tag appears more than once"): no occurrence can be trusted over
+    /// the others.
     Repeated,
 }
 
@@ -240,22 +242,22 @@ pub(crate) enum HeaderField<'a> {
 ///
 /// The header is the leading run of standard-header tags, as for
 /// [`in_standard_header`]: a `tag` that occurs only in the body is
-/// [`HeaderField::Absent`], and a tag outside the standard header set is never
+/// [`FieldOccurrence::Absent`], and a tag outside the standard header set is never
 /// found. The whole header is scanned, so a tag repeated in it is
-/// [`HeaderField::Repeated`] rather than its first value. One scan, no
+/// [`FieldOccurrence::Repeated`] rather than its first value. One scan, no
 /// allocation, and the value is returned as raw bytes, so a caller bounding an
 /// untrusted value sees every byte before deciding whether it is text at all.
-pub(crate) fn header_field<'a>(raw: &RawMessage<'a>, tag: u32) -> HeaderField<'a> {
-    let mut found = HeaderField::Absent;
+pub(crate) fn header_field<'a>(raw: &RawMessage<'a>, tag: u32) -> FieldOccurrence<'a> {
+    let mut found = FieldOccurrence::Absent;
     for field in raw.fields() {
         if !is_standard_header_tag(field.tag) {
             break;
         }
         if field.tag == tag {
-            if found != HeaderField::Absent {
-                return HeaderField::Repeated;
+            if found != FieldOccurrence::Absent {
+                return FieldOccurrence::Repeated;
             }
-            found = HeaderField::Once(field.value);
+            found = FieldOccurrence::Once(field.value);
         }
     }
     found
@@ -604,6 +606,353 @@ impl SendingTimeGuard {
             });
         }
         Ok(())
+    }
+}
+
+/// `DefaultApplVerID` (1137): the counterparty's default application version,
+/// declared in the body of a FIXT.1.1 Logon.
+pub(crate) const DEFAULT_APPL_VER_ID: u32 = 1137;
+
+/// `ApplVerID` (1128): the application version of one FIXT.1.1 application
+/// message. A standard-header field (`FIXT11.xml`, `<header>`), and only that.
+pub(crate) const APPL_VER_ID: u32 = 1128;
+
+/// `RefApplVerID` (1130): on a FIXT.1.1 Reject, the `ApplVerID` of the
+/// rejected message.
+pub(crate) const REF_APPL_VER_ID: u32 = 1130;
+
+/// Longest application-version value echoed in a log line, a Reject or a
+/// Logout `Text` (58). The value is counterparty-controlled, so it is bounded;
+/// a legal one is a single digit.
+const MAX_ECHOED_APPL_VER_ID: usize = 16;
+
+/// Why an inbound application version was refused: `DefaultApplVerID` (1137)
+/// on a Logon, or `ApplVerID` (1128) on an application message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ApplVersionProblem {
+    /// A FIXT.1.1 Logon without the required `DefaultApplVerID` (1137).
+    Missing {
+        /// The missing tag.
+        tag: u32,
+    },
+    /// The tag occurs more than once: no occurrence can be trusted over the
+    /// others (`SessionRejectReason` 13).
+    Repeated {
+        /// The repeated tag.
+        tag: u32,
+    },
+    /// A header-only tag (`ApplVerID` (1128)) occurs after the standard
+    /// header has ended (`SessionRejectReason` 14, "tag specified out of
+    /// required order").
+    OutsideHeader {
+        /// The misplaced tag.
+        tag: u32,
+    },
+    /// The value names no version: it is not one of the `ApplVerID` codes
+    /// `2` to `9` that [`FixVersion::from_appl_ver_id`] decodes (`0`, `1` and
+    /// `10` included).
+    Unknown {
+        /// The offending tag.
+        tag: u32,
+        /// The value, truncated to [`MAX_ECHOED_APPL_VER_ID`] bytes and
+        /// escaped.
+        value: String,
+        /// The versions the session accepts, for the text.
+        accepted: String,
+    },
+    /// The value names a version this session does not accept: a FIX 4.x
+    /// code (`2` to `6`), or a FIX 5.0 one outside the accepted set.
+    NotAccepted {
+        /// The offending tag.
+        tag: u32,
+        /// The code received: one of `2` to `9`, so a single digit.
+        code: String,
+        /// The version the code names.
+        version: FixVersion,
+        /// The versions the session accepts, for the text.
+        accepted: String,
+    },
+}
+
+impl ApplVersionProblem {
+    /// The tag the problem is about, `RefTagID` (371) of a Reject.
+    #[must_use]
+    pub(crate) const fn tag(&self) -> u32 {
+        match self {
+            Self::Missing { tag }
+            | Self::Repeated { tag }
+            | Self::OutsideHeader { tag }
+            | Self::Unknown { tag, .. }
+            | Self::NotAccepted { tag, .. } => *tag,
+        }
+    }
+
+    /// The session-level Reject this problem produces, `RefTagID` (371) the
+    /// offending tag.
+    ///
+    /// `SessionRejectReason` 18 is "Invalid/Unsupported Application Version"
+    /// in the FIXT.1.1 session dictionary (QuickFIX `FIXT11.xml`,
+    /// `INVALID_UNSUPPORTED_APPLICATION_VERSION`), which governs the Reject
+    /// message on every FIXT.1.1 session; this check runs on no other kind. A
+    /// missing required tag is reason 1, a repeated one reason 13 and a
+    /// header tag outside the header reason 14 (`doc/fix_operations.md`,
+    /// "Session Reject Reasons").
+    #[must_use]
+    pub(crate) fn reject_reason(&self) -> RejectReason {
+        let code = match self {
+            // Reaches the wire only from an initiator in strict mode
+            // (`require_ack_default_appl_ver_id`): the acceptor answers a
+            // Logon without 1137 with a Logout alone, and by default the
+            // initiator accepts an ack without it.
+            Self::Missing { .. } => 1,
+            Self::Repeated { .. } => 13,
+            Self::OutsideHeader { .. } => 14,
+            Self::Unknown { .. } | Self::NotAccepted { .. } => 18,
+        };
+        RejectReason::new(code, self.to_string()).with_ref_tag(self.tag())
+    }
+
+    /// The `RefApplVerID` (1130) a Reject for this problem carries: the
+    /// rejected message's `ApplVerID` (1128), when it is a code that names a
+    /// version (`2` to `9`) and the session does not accept it.
+    ///
+    /// `None` for every other problem: a 1137 problem concerns a Logon,
+    /// which has no `ApplVerID` of its own; a value that names no version
+    /// (`0` and `1` included, which name versions [`FixVersion`] does not
+    /// model) has nothing validated to echo; and a repeated or misplaced
+    /// 1128 has no single value to name.
+    #[must_use]
+    pub(crate) fn ref_appl_ver_id(&self) -> Option<&str> {
+        match self {
+            Self::NotAccepted { tag, code, .. } if *tag == APPL_VER_ID => Some(code),
+            _ => None,
+        }
+    }
+}
+
+/// The field name of an application-version tag, for refusal texts.
+const fn appl_ver_tag_name(tag: u32) -> &'static str {
+    if tag == DEFAULT_APPL_VER_ID {
+        "DefaultApplVerID"
+    } else {
+        "ApplVerID"
+    }
+}
+
+impl std::fmt::Display for ApplVersionProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = appl_ver_tag_name(self.tag());
+        match self {
+            Self::Missing { tag } => write!(
+                f,
+                "{name} ({tag}) is missing; a FIXT.1.1 Logon must declare its default \
+                 application version"
+            ),
+            Self::Repeated { tag } => write!(f, "{name} ({tag}) appears more than once"),
+            Self::OutsideHeader { tag } => write!(
+                f,
+                "{name} ({tag}) appears outside the standard header, where it belongs"
+            ),
+            Self::Unknown {
+                tag,
+                value,
+                accepted,
+            } => write!(
+                f,
+                "{name} ({tag}) '{value}' is not a supported application version; \
+                 this session accepts {accepted}"
+            ),
+            Self::NotAccepted {
+                tag,
+                code,
+                version,
+                accepted,
+            } => write!(
+                f,
+                "{name} ({tag}) {code} ({version}) is not an application version this \
+                 session accepts; it accepts {accepted}"
+            ),
+        }
+    }
+}
+
+/// Where a tag occurs anywhere in a message, header, body or trailer.
+///
+/// Used for `DefaultApplVerID` (1137), a body field of the Logon: an
+/// application reads it with [`RawMessage::get_field_str`], which finds the
+/// first occurrence wherever it is, so the value the session checks has to be
+/// the only one the message carries.
+fn message_field<'a>(raw: &RawMessage<'a>, tag: u32) -> FieldOccurrence<'a> {
+    let mut found = FieldOccurrence::Absent;
+    for field in raw.fields() {
+        if field.tag == tag {
+            if found != FieldOccurrence::Absent {
+                return FieldOccurrence::Repeated;
+            }
+            found = FieldOccurrence::Once(field.value);
+        }
+    }
+    found
+}
+
+/// Checks the application versions a FIXT.1.1 counterparty declares
+/// (`DefaultApplVerID` (1137) on its Logon) and uses (`ApplVerID` (1128) on
+/// an application message) against the versions the session accepts.
+///
+/// The accepted set is [`SessionConfig::accepts_appl_version`], resolved once:
+/// the session's own version plus
+/// [`SessionConfig::allowed_appl_versions`]. A FIX 4.x session carries
+/// neither field, and its guard checks nothing.
+///
+/// Both checks are synchronous decisions over one message, read no clock and
+/// keep no state (ADR-0002), so any path that releases an application message
+/// to the application (in sequence today; from a gap queue later) applies the
+/// same [`ApplVersionGuard::check_application`].
+#[derive(Debug, Clone)]
+pub(crate) struct ApplVersionGuard {
+    /// Whether the session is framed as FIXT.1.1. Off, nothing is checked.
+    fixt: bool,
+    /// The accepted versions, in ascending order.
+    accepted: Vec<FixVersion>,
+    /// The accepted versions as `code (name)`, for refusal texts.
+    accepted_text: String,
+}
+
+impl ApplVersionGuard {
+    /// Builds the guard for a session framed as `version`.
+    #[must_use]
+    pub(crate) fn new(config: &SessionConfig, version: FixVersion) -> Self {
+        let fixt = version.uses_fixt();
+        let accepted: Vec<FixVersion> = if fixt {
+            FixVersion::ALL
+                .into_iter()
+                .filter(|candidate| config.accepts_appl_version(*candidate))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let accepted_text = if accepted.is_empty() {
+            "none".to_string()
+        } else {
+            accepted
+                .iter()
+                .map(|version| format!("{} ({version})", version.appl_ver_id().unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Self {
+            fixt,
+            accepted,
+            accepted_text,
+        }
+    }
+
+    /// Checks one occurrence of an application-version tag.
+    fn check_value(&self, tag: u32, value: &[u8]) -> Result<FixVersion, ApplVersionProblem> {
+        // Decoding is `FixVersion`'s; acceptance is the session's. A FIX 4.x
+        // code decodes to a version no FIX 5.0 session accepts.
+        let text = std::str::from_utf8(value).ok();
+        match text.and_then(FixVersion::from_appl_ver_id) {
+            Some(version) if self.accepted.contains(&version) => Ok(version),
+            Some(version) => Err(ApplVersionProblem::NotAccepted {
+                tag,
+                code: text.unwrap_or_default().to_owned(),
+                version,
+                accepted: self.accepted_text.clone(),
+            }),
+            None => {
+                let shown = value.get(..MAX_ECHOED_APPL_VER_ID).unwrap_or(value);
+                Err(ApplVersionProblem::Unknown {
+                    tag,
+                    value: shown.escape_ascii().to_string(),
+                    accepted: self.accepted_text.clone(),
+                })
+            }
+        }
+    }
+
+    /// Checks the `DefaultApplVerID` (1137) of an inbound Logon or Logon
+    /// acknowledgement, and returns the version it declares.
+    ///
+    /// `required` is the acceptor's rule: 1137 is a required field of the
+    /// FIXT.1.1 Logon, so a Logon without it is refused. The initiator passes
+    /// [`SessionConfig::require_ack_default_appl_ver_id`]: by default it
+    /// checks an acknowledgement's 1137 only when present (issue #67), so an
+    /// absent one is `Ok(None)` there, and in strict mode it requires it. On
+    /// a FIX 4.x session nothing is checked and the answer is `Ok(None)`.
+    ///
+    /// # Errors
+    /// [`ApplVersionProblem::Missing`] when `required` and 1137 is absent,
+    /// [`ApplVersionProblem::Repeated`] when it occurs more than once,
+    /// [`ApplVersionProblem::Unknown`] when its value names no version, and
+    /// [`ApplVersionProblem::NotAccepted`] when it names one the session does
+    /// not accept.
+    pub(crate) fn check_logon(
+        &self,
+        raw: &RawMessage<'_>,
+        required: bool,
+    ) -> Result<Option<FixVersion>, ApplVersionProblem> {
+        if !self.fixt {
+            return Ok(None);
+        }
+        match message_field(raw, DEFAULT_APPL_VER_ID) {
+            FieldOccurrence::Absent if required => Err(ApplVersionProblem::Missing {
+                tag: DEFAULT_APPL_VER_ID,
+            }),
+            FieldOccurrence::Absent => Ok(None),
+            FieldOccurrence::Repeated => Err(ApplVersionProblem::Repeated {
+                tag: DEFAULT_APPL_VER_ID,
+            }),
+            FieldOccurrence::Once(value) => self.check_value(DEFAULT_APPL_VER_ID, value).map(Some),
+        }
+    }
+
+    /// Checks the `ApplVerID` (1128) of an inbound application message.
+    ///
+    /// A message without 1128 is in the counterparty's default application
+    /// version, which its Logon declared and the handshake already checked,
+    /// so it passes. 1128 is a standard-header field (`FIXT11.xml`), so it is
+    /// read positionally, as [`header_field`] reads the CompIDs: one in the
+    /// header is the message's version, and one after the header has ended is
+    /// out of order, wherever else 1128 occurs. Every occurrence is looked at,
+    /// so no 1128 the application could read with
+    /// [`RawMessage::get_field_str`] escapes the check. On a FIX 4.x session
+    /// nothing is checked.
+    ///
+    /// # Errors
+    /// [`ApplVersionProblem::OutsideHeader`] when any 1128 occurs after the
+    /// standard header (this outranks a repetition),
+    /// [`ApplVersionProblem::Repeated`] when the header carries it more than
+    /// once,
+    /// [`ApplVersionProblem::Unknown`] when its value names no version, and
+    /// [`ApplVersionProblem::NotAccepted`] when it names one the session does
+    /// not accept.
+    pub(crate) fn check_application(&self, raw: &RawMessage<'_>) -> Result<(), ApplVersionProblem> {
+        if !self.fixt {
+            return Ok(());
+        }
+        // One scan: the header is the leading run of standard-header tags,
+        // and any 1128 after it is out of order.
+        let mut in_header = true;
+        let mut found = FieldOccurrence::Absent;
+        for field in raw.fields() {
+            in_header = in_header && is_standard_header_tag(field.tag);
+            if field.tag != APPL_VER_ID {
+                continue;
+            }
+            if !in_header {
+                return Err(ApplVersionProblem::OutsideHeader { tag: APPL_VER_ID });
+            }
+            found = match found {
+                FieldOccurrence::Absent => FieldOccurrence::Once(field.value),
+                FieldOccurrence::Once(_) | FieldOccurrence::Repeated => FieldOccurrence::Repeated,
+            };
+        }
+        match found {
+            FieldOccurrence::Absent => Ok(()),
+            FieldOccurrence::Repeated => Err(ApplVersionProblem::Repeated { tag: APPL_VER_ID }),
+            FieldOccurrence::Once(value) => self.check_value(APPL_VER_ID, value).map(|_| ()),
+        }
     }
 }
 
@@ -1182,14 +1531,35 @@ impl MessageFactory {
         ref_msg_type: &str,
         reason: &RejectReason,
     ) -> PendingMessage {
+        self.session_reject_with_appl_ver(ref_seq, ref_msg_type, reason, None)
+    }
+
+    /// Builds a session-level Reject (35=3) that also names the `ApplVerID`
+    /// of the rejected message in `RefApplVerID` (1130), a FIXT.1.1 Reject
+    /// field.
+    ///
+    /// The fields follow the FIXT.1.1 Reject layout: `RefSeqNum` (45),
+    /// `RefTagID` (371), `RefMsgType` (372), `RefApplVerID` (1130),
+    /// `SessionRejectReason` (373), `Text` (58). `ref_appl_ver_id` must be a
+    /// code the caller has validated; it is written verbatim.
+    #[must_use]
+    pub(crate) fn session_reject_with_appl_ver(
+        &self,
+        ref_seq: u64,
+        ref_msg_type: &str,
+        reason: &RejectReason,
+        ref_appl_ver_id: Option<&str>,
+    ) -> PendingMessage {
         let mut message = OutboundMessage::new(MsgType::Reject);
         message.push_uint(45, ref_seq);
         if let Some(ref_tag) = reason.ref_tag {
             message.push_uint(371, u64::from(ref_tag));
         }
-        message
-            .push_str(372, ref_msg_type)
-            .push_uint(373, u64::from(reason.code));
+        message.push_str(372, ref_msg_type);
+        if let Some(code) = ref_appl_ver_id {
+            message.push_str(REF_APPL_VER_ID, code);
+        }
+        message.push_uint(373, u64::from(reason.code));
         if !reason.text.is_empty() {
             message.push_str(58, &reason.text);
         }
@@ -1926,14 +2296,14 @@ mod tests {
         ]);
         let raw = decode(&frame);
 
-        assert_eq!(header_field(&raw, 49), HeaderField::Once(b"CLIENT"));
-        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"VENUE"));
+        assert_eq!(header_field(&raw, 49), FieldOccurrence::Once(b"CLIENT"));
+        assert_eq!(header_field(&raw, 56), FieldOccurrence::Once(b"VENUE"));
         // Not UTF-8, returned as bytes for the caller to bound.
-        assert_eq!(header_field(&raw, 142), HeaderField::Once(b"LON\x80"));
-        assert_eq!(header_field(&raw, 57), HeaderField::Absent);
-        assert_eq!(header_field(&raw, 50), HeaderField::Absent);
+        assert_eq!(header_field(&raw, 142), FieldOccurrence::Once(b"LON\x80"));
+        assert_eq!(header_field(&raw, 57), FieldOccurrence::Absent);
+        assert_eq!(header_field(&raw, 50), FieldOccurrence::Absent);
         // A body tag is never a header field, even as the first body field.
-        assert_eq!(header_field(&raw, 98), HeaderField::Absent);
+        assert_eq!(header_field(&raw, 98), FieldOccurrence::Absent);
     }
 
     #[test]
@@ -1951,8 +2321,8 @@ mod tests {
         ]);
         let raw = decode(&frame);
 
-        assert_eq!(header_field(&raw, 49), HeaderField::Repeated);
-        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"VENUE"));
+        assert_eq!(header_field(&raw, 49), FieldOccurrence::Repeated);
+        assert_eq!(header_field(&raw, 56), FieldOccurrence::Once(b"VENUE"));
     }
 
     #[test]
@@ -1970,7 +2340,7 @@ mod tests {
         let raw = decode(&frame);
 
         assert!(is_standard_header_tag(370));
-        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"CLIENT"));
+        assert_eq!(header_field(&raw, 56), FieldOccurrence::Once(b"CLIENT"));
         assert_eq!(
             PeerIdentity::new(&config_for("FIX.4.4")).validate(&raw),
             Ok(())
@@ -2410,6 +2780,340 @@ mod tests {
                 assert_eq!(value.chars().count(), MAX_ECHOED_HEARTBEAT);
             }
             other => panic!("a 200-digit HeartBtInt must be malformed, got {other:?}"),
+        }
+    }
+
+    // --- Application versions (FIXT.1.1) ------------------------------------
+
+    /// The guard of a session configured as `begin_string`, with `allowed`
+    /// accepted besides its own version.
+    fn appl_guard(begin_string: &str, allowed: &[FixVersion]) -> ApplVersionGuard {
+        let config = config_for(begin_string).with_allowed_appl_versions(allowed.iter().copied());
+        match wire_version(&config.begin_string) {
+            Ok(version) => ApplVersionGuard::new(&config, version),
+            Err(err) => panic!("test fixture uses an unsupported version: {err}"),
+        }
+    }
+
+    /// A Logon carrying `extra` after the required fields.
+    fn logon_with(extra: &[(u32, &str)]) -> Vec<u8> {
+        let mut fields = vec![
+            (35, "A"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "1"),
+            (98, "0"),
+            (108, "30"),
+        ];
+        fields.extend_from_slice(extra);
+        frame_with_fields(&fields)
+    }
+
+    /// An application message (ExecutionReport) carrying `extra`.
+    fn report_with(extra: &[(u32, &str)]) -> Vec<u8> {
+        let mut fields = vec![(35, "8"), (49, "VENUE"), (56, "CLIENT"), (34, "2")];
+        fields.extend_from_slice(extra);
+        fields.extend_from_slice(&[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")]);
+        frame_with_fields(&fields)
+    }
+
+    #[test]
+    fn test_appl_guard_accepts_the_configured_default_appl_ver_id() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        assert_eq!(
+            guard.check_logon(&decode(&logon_with(&[(1137, "9")])), true),
+            Ok(Some(FixVersion::Fix50Sp2))
+        );
+    }
+
+    #[test]
+    fn test_appl_guard_requires_default_appl_ver_id_on_the_acceptor_only() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        let logon = logon_with(&[]);
+        let refused = guard.check_logon(&decode(&logon), true);
+        assert_eq!(refused, Err(ApplVersionProblem::Missing { tag: 1137 }));
+        if let Err(problem) = refused {
+            let reason = problem.reject_reason();
+            assert_eq!(reason.code, 1);
+            assert_eq!(reason.ref_tag, Some(1137));
+        }
+        assert_eq!(guard.check_logon(&decode(&logon), false), Ok(None));
+    }
+
+    #[test]
+    fn test_appl_guard_refuses_a_default_appl_ver_id_not_accepted() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        match guard.check_logon(&decode(&logon_with(&[(1137, "7")])), true) {
+            Err(problem @ ApplVersionProblem::NotAccepted { .. }) => {
+                let text = problem.to_string();
+                assert!(text.contains("1137"), "{text}");
+                assert!(text.contains("FIX.5.0"), "{text}");
+                assert!(text.contains("9 (FIX.5.0SP2)"), "{text}");
+                let reason = problem.reject_reason();
+                assert_eq!(reason.code, 18);
+                assert_eq!(reason.ref_tag, Some(1137));
+            }
+            other => panic!("1137=7 must not be accepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_appl_guard_refuses_a_fix4_code_as_not_accepted() {
+        // 2 to 6 decode to FIX 4.x versions, which no FIX 5.0 session
+        // accepts: the refusal names the version.
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        for (code, version) in [("2", FixVersion::Fix40), ("6", FixVersion::Fix44)] {
+            match guard.check_logon(&decode(&logon_with(&[(1137, code)])), true) {
+                Err(problem @ ApplVersionProblem::NotAccepted { .. }) => {
+                    assert_eq!(
+                        problem,
+                        ApplVersionProblem::NotAccepted {
+                            tag: 1137,
+                            code: code.to_string(),
+                            version,
+                            accepted: "9 (FIX.5.0SP2)".to_string(),
+                        }
+                    );
+                    let text = problem.to_string();
+                    assert!(text.contains(&format!("{code} ({version})")), "{text}");
+                    assert_eq!(problem.reject_reason().code, 18);
+                }
+                other => panic!("1137={code} must not be accepted, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_appl_guard_refuses_values_that_name_no_version() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        for value in ["X", "0", "1", "10", "09"] {
+            match guard.check_logon(&decode(&logon_with(&[(1137, value)])), true) {
+                Err(ApplVersionProblem::Unknown {
+                    tag, value: shown, ..
+                }) => {
+                    assert_eq!(tag, 1137);
+                    assert_eq!(shown, value);
+                }
+                other => panic!("1137={value} must be unknown, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_appl_guard_refuses_a_repeated_default_appl_ver_id() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        let logon = logon_with(&[(1137, "9"), (1137, "9")]);
+        let refused = guard.check_logon(&decode(&logon), true);
+        assert_eq!(refused, Err(ApplVersionProblem::Repeated { tag: 1137 }));
+        if let Err(problem) = refused {
+            assert_eq!(problem.reject_reason().code, 13);
+        }
+    }
+
+    #[test]
+    fn test_appl_guard_echoes_a_bounded_escaped_value() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        let long = format!("{}\u{7f}", "A".repeat(200));
+        let logon = frame_with_raw_fields(&[
+            (35, b"A"),
+            (49, b"VENUE"),
+            (56, b"CLIENT"),
+            (34, b"1"),
+            (98, b"0"),
+            (108, b"30"),
+            (1137, &[0xff, 0xfe]),
+        ]);
+        match guard.check_logon(&decode(&logon), true) {
+            Err(ApplVersionProblem::Unknown { value, .. }) => assert_eq!(value, "\\xff\\xfe"),
+            other => panic!("non-UTF-8 1137 must be unknown, got {other:?}"),
+        }
+        match guard.check_logon(&decode(&logon_with(&[(1137, &long)])), true) {
+            Err(ApplVersionProblem::Unknown { value, .. }) => {
+                assert_eq!(value, "A".repeat(MAX_ECHOED_APPL_VER_ID));
+            }
+            other => panic!("an over-long 1137 must be unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_appl_guard_accepts_an_allowed_version_besides_the_configured_one() {
+        let guard = appl_guard("FIX.5.0SP2", &[FixVersion::Fix50Sp1]);
+        assert_eq!(
+            guard.check_logon(&decode(&logon_with(&[(1137, "8")])), true),
+            Ok(Some(FixVersion::Fix50Sp1))
+        );
+        assert_eq!(
+            guard.check_application(&decode(&report_with(&[(1128, "8")]))),
+            Ok(())
+        );
+        assert!(matches!(
+            guard.check_application(&decode(&report_with(&[(1128, "7")]))),
+            Err(ApplVersionProblem::NotAccepted {
+                tag: 1128,
+                version: FixVersion::Fix50,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_appl_guard_application_message_without_appl_ver_id_passes() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        assert_eq!(guard.check_application(&decode(&report_with(&[]))), Ok(()));
+        assert_eq!(
+            guard.check_application(&decode(&report_with(&[(1128, "9")]))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_appl_guard_refuses_a_disallowed_appl_ver_id_with_reason_18() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        let refused = guard.check_application(&decode(&report_with(&[(1128, "7")])));
+        match refused {
+            Err(problem) => {
+                let reason = problem.reject_reason();
+                assert_eq!(reason.code, 18);
+                assert_eq!(reason.ref_tag, Some(1128));
+                assert!(reason.text.contains("ApplVerID (1128)"), "{}", reason.text);
+            }
+            Ok(()) => panic!("1128=7 must not be accepted on an SP2 session"),
+        }
+    }
+
+    #[test]
+    fn test_appl_guard_refuses_an_appl_ver_id_outside_the_header() {
+        // 1128 is header-only: one after the body opens is out of order
+        // (reason 14), whatever its value, accepted or not.
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        for value in ["7", "9"] {
+            let frame = frame_with_fields(&[
+                (35, "8"),
+                (49, "VENUE"),
+                (56, "CLIENT"),
+                (34, "2"),
+                (37, "EX-1"),
+                (1128, value),
+            ]);
+            let refused = guard.check_application(&decode(&frame));
+            assert_eq!(
+                refused,
+                Err(ApplVersionProblem::OutsideHeader { tag: 1128 })
+            );
+            if let Err(problem) = refused {
+                let reason = problem.reject_reason();
+                assert_eq!(reason.code, 14);
+                assert_eq!(reason.ref_tag, Some(1128));
+            }
+        }
+        // A header copy and a body copy: the body one is out of order, which
+        // outranks the repetition.
+        let both = frame_with_fields(&[
+            (35, "8"),
+            (1128, "9"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "2"),
+            (37, "EX-1"),
+            (1128, "9"),
+        ]);
+        assert_eq!(
+            guard.check_application(&decode(&both)),
+            Err(ApplVersionProblem::OutsideHeader { tag: 1128 })
+        );
+    }
+
+    #[test]
+    fn test_appl_guard_refuses_an_appl_ver_id_repeated_in_the_header() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        let frame = frame_with_fields(&[
+            (35, "8"),
+            (1128, "9"),
+            (1128, "9"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "2"),
+            (37, "EX-1"),
+        ]);
+        let refused = guard.check_application(&decode(&frame));
+        assert_eq!(refused, Err(ApplVersionProblem::Repeated { tag: 1128 }));
+        if let Err(problem) = refused {
+            assert_eq!(problem.reject_reason().code, 13);
+        }
+    }
+
+    #[test]
+    fn test_appl_guard_reads_appl_ver_id_anywhere_in_the_header() {
+        // After the CompIDs and MsgSeqNum is still the header.
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        let frame = frame_with_fields(&[
+            (35, "8"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "2"),
+            (1128, "7"),
+            (37, "EX-1"),
+        ]);
+        assert!(matches!(
+            guard.check_application(&decode(&frame)),
+            Err(ApplVersionProblem::NotAccepted { tag: 1128, .. })
+        ));
+    }
+
+    #[test]
+    fn test_session_reject_with_appl_ver_places_ref_appl_ver_id() {
+        let mut factory = factory_for("FIX.5.0SP2");
+        let reason = RejectReason::new(18, "not accepted").with_ref_tag(1128);
+        let pending = factory.session_reject_with_appl_ver(2, "D", &reason, Some("7"));
+        let frame = framed(&mut factory, 3, &pending);
+        assert_eq!(field_of(&frame, 1130).as_deref(), Some("7"));
+        // The FIXT.1.1 Reject layout: 45, 371, 372, 1130, 373, 58.
+        let raw = decode(&frame);
+        let order: Vec<u32> = raw
+            .fields()
+            .map(|field| field.tag)
+            .filter(|tag| [45, 371, 372, 1130, 373, 58].contains(tag))
+            .collect();
+        assert_eq!(order, vec![45, 371, 372, 1130, 373, 58]);
+
+        let plain = factory.session_reject(2, "D", &reason);
+        assert_eq!(field_of(&framed(&mut factory, 4, &plain), 1130), None);
+    }
+
+    #[test]
+    fn test_appl_problem_ref_appl_ver_id_names_only_a_refused_1128_code() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        let refused =
+            |extra: &[(u32, &str)]| match guard.check_application(&decode(&report_with(extra))) {
+                Err(problem) => problem,
+                Ok(()) => panic!("{extra:?} must be refused"),
+            };
+        assert_eq!(refused(&[(1128, "7")]).ref_appl_ver_id(), Some("7"));
+        assert_eq!(refused(&[(1128, "6")]).ref_appl_ver_id(), Some("6"));
+        // A value that names no version, and a repetition, name nothing.
+        assert_eq!(refused(&[(1128, "0")]).ref_appl_ver_id(), None);
+        assert_eq!(refused(&[(1128, "X")]).ref_appl_ver_id(), None);
+        assert_eq!(refused(&[(1128, "7"), (1128, "7")]).ref_appl_ver_id(), None);
+        // A 1137 problem concerns a Logon, which has no ApplVerID.
+        match guard.check_logon(&decode(&logon_with(&[(1137, "7")])), true) {
+            Err(problem) => assert_eq!(problem.ref_appl_ver_id(), None),
+            Ok(declared) => panic!("1137=7 must be refused, got {declared:?}"),
+        }
+    }
+
+    #[test]
+    fn test_appl_guard_is_off_on_fix4_sessions() {
+        for begin_string in ["FIX.4.2", "FIX.4.4"] {
+            let guard = appl_guard(begin_string, &[]);
+            assert_eq!(guard.check_logon(&decode(&logon_with(&[])), true), Ok(None));
+            assert_eq!(
+                guard.check_logon(&decode(&logon_with(&[(1137, "7")])), true),
+                Ok(None)
+            );
+            assert_eq!(
+                guard.check_application(&decode(&report_with(&[(1128, "7")]))),
+                Ok(())
+            );
         }
     }
 }
