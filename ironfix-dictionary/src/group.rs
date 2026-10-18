@@ -48,7 +48,8 @@
 //!   entries is skipped with that group. One read is one pass over the
 //!   message: the group asked for is checked while it is located, and the
 //!   rest of the message is still scanned so a second instance of its count
-//!   field is reported ([`GroupError::DuplicateGroup`]).
+//!   field is reported ([`GroupError::DuplicateGroup`]). [`GroupSet::field`]
+//!   looks a plain field up the same way, skipping the groups' runs.
 //! - **No allocation on the read path.** A successful read, iterating its
 //!   entries, looking fields up and reading nested groups borrow ranges of the
 //!   message's field list and allocate nothing; so does a read that fails
@@ -595,6 +596,58 @@ impl<'s> GroupSet<'s> {
             };
         }
         Ok(found)
+    }
+
+    /// Returns the first field `tag` at the message level of `msg`.
+    ///
+    /// The runs of the set's groups are skipped with the same positional walk
+    /// [`GroupSet::read`] uses, so a field inside one of their entries is not
+    /// taken for a message-level field with the same tag. The groups are not
+    /// checked here: a malformed group is still skipped by membership, and
+    /// reading it reports the error. A count tag asked for is found like any
+    /// other field. No allocation, for groups of up to 512 entry-level
+    /// members.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironfix_dictionary::{GroupSet, GroupSpec};
+    /// use ironfix_tagvalue::Decoder;
+    ///
+    /// // FIX 4.4 NoPartyIDs(453), whose entries may carry PartyIDSource(447).
+    /// const PARTIES: GroupSpec<'static> = match GroupSpec::new(453, 448, &[447, 448, 452], &[]) {
+    ///     Ok(spec) => spec,
+    ///     Err(_) => panic!("bad NoPartyIDs table"),
+    /// };
+    /// const GROUPS: GroupSet<'static> = match GroupSet::new(&[PARTIES]) {
+    ///     Ok(set) => set,
+    ///     Err(_) => panic!("bad group table"),
+    /// };
+    ///
+    /// let body = "35=D\x0111=ORDER-1\x01453=1\x01448=BROKER\x01447=D\x0155=EURUSD\x01";
+    /// let frame = format!("8=FIX.4.4\x019={}\x01{body}10=000\x01", body.len());
+    /// let mut decoder = Decoder::new(frame.as_bytes()).with_checksum_validation(false);
+    /// let message = decoder.decode()?;
+    ///
+    /// assert_eq!(GROUPS.field(&message, 55).map(|field| field.value), Some(&b"EURUSD"[..]));
+    /// // PartyIDSource(447) appears only inside a NoPartyIDs entry.
+    /// assert!(GROUPS.field(&message, 447).is_none());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn field<'m, 'a>(&self, msg: &'m RawMessage<'a>, tag: u32) -> Option<&'m FieldRef<'a>> {
+        let fields = msg.field_slice();
+        let mut index = 0;
+        while let Some(field) = fields.get(index) {
+            if field.tag == tag {
+                return Some(field);
+            }
+            index = match self.get(field.tag) {
+                Some(group) => walk::walk_group(fields, index, group, 0, &mut Skip),
+                None => index + 1,
+            };
+        }
+        None
     }
 }
 
@@ -1462,6 +1515,63 @@ mod tests {
             panic!("the top-level NoInner is present");
         };
         assert_eq!(values(top, 210), vec![&b"TOP"[..]]);
+    }
+
+    #[test]
+    fn test_group_set_field_skips_the_runs_of_its_groups() {
+        let layout = dialect_layout("U5");
+        let groups = layout.groups();
+        // Extra(300) appears only inside the NoOuter entry: no message-level
+        // field. Plain(55) follows the group and is found.
+        let text = frame("U5", &["102=1", "200=A", "300=IN-GROUP", "55=P"]);
+        let msg = decode(&text);
+        assert!(groups.field(&msg, 300).is_none());
+        assert_eq!(
+            groups.field(&msg, 55).map(|field| field.value),
+            Some(&b"P"[..])
+        );
+        // A count tag is found like any field.
+        assert_eq!(
+            groups.field(&msg, 102).map(|field| field.value),
+            Some(&b"1"[..])
+        );
+        // A header field before the group is found.
+        assert_eq!(
+            groups.field(&msg, 35).map(|field| field.value),
+            Some(&b"U5"[..])
+        );
+
+        // A nested group's field is skipped with its enclosing run; the same
+        // tag after the run is the message-level one.
+        let text = frame(
+            "U5",
+            &["102=1", "200=A", "110=1", "210=NESTED", "55=P", "210=TOP"],
+        );
+        let msg = decode(&text);
+        assert_eq!(
+            groups.field(&msg, 210).map(|field| field.value),
+            Some(&b"TOP"[..])
+        );
+
+        // A malformed group (count 2, one entry) is still skipped by
+        // membership; reading it reports the error.
+        let text = frame("U5", &["102=2", "200=A", "300=IN-GROUP", "55=P"]);
+        let msg = decode(&text);
+        assert!(groups.field(&msg, 300).is_none());
+        assert_eq!(
+            groups.field(&msg, 55).map(|field| field.value),
+            Some(&b"P"[..])
+        );
+        assert!(layout.read(&msg, 102).is_err());
+
+        // The first message-level occurrence wins.
+        let text = frame("U5", &["55=FIRST", "55=SECOND"]);
+        let msg = decode(&text);
+        assert_eq!(
+            groups.field(&msg, 55).map(|field| field.value),
+            Some(&b"FIRST"[..])
+        );
+        assert!(groups.field(&msg, 9999).is_none());
     }
 
     #[test]

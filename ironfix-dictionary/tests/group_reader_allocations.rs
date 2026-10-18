@@ -18,7 +18,10 @@
 //! - reads an absent group;
 //! - iterates the layout's top-level groups;
 //! - reads a malformed group, which fails with a count mismatch;
-//! - repeats the first read through a static [`GroupSet`].
+//! - repeats the first read through a static [`GroupSet`];
+//! - looks message-level fields up past both groups with
+//!   [`GroupSet::field`], through the layout and the static set, including a
+//!   tag that appears only inside a group entry.
 //!
 //! The number of blocks allocated in the window must be zero.
 //!
@@ -153,6 +156,9 @@ fn main() {
         Ok(Some(parties)) => walk_parties(parties),
         other => panic!("NoPartyIDs must read through the static set: {other:?}"),
     };
+    let symbol = layout.groups().field(&msg, 55).map(|field| field.value);
+    let static_symbol = ORDER_GROUPS.field(&msg, 55).map(|field| field.value);
+    let party_at_top = layout.groups().field(&msg, 448).is_some();
 
     let after = dhat::HeapStats::get();
     drop(profiler);
@@ -179,4 +185,7 @@ fn main() {
     assert!(absent, "NoAllocs(78) is absent from the message");
     assert_eq!(top_level, 2);
     assert!(mismatch, "the malformed NoPartyIDs is a count mismatch");
+    assert_eq!(symbol, Some(&b"EURUSD"[..]));
+    assert_eq!(static_symbol, symbol);
+    assert!(!party_at_top, "PartyID(448) appears only inside NoPartyIDs");
 }
