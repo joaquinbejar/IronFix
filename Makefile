@@ -15,16 +15,18 @@ WORKSPACE_VERSION := $(shell sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml |
 
 # Every crate carrying a path+version entry in [workspace.dependencies].
 PATH_CRATES := ironfix-core ironfix-dictionary ironfix-tagvalue ironfix-session \
-	ironfix-store ironfix-transport ironfix-fast ironfix-codegen ironfix-derive \
-	ironfix-engine
+	ironfix-store ironfix-transport ironfix-sofh ironfix-fast ironfix-codegen \
+	ironfix-derive ironfix-engine
 
 # Publication order. A crate must appear after every crate it depends on,
 # because crates.io resolves the version requirements at upload time.
 # ironfix-codegen-check is deliberately absent: it is `publish = false`, a CI
 # check that compiles the generated views of the embedded dictionaries.
-PUBLISH_ORDER := ironfix-core ironfix-derive ironfix-tagvalue ironfix-dictionary \
-	ironfix-store ironfix-session ironfix-transport ironfix-fast ironfix-codegen \
-	ironfix-engine ironfix-example
+# ironfix-sofh depends on ironfix-core only, so it goes right after it
+# (ADR-0003).
+PUBLISH_ORDER := ironfix-core ironfix-sofh ironfix-derive ironfix-tagvalue \
+	ironfix-dictionary ironfix-store ironfix-session ironfix-transport ironfix-fast \
+	ironfix-codegen ironfix-engine ironfix-example
 
 # crates.io answers 403 to any request without a User-Agent, so the
 # already-published probe in publish-all must identify itself.
@@ -327,7 +329,8 @@ BENCH_BASELINE ?= v$(WORKSPACE_VERSION)
 # would also select every crate's implicit libtest bench target, and libtest
 # rejects criterion's arguments ("error: Unrecognized option: 'quick'"), so any
 # target that forwards flags would fail on an unrelated crate.
-CRITERION_BENCHES := ironfix-tagvalue:tagvalue ironfix-fast:fast ironfix-transport:framing ironfix-store:file_store
+CRITERION_BENCHES := ironfix-tagvalue:tagvalue ironfix-fast:fast ironfix-transport:framing \
+	ironfix-sofh:sofh_codec ironfix-store:file_store
 
 # Arguments forwarded to the criterion harness. Set by the wrapper targets
 # below; override directly for anything criterion accepts, for example:

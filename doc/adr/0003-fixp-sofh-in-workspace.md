@@ -70,3 +70,12 @@ decision and pinned to a compatible 0.7 range when `ironfix-fixp` lands.
 - Follow-up issues: #94 (`ironfix-sofh`), #95 (`ironfix-fixp` session core,
   recoverable and idempotent flows), #96 (FIXP over SOFH in `ironfix-engine`
   behind the `fixp` feature), #97 (FIXP/SOFH conformance suite).
+- **`ironfix-sofh` exists** (#94). It implements SOFH v1.0, the Draft
+  Standard of December 2016: `SofhHeader`, the registered `EncodingType`
+  values (an unregistered value is preserved, not rejected), and `SofhCodec`,
+  a `tokio-util` codec with a `Message_Length` ceiling whose every error is
+  fatal for the stream, since SOFH has no resynchronisation anchor. It
+  depends on `ironfix-core` only, joins the lockstep version, and is
+  published right after `ironfix-core`; it enters the `semver.yml` matrix
+  after its first publish. Nothing composes it yet: `ironfix-fixp` (#95) and
+  the engine wiring (#96) do not exist.

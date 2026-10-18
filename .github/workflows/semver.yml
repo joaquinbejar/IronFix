@@ -37,6 +37,10 @@ jobs:
   #
   # ironfix-codegen-check is absent by policy: it is `publish = false`, a CI
   # check that compiles generated code, with no public surface to gate.
+  #
+  # ironfix-sofh is absent until its first publish: cargo-semver-checks
+  # compares against the version on crates.io, and there is none yet. Add it
+  # here once `make publish-all` has released it (ADR-0003).
   semver:
     name: semver (${{ matrix.package }})
     runs-on: ubuntu-latest

@@ -8,6 +8,7 @@ members = [
     "ironfix-session",
     "ironfix-store",
     "ironfix-transport",
+    "ironfix-sofh",
     "ironfix-fast",
     "ironfix-codegen",
     "ironfix-codegen-check",
@@ -33,6 +34,7 @@ ironfix-tagvalue = { path = "ironfix-tagvalue", version = "0.4" }
 ironfix-session = { path = "ironfix-session", version = "0.4" }
 ironfix-store = { path = "ironfix-store", version = "0.4" }
 ironfix-transport = { path = "ironfix-transport", version = "0.4" }
+ironfix-sofh = { path = "ironfix-sofh", version = "0.4" }
 ironfix-fast = { path = "ironfix-fast", version = "0.4" }
 ironfix-codegen = { path = "ironfix-codegen", version = "0.4" }
 ironfix-derive = { path = "ironfix-derive", version = "0.4" }

@@ -1,0 +1,27 @@
+[package]
+name = "ironfix-sofh"
+description = "Simple Open Framing Header (SOFH) codec for IronFix: frames SBE and other encodings on a byte stream"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+# Framing never interprets the payload, so there is deliberately no SBE codec
+# here. ironfix-core is declared per ADR-0003 (`sofh -> core`) and is unused
+# today: no ironfix-core item appears in this crate's code yet.
+[dependencies]
+ironfix-core.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "sofh_codec"
+harness = false
