@@ -59,9 +59,11 @@
 //!   [`ironfix_store::MemoryStore`] with [`Initiator::with_store`],
 //!   [`Acceptor::with_store`] or [`EngineBuilder::with_store`] enables
 //!   resend-from-store replay and seeds each session's counters in both roles,
-//!   but there is no persistent implementation yet. The acceptor touches its
-//!   store only once the Logon is authenticated. Store
-//!   writes are ordered and fallible, and [`StoreFailurePolicy`] decides
+//!   but there is no persistent implementation yet. A store belongs to
+//!   exactly one engine. The acceptor touches its store only once the peer is
+//!   known to be the counterparty, and resets it only for a Logon that passes
+//!   every check. Store writes are ordered and fallible, and
+//!   [`StoreFailurePolicy`] decides
 //!   whether a failed one is tolerated or closes the session (see
 //!   [`persistence`]). Inbound application messages are delivered at most
 //!   once: a crash, or a close whose application queue does not drain in

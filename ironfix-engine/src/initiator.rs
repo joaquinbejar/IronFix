@@ -157,8 +157,7 @@ use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
 use crate::persistence::{
-    HandshakeStore, PersistedCounters, SeedPlan, Seeded, SessionStore, StoreFailurePolicy,
-    seed_session,
+    PersistedCounters, SeedPlan, Seeded, StoreAttachment, StoreFailurePolicy, seed_session,
 };
 use crate::reactor::{
     DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, HandshakeRead,
@@ -175,7 +174,6 @@ use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResu
 use ironfix_session::{Disconnected, HeartbeatManager, Session, SessionConfig};
 use ironfix_store::MessageStore;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -211,16 +209,10 @@ pub struct Initiator<A: Application = NoOpApplication> {
     outbound_capacity: usize,
     /// Capacity of the inbound application queue.
     app_queue_capacity: usize,
-    /// Optional message store: outbound frames are filed here and replayed
-    /// from here when the counterparty asks for a resend.
-    store: Option<Arc<dyn MessageStore>>,
-    /// What a failed write to `store` means.
-    store_policy: StoreFailurePolicy,
-    /// Bound on each store call, or `None` for the write timeout.
-    store_timeout: Option<Duration>,
-    /// Set when a session's close-time store reset failed: the next
-    /// [`Initiator::connect`] must reset the store before anything else.
-    reset_owed: Arc<AtomicBool>,
+    /// The optional message store, its failure policy, its call timeout and
+    /// the owed-reset record: outbound frames are filed in the store and
+    /// replayed from it when the counterparty asks for a resend.
+    store: StoreAttachment,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
@@ -236,13 +228,8 @@ impl<A: Application> std::fmt::Debug for Initiator<A> {
             .field("initial_sequences", &self.initial_sequences)
             .field("outbound_capacity", &self.outbound_capacity)
             .field("app_queue_capacity", &self.app_queue_capacity)
-            .field("store", &self.store.is_some())
-            .field("store_policy", &self.store_policy)
-            .field(
-                "store_timeout",
-                &self.store_timeout.unwrap_or(self.write_timeout),
-            )
-            .field("reset_owed", &self.reset_owed.load(Ordering::Acquire))
+            .field("store", &self.store)
+            .field("store_timeout", &self.store.timeout(self.write_timeout))
             .finish_non_exhaustive()
     }
 }
@@ -285,10 +272,7 @@ impl<A: Application + 'static> Initiator<A> {
             initial_sequences: None,
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
             app_queue_capacity: DEFAULT_APP_QUEUE_CAPACITY,
-            store: None,
-            store_policy: StoreFailurePolicy::Continue,
-            store_timeout: None,
-            reset_owed: Arc::new(AtomicBool::new(false)),
+            store: StoreAttachment::default(),
         }
     }
 
@@ -314,13 +298,20 @@ impl<A: Application + 'static> Initiator<A> {
     /// [`MemoryStore`](ironfix_store::MemoryStore) is the only implementation
     /// today and is **not** persistent, so this does not yet survive a restart.
     ///
+    /// **One store, one engine.** The store must belong to this initiator
+    /// alone: two engines, or two processes, writing to one store would
+    /// interleave two sequence streams in it. The record of a reset owed to the
+    /// next session is held in memory by the initiator, not in the store, so a
+    /// restart forgets it (#78, #89). Call [`Initiator::connect`] again only
+    /// once the previous session's [`Connection::wait_closed`] has returned.
+    ///
     /// A failed write to the store is handled by
     /// [`Initiator::with_store_failure_policy`]; the default carries on with a
     /// warning. Every store call is bounded by
     /// [`Initiator::with_store_timeout`].
     #[must_use]
     pub fn with_store(mut self, store: Arc<dyn MessageStore>) -> Self {
-        self.store = Some(store);
+        self.store.attach(store);
         self
     }
 
@@ -338,7 +329,7 @@ impl<A: Application + 'static> Initiator<A> {
     /// * `policy` - The policy for store write failures
     #[must_use]
     pub const fn with_store_failure_policy(mut self, policy: StoreFailurePolicy) -> Self {
-        self.store_policy = policy;
+        self.store.set_policy(policy);
         self
     }
 
@@ -369,15 +360,8 @@ impl<A: Application + 'static> Initiator<A> {
     /// * `timeout` - Maximum duration of one store call
     #[must_use]
     pub fn with_store_timeout(mut self, timeout: Duration) -> Self {
-        self.store_timeout = Some(timeout.max(TICK_INTERVAL));
+        self.store.set_timeout(timeout.max(TICK_INTERVAL));
         self
-    }
-
-    /// The bound on one store call: the configured store timeout, or the
-    /// write timeout when none was set.
-    #[must_use]
-    fn store_timeout(&self) -> Duration {
-        self.store_timeout.unwrap_or(self.write_timeout)
     }
 
     /// Sets the TCP connect timeout (default 30s).
@@ -469,13 +453,6 @@ impl<A: Application + 'static> Initiator<A> {
         self
     }
 
-    /// Whether an earlier session of this `Initiator` left a store reset owed
-    /// (see the [`persistence`](crate::persistence) module).
-    #[must_use]
-    fn reset_is_owed(&self) -> bool {
-        self.store.is_some() && self.reset_owed.load(Ordering::Acquire)
-    }
-
     /// How this connect decides its starting sequence numbers (see
     /// [`seed_session`]).
     ///
@@ -488,14 +465,12 @@ impl<A: Application + 'static> Initiator<A> {
     /// owes the reset.
     #[must_use]
     fn seed_plan(&self, reset: bool) -> SeedPlan<'_> {
-        SeedPlan {
-            session_id: &self.session_id,
-            store: self.store.as_deref(),
-            policy: self.store_policy,
-            timeout: self.store_timeout(),
+        self.store.seed_plan(
+            &self.session_id,
             reset,
-            initial: self.initial_sequences,
-        }
+            self.initial_sequences,
+            self.write_timeout,
+        )
     }
 
     /// Returns the session configuration.
@@ -582,11 +557,11 @@ impl<A: Application + 'static> Initiator<A> {
         // rejects. The seed is ignored entirely when the Logon declares a reset
         // (reset_on_logon, or a reset owed by an earlier session), so a zero
         // is only refused when it would actually be used. The validated seed
-        // is applied by `seed_sequences`, which reads the same fields; this is
+        // is applied by `seed_session`, which reads the same fields; this is
         // only the guard.
         if let Some((sender, target)) = self.initial_sequences
             && !self.config.reset_on_logon
-            && !self.reset_is_owed()
+            && !self.store.reset_is_owed()
         {
             NonZeroU64::new(sender).ok_or(EngineError::InvalidInitialSequence {
                 counter: SequenceCounter::Sender,
@@ -621,12 +596,12 @@ impl<A: Application + 'static> Initiator<A> {
         // the session unable to vouch for its own counters, so it is refused
         // here rather than started from a number that could collide with a
         // stream still on file.
-        let reset_logon = self.config.reset_on_logon || self.reset_is_owed();
-        if reset_logon && self.store.is_some() {
+        let reset_logon = self.config.reset_on_logon || self.store.reset_is_owed();
+        if reset_logon && self.store.store().is_some() {
             // Owed from before the reset until the Logon declaring it is
             // acknowledged: a connect dropped while the reset is pending leaves
             // it owed, and so does one that fails later.
-            self.reset_owed.store(true, Ordering::Release);
+            self.store.owe_reset();
         }
         let Seeded {
             sequences,
@@ -646,13 +621,10 @@ impl<A: Application + 'static> Initiator<A> {
         let identity = PeerIdentity::new(&self.config);
         let sending_time = SendingTimeGuard::new(&self.config);
         let write_timeout = self.write_timeout;
-        let store_timeout = self.store_timeout();
+        let store_timeout = self.store.timeout(write_timeout);
         // Every handshake write goes through this binding, which also records
         // the counter values written, for the reactor to start from.
-        let mut store = self.store.as_deref().map(|store| HandshakeStore {
-            store: SessionStore::new(store, self.store_policy, store_timeout, &self.reset_owed),
-            persisted,
-        });
+        let mut store = self.store.handshake(persisted, write_timeout);
 
         // Typestate: Connecting -> LogonSent.
         //
@@ -952,12 +924,12 @@ impl<A: Application + 'static> Initiator<A> {
                     // succeeded: a caller that drops this connect while the
                     // reset is pending runs no error branch, and the next
                     // connect must still make the reset and declare it.
-                    self.reset_owed.store(true, Ordering::Release);
+                    self.store.owe_reset();
                     if let Err(err) = handshake.reset_to(&session_id, 2, 2).await {
                         let _ = session.on_logon_reject();
                         return Err(err.into());
                     }
-                    self.reset_owed.store(false, Ordering::Release);
+                    self.store.reset_paid();
                 }
                 runtime.sequences.set_target_seq(1);
                 // The Logon already on the wire is message 1 of the reset
@@ -966,13 +938,25 @@ impl<A: Application + 'static> Initiator<A> {
                 runtime.sequences.set_sender_seq(2);
             }
 
-            match runtime.sequences.validate_incoming(ack_seq) {
+            // The reset rule both roles share: in a Logon exchange that resets
+            // the sequence, each side's Logon or acknowledgement is message 1
+            // of its new stream. A reset this side declared therefore takes the
+            // ack as the counterparty's message 1 whatever MsgSeqNum it carries,
+            // and expects 2 next; an ack that declares a reset itself was held
+            // to 34=1 above.
+            let validation = if reset_logon {
+                SequenceResult::Ok
+            } else {
+                runtime.sequences.validate_incoming(ack_seq)
+            };
+            match validation {
                 SequenceResult::Ok => {
                     // The receive cursor includes the ack before the session
                     // goes Active on it and before the in-memory expectation
                     // moves, as for every later inbound message.
                     if let Some(handshake) = store.as_mut() {
-                        let Some(next) = ack_seq.checked_add(1) else {
+                        let expected = runtime.sequences.next_target_seq().value();
+                        let Some(next) = expected.checked_add(1) else {
                             let _ = session.on_logon_reject();
                             return Err(SequenceExhausted {
                                 counter: SequenceCounter::Target,
@@ -1004,7 +988,7 @@ impl<A: Application + 'static> Initiator<A> {
         // The Logon that declared the reset has been acknowledged: no reset is
         // owed any more.
         if reset_logon {
-            self.reset_owed.store(false, Ordering::Release);
+            self.store.reset_paid();
         }
 
         // Typestate: LogonSent -> Active.
@@ -1028,12 +1012,12 @@ impl<A: Application + 'static> Initiator<A> {
             config: self.config.clone(),
             application: Arc::clone(&self.application),
             session_id: session_id.clone(),
-            store: self.store.clone(),
-            store_policy: self.store_policy,
+            store: self.store.store().cloned(),
+            store_policy: self.store.policy(),
             store_timeout,
             persisted: store
                 .map_or_else(PersistedCounters::default, |handshake| handshake.persisted),
-            reset_owed: Arc::clone(&self.reset_owed),
+            reset_owed: self.store.owed_record(),
             opening_gap: pending_resend,
             write_timeout,
             outbound_capacity: self.outbound_capacity,

@@ -105,15 +105,16 @@
 //! acknowledged.
 //!
 //! The [`Acceptor`](crate::Acceptor) keeps the same record: a failed
-//! close-time reset, or a failed reset for a Logon carrying `ResetSeqNumFlag`,
-//! is owed to its next authenticated Logon, whose acknowledgement then
-//! declares the reset at 1; the record is cleared once that acknowledgement
-//! is sent. The acceptor's resets, like its refresh, come only after the
-//! Logon is authenticated, so an unauthenticated Logon cannot clear the store.
+//! close-time reset, or a failed reset for a session that resets, is owed to
+//! its next accepted Logon, whose acknowledgement then declares the reset at
+//! 1; the record is cleared once that acknowledgement is sent. The acceptor
+//! resets its store only for a Logon that passes every check, so a refused
+//! Logon cannot clear it, whatever it declares.
 //!
-//! The record lives in the engine, not in the store: a process restart
-//! forgets it, and the next session starts from the counters the store still
-//! holds.
+//! The record lives in the engine, in memory, not in the store: a process
+//! restart forgets it, and the next session starts from the counters the store
+//! still holds. For the same reason a store must belong to exactly one engine
+//! instance.
 //!
 //! The default [`MessageStore::reset_to`] is three calls, not one atomic
 //! write: a crash between them leaves the store cleared with its initial
@@ -153,6 +154,7 @@ use ironfix_session::SequenceManager;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_store::MessageStore;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -461,6 +463,153 @@ impl<'s> SessionStore<'s> {
     }
 }
 
+/// A store attached to an engine, with its failure policy, the bound on each
+/// call and the owed-reset record.
+///
+/// Both engines hold one, so the store settings and the inputs to
+/// [`seed_session`] cannot drift between the roles. The owed-reset record is in
+/// memory only: a process restart forgets it (see the module documentation).
+#[derive(Default)]
+pub(crate) struct StoreAttachment {
+    /// The attached store, if any.
+    store: Option<Arc<dyn MessageStore>>,
+    /// What a failed write to `store` means.
+    policy: StoreFailurePolicy,
+    /// Bound on each store call, or `None` for the engine's write timeout.
+    timeout: Option<Duration>,
+    /// Set when a reset could not be made; the next session makes it first.
+    reset_owed: Arc<AtomicBool>,
+}
+
+/// Written by hand rather than derived: `dyn MessageStore` is not `Debug`.
+impl std::fmt::Debug for StoreAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreAttachment")
+            .field("store", &self.store.is_some())
+            .field("policy", &self.policy)
+            .field("timeout", &self.timeout)
+            .field("reset_owed", &self.reset_is_owed())
+            .finish()
+    }
+}
+
+impl StoreAttachment {
+    /// Attaches `store`.
+    pub(crate) fn attach(&mut self, store: Arc<dyn MessageStore>) {
+        self.store = Some(store);
+    }
+
+    /// Sets the store failure policy.
+    pub(crate) const fn set_policy(&mut self, policy: StoreFailurePolicy) {
+        self.policy = policy;
+    }
+
+    /// Sets the bound on each store call.
+    pub(crate) const fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = Some(timeout);
+    }
+
+    /// The attached store, if any.
+    #[must_use]
+    pub(crate) const fn store(&self) -> Option<&Arc<dyn MessageStore>> {
+        self.store.as_ref()
+    }
+
+    /// The store failure policy.
+    #[must_use]
+    pub(crate) const fn policy(&self) -> StoreFailurePolicy {
+        self.policy
+    }
+
+    /// The bound on one store call: the configured one, or `write_timeout`
+    /// when none was set.
+    #[must_use]
+    pub(crate) fn timeout(&self, write_timeout: Duration) -> Duration {
+        self.timeout.unwrap_or(write_timeout)
+    }
+
+    /// Whether a store is attached and an earlier session left a reset owed.
+    #[must_use]
+    pub(crate) fn reset_is_owed(&self) -> bool {
+        self.store.is_some() && self.reset_owed.load(Ordering::Acquire)
+    }
+
+    /// Records that a reset could not be made and is owed to the next
+    /// session.
+    pub(crate) fn owe_reset(&self) {
+        self.reset_owed.store(true, Ordering::Release);
+    }
+
+    /// Records that the owed reset has been made and declared to the
+    /// counterparty.
+    pub(crate) fn reset_paid(&self) {
+        self.reset_owed.store(false, Ordering::Release);
+    }
+
+    /// The owed-reset record, shared with a session's reactor so its
+    /// close-time reset can owe one.
+    #[must_use]
+    pub(crate) fn owed_record(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.reset_owed)
+    }
+
+    /// The inputs to [`seed_session`] for a session of this engine.
+    #[must_use]
+    pub(crate) fn seed_plan<'a>(
+        &'a self,
+        session_id: &'a SessionId,
+        reset: bool,
+        initial: Option<(u64, u64)>,
+        write_timeout: Duration,
+    ) -> SeedPlan<'a> {
+        SeedPlan {
+            session_id,
+            store: self.store.as_deref(),
+            policy: self.policy,
+            timeout: self.timeout(write_timeout),
+            reset,
+            initial,
+        }
+    }
+
+    /// The binding a Logon handshake writes through, starting from the
+    /// counter values `persisted` records, or `None` without a store.
+    #[must_use]
+    pub(crate) fn handshake(
+        &self,
+        persisted: PersistedCounters,
+        write_timeout: Duration,
+    ) -> Option<HandshakeStore<'_>> {
+        self.store.as_deref().map(|store| HandshakeStore {
+            store: SessionStore::new(
+                store,
+                self.policy,
+                self.timeout(write_timeout),
+                &self.reset_owed,
+            ),
+            persisted,
+        })
+    }
+}
+
+/// The counters an explicit initial seed starts a session from.
+///
+/// # Errors
+/// [`EngineError::InvalidInitialSequence`] for a zero seed: FIX numbers
+/// messages from 1, and a `MsgSeqNum` (34) of 0 is rejected by every
+/// conforming counterparty. Refused rather than raised to 1, in both roles.
+pub(crate) fn seeded_counters(
+    (sender, target): (u64, u64),
+) -> Result<SequenceManager, EngineError> {
+    let sender = NonZeroU64::new(sender).ok_or(EngineError::InvalidInitialSequence {
+        counter: SequenceCounter::Sender,
+    })?;
+    let target = NonZeroU64::new(target).ok_or(EngineError::InvalidInitialSequence {
+        counter: SequenceCounter::Target,
+    })?;
+    Ok(SequenceManager::with_initial(sender, target))
+}
+
 /// The store binding a Logon handshake writes through, with the counter values
 /// it wrote.
 ///
@@ -569,6 +718,7 @@ pub(crate) struct SeedPlan<'a> {
 /// `MsgSeqNum` the counterparty has already seen.
 /// [`EngineError::InitialSequenceBelowStore`] for a sender seed below the
 /// store's next sender number under [`StoreFailurePolicy::CloseSession`].
+/// [`EngineError::InvalidInitialSequence`] for a zero seed (case 2).
 pub(crate) async fn seed_session(plan: SeedPlan<'_>) -> Result<Seeded, EngineError> {
     let SeedPlan {
         session_id,
@@ -601,7 +751,9 @@ pub(crate) async fn seed_session(plan: SeedPlan<'_>) -> Result<Seeded, EngineErr
         });
     }
 
-    if let Some((sender, target)) = initial {
+    if let Some(initial) = initial {
+        let sequences = seeded_counters(initial)?;
+        let (sender, _) = initial;
         if let Some(store) = store
             && policy.closes_session()
         {
@@ -621,13 +773,8 @@ pub(crate) async fn seed_session(plan: SeedPlan<'_>) -> Result<Seeded, EngineErr
                 });
             }
         }
-        // MsgSeqNum starts at 1, so a zero seed is floored rather than number
-        // a message 0 (the initiator refuses one before dialling).
         return Ok(Seeded {
-            sequences: SequenceManager::with_initial(
-                NonZeroU64::new(sender).unwrap_or(NonZeroU64::MIN),
-                NonZeroU64::new(target).unwrap_or(NonZeroU64::MIN),
-            ),
+            sequences,
             persisted,
         });
     }

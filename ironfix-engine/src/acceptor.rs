@@ -34,24 +34,35 @@
 //! checked and the single admission slot is claimed — a second concurrent Logon
 //! for the same counterparty is refused rather than allowed to fork the session;
 //! then `SendingTime` (52) accuracy and the `from_admin` authentication hook;
-//! then `ResetSeqNumFlag` (141) is checked against the Logon's `MsgSeqNum` and
-//! reconciled with the local `reset_on_logon` knob (an attached store is
-//! first touched here, see below); then the `HeartBtInt` (108) the initiator
-//! requested is bounded, honored, and echoed; and finally `MsgSeqNum` is
-//! validated and the ack, mirroring 141, is sent. A failure at any step sends a
-//! session Reject (reason 9 for identity, the `SendingTime` reason for a clock
-//! problem) and/or a Logout (unless a store is attached and the Logon is not yet
-//! authenticated), drives the typestate to `reject_logon`, and drops the
-//! connection without ever reaching Active. Waiting for the inbound Logon is
-//! bounded by
-//! [`SessionConfig::logon_timeout`]; a garbled frame that arrives first (a bad
-//! CheckSum or BodyLength, bytes before `8=`, or a frame whose MsgType (35) is
-//! not third) is skipped and the wait goes on against the same timeout. So is
-//! a frame whose header decodes but whose body does not: it is not garbled,
-//! but it cannot be read as a Logon either. A Logon that never arrives intact
-//! ends in [`EngineError::LogonTimeout`].
-//! A gap in the Logon completes the handshake and immediately issues a
-//! `ResendRequest` (2).
+//! then a `ResetSeqNumFlag` (141) Logon must carry `MsgSeqNum` 1; then the
+//! `HeartBtInt` (108) the initiator requested is bounded; only then is an
+//! attached store reset (for 141, the local `reset_on_logon`, or an owed
+//! reset) or refreshed; and finally `MsgSeqNum` is validated and the ack,
+//! mirroring 141 and echoing 108, is sent. Waiting for the inbound Logon is
+//! bounded by [`SessionConfig::logon_timeout`]; a garbled frame that arrives
+//! first (a bad CheckSum or BodyLength, bytes before `8=`, or a frame whose
+//! MsgType (35) is not third) is skipped and the wait goes on against the same
+//! timeout. So is a frame whose header decodes but whose body does not: it is
+//! not garbled, but it cannot be read as a Logon either. A Logon that never
+//! arrives intact ends in [`EngineError::LogonTimeout`]. A gap in the Logon
+//! completes the handshake and immediately issues a `ResendRequest` (2).
+//!
+//! A refused Logon drives the typestate to `reject_logon` and the connection
+//! is dropped without reaching Active. What the peer is sent first depends on
+//! who it is:
+//!
+//! - **An unknown peer** (wrong version or encryption, no `MsgSeqNum` in the
+//!   header, wrong CompIDs): with a store attached, nothing; without one, a
+//!   Reject (reason 9 for identity) and/or a Logout as before, except for a
+//!   missing `MsgSeqNum`, which has no reply in either mode.
+//! - **A duplicate Logon** for a session already live: nothing, in either
+//!   mode. The live session owns the sequence stream.
+//! - **The configured counterparty**, which holds the admission slot (refused
+//!   by `SendingTime` with reason 10, by `from_admin`, by a 141 Logon not
+//!   numbered 1, by its `HeartBtInt`, or by a `MsgSeqNum` too low): a Reject
+//!   and/or a Logout carrying the reason, sent like every session frame,
+//!   numbered from the store's refreshed counters (or the seed) and filed when
+//!   a store is attached. Such a refusal never resets the store.
 //!
 //! `HeartBtInt` (108) is counterparty-controlled and drives a `Duration` on the
 //! heartbeat clock, so it is bounded at the handshake: a value large enough to
@@ -60,6 +71,13 @@
 //! acceptor resets when the peer asks *or* when it is locally configured to, and
 //! whichever drives the reset the ack carries `141=Y` so the peer resets in
 //! lockstep instead of silently desyncing.
+//!
+//! The reset rule is the one both roles share: in a Logon exchange that resets
+//! the sequence, each side's Logon or acknowledgement is message 1 of its new
+//! stream. After a reset the acceptor's ack goes out at 1 and 2 is expected
+//! next from the peer, whatever `MsgSeqNum` its Logon carried: a peer that did
+//! not ask for the reset is told to make it by the ack's `141=Y`, and no gap is
+//! opened for the numbers of its old stream.
 //!
 //! Every handshake frame goes through the same peek-then-spend path the reactor
 //! uses (`send_handshake_admin`): the `to_admin` callback runs
@@ -84,18 +102,14 @@
 //! [`persistence`](crate::persistence) module for the write order and
 //! [`StoreFailurePolicy`] for what a failed write means.
 //!
-//! **Nothing touches the store before the Logon is authenticated.** The
-//! version, encryption, identity, admission, `SendingTime` and `from_admin`
-//! checks all come first, so an unauthenticated Logon, `141=Y` or not, can
-//! neither reset the outbound journal nor write to it. With a store attached a
-//! Logon refused by one of those checks gets no Reject and no Logout: a frame
-//! sent then could not be filed without letting an unauthenticated peer write
-//! to the journal, nor numbered without reusing a number the session's stream
-//! already holds. Without a store those refusals are sent as before. From
-//! authentication on, every frame the handshake sends is filed.
+//! **Nothing reaches the store before the peer is known.** The version,
+//! encryption, identity and admission checks come first, so an unknown peer or
+//! a duplicate Logon never touches the store. A refusal of the configured
+//! counterparty after that is numbered from a refresh of the store and filed,
+//! and only a Logon that passes every check can reset the store, so a refused
+//! `141=Y` Logon cannot clear the outbound journal.
 //!
-//! All
-//! sequence arithmetic goes through the checked
+//! All sequence arithmetic goes through the checked
 //! [`SequenceManager::try_allocate_sender_seq`](ironfix_session::SequenceManager::try_allocate_sender_seq) /
 //! [`SequenceManager::try_increment_target_seq`](ironfix_session::SequenceManager::try_increment_target_seq);
 //! an exhausted counter refuses the session rather than wrapping.
@@ -136,8 +150,8 @@ use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
 use crate::persistence::{
-    HandshakeStore, PersistedCounters, SeedPlan, Seeded, SessionStore, StoreFailurePolicy,
-    seed_session,
+    PersistedCounters, SeedPlan, Seeded, StoreAttachment, StoreFailurePolicy, seed_session,
+    seeded_counters,
 };
 use crate::reactor::{
     DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, FixFramed,
@@ -154,8 +168,6 @@ use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResu
 use ironfix_session::{Disconnected, HeartbeatManager, SequenceManager, Session, SessionConfig};
 use ironfix_store::MessageStore;
 use std::collections::HashSet;
-use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -213,8 +225,8 @@ pub struct Acceptor<A: Application = NoOpApplication> {
     /// at construction and reported before the handshake begins.
     version: Result<FixVersion, UnsupportedVersion>,
     /// Whether the configuration is usable. Resolved once at construction and
-    /// reported by [`Acceptor::serve`] before the handshake, so a knob that
-    /// would corrupt the session's own messages never reaches a socket.
+    /// reported before a connection is taken or a handshake run, so a knob
+    /// that would corrupt the session's own messages never reaches a socket.
     config_check: Result<(), SessionConfigError>,
     /// Initial (sender, target) sequence numbers for session continuity.
     initial_sequences: Option<(u64, u64)>,
@@ -224,17 +236,10 @@ pub struct Acceptor<A: Application = NoOpApplication> {
     write_timeout: Duration,
     /// Capacity of each session's inbound application queue.
     app_queue_capacity: usize,
-    /// Optional message store: outbound frames are filed here and replayed
-    /// from here when the counterparty asks for a resend. Shared by every
-    /// session this acceptor admits, one at a time.
-    store: Option<Arc<dyn MessageStore>>,
-    /// What a failed write to `store` means.
-    store_policy: StoreFailurePolicy,
-    /// Bound on each store call, or `None` for the write timeout.
-    store_timeout: Option<Duration>,
-    /// Set when a session's store reset failed: the next authenticated Logon
-    /// resets the store before anything else.
-    reset_owed: Arc<AtomicBool>,
+    /// The optional message store, its failure policy, its call timeout and
+    /// the owed-reset record, shared by every session this acceptor admits,
+    /// one at a time.
+    store: StoreAttachment,
     /// Sessions currently live on this acceptor, one entry per admitted
     /// counterparty. Shared across every [`Acceptor::serve`] call so a second
     /// concurrent Logon for a session already established is refused rather than
@@ -255,13 +260,8 @@ impl<A: Application> std::fmt::Debug for Acceptor<A> {
             .field("outbound_capacity", &self.outbound_capacity)
             .field("write_timeout", &self.write_timeout)
             .field("app_queue_capacity", &self.app_queue_capacity)
-            .field("store", &self.store.is_some())
-            .field("store_policy", &self.store_policy)
-            .field(
-                "store_timeout",
-                &self.store_timeout.unwrap_or(self.write_timeout),
-            )
-            .field("reset_owed", &self.reset_owed.load(Ordering::Acquire))
+            .field("store", &self.store)
+            .field("store_timeout", &self.store.timeout(self.write_timeout))
             .finish_non_exhaustive()
     }
 }
@@ -270,9 +270,10 @@ impl<A: Application + 'static> Acceptor<A> {
     /// Creates a new acceptor.
     ///
     /// The configuration is validated here and the verdict is reported by
-    /// [`Acceptor::serve`], which refuses to run a handshake with an unusable
-    /// one. Building it through [`ironfix_session::SessionConfigBuilder`]
-    /// surfaces the same errors earlier.
+    /// [`Acceptor::accept`] and [`Acceptor::serve`], which refuse to take a
+    /// connection or run a handshake with an unusable one. Building it through
+    /// [`ironfix_session::SessionConfigBuilder`] surfaces the same errors
+    /// earlier.
     ///
     /// # Arguments
     /// * `config` - The session configuration (sender = this acceptor's CompID,
@@ -294,10 +295,7 @@ impl<A: Application + 'static> Acceptor<A> {
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             app_queue_capacity: DEFAULT_APP_QUEUE_CAPACITY,
-            store: None,
-            store_policy: StoreFailurePolicy::Continue,
-            store_timeout: None,
-            reset_owed: Arc::new(AtomicBool::new(false)),
+            store: StoreAttachment::default(),
             admitted: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -341,13 +339,27 @@ impl<A: Application + 'static> Acceptor<A> {
     /// implementation today and is **not** persistent, so this does not yet
     /// survive a restart.
     ///
-    /// Nothing touches the store before the Logon is authenticated: the
-    /// identity, admission, `SendingTime` and `from_admin` checks come first,
-    /// so a Logon that fails them cannot reset the store or write to it. With
-    /// a store attached such a Logon is refused without a reply (see
-    /// [`Acceptor::serve`]). The admission slot is held until a session's close
-    /// path, its store writes included, has finished, so two sessions never
-    /// write to the store at once.
+    /// **One store, one engine.** The store must belong to this acceptor alone:
+    /// two engines, or two processes, writing to one store would interleave two
+    /// sequence streams in it. The record of a reset owed to the next session
+    /// is held in memory by the acceptor, not in the store, so a restart
+    /// forgets it (#78, #89).
+    ///
+    /// **Nothing reaches the store before the Logon is authenticated.** A Logon
+    /// from an unknown peer (wrong version, encryption, `MsgSeqNum` placement or
+    /// CompIDs) or for a session already live is refused before the store is
+    /// touched. A Logon from the configured counterparty refused afterwards (by
+    /// the `SendingTime` check, `from_admin`, or a malformed `ResetSeqNumFlag`
+    /// or `HeartBtInt`) is answered with a filed Reject and/or Logout, numbered
+    /// from the store's counters, and never resets the store; see
+    /// [`Acceptor::serve`].
+    ///
+    /// **One session at a time.** The admission slot is held until a session's
+    /// task has ended: past its close-time store writes, the drain of its
+    /// application queue (up to 5 s) and `on_logout`. Two sessions therefore
+    /// never write to the store at once, and a Logon that arrives while the
+    /// previous session is still closing is refused as a duplicate, without a
+    /// reply.
     ///
     /// A failed write to the store is handled by
     /// [`Acceptor::with_store_failure_policy`]; the default carries on with a
@@ -355,7 +367,7 @@ impl<A: Application + 'static> Acceptor<A> {
     /// [`Acceptor::with_store_timeout`].
     #[must_use]
     pub fn with_store(mut self, store: Arc<dyn MessageStore>) -> Self {
-        self.store = Some(store);
+        self.store.attach(store);
         self
     }
 
@@ -373,7 +385,7 @@ impl<A: Application + 'static> Acceptor<A> {
     /// * `policy` - The policy for store write failures
     #[must_use]
     pub const fn with_store_failure_policy(mut self, policy: StoreFailurePolicy) -> Self {
-        self.store_policy = policy;
+        self.store.set_policy(policy);
         self
     }
 
@@ -397,15 +409,8 @@ impl<A: Application + 'static> Acceptor<A> {
     /// * `timeout` - Maximum duration of one store call
     #[must_use]
     pub fn with_store_timeout(mut self, timeout: Duration) -> Self {
-        self.store_timeout = Some(timeout.max(TICK_INTERVAL));
+        self.store.set_timeout(timeout.max(TICK_INTERVAL));
         self
-    }
-
-    /// The bound on one store call: the configured store timeout, or the
-    /// write timeout when none was set.
-    #[must_use]
-    fn store_timeout(&self) -> Duration {
-        self.store_timeout.unwrap_or(self.write_timeout)
     }
 
     /// Sets how long a single socket write may take before the session is
@@ -457,6 +462,11 @@ impl<A: Application + 'static> Acceptor<A> {
     /// new stream: the inbound Logon carries `ResetSeqNumFlag` (141) = Y,
     /// `reset_on_logon` is set, or a store reset is owed.
     ///
+    /// Both values must be at least 1: FIX numbers messages from 1. A zero
+    /// seed that would actually be used makes [`Acceptor::serve`] fail with
+    /// [`EngineError::InvalidInitialSequence`] once the Logon is
+    /// authenticated (it used to be raised to 1 silently).
+    ///
     /// The seed outranks the counters an attached store reports. Under
     /// [`StoreFailurePolicy::CloseSession`], though, a sender seed below the
     /// store's next sender number is refused with
@@ -464,8 +474,8 @@ impl<A: Application + 'static> Acceptor<A> {
     /// at those numbers, so the counterparty has seen them.
     ///
     /// # Arguments
-    /// * `sender_seq` - Next outgoing sequence number
-    /// * `target_seq` - Next expected incoming sequence number
+    /// * `sender_seq` - Next outgoing sequence number, `>= 1`
+    /// * `target_seq` - Next expected incoming sequence number, `>= 1`
     #[must_use]
     pub fn with_initial_sequences(mut self, sender_seq: u64, target_seq: u64) -> Self {
         self.initial_sequences = Some((sender_seq, target_seq));
@@ -492,83 +502,87 @@ impl<A: Application + 'static> Acceptor<A> {
         &self.session_id
     }
 
-    /// Whether an earlier session left a store reset owed (see the
-    /// [`persistence`](crate::persistence) module).
-    #[must_use]
-    fn reset_is_owed(&self) -> bool {
-        self.store.is_some() && self.reset_owed.load(Ordering::Acquire)
-    }
-
-    /// How an authenticated session decides its starting sequence numbers
-    /// (see [`seed_session`]).
-    #[must_use]
-    fn seed_plan(&self, reset: bool) -> SeedPlan<'_> {
-        SeedPlan {
-            session_id: &self.session_id,
-            store: self.store.as_deref(),
-            policy: self.store_policy,
-            timeout: self.store_timeout(),
-            reset,
-            initial: self.initial_sequences,
+    /// The checks that need no connection: a usable configuration and a FIX
+    /// version this engine can frame.
+    ///
+    /// # Errors
+    /// [`EngineError::Config`] for an unusable configuration, and
+    /// [`EngineError::UnsupportedVersion`] for a `BeginString` this engine
+    /// cannot frame conformantly.
+    fn preflight(&self) -> Result<FixVersion, EngineError> {
+        if let Err(err) = &self.config_check {
+            return Err(EngineError::Config(err.clone()));
+        }
+        // An unsupported version cannot produce a conforming Logon reply, and
+        // guessing one would put a fabricated version on the wire.
+        match &self.version {
+            Ok(version) => Ok(*version),
+            Err(err) => Err(EngineError::UnsupportedVersion {
+                version: err.version.clone(),
+                detail: err.detail.clone(),
+            }),
         }
     }
 
-    /// The counters a store-less acceptor numbers its refusal of an
-    /// unauthenticated Logon from: the configured seed, or 1.
+    /// The inputs to [`seed_session`] for a session of this acceptor.
+    #[must_use]
+    fn seed_plan(&self, reset: bool) -> SeedPlan<'_> {
+        self.store.seed_plan(
+            &self.session_id,
+            reset,
+            self.initial_sequences,
+            self.write_timeout,
+        )
+    }
+
+    /// The counters a store-less acceptor numbers its refusal of an unknown
+    /// peer from: the seed [`seed_session`] would use, or 1 (also when the seed
+    /// is zero, which a session refuses once the peer is authenticated).
     #[must_use]
     fn provisional_sequences(&self) -> SequenceManager {
         match self.initial_sequences {
-            Some((sender, target)) if !self.config.reset_on_logon => {
-                // MsgSeqNum starts at 1, so a zero seed is floored to 1 rather
-                // than numbering a message 0 that every counterparty rejects.
-                SequenceManager::with_initial(
-                    NonZeroU64::new(sender).unwrap_or(NonZeroU64::MIN),
-                    NonZeroU64::new(target).unwrap_or(NonZeroU64::MIN),
-                )
+            Some(initial) if !self.config.reset_on_logon => {
+                seeded_counters(initial).unwrap_or_else(|_| SequenceManager::new())
             }
             _ => SequenceManager::new(),
         }
     }
 
-    /// Refuses a Logon that has not been authenticated yet (its version,
-    /// encryption, identity, admission, `SendingTime` or `from_admin` check
-    /// failed).
+    /// Refuses a Logon from a peer not yet known to be the counterparty: its
+    /// version, encryption method or CompIDs are wrong.
     ///
     /// Without a store the refusal frames are sent, numbered from the
     /// provisional counters, as the acceptor always has. With a store attached
-    /// nothing is sent: the peer is not known to be the counterparty, so a
-    /// frame could neither be filed (that would let an unauthenticated peer
-    /// write to the outbound journal and move its counters, and a duplicate
-    /// Logon race the live session's own writes) nor be numbered without
-    /// reusing, with different content, a number the session's stream already
-    /// holds.
-    #[allow(clippy::too_many_arguments)]
-    async fn refuse_unauthenticated<const N: usize>(
+    /// nothing is sent: a frame could neither be filed (that would let an
+    /// unknown peer write to the outbound journal and move its counters) nor
+    /// be numbered without reusing, with different content, a number the
+    /// session's stream already holds.
+    async fn refuse_unknown<const N: usize>(
         &self,
         session_id: &SessionId,
         framed: &mut FixFramed,
         factory: &mut MessageFactory,
-        provisional: &SequenceManager,
         refusal: &str,
         messages: [PendingMessage; N],
     ) {
-        if self.store.is_some() {
+        if self.store.store().is_some() {
             tracing::warn!(
                 session = %session_id,
                 refusal,
-                "refusing an unauthenticated Logon without a reply: with a store attached, \
-                 nothing is written before the Logon is authenticated"
+                "refusing a Logon from an unknown peer without a reply: with a store attached, \
+                 nothing is written before the peer is authenticated"
             );
             return;
         }
         // Without a store nothing is filed, so the only possible failure is
         // the transport's, which `refuse_handshake` logs.
+        let provisional = self.provisional_sequences();
         let _ = refuse_handshake(
             self.application.as_ref(),
             session_id,
             framed,
             factory,
-            provisional,
+            &provisional,
             None,
             self.write_timeout,
             refusal,
@@ -577,21 +591,67 @@ impl<A: Application + 'static> Acceptor<A> {
         .await;
     }
 
+    /// Refuses a Logon from the configured counterparty, which holds the
+    /// admission slot: its `SendingTime`, `from_admin`, `ResetSeqNumFlag` or
+    /// `HeartBtInt` check failed.
+    ///
+    /// The counterparty gets the refusal (the Reject's reason, the Logout's
+    /// text), sent like every frame of the session: numbered from a seed that
+    /// never resets (the store's refreshed counters, or the configured seed),
+    /// and filed before it is written when a store is attached. A refused Logon
+    /// therefore cannot clear the outbound journal, whatever it declares.
+    ///
+    /// # Errors
+    /// The seeding error (a refresh that fails, a zero seed), or the store
+    /// error that stopped the refusal under
+    /// [`StoreFailurePolicy::CloseSession`]; the caller reports it in place of
+    /// the refusal's own.
+    async fn refuse_known<const N: usize>(
+        &self,
+        session_id: &SessionId,
+        framed: &mut FixFramed,
+        factory: &mut MessageFactory,
+        refusal: &str,
+        messages: [PendingMessage; N],
+    ) -> Result<(), EngineError> {
+        let Seeded {
+            sequences,
+            persisted,
+        } = seed_session(self.seed_plan(false)).await?;
+        let mut store = self.store.handshake(persisted, self.write_timeout);
+        refuse_handshake(
+            self.application.as_ref(),
+            session_id,
+            framed,
+            factory,
+            &sequences,
+            store.as_mut(),
+            self.write_timeout,
+            refusal,
+            messages,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Accepts the next inbound connection on `listener` and establishes a
     /// session on it.
     ///
     /// This is a thin convenience over [`Acceptor::serve`]: it awaits one TCP
     /// connection and hands the stream to the handshake. For concurrent
     /// handshakes, run the accept loop yourself and spawn a `serve` per
-    /// connection (see the module example).
+    /// connection (see the module example). An unusable configuration or FIX
+    /// version is reported before a connection is taken off the listener.
     ///
     /// # Arguments
     /// * `listener` - A bound [`TcpListener`]
     ///
     /// # Errors
-    /// Returns [`EngineError::Io`] if the TCP accept fails, or any error
-    /// [`Acceptor::serve`] can produce.
+    /// [`EngineError::Config`] or [`EngineError::UnsupportedVersion`] before
+    /// any connection is taken; [`EngineError::Io`] if the TCP accept fails;
+    /// otherwise any error [`Acceptor::serve`] can produce.
     pub async fn accept(&self, listener: &TcpListener) -> Result<Connection, EngineError> {
+        self.preflight()?;
         let (stream, _addr) = listener.accept().await?;
         self.serve(stream).await
     }
@@ -604,11 +664,28 @@ impl<A: Application + 'static> Acceptor<A> {
     /// socket and handles heartbeats, TestRequests, sequence validation, and
     /// admin replies until the session closes.
     ///
-    /// With a store attached ([`Acceptor::with_store`]), the store is first
-    /// touched once the Logon is authenticated: after the identity, admission,
-    /// `SendingTime` and `from_admin` checks. A Logon refused before that is
-    /// refused without a reply. From then on every frame the handshake sends
-    /// (a refusing Logout, the Logon acknowledgement) is filed, and the Logon's
+    /// A refused Logon is answered according to who sent it:
+    ///
+    /// - **An unknown peer** (a wrong `BeginString` (8) or `EncryptMethod` (98),
+    ///   no `MsgSeqNum` (34) in the standard header, or the wrong CompIDs). With
+    ///   a store attached the connection is closed without a reply; without one
+    ///   a Reject and/or Logout is sent, as before, except for a missing
+    ///   `MsgSeqNum`, which has never had a reply.
+    /// - **A second Logon for a session already live** is closed without a
+    ///   reply, with or without a store: the live session owns the sequence
+    ///   stream, and nothing the newcomer could be sent belongs to it.
+    /// - **The configured counterparty** (it holds the admission slot), refused
+    ///   by the `SendingTime` check (Reject with `SessionRejectReason` (373) =
+    ///   10, then Logout), `from_admin` (Logout with its text), a
+    ///   `ResetSeqNumFlag` (141) Logon not numbered 1, or a missing or out of
+    ///   range `HeartBtInt` (108): the Reject and Logout are sent like every
+    ///   session frame, numbered from the store's refreshed counters (or the
+    ///   seed) and filed when a store is attached. Such a refusal never resets
+    ///   the store. A `MsgSeqNum` below the expected one is refused the same
+    ///   way.
+    ///
+    /// An attached store is touched first once the Logon is authenticated.
+    /// From then on every frame the handshake sends is filed, and the Logon's
     /// number persisted, in the order the [`persistence`](crate::persistence)
     /// module describes.
     ///
@@ -629,32 +706,16 @@ impl<A: Application + 'static> Acceptor<A> {
     /// (98), a `HeartBtInt` (108) that is missing, non-numeric, or out of range,
     /// and a second concurrent Logon for a session already established. A
     /// `BeginString` this engine cannot frame *at all* is refused up front with
-    /// [`EngineError::UnsupportedVersion`], and an unusable configuration with
-    /// [`EngineError::Config`]. With a store, [`EngineError::Store`] when the
-    /// store cannot be reset or refreshed for the session (whatever the
-    /// policy), or a handshake write fails under
+    /// [`EngineError::UnsupportedVersion`], an unusable configuration with
+    /// [`EngineError::Config`], and a zero initial seed that would be used with
+    /// [`EngineError::InvalidInitialSequence`]. With a store,
+    /// [`EngineError::Store`] when the store cannot be reset or refreshed for
+    /// the session (whatever the policy), or a handshake write fails under
     /// [`StoreFailurePolicy::CloseSession`]; and
     /// [`EngineError::InitialSequenceBelowStore`] for a sender seed below the
     /// store under [`StoreFailurePolicy::CloseSession`].
     pub async fn serve(&self, stream: TcpStream) -> Result<Connection, EngineError> {
-        // Refuse before framing: a knob outside its documented range corrupts
-        // the session's own messages.
-        if let Err(err) = &self.config_check {
-            return Err(EngineError::Config(err.clone()));
-        }
-
-        // Refuse before framing: an unsupported version cannot produce a
-        // conforming Logon reply, and guessing one would put a fabricated
-        // version on the wire.
-        let version = match &self.version {
-            Ok(version) => *version,
-            Err(err) => {
-                return Err(EngineError::UnsupportedVersion {
-                    version: err.version.clone(),
-                    detail: err.detail.clone(),
-                });
-            }
-        };
+        let version = self.preflight()?;
 
         let session_id = self.session_id.clone();
         self.application.on_create(&session_id).await;
@@ -665,16 +726,11 @@ impl<A: Application + 'static> Acceptor<A> {
         let _ = stream.set_nodelay(true);
         let mut framed = Framed::new(stream, session_codec(&self.config, version));
 
-        // Until the Logon is authenticated the store is not touched. These
-        // provisional counters number the refusal frames of a store-less
-        // acceptor; the session's real counters are seeded after
-        // authentication.
-        let provisional = self.provisional_sequences();
         let mut factory = MessageFactory::new(&self.config, version);
         let identity = PeerIdentity::new(&self.config);
         let sending_time = SendingTimeGuard::new(&self.config);
         let write_timeout = self.write_timeout;
-        let store_timeout = self.store_timeout();
+        let store_timeout = self.store.timeout(write_timeout);
 
         // Await the inbound Logon. Garbled frames are skipped, and the logon
         // timeout covers the whole wait, so a Logon that never arrives intact
@@ -740,15 +796,8 @@ impl<A: Application + 'static> Acceptor<A> {
                     version.begin_string()
                 );
                 let logout = factory.logout(Some(&detail));
-                self.refuse_unauthenticated(
-                    &session_id,
-                    &mut framed,
-                    &mut factory,
-                    &provisional,
-                    &detail,
-                    [logout],
-                )
-                .await;
+                self.refuse_unknown(&session_id, &mut framed, &mut factory, &detail, [logout])
+                    .await;
                 let _ = session.reject_logon();
                 return Err(EngineError::LogonRejected { reason: detail });
             }
@@ -763,22 +812,16 @@ impl<A: Application + 'static> Acceptor<A> {
                 let detail =
                     format!("unsupported EncryptMethod (98) '{shown}'; only 0 (None) is supported");
                 let logout = factory.logout(Some(&detail));
-                self.refuse_unauthenticated(
-                    &session_id,
-                    &mut framed,
-                    &mut factory,
-                    &provisional,
-                    &detail,
-                    [logout],
-                )
-                .await;
+                self.refuse_unknown(&session_id, &mut framed, &mut factory, &detail, [logout])
+                    .await;
                 let _ = session.reject_logon();
                 return Err(EngineError::LogonRejected { reason: detail });
             }
 
             // MsgSeqNum (34) must sit in the standard header: a body-only 34 is
             // not the session sequence number, exactly as the identity check
-            // requires 49/56 in the header.
+            // requires 49/56 in the header. No reply: nothing can reference a
+            // Logon that has no number.
             let logon_seq = match wire::header_seq_num(&raw) {
                 Some(seq) => seq,
                 None => {
@@ -796,11 +839,10 @@ impl<A: Application + 'static> Acceptor<A> {
                 let reason = RejectReason::new(9, detail.clone()).with_ref_tag(mismatch.tag);
                 let reject = factory.session_reject(logon_seq, MsgType::Logon.as_str(), &reason);
                 let logout = factory.logout(Some(&detail));
-                self.refuse_unauthenticated(
+                self.refuse_unknown(
                     &session_id,
                     &mut framed,
                     &mut factory,
-                    &provisional,
                     &detail,
                     [reject, logout],
                 )
@@ -813,22 +855,17 @@ impl<A: Application + 'static> Acceptor<A> {
             // concurrent Logon for this same counterparty is refused here rather
             // than allowed to fork the session into two independent sequence
             // streams both starting at 1. Policy: the live session is preserved
-            // and the newcomer is logged out (or, with a store, dropped).
+            // and the newcomer's connection is closed without a reply, with or
+            // without a store: the live session owns the sequence stream, so
+            // nothing the newcomer could be sent belongs to it.
             admission = match self.try_admit() {
                 Some(guard) => guard,
                 None => {
                     let detail = format!("session already active for {session_id}");
-                    tracing::warn!(session = %session_id, "refusing duplicate concurrent Logon");
-                    let logout = factory.logout(Some(&detail));
-                    self.refuse_unauthenticated(
-                        &session_id,
-                        &mut framed,
-                        &mut factory,
-                        &provisional,
-                        &detail,
-                        [logout],
-                    )
-                    .await;
+                    tracing::warn!(
+                        session = %session_id,
+                        "refusing a duplicate concurrent Logon without a reply"
+                    );
                     let _ = session.reject_logon();
                     return Err(EngineError::LogonRejected { reason: detail });
                 }
@@ -837,69 +874,100 @@ impl<A: Application + 'static> Acceptor<A> {
             // The clock is checked next, before the heartbeat is set: an
             // initiator whose SendingTime is wildly skewed cannot be trusted to
             // sequence a session, and the handshake is the cheapest place to
-            // refuse it.
+            // refuse it. The counterparty holds the slot, so it gets the Reject
+            // and the Logout, filed like any session frame.
             if let Err(problem) = sending_time.validate(&raw) {
                 let detail = problem.to_string();
                 let reason = problem.reject_reason();
                 let reject = factory.session_reject(logon_seq, MsgType::Logon.as_str(), &reason);
                 let logout = factory.logout(Some(&detail));
-                self.refuse_unauthenticated(
-                    &session_id,
-                    &mut framed,
-                    &mut factory,
-                    &provisional,
-                    &detail,
-                    [reject, logout],
-                )
-                .await;
+                let refused = self
+                    .refuse_known(
+                        &session_id,
+                        &mut framed,
+                        &mut factory,
+                        &detail,
+                        [reject, logout],
+                    )
+                    .await;
                 let _ = session.reject_logon();
+                refused?;
                 return Err(EngineError::SendingTime { detail });
             }
 
             // Authentication hook: the application inspects the Logon (Username
-            // 553 / Password 554 and the like) and may refuse it.
+            // 553 / Password 554 and the like) and may refuse it. The refusal's
+            // text reaches the counterparty in a filed Logout.
             if let Err(reason) = self.application.from_admin(&raw, &session_id).await {
                 let logout = factory.logout(Some(&reason.text));
-                self.refuse_unauthenticated(
-                    &session_id,
-                    &mut framed,
-                    &mut factory,
-                    &provisional,
-                    &reason.text,
-                    [logout],
-                )
-                .await;
+                let refused = self
+                    .refuse_known(
+                        &session_id,
+                        &mut framed,
+                        &mut factory,
+                        &reason.text,
+                        [logout],
+                    )
+                    .await;
                 let _ = session.reject_logon();
+                refused?;
                 return Err(EngineError::LogonRejected {
                     reason: reason.text,
                 });
             }
 
-            // ResetSeqNumFlag (141): the acceptor resets when the peer asks
-            // (141=Y) *or* when it is locally configured to (`reset_on_logon`),
-            // or when an earlier session left a store reset owed. FIX requires
-            // MsgSeqNum = 1 on a Logon that itself carries ResetSeqNumFlag = Y:
-            // the reset and the number carrying it have to describe the same
-            // stream. That binds only when the *peer* declared the reset, and
-            // it is checked before the store is touched, so a contradictory
-            // Logon cannot reset it.
+            // ResetSeqNumFlag (141): FIX requires MsgSeqNum = 1 on a Logon that
+            // itself carries ResetSeqNumFlag = Y: the reset and the number
+            // carrying it have to describe the same stream. Checked before the
+            // store is touched, so a contradictory Logon cannot reset it.
             let inbound_reset = raw.get_field_str(141) == Some("Y");
             if inbound_reset && logon_seq != 1 {
+                let detail =
+                    format!("Logon set ResetSeqNumFlag=Y but carried MsgSeqNum {logon_seq}, not 1");
+                let logout = factory.logout(Some(&detail));
+                let refused = self
+                    .refuse_known(&session_id, &mut framed, &mut factory, &detail, [logout])
+                    .await;
                 let _ = session.reject_logon();
-                return Err(EngineError::Sequence(format!(
-                    "Logon set ResetSeqNumFlag=Y but carried MsgSeqNum {logon_seq}, not 1"
-                )));
+                refused?;
+                return Err(EngineError::Sequence(detail));
             }
-            reset = inbound_reset || self.config.reset_on_logon || self.reset_is_owed();
 
-            // The Logon is authenticated: only now is the store touched. A reset
-            // clears it (one `reset_to` call) before the acknowledgement is
-            // filed; otherwise the counters come from the seed or the refreshed
-            // store. Either fails closed whatever the policy. A reset is owed
-            // from before it is awaited until the acknowledgement declaring it
-            // is sent, so a serve dropped or failed in between leaves it owed.
-            if reset && self.store.is_some() {
-                self.reset_owed.store(true, Ordering::Release);
+            // HeartBtInt (108): the acceptor adopts the interval the initiator
+            // requested and echoes it back on the reply. The value is
+            // counterparty-controlled and drives a Duration on the heartbeat
+            // clock, so it is bounded here — a missing, non-numeric, or
+            // over-range 108 fails the handshake rather than being defaulted or,
+            // at u64::MAX, overflowing the clock and aborting the process. It is
+            // checked before the store is reset, so a refused Logon never resets
+            // it.
+            let requested_heartbeat_secs = match wire::parse_heartbeat_interval(&raw) {
+                Ok(secs) => secs,
+                Err(problem) => {
+                    let detail = problem.to_string();
+                    tracing::warn!(session = %session_id, detail = %detail, "rejecting Logon HeartBtInt");
+                    let logout = factory.logout(Some(&detail));
+                    let refused = self
+                        .refuse_known(&session_id, &mut framed, &mut factory, &detail, [logout])
+                        .await;
+                    let _ = session.reject_logon();
+                    refused?;
+                    return Err(EngineError::LogonRejected { reason: detail });
+                }
+            };
+
+            // The Logon is accepted: only now is the store reset. The session
+            // starts a new stream when the peer asks (141=Y), when it is
+            // locally configured to (`reset_on_logon`), or when an earlier
+            // session left a reset owed. A reset clears the store (one
+            // `reset_to` call) before the acknowledgement is filed; otherwise
+            // the counters come from the seed or the refreshed store. Either
+            // fails closed whatever the policy. A reset is owed from before it
+            // is awaited until the acknowledgement declaring it is sent, so a
+            // serve dropped or failed in between leaves it owed.
+            reset = inbound_reset || self.config.reset_on_logon || self.store.reset_is_owed();
+            if reset && self.store.store().is_some() {
+                self.store.owe_reset();
             }
             let Seeded {
                 sequences,
@@ -924,40 +992,8 @@ impl<A: Application + 'static> Acceptor<A> {
             });
             // Every frame from here on goes through this binding: filed, and its
             // number persisted, before it is written.
-            store = self.store.as_deref().map(|store| HandshakeStore {
-                store: SessionStore::new(store, self.store_policy, store_timeout, &self.reset_owed),
-                persisted,
-            });
+            store = self.store.handshake(persisted, write_timeout);
 
-            // Honor the heartbeat interval the initiator requested (HeartBtInt,
-            // 108): the acceptor adopts it and echoes it back on the reply. The
-            // value is counterparty-controlled and drives a Duration on the
-            // heartbeat clock, so it is bounded here — a missing, non-numeric,
-            // or over-range 108 fails the handshake rather than being defaulted
-            // or, at u64::MAX, overflowing the clock and aborting the process.
-            let requested_heartbeat_secs = match wire::parse_heartbeat_interval(&raw) {
-                Ok(secs) => secs,
-                Err(problem) => {
-                    let detail = problem.to_string();
-                    tracing::warn!(session = %session_id, detail = %detail, "rejecting Logon HeartBtInt");
-                    let logout = factory.logout(Some(&detail));
-                    let refused = refuse_handshake(
-                        self.application.as_ref(),
-                        &session_id,
-                        &mut framed,
-                        &mut factory,
-                        &runtime.sequences,
-                        store.as_mut(),
-                        write_timeout,
-                        &detail,
-                        [logout],
-                    )
-                    .await;
-                    let _ = session.reject_logon();
-                    refused?;
-                    return Err(EngineError::LogonRejected { reason: detail });
-                }
-            };
             {
                 let mut heartbeat = lock_heartbeat(&runtime);
                 heartbeat.on_message_received(false, None);
@@ -973,13 +1009,26 @@ impl<A: Application + 'static> Acceptor<A> {
             }
             let reply_heartbeat_secs = requested_heartbeat_secs;
 
-            match runtime.sequences.validate_incoming(logon_seq) {
+            // The reset rule both roles share: in a Logon exchange that resets
+            // the sequence, each side's Logon or acknowledgement is message 1
+            // of its new stream. After a reset, the peer's Logon is therefore
+            // taken as its message 1 whatever MsgSeqNum it carries (a peer that
+            // did not ask for the reset is told to make it by the ack's 141=Y),
+            // and 2 is expected next: no gap is opened for the old stream's
+            // numbers. Without a reset the Logon is validated as usual.
+            let validation = if reset {
+                SequenceResult::Ok
+            } else {
+                runtime.sequences.validate_incoming(logon_seq)
+            };
+            match validation {
                 SequenceResult::Ok => {
                     // The receive cursor includes the Logon before the session
                     // goes Active on it and before the in-memory expectation
                     // moves, as for every later inbound message.
                     if let Some(handshake) = store.as_mut() {
-                        let Some(next) = logon_seq.checked_add(1) else {
+                        let expected = runtime.sequences.next_target_seq().value();
+                        let Some(next) = expected.checked_add(1) else {
                             let _ = session.reject_logon();
                             return Err(SequenceExhausted {
                                 counter: SequenceCounter::Target,
@@ -1050,7 +1099,7 @@ impl<A: Application + 'static> Acceptor<A> {
         // The acknowledgement that declared the reset is on the wire: no reset
         // is owed any more.
         if reset {
-            self.reset_owed.store(false, Ordering::Release);
+            self.store.reset_paid();
         }
 
         // Typestate: LogonReceived -> Active.
@@ -1060,11 +1109,12 @@ impl<A: Application + 'static> Acceptor<A> {
 
         // Hand the framed socket to the shared reactor, the same one the
         // initiator uses. The admission guard rides the reactor task and frees
-        // the slot when the session closes, after its close path (store writes
-        // included) has run. A gap in the inbound Logon is requested by the
-        // reactor as its first act, so that once `on_logon` has run, a failure
-        // to send the request closes the session through the reactor's close
-        // path (`on_logout` included) like any other.
+        // the slot when the task ends: after its close path (store writes
+        // included), the drain of its application queue and `on_logout`. A gap
+        // in the inbound Logon is requested by the reactor as its first act,
+        // so that once `on_logon` has run, a failure to send the request
+        // closes the session through the reactor's close path (`on_logout`
+        // included) like any other.
         let params = SessionParams {
             framed,
             session,
@@ -1075,12 +1125,12 @@ impl<A: Application + 'static> Acceptor<A> {
             config: self.config.clone(),
             application: Arc::clone(&self.application),
             session_id: session_id.clone(),
-            store: self.store.clone(),
-            store_policy: self.store_policy,
+            store: self.store.store().cloned(),
+            store_policy: self.store.policy(),
             store_timeout,
             persisted: store
                 .map_or_else(PersistedCounters::default, |handshake| handshake.persisted),
-            reset_owed: Arc::clone(&self.reset_owed),
+            reset_owed: self.store.owed_record(),
             opening_gap: pending_resend,
             write_timeout,
             outbound_capacity: self.outbound_capacity,

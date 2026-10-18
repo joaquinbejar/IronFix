@@ -32,6 +32,7 @@ use ironfix_engine::{
     Acceptor, Connection, EngineBuilder, EngineError, Initiator, OutboundMessage,
     StoreFailurePolicy,
 };
+use ironfix_session::sequence::SequenceCounter;
 use ironfix_session::{GarbledFrameLimit, SessionConfig};
 use ironfix_store::{MemoryStore, MessageStore, StoredMessage};
 use ironfix_tagvalue::{Decoder, Encoder};
@@ -595,6 +596,22 @@ async fn test_acceptor_refuses_second_concurrent_logon() {
             "serve B in 5s",
         ),
         "serve B joins",
+    );
+
+    // The duplicate is closed without a reply, with or without a store: the
+    // live session owns the sequence stream.
+    let refused_framed = if res_a.is_err() {
+        &mut framed_a
+    } else {
+        &mut framed_b
+    };
+    assert!(
+        timeout(Duration::from_secs(5), refused_framed.next())
+            .await
+            .ok()
+            .flatten()
+            .is_none(),
+        "the duplicate gets no reply"
     );
 
     // Exactly one session established; the other was refused as a duplicate.
@@ -1795,53 +1812,297 @@ impl Application for RefusingApp {
     }
 }
 
-/// A `ResetSeqNumFlag` (141) Logon that `from_admin` refuses cannot wipe the
-/// outbound journal: the store is never touched, its history survives, and no
-/// reply is sent.
-#[tokio::test]
-async fn test_acceptor_unauthenticated_reset_logon_never_touches_the_store() {
-    let (listener, addr) = bind_listener().await;
-    let store = Arc::new(ProbeStore::new());
-    let frame = client_msg("8", 1, &[(17, "OLD")]);
+/// Files three frames of a previous stream in `store` and moves its counters
+/// past them: next sender 4, next target 3.
+async fn seed_history(store: &MemoryStore) {
+    for seq in 1..=3u64 {
+        let frame = client_msg("8", seq, &[(17, "OLD")]);
+        ok(
+            store.store(seq, &MsgType::ExecutionReport, &frame).await,
+            "seed the journal",
+        );
+    }
     ok(
-        store
-            .inner
-            .store(1, &MsgType::ExecutionReport, &frame)
-            .await,
-        "seed the journal",
+        store.set_next_sender_seq(4).await,
+        "seed the sender counter",
     );
-    let acceptor = Acceptor::new(venue_config(Duration::from_secs(30)), Arc::new(RefusingApp))
-        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
-    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+    ok(
+        store.set_next_target_seq(3).await,
+        "seed the target counter",
+    );
+}
 
+/// Sends `logon` to `acceptor` from a stub initiator, and returns what the
+/// acceptor's `accept` returned and every frame the stub received before the
+/// acceptor hung up, as (MsgType, MsgSeqNum, Text) triples.
+async fn refused_logon<A: Application + 'static>(
+    acceptor: Arc<Acceptor<A>>,
+    logon: BytesMut,
+) -> (
+    Result<Connection, EngineError>,
+    Vec<(String, Option<String>, Option<String>)>,
+) {
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
     let stream = ok(TcpStream::connect(addr).await, "client connects");
     let mut framed = Framed::new(stream, FixCodec::new());
-    ok(
-        framed
-            .send(client_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]))
-            .await,
-        "client sends a resetting logon",
+    ok(framed.send(logon).await, "client sends its logon");
+    let result = ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue task finishes within 5s",
+        ),
+        "venue task joins",
     );
+    let mut frames = Vec::new();
+    while let Ok(Some(Ok(frame))) = timeout(Duration::from_secs(2), framed.next()).await {
+        frames.push((msg_type_of(&frame), field(&frame, 34), field(&frame, 58)));
+    }
+    (result, frames)
+}
 
-    match ok(
-        timeout(Duration::from_secs(5), venue).await,
-        "venue task finishes within 5s",
-    ) {
-        Ok(Err(EngineError::LogonRejected { reason })) => {
-            assert_eq!(reason, "bad credentials");
-        }
+/// A store-backed acceptor with a previous stream filed (next sender 4, next
+/// target 3), and the store.
+async fn acceptor_with_history<A: Application + 'static>(
+    application: Arc<A>,
+) -> (Arc<Acceptor<A>>, Arc<ProbeStore>) {
+    let store = Arc::new(ProbeStore::new());
+    seed_history(&store.inner).await;
+    let acceptor = Arc::new(
+        Acceptor::new(venue_config(Duration::from_secs(30)), application)
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    (acceptor, store)
+}
+
+/// The previous stream survived a refused Logon: frames 1 to 3 are still
+/// filed.
+#[track_caller]
+fn assert_history_kept(store: &ProbeStore) {
+    for seq in 1..=3u64 {
+        assert!(
+            store.inner.contains(seq),
+            "the refused Logon must not reset the store (frame {seq})"
+        );
+    }
+}
+
+/// A Logon from the configured counterparty that `from_admin` refuses gets a
+/// Logout with the refusal's text, numbered from the store's counters and
+/// filed. Its `ResetSeqNumFlag` (141) does not reset the store: a refused Logon
+/// cannot clear the outbound journal.
+#[tokio::test]
+async fn test_acceptor_from_admin_refusal_is_filed_and_never_resets() {
+    let (acceptor, store) = acceptor_with_history(Arc::new(RefusingApp)).await;
+    let (result, frames) = refused_logon(
+        acceptor,
+        client_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]),
+    )
+    .await;
+
+    match result {
+        Err(EngineError::LogonRejected { reason }) => assert_eq!(reason, "bad credentials"),
         other => panic!("expected LogonRejected, got {other:?}"),
     }
-    assert!(
-        timeout(Duration::from_secs(5), framed.next())
-            .await
-            .ok()
-            .flatten()
-            .is_none(),
-        "no Logout with a store attached"
+    assert_eq!(
+        frames,
+        vec![(
+            "5".to_string(),
+            Some("4".to_string()),
+            Some("bad credentials".to_string())
+        )],
+        "one Logout, numbered from the store, carrying the refusal"
     );
-    assert_eq!(store.touched(), 0, "the store was never touched");
-    assert!(store.inner.contains(1), "the journal survives");
+    assert_history_kept(&store);
+    assert!(store.inner.contains(4), "the Logout is filed");
+    assert_eq!(store.inner.next_sender_seq(), 5);
+}
+
+/// A Logon from the configured counterparty whose `SendingTime` (52) is out of
+/// tolerance gets a Reject (373 = 10) and a Logout, both numbered from the
+/// store's counters and filed.
+#[tokio::test]
+async fn test_acceptor_sending_time_refusal_is_filed() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let (acceptor, store) = acceptor_with_history(venue_app).await;
+
+    let mut encoder = Encoder::new("FIX.4.4");
+    encoder.put_str(35, "A");
+    encoder.put_str(49, "CLIENT");
+    encoder.put_str(56, "VENUE");
+    encoder.put_uint(34, 3);
+    encoder.put_str(52, "20200101-00:00:00.000");
+    encoder.put_uint(98, 0);
+    encoder.put_uint(108, 30);
+    let mut logon = BytesMut::new();
+    ok(encoder.finish_into(&mut logon), "stale logon must encode");
+
+    let (result, frames) = refused_logon(acceptor, logon).await;
+    assert!(
+        matches!(result, Err(EngineError::SendingTime { .. })),
+        "expected a SendingTime error, got {result:?}"
+    );
+    let numbered: Vec<_> = frames
+        .iter()
+        .map(|(msg_type, seq, _)| (msg_type.clone(), seq.clone()))
+        .collect();
+    assert_eq!(
+        numbered,
+        vec![
+            ("3".to_string(), Some("4".to_string())),
+            ("5".to_string(), Some("5".to_string())),
+        ],
+        "a Reject then a Logout, numbered from the store"
+    );
+    assert!(store.inner.contains(4) && store.inner.contains(5));
+    assert_eq!(store.inner.next_sender_seq(), 6);
+    assert_history_kept(&store);
+}
+
+/// A `HeartBtInt` (108) that cannot be honoured is refused after
+/// authentication with a filed Logout numbered from the store, and a
+/// `ResetSeqNumFlag` (141) on that Logon does not reset the store.
+#[tokio::test]
+async fn test_acceptor_heartbeat_refusal_is_filed_and_never_resets() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let (acceptor, store) = acceptor_with_history(venue_app).await;
+    let (result, frames) = refused_logon(
+        acceptor,
+        client_msg("A", 1, &[(98, "0"), (108, "abc"), (141, "Y")]),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(EngineError::LogonRejected { .. })),
+        "expected LogonRejected, got {result:?}"
+    );
+    assert_eq!(frames.len(), 1, "one Logout: {frames:?}");
+    assert_eq!(frames[0].0, "5");
+    assert_eq!(frames[0].1.as_deref(), Some("4"));
+    assert!(store.inner.contains(4), "the Logout is filed");
+    assert_history_kept(&store);
+}
+
+/// A Logon numbered below what the store expects is refused with a Logout
+/// numbered from the store and filed.
+#[tokio::test]
+async fn test_acceptor_too_low_logon_refusal_is_filed() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let (acceptor, store) = acceptor_with_history(venue_app).await;
+    let (result, frames) =
+        refused_logon(acceptor, client_msg("A", 2, &[(98, "0"), (108, "30")])).await;
+
+    assert!(
+        matches!(result, Err(EngineError::Sequence(ref detail)) if detail.contains("too low")),
+        "expected a too-low Sequence error, got {result:?}"
+    );
+    assert_eq!(frames.len(), 1, "one Logout: {frames:?}");
+    assert_eq!(frames[0].0, "5");
+    assert_eq!(frames[0].1.as_deref(), Some("4"));
+    assert!(store.inner.contains(4), "the Logout is filed");
+    assert_eq!(store.inner.next_sender_seq(), 5);
+    assert_eq!(
+        store.inner.next_target_seq(),
+        3,
+        "the refused Logon is not consumed"
+    );
+}
+
+/// A `ResetSeqNumFlag` (141) Logon not numbered 1 is refused with a filed
+/// Logout that says why, and does not reset the store.
+#[tokio::test]
+async fn test_acceptor_reset_logon_not_numbered_one_is_refused_and_filed() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let (acceptor, store) = acceptor_with_history(venue_app).await;
+    let (result, frames) = refused_logon(
+        acceptor,
+        client_msg("A", 5, &[(98, "0"), (108, "30"), (141, "Y")]),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(EngineError::Sequence(_))),
+        "expected a Sequence error, got {result:?}"
+    );
+    assert_eq!(frames.len(), 1, "one Logout: {frames:?}");
+    assert_eq!(frames[0].0, "5");
+    assert_eq!(frames[0].1.as_deref(), Some("4"));
+    assert!(
+        frames[0]
+            .2
+            .as_deref()
+            .is_some_and(|text| text.contains("ResetSeqNumFlag")),
+        "the Logout says why: {frames:?}"
+    );
+    assert_history_kept(&store);
+}
+
+/// A zero sender seed that would be used is refused once the Logon is
+/// authenticated, instead of being raised to 1, and nothing is sent.
+#[tokio::test]
+async fn test_acceptor_refuses_a_zero_initial_seed() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)),
+            Arc::clone(&venue_app),
+        )
+        .with_initial_sequences(0, 1),
+    );
+    let (result, frames) =
+        refused_logon(acceptor, client_msg("A", 1, &[(98, "0"), (108, "30")])).await;
+
+    assert!(
+        matches!(
+            result,
+            Err(EngineError::InvalidInitialSequence {
+                counter: SequenceCounter::Sender
+            })
+        ),
+        "expected InvalidInitialSequence, got {result:?}"
+    );
+    assert!(frames.is_empty(), "nothing is sent: {frames:?}");
+    assert!(!venue_app.events().contains(&"logon".to_string()));
+}
+
+/// The reset rule both roles share: after a reset the acceptor drives
+/// (`reset_on_logon`), the peer's Logon is its message 1 whatever its
+/// `MsgSeqNum`. A Logon at 5 without `ResetSeqNumFlag` gets an ack at 1 with
+/// `141=Y`, no `ResendRequest` follows it for the old stream's numbers, and
+/// the peer's next message, at 2, is accepted.
+#[tokio::test]
+async fn test_acceptor_driven_reset_takes_the_logon_as_message_one() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(Acceptor::new(
+        venue_config(Duration::from_secs(30)).with_reset_on_logon(true),
+        Arc::clone(&venue_app),
+    ));
+    let (mut framed, connection, ack) = establish_shared(&acceptor, 5, &[]).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("1"));
+    assert_eq!(field(&ack, 141).as_deref(), Some("Y"));
+    assert_eq!(connection.next_target_seq(), 2);
+
+    // Past the ack: nothing, in particular no ResendRequest for 1..5.
+    assert!(
+        timeout(Duration::from_millis(500), framed.next())
+            .await
+            .is_err(),
+        "no frame follows the ack"
+    );
+
+    // The peer, having reset as the ack told it to, continues at 2.
+    ok(
+        framed
+            .send(client_msg("1", 2, &[(112, "AFTER-RESET")]))
+            .await,
+        "send TestRequest",
+    );
+    let heartbeat = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&heartbeat), "0");
+    assert_eq!(field(&heartbeat, 34).as_deref(), Some("2"));
+    assert_eq!(field(&heartbeat, 112).as_deref(), Some("AFTER-RESET"));
+    assert!(!connection.is_closed());
+    assert_eq!(connection.next_target_seq(), 3);
 }
 
 /// A second concurrent Logon for a live session is refused without touching
@@ -1965,25 +2226,24 @@ async fn test_acceptor_store_timeout_is_a_failed_write() {
     );
 }
 
-/// An unusable configuration is refused by `serve` before the handshake, as
-/// the initiator refuses it before dialling.
+/// An unusable configuration is refused before a connection is taken off the
+/// listener, as the initiator refuses it before dialling: `accept` returns at
+/// once, with nobody connected.
 #[tokio::test]
 async fn test_acceptor_refuses_an_invalid_configuration() {
-    let (listener, addr) = bind_listener().await;
+    let (listener, _addr) = bind_listener().await;
     let (venue_app, _venue_rx) = RecordingApp::new();
     // A fractional HeartBtInt has no wire form.
     let acceptor = Acceptor::new(
         venue_config(Duration::from_millis(1500)),
         Arc::clone(&venue_app),
     );
-    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
-    let _stream = ok(TcpStream::connect(addr).await, "client connects");
 
     match ok(
-        timeout(Duration::from_secs(5), venue).await,
-        "venue task finishes within 5s",
+        timeout(Duration::from_secs(1), acceptor.accept(&listener)).await,
+        "accept refuses without waiting for a connection",
     ) {
-        Ok(Err(EngineError::Config(_))) => {}
+        Err(EngineError::Config(_)) => {}
         other => panic!("expected a configuration error, got {other:?}"),
     }
     assert!(!venue_app.events().contains(&"create".to_string()));

@@ -7586,3 +7586,53 @@ async fn test_a_late_reset_cannot_erase_the_next_session_on_an_ordered_store() {
 async fn test_a_late_reset_erases_the_next_session_on_an_unordered_store() {
     assert_eq!(late_reset_scenario(false).await, (false, false, 1));
 }
+
+/// The reset rule both roles share: when the initiator drives a reset
+/// (`reset_on_logon`), the counterparty's acknowledgement is its message 1
+/// whatever its `MsgSeqNum`. An ack at 7 that does not echo the reset opens no
+/// gap and draws no `ResendRequest`; the next number expected is 2.
+#[tokio::test]
+async fn test_initiator_driven_reset_takes_the_ack_as_message_one() {
+    let (listener, addr) = bind_listener().await;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(field(&logon, 34).as_deref(), Some("1"));
+        assert_eq!(field(&logon, 141).as_deref(), Some("Y"));
+        ok(
+            framed
+                .send(venue_msg("A", 7, &[(98, "0"), (108, "30")]))
+                .await,
+            "send an ack that does not echo the reset",
+        );
+        // Past the ack: nothing, in particular no ResendRequest for 1..7.
+        assert!(
+            timeout(Duration::from_millis(500), framed.next())
+                .await
+                .is_err(),
+            "no frame follows the Logon"
+        );
+        let _ = ready_tx.send(());
+        let _ = timeout(Duration::from_secs(5), framed.next()).await;
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(
+        client_config(Duration::from_secs(30)).with_reset_on_logon(true),
+        Arc::clone(&app),
+    );
+    let connection = ok(initiator.connect(addr).await, "connect");
+    assert_eq!(connection.next_target_seq(), 2);
+    assert_eq!(connection.next_sender_seq(), 2);
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), ready_rx).await,
+            "stub checked within 5s",
+        ),
+        "stub must see no ResendRequest",
+    );
+    drop(connection);
+    acceptor.abort();
+}
