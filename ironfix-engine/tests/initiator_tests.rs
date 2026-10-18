@@ -19,7 +19,7 @@ use ironfix_engine::application::{Application, RejectReason, SessionId};
 use ironfix_engine::{EngineError, Initiator, OutboundMessage, StoreFailurePolicy};
 use ironfix_session::sequence::SequenceCounter;
 use ironfix_session::{GarbledFrameLimit, SessionConfig, SessionConfigError};
-use ironfix_store::{MemoryStore, MessageStore, StoredMessage};
+use ironfix_store::{FileStore, FileStoreConfig, MemoryStore, MessageStore, StoredMessage};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
 use std::num::NonZeroU32;
@@ -3383,6 +3383,127 @@ async fn test_resend_request_unbounded_replays_to_the_last_sent_message() {
         ),
         "acceptor task",
     );
+}
+
+/// A `FileStore` carries a session across a restart: the first engine is
+/// dropped and its store closed, the store is reopened in a new `Initiator`,
+/// and the new session resumes from the stored counters and answers a
+/// `ResendRequest` with the original frames, under their original numbers,
+/// carrying `PossDupFlag` (43) = Y and the original `SendingTime` in
+/// `OrigSendingTime` (122).
+#[tokio::test]
+async fn test_file_store_resends_original_messages_after_a_restart() {
+    let dir = std::env::temp_dir().join(format!(
+        "ironfix-engine-file-store-restart-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config = ok(
+        FileStoreConfig::try_new(&dir, "FIX.4.4-CLIENT-VENUE"),
+        "store config",
+    );
+
+    // First process: Logon at 1, orders at 2..=4, then the venue logs out and
+    // the client's Logout reply goes out at 5.
+    let (listener, addr) = bind_listener().await;
+    let first_venue = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let sent = drain_orders(&mut framed, 2, 3).await;
+        ok(framed.send(venue_msg("5", 2, &[])).await, "venue logout");
+        let reply = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reply), "5");
+        assert_eq!(field(&reply, 34).as_deref(), Some("5"));
+        sent
+    });
+    let store = Arc::new(ok(FileStore::open(config.clone()).await, "open the store"));
+    {
+        let (app, _app_rx) = RecordingApp::new();
+        let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+        let connection = ok(initiator.connect(addr).await, "first connect");
+        send_orders(&connection, 3).await;
+        ok(
+            timeout(Duration::from_secs(5), connection.wait_closed()).await,
+            "first session closes within 5s",
+        );
+    }
+    let sent = ok(
+        ok(
+            timeout(Duration::from_secs(5), first_venue).await,
+            "first venue done within 5s",
+        ),
+        "first venue task",
+    );
+    // The reactor lets go of the store as its task ends. Wait for that, then
+    // close the store, as the process exiting would.
+    ok(
+        timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&store) > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await,
+        "the engine releases the store when its session ends",
+    );
+    drop(store);
+
+    // Second process: the reopened store holds both counters and the frames.
+    let store = ok(FileStore::open(config).await, "reopen the store");
+    assert_eq!(store.next_sender_seq(), 6);
+    assert_eq!(store.next_target_seq(), 3);
+
+    let (listener, addr) = bind_listener().await;
+    let second_venue = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logon), "A");
+        assert_eq!(
+            field(&logon, 34).as_deref(),
+            Some("6"),
+            "the Logon resumes from the stored sender counter"
+        );
+        assert_eq!(field(&logon, 141), None, "no sequence reset");
+        ok(
+            framed
+                .send(venue_msg("A", 3, &[(98, "0"), (108, "30")]))
+                .await,
+            "send the Logon ack at the stored target counter",
+        );
+        ok(
+            framed.send(venue_msg("2", 4, &[(7, "2"), (16, "4")])).await,
+            "ask for the previous process's orders",
+        );
+        for (seq, original) in (2..).zip(sent.iter()) {
+            let replayed = next_frame(&mut framed).await;
+            assert_replay_of(&replayed, seq, original);
+        }
+        ok(framed.send(venue_msg("5", 5, &[])).await, "venue logout");
+        let reply = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reply), "5");
+        assert_eq!(
+            field(&reply, 34).as_deref(),
+            Some("7"),
+            "a replay allocates no sender number"
+        );
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::new(store));
+    let connection = ok(initiator.connect(addr).await, "second connect");
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "second session closes within 5s",
+    );
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), second_venue).await,
+            "second venue done within 5s",
+        ),
+        "second venue task",
+    );
+    drop(initiator);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A store carries sequence numbers as well as messages: a session started
