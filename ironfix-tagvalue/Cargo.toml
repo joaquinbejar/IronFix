@@ -20,7 +20,16 @@ itoa.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+dhat.workspace = true
 
 [[bench]]
 name = "tagvalue"
+harness = false
+
+# Installs dhat as the global allocator to count the allocations of a reused
+# Encoder stamping SendingTime (52), so it runs as its own binary without the
+# libtest harness: no other test and no harness thread allocates while it
+# measures.
+[[test]]
+name = "sending_time_allocations"
 harness = false

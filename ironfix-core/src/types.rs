@@ -14,14 +14,110 @@
 
 use crate::error::{CompIdError, InvalidSide, TimestampError};
 use arrayvec::ArrayString;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use num_derive::{FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
 /// Maximum length for CompID strings in bytes.
 pub const COMP_ID_MAX_LEN: usize = 32;
+
+/// Length of `YYYYMMDD-HH:MM:SS.`, the part of a FIX UTCTimestamp before its
+/// fractional-second digits, in bytes.
+const UTC_TIMESTAMP_PREFIX_LEN: usize = 18;
+
+/// The most fractional-second digits a UTCTimestamp carries (nanoseconds).
+const MAX_FRACTION_DIGITS: usize = 9;
+
+/// Nanoseconds in one second.
+const NANOS_PER_SECOND: u32 = 1_000_000_000;
+
+/// Formats `dt` as a FIX UTCTimestamp of exactly `LEN` bytes:
+/// `YYYYMMDD-HH:MM:SS.` followed by `LEN - 18` fractional-second digits,
+/// truncated rather than rounded (`LEN` 21 is milliseconds, 24 microseconds,
+/// 27 nanoseconds).
+///
+/// The calendar fields come from chrono's plain accessors and the digits are
+/// written into a fixed-size array, so the call allocates nothing.
+///
+/// The output is byte-identical to chrono's `%Y%m%d-%H:%M:%S%.3f` (and
+/// `%.6f` / `%.9f`), leap second included: chrono represents a leap second as
+/// a nanosecond count of 1_000_000_000 or more, prints its second as `60`,
+/// and takes the fractional digits from the count modulo one second.
+///
+/// Returns `None`, never a truncated value, when the year has no four-digit
+/// form (outside `0..=9999`) or `LEN` leaves room for no fractional digit or
+/// for more than nine.
+#[must_use]
+fn format_utc_timestamp<const LEN: usize>(dt: DateTime<Utc>) -> Option<ArrayString<LEN>> {
+    let fraction_digits = LEN.checked_sub(UTC_TIMESTAMP_PREFIX_LEN)?;
+    if !(1..=MAX_FRACTION_DIGITS).contains(&fraction_digits) {
+        return None;
+    }
+    // Nanoseconds per unit of the last fractional digit: 10^(9 - digits).
+    let dropped_digits = u32::try_from(MAX_FRACTION_DIGITS.checked_sub(fraction_digits)?).ok()?;
+    let fraction_unit = 10_u32.checked_pow(dropped_digits)?;
+
+    let naive = dt.naive_utc();
+    let nanos = naive.nanosecond();
+    let second = naive.second().checked_add(nanos / NANOS_PER_SECOND)?;
+    let fraction = (nanos % NANOS_PER_SECOND).checked_div(fraction_unit)?;
+
+    // Byte offsets: YYYY 0..4, MM 4..6, DD 6..8, '-' 8, HH 9..11, ':' 11,
+    // MM 12..14, ':' 14, SS 15..17, '.' 17, then the fraction to the end.
+    let mut out = [b'0'; LEN];
+    put_digits(out.get_mut(0..4)?, u32::try_from(naive.year()).ok()?)?;
+    put_digits(out.get_mut(4..6)?, naive.month())?;
+    put_digits(out.get_mut(6..8)?, naive.day())?;
+    *out.get_mut(8)? = b'-';
+    put_digits(out.get_mut(9..11)?, naive.hour())?;
+    *out.get_mut(11)? = b':';
+    put_digits(out.get_mut(12..14)?, naive.minute())?;
+    *out.get_mut(14)? = b':';
+    put_digits(out.get_mut(15..17)?, second)?;
+    *out.get_mut(17)? = b'.';
+    put_digits(out.get_mut(UTC_TIMESTAMP_PREFIX_LEN..)?, fraction)?;
+    ArrayString::from_byte_string(&out).ok()
+}
+
+/// Writes `value` into `dst` as zero-padded decimal digits that fill it
+/// exactly.
+///
+/// Returns `None` when `value` has more digits than `dst` holds; `dst` is then
+/// partly written and must be discarded.
+#[must_use = "a None means the value did not fit and the buffer must be discarded"]
+const fn put_digits(mut dst: &mut [u8], mut value: u32) -> Option<()> {
+    while let Some((slot, rest)) = dst.split_last_mut() {
+        // `value % 10` is below 10, so the narrowing cast is lossless.
+        *slot = match b'0'.checked_add((value % 10) as u8) {
+            Some(digit) => digit,
+            None => return None,
+        };
+        value /= 10;
+        dst = rest;
+    }
+    if value == 0 { Some(()) } else { None }
+}
+
+/// Whole seconds from the Unix epoch of the instant `before` ahead of it,
+/// floored like [`DateTime::timestamp`]: half a second before the epoch is
+/// `-1`.
+#[must_use]
+fn seconds_before_epoch(before: Duration) -> i64 {
+    let whole = i64::try_from(before.as_secs())
+        .ok()
+        .and_then(i64::checked_neg);
+    let floored = if before.subsec_nanos() == 0 {
+        whole
+    } else {
+        whole.and_then(|seconds| seconds.checked_sub(1))
+    };
+    // Misses only for a reading more than `i64::MAX` seconds before the
+    // epoch, which no system clock produces; `i64::MIN` labels it.
+    floored.unwrap_or(i64::MIN)
+}
 
 /// FIX message sequence number.
 ///
@@ -178,13 +274,48 @@ impl Timestamp {
         }
     }
 
-    /// Converts a calendar instant to a timestamp, clamping an unrepresentable
-    /// instant to [`Timestamp::EPOCH`].
-    fn clamp_datetime(dt: DateTime<Utc>) -> Self {
-        match Self::from_datetime(dt) {
-            Ok(ts) => ts,
-            Err(_) => Self::EPOCH,
+    /// Converts a reading of the system clock, as
+    /// `SystemTime::now().duration_since(UNIX_EPOCH)` returns it, to a
+    /// timestamp.
+    ///
+    /// Takes the reading rather than the clock so that a clock before the
+    /// epoch, which `duration_since` reports as an `Err`, can be tested.
+    ///
+    /// # Errors
+    /// Returns [`TimestampError::InstantOutOfRange`] if the reading lies
+    /// before the Unix epoch, or past [`Timestamp::MAX_NANOS`] (the nanosecond
+    /// count is built with checked arithmetic, so an overflow is reported, not
+    /// wrapped). `seconds` is the reading's whole seconds from the epoch,
+    /// floored like [`DateTime::timestamp`].
+    fn from_system_clock(
+        reading: Result<Duration, SystemTimeError>,
+    ) -> Result<Self, TimestampError> {
+        match reading {
+            Ok(since_epoch) => {
+                let nanos = since_epoch
+                    .as_secs()
+                    .checked_mul(u64::from(NANOS_PER_SECOND))
+                    .and_then(|nanos| nanos.checked_add(u64::from(since_epoch.subsec_nanos())));
+                match nanos.map(Self::from_nanos) {
+                    Some(Ok(ts)) => Ok(ts),
+                    _ => Err(TimestampError::InstantOutOfRange {
+                        // A system clock counts seconds in an `i64`, so this
+                        // fits; `i64::MAX` only labels an impossible reading.
+                        seconds: i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
+                    }),
+                }
+            }
+            Err(before_epoch) => Err(TimestampError::InstantOutOfRange {
+                seconds: seconds_before_epoch(before_epoch.duration()),
+            }),
         }
+    }
+
+    /// Converts a reading of the system clock to a timestamp, clamping an
+    /// unrepresentable reading (before 1970 or after 2262) to
+    /// [`Timestamp::EPOCH`].
+    fn clamp_system_clock(reading: Result<Duration, SystemTimeError>) -> Self {
+        Self::from_system_clock(reading).unwrap_or(Self::EPOCH)
     }
 
     /// Returns the current UTC timestamp.
@@ -198,21 +329,27 @@ impl Timestamp {
     /// obviously wrong SendingTime a counterparty will reject, not a plausible
     /// substitute. Use [`Timestamp::try_now`] to observe that condition as a
     /// typed error instead.
+    ///
+    /// The clock is read through [`SystemTime`] directly, never through
+    /// `chrono::Utc::now`, which panics on a clock before the epoch.
     #[inline]
     #[must_use]
     pub fn now() -> Self {
-        Self::clamp_datetime(Utc::now())
+        Self::clamp_system_clock(SystemTime::now().duration_since(UNIX_EPOCH))
     }
 
     /// Returns the current UTC timestamp, or an error if the system clock is
     /// outside the representable range.
+    ///
+    /// Like [`Timestamp::now`], it reads [`SystemTime`] directly and never
+    /// panics.
     ///
     /// # Errors
     /// Returns [`TimestampError::InstantOutOfRange`] if the system clock reads
     /// before the Unix epoch or past [`Timestamp::MAX_NANOS`].
     #[inline]
     pub fn try_now() -> Result<Self, TimestampError> {
-        Self::from_datetime(Utc::now())
+        Self::from_system_clock(SystemTime::now().duration_since(UNIX_EPOCH))
     }
 
     /// Returns nanoseconds since Unix epoch.
@@ -257,30 +394,42 @@ impl Timestamp {
 
     /// Formats the timestamp in FIX format with millisecond precision.
     ///
-    /// Format: `YYYYMMDD-HH:MM:SS.sss`
+    /// Format: `YYYYMMDD-HH:MM:SS.sss`, the fraction truncated, not rounded.
+    /// The digits are written straight into the returned buffer, so the call
+    /// allocates nothing; it runs for every outbound `SendingTime` (52).
+    #[inline]
     #[must_use]
     pub fn format_millis(self) -> ArrayString<21> {
-        let dt = self.to_datetime();
-        let mut buf = ArrayString::new();
-        let _ = std::fmt::write(
-            &mut buf,
-            format_args!("{}", dt.format("%Y%m%d-%H:%M:%S%.3f")),
-        );
-        buf
+        self.format_fixed()
     }
 
     /// Formats the timestamp in FIX format with microsecond precision.
     ///
-    /// Format: `YYYYMMDD-HH:MM:SS.ssssss`
+    /// Format: `YYYYMMDD-HH:MM:SS.ssssss`, the fraction truncated, not
+    /// rounded. The digits are written straight into the returned buffer, so
+    /// the call allocates nothing.
+    #[inline]
     #[must_use]
     pub fn format_micros(self) -> ArrayString<24> {
-        let dt = self.to_datetime();
-        let mut buf = ArrayString::new();
-        let _ = std::fmt::write(
-            &mut buf,
-            format_args!("{}", dt.format("%Y%m%d-%H:%M:%S%.6f")),
+        self.format_fixed()
+    }
+
+    /// Formats the timestamp as a `LEN`-byte FIX UTCTimestamp.
+    ///
+    /// Total for every timestamp: the constructors bound the instant to
+    /// `1970..=2262`, whose years all have four digits, and the callers pass
+    /// a `LEN` with one to nine fractional digits. Were that ever violated,
+    /// the result would be empty, which is also what the chrono-based
+    /// formatter this replaced produced for a year without four digits:
+    /// never a truncated or wrapped value.
+    #[must_use]
+    fn format_fixed<const LEN: usize>(self) -> ArrayString<LEN> {
+        let formatted = format_utc_timestamp(self.to_datetime());
+        debug_assert!(
+            formatted.is_some(),
+            "a Timestamp's year has four digits and LEN fits a UTCTimestamp"
         );
-        buf
+        formatted.unwrap_or_default()
     }
 }
 
@@ -308,8 +457,10 @@ impl TryFrom<DateTime<Utc>> for Timestamp {
 }
 
 impl fmt::Display for Timestamp {
+    /// Writes [`Timestamp::format_millis`] as is. Width, fill and alignment
+    /// flags are ignored, as they always were: `f.pad` would honour them.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.format_millis())
+        f.write_str(self.format_millis().as_str())
     }
 }
 
@@ -663,30 +814,133 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_timestamp_clamp_datetime_pre_epoch_yields_epoch() {
-        let Some(dt) = DateTime::from_timestamp(-86_400, 0) else {
-            panic!("1969-12-31T00:00:00Z is a valid chrono instant");
+    /// What `SystemTime::now().duration_since(UNIX_EPOCH)` returns on a clock
+    /// that reads `before` ahead of the epoch: the real clock cannot be moved.
+    #[track_caller]
+    fn reading_before_epoch(before: Duration) -> Result<Duration, SystemTimeError> {
+        let Some(instant) = UNIX_EPOCH.checked_sub(before) else {
+            panic!("{before:?} before the epoch is a valid SystemTime");
         };
-        assert_eq!(Timestamp::clamp_datetime(dt), Timestamp::EPOCH);
+        let reading = instant.duration_since(UNIX_EPOCH);
+        assert!(reading.is_err(), "an instant before the epoch reads as Err");
+        reading
+    }
+
+    #[test]
+    fn test_timestamp_from_system_clock_pre_epoch_is_typed_error() {
+        // Whole multiples of 100 ns, the coarsest `SystemTime` resolution
+        // (Windows), so every instant really lies before the epoch.
+        let cases = [
+            (Duration::from_micros(1), -1),
+            (Duration::from_secs(1), -1),
+            (Duration::from_millis(1_500), -2),
+            (Duration::from_secs(86_400), -86_400),
+        ];
+        for (before, seconds) in cases {
+            assert_eq!(
+                Timestamp::from_system_clock(reading_before_epoch(before)),
+                Err(TimestampError::InstantOutOfRange { seconds }),
+                "{before:?} before the epoch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_timestamp_from_system_clock_pre_epoch_seconds_match_try_from_datetime() {
+        // 1.5 s before the epoch, through the clock and through chrono.
+        let Some(dt) = DateTime::from_timestamp(-2, 500_000_000) else {
+            panic!("1969-12-31T23:59:58.5Z is a valid chrono instant");
+        };
+        assert_eq!(
+            Timestamp::from_system_clock(reading_before_epoch(Duration::from_millis(1_500))),
+            Timestamp::try_from(dt)
+        );
+    }
+
+    #[test]
+    fn test_timestamp_clamp_system_clock_pre_epoch_yields_epoch() {
+        let reading = reading_before_epoch(Duration::from_secs(86_400));
+        assert_eq!(Timestamp::clamp_system_clock(reading), Timestamp::EPOCH);
         assert_eq!(Timestamp::EPOCH.as_nanos(), 0);
     }
 
     #[test]
-    fn test_timestamp_clamp_datetime_in_range_is_exact() {
-        let Some(dt) = DateTime::from_timestamp(1_700_000_000, 123_456_789) else {
-            panic!("2023-11-14T22:13:20Z is a valid chrono instant");
-        };
+    fn test_timestamp_from_system_clock_in_range_is_exact() {
+        let reading = Ok(Duration::new(1_700_000_000, 123_456_789));
+        let ts = ok(Timestamp::from_system_clock(reading), "in range");
+        assert_eq!(ts.as_nanos(), 1_700_000_000_123_456_789);
         assert_eq!(
-            Timestamp::clamp_datetime(dt).as_nanos(),
-            1_700_000_000_123_456_789
+            Timestamp::clamp_system_clock(Ok(Duration::new(1_700_000_000, 123_456_789))),
+            ts
         );
+        assert_eq!(
+            Timestamp::from_system_clock(Ok(Duration::ZERO)),
+            Ok(Timestamp::EPOCH)
+        );
+    }
+
+    #[test]
+    fn test_timestamp_from_system_clock_past_ceiling_is_typed_error() {
+        let ceiling = Duration::from_nanos(Timestamp::MAX_NANOS);
+        let max = ok(Timestamp::from_system_clock(Ok(ceiling)), "MAX_NANOS");
+        assert_eq!(max.as_nanos(), Timestamp::MAX_NANOS);
+
+        let past = Duration::from_nanos(Timestamp::MAX_NANOS + 1);
+        assert_eq!(
+            Timestamp::from_system_clock(Ok(past)),
+            Err(TimestampError::InstantOutOfRange {
+                seconds: 9_223_372_036
+            })
+        );
+        assert_eq!(Timestamp::clamp_system_clock(Ok(past)), Timestamp::EPOCH);
+    }
+
+    #[test]
+    fn test_timestamp_from_system_clock_nanos_overflow_is_typed_error() {
+        // u64::MAX seconds overflows the checked scale to nanoseconds.
+        assert_eq!(
+            Timestamp::from_system_clock(Ok(Duration::MAX)),
+            Err(TimestampError::InstantOutOfRange { seconds: i64::MAX })
+        );
+        assert_eq!(
+            Timestamp::clamp_system_clock(Ok(Duration::MAX)),
+            Timestamp::EPOCH
+        );
+    }
+
+    #[test]
+    fn test_seconds_before_epoch_floors() {
+        let i64_max_secs = Duration::from_secs(9_223_372_036_854_775_807);
+        let cases = [
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(1), -1),
+            (Duration::from_secs(1), -1),
+            (Duration::from_millis(1_500), -2),
+            (i64_max_secs, -i64::MAX),
+            (i64_max_secs + Duration::from_nanos(1), i64::MIN),
+            (Duration::MAX, i64::MIN),
+        ];
+        for (before, seconds) in cases {
+            assert_eq!(seconds_before_epoch(before), seconds, "{before:?}");
+        }
     }
 
     #[test]
     fn test_timestamp_try_now_is_representable() {
         let now = ok(Timestamp::try_now(), "the system clock is in range");
         assert!(now.as_nanos() > 0);
+        assert!(Timestamp::now() >= now);
+    }
+
+    #[test]
+    fn test_timestamp_display_ignores_width_flags() {
+        let ts = ok(
+            Timestamp::from_nanos(1_709_210_096_789_012_345),
+            "instant is representable",
+        );
+        assert_eq!(format!("{ts}"), "20240229-12:34:56.789");
+        assert_eq!(format!("{ts:>30}"), "20240229-12:34:56.789");
+        assert_eq!(format!("{ts:*<30}"), "20240229-12:34:56.789");
     }
 
     #[test]
@@ -703,6 +957,285 @@ mod tests {
             "instant is representable",
         );
         assert_eq!(ts.format_micros().as_str(), "20231114-22:13:20.123456");
+    }
+
+    /// chrono's pattern for a millisecond UTCTimestamp.
+    const MILLIS_PATTERN: &str = "%Y%m%d-%H:%M:%S%.3f";
+    /// chrono's pattern for a microsecond UTCTimestamp.
+    const MICROS_PATTERN: &str = "%Y%m%d-%H:%M:%S%.6f";
+    /// chrono's pattern for a nanosecond UTCTimestamp.
+    const NANOS_PATTERN: &str = "%Y%m%d-%H:%M:%S%.9f";
+
+    /// The chrono-based formatter `format_millis` / `format_micros` used
+    /// before #127, kept verbatim as the byte-for-byte reference. It formats
+    /// into a `String` first, and writes nothing when that does not fit `LEN`.
+    fn chrono_reference<const LEN: usize>(dt: DateTime<Utc>, pattern: &str) -> ArrayString<LEN> {
+        let mut buf = ArrayString::new();
+        let _ = std::fmt::write(&mut buf, format_args!("{}", dt.format(pattern)));
+        buf
+    }
+
+    /// Builds a UTC instant; `nano` may be 1_000_000_000 or more on second 59,
+    /// which is how chrono represents a leap second.
+    #[track_caller]
+    fn utc(ymd: (i32, u32, u32), hms: (u32, u32, u32), nano: u32) -> DateTime<Utc> {
+        let (year, month, day) = ymd;
+        let (hour, minute, second) = hms;
+        let Some(date) = chrono::NaiveDate::from_ymd_opt(year, month, day) else {
+            panic!("{year:04}-{month:02}-{day:02} is a valid date");
+        };
+        let Some(naive) = date.and_hms_nano_opt(hour, minute, second, nano) else {
+            panic!("{hour:02}:{minute:02}:{second:02}.{nano} is a valid time");
+        };
+        naive.and_utc()
+    }
+
+    /// Edge instants inside the range a [`Timestamp`] can hold.
+    fn representable_edges() -> Vec<DateTime<Utc>> {
+        vec![
+            // The epoch, the earliest representable instant.
+            utc((1970, 1, 1), (0, 0, 0), 0),
+            utc((1970, 1, 1), (0, 0, 0), 1),
+            // Leap days, a century leap day among them.
+            utc((2024, 2, 29), (12, 34, 56), 789_012_345),
+            utc((2000, 2, 29), (0, 0, 0), 0),
+            // Year boundaries, the last instant of a year on every digit.
+            utc((1999, 12, 31), (23, 59, 59), 999_999_999),
+            utc((2000, 1, 1), (0, 0, 0), 0),
+            utc((2023, 12, 31), (23, 59, 59), 999_000_000),
+            utc((2024, 1, 1), (0, 0, 0), 1),
+            // Truncated, not rounded, at every precision.
+            utc((2025, 6, 30), (23, 59, 59), 999_999_999),
+            utc((2025, 6, 30), (23, 59, 59), 999_499_999),
+            utc((2025, 6, 30), (23, 59, 59), 1_000),
+            // Single-digit calendar and time fields.
+            utc((2001, 2, 3), (4, 5, 6), 7_008_009),
+            utc((2009, 9, 9), (9, 9, 9), 9),
+            // The latest representable instant, Timestamp::MAX_NANOS.
+            utc((2262, 4, 11), (23, 47, 16), 854_775_807),
+        ]
+    }
+
+    #[test]
+    fn test_format_utc_timestamp_edges_match_chrono() {
+        for dt in representable_edges() {
+            let millis: Option<ArrayString<21>> = format_utc_timestamp(dt);
+            let micros: Option<ArrayString<24>> = format_utc_timestamp(dt);
+            let nanos: Option<ArrayString<27>> = format_utc_timestamp(dt);
+            assert_eq!(millis, Some(chrono_reference(dt, MILLIS_PATTERN)), "{dt}");
+            assert_eq!(micros, Some(chrono_reference(dt, MICROS_PATTERN)), "{dt}");
+            assert_eq!(nanos, Some(chrono_reference(dt, NANOS_PATTERN)), "{dt}");
+        }
+    }
+
+    #[test]
+    fn test_timestamp_format_edges_match_chrono() {
+        for dt in representable_edges() {
+            let ts = ok(Timestamp::try_from(dt), "edge instant is representable");
+            let millis: ArrayString<21> = chrono_reference(dt, MILLIS_PATTERN);
+            let micros: ArrayString<24> = chrono_reference(dt, MICROS_PATTERN);
+            assert_eq!(ts.format_millis(), millis, "{dt}");
+            assert_eq!(ts.format_micros(), micros, "{dt}");
+            assert_eq!(ts.to_string(), millis.as_str(), "{dt}");
+        }
+    }
+
+    #[test]
+    fn test_timestamp_format_edges_exact_bytes() {
+        let cases = [
+            (0, "19700101-00:00:00.000", "19700101-00:00:00.000000"),
+            (
+                1_709_210_096_789_012_345,
+                "20240229-12:34:56.789",
+                "20240229-12:34:56.789012",
+            ),
+            (
+                946_684_799_999_999_999,
+                "19991231-23:59:59.999",
+                "19991231-23:59:59.999999",
+            ),
+            (
+                981_173_106_007_008_009,
+                "20010203-04:05:06.007",
+                "20010203-04:05:06.007008",
+            ),
+            (
+                Timestamp::MAX_NANOS,
+                "22620411-23:47:16.854",
+                "22620411-23:47:16.854775",
+            ),
+        ];
+        for (nanos, millis, micros) in cases {
+            let ts = ok(Timestamp::from_nanos(nanos), "instant is representable");
+            assert_eq!(ts.format_millis().as_str(), millis);
+            assert_eq!(ts.format_micros().as_str(), micros);
+        }
+    }
+
+    #[test]
+    fn test_timestamp_format_matches_chrono_across_range() {
+        // About 50_000 instants spread over the whole range; the step is not
+        // a whole second, so the fractional digits vary from one to the next.
+        let step = Timestamp::MAX_NANOS / 50_000;
+        let mut nanos = 0_u64;
+        while let Ok(ts) = Timestamp::from_nanos(nanos) {
+            let dt = ts.to_datetime();
+            let millis: ArrayString<21> = chrono_reference(dt, MILLIS_PATTERN);
+            let micros: ArrayString<24> = chrono_reference(dt, MICROS_PATTERN);
+            assert_eq!(ts.format_millis(), millis, "{nanos}");
+            assert_eq!(ts.format_micros(), micros, "{nanos}");
+            let Some(next) = nanos.checked_add(step) else {
+                break;
+            };
+            nanos = next;
+        }
+    }
+
+    #[test]
+    fn test_timestamp_format_matches_chrono_through_leap_day() {
+        // 2024-02-28T23:00:00Z to 2024-03-01T01:00:00Z in steps just under
+        // 7.4 seconds, so every hour, minute and second field turns over.
+        let start = 1_709_161_200_000_000_000_u64;
+        let end = 1_709_254_800_000_000_000_u64;
+        let mut nanos = start;
+        while nanos <= end {
+            let ts = ok(Timestamp::from_nanos(nanos), "instant is representable");
+            let dt = ts.to_datetime();
+            let millis: ArrayString<21> = chrono_reference(dt, MILLIS_PATTERN);
+            let micros: ArrayString<24> = chrono_reference(dt, MICROS_PATTERN);
+            assert_eq!(ts.format_millis(), millis, "{nanos}");
+            assert_eq!(ts.format_micros(), micros, "{nanos}");
+            let Some(next) = nanos.checked_add(7_398_765_431) else {
+                break;
+            };
+            nanos = next;
+        }
+    }
+
+    #[test]
+    fn test_format_utc_timestamp_leap_second_matches_chrono() {
+        // chrono represents 2016-12-31T23:59:60 as second 59 with a nanosecond
+        // count of one second or more, and prints that second as 60.
+        let cases = [
+            (
+                1_000_000_000,
+                "20161231-23:59:60.000",
+                "20161231-23:59:60.000000",
+            ),
+            (
+                1_500_000_000,
+                "20161231-23:59:60.500",
+                "20161231-23:59:60.500000",
+            ),
+            (
+                1_999_999_999,
+                "20161231-23:59:60.999",
+                "20161231-23:59:60.999999",
+            ),
+        ];
+        for (nano, millis, micros) in cases {
+            let dt = utc((2016, 12, 31), (23, 59, 59), nano);
+            let ours_millis: Option<ArrayString<21>> = format_utc_timestamp(dt);
+            let ours_micros: Option<ArrayString<24>> = format_utc_timestamp(dt);
+            let ours_nanos: Option<ArrayString<27>> = format_utc_timestamp(dt);
+            assert_eq!(ours_millis, Some(chrono_reference(dt, MILLIS_PATTERN)));
+            assert_eq!(ours_micros, Some(chrono_reference(dt, MICROS_PATTERN)));
+            assert_eq!(ours_nanos, Some(chrono_reference(dt, NANOS_PATTERN)));
+            assert_eq!(ours_millis.as_ref().map(ArrayString::as_str), Some(millis));
+            assert_eq!(ours_micros.as_ref().map(ArrayString::as_str), Some(micros));
+        }
+    }
+
+    #[test]
+    fn test_timestamp_from_leap_second_formats_as_next_second() {
+        // A Timestamp counts nanoseconds since the epoch, which has no slot
+        // for a leap second: 23:59:60.5 becomes 00:00:00.5 of the next day
+        // when it is converted, before any formatting happens.
+        let leap = utc((2016, 12, 31), (23, 59, 59), 1_500_000_000);
+        let ts = ok(Timestamp::try_from(leap), "a leap second is representable");
+        let dt = ts.to_datetime();
+        let millis: ArrayString<21> = chrono_reference(dt, MILLIS_PATTERN);
+        let micros: ArrayString<24> = chrono_reference(dt, MICROS_PATTERN);
+        assert_eq!(ts.format_millis(), millis);
+        assert_eq!(ts.format_micros(), micros);
+        assert_eq!(ts.format_millis().as_str(), "20170101-00:00:00.500");
+    }
+
+    #[test]
+    fn test_format_utc_timestamp_four_digit_year_limits_match_chrono() {
+        // Outside the Timestamp range, but still four digits: zero-padded.
+        let cases = [
+            (utc((0, 1, 1), (0, 0, 0), 0), "00000101-00:00:00.000"),
+            (utc((1, 1, 1), (0, 0, 0), 0), "00010101-00:00:00.000"),
+            (
+                utc((999, 12, 31), (23, 59, 59), 999_999_999),
+                "09991231-23:59:59.999",
+            ),
+            (utc((1000, 1, 1), (0, 0, 0), 0), "10000101-00:00:00.000"),
+            (
+                utc((9999, 12, 31), (23, 59, 59), 999_999_999),
+                "99991231-23:59:59.999",
+            ),
+        ];
+        for (dt, expected) in cases {
+            let millis: Option<ArrayString<21>> = format_utc_timestamp(dt);
+            let micros: Option<ArrayString<24>> = format_utc_timestamp(dt);
+            assert_eq!(millis, Some(chrono_reference(dt, MILLIS_PATTERN)), "{dt}");
+            assert_eq!(micros, Some(chrono_reference(dt, MICROS_PATTERN)), "{dt}");
+            assert_eq!(millis.as_ref().map(ArrayString::as_str), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_format_utc_timestamp_year_without_four_digits_is_none() {
+        // chrono prints a sign on such a year (`+10000`, `-0001`), which
+        // overflows the buffer, so the reference wrote nothing at all. The
+        // hand-written formatter reports it instead of truncating, and its
+        // caller's fallback is the same empty buffer.
+        let cases = [
+            utc((10_000, 1, 1), (0, 0, 0), 0),
+            utc((-1, 12, 31), (23, 59, 59), 999_999_999),
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MAX_UTC,
+        ];
+        for dt in cases {
+            let millis: Option<ArrayString<21>> = format_utc_timestamp(dt);
+            let micros: Option<ArrayString<24>> = format_utc_timestamp(dt);
+            let reference_millis: ArrayString<21> = chrono_reference(dt, MILLIS_PATTERN);
+            let reference_micros: ArrayString<24> = chrono_reference(dt, MICROS_PATTERN);
+            assert_eq!(millis, None, "{dt}");
+            assert_eq!(micros, None, "{dt}");
+            assert_eq!(reference_millis.as_str(), "", "{dt}");
+            assert_eq!(reference_micros.as_str(), "", "{dt}");
+            assert_eq!(millis.unwrap_or_default(), reference_millis, "{dt}");
+            assert_eq!(micros.unwrap_or_default(), reference_micros, "{dt}");
+        }
+    }
+
+    #[test]
+    fn test_format_utc_timestamp_length_without_fraction_digits_is_none() {
+        let dt = utc((2024, 2, 29), (12, 34, 56), 789_012_345);
+        // Too short for the prefix, a bare dot, and ten fractional digits.
+        assert_eq!(format_utc_timestamp::<17>(dt), None);
+        assert_eq!(format_utc_timestamp::<18>(dt), None);
+        assert_eq!(format_utc_timestamp::<28>(dt), None);
+    }
+
+    #[test]
+    fn test_put_digits_zero_pads_and_rejects_overflow() {
+        let mut four = [0_u8; 4];
+        assert_eq!(put_digits(&mut four, 7), Some(()));
+        assert_eq!(&four, b"0007");
+        assert_eq!(put_digits(&mut four, 9_999), Some(()));
+        assert_eq!(&four, b"9999");
+        assert_eq!(put_digits(&mut four, 10_000), None);
+
+        let mut two = [0_u8; 2];
+        assert_eq!(put_digits(&mut two, 0), Some(()));
+        assert_eq!(&two, b"00");
+        assert_eq!(put_digits(&mut two, 100), None);
+        assert_eq!(put_digits(&mut [], 0), Some(()));
+        assert_eq!(put_digits(&mut [], 1), None);
     }
 
     #[test]
