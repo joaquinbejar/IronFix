@@ -3573,6 +3573,7 @@ struct FailingStore {
     sender_writes: AtomicU64,
     target_writes: AtomicU64,
     reset_to_calls: AtomicU64,
+    hold_reset_to: AtomicBool,
 }
 
 impl FailingStore {
@@ -3588,6 +3589,7 @@ impl FailingStore {
             sender_writes: AtomicU64::new(0),
             target_writes: AtomicU64::new(0),
             reset_to_calls: AtomicU64::new(0),
+            hold_reset_to: AtomicBool::new(false),
         }
     }
 
@@ -3697,6 +3699,9 @@ impl MessageStore for FailingStore {
     /// Counted, then the same three steps as the trait's default.
     async fn reset_to(&self, next_sender: u64, next_target: u64) -> Result<(), StoreError> {
         self.reset_to_calls.fetch_add(1, Ordering::SeqCst);
+        if self.hold_reset_to.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         self.reset().await?;
         self.set_next_sender_seq(next_sender).await?;
         self.set_next_target_seq(next_target).await
@@ -7176,4 +7181,408 @@ async fn test_opening_resend_request_store_failure_closes_through_the_close_path
         "the close-time reset ran and cleared the filed Logon"
     );
     assert_eq!(store.inner.next_sender_seq(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation and timeouts
+// ---------------------------------------------------------------------------
+
+/// A connect dropped while the store reset for a resetting Logon ack is still
+/// pending leaves the reset owed: the next connect resets the store, logs on
+/// at 1 with `ResetSeqNumFlag` (141), and a `ResendRequest` replays nothing of
+/// the previous stream.
+#[tokio::test]
+async fn test_connect_dropped_during_the_ack_reset_leaves_it_owed() {
+    let (listener, addr) = bind_listener().await;
+    let acceptor = tokio::spawn(async move {
+        // First connection: the venue resets on its ack, and the client gives
+        // up while its store reset hangs.
+        let (socket, _) = ok(listener.accept().await, "accept the first connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(
+            field(&logon, 34).as_deref(),
+            Some("6"),
+            "numbered from the store"
+        );
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]))
+                .await,
+            "send the resetting logon ack",
+        );
+        let _ = msg_types_until_closed(&mut framed).await;
+
+        // Second connection: the client owes the reset and declares it.
+        let (socket, _) = ok(listener.accept().await, "accept the second connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let logon = next_frame(&mut framed).await;
+        let retry_logon = (field(&logon, 34), field(&logon, 141));
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]))
+                .await,
+            "acknowledge the reset",
+        );
+        ok(
+            framed.send(venue_msg("2", 2, &[(7, "1"), (16, "0")])).await,
+            "send ResendRequest",
+        );
+        let mut replies = Vec::new();
+        loop {
+            let frame = next_frame(&mut framed).await;
+            let msg_type = msg_type_of(&frame);
+            let done = msg_type == "4";
+            replies.push((msg_type, field(&frame, 11)));
+            if done {
+                break;
+            }
+        }
+        (retry_logon, replies, framed)
+    });
+
+    let store = Arc::new(FailingStore::working().with_previous_stream(4).await);
+    store.hold_reset_to.store(true, Ordering::SeqCst);
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+
+    // The caller abandons the connect while the reset is pending: no error
+    // branch runs for it.
+    assert!(
+        timeout(Duration::from_millis(500), initiator.connect(addr))
+            .await
+            .is_err(),
+        "the first connect must still be inside the store reset"
+    );
+    assert!(store.inner.contains(5), "the held reset changed nothing");
+    store.hold_reset_to.store(false, Ordering::SeqCst);
+
+    let connection = ok(initiator.connect(addr).await, "reconnect");
+    let (retry_logon, replies, _framed) = ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+    assert_eq!(
+        retry_logon,
+        (Some("1".to_string()), Some("Y".to_string())),
+        "the retry makes the owed reset and declares it"
+    );
+    assert!(
+        replies.iter().all(|(msg_type, _)| msg_type != "D"),
+        "no frame of the previous stream may be replayed: {replies:?}"
+    );
+    assert_eq!(replies, vec![("4".to_string(), None)]);
+    drop(connection);
+}
+
+/// A store write that overruns the store timeout may still land later, so it
+/// leaves a reset owed: under `Continue` the session carries on, and the next
+/// connect resets the store and logs on at 1 with `ResetSeqNumFlag` (141).
+#[tokio::test]
+async fn test_a_timed_out_store_write_leaves_a_reset_owed() {
+    let (listener, addr) = bind_listener().await;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let (socket, _) = ok(listener.accept().await, "accept the first connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let _logon = next_frame(&mut framed).await;
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30")]))
+                .await,
+            "send logon ack",
+        );
+        ok(
+            framed.send(venue_msg("1", 2, &[(112, "READY")])).await,
+            "send TestRequest",
+        );
+        let _reply = next_frame(&mut framed).await;
+        let _ = ready_tx.send(());
+        let _ = armed_rx.await;
+        ok(
+            framed.send(venue_msg("1", 3, &[(112, "PING")])).await,
+            "send TestRequest",
+        );
+        // Continue: answered once the overrun has been logged.
+        let heartbeat = next_frame(&mut framed).await;
+        assert_eq!(field(&heartbeat, 112).as_deref(), Some("PING"));
+        drop(framed);
+
+        let (socket, _) = ok(listener.accept().await, "accept the second connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let logon = next_frame(&mut framed).await;
+        (field(&logon, 34), field(&logon, 141), framed)
+    });
+
+    let store = Arc::new(FailingStore::working());
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+        .with_store_timeout(Duration::from_millis(200));
+    let first = ok(initiator.connect(addr).await, "connect");
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), ready_rx).await,
+            "ready within 5s",
+        ),
+        "stub must reach the session",
+    );
+    store.stall_target.store(true, Ordering::SeqCst);
+    let _ = armed_tx.send(());
+    ok(
+        timeout(Duration::from_secs(5), first.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+    store.stall_target.store(false, Ordering::SeqCst);
+
+    // The reconnect stops at the Logon; the stub reads it and hangs up.
+    let _ = timeout(Duration::from_secs(2), initiator.connect(addr)).await;
+    let (seq, reset, _framed) = ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+    assert_eq!(
+        seq.as_deref(),
+        Some("1"),
+        "the next session starts a new stream"
+    );
+    assert_eq!(reset.as_deref(), Some("Y"), "and declares it");
+}
+
+/// A store whose reset can be submitted as background work that lands only
+/// once a gate opens, after the call's future has been dropped: a durable
+/// store whose write outlives the engine's timeout.
+///
+/// With `ordered` set, every mutation takes a turn in one queue, in call order,
+/// and the late reset keeps its turn until it lands: the ordering the
+/// `MessageStore` contract requires. Without it, mutations do not wait, and the
+/// late reset can land after later writes.
+#[derive(Debug)]
+struct LateResetStore {
+    inner: Arc<MemoryStore>,
+    ordered: bool,
+    queue: Arc<tokio::sync::Mutex<()>>,
+    /// Calls waiting for their turn.
+    waiting: AtomicU64,
+    defer_next_reset: AtomicBool,
+    gate: tokio::sync::watch::Sender<bool>,
+    landed: Arc<AtomicBool>,
+}
+
+impl LateResetStore {
+    fn new(ordered: bool) -> Self {
+        Self {
+            inner: Arc::new(MemoryStore::new()),
+            ordered,
+            queue: Arc::new(tokio::sync::Mutex::new(())),
+            waiting: AtomicU64::new(0),
+            defer_next_reset: AtomicBool::new(false),
+            gate: tokio::sync::watch::channel(false).0,
+            landed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Waits for this call's turn in the queue, when the store is ordered.
+    async fn turn(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        if !self.ordered {
+            return None;
+        }
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let guard = self.queue.lock().await;
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+        Some(guard)
+    }
+}
+
+#[async_trait]
+impl MessageStore for LateResetStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), StoreError> {
+        let _turn = self.turn().await;
+        self.inner.store(seq_num, msg_type, message).await
+    }
+
+    async fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        self.inner.get_range(begin, end).await
+    }
+
+    fn next_sender_seq(&self) -> u64 {
+        self.inner.next_sender_seq()
+    }
+
+    fn next_target_seq(&self) -> u64 {
+        self.inner.next_target_seq()
+    }
+
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+        let _turn = self.turn().await;
+        self.inner.set_next_sender_seq(seq).await
+    }
+
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        let _turn = self.turn().await;
+        self.inner.set_next_target_seq(seq).await
+    }
+
+    async fn reset(&self) -> Result<(), StoreError> {
+        if self.defer_next_reset.swap(false, Ordering::SeqCst) {
+            // The work is submitted now, in call order, and outlives the call.
+            let turn = if self.ordered {
+                Some(Arc::clone(&self.queue).lock_owned().await)
+            } else {
+                None
+            };
+            let inner = Arc::clone(&self.inner);
+            let mut gate = self.gate.subscribe();
+            let landed = Arc::clone(&self.landed);
+            tokio::spawn(async move {
+                let _ = gate.wait_for(|open| *open).await;
+                let _ = inner.reset().await;
+                landed.store(true, Ordering::SeqCst);
+                drop(turn);
+            });
+            // The call itself never completes: the engine's timeout drops it.
+            std::future::pending::<()>().await;
+        }
+        let _turn = self.turn().await;
+        self.inner.reset().await
+    }
+
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.inner.creation_time()
+    }
+}
+
+/// Runs a session whose close-time reset times out but lands later, then a
+/// second session on the same store, and returns what the store holds once
+/// the late reset has landed: whether frames 1 and 2 of the second session are
+/// filed, and the next sender number.
+async fn late_reset_scenario(ordered: bool) -> (bool, bool, u64) {
+    let (listener, addr) = bind_listener().await;
+    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+    let acceptor = tokio::spawn(async move {
+        // First session: logon and ack, then the venue drops the connection.
+        let (socket, _) = ok(listener.accept().await, "accept the first connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let _logon = next_frame(&mut framed).await;
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30")]))
+                .await,
+            "send logon ack",
+        );
+        let _ = armed_rx.await;
+        drop(framed);
+
+        // Second session: the reset is owed, so the Logon declares it.
+        let (socket, _) = ok(listener.accept().await, "accept the second connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(field(&logon, 34).as_deref(), Some("1"));
+        assert_eq!(field(&logon, 141).as_deref(), Some("Y"));
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]))
+                .await,
+            "acknowledge the reset",
+        );
+        let order = next_frame(&mut framed).await;
+        assert_eq!(field(&order, 34).as_deref(), Some("2"));
+        let _ = timeout(Duration::from_secs(5), framed.next()).await;
+    });
+
+    let store = Arc::new(LateResetStore::new(ordered));
+    let mut config = client_config(Duration::from_secs(30));
+    config.reset_on_disconnect = true;
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(config, Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+        .with_store_timeout(Duration::from_millis(200));
+
+    let first = ok(initiator.connect(addr).await, "connect");
+    store.defer_next_reset.store(true, Ordering::SeqCst);
+    let _ = armed_tx.send(());
+    ok(
+        timeout(Duration::from_secs(5), first.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+    assert!(
+        !store.landed.load(Ordering::SeqCst),
+        "the close-time reset timed out with its work still outstanding"
+    );
+
+    let second = if ordered {
+        // The next session's reset queues behind the late one: open the gate
+        // once it waits, so the late reset lands first.
+        let opener = async {
+            while store.waiting.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = store.gate.send(true);
+        };
+        let (second, ()) = tokio::join!(initiator.connect(addr), opener);
+        ok(second, "reconnect")
+    } else {
+        ok(initiator.connect(addr).await, "reconnect")
+    };
+    send_orders(&second, 1).await;
+    ok(
+        timeout(Duration::from_secs(5), async {
+            while !store.inner.contains(2) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the order is filed within 5s",
+    );
+
+    // Let the late reset land, if it has not already.
+    let _ = store.gate.send(true);
+    ok(
+        timeout(Duration::from_secs(5), async {
+            while !store.landed.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the late reset lands within 5s",
+    );
+    let held = (
+        store.inner.contains(1),
+        store.inner.contains(2),
+        store.inner.next_sender_seq(),
+    );
+    drop(second);
+    acceptor.abort();
+    held
+}
+
+/// With a store that applies its mutations in call order, a close-time reset
+/// that timed out and lands later lands before the next session's own reset,
+/// so the next session's frames and counters survive it.
+#[tokio::test]
+async fn test_a_late_reset_cannot_erase_the_next_session_on_an_ordered_store() {
+    assert_eq!(late_reset_scenario(true).await, (true, true, 3));
+}
+
+/// The documented hazard of a store that does not apply its mutations in call
+/// order: the late reset lands after the next session's writes and erases
+/// them. Pinned so the documentation stays true; such a store must not be
+/// reused after a timed-out mutation.
+#[tokio::test]
+async fn test_a_late_reset_erases_the_next_session_on_an_unordered_store() {
+    assert_eq!(late_reset_scenario(false).await, (false, false, 1));
 }

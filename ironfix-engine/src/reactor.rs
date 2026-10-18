@@ -883,21 +883,32 @@ async fn run_reactor<A: Application + 'static>(
         // The stored messages go with the counters. Leaving them behind would
         // file the next session's messages on top of this one's, and a resend
         // request in that session could answer with traffic from this one.
-        if let Some(store) = ctx.store.as_deref()
-            && let Err(err) = timed(ctx.store_timeout, store.reset()).await
-        {
-            // The reset counters written over a store that still holds this
-            // session's stream would describe neither, so none are written.
-            // The reset is owed instead, and the next session fails closed
-            // on it, whatever the policy.
-            write_counters = false;
+        if let Some(store) = ctx.store.as_deref() {
+            // Owed from before the call and cleared only once it has
+            // succeeded: a reactor dropped while the reset is pending (a
+            // runtime shutting down) runs no error branch, and the next
+            // session must still make the reset.
             ctx.reset_owed.store(true, Ordering::Release);
-            tracing::error!(
-                session = %ctx.session_id,
-                error = %err,
-                "cannot reset the store after a session-closing sequence reset: its counters \
-                 are left untouched and the next session must reset it before it starts"
-            );
+            match timed(ctx.store_timeout, store.reset()).await {
+                Ok(()) => ctx.reset_owed.store(false, Ordering::Release),
+                Err(err) => {
+                    // The reset counters written over a store that still
+                    // holds this session's stream would describe neither, so
+                    // none are written. The reset stays owed, and the next
+                    // session fails closed on it, whatever the policy. A reset
+                    // that timed out may still land later; a store that
+                    // applies its mutations in call order lands it before the
+                    // next session's reset.
+                    write_counters = false;
+                    tracing::error!(
+                        session = %ctx.session_id,
+                        error = %err,
+                        "cannot reset the store after a session-closing sequence reset: its \
+                         counters are left untouched and the next session must reset it before \
+                         it starts"
+                    );
+                }
+            }
         }
     }
     // The session is over, so a failure here has nothing left to close: it is
@@ -949,18 +960,20 @@ async fn run_reactor<A: Application + 'static>(
     }
 }
 
-/// Binds an attached store to the session's policy and timeout.
+/// Binds an attached store to the session's policy, timeout and owed-reset
+/// record.
 ///
 /// A free function over the fields, not a `Reactor` method: a method would
 /// borrow the whole reactor, and the callers need the counter record mutably
 /// beside it.
 #[must_use]
-fn bind_store(
-    store: Option<&Arc<dyn MessageStore>>,
+fn bind_store<'s>(
+    store: Option<&'s Arc<dyn MessageStore>>,
     policy: StoreFailurePolicy,
     timeout: Duration,
-) -> Option<SessionStore<'_>> {
-    store.map(|store| SessionStore::new(store.as_ref(), policy, timeout))
+    owed: &'s AtomicBool,
+) -> Option<SessionStore<'s>> {
+    store.map(|store| SessionStore::new(store.as_ref(), policy, timeout, owed))
 }
 
 /// Persists `next` as the next target sequence number, if it changed since the
@@ -1031,7 +1044,12 @@ impl<A: Application> Reactor<A> {
         let Some(store) = self.store.as_deref() else {
             return Ok(());
         };
-        let store = SessionStore::new(store, self.store_policy, self.store_timeout);
+        let store = SessionStore::new(
+            store,
+            self.store_policy,
+            self.store_timeout,
+            &self.reset_owed,
+        );
         let sender = self.runtime.sequences.next_sender_seq().value();
         if let Some(next) = self.persisted.sender_to_write(sender) {
             self.persisted.record_sender(next);
@@ -1052,7 +1070,12 @@ impl<A: Application> Reactor<A> {
     /// A store error under [`StoreFailurePolicy::CloseSession`]: the message
     /// must then not be acted on.
     async fn persist_target(&mut self, next: u64) -> Result<(), StoreError> {
-        let store = bind_store(self.store.as_ref(), self.store_policy, self.store_timeout);
+        let store = bind_store(
+            self.store.as_ref(),
+            self.store_policy,
+            self.store_timeout,
+            &self.reset_owed,
+        );
         persist_target_with(store, &mut self.persisted, &self.session_id, next).await
     }
 
@@ -1108,8 +1131,13 @@ impl<A: Application> Reactor<A> {
             // spends them, so nothing can take the peeked number in between;
             // the mismatch check inside exists so a wrong `MsgSeqNum` can never
             // reach the wire, not because it is reachable.
-            let store = bind_store(self.store.as_ref(), self.store_policy, self.store_timeout)
-                .map(|store| (store, &mut self.persisted));
+            let store = bind_store(
+                self.store.as_ref(),
+                self.store_policy,
+                self.store_timeout,
+                &self.reset_owed,
+            )
+            .map(|store| (store, &mut self.persisted));
             file_and_spend(
                 store,
                 &self.runtime.sequences,
@@ -2411,7 +2439,12 @@ impl<A: Application> Reactor<A> {
                 },
             ));
         };
-        let store = bind_store(self.store.as_ref(), self.store_policy, self.store_timeout);
+        let store = bind_store(
+            self.store.as_ref(),
+            self.store_policy,
+            self.store_timeout,
+            &self.reset_owed,
+        );
         if let Err(err) =
             persist_target_with(store, &mut self.persisted, &self.session_id, next).await
         {

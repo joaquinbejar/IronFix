@@ -47,6 +47,37 @@
 //! so after a failure a crash can leave the store behind what the
 //! counterparty has seen.
 //!
+//! # Mutations take effect in call order, even when a call is dropped
+//!
+//! `ironfix-engine` bounds every call with a timeout, and a timeout drops the
+//! call's future; so does a caller that abandons a connect. A store whose call
+//! has already submitted work (a disk write, a replication round trip) may
+//! still complete it afterwards. Every implementation must therefore apply
+//! its **mutations** ([`MessageStore::store`],
+//! [`MessageStore::file_outbound`], the two counter setters,
+//! [`MessageStore::reset`], [`MessageStore::reset_to`]) **in call order, even
+//! when a call's future is dropped before it completes**: a mutation takes
+//! effect before any mutation called after it, or not at all. Serialising
+//! mutations through an internal queue that later calls wait behind, or
+//! completing or aborting the submitted work synchronously when the future is
+//! dropped, both satisfy this.
+//!
+//! [`MemoryStore`](crate::MemoryStore) satisfies it: each of its mutations
+//! runs to completion within a single poll of its future, under its lock and
+//! without awaiting anything, so a dropped future has either applied its
+//! change in full or not started it. (The defaulted composite methods,
+//! [`MessageStore::file_outbound`] and [`MessageStore::reset_to`], run their
+//! steps in order; a composite dropped between steps leaves the earlier steps
+//! applied, still in order.)
+//!
+//! The engine relies on this after a mutation times out: it treats the store
+//! as possibly holding an outstanding write, records that a reset is owed, and
+//! starts the next session with a reset. With a conforming store the late
+//! write lands before that reset, which erases it. A store that does not
+//! conform can apply the late write after the next session's reset and
+//! writes, overwriting a frame or moving a counter of the new stream:
+//! reusing such a store after a timed-out mutation is not safe.
+//!
 //! Error values must never contain frame bytes: an outbound Logon carries
 //! `Password` (554), and the engine logs store errors.
 

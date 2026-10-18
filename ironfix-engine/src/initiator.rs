@@ -365,6 +365,12 @@ impl<A: Application + 'static> Initiator<A> {
     /// that overruns is answered with a gap fill. Without a store this has no
     /// effect.
     ///
+    /// A write that overruns may still land later, so it also leaves a reset
+    /// owed: the next session resets the store and logs on with
+    /// `ResetSeqNumFlag` (141) = Y. Reusing the store is safe only if it
+    /// applies its mutations in call order even when a call is dropped (see
+    /// the [`persistence`](crate::persistence) module).
+    ///
     /// A zero timeout is raised to one tick, as for the write timeout: a call
     /// given no time at all can never succeed.
     ///
@@ -524,6 +530,12 @@ impl<A: Application + 'static> Initiator<A> {
 
         let owed = self.reset_is_owed();
         if owed || self.config.reset_on_logon {
+            if store.is_some() {
+                // Owed from before the call until the Logon declaring the
+                // reset is acknowledged: a connect dropped while the reset is
+                // pending leaves it owed, and so does one that fails later.
+                self.reset_owed.store(true, Ordering::Release);
+            }
             if let Some(store) = store
                 && let Err(err) = timed(store_timeout, store.reset()).await
             {
@@ -773,7 +785,7 @@ impl<A: Application + 'static> Initiator<A> {
         // Every handshake write goes through this binding, which also records
         // the counter values written, for the reactor to start from.
         let mut store = self.store.as_deref().map(|store| HandshakeStore {
-            store: SessionStore::new(store, self.store_policy, store_timeout),
+            store: SessionStore::new(store, self.store_policy, store_timeout, &self.reset_owed),
             persisted,
         });
 
@@ -1071,11 +1083,16 @@ impl<A: Application + 'static> Initiator<A> {
                 // the new one uses. The reset is then owed, so the next connect
                 // makes it and declares ResetSeqNumFlag itself.
                 if !reset_logon && let Some(handshake) = store.as_mut() {
+                    // Owed before the call and cleared only once it has
+                    // succeeded: a caller that drops this connect while the
+                    // reset is pending runs no error branch, and the next
+                    // connect must still make the reset and declare it.
+                    self.reset_owed.store(true, Ordering::Release);
                     if let Err(err) = handshake.store.reset_to(&session_id, 2, 2).await {
-                        self.reset_owed.store(true, Ordering::Release);
                         let _ = session.on_logon_reject();
                         return Err(err.into());
                     }
+                    self.reset_owed.store(false, Ordering::Release);
                     // The reset replaced whatever was recorded as written.
                     handshake.persisted = PersistedCounters::default();
                     handshake.persisted.record_sender(2);
@@ -1128,9 +1145,9 @@ impl<A: Application + 'static> Initiator<A> {
             }
         }
 
-        // The Logon that declared an owed reset has been acknowledged: the
-        // reset is no longer owed.
-        if reset_logon && !self.config.reset_on_logon {
+        // The Logon that declared the reset has been acknowledged: no reset is
+        // owed any more.
+        if reset_logon {
             self.reset_owed.store(false, Ordering::Release);
         }
 

@@ -111,6 +111,28 @@
 //! counters, and the next session's Logon goes out at 1 without a reset. A
 //! durable store should override it.
 //!
+//! # Cancellation and timeouts
+//!
+//! A reset is recorded as owed **before** the engine awaits it, and the
+//! record is cleared only once the reset has succeeded (for a reset declared
+//! on a Logon, once that Logon is acknowledged). A caller that drops a connect
+//! while a reset is pending, or a runtime that drops a closing session, runs no
+//! error branch; the record still says the reset is owed, and the next session
+//! makes it and declares it.
+//!
+//! A timeout drops the store call's future, not necessarily the work the store
+//! has already submitted: a disk or replication write can still land later.
+//! After any mutation overruns the store timeout, the engine therefore treats
+//! the store as possibly holding an outstanding write and records a reset as
+//! owed: the next session starts a new stream, with a reset and
+//! `ResetSeqNumFlag` (141) = Y, rather than building on counters a late write
+//! may still move. That is safe only for a store that applies its mutations in
+//! call order even when a call's future is dropped, as the [`MessageStore`]
+//! contract requires: the late write then lands before the next session's
+//! reset, which erases it. A store that does not can apply the late write after
+//! the next session's own writes, erasing a filed frame or moving a counter of
+//! the new stream; such a store must not be reused after a timed-out mutation.
+//!
 //! A store failure never logs frame bytes: an outbound Logon carries
 //! `Password` (554).
 
@@ -121,6 +143,7 @@ use ironfix_core::message::MsgType;
 use ironfix_session::SequenceManager;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_store::MessageStore;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// What the engine does when a write to the attached [`MessageStore`] fails.
@@ -231,7 +254,7 @@ pub(crate) async fn timed<T>(
 }
 
 /// A store attached to a session, together with the policy for its write
-/// failures and the bound on each call.
+/// failures, the bound on each call, and the engine's owed-reset record.
 ///
 /// Built wherever the engine writes: the handshakes and the reactor share it,
 /// so the ordering and the policy cannot drift between them.
@@ -243,21 +266,52 @@ pub(crate) struct SessionStore<'s> {
     policy: StoreFailurePolicy,
     /// Bound on each store call; an overrun is a failed write.
     timeout: Duration,
+    /// The engine's record of a reset owed to the next session, set when a
+    /// mutation overruns the timeout.
+    owed: &'s AtomicBool,
 }
 
 impl<'s> SessionStore<'s> {
-    /// Binds `store` to `policy`, bounding each call by `timeout`.
+    /// Binds `store` to `policy`, bounding each call by `timeout`; a mutation
+    /// that overruns it leaves a reset owed in `owed`.
     #[must_use]
     pub(crate) const fn new(
         store: &'s dyn MessageStore,
         policy: StoreFailurePolicy,
         timeout: Duration,
+        owed: &'s AtomicBool,
     ) -> Self {
         Self {
             store,
             policy,
             timeout,
+            owed,
         }
+    }
+
+    /// Runs one mutation bounded by the timeout.
+    ///
+    /// A timeout drops the call's future, not necessarily the work the store
+    /// has already submitted: a disk or replication write can still land
+    /// later. After an overrun the store is therefore treated as possibly
+    /// holding an outstanding write, and a reset is owed, so the next session
+    /// starts a new stream (a reset, and `ResetSeqNumFlag` (141) = Y) instead
+    /// of building on counters a late write may still move. That is safe only
+    /// for a store that applies its mutations in call order even when a call's
+    /// future is dropped (see [`MessageStore`]): the late write then lands
+    /// before the reset, which erases it.
+    ///
+    /// # Errors
+    /// The store's error, or [`StoreError::Timeout`].
+    async fn mutate(
+        self,
+        call: impl Future<Output = Result<(), StoreError>>,
+    ) -> Result<(), StoreError> {
+        let result = timed(self.timeout, call).await;
+        if matches!(result, Err(StoreError::Timeout { .. })) {
+            self.owed.store(true, Ordering::Release);
+        }
+        result
     }
 
     /// Files an outbound frame under `seq` and persists `next_sender`,
@@ -283,11 +337,9 @@ impl<'s> SessionStore<'s> {
         frame: &[u8],
         next_sender: u64,
     ) -> Result<(), StoreError> {
-        let filed = timed(
-            self.timeout,
-            self.store.file_outbound(seq, msg_type, frame, next_sender),
-        )
-        .await;
+        let filed = self
+            .mutate(self.store.file_outbound(seq, msg_type, frame, next_sender))
+            .await;
         match filed {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -306,7 +358,7 @@ impl<'s> SessionStore<'s> {
         session_id: &SessionId,
         next: u64,
     ) -> Result<(), StoreError> {
-        match timed(self.timeout, self.store.set_next_sender_seq(next)).await {
+        match self.mutate(self.store.set_next_sender_seq(next)).await {
             Ok(()) => Ok(()),
             Err(err) => self.on_failure(session_id, StoreWrite::NextSender(next), err),
         }
@@ -321,7 +373,7 @@ impl<'s> SessionStore<'s> {
         session_id: &SessionId,
         next: u64,
     ) -> Result<(), StoreError> {
-        match timed(self.timeout, self.store.set_next_target_seq(next)).await {
+        match self.mutate(self.store.set_next_target_seq(next)).await {
             Ok(()) => Ok(()),
             Err(err) => self.on_failure(session_id, StoreWrite::NextTarget(next), err),
         }
@@ -344,7 +396,7 @@ impl<'s> SessionStore<'s> {
         next_target: u64,
     ) -> Result<(), StoreError> {
         let reset = self.store.reset_to(next_sender, next_target);
-        timed(self.timeout, reset).await.inspect_err(|err| {
+        self.mutate(reset).await.inspect_err(|err| {
             tracing::error!(
                 session = %session_id,
                 error = %err,
