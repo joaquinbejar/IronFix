@@ -198,7 +198,10 @@ around it.
   repository exercised is the FIX Trading Community's `OrchestraFIX44.xml`, a
   test fixture that is not embedded or published. `FIX.Latest` repositories
   are rejected (`DictionaryError::UnsupportedVersion`): FIX Latest names no
-  fixed FIX version. Only the `base` scenario is loaded.
+  fixed FIX version. So is a repository named `FIXT` whose version is not
+  `FIXT.1.1`, which includes the FIX Trading Community's FIXT session
+  repository (it declares `FIX.5.0SP2_EP247`). Only the `base` scenario is
+  loaded.
 - **Generated code has no consumer.** Nothing in the workspace uses the
   derives or `ironfix-codegen` output (data structs or views) at run time
   (`ironfix-codegen-check` only compiles generated code: the views of the
