@@ -1067,6 +1067,123 @@ mod tests {
         }
     }
 
+    /// The embedded dictionaries, loaded.
+    fn embedded_dictionaries() -> [(&'static Dictionary, &'static str); 4] {
+        [
+            (embedded(Dictionary::fix42(), "FIX 4.2"), "FIX 4.2"),
+            (embedded(Dictionary::fix44(), "FIX 4.4"), "FIX 4.4"),
+            (embedded(Dictionary::fixt11(), "FIXT 1.1"), "FIXT 1.1"),
+            (
+                embedded(Dictionary::fix50sp2(), "FIX 5.0 SP2"),
+                "FIX 5.0 SP2",
+            ),
+        ]
+    }
+
+    /// The names of the types declared in `code`, generic parameters
+    /// dropped (`XView<'m, 'a>` is `XView`).
+    fn declared_types(code: &str) -> Vec<&str> {
+        code.lines()
+            .filter_map(|text| text.trim_start().strip_prefix("pub struct "))
+            .filter_map(|rest| rest.split([' ', '<']).next())
+            .collect()
+    }
+
+    #[test]
+    fn test_generate_entry_structs_pair_with_the_group_views() {
+        // ADR-0019: absent a name collision, the entry struct of a group is
+        // its view's base followed by `Entry` (`PartiesNoPartyIDsEntry` and
+        // `PartiesNoPartyIDsView`). None of the embedded dictionaries has a
+        // collision, so the two sets of bases are equal.
+        let generator = CodeGenerator::new();
+        for (dict, what) in embedded_dictionaries() {
+            let code = generate(&generator, dict);
+            let views = match generator.generate_views(dict) {
+                Ok(views) => views,
+                Err(err) => panic!("{what} views must generate: {err}"),
+            };
+            let entries: std::collections::BTreeSet<&str> = declared_types(&code)
+                .into_iter()
+                .filter_map(|name| name.strip_suffix("Entry"))
+                .collect();
+            let messages: HashSet<&str> = declared_types(messages_module(&code))
+                .into_iter()
+                .filter(|name| !name.ends_with("Entry"))
+                .collect();
+            assert_eq!(messages.len(), dict.messages().count(), "{what}");
+            let group_views: std::collections::BTreeSet<&str> = declared_types(&views)
+                .into_iter()
+                .filter_map(|name| name.strip_suffix("View"))
+                .filter(|base| !messages.contains(base))
+                .collect();
+            assert_eq!(entries, group_views, "{what}");
+            // FIXT 1.1 has no group in a message body; the others do.
+            assert_eq!(entries.is_empty(), what == "FIXT 1.1", "{what}");
+        }
+    }
+
+    /// Collects the field tags one level reaches, its own and its
+    /// components' (recursively), without entering groups; the groups met
+    /// are pushed to `groups`, each a level of its own.
+    fn level_tags<'d>(
+        dict: &'d Dictionary,
+        members: Vec<ironfix_dictionary::schema::MemberRef<'d>>,
+        tags: &mut Vec<u32>,
+        groups: &mut Vec<&'d GroupDef>,
+    ) {
+        use ironfix_dictionary::schema::MemberRef;
+        for member in members {
+            match member {
+                MemberRef::Field(field) => tags.push(field.tag),
+                MemberRef::Group(group) => groups.push(group),
+                MemberRef::Component(reference) => {
+                    if let Some(component) = dict.get_component(&reference.name) {
+                        level_tags(dict, component.members().collect(), tags, groups);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_embedded_dictionaries_reach_no_tag_twice_at_one_level() {
+        // ADR-0019's "not covered" case, a tag a message (or an entry) lists
+        // and also reaches through one of its components, becomes a field of
+        // each struct. No message body and no group entry of the embedded
+        // dictionaries reaches a tag twice, so none of their outputs has it.
+        for (dict, what) in embedded_dictionaries() {
+            let mut levels: Vec<(String, Vec<ironfix_dictionary::schema::MemberRef<'_>>)> = dict
+                .messages()
+                .map(|message| {
+                    (
+                        format!("message {}", message.name),
+                        message.members().collect(),
+                    )
+                })
+                .collect();
+            let mut checked = 0usize;
+            while let Some((scope, members)) = levels.pop() {
+                let mut tags = Vec::new();
+                let mut groups = Vec::new();
+                level_tags(dict, members, &mut tags, &mut groups);
+                let unique: HashSet<u32> = tags.iter().copied().collect();
+                assert_eq!(
+                    unique.len(),
+                    tags.len(),
+                    "{what}: {scope} reaches a tag twice"
+                );
+                for group in groups {
+                    levels.push((
+                        format!("group {} of {scope}", group.name),
+                        group.members().collect(),
+                    ));
+                }
+                checked += 1;
+            }
+            assert!(checked >= dict.messages().count(), "{what}");
+        }
+    }
+
     #[test]
     fn test_generate_respects_configured_visibility() {
         let generator = CodeGenerator::with_config(GeneratorConfig {
