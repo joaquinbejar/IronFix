@@ -332,6 +332,17 @@ pub enum StoreError {
     /// I/O error in persistent store.
     #[error("store i/o error: {0}")]
     Io(String),
+
+    /// A store call did not complete within the time the caller allowed it.
+    ///
+    /// Raised by the caller, not by a store: `ironfix-engine` bounds every
+    /// store call and reports one that overruns as this error, which its store
+    /// failure policy then treats like any other failed write.
+    #[error("store call did not complete within {timeout:?}")]
+    Timeout {
+        /// The bound the call overran.
+        timeout: std::time::Duration,
+    },
 }
 
 /// Rejection reasons for [`crate::types::CompId`] construction.

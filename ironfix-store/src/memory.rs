@@ -444,6 +444,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_memory_store_store_at_an_existing_seq_replaces_the_frame() {
+        let store = MemoryStore::new();
+        put(&store, 7, MsgType::NewOrderSingle, b"first").await;
+        put(&store, 7, MsgType::OrderCancelRequest, b"second").await;
+
+        let range = ok(store.get_range(7, 7).await, "range 7..=7 must resolve");
+        let [message] = range.as_slice() else {
+            panic!("exactly one message must remain, got {}", range.len());
+        };
+        assert_eq!(message.msg_type(), &MsgType::OrderCancelRequest);
+        assert_eq!(&message.payload()[..], b"second");
+    }
+
+    #[tokio::test]
+    async fn test_memory_store_file_outbound_files_then_persists_the_counter() {
+        let store = MemoryStore::new();
+        ok(
+            store
+                .file_outbound(4, &MsgType::NewOrderSingle, b"frame", 5)
+                .await,
+            "file_outbound",
+        );
+        assert!(store.contains(4));
+        assert_eq!(store.next_sender_seq(), 5);
+    }
+
+    #[tokio::test]
     async fn test_memory_store_sequence_numbers_round_trip() {
         let store = MemoryStore::new();
 

@@ -11,25 +11,40 @@
 //! # The persistence contract
 //!
 //! Every write is fallible and asynchronous: [`MessageStore::store`],
-//! [`MessageStore::set_next_sender_seq`] and
+//! [`MessageStore::file_outbound`], [`MessageStore::set_next_sender_seq`] and
 //! [`MessageStore::set_next_target_seq`] return a `Result`, so a store backed by
-//! a disk or a replica can report a write it could not make, and can do real
-//! I/O without blocking the session reactor. `Ok` means the value is as durable
-//! as the implementation promises; [`MemoryStore`](crate::MemoryStore) promises
+//! a disk or a replica can report a write it could not make. Being `async`, a
+//! call does not block the runtime thread, but the session awaits it: a slow
+//! store delays that session's reactor for as long as the call takes.
+//! `ironfix-engine` bounds every call with a store timeout and treats an
+//! overrun as a failed write. `Ok` means the value is as durable as the
+//! implementation promises; [`MemoryStore`](crate::MemoryStore) promises
 //! nothing beyond the process.
+//!
+//! Each call through this `async_trait` interface allocates one boxed future.
+//! [`MessageStore::file_outbound`] exists so the per-message outbound write is
+//! one call (and, for a durable store, can be one atomic write) rather than
+//! two.
 //!
 //! `ironfix-engine` relies on the following ordering, which a durable store
 //! makes meaningful (see `doc/adr/0005-fallible-store-writes.md`):
 //!
-//! - An outbound frame is filed with `store`, and then the next sender
-//!   sequence number is persisted, **before** the frame's bytes reach the
-//!   socket. A crash can therefore leave a filed frame the peer never saw, or a
-//!   spent number, but never a frame on the wire the store cannot replay.
+//! - An outbound frame is filed, and then the next sender sequence number is
+//!   persisted, **before** the frame's bytes reach the socket (both through
+//!   [`MessageStore::file_outbound`]). A crash can therefore leave a filed
+//!   frame the peer never saw, or a spent number, but never a frame on the wire
+//!   the store cannot replay.
 //! - The next target sequence number is persisted **before** the inbound
 //!   message that advanced it is acted on: before an administrative message is
 //!   processed, and before an application message is handed to the
-//!   application.
+//!   application. The initiator's Logon acknowledgement and a `SequenceReset`
+//!   in Reset mode are the exceptions: they reach `from_admin` first.
 //! - A counter is written only when its value changed.
+//!
+//! These are guarantees only under the engine's fail-closed store policy. Its
+//! default policy logs a failed write and carries on as if it had succeeded,
+//! so after a failure a crash can leave the store behind what the
+//! counterparty has seen.
 //!
 //! Error values must never contain frame bytes: an outbound Logon carries
 //! `Password` (554), and the engine logs store errors.
@@ -54,6 +69,12 @@ pub trait MessageStore: Send + Sync {
     ///
     /// `message` must be the **complete frame**, from `BeginString` (8) through
     /// `CheckSum` (10), because a resend rebuilds from it verbatim.
+    ///
+    /// Filing under a `seq_num` that is already filed **replaces** the frame
+    /// there. The engine relies on this: a crash after a frame is filed but
+    /// before its number is persisted makes the next session reuse that number
+    /// for a message the peer never saw, and the new frame must be the one a
+    /// resend replays.
     ///
     /// # Arguments
     /// * `seq_num` - The `MsgSeqNum` (34) the message was sent under
@@ -146,6 +167,37 @@ pub trait MessageStore: Send + Sync {
         }
     }
 
+    /// Files an outbound frame under `seq_num` and persists `next_sender` as
+    /// the next sender sequence number, in that order.
+    ///
+    /// This is the one call the engine makes per outbound sequenced message,
+    /// before the frame's bytes are written. The default runs
+    /// [`store`](MessageStore::store) and then
+    /// [`set_next_sender_seq`](MessageStore::set_next_sender_seq), stopping at
+    /// the first error. A durable store should override it to make both
+    /// changes in one atomic write: then a crash leaves either both or
+    /// neither, and the engine pays one call instead of two.
+    ///
+    /// # Arguments
+    /// * `seq_num` - The `MsgSeqNum` (34) the message is sent under
+    /// * `msg_type` - The `MsgType` (35) the message is sent as
+    /// * `message` - The complete raw frame bytes
+    /// * `next_sender` - The next `MsgSeqNum` to send, `seq_num + 1`
+    ///
+    /// # Errors
+    /// Returns `StoreError` if either write fails. The error must not contain
+    /// frame bytes.
+    async fn file_outbound(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+        next_sender: u64,
+    ) -> Result<(), StoreError> {
+        self.store(seq_num, msg_type, message).await?;
+        self.set_next_sender_seq(next_sender).await
+    }
+
     /// Returns the next sender sequence number.
     fn next_sender_seq(&self) -> u64;
 
@@ -154,10 +206,26 @@ pub trait MessageStore: Send + Sync {
 
     /// Persists the next sender sequence number.
     ///
-    /// The engine calls this after filing an outbound frame and before the
-    /// frame is written, with the number the next outbound message will carry.
-    /// It calls it only when the value changed, and the value never goes down
-    /// except through [`reset`](MessageStore::reset).
+    /// The engine calls this through
+    /// [`file_outbound`](MessageStore::file_outbound) before a frame is
+    /// written, with the number the next outbound message will carry, and on
+    /// its own after other counter changes, only when the value changed.
+    ///
+    /// The value is **not** monotonic, and a store must not reject a lower
+    /// one:
+    ///
+    /// - A sequence reset brings it back down: a Logon or Logon ack with
+    ///   `ResetSeqNumFlag` (141) = Y, the `reset_on_logout` /
+    ///   `reset_on_disconnect` close, and a reset the previous session owed.
+    ///   The engine resets the store first in each case.
+    /// - After a failed [`file_outbound`](MessageStore::file_outbound) the
+    ///   number was not spent, and the engine writes the unspent number when
+    ///   the session closes. That can be one below what the failed call left
+    ///   behind, if it took effect and still reported a failure (a call that
+    ///   overran the engine's store timeout, for instance).
+    /// - An explicit `with_initial_sequences` seed on the initiator can start
+    ///   a session below the stored value (the fail-closed policy refuses
+    ///   that; the default does not).
     ///
     /// # Arguments
     /// * `seq` - The next `MsgSeqNum` (34) to send
@@ -171,9 +239,11 @@ pub trait MessageStore: Send + Sync {
     ///
     /// The engine calls this when an inbound message has been accepted in
     /// sequence, before the message is acted on (processed, if administrative;
-    /// handed to the application, if not), and after any other change to the
-    /// expectation (a `SequenceReset`, a gap fill), only when the value
-    /// changed.
+    /// handed to the application, if not), and before any other change to the
+    /// expectation (a `SequenceReset`, a gap fill) takes effect, only when the
+    /// value changed. Two messages reach the application's `from_admin`
+    /// before the write: the initiator's Logon acknowledgement and a
+    /// `SequenceReset` in Reset mode (see `doc/adr/0005-fallible-store-writes.md`).
     ///
     /// # Arguments
     /// * `seq` - The next inbound `MsgSeqNum` (34) expected
@@ -259,6 +329,13 @@ mod tests {
         assert!(store.store(1, &MsgType::Heartbeat, b"test").await.is_ok());
         assert!(store.set_next_sender_seq(2).await.is_ok());
         assert!(store.set_next_target_seq(2).await.is_ok());
+        // The default `file_outbound` composes the two writes.
+        assert!(
+            store
+                .file_outbound(2, &MsgType::Heartbeat, b"test", 3)
+                .await
+                .is_ok()
+        );
         assert!(store.reset().await.is_ok());
     }
 }
