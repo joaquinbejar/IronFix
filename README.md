@@ -48,8 +48,14 @@ exists yet.
   serves inbound connections for one configured counterparty and runs the
   acceptor half: CompID authentication, a logon timeout, honouring the
   counterparty's `HeartBtInt`, and mirroring `ResetSeqNumFlag`.
-  `EngineBuilder` terminates in either one via `into_initiator()` /
-  `into_acceptor()`.
+  `AcceptorRegistry` serves many counterparties on one listener: it reads
+  each inbound Logon once, routes it by the CompIDs (and configured sub and
+  location IDs) in its standard header, bounded before anything is looked
+  up, to a registered `Acceptor` or one an optional `SessionLookup` admits,
+  and runs that session's handshake; a Logon it cannot route is closed
+  without a reply, touching no store. Each session keeps its own sequence
+  numbers, store and heartbeat. `EngineBuilder` terminates in any of them
+  via `into_initiator()`, `into_acceptor()` or `into_acceptor_registry()`.
 - **One session reactor shared by both roles.** Once Logon completes, the
   engine owns the socket: heartbeats and TestRequests at the negotiated
   interval, CompID and `SendingTime` validation, sequence-gap detection with
@@ -157,10 +163,15 @@ around it.
   close whose application queue does not drain in time, loses the messages
   still queued. The close logs the lost range; nothing reports a loss across
   a restart yet (#105). Inbound frames are not filed.
-- **One session per engine.** `EngineBuilder` takes exactly one
-  `SessionConfig`; `into_initiator()` and `into_acceptor()` return
-  `EngineError::Configuration` for zero or several
-  (`ironfix-engine/src/builder.rs`).
+- **One session per `Initiator` or `Acceptor`.** `into_initiator()` and
+  `into_acceptor()` return `EngineError::Configuration` unless exactly one
+  `SessionConfig` was added (`ironfix-engine/src/builder.rs`). Several
+  acceptor sessions on one listener go through `AcceptorRegistry`
+  (`into_acceptor_registry()`); there is no multi-session initiator. The
+  registry's routing key does not include `BeginString`, so two sessions
+  that differ only by FIX version cannot share a registry, and
+  `into_acceptor_registry()` attaches a builder store only to a single
+  session (register each `Acceptor` with its own store instead).
 - **No TLS.** There is no `rustls` dependency anywhere. `ironfix-transport`
   contains `FixCodec` only; the engines open plain TCP themselves (`Initiator`
   calls `TcpStream::connect`, `Acceptor` serves a `TcpStream`). See "Current

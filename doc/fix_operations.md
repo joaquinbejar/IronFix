@@ -47,7 +47,9 @@ These messages are required for establishing and maintaining FIX sessions.
 | 384 | NoMsgTypes | FIXT.1.1 only: repeating group of supported message types (372, 385, 1130, 1406, 1131, 1410). The embedded QuickFIX `FIXT11.xml` does not define it; see "Dictionary side, standalone" below |
 
 **Server Behavior**:
-1. Validate SenderCompID and TargetCompID
+1. Validate SenderCompID and TargetCompID (a server fronting several
+   counterparties first selects the session by them; see "Routing a Logon to
+   its session" below)
 2. Authenticate credentials if provided
 3. Initialize session state
 4. Respond with Logon message
@@ -206,6 +208,60 @@ the Logon:
 A gap in the inbound Logon completes the handshake and immediately issues a
 `ResendRequest` (2). Once Active, the session runs the same reactor as the
 initiator, so every inbound-frame rule below applies identically to both roles.
+
+**Routing a Logon to its session (several counterparties on one listener)**
+
+An `Acceptor` is one configured session. `ironfix-engine::AcceptorRegistry`
+holds one `Acceptor` per session (each with its own configuration, optional
+store and settings; one application type for all), reads each inbound Logon
+once and routes it before any session's handshake runs
+(`doc/adr/0018-acceptor-registry.md`):
+
+1. **Read.** The Logon is framed under the registry's own ceiling
+   (`AcceptorRegistry::with_max_message_size`, default 64 KiB) with checksum
+   validation and garbled-frame recovery on (garbled frames are skipped, as on
+   `Acceptor::serve`). Reading it and resolving its session are bounded
+   together by the registry's logon timeout (`with_logon_timeout`, default
+   10 s); expiry is `EngineError::LogonTimeout`. The first frame must be a
+   Logon.
+2. **Bound the identity.** `SenderCompID` (49) and `TargetCompID` (56), and
+   `SenderSubID` (50), `TargetSubID` (57), `SenderLocationID` (142) and
+   `TargetLocationID` (143) when present, are read from the **standard header**
+   only (a body-only 49 or 56 is absent) and must each be 1 to 32 bytes of
+   printable ASCII, the bound a configured CompID, sub ID or location ID
+   obeys. Anything else is `EngineError::UnroutableLogon`, decided before any
+   session or the lookup is consulted. Only these fields are ever logged, so
+   `Password` (554), `NewPassword` (925) and `RawData` (96) never are.
+3. **Match.** The key is the session's configured identity, reversed: the
+   Logon's 49 is the session's `target_comp_id`, its 56 the session's
+   `sender_comp_id`, and a sub or location ID the session configures must be
+   carried with the reversed value; one it does not configure places no
+   requirement. `BeginString` (8) is not part of the key; the routed session
+   checks it. Registration refuses a session whose key overlaps one already
+   registered (a Logon could match both) or whose `SessionId` is already
+   registered, so a Logon matches at most one session.
+4. **Look up.** With no match, an optional `SessionLookup` is asked about the
+   identity (never the Logon, so it never sees credentials). It may return the
+   `Acceptor` that serves it, which must route that identity and not overlap a
+   registered session, or refuse. An admitted session stays registered for the
+   registry's lifetime, so its single admission slot and owed-reset record
+   persist; two lookups racing for one identity end with one `Acceptor`, and
+   the second Logon is then refused as a duplicate.
+5. **Hand over.** The routed `Acceptor` runs its handshake on the Logon
+   exactly as `Acceptor::serve` does once a Logon has arrived: the checks
+   above in the same order, with the same refusal groups. `on_create` fires
+   for it at this point (not before the read, as on `serve`), the socket
+   switches to the session's own codec settings, and a Logon above the
+   session's `max_message_size` is refused as its codec would have refused it.
+
+A Logon that cannot be routed (unroutable identity, unknown session, a lookup
+that refuses or does not answer in time, a first frame that is not a Logon) is
+closed **without a reply**, touches no store and runs no `Application`
+callback: before routing there is no session whose stream could number a
+reply, no store to file it in, and no configured identity to stamp on it. A
+second Logon for a session that is live is refused without a reply by that
+session's admission slot while the live session continues. Every session keeps
+its own sequence numbers, store and heartbeat.
 
 ---
 
