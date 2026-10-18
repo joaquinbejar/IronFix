@@ -32,6 +32,16 @@ pub enum EngineError {
     Codec(#[from] CodecError),
 
     /// Failure decoding a framed FIX message.
+    ///
+    /// Neither Logon handshake returns this for a frame that does not decode
+    /// any more: both skip such frames and keep waiting until
+    /// [`EngineError::LogonTimeout`]. What can still produce it: the
+    /// initiator, when a Logon ack that decodes carries a BeginString (8) value
+    /// that is not valid UTF-8; and the `?` and `From` conversions on the
+    /// handshake paths that re-read a frame already decoded once, which cannot
+    /// fail and are kept as typed errors rather than unwraps. During the Active
+    /// session a frame that does not decode never surfaces as an error: it is
+    /// dropped (and, if garbled, counted) by the reactor.
     #[error("decode error: {0}")]
     Decode(#[from] DecodeError),
 

@@ -41,9 +41,11 @@
 //! `CheckSum` (10), a `BodyLength` (9) that does not match the frame, bytes
 //! before `8=`) never reaches this loop as an error: the codec skips it and
 //! counts it, and the reactor reads the count before each inbound frame and on
-//! every tick. A frame that frames but does not decode (`MsgType` (35) not
-//! third, a malformed tag) is garbled too and is handled the same way. A
-//! garbled frame is ignored, as FIX requires. It consumes no `MsgSeqNum` (34),
+//! every tick. A frame whose header does not decode (`MsgType` (35) not third,
+//! `BodyLength` invalid) is garbled too and is handled the same way. A
+//! malformed body behind a sound header (an invalid tag, a bad data length) is
+//! not garbled: it is dropped with a warning and not counted. A garbled frame
+//! is ignored, as FIX requires. It consumes no `MsgSeqNum` (34),
 //! so the next valid frame with a higher number is a gap and gets the usual
 //! `ResendRequest`. It does not refresh the heartbeat clock, because garbled
 //! bytes are not proof of life. It is logged as a count and a static cause,
@@ -93,8 +95,9 @@ use crate::wire::{
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
-use ironfix_core::error::EncodeError;
+use ironfix_core::error::{DecodeError, EncodeError};
 use ironfix_core::message::{MsgType, RawMessage};
+use ironfix_core::version::FixVersion;
 use ironfix_session::heartbeat::generate_test_req_id;
 use ironfix_session::sequence::{SequenceExhausted, SequenceResult};
 use ironfix_session::{
@@ -118,14 +121,18 @@ pub(crate) type FixFramed = Framed<TcpStream, FixCodec>;
 ///
 /// Garbled-frame recovery is always on: FIX ignores a garbled message instead
 /// of ending the session over it, and `Framed` cannot resume after a decoder
-/// error, so the skip has to happen inside the codec. The message-size ceiling
-/// and checksum validation come from the session configuration.
+/// error, so the skip has to happen inside the codec. Resync anchors are
+/// restricted to the session's own wire BeginString (`FIXT.1.1` for a 5.0
+/// session): every real frame carries it, and an embedded frame of another
+/// version can then never be resynchronised onto. The message-size ceiling and
+/// checksum validation come from the session configuration.
 #[must_use]
-pub(crate) const fn session_codec(config: &SessionConfig) -> FixCodec {
+pub(crate) fn session_codec(config: &SessionConfig, version: FixVersion) -> FixCodec {
     FixCodec::new()
         .with_max_message_size(config.max_message_size)
         .with_checksum_validation(config.validate_checksum)
         .with_garbled_recovery(true)
+        .with_begin_string(version.begin_string())
 }
 
 /// Log cause for frames the codec skipped as garbled at the framing level.
@@ -276,63 +283,84 @@ pub(crate) enum HandshakeRead {
 ///
 /// FIX ignores a garbled message during the Logon exchange as it does later,
 /// so neither role fails its handshake over one. The codec already skips the
-/// frames it cannot frame; a frame that frames but does not decode (MsgType
-/// (35) not third, a malformed tag) is skipped here. One timeout covers the
-/// whole wait, so a stream of garbage cannot extend the logon timeout, and a
+/// frames it cannot frame; a frame whose header does not decode (MsgType (35)
+/// not third, BodyLength invalid) is skipped here. A frame whose header
+/// decodes but whose body does not (an invalid tag, a bad data length) is not
+/// garbled, but it cannot be read as a Logon either, so it is skipped under
+/// the same rule rather than failing the handshake. One timeout covers the
+/// whole wait, so a stream of either cannot extend the logon timeout, and a
 /// Logon that never arrives intact ends in [`HandshakeRead::TimedOut`].
 ///
 /// The skips are reported once, when the read ends: as a warning that the
-/// handshake failed after garbled frames (so a timeout after garbage is
-/// diagnosable), or that it succeeded despite them. The line carries counts
-/// and the session only, never frame bytes. The codec's count is drained here,
-/// so nothing skipped during the handshake counts toward
+/// handshake failed after them (so a timeout after garbage is diagnosable), or
+/// that it succeeded despite them. The line carries counts and the session
+/// only, never frame bytes. The codec's count is drained here, so nothing
+/// skipped during the handshake counts toward
 /// [`SessionConfig::garbled_frame_limit`], which governs the Active session.
 pub(crate) async fn read_handshake_frame(
     framed: &mut FixFramed,
     logon_timeout: Duration,
     session_id: &SessionId,
 ) -> HandshakeRead {
-    let mut undecodable = 0u64;
-    let outcome = match timeout(
-        logon_timeout,
-        next_decodable_frame(framed, &mut undecodable),
-    )
-    .await
-    {
+    let mut skips = HandshakeSkips::default();
+    let outcome = match timeout(logon_timeout, next_decodable_frame(framed, &mut skips)).await {
         Err(_) => HandshakeRead::TimedOut,
         Ok(outcome) => outcome,
     };
     let framing = framed.codec_mut().take_garbled_count();
-    if framing > 0 || undecodable > 0 {
+    if framing > 0 || skips.garbled > 0 || skips.malformed > 0 {
         let succeeded = matches!(outcome, HandshakeRead::Frame(_));
         tracing::warn!(
             session = %session_id,
             framing,
-            undecodable,
+            garbled = skips.garbled,
+            malformed = skips.malformed,
             succeeded,
-            "ignored garbled inbound frame(s) during the Logon handshake"
+            "ignored undecodable inbound frame(s) during the Logon handshake"
         );
     }
     outcome
 }
 
+/// Frames that framed but did not decode during one handshake read, for the
+/// report only: no decision reads these numbers.
+#[derive(Debug, Default)]
+struct HandshakeSkips {
+    /// Header defects: garbled in the FIX Session Layer's sense.
+    garbled: u64,
+    /// Malformed bodies behind a header that decoded.
+    malformed: u64,
+}
+
+impl HandshakeSkips {
+    /// Counts one skipped frame of the kind `error` describes. At `u64::MAX`
+    /// a count stops moving rather than wrapping; the timeout bounds the loop
+    /// regardless.
+    fn record(&mut self, error: &DecodeError) {
+        let count = if wire::decode_is_garbled(error) {
+            &mut self.garbled
+        } else {
+            &mut self.malformed
+        };
+        if let Some(next) = count.checked_add(1) {
+            *count = next;
+        }
+    }
+}
+
 /// The loop inside [`read_handshake_frame`], without its timeout: returns the
 /// first frame that decodes, or why the stream ended, and counts the frames
-/// that framed but did not decode in `undecodable`.
-async fn next_decodable_frame(framed: &mut FixFramed, undecodable: &mut u64) -> HandshakeRead {
+/// that framed but did not decode.
+async fn next_decodable_frame(framed: &mut FixFramed, skips: &mut HandshakeSkips) -> HandshakeRead {
     loop {
         match framed.next().await {
             None => return HandshakeRead::Closed,
             Some(Err(err)) => return HandshakeRead::Codec(err),
             Some(Ok(frame)) => {
-                if wire::decode_frame(&frame).is_ok() {
-                    return HandshakeRead::Frame(frame);
-                }
-                // Counted for the report only. At u64::MAX the count stops
-                // moving rather than wrapping; the timeout bounds the loop
-                // regardless, and no decision reads this number.
-                if let Some(next) = undecodable.checked_add(1) {
-                    *undecodable = next;
+                // Owned error, so the borrow of `frame` ends before it moves.
+                match wire::decode_frame(&frame).err() {
+                    None => return HandshakeRead::Frame(frame),
+                    Some(err) => skips.record(&err),
                 }
             }
         }
@@ -1378,6 +1406,10 @@ impl<A: Application> Reactor<A> {
     /// An I/O failure gets no Logout: the socket is what failed. The close
     /// reason recorded here is a string for the log only; a typed close reason
     /// on the [`Connection`](crate::Connection) is issue #69's job.
+    ///
+    /// Known limit: the oversized frame's bytes are still arriving when the
+    /// socket is dropped after the Logout, so the close can send RST and the
+    /// peer may lose the Logout. A graceful drain does not exist yet.
     async fn close_on_fatal_codec_error(
         &mut self,
         framed: &mut FixFramed,
@@ -1401,6 +1433,11 @@ impl<A: Application> Reactor<A> {
     /// waiting for the acknowledgement: the very link that keeps garbling
     /// frames is the one the acknowledgement would have to cross. A session
     /// already waiting on its own Logout is simply torn down.
+    ///
+    /// Known limit: the socket is dropped right after the Logout is written,
+    /// while the peer's input may still be arriving. Closing a socket with
+    /// unread input can make the kernel send RST, and the peer may then lose
+    /// the Logout. A graceful drain before the drop does not exist yet.
     async fn close_on_garbled_limit(
         &mut self,
         framed: &mut FixFramed,
@@ -1920,14 +1957,27 @@ impl<A: Application> Reactor<A> {
         let frame = frame.freeze();
         let raw = match wire::decode_frame(&frame) {
             Ok(raw) => raw,
-            // A frame that frames but does not decode (MsgType (35) not third,
-            // a malformed tag, ...) is garbled too: it is ignored exactly like
+            // A frame whose header does not decode (MsgType (35) not third,
+            // BodyLength invalid, ...) is garbled: it is ignored exactly like
             // one the codec skipped, and counts toward the same limit. The log
             // names the defect, never the error's text, which can quote input.
-            Err(err) => {
+            Err(err) if wire::decode_is_garbled(&err) => {
                 return self
                     .on_garbled(framed, phase, 1, wire::decode_defect(&err))
                     .await;
+            }
+            // A malformed body behind a sound header (an invalid tag, a bad
+            // data length) is not garbled. It keeps the behaviour it always
+            // had: dropped with a warning, no MsgSeqNum consumed, not counted
+            // toward the limit. No Reject can be sent without a decoded
+            // MsgSeqNum to reference.
+            Err(err) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    defect = wire::decode_defect(&err),
+                    "dropping a message whose body does not decode: no MsgSeqNum consumed"
+                );
+                return Ok(phase);
             }
         };
         let msg_type = raw.msg_type().clone();

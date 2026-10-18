@@ -5208,3 +5208,102 @@ async fn test_decode_level_garbled_frame_counts_toward_the_limit() {
         "acceptor task",
     );
 }
+
+/// A message whose header is sound but whose body does not decode (here a
+/// non-numeric tag) is not garbled: it is dropped as it always was, consumes
+/// no MsgSeqNum, and does not count toward the limit, so a limit of one
+/// survives it.
+#[tokio::test]
+async fn test_malformed_body_frame_is_dropped_and_not_counted_toward_the_limit() {
+    let (listener, addr) = bind_listener().await;
+    let (answered_tx, answered_rx) = tokio::sync::oneshot::channel::<()>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+
+        let mut burst = raw_frame(b"35=0\x0149=VENUE\x0156=CLIENT\x0134=2\x01abc=1\x01");
+        burst.extend_from_slice(&venue_msg("1", 3, &[(112, "STILL-UP")]));
+        ok(
+            framed.send(burst).await,
+            "send a malformed-body frame + one valid",
+        );
+
+        // The malformed frame consumed nothing: seq 3 is a gap.
+        let resend = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&resend), "2");
+        assert_eq!(field(&resend, 7).as_deref(), Some("2"));
+        let reply = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reply), "0", "the limit of one was not reached");
+        assert_eq!(field(&reply, 112).as_deref(), Some("STILL-UP"));
+
+        let _ = answered_tx.send(());
+        let _ = done_rx.await;
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let config = client_config(Duration::from_secs(30))
+        .with_garbled_frame_limit(Some(garbled_limit(1, Duration::from_secs(60))));
+    let initiator = Initiator::new(config, Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), answered_rx).await,
+            "answered within 5s",
+        ),
+        "stub must see the answer",
+    );
+    assert!(!connection.is_closed());
+    assert_eq!(connection.next_target_seq(), 2);
+
+    let _ = done_tx.send(());
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// A Logon ack whose header is sound but whose body does not decode cannot be
+/// read as an ack: it is skipped under the same logon timeout, and the valid
+/// ack behind it takes the session Active.
+#[tokio::test]
+async fn test_malformed_body_logon_ack_is_skipped_under_the_same_deadline() {
+    let (listener, addr) = bind_listener().await;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let _logon = next_frame(&mut framed).await;
+        let mut burst =
+            raw_frame(b"35=A\x0149=VENUE\x0156=CLIENT\x0134=1\x01abc=1\x0198=0\x01108=30\x01");
+        burst.extend_from_slice(&venue_msg("A", 1, &[(98, "0"), (108, "30")]));
+        ok(
+            framed.send(burst).await,
+            "send a malformed-body ack + a valid one",
+        );
+        let _ = done_rx.await;
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let config = client_config(Duration::from_secs(30)).with_logon_timeout(Duration::from_secs(2));
+    let initiator = Initiator::new(config, Arc::clone(&app));
+    let connection = ok(
+        initiator.connect(addr).await,
+        "the valid ack must go Active",
+    );
+    assert_eq!(connection.next_target_seq(), 2);
+    assert!(!connection.is_closed());
+
+    let _ = done_tx.send(());
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}

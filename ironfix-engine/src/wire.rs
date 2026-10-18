@@ -672,6 +672,30 @@ pub(crate) fn decode_frame(frame: &[u8]) -> Result<RawMessage<'_>, DecodeError> 
     decoder.decode()
 }
 
+/// Returns whether a frame that framed but did not decode is *garbled* in the
+/// FIX Session Layer's sense.
+///
+/// Garbled means the header cannot be trusted: BeginString (8) not first,
+/// BodyLength (9) not second or invalid, MsgType (35) not third, or a CheckSum
+/// (10) mismatch. Such a frame is ignored and counts toward
+/// [`SessionConfig::garbled_frame_limit`].
+///
+/// Every other decode failure (an invalid tag, an unterminated field, a bad
+/// data length or Length value, an invalid MsgType value, ...) is a malformed
+/// *body* behind a header that framed and decoded. It is not garbled: the
+/// reactor drops it with a warning, as it always has, and does not count it.
+#[must_use]
+pub(crate) const fn decode_is_garbled(error: &DecodeError) -> bool {
+    matches!(
+        error,
+        DecodeError::InvalidBeginString
+            | DecodeError::MissingBodyLength
+            | DecodeError::InvalidBodyLength
+            | DecodeError::MissingMsgType
+            | DecodeError::ChecksumMismatch { .. }
+    )
+}
+
 /// Names the defect behind a frame that framed but did not decode, for a log
 /// line that must not carry the frame's bytes.
 ///
@@ -681,17 +705,18 @@ pub(crate) fn decode_frame(frame: &[u8]) -> Result<RawMessage<'_>, DecodeError> 
 #[must_use]
 pub(crate) const fn decode_defect(error: &DecodeError) -> &'static str {
     match error {
-        DecodeError::InvalidBeginString => "decode: BeginString (8) not first",
-        DecodeError::MissingBodyLength => "decode: BodyLength (9) not second",
-        DecodeError::InvalidBodyLength => "decode: BodyLength (9) invalid",
-        DecodeError::MissingMsgType => "decode: MsgType (35) not third",
-        DecodeError::InvalidMsgType(_) => "decode: MsgType (35) invalid",
-        DecodeError::ChecksumMismatch { .. } => "decode: CheckSum (10) mismatch",
-        DecodeError::InvalidTag(_) => "decode: invalid tag",
-        DecodeError::UnterminatedField { .. } => "decode: unterminated field",
-        DecodeError::InvalidDataLength { .. } => "decode: invalid data length",
-        DecodeError::InvalidUtf8(_) => "decode: invalid UTF-8",
-        _ => "decode: malformed frame",
+        DecodeError::InvalidBeginString => "BeginString (8) not first",
+        DecodeError::MissingBodyLength => "BodyLength (9) not second",
+        DecodeError::InvalidBodyLength => "BodyLength (9) invalid",
+        DecodeError::MissingMsgType => "MsgType (35) not third",
+        DecodeError::ChecksumMismatch { .. } => "CheckSum (10) mismatch",
+        DecodeError::InvalidMsgType(_) => "MsgType (35) value invalid",
+        DecodeError::InvalidTag(_) => "invalid tag",
+        DecodeError::UnterminatedField { .. } => "unterminated field",
+        DecodeError::InvalidDataLength { .. } => "invalid data length",
+        DecodeError::InvalidFieldValue { .. } => "invalid field value",
+        DecodeError::InvalidUtf8(_) => "invalid UTF-8",
+        _ => "malformed message",
     }
 }
 
@@ -1163,7 +1188,10 @@ mod tests {
         // third" garbling.
         let frame = b"8=FIX.4.4\x019=15\x0149=X\x0135=0\x0134=2\x0110=000\x01";
         match decode_frame(frame) {
-            Err(err) => assert_eq!(decode_defect(&err), "decode: MsgType (35) not third"),
+            Err(err) => {
+                assert_eq!(decode_defect(&err), "MsgType (35) not third");
+                assert!(decode_is_garbled(&err));
+            }
             Ok(_) => panic!("a frame with MsgType out of place must not decode"),
         }
     }
@@ -1176,7 +1204,46 @@ mod tests {
         assert!(err.to_string().contains("hunter2"));
         let label = decode_defect(&err);
         assert!(!label.contains("hunter2"));
-        assert_eq!(label, "decode: invalid tag");
+        assert_eq!(label, "invalid tag");
+    }
+
+    #[test]
+    fn test_decode_is_garbled_covers_header_defects_only() {
+        let garbled = [
+            DecodeError::InvalidBeginString,
+            DecodeError::MissingBodyLength,
+            DecodeError::InvalidBodyLength,
+            DecodeError::MissingMsgType,
+            DecodeError::ChecksumMismatch {
+                calculated: 1,
+                declared: 2,
+            },
+        ];
+        for err in &garbled {
+            assert!(decode_is_garbled(err), "{err:?} is a header defect");
+        }
+
+        let malformed_body = [
+            DecodeError::InvalidTag("abc".to_string()),
+            DecodeError::InvalidFieldValue {
+                tag: 95,
+                reason: "length field value is not a valid byte count".to_string(),
+            },
+            DecodeError::MissingRequiredField { tag: 36 },
+        ];
+        for err in &malformed_body {
+            assert!(!decode_is_garbled(err), "{err:?} is a malformed body");
+        }
+
+        // A real frame: header and MsgType are fine, a body tag is not.
+        let frame = b"8=FIX.4.4\x019=16\x0135=0\x0134=2\x01abc=1\x0110=000\x01";
+        match decode_frame(frame) {
+            Err(err) => {
+                assert!(matches!(err, DecodeError::InvalidTag(_)), "{err:?}");
+                assert!(!decode_is_garbled(&err), "{err:?}");
+            }
+            Ok(_) => panic!("a frame with a non-numeric tag must not decode"),
+        }
     }
 
     #[test]

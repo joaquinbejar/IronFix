@@ -32,12 +32,12 @@
 //! whose clock is two minutes out, will be so on its next message too.
 //!
 //! A *garbled* frame, by contrast, is per-message and is ignored: the codec
-//! skips it, or the engine does when it frames but does not decode (see the
-//! crate-level docs). It consumes no `MsgSeqNum`, and the gap is recovered by
-//! `ResendRequest`. That applies while waiting for the Logon ack too: a garbled
-//! ack is skipped and the wait continues against the same
-//! [`SessionConfig::logon_timeout`], so an ack that never arrives intact ends
-//! in [`EngineError::LogonTimeout`].
+//! skips it, or the engine does when its header frames but does not decode
+//! (see the crate-level docs). It consumes no `MsgSeqNum`, and the gap is
+//! recovered by `ResendRequest`. While waiting for the Logon ack, a garbled ack
+//! is skipped, and so is one whose body does not decode; the wait continues
+//! against the same [`SessionConfig::logon_timeout`], so an ack that never
+//! arrives intact ends in [`EngineError::LogonTimeout`].
 //!
 //! # Bounded recovery
 //!
@@ -535,7 +535,7 @@ impl<A: Application + 'static> Initiator<A> {
         };
         let _ = stream.set_nodelay(true);
 
-        let mut framed = Framed::new(stream, session_codec(&self.config));
+        let mut framed = Framed::new(stream, session_codec(&self.config, version));
 
         // Seeding fails closed: a store that cannot be reset or refreshed leaves
         // the session unable to vouch for its own counters, so it is refused

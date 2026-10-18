@@ -43,8 +43,10 @@
 //! reaching Active. Waiting for the inbound Logon is bounded by
 //! [`SessionConfig::logon_timeout`]; a garbled frame that arrives first (a bad
 //! CheckSum or BodyLength, bytes before `8=`, or a frame whose MsgType (35) is
-//! not third) is skipped and the wait goes on against the same timeout, so a
-//! Logon that never arrives intact ends in [`EngineError::LogonTimeout`].
+//! not third) is skipped and the wait goes on against the same timeout. So is
+//! a frame whose header decodes but whose body does not: it is not garbled,
+//! but it cannot be read as a Logon either. A Logon that never arrives intact
+//! ends in [`EngineError::LogonTimeout`].
 //! A gap in the Logon completes the handshake and immediately issues a
 //! `ResendRequest` (2).
 //!
@@ -321,7 +323,7 @@ impl<A: Application + 'static> Acceptor<A> {
         let session = Session::<Disconnected>::new(session_id.to_string()).accept();
 
         let _ = stream.set_nodelay(true);
-        let mut framed = Framed::new(stream, session_codec(&self.config));
+        let mut framed = Framed::new(stream, session_codec(&self.config, version));
 
         let sequences = match self.initial_sequences {
             Some((sender, target)) if !self.config.reset_on_logon => {
