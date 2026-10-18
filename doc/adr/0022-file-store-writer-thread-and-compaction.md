@@ -135,6 +135,28 @@ future its store timeout dropped stays in the queue, holding a slot, until
 the thread reaches and skips it; the bound holds under a slow disk that
 times calls out faster than the thread drains them.
 
+**Every call is answered, a panic included.** A queued call holds a ticket
+on its reply cell, and the ticket answers it exactly once: with the call's
+outcome when it runs, or, when it is dropped unanswered, that the store is
+closed (if the caller dropped its future, the ticket gives the cell back to
+the pool instead). In a build that unwinds, a panic in the journal's opening,
+in a call or in after-call work is caught on the writer thread: the call that
+panicked is answered with `StoreError::Io`, and the store closes. The journal
+is not trusted after a panic, since it may be half-way through a change: it
+is dropped as it is, which leaves the files as a process crash would, and the
+next open recovers them under the rules of ADR-0006. The thread survives and
+answers every queued and later call that the store is closed; should it stop
+anyway, it drains the queue as it exits. Without this, a panic would have
+left the call that panicked and every call queued behind it (up to 1 023)
+waiting for ever: crossbeam keeps the queued calls until the sender side
+goes, and the sender side is the store itself. Under the workspace's
+`panic = "abort"` release profile a panic ends the process instead.
+
+**Commands that do not run give their buffers back.** A `store` or
+`file_outbound` that is skipped (its future was dropped first), refused by a
+full queue, or reaches a closed store returns its record buffer to the pool,
+through a `discard` hook the writer calls on each of those paths.
+
 **After-call work.** Whether an automatic compaction is due is checked under
 the same lock guard as the call. The compaction itself runs after the call
 has been answered, under a second guard, so the call that crossed the

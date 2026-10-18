@@ -1221,6 +1221,7 @@ impl Command {
 impl Served for Journal {
     type Command = Command;
     type Answer = Answer;
+    type Recycler = BufferPool;
 
     fn execute(&mut self, command: Command) -> Result<Answer, StoreError> {
         self.run(command)
@@ -1228,6 +1229,17 @@ impl Served for Journal {
 
     fn closes(command: &Command) -> bool {
         matches!(command, Command::Close)
+    }
+
+    /// Gives a record buffer back to the pool: a `store` or `file_outbound`
+    /// that was skipped, refused by a full queue, or reached a closed store.
+    fn discard(buffers: &BufferPool, command: Command) {
+        match command {
+            Command::Store { record, .. } | Command::FileOutbound { record, .. } => {
+                buffers.give(record);
+            }
+            _ => {}
+        }
     }
 
     fn after_call_due(&self) -> bool {
@@ -1715,9 +1727,13 @@ impl FileStore {
             let config = config.clone();
             let shared = Arc::clone(&shared);
             let buffers = Arc::clone(&buffers);
-            Writer::spawn(WRITER_THREAD_NAME, CALL_QUEUE_CAPACITY, move || {
-                open_journal(config, shared, buffers, rule, create)
-            })?
+            let recycler = Arc::clone(&buffers);
+            Writer::spawn(
+                WRITER_THREAD_NAME,
+                CALL_QUEUE_CAPACITY,
+                recycler,
+                move || open_journal(config, shared, buffers, rule, create),
+            )?
         };
         opened.await.map_err(|_| {
             StoreError::Io("the file store's writer thread stopped while opening".to_string())
