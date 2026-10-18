@@ -124,19 +124,32 @@ authenticated anyone. A first version kept every admitted session for the
 registry's lifetime, so a peer cycling fresh `SenderCompID`s that the lookup
 admitted could grow the route table, and whatever each session held (a store,
 its file descriptors), without bound and without ever authenticating. Now an
-admitted session is inserted **provisionally**, and the connection's claim on
-it is a guard settled when the handshake ends, however it ends (a `serve`
-future dropped mid-handshake included):
+admitted session is inserted **provisionally**. Every connection routed to
+it while it is provisional holds a **claim** on it: the admitting connection,
+a connection whose lookup raced the admission, and a later Logon that finds
+it. Each route counts its claims, and a claim is taken and released only
+under the table's write lock. A claim is an RAII value from the moment it is
+counted, released exactly once when the handshake ends, however it ends (a
+`serve` future dropped mid-handshake included):
 
-- if the handshake got past `from_admin`, the session is **confirmed** and
+- if that handshake got past `from_admin`, the session is **confirmed** and
   kept for the registry's lifetime, like a registered one, so its admission
   slot and in-memory owed-reset record (ADR-0005, ADR-0017) outlive the
   connection;
-- otherwise, if the session is still provisional and no other connection is
-  routed to it (the table's reference and the guard's are the only ones;
-  references are cloned only under the read lock, which the settle's write
-  lock excludes), it is **evicted**. Nothing is lost: before authentication
-  its store is never touched.
+- otherwise, if the session is still provisional and that was its last
+  claim, it is **evicted**. Nothing is lost: before authentication its store
+  is never touched.
+
+A first revision decided eviction from the acceptor's reference count: the
+table's reference and the releasing guard's being the only ones. Review found
+the race (#115): a guard releases while still holding its reference, so two
+handshakes ending on different threads could each release while the other
+still held its own, both see three references and both keep the session,
+leaving a provisional route with no connection, its store and its place under
+the cap. A count of claims mutated only under the lock cannot be read in that
+state: whichever release comes second sees the other's claim already gone. A
+unit test pins the interleaving (both releases made while both references are
+still alive).
 
 `with_max_sessions(n)` caps the lookup-admitted sessions held at once,
 provisional and confirmed together; registered sessions do not count. An
@@ -156,7 +169,8 @@ must not share one's store; otherwise the Logon is refused with
 **Resource use**, stated on `SessionLookup`: the lookup runs once per Logon
 whose identity matches no session, so an unauthenticated peer can make it run
 once per connection; an admission costs one `Acceptor`, and whatever the
-lookup built for it, until the first handshake settles it. A confirmed
+lookup built for it, until its last claim is released or a handshake for it
+is authenticated. A confirmed
 session cannot be revoked by the lookup (refuse the credentials in
 `from_admin` instead), and removing a session from a running registry is not
 provided.
@@ -166,7 +180,7 @@ provided.
 The route table is a `std::sync::RwLock`, not `tokio::sync` or `DashMap`. Every
 critical section is synchronous and short (a lookup, a push, a retain, a state
 change), no guard is ever held across an `.await`, and `register`, `Debug` and
-the guard's `Drop` need the lock outside any async context. A poisoned lock is
+a claim's `Drop` need the lock outside any async context. A poisoned lock is
 recovered: every write is one push, retain or state change after its checks.
 `DashMap`, which the ruleset prefers, is not a dependency; this is recorded as
 an allowed deviation.
