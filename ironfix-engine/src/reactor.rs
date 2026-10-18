@@ -722,23 +722,17 @@ impl ResendState {
     /// `attempts` is 0.
     ///
     /// The state is armed so a gapped frame arriving meanwhile does not send a
-    /// request that would cross the counterparty's 789 resend, and so a
-    /// counterparty that never resends is still chased: once the gap has made
-    /// no progress for the retry timeout, [`Reactor::on_resend_stalled`] sends
-    /// a real `ResendRequest`, which a limit of one request still allows.
+    /// request that would cross the counterparty's 789 resend, and so a gap
+    /// that stops filling is still chased: once it has made no progress for
+    /// the retry timeout (no resend at all, or one that stalls partway),
+    /// [`Reactor::on_resend_stalled`] sends a real `ResendRequest`, which a
+    /// limit of one request still allows.
     #[must_use]
     pub(crate) fn implied(expected: u64, high_water: u64, config: &SessionConfig) -> Self {
         Self {
             attempts: 0,
             ..Self::first(expected, high_water, config)
         }
-    }
-
-    /// Whether no `ResendRequest` has been sent for this gap yet: it is one
-    /// `NextExpectedMsgSeqNum` (789) asked the counterparty to fill.
-    #[must_use]
-    const fn is_implied(&self) -> bool {
-        self.attempts == 0
     }
 
     /// Whether this gap has waited longer than its retry timeout.
@@ -2237,7 +2231,7 @@ impl<A: Application> Reactor<A> {
         frame: BytesMut,
     ) -> Result<Phase, SessionClosed> {
         let phase = self.on_frame(framed, phase, frame).await?;
-        self.release_held_logon(framed, phase).await
+        self.release_held_logon(phase).await
     }
 
     /// Consumes a Logon or acknowledgement held by [`Reactor::open`] once the
@@ -2254,20 +2248,18 @@ impl<A: Application> Reactor<A> {
     ///   target number and only then is the expectation moved, the order every
     ///   inbound message takes (ADR-0005), and recovery progress is noted.
     ///
-    /// If frames beyond the held Logon arrived while it was held, the 789
-    /// resend does not cover them and recovery is still armed with nothing
-    /// requested; they are requested at once rather than after the retry
-    /// timeout.
+    /// Nothing is requested here, even when frames from beyond the held Logon
+    /// arrived while it was held: a counterparty such as QuickFIX/C++ resends
+    /// through its own Logon and the live frames it sent after it, so a
+    /// request now would cross that resend. Recovery stays armed, implied, at
+    /// the next number with a fresh clock, so a counterparty that does not
+    /// cover those frames still gets one `ResendRequest` once the gap has made
+    /// no progress for the retry timeout.
     ///
     /// # Errors
-    /// The session is closed on an exhausted target counter, a store write
-    /// that fails under the fail-closed policy, or a failure to send that
-    /// request.
-    async fn release_held_logon(
-        &mut self,
-        framed: &mut FixFramed,
-        phase: Phase,
-    ) -> Result<Phase, SessionClosed> {
+    /// The session is closed on an exhausted target counter, or a store write
+    /// that fails under the fail-closed policy.
+    async fn release_held_logon(&mut self, phase: Phase) -> Result<Phase, SessionClosed> {
         let Some(logon_seq) = self.held_logon else {
             return Ok(phase);
         };
@@ -2305,14 +2297,7 @@ impl<A: Application> Reactor<A> {
             held_logon = logon_seq,
             "consumed the held Logon: the gap below it is filled"
         );
-        match self.resend {
-            Some(state) if state.is_implied() => {
-                self.resend = None;
-                self.request_resend(framed, phase, next, state.high_water)
-                    .await
-            }
-            _ => Ok(phase),
-        }
+        Ok(phase)
     }
 
     /// The reactor's first acts, left by the Logon exchange: request a gap it
@@ -2324,9 +2309,9 @@ impl<A: Application> Reactor<A> {
     /// resends on its own, because this session's 789 named it: requesting it
     /// as well would cross that resend, which 789 exists to avoid. The gap is
     /// armed as an implied recovery ([`ResendState::implied`]), so a gapped
-    /// frame arriving meanwhile sends no request either, and a counterparty
-    /// that never resends gets one real `ResendRequest` once the gap has made
-    /// no progress for [`SessionConfig::resend_timeout`]. The Logon's number
+    /// frame arriving meanwhile sends no request either, and a gap that makes
+    /// no progress for [`SessionConfig::resend_timeout`] (no resend, or one
+    /// that stalls partway) gets one real `ResendRequest`. The Logon's number
     /// is consumed by [`Reactor::release_held_logon`].
     ///
     /// The resend is the one a `ResendRequest` for exactly that range would
@@ -3167,14 +3152,14 @@ mod tests {
     fn test_resend_state_implied_has_sent_nothing_yet() {
         let config = config_with_limit(1);
         let implied = ResendState::implied(3, 6, &config);
-        assert!(implied.is_implied());
+        assert_eq!(implied.attempts, 0, "nothing sent yet");
         assert_eq!(implied.expected, 3);
         assert_eq!(implied.high_water, 6);
         // Even a limit of one request leaves room for the real one.
         assert!(implied.can_retry());
 
         let first = ResendState::first(3, 6, &config);
-        assert!(!first.is_implied());
+        assert_eq!(first.attempts, 1);
         assert!(!first.can_retry());
     }
 
@@ -3183,7 +3168,7 @@ mod tests {
         let config = config_with_limit(1);
         let mut state = ResendState::implied(3, 6, &config);
         state.record_retry();
-        assert!(!state.is_implied());
+        assert_eq!(state.attempts, 1);
         assert!(!state.can_retry(), "the one real request is spent");
     }
 
@@ -3193,8 +3178,8 @@ mod tests {
         let mut implied = ResendState::implied(3, 6, &config);
         implied.record_progress(4);
         assert_eq!(implied.expected, 4);
-        assert!(
-            implied.is_implied(),
+        assert_eq!(
+            implied.attempts, 0,
             "a stall after partial progress still gets its one real request"
         );
 

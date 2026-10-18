@@ -99,8 +99,9 @@
 //! `ResendRequest`. When the acknowledgement declares 789 too and arrives with
 //! a gap below it, no `ResendRequest` is sent: the acceptor resends that gap on
 //! its own because of this Logon's 789, so the acknowledgement is held and its
-//! number consumed once the gap is filled, with one `ResendRequest` after
-//! [`SessionConfig::resend_timeout`] only if the acceptor never resends.
+//! number consumed once the gap is filled. One `ResendRequest` goes out only
+//! when the gap makes no progress for [`SessionConfig::resend_timeout`], a
+//! resend that stalls partway included.
 //! Without the flag no 789 is sent and the acknowledgement's is ignored. 789 is
 //! bilateral: both sides must enable it.
 //!

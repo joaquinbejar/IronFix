@@ -59,8 +59,9 @@
 //! completes the handshake and immediately issues a `ResendRequest` (2),
 //! unless both sides declared `NextExpectedMsgSeqNum` (789): the initiator then
 //! resends the gap on its own, so the Logon is held and its number consumed
-//! once the gap is filled, with one `ResendRequest` after
-//! [`SessionConfig::resend_timeout`] only if the initiator never resends.
+//! once the gap is filled. One `ResendRequest` goes out only when the gap
+//! makes no progress for [`SessionConfig::resend_timeout`], a resend that
+//! stalls partway included.
 //!
 //! A refused Logon drives the typestate to `reject_logon` and the connection
 //! is dropped without reaching Active. What the peer is sent first depends on

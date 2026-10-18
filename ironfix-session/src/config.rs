@@ -698,9 +698,10 @@ pub struct SessionConfig {
     /// acknowledgement arrives with a gap below it, the session sends no
     /// `ResendRequest`: the counterparty resends that gap on its own, because
     /// of this session's 789, so its Logon is held and consumed once the gap
-    /// is filled. A counterparty that never resends gets one `ResendRequest`
-    /// after [`SessionConfig::resend_timeout`]. When unset, no 789 is sent and
-    /// a counterparty's 789 is ignored, as before.
+    /// is filled. One `ResendRequest` goes out only when the gap makes no
+    /// progress for [`SessionConfig::resend_timeout`], a resend that stalls
+    /// partway included. When unset, no 789 is sent and a counterparty's 789
+    /// is ignored, as before.
     ///
     /// 789 is bilateral: enable it on both sides. A counterparty that uses it
     /// while this session does not may wait on a resend this session never
