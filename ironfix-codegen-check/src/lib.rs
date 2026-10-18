@@ -13,9 +13,11 @@
 //! `make doc` (`-D missing_docs`) check the generated text, which carries no
 //! `#[allow]`, and so does this crate.
 //!
-//! `build.rs` generates the sources into `OUT_DIR` on every build, so there
-//! is no golden file to keep in step. Not published: it is a check, left out
-//! of `make publish-all`, the semver matrix and the coverage report.
+//! `build.rs` generates the sources into `OUT_DIR`; Cargo reruns it when
+//! `build.rs` or one of its build dependencies (`ironfix-codegen`,
+//! `ironfix-dictionary`, the embedded XML they include) changes, so there is
+//! no golden file to keep in step. Not published: it is a check, left out of
+//! `make publish-all`, the semver matrix and the coverage report.
 #![deny(missing_docs)]
 
 /// The full views of the embedded FIX 4.4 dictionary.

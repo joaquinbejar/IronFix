@@ -95,9 +95,14 @@ const RESERVED_ENUM_NAMES: [&str; 2] = ["Tokens", OTHER];
 const PRELUDE_VARIANTS: [&str; 4] = ["None", "Some", "Ok", "Err"];
 
 /// The ironfix-dictionary versions the generated code compiles against, as a
-/// Cargo requirement: `GroupSet::field` is new after 0.4.1. Set it to the
-/// release that ships it when that release is cut.
-const MIN_DICTIONARY_VERSION: &str = ">0.4.1";
+/// Cargo requirement: the release that carries every API it calls
+/// ([`DICTIONARY_APIS`]), 0.5, and the releases compatible with it.
+const DICTIONARY_REQUIREMENT: &str = "^0.5";
+
+/// The ironfix-dictionary APIs the generated code calls beyond its types: the
+/// first two are new after 0.4.1, the last release without them.
+const DICTIONARY_APIS: &str =
+    "GroupSet::field, GroupSet::with_level_tags and FieldType::is_valid_value";
 
 /// Size, in bytes, of the stack buffer the writers format numbers into: room
 /// for any `rust_decimal::Decimal`, `i64`, `u64` or `usize`.
@@ -1352,13 +1357,10 @@ pub(crate) fn generate(dict: &Dictionary, visibility: &str) -> Result<String, Ge
     line(
         &mut code,
         &format!(
-            "// It needs the ironfix-core and rust_decimal crates, and ironfix-dictionary {MIN_DICTIONARY_VERSION}"
+            "// It needs the ironfix-core and rust_decimal crates, and ironfix-dictionary {DICTIONARY_REQUIREMENT}"
         ),
     );
-    line(
-        &mut code,
-        "// (it calls GroupSet::field and FieldType::is_valid_value).",
-    );
+    line(&mut code, &format!("// (it calls {DICTIONARY_APIS})."));
     line(&mut code, "");
     emit_enums(&mut code, &model, visibility);
     emit_layouts(&mut code, &model, visibility);
@@ -1756,8 +1758,11 @@ fn emit_views(code: &mut String, model: &Model, visibility: &str) {
         "/// one `ironfix_dictionary::Validator` applies, before it is converted: a value that does not match",
         "/// it, or a decimal that does not fit `rust_decimal::Decimal` exactly, is",
         "/// `DecodeError::InvalidFieldValue`, never rounded or read leniently. An absent required field is",
-        "/// `DecodeError::MissingRequiredField`. A group is checked whole before any entry is handed out,",
-        "/// and is `Ok(None)` when absent: group presence is the validator's concern.",
+        "/// `DecodeError::MissingRequiredField`, and so is one that cannot be located: a message-level",
+        "/// lookup (`GroupSet::field`) stops at a group nested past the reader's depth limit and finds",
+        "/// nothing after it. The tables generated here nest at most as deep as that limit, so with them",
+        "/// it does not happen. A group is checked whole before any entry is handed out, and is",
+        "/// `Ok(None)` when absent: group presence is the validator's concern.",
         "///",
         "/// The views' own `Debug` prints no field value. `message()` and `entry()` return the decoded",
         "/// message and entry, whose `Debug` prints raw values, credentials included: do not log them.",
@@ -1971,7 +1976,7 @@ fn emit_message_view(code: &mut String, model: &Model, message: &MessageModel) {
         line(code, "");
         line(
             code,
-            "        /// Returns the first field `tag` at the message level, outside every repeating group.",
+            "        /// Returns the first field `tag` at the message level, outside every repeating group;\n        /// `None` past a group nested beyond the reader's depth limit, which a required accessor\n        /// reports as `MissingRequiredField`.",
         );
         line(
             code,
@@ -3028,6 +3033,11 @@ mod tests {
         }
         let fix44 = views(embedded(Dictionary::fix44()));
         assert!(fix44.contains("pub struct NewOrderSingleView<'m, 'a> {"));
+        // The header names the bounded dictionary requirement and the APIs.
+        assert!(fix44.contains("ironfix-dictionary ^0.5\n"));
+        assert!(fix44.contains(
+            "(it calls GroupSet::field, GroupSet::with_level_tags and FieldType::is_valid_value)."
+        ));
         assert!(fix44.contains("pub struct NewOrderSingleFields<'v> {"));
         assert!(fix44.contains("pub fn price(&self) -> Result<Option<Decimal>, DecodeError> {"));
         assert!(fix44.contains("pub price: Option<Decimal>,"));

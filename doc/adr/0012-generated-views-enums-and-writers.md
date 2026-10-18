@@ -189,9 +189,10 @@ view's `message()` returns the `RawMessage` and an entry view's `entry()` the
 generated docs say so. Enumerations derive `Debug`.
 
 **The generated file states its dependencies.** Its header names
-`ironfix-core`, `rust_decimal`, and `ironfix-dictionary >0.4.1`: the calls to
-`GroupSet::field` need a release after 0.4.1. The exact version is set when
-that release is cut.
+`ironfix-core`, `rust_decimal`, and `ironfix-dictionary ^0.5`, and lists the
+dictionary APIs it calls: `GroupSet::field` and `GroupSet::with_level_tags`
+(new after 0.4.1) and `FieldType::is_valid_value`. 0.5 is the release that
+carries them; the bounded requirement leaves out a later breaking release.
 
 ## Consequences
 

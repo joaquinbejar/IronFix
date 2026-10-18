@@ -343,9 +343,9 @@ impl CodeGenerator {
     ///   LENGTH/DATA pairs itself (`ironfix_tagvalue::Encoder`,
     ///   `ironfix_engine::OutboundMessage`) implements it.
     ///
-    /// The generated code depends on the `ironfix-core`,
-    /// `ironfix-dictionary` (a release after 0.4.1: it calls
-    /// `GroupSet::field`) and `rust_decimal` crates, and contains no
+    /// The generated code depends on the `ironfix-core`, `rust_decimal` and
+    /// `ironfix-dictionary` `^0.5` crates (it calls `GroupSet::field`,
+    /// `GroupSet::with_level_tags` and `FieldType::is_valid_value`), and contains no
     /// `#[allow]`. Only [`GeneratorConfig::visibility`] applies: components
     /// are always expanded, because a view must know every group of a
     /// message to tell a message-level field from one inside a group.
