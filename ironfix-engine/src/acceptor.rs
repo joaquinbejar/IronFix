@@ -42,7 +42,9 @@
 //! drives the typestate to `reject_logon`, and drops the connection without ever
 //! reaching Active. Waiting for the inbound Logon is bounded by
 //! [`SessionConfig::logon_timeout`]; a garbled frame that arrives first (a bad
-//! CheckSum or BodyLength, bytes before `8=`) is skipped and the wait goes on.
+//! CheckSum or BodyLength, bytes before `8=`, or a frame whose MsgType (35) is
+//! not third) is skipped and the wait goes on against the same timeout, so a
+//! Logon that never arrives intact ends in [`EngineError::LogonTimeout`].
 //! A gap in the Logon completes the handshake and immediately issues a
 //! `ResendRequest` (2).
 //!
@@ -100,11 +102,11 @@ use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
 use crate::reactor::{
-    DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, ResendState,
-    SessionParams, lock_heartbeat, send_handshake_admin, session_codec, spawn_session,
+    DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, HandshakeRead,
+    ResendState, SessionParams, lock_heartbeat, read_handshake_frame, send_handshake_admin,
+    session_codec, spawn_session,
 };
 use crate::wire::{self, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion};
-use futures_util::StreamExt;
 use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
 use ironfix_session::sequence::SequenceResult;
@@ -114,7 +116,6 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
 /// RAII claim on the one live session an [`Acceptor`] admits at a time for a
@@ -286,8 +287,9 @@ impl<A: Application + 'static> Acceptor<A> {
     ///
     /// # Errors
     /// Returns an [`EngineError`] if framing or the Logon handshake fails. That
-    /// includes [`EngineError::LogonTimeout`] when no Logon arrives within
-    /// [`SessionConfig::logon_timeout`], [`EngineError::UnexpectedMessage`] when
+    /// includes [`EngineError::LogonTimeout`] when no intact Logon arrives
+    /// within [`SessionConfig::logon_timeout`] (garbled ones are skipped),
+    /// [`EngineError::UnexpectedMessage`] when
     /// the first frame is not a Logon, [`EngineError::IdentityMismatch`] when
     /// the Logon's CompIDs do not match the configured counterparty, and
     /// [`EngineError::SequenceExhausted`] when a sequence counter has reached
@@ -340,22 +342,25 @@ impl<A: Application + 'static> Acceptor<A> {
         let identity = PeerIdentity::new(&self.config);
         let sending_time = SendingTimeGuard::new(&self.config);
 
-        // Await the inbound Logon, bounded by logon_timeout.
-        let logon_frame = match timeout(self.config.logon_timeout, framed.next()).await {
-            Err(_) => {
-                let _ = session.disconnect();
-                return Err(EngineError::LogonTimeout(self.config.logon_timeout));
-            }
-            Ok(None) => {
-                let _ = session.disconnect();
-                return Err(EngineError::Closed);
-            }
-            Ok(Some(Err(err))) => {
-                let _ = session.disconnect();
-                return Err(err.into());
-            }
-            Ok(Some(Ok(frame))) => frame,
-        };
+        // Await the inbound Logon. Garbled frames are skipped, and the logon
+        // timeout covers the whole wait, so a Logon that never arrives intact
+        // is a LogonTimeout.
+        let logon_frame =
+            match read_handshake_frame(&mut framed, self.config.logon_timeout, &session_id).await {
+                HandshakeRead::Frame(frame) => frame,
+                HandshakeRead::TimedOut => {
+                    let _ = session.disconnect();
+                    return Err(EngineError::LogonTimeout(self.config.logon_timeout));
+                }
+                HandshakeRead::Closed => {
+                    let _ = session.disconnect();
+                    return Err(EngineError::Closed);
+                }
+                HandshakeRead::Codec(err) => {
+                    let _ = session.disconnect();
+                    return Err(err.into());
+                }
+            };
 
         // Typestate: Connecting -> LogonReceived.
         let session = session.on_logon_received();

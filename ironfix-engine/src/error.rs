@@ -24,7 +24,8 @@ pub enum EngineError {
     ///
     /// Both engines frame with garbled-frame recovery on, so a garbled frame
     /// (a bad CheckSum or BodyLength, bytes before `8=`) is skipped rather than
-    /// reported here. What remains is fatal: a frame above
+    /// reported here, during the Logon handshake as well as afterwards. What
+    /// remains is fatal: a frame above
     /// [`SessionConfig::max_message_size`](ironfix_session::SessionConfig::max_message_size),
     /// or an I/O failure inside the codec.
     #[error("codec error: {0}")]
@@ -57,7 +58,13 @@ pub enum EngineError {
     #[error("connect timed out after {0:?}")]
     ConnectTimeout(Duration),
 
-    /// The Logon acknowledgement did not arrive within the logon timeout.
+    /// The Logon (acceptor) or Logon acknowledgement (initiator) did not
+    /// arrive intact within the logon timeout.
+    ///
+    /// Garbled frames received while waiting are ignored, not reported, so a
+    /// counterparty that sends only garbled Logons ends here once the timeout
+    /// expires rather than in an immediate [`EngineError::Codec`] or
+    /// [`EngineError::Decode`].
     #[error("logon timed out after {0:?}")]
     LogonTimeout(Duration),
 

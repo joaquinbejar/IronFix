@@ -672,6 +672,29 @@ pub(crate) fn decode_frame(frame: &[u8]) -> Result<RawMessage<'_>, DecodeError> 
     decoder.decode()
 }
 
+/// Names the defect behind a frame that framed but did not decode, for a log
+/// line that must not carry the frame's bytes.
+///
+/// [`DecodeError`]'s `Display` can quote input: an `InvalidTag` shows the first
+/// bytes of the offending tag, which in a garbled frame may be the start of a
+/// `Password` (554) value. The engine logs this static label instead.
+#[must_use]
+pub(crate) const fn decode_defect(error: &DecodeError) -> &'static str {
+    match error {
+        DecodeError::InvalidBeginString => "decode: BeginString (8) not first",
+        DecodeError::MissingBodyLength => "decode: BodyLength (9) not second",
+        DecodeError::InvalidBodyLength => "decode: BodyLength (9) invalid",
+        DecodeError::MissingMsgType => "decode: MsgType (35) not third",
+        DecodeError::InvalidMsgType(_) => "decode: MsgType (35) invalid",
+        DecodeError::ChecksumMismatch { .. } => "decode: CheckSum (10) mismatch",
+        DecodeError::InvalidTag(_) => "decode: invalid tag",
+        DecodeError::UnterminatedField { .. } => "decode: unterminated field",
+        DecodeError::InvalidDataLength { .. } => "decode: invalid data length",
+        DecodeError::InvalidUtf8(_) => "decode: invalid UTF-8",
+        _ => "decode: malformed frame",
+    }
+}
+
 /// Why a stored message could not be rebuilt as a resend.
 ///
 /// Every variant means the same thing to the reactor — this particular message
@@ -1132,6 +1155,28 @@ mod tests {
         decode_frame(frame)
             .ok()
             .and_then(|raw| raw.get_field_str(tag).map(str::to_string))
+    }
+
+    #[test]
+    fn test_decode_defect_names_msg_type_out_of_place() {
+        // MsgType (35) second in the body: the FIX Session Layer's "MsgType not
+        // third" garbling.
+        let frame = b"8=FIX.4.4\x019=15\x0149=X\x0135=0\x0134=2\x0110=000\x01";
+        match decode_frame(frame) {
+            Err(err) => assert_eq!(decode_defect(&err), "decode: MsgType (35) not third"),
+            Ok(_) => panic!("a frame with MsgType out of place must not decode"),
+        }
+    }
+
+    #[test]
+    fn test_decode_defect_never_quotes_input() {
+        // An InvalidTag's Display quotes the start of the bad tag; in a garbled
+        // frame that can be a Password (554) value whose `=` was lost.
+        let err = DecodeError::InvalidTag("554hunter2".to_string());
+        assert!(err.to_string().contains("hunter2"));
+        let label = decode_defect(&err);
+        assert!(!label.contains("hunter2"));
+        assert_eq!(label, "decode: invalid tag");
     }
 
     #[test]

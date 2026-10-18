@@ -769,6 +769,55 @@ fn with_wrong_checksum(frame: &[u8]) -> BytesMut {
     garbled
 }
 
+/// Builds a frame around `body` with a correct BodyLength and CheckSum,
+/// bypassing the encoder, which refuses a body whose first field is not
+/// MsgType.
+fn raw_frame(body: &[u8]) -> BytesMut {
+    let mut frame = Vec::with_capacity(body.len() + 32);
+    frame.extend_from_slice(b"8=FIX.4.4\x01");
+    frame.extend_from_slice(format!("9={}\x01", body.len()).as_bytes());
+    frame.extend_from_slice(body);
+    let sum: u64 = frame.iter().map(|&b| u64::from(b)).sum();
+    frame.extend_from_slice(format!("10={:03}\x01", sum % 256).as_bytes());
+    BytesMut::from(&frame[..])
+}
+
+/// A client Logon that frames correctly but whose MsgType (35) is not the
+/// third field: garbled at the decode level, as the FIX Session Layer defines
+/// it.
+fn logon_with_msg_type_out_of_place() -> BytesMut {
+    raw_frame(b"49=CLIENT\x0135=A\x0156=VENUE\x0134=1\x0198=0\x01108=30\x01")
+}
+
+/// Returns `frame` with its BodyLength (9) one short of the real body: the
+/// trailer is then not where BodyLength points, so the codec resynchronises
+/// through the body instead of consuming a corroborated frame.
+#[track_caller]
+fn with_wrong_body_length(frame: &[u8]) -> BytesMut {
+    let tag_at = some(
+        frame.windows(3).position(|window| window == b"\x019="),
+        "frame must carry BodyLength",
+    );
+    let start = some(tag_at.checked_add(3), "BodyLength digits follow the tag");
+    let digits_len = some(
+        frame
+            .get(start..)
+            .and_then(|rest| rest.iter().position(|&byte| byte == 0x01)),
+        "BodyLength must be terminated",
+    );
+    let end = some(start.checked_add(digits_len), "digits end inside the frame");
+    let digits = some(frame.get(start..end), "digits are inside the frame");
+    let declared: usize = ok(
+        ok(std::str::from_utf8(digits), "BodyLength is ASCII").parse(),
+        "BodyLength is decimal",
+    );
+    let short = some(declared.checked_sub(1), "BodyLength is positive");
+    let mut garbled = BytesMut::from(some(frame.get(..start), "head is inside the frame"));
+    garbled.extend_from_slice(short.to_string().as_bytes());
+    garbled.extend_from_slice(some(frame.get(end..), "tail is inside the frame"));
+    garbled
+}
+
 /// A garbled-frame bound of `max` frames within `window`.
 #[track_caller]
 fn garbled_limit(max: u32, window: Duration) -> GarbledFrameLimit {
@@ -947,7 +996,10 @@ async fn test_acceptor_garbled_frame_before_the_logon_is_skipped() {
 
     let stream = ok(TcpStream::connect(addr).await, "client connects");
     let mut framed = Framed::new(stream, FixCodec::new());
+    // One Logon the codec cannot frame, one that frames but does not decode,
+    // then the valid one.
     let mut burst = with_wrong_checksum(&client_msg("A", 1, &[(98, "0"), (108, "30")]));
+    burst.extend_from_slice(&logon_with_msg_type_out_of_place());
     burst.extend_from_slice(&client_msg("A", 1, &[(98, "0"), (108, "30")]));
     ok(framed.send(burst).await, "send garbled + valid Logon");
 
@@ -989,6 +1041,12 @@ async fn test_acceptor_oversized_frame_still_closes_the_session() {
             .await,
         "send oversized header",
     );
+
+    // The read side is unusable but the write side is not: the acceptor says
+    // why before it hangs up.
+    let logout = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&logout), "5");
+    assert_eq!(field(&logout, 58).as_deref(), Some("message too large"));
 
     ok(
         timeout(Duration::from_secs(5), connection.wait_closed()).await,
@@ -1114,4 +1172,121 @@ async fn test_acceptor_garbled_frames_do_not_refresh_the_heartbeat() {
         ),
         "the acceptor should have probed with a TestRequest"
     );
+}
+
+/// A Logon that never arrives intact ends the acceptor handshake in
+/// LogonTimeout after `logon_timeout`, not in an immediate codec or decode
+/// error: both kinds of garbled Logon are ignored.
+#[tokio::test]
+async fn test_acceptor_garbled_only_logon_ends_in_logon_timeout() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let config =
+        venue_config(Duration::from_secs(30)).with_logon_timeout(Duration::from_millis(300));
+    let acceptor = Acceptor::new(config, Arc::clone(&venue_app));
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+
+    let stream = ok(TcpStream::connect(addr).await, "client connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    let mut burst = with_wrong_checksum(&client_msg("A", 1, &[(98, "0"), (108, "30")]));
+    burst.extend_from_slice(&logon_with_msg_type_out_of_place());
+    ok(framed.send(burst).await, "send garbled Logons only");
+
+    match ok(
+        timeout(Duration::from_secs(5), venue).await,
+        "venue task finishes within 5s",
+    ) {
+        Ok(Err(EngineError::LogonTimeout(_))) => {}
+        other => panic!("expected LogonTimeout, got {other:?}"),
+    }
+    assert!(!venue_app.events().contains(&"logon".to_string()));
+    drop(framed);
+}
+
+/// A frame whose BodyLength is wrong, rather than its CheckSum, is skipped by
+/// the acceptor too: no MsgSeqNum consumed, a ResendRequest for its number,
+/// and the session stays Active.
+#[tokio::test]
+async fn test_acceptor_garbled_body_length_frame_is_skipped_and_its_gap_resent() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    );
+    let (mut framed, connection) = establish(acceptor, 30).await;
+
+    let mut burst = with_wrong_body_length(&client_msg("1", 2, &[(112, "GARBLED")]));
+    burst.extend_from_slice(&client_msg("1", 3, &[(112, "AFTER")]));
+    ok(framed.send(burst).await, "send garbled + valid frames");
+
+    let resend = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&resend), "2", "the gap must be requested");
+    assert_eq!(field(&resend, 7).as_deref(), Some("2"));
+    let reply = next_frame(&mut framed).await;
+    assert_eq!(field(&reply, 112).as_deref(), Some("AFTER"));
+    assert_eq!(connection.next_target_seq(), 2);
+    assert!(!connection.is_closed());
+
+    drop(framed);
+    let _ = timeout(Duration::from_secs(5), connection.wait_closed()).await;
+}
+
+/// Garbled Logons skipped during the acceptor handshake are not counted
+/// toward the limit: with a limit of one the session survives them, keeps
+/// answering, and only the first garbled frame of the Active session logs it
+/// out.
+#[tokio::test]
+async fn test_acceptor_garbled_frames_during_the_handshake_do_not_count_toward_the_limit() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let config = venue_config(Duration::from_secs(30))
+        .with_garbled_frame_limit(Some(garbled_limit(1, Duration::from_secs(60))));
+    let acceptor = Acceptor::new(config, Arc::clone(&venue_app));
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+
+    let stream = ok(TcpStream::connect(addr).await, "client connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    let mut burst = with_wrong_checksum(&client_msg("A", 1, &[(98, "0"), (108, "30")]));
+    burst.extend_from_slice(&logon_with_msg_type_out_of_place());
+    burst.extend_from_slice(&client_msg("A", 1, &[(98, "0"), (108, "30")]));
+    ok(framed.send(burst).await, "send garbled + valid Logon");
+    let ack = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&ack), "A");
+    let connection = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), venue).await,
+                "handshake within 5s",
+            ),
+            "venue task joins",
+        ),
+        "acceptor establishes the session",
+    );
+
+    ok(
+        framed.send(client_msg("1", 2, &[(112, "ALIVE")])).await,
+        "send TestRequest",
+    );
+    let reply = next_frame(&mut framed).await;
+    assert_eq!(
+        msg_type_of(&reply),
+        "0",
+        "the handshake garbage did not count"
+    );
+    assert_eq!(field(&reply, 112).as_deref(), Some("ALIVE"));
+
+    ok(
+        framed
+            .send(with_wrong_checksum(&client_msg("0", 3, &[])))
+            .await,
+        "send one garbled frame in session",
+    );
+    let logout = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&logout), "5");
+    assert!(some(field(&logout, 58), "logout must carry Text").contains("garbled"));
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s",
+    );
+    read_until_closed(&mut framed).await;
 }

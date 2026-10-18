@@ -38,12 +38,15 @@
 //!
 //! Both also frame their socket with garbled-frame recovery on
 //! ([`ironfix_transport::FixCodec::with_garbled_recovery`]). A garbled inbound
-//! frame is ignored as FIX requires: it consumes no `MsgSeqNum`, does not
-//! refresh the heartbeat clock, is logged as a count and never as bytes, and
-//! the gap it leaves is recovered by the usual `ResendRequest`. The optional
+//! frame, including one that frames but does not decode (`MsgType` not third),
+//! is ignored as FIX requires: it consumes no `MsgSeqNum`, does not refresh the
+//! heartbeat clock, is logged as a count and never as bytes, and the gap it
+//! leaves is recovered by the usual `ResendRequest`. During the Logon handshake
+//! a garbled frame is skipped too, so a counterparty that never sends an intact
+//! Logon ends in [`EngineError::LogonTimeout`]. The optional
 //! [`SessionConfig::garbled_frame_limit`] logs out a session whose link keeps
-//! garbling. Only a frame above `max_message_size` or an I/O error still ends
-//! the session at the codec.
+//! garbling. Only a frame above `max_message_size` (after a Logout saying so)
+//! or an I/O error still ends the session at the codec.
 //!
 //! ## Current limitations
 //!

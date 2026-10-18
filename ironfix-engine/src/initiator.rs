@@ -32,10 +32,12 @@
 //! whose clock is two minutes out, will be so on its next message too.
 //!
 //! A *garbled* frame, by contrast, is per-message and is ignored: the codec
-//! skips it (see the crate-level docs), it consumes no `MsgSeqNum`, and the gap
-//! is recovered by `ResendRequest`. That applies while waiting for the Logon ack
-//! too: a garbled ack is skipped and the wait continues, bounded by
-//! [`SessionConfig::logon_timeout`].
+//! skips it, or the engine does when it frames but does not decode (see the
+//! crate-level docs). It consumes no `MsgSeqNum`, and the gap is recovered by
+//! `ResendRequest`. That applies while waiting for the Logon ack too: a garbled
+//! ack is skipped and the wait continues against the same
+//! [`SessionConfig::logon_timeout`], so an ack that never arrives intact ends
+//! in [`EngineError::LogonTimeout`].
 //!
 //! # Bounded recovery
 //!
@@ -142,12 +144,11 @@ use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
 use crate::reactor::{
-    DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, ResendState,
-    SessionParams, TICK_INTERVAL, lock_heartbeat, send_handshake_admin, session_codec,
-    spawn_session,
+    DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, HandshakeRead,
+    ResendState, SessionParams, TICK_INTERVAL, lock_heartbeat, read_handshake_frame,
+    send_handshake_admin, session_codec, spawn_session,
 };
 use crate::wire::{self, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion};
-use futures_util::StreamExt;
 use ironfix_core::error::DecodeError;
 use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
@@ -463,7 +464,10 @@ impl<A: Application + 'static> Initiator<A> {
     ///
     /// # Errors
     /// Returns an [`EngineError`] if the dial, framing, or Logon handshake
-    /// fails. Beyond timeouts and transport failures that includes
+    /// fails. An ack that never arrives intact within
+    /// [`SessionConfig::logon_timeout`], including one that arrives only
+    /// garbled, is [`EngineError::LogonTimeout`]. Beyond timeouts and
+    /// transport failures that includes
     /// [`EngineError::IdentityMismatch`], when the ack's CompIDs do not match
     /// the configured session, and [`EngineError::SequenceExhausted`], when a
     /// sequence counter has reached `u64::MAX` and the session must be reset
@@ -580,22 +584,25 @@ impl<A: Application + 'static> Initiator<A> {
         lock_heartbeat(&runtime).on_message_sent();
         let session = session.send_logon();
 
-        // Await the Logon acknowledgement.
-        let ack = match timeout(self.config.logon_timeout, framed.next()).await {
-            Err(_) => {
-                let _ = session.on_logon_reject();
-                return Err(EngineError::LogonTimeout(self.config.logon_timeout));
-            }
-            Ok(None) => {
-                let _ = session.on_logon_reject();
-                return Err(EngineError::Closed);
-            }
-            Ok(Some(Err(err))) => {
-                let _ = session.on_logon_reject();
-                return Err(err.into());
-            }
-            Ok(Some(Ok(frame))) => frame,
-        };
+        // Await the Logon acknowledgement. Garbled frames are skipped, and the
+        // logon timeout covers the whole wait, so an ack that never arrives
+        // intact is a LogonTimeout.
+        let ack =
+            match read_handshake_frame(&mut framed, self.config.logon_timeout, &session_id).await {
+                HandshakeRead::Frame(frame) => frame,
+                HandshakeRead::TimedOut => {
+                    let _ = session.on_logon_reject();
+                    return Err(EngineError::LogonTimeout(self.config.logon_timeout));
+                }
+                HandshakeRead::Closed => {
+                    let _ = session.on_logon_reject();
+                    return Err(EngineError::Closed);
+                }
+                HandshakeRead::Codec(err) => {
+                    let _ = session.on_logon_reject();
+                    return Err(err.into());
+                }
+            };
 
         // (gap start, high-water) of a gap detected in the Logon ack itself.
         let mut pending_resend: Option<(u64, u64)> = None;
