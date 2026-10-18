@@ -166,11 +166,14 @@ use crate::reactor::{
 use crate::wire::{
     self, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard, UnsupportedVersion,
 };
+use bytes::BytesMut;
 use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
 use ironfix_session::config::SessionConfigError;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
-use ironfix_session::{Disconnected, HeartbeatManager, SequenceManager, Session, SessionConfig};
+use ironfix_session::{
+    Connecting, Disconnected, HeartbeatManager, SequenceManager, Session, SessionConfig,
+};
 use ironfix_store::MessageStore;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -740,12 +743,6 @@ impl<A: Application + 'static> Acceptor<A> {
         let _ = stream.set_nodelay(true);
         let mut framed = Framed::new(stream, session_codec(&self.config, version));
 
-        let mut factory = MessageFactory::new(&self.config, version);
-        let identity = PeerIdentity::new(&self.config);
-        let sending_time = SendingTimeGuard::new(&self.config);
-        let write_timeout = self.write_timeout;
-        let store_timeout = self.store.timeout(write_timeout);
-
         // Await the inbound Logon. Garbled frames are skipped, and the logon
         // timeout covers the whole wait, so a Logon that never arrives intact
         // is a LogonTimeout.
@@ -765,6 +762,35 @@ impl<A: Application + 'static> Acceptor<A> {
                     return Err(err.into());
                 }
             };
+
+        self.complete_handshake(version, session, framed, logon_frame)
+            .await
+    }
+
+    /// The acceptor half of the Logon handshake, from a Logon frame that has
+    /// already been read (and decoded once) on `framed`, up to the spawned
+    /// reactor.
+    ///
+    /// Kept apart from the read in [`Acceptor::serve`], so a caller that has
+    /// already read the Logon can run exactly the same checks, refusals,
+    /// store order and reactor on it.
+    ///
+    /// # Errors
+    /// Every handshake error [`Acceptor::serve`] documents after the read.
+    async fn complete_handshake(
+        &self,
+        version: FixVersion,
+        session: Session<Connecting>,
+        mut framed: FixFramed,
+        logon_frame: BytesMut,
+    ) -> Result<Connection, EngineError> {
+        let session_id = self.session_id.clone();
+
+        let mut factory = MessageFactory::new(&self.config, version);
+        let identity = PeerIdentity::new(&self.config);
+        let sending_time = SendingTimeGuard::new(&self.config);
+        let write_timeout = self.write_timeout;
+        let store_timeout = self.store.timeout(write_timeout);
 
         // Typestate: Connecting -> LogonReceived.
         let session = session.on_logon_received();
