@@ -61,8 +61,8 @@
 //!   resend-from-store replay and seeds each session's counters in both roles,
 //!   but there is no persistent implementation yet. A store belongs to
 //!   exactly one engine. The acceptor touches its store only once the peer is
-//!   known to be the counterparty, and resets it only for a Logon that passes
-//!   every check. Store writes are ordered and fallible, and
+//!   authenticated (`from_admin` accepted it), and resets it only for a Logon
+//!   that passes every check. Store writes are ordered and fallible, and
 //!   [`StoreFailurePolicy`] decides
 //!   whether a failed one is tolerated or closes the session (see
 //!   [`persistence`]). Inbound application messages are delivered at most

@@ -7636,3 +7636,51 @@ async fn test_initiator_driven_reset_takes_the_ack_as_message_one() {
     drop(connection);
     acceptor.abort();
 }
+
+/// An ack numbered 0 names no message. After a reset the initiator declared,
+/// it must not slip through the reset rule, which takes a positive number as
+/// the acceptor's message 1: it is validated and refused as too low, the
+/// session never goes Active, and the store's target counter does not move.
+#[tokio::test]
+async fn test_initiator_refuses_an_ack_numbered_zero_after_its_reset() {
+    let (listener, addr) = bind_listener().await;
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(field(&logon, 141).as_deref(), Some("Y"));
+        ok(
+            framed
+                .send(venue_msg("A", 0, &[(98, "0"), (108, "30")]))
+                .await,
+            "send an ack numbered 0",
+        );
+        msg_types_until_closed(&mut framed).await
+    });
+
+    let store = Arc::new(FailingStore::working());
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(
+        client_config(Duration::from_secs(30)).with_reset_on_logon(true),
+        Arc::clone(&app),
+    )
+    .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+
+    match initiator.connect(addr).await {
+        Err(EngineError::Sequence(detail)) => assert!(detail.contains("too low"), "{detail}"),
+        Err(other) => panic!("expected a too-low Sequence error, got {other:?}"),
+        Ok(_) => panic!("an ack numbered 0 must not establish the session"),
+    }
+    let _ = ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+    assert!(!app.events().contains(&"logon".to_string()));
+    assert_eq!(
+        store.inner.next_target_seq(),
+        1,
+        "the ack's number was never persisted"
+    );
+}

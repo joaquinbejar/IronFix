@@ -1892,12 +1892,13 @@ fn assert_history_kept(store: &ProbeStore) {
     }
 }
 
-/// A Logon from the configured counterparty that `from_admin` refuses gets a
-/// Logout with the refusal's text, numbered from the store's counters and
-/// filed. Its `ResetSeqNumFlag` (141) does not reset the store: a refused Logon
-/// cannot clear the outbound journal.
+/// Matching CompIDs authenticate nobody. A Logon that `from_admin` refuses, with
+/// a store attached, gets no reply and never touches the store: a peer that
+/// knows the CompIDs but not the credentials can neither append to the
+/// journal, advance the session's counters, nor (with `ResetSeqNumFlag`)
+/// clear it.
 #[tokio::test]
-async fn test_acceptor_from_admin_refusal_is_filed_and_never_resets() {
+async fn test_acceptor_from_admin_refusal_has_no_reply_and_no_store_access() {
     let (acceptor, store) = acceptor_with_history(Arc::new(RefusingApp)).await;
     let (result, frames) = refused_logon(
         acceptor,
@@ -1909,25 +1910,46 @@ async fn test_acceptor_from_admin_refusal_is_filed_and_never_resets() {
         Err(EngineError::LogonRejected { reason }) => assert_eq!(reason, "bad credentials"),
         other => panic!("expected LogonRejected, got {other:?}"),
     }
+    assert!(frames.is_empty(), "no reply: {frames:?}");
+    assert_eq!(store.touched(), 0, "the store was never touched");
+    assert_history_kept(&store);
+    assert_eq!(
+        store.inner.next_sender_seq(),
+        4,
+        "the counters did not move"
+    );
+}
+
+/// Without a store there is no journal to protect, and a Logon that
+/// `from_admin` refuses still gets a Logout with the refusal's text.
+#[tokio::test]
+async fn test_acceptor_from_admin_refusal_without_a_store_gets_a_logout() {
+    let acceptor = Arc::new(Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::new(RefusingApp),
+    ));
+    let (result, frames) =
+        refused_logon(acceptor, client_msg("A", 1, &[(98, "0"), (108, "30")])).await;
+
+    assert!(
+        matches!(result, Err(EngineError::LogonRejected { .. })),
+        "expected LogonRejected, got {result:?}"
+    );
     assert_eq!(
         frames,
         vec![(
             "5".to_string(),
-            Some("4".to_string()),
+            Some("1".to_string()),
             Some("bad credentials".to_string())
-        )],
-        "one Logout, numbered from the store, carrying the refusal"
+        )]
     );
-    assert_history_kept(&store);
-    assert!(store.inner.contains(4), "the Logout is filed");
-    assert_eq!(store.inner.next_sender_seq(), 5);
 }
 
-/// A Logon from the configured counterparty whose `SendingTime` (52) is out of
-/// tolerance gets a Reject (373 = 10) and a Logout, both numbered from the
-/// store's counters and filed.
+/// A Logon whose `SendingTime` (52) is out of tolerance is refused before the
+/// peer is authenticated: with a store attached it gets no reply and the store
+/// is not touched.
 #[tokio::test]
-async fn test_acceptor_sending_time_refusal_is_filed() {
+async fn test_acceptor_sending_time_refusal_has_no_reply_and_no_store_access() {
     let (venue_app, _venue_rx) = RecordingApp::new();
     let (acceptor, store) = acceptor_with_history(venue_app).await;
 
@@ -1947,20 +1969,8 @@ async fn test_acceptor_sending_time_refusal_is_filed() {
         matches!(result, Err(EngineError::SendingTime { .. })),
         "expected a SendingTime error, got {result:?}"
     );
-    let numbered: Vec<_> = frames
-        .iter()
-        .map(|(msg_type, seq, _)| (msg_type.clone(), seq.clone()))
-        .collect();
-    assert_eq!(
-        numbered,
-        vec![
-            ("3".to_string(), Some("4".to_string())),
-            ("5".to_string(), Some("5".to_string())),
-        ],
-        "a Reject then a Logout, numbered from the store"
-    );
-    assert!(store.inner.contains(4) && store.inner.contains(5));
-    assert_eq!(store.inner.next_sender_seq(), 6);
+    assert!(frames.is_empty(), "no reply: {frames:?}");
+    assert_eq!(store.touched(), 0, "the store was never touched");
     assert_history_kept(&store);
 }
 
@@ -2392,4 +2402,33 @@ async fn test_acceptor_timed_out_store_write_leaves_a_reset_owed() {
     let (_framed, _connection, ack) = establish_shared(&acceptor, 3, &[]).await;
     assert_eq!(field(&ack, 34).as_deref(), Some("1"), "a new stream starts");
     assert_eq!(field(&ack, 141).as_deref(), Some("Y"), "and is declared");
+}
+
+/// A Logon numbered 0 names no message. With a reset the acceptor drives
+/// (`reset_on_logon`), it must not slip through the reset rule, which takes a
+/// positive old-stream number as message 1: it is refused like a missing
+/// `MsgSeqNum`, without a reply and before the store is touched.
+#[tokio::test]
+async fn test_acceptor_refuses_a_logon_numbered_zero_before_any_reset() {
+    let store = Arc::new(ProbeStore::new());
+    seed_history(&store.inner).await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)).with_reset_on_logon(true),
+            Arc::clone(&venue_app),
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    let (result, frames) =
+        refused_logon(acceptor, client_msg("A", 0, &[(98, "0"), (108, "30")])).await;
+
+    assert!(
+        matches!(result, Err(EngineError::Sequence(_))),
+        "expected a Sequence error, got {result:?}"
+    );
+    assert!(frames.is_empty(), "no reply: {frames:?}");
+    assert_eq!(store.touched(), 0, "the store was never touched");
+    assert_history_kept(&store);
+    assert!(!venue_app.events().contains(&"logon".to_string()));
 }

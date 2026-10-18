@@ -941,10 +941,11 @@ impl<A: Application + 'static> Initiator<A> {
             // The reset rule both roles share: in a Logon exchange that resets
             // the sequence, each side's Logon or acknowledgement is message 1
             // of its new stream. A reset this side declared therefore takes the
-            // ack as the counterparty's message 1 whatever MsgSeqNum it carries,
-            // and expects 2 next; an ack that declares a reset itself was held
-            // to 34=1 above.
-            let validation = if reset_logon {
+            // ack as the counterparty's message 1 whatever positive MsgSeqNum it
+            // carries, and expects 2 next; an ack that declares a reset itself
+            // was held to 34=1 above. 0 names no message, so an ack numbered 0
+            // is validated as usual and refused as too low.
+            let validation = if reset_logon && ack_seq > 0 {
                 SequenceResult::Ok
             } else {
                 runtime.sequences.validate_incoming(ack_seq)

@@ -51,18 +51,22 @@
 //! is dropped without reaching Active. What the peer is sent first depends on
 //! who it is:
 //!
-//! - **An unknown peer** (wrong version or encryption, no `MsgSeqNum` in the
-//!   header, wrong CompIDs): with a store attached, nothing; without one, a
-//!   Reject (reason 9 for identity) and/or a Logout as before, except for a
-//!   missing `MsgSeqNum`, which has no reply in either mode.
+//! - **An unauthenticated peer** (wrong version or encryption, wrong CompIDs,
+//!   a `SendingTime` out of tolerance, credentials that `from_admin`
+//!   refuses): with a store attached, nothing, and the store is not touched;
+//!   without one, a Reject (reason 9 for identity, 10 for the clock) and/or a
+//!   Logout as before. Matching CompIDs authenticate nobody: they are
+//!   caller-supplied, so a peer that knows them but not the credentials must
+//!   not be able to write to the journal or move the session's counters.
+//! - **A Logon without a valid `MsgSeqNum`** (absent, outside the header, or
+//!   0): nothing, in either mode.
 //! - **A duplicate Logon** for a session already live: nothing, in either
 //!   mode. The live session owns the sequence stream.
-//! - **The configured counterparty**, which holds the admission slot (refused
-//!   by `SendingTime` with reason 10, by `from_admin`, by a 141 Logon not
-//!   numbered 1, by its `HeartBtInt`, or by a `MsgSeqNum` too low): a Reject
-//!   and/or a Logout carrying the reason, sent like every session frame,
-//!   numbered from the store's refreshed counters (or the seed) and filed when
-//!   a store is attached. Such a refusal never resets the store.
+//! - **An authenticated peer** (`from_admin` accepted it) refused by a 141
+//!   Logon not numbered 1, by its `HeartBtInt`, or by a `MsgSeqNum` too low: a
+//!   Logout carrying the reason, sent like every session frame, numbered from
+//!   the store's refreshed counters (or the seed) and filed when a store is
+//!   attached. Such a refusal never resets the store.
 //!
 //! `HeartBtInt` (108) is counterparty-controlled and drives a `Duration` on the
 //! heartbeat clock, so it is bounded at the handshake: a value large enough to
@@ -102,12 +106,13 @@
 //! [`persistence`](crate::persistence) module for the write order and
 //! [`StoreFailurePolicy`] for what a failed write means.
 //!
-//! **Nothing reaches the store before the peer is known.** The version,
-//! encryption, identity and admission checks come first, so an unknown peer or
-//! a duplicate Logon never touches the store. A refusal of the configured
-//! counterparty after that is numbered from a refresh of the store and filed,
-//! and only a Logon that passes every check can reset the store, so a refused
-//! `141=Y` Logon cannot clear the outbound journal.
+//! **Nothing reaches the store before the peer is authenticated.** The
+//! version, encryption, `MsgSeqNum`, identity, admission, `SendingTime` and
+//! `from_admin` checks all come first, so an unauthenticated peer or a
+//! duplicate Logon never touches the store. A refusal after authentication is
+//! numbered from a refresh of the store and filed, and only a Logon that passes
+//! every check can reset the store, so a refused `141=Y` Logon cannot clear the
+//! outbound journal.
 //!
 //! All sequence arithmetic goes through the checked
 //! [`SequenceManager::try_allocate_sender_seq`](ironfix_session::SequenceManager::try_allocate_sender_seq) /
@@ -346,13 +351,13 @@ impl<A: Application + 'static> Acceptor<A> {
     /// forgets it (#78, #89).
     ///
     /// **Nothing reaches the store before the Logon is authenticated.** A Logon
-    /// from an unknown peer (wrong version, encryption, `MsgSeqNum` placement or
-    /// CompIDs) or for a session already live is refused before the store is
-    /// touched. A Logon from the configured counterparty refused afterwards (by
-    /// the `SendingTime` check, `from_admin`, or a malformed `ResetSeqNumFlag`
-    /// or `HeartBtInt`) is answered with a filed Reject and/or Logout, numbered
-    /// from the store's counters, and never resets the store; see
-    /// [`Acceptor::serve`].
+    /// refused before `from_admin` has accepted it (wrong version, encryption,
+    /// `MsgSeqNum`, CompIDs, `SendingTime` or credentials) or for a session
+    /// already live gets no reply and never touches the store: matching
+    /// CompIDs authenticate nobody. A Logon refused after authentication (a
+    /// malformed `ResetSeqNumFlag` or `HeartBtInt`, a `MsgSeqNum` too low) is
+    /// answered with a filed Logout, numbered from the store's counters, and
+    /// never resets the store; see [`Acceptor::serve`].
     ///
     /// **One session at a time.** The admission slot is held until a session's
     /// task has ended: past its close-time store writes, the drain of its
@@ -554,16 +559,19 @@ impl<A: Application + 'static> Acceptor<A> {
         }
     }
 
-    /// Refuses a Logon from a peer not yet known to be the counterparty: its
-    /// version, encryption method or CompIDs are wrong.
+    /// Refuses a Logon that has not been authenticated: its version,
+    /// encryption method, CompIDs, `SendingTime` or credentials (`from_admin`)
+    /// failed.
     ///
-    /// Without a store the refusal frames are sent, numbered from the
-    /// provisional counters, as the acceptor always has. With a store attached
-    /// nothing is sent: a frame could neither be filed (that would let an
-    /// unknown peer write to the outbound journal and move its counters) nor
-    /// be numbered without reusing, with different content, a number the
+    /// Matching CompIDs authenticate nobody: they are caller-supplied. Without
+    /// a store the refusal frames are sent, numbered from the provisional
+    /// counters, as the acceptor always has. With a store attached nothing is
+    /// sent and the store is not touched: a frame could neither be filed (that
+    /// would let a peer that knows the CompIDs, but not the credentials, write
+    /// to the outbound journal and advance the session's counters) nor be
+    /// numbered without reusing, with different content, a number the
     /// session's stream already holds.
-    async fn refuse_unknown<const N: usize>(
+    async fn refuse_unauthenticated<const N: usize>(
         &self,
         session_id: &SessionId,
         framed: &mut FixFramed,
@@ -575,7 +583,7 @@ impl<A: Application + 'static> Acceptor<A> {
             tracing::warn!(
                 session = %session_id,
                 refusal,
-                "refusing a Logon from an unknown peer without a reply: with a store attached, \
+                "refusing an unauthenticated Logon without a reply: with a store attached, \
                  nothing is written before the peer is authenticated"
             );
             return;
@@ -597,14 +605,13 @@ impl<A: Application + 'static> Acceptor<A> {
         .await;
     }
 
-    /// Refuses a Logon from the configured counterparty, which holds the
-    /// admission slot: its `SendingTime`, `from_admin`, `ResetSeqNumFlag` or
-    /// `HeartBtInt` check failed.
+    /// Refuses a Logon that `from_admin` has accepted: its `ResetSeqNumFlag`
+    /// or `HeartBtInt` check failed.
     ///
-    /// The counterparty gets the refusal (the Reject's reason, the Logout's
-    /// text), sent like every frame of the session: numbered from a seed that
-    /// never resets (the store's refreshed counters, or the configured seed),
-    /// and filed before it is written when a store is attached. A refused Logon
+    /// The peer is authenticated, so it gets the refusal (the Logout's text),
+    /// sent like every frame of the session: numbered from a seed that never
+    /// resets (the store's refreshed counters, or the configured seed), and
+    /// filed before it is written when a store is attached. A refused Logon
     /// therefore cannot clear the outbound journal, whatever it declares.
     ///
     /// # Errors
@@ -612,7 +619,7 @@ impl<A: Application + 'static> Acceptor<A> {
     /// error that stopped the refusal under
     /// [`StoreFailurePolicy::CloseSession`]; the caller reports it in place of
     /// the refusal's own.
-    async fn refuse_known<const N: usize>(
+    async fn refuse_authenticated<const N: usize>(
         &self,
         session_id: &SessionId,
         framed: &mut FixFramed,
@@ -672,23 +679,23 @@ impl<A: Application + 'static> Acceptor<A> {
     ///
     /// A refused Logon is answered according to who sent it:
     ///
-    /// - **An unknown peer** (a wrong `BeginString` (8) or `EncryptMethod` (98),
-    ///   no `MsgSeqNum` (34) in the standard header, or the wrong CompIDs). With
-    ///   a store attached the connection is closed without a reply; without one
-    ///   a Reject and/or Logout is sent, as before, except for a missing
-    ///   `MsgSeqNum`, which has never had a reply.
+    /// - **An unauthenticated peer** (a wrong `BeginString` (8) or
+    ///   `EncryptMethod` (98), the wrong CompIDs, a `SendingTime` (52) out of
+    ///   tolerance, or credentials `from_admin` refuses). With a store attached
+    ///   the connection is closed without a reply and the store is not touched;
+    ///   without one a Reject (373 = 9 or 10) and/or Logout is sent, as before.
+    ///   Matching CompIDs authenticate nobody.
+    /// - **A Logon without a valid `MsgSeqNum` (34)** (absent, outside the
+    ///   standard header, or 0) is closed without a reply in either mode.
     /// - **A second Logon for a session already live** is closed without a
     ///   reply, with or without a store: the live session owns the sequence
     ///   stream, and nothing the newcomer could be sent belongs to it.
-    /// - **The configured counterparty** (it holds the admission slot), refused
-    ///   by the `SendingTime` check (Reject with `SessionRejectReason` (373) =
-    ///   10, then Logout), `from_admin` (Logout with its text), a
-    ///   `ResetSeqNumFlag` (141) Logon not numbered 1, or a missing or out of
-    ///   range `HeartBtInt` (108): the Reject and Logout are sent like every
-    ///   session frame, numbered from the store's refreshed counters (or the
-    ///   seed) and filed when a store is attached. Such a refusal never resets
-    ///   the store. A `MsgSeqNum` below the expected one is refused the same
-    ///   way.
+    /// - **An authenticated peer** (`from_admin` accepted it), refused by a
+    ///   `ResetSeqNumFlag` (141) Logon not numbered 1, a missing or out of
+    ///   range `HeartBtInt` (108), or a `MsgSeqNum` below the expected one: the
+    ///   Logout is sent like every session frame, numbered from the store's
+    ///   refreshed counters (or the seed) and filed when a store is attached.
+    ///   Such a refusal never resets the store.
     ///
     /// An attached store is touched first once the Logon is authenticated.
     /// From then on every frame the handshake sends is filed, and the Logon's
@@ -802,8 +809,14 @@ impl<A: Application + 'static> Acceptor<A> {
                     version.begin_string()
                 );
                 let logout = factory.logout(Some(&detail));
-                self.refuse_unknown(&session_id, &mut framed, &mut factory, &detail, [logout])
-                    .await;
+                self.refuse_unauthenticated(
+                    &session_id,
+                    &mut framed,
+                    &mut factory,
+                    &detail,
+                    [logout],
+                )
+                .await;
                 let _ = session.reject_logon();
                 return Err(EngineError::LogonRejected { reason: detail });
             }
@@ -818,17 +831,26 @@ impl<A: Application + 'static> Acceptor<A> {
                 let detail =
                     format!("unsupported EncryptMethod (98) '{shown}'; only 0 (None) is supported");
                 let logout = factory.logout(Some(&detail));
-                self.refuse_unknown(&session_id, &mut framed, &mut factory, &detail, [logout])
-                    .await;
+                self.refuse_unauthenticated(
+                    &session_id,
+                    &mut framed,
+                    &mut factory,
+                    &detail,
+                    [logout],
+                )
+                .await;
                 let _ = session.reject_logon();
                 return Err(EngineError::LogonRejected { reason: detail });
             }
 
             // MsgSeqNum (34) must sit in the standard header: a body-only 34 is
             // not the session sequence number, exactly as the identity check
-            // requires 49/56 in the header. No reply: nothing can reference a
-            // Logon that has no number.
-            let logon_seq = match wire::header_seq_num(&raw) {
+            // requires 49/56 in the header. 0 names no message (FIX numbers from
+            // 1), so it is no number either; refusing it here also keeps it away
+            // from the reset rule, which takes a positive number of an old
+            // stream as message 1. No reply, and the store is not touched:
+            // nothing can reference a Logon that has no number.
+            let logon_seq = match wire::header_seq_num(&raw).filter(|seq| *seq > 0) {
                 Some(seq) => seq,
                 None => {
                     let _ = session.reject_logon();
@@ -845,7 +867,7 @@ impl<A: Application + 'static> Acceptor<A> {
                 let reason = RejectReason::new(9, detail.clone()).with_ref_tag(mismatch.tag);
                 let reject = factory.session_reject(logon_seq, MsgType::Logon.as_str(), &reason);
                 let logout = factory.logout(Some(&detail));
-                self.refuse_unknown(
+                self.refuse_unauthenticated(
                     &session_id,
                     &mut framed,
                     &mut factory,
@@ -880,47 +902,49 @@ impl<A: Application + 'static> Acceptor<A> {
             // The clock is checked next, before the heartbeat is set: an
             // initiator whose SendingTime is wildly skewed cannot be trusted to
             // sequence a session, and the handshake is the cheapest place to
-            // refuse it. The counterparty holds the slot, so it gets the Reject
-            // and the Logout, filed like any session frame.
+            // refuse it. The peer is not authenticated yet (matching CompIDs
+            // prove nothing), so with a store attached it gets no reply.
             if let Err(problem) = sending_time.validate(&raw) {
                 let detail = problem.to_string();
                 let reason = problem.reject_reason();
                 let reject = factory.session_reject(logon_seq, MsgType::Logon.as_str(), &reason);
                 let logout = factory.logout(Some(&detail));
-                let refused = self
-                    .refuse_known(
-                        &session_id,
-                        &mut framed,
-                        &mut factory,
-                        &detail,
-                        [reject, logout],
-                    )
-                    .await;
+                self.refuse_unauthenticated(
+                    &session_id,
+                    &mut framed,
+                    &mut factory,
+                    &detail,
+                    [reject, logout],
+                )
+                .await;
                 let _ = session.reject_logon();
-                refused?;
                 return Err(EngineError::SendingTime { detail });
             }
 
             // Authentication hook: the application inspects the Logon (Username
-            // 553 / Password 554 and the like) and may refuse it. The refusal's
-            // text reaches the counterparty in a filed Logout.
+            // 553 / Password 554 and the like) and may refuse it. A refused
+            // peer is not authenticated, so with a store attached it gets no
+            // reply and the store is not touched: knowing the CompIDs must not
+            // be enough to write to the journal or move the session's
+            // counters.
             if let Err(reason) = self.application.from_admin(&raw, &session_id).await {
                 let logout = factory.logout(Some(&reason.text));
-                let refused = self
-                    .refuse_known(
-                        &session_id,
-                        &mut framed,
-                        &mut factory,
-                        &reason.text,
-                        [logout],
-                    )
-                    .await;
+                self.refuse_unauthenticated(
+                    &session_id,
+                    &mut framed,
+                    &mut factory,
+                    &reason.text,
+                    [logout],
+                )
+                .await;
                 let _ = session.reject_logon();
-                refused?;
                 return Err(EngineError::LogonRejected {
                     reason: reason.text,
                 });
             }
+
+            // Authenticated from here on: a refusal is sent like any session
+            // frame, filed when a store is attached.
 
             // ResetSeqNumFlag (141): FIX requires MsgSeqNum = 1 on a Logon that
             // itself carries ResetSeqNumFlag = Y: the reset and the number
@@ -932,7 +956,7 @@ impl<A: Application + 'static> Acceptor<A> {
                     format!("Logon set ResetSeqNumFlag=Y but carried MsgSeqNum {logon_seq}, not 1");
                 let logout = factory.logout(Some(&detail));
                 let refused = self
-                    .refuse_known(&session_id, &mut framed, &mut factory, &detail, [logout])
+                    .refuse_authenticated(&session_id, &mut framed, &mut factory, &detail, [logout])
                     .await;
                 let _ = session.reject_logon();
                 refused?;
@@ -954,7 +978,13 @@ impl<A: Application + 'static> Acceptor<A> {
                     tracing::warn!(session = %session_id, detail = %detail, "rejecting Logon HeartBtInt");
                     let logout = factory.logout(Some(&detail));
                     let refused = self
-                        .refuse_known(&session_id, &mut framed, &mut factory, &detail, [logout])
+                        .refuse_authenticated(
+                            &session_id,
+                            &mut framed,
+                            &mut factory,
+                            &detail,
+                            [logout],
+                        )
                         .await;
                     let _ = session.reject_logon();
                     refused?;
@@ -1022,7 +1052,7 @@ impl<A: Application + 'static> Acceptor<A> {
             // did not ask for the reset is told to make it by the ack's 141=Y),
             // and 2 is expected next: no gap is opened for the old stream's
             // numbers. Without a reset the Logon is validated as usual.
-            let validation = if reset {
+            let validation = if reset && logon_seq > 0 {
                 SequenceResult::Ok
             } else {
                 runtime.sequences.validate_incoming(logon_seq)
