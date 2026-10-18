@@ -1042,6 +1042,8 @@ rustflags = ["-C", "target-cpu=native"]
 
 *Status (dictionary side): built for validation, see ADR-0010.* `SessionDictionary::new(transport, application)` pairs a FIXT.1.1 dictionary with an application dictionary of any version FIXT.1.1 carries, FIX 4.0 through 5.0 SP2 (a non-FIXT transport, or FIXT.1.1 as the application, is `DictionaryError::IncompatibleComposition`). `Validator::for_session` then applies QuickFIX-like rules: `BeginString` must be `FIXT.1.1`; admin messages the transport defines are validated against it alone; for application messages, header and trailer tags resolve against the transport and body tags against the application dictionary. Unlike QuickFIX, `ApplVerID` is not read to pick the application dictionary, and admin routing follows the transport's `msgcat` (so 35=n is admin). The embedded QuickFIX `FIXT11.xml` does not define the Logon `NoMsgTypes(384)` group, an upstream deviation documented in `ironfix-dictionary/spec/README.md`.
 
+*Status (engine side): built, see ADR-0020.* A FIX 5.0 session accepts its own configured application version plus `SessionConfig::allowed_appl_versions`. The acceptor requires the Logon's `DefaultApplVerID` (1137) to name one of them (refused with a Logout after `from_admin`), the initiator holds the acknowledgement's 1137 to the same rule when present, and an inbound application message whose `ApplVerID` (1128) names another version gets a session Reject (`SessionRejectReason` 18, `RefTagID` 1128), its number consumed, without reaching `from_app`. No dictionary is selected by the version, and FIX 4.x carried over FIXT.1.1 (`ApplVerID` 2 to 6) is refused.
+
 ---
 
 ## Critical code patterns
