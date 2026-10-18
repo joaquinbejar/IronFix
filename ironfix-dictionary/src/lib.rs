@@ -17,6 +17,10 @@
 //!   ([`Dictionary::from_quickfix_xml`]) with a component-recursion depth guard.
 //!   Loading is treated as untrusted-input parsing: see the [`loader`] module
 //!   docs for the ceilings that bound it.
+//! - **FIX Orchestra loading**: [`Dictionary::from_orchestra_xml`] reads the
+//!   `base` scenario of a FIX Orchestra 1.0 repository into the same model,
+//!   and returns an [`OrchestraReport`] of what the model cannot hold; see the
+//!   [`orchestra`] module docs for the mapping and the limits
 //! - **Runtime validation**: message validation against dictionary rules
 //!   ([`Validator`]): known message type, defined and allowed tags, required
 //!   fields, enum values, repeating-group count and delimiter, and the
@@ -62,6 +66,12 @@
 //! via [`Dictionary::from_quickfix_xml`]; the [`Version`] enum naming a version
 //! does not imply a bundled schema for it.
 //!
+//! **Orchestra loading is tested on FIX 4.4 only.** The only Orchestra
+//! repository the tests load is the FIX Trading Community's FIX 4.4 one, a
+//! test fixture that is neither embedded nor published. `FIX.Latest`
+//! repositories are rejected with [`DictionaryError::UnsupportedVersion`],
+//! because FIX Latest names no fixed FIX version.
+//!
 //! **[`SessionDictionary`] does not read `ApplVerID(1128)`.** The caller picks
 //! the application dictionary when building the pair; a message whose
 //! `ApplVerID` names a different application version is still validated
@@ -92,6 +102,7 @@
 pub mod composition;
 pub mod group;
 pub mod loader;
+pub mod orchestra;
 pub mod schema;
 mod scope;
 pub mod validator;
@@ -102,6 +113,10 @@ pub use group::{
     GroupEntries, GroupEntry, GroupError, GroupSet, GroupSpec, MessageLayout, SpecError,
 };
 pub use loader::{DefinitionKind, DictionaryError, MAX_COMPONENT_DEPTH, MAX_NESTING_DEPTH};
+pub use orchestra::{
+    MAX_ORCHESTRA_ATTRIBUTES_LEN, MAX_ORCHESTRA_DOCUMENT_LEN, MAX_ORCHESTRA_MEMBERS,
+    ORCHESTRA_NAMESPACE, OrchestraImport, OrchestraKind, OrchestraReport, UnmappedConstruct,
+};
 pub use schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, Member,
     MemberRef, MessageCategory, MessageDef, UnknownFieldType, Version,

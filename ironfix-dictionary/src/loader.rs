@@ -52,6 +52,7 @@
 //! definitions are rejected rather than silently overwriting each other
 //! ([`DictionaryError::DuplicateDefinition`]).
 
+use crate::orchestra::OrchestraKind;
 use crate::schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, Member,
     MessageCategory, MessageDef, Version,
@@ -222,6 +223,92 @@ pub enum DictionaryError {
         /// Version of the dictionary offered as the application.
         application: Version,
     },
+    /// The document is not a FIX Orchestra 1.0 repository: its root element
+    /// is not `repository` in the
+    /// [`ORCHESTRA_NAMESPACE`](crate::orchestra::ORCHESTRA_NAMESPACE).
+    #[error("not a FIX Orchestra 1.0 repository: the root element is {0}")]
+    NotOrchestra(String),
+    /// The document is longer than the loader accepts
+    /// ([`MAX_ORCHESTRA_DOCUMENT_LEN`](crate::orchestra::MAX_ORCHESTRA_DOCUMENT_LEN)).
+    #[error("the document is {len} bytes, over the {limit}-byte limit")]
+    DocumentTooLarge {
+        /// Length of the document, in bytes.
+        len: usize,
+        /// The limit, in bytes.
+        limit: usize,
+    },
+    /// The attributes of one element are longer than the loader accepts
+    /// ([`MAX_ORCHESTRA_ATTRIBUTES_LEN`](crate::orchestra::MAX_ORCHESTRA_ATTRIBUTES_LEN)).
+    #[error("the attributes of <{element}> are {len} bytes, over the {limit}-byte limit")]
+    AttributesTooLong {
+        /// The element, as written in the document.
+        element: String,
+        /// Length of its attributes, in bytes.
+        len: usize,
+        /// The limit, in bytes.
+        limit: usize,
+    },
+    /// An Orchestra `id` is not a positive integer that fits a `u32`.
+    #[error("invalid id `{value}` on <{element}>")]
+    InvalidOrchestraId {
+        /// The element carrying the id.
+        element: String,
+        /// The id, as written in the document.
+        value: String,
+    },
+    /// An Orchestra reference names an id that no definition in the `base`
+    /// scenario has.
+    #[error("{owner} references {kind} id {id}, which is not defined")]
+    UnknownOrchestraReference {
+        /// The kind of definition referenced.
+        kind: OrchestraKind,
+        /// The referenced id.
+        id: u32,
+        /// The definition holding the reference.
+        owner: String,
+    },
+    /// Two Orchestra definitions share an id or a name that must be unique.
+    #[error("duplicate {kind} `{key}`")]
+    DuplicateOrchestraDefinition {
+        /// The kind of the duplicated definitions.
+        kind: OrchestraKind,
+        /// The shared id or name.
+        key: String,
+    },
+    /// A code set names a datatype that is not declared or maps to no FIX
+    /// data type.
+    #[error("{owner} names datatype `{datatype}`, which maps to no FIX data type")]
+    UnknownDatatype {
+        /// The definition naming the datatype.
+        owner: String,
+        /// The datatype name, as written in the document.
+        datatype: String,
+    },
+    /// An Orchestra repeating group has no count field (`numInGroup`).
+    #[error("group `{0}` has no numInGroup count field")]
+    MissingCountField(String),
+    /// An Orchestra repeating group contains itself, directly or through
+    /// other groups.
+    #[error("group `{0}` is part of a reference cycle")]
+    GroupCycle(String),
+    /// Expanding the group references of an Orchestra repository would
+    /// produce more members than the loader accepts
+    /// ([`MAX_ORCHESTRA_MEMBERS`](crate::orchestra::MAX_ORCHESTRA_MEMBERS)).
+    #[error("expanding the groups produces more than {limit} members")]
+    TooManyMembers {
+        /// The limit, in members.
+        limit: usize,
+    },
+    /// The Orchestra standard header or trailer component is referenced from
+    /// a component or a group; only a message's own members may reference
+    /// it, which is where the dictionary's header and trailer apply.
+    #[error("{owner} references the {component} component, which only a message may reference")]
+    EnvelopeReference {
+        /// `StandardHeader` or `StandardTrailer`.
+        component: String,
+        /// The definition holding the reference.
+        owner: String,
+    },
 }
 
 impl Dictionary {
@@ -328,8 +415,9 @@ impl Dictionary {
 /// Intermediate representation of a member of a message, component,
 /// group, header, or trailer, preserving document order.
 ///
-/// Crate-internal so that another loader can resolve its own references into
-/// these name references and hand them to the same [`assemble`] step.
+/// Shared with the Orchestra loader ([`crate::orchestra`]), which resolves
+/// its id references into these name references and hands them to the same
+/// [`assemble`] step.
 #[derive(Debug)]
 pub(crate) enum Item {
     /// Field reference.
