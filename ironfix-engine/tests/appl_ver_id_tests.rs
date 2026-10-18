@@ -9,13 +9,18 @@
 //! `ApplVerID` (1128) on inbound application messages.
 //!
 //! The acceptor requires an accepted 1137 on a FIX 5.0 Logon and refuses a
-//! missing, unknown or disallowed one with a filed Logout once `from_admin`
-//! has accepted the peer; the initiator refuses an acknowledgement whose
-//! 1137, when present, is not accepted. In session, an application message
-//! whose 1128 is not accepted is answered with a session Reject
-//! (`SessionRejectReason` 18, `RefTagID` 1128), its number is consumed and it
-//! never reaches `from_app`; one without 1128 is delivered. FIX 4.2 and 4.4
-//! sessions are unaffected, an allowed set on a FIX 4.x session is a
+//! missing, repeated, unknown or disallowed one with a filed Logout once
+//! `from_admin` has accepted the peer; the initiator refuses an
+//! acknowledgement whose 1137, when present (or always, in strict mode), is
+//! repeated or not accepted, with a Reject and a Logout filed when a store is
+//! attached. Both keep the accepted 1137 on the `Connection`. In session, an
+//! application message whose 1128 is not accepted is answered with a session
+//! Reject (`SessionRejectReason` 18, `RefTagID` 1128, `RefApplVerID` 1130
+//! when the code names a version), one with 1128 repeated in the header or
+//! placed outside it with 13 or 14; its number is consumed and it never
+//! reaches `from_app`; one without 1128 is delivered. FIX.5.0, FIX.5.0SP1 and
+//! FIX.5.0SP2 each run end to end between real engines. Every FIX 4.x
+//! version is unaffected, an allowed set on a FIX 4.x session is a
 //! configuration error, and a session routed by an `AcceptorRegistry` behaves
 //! as one served directly. Scripted peers play the counterparty over real
 //! loopback sockets where a real engine cannot send what a test needs.
@@ -405,6 +410,26 @@ async fn test_acceptor_fixt_logon_with_non_numeric_default_appl_ver_id_is_refuse
     assert!(!venue_app.logged_on());
 }
 
+/// A Logon carrying `DefaultApplVerID` twice is refused with a Logout: no
+/// occurrence can be trusted over the other.
+#[tokio::test]
+async fn test_acceptor_fixt_logon_with_a_repeated_default_appl_ver_id_is_refused() {
+    let (venue_app, _rx) = RecordingApp::new();
+    let acceptor = Arc::new(Acceptor::new(
+        venue_config("FIX.5.0SP2"),
+        Arc::clone(&venue_app),
+    ));
+    let (result, frames) =
+        refused_logon(acceptor, client_fixt_logon(1, &[(1137, "9"), (1137, "9")])).await;
+
+    assert_appl_version_refusal(&result, &["DefaultApplVerID (1137)", "more than once"]);
+    assert_eq!(frames.len(), 1, "one Logout: {frames:?}");
+    assert_eq!(frames[0].0, "5");
+    let text = some(frames[0].2.clone(), "the Logout says why");
+    assert!(text.contains("more than once"), "{text}");
+    assert!(!venue_app.logged_on());
+}
+
 /// The refusal comes after `from_admin` accepted the peer, so with a store
 /// attached it is an authenticated refusal (ADR-0017 group 3): the Logout is
 /// numbered from the store and filed, and a `ResetSeqNumFlag` (141) on the
@@ -488,68 +513,109 @@ async fn test_acceptor_fixt_logon_with_default_appl_ver_id_9_reaches_active() {
     assert_eq!(connection.next_target_seq(), 3);
 }
 
-/// A real FIX.5.0SP2 `Initiator` against a real FIX.5.0SP2 `Acceptor`: both
-/// declare 9, both accept it, and application messages flow each way carrying
-/// `ApplVerID` 9.
+/// A real `Initiator` against a real `Acceptor`, configured alike with each
+/// FIX 5.0 version in turn (FIX.5.0, FIX.5.0SP1, FIX.5.0SP2): both declare
+/// the version's code in 1137, each keeps the other's, and application
+/// messages flow each way carrying that code in 1128.
 #[tokio::test]
 async fn test_initiator_against_acceptor_fixt_session_exchanges_messages() {
-    let (listener, addr) = bind_listener().await;
-    let (venue_app, mut venue_rx) = RecordingApp::new();
-    let acceptor = Acceptor::new(venue_config("FIX.5.0SP2"), Arc::clone(&venue_app));
-    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+    for version in [
+        FixVersion::Fix50,
+        FixVersion::Fix50Sp1,
+        FixVersion::Fix50Sp2,
+    ] {
+        let code = some(version.appl_ver_id(), "a FIX 5.0 version has a code");
+        let (listener, addr) = bind_listener().await;
+        let (venue_app, mut venue_rx) = RecordingApp::new();
+        let acceptor = Acceptor::new(venue_config(version.as_str()), Arc::clone(&venue_app));
+        let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
 
-    let (client_app, mut client_rx) = RecordingApp::new();
-    let client = ok(
-        Initiator::new(client_config("FIX.5.0SP2"), Arc::clone(&client_app))
-            .connect(addr)
-            .await,
-        "the initiator logs on",
-    );
-    let venue_connection = ok(
-        ok(
+        let (client_app, mut client_rx) = RecordingApp::new();
+        let client = ok(
+            Initiator::new(client_config(version.as_str()), Arc::clone(&client_app))
+                .connect(addr)
+                .await,
+            "the initiator logs on",
+        );
+        let venue_connection = ok(
             ok(
-                timeout(Duration::from_secs(5), venue).await,
-                "handshake within 5s",
+                ok(
+                    timeout(Duration::from_secs(5), venue).await,
+                    "handshake within 5s",
+                ),
+                "venue task joins",
             ),
-            "venue task joins",
-        ),
-        "the acceptor establishes the session",
-    );
+            "the acceptor establishes the session",
+        );
+        assert_eq!(client.counterparty_default_appl_version(), Some(version));
+        assert_eq!(
+            venue_connection.counterparty_default_appl_version(),
+            Some(version)
+        );
 
-    let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
-    order
-        .push_str(11, "ORDER-1")
-        .push_str(55, "EUR/USD")
-        .push_char(54, '1')
-        .push_uint(38, 100);
-    ok(client.send(order).await, "the client sends an order");
-    let (msg_type, _, appl_ver_id) = next_app_message(&mut venue_rx).await;
-    assert_eq!(msg_type, "D");
-    assert_eq!(appl_ver_id.as_deref(), Some("9"));
+        let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+        order
+            .push_str(11, "ORDER-1")
+            .push_str(55, "EUR/USD")
+            .push_char(54, '1')
+            .push_uint(38, 100);
+        ok(client.send(order).await, "the client sends an order");
+        let (msg_type, _, appl_ver_id) = next_app_message(&mut venue_rx).await;
+        assert_eq!(msg_type, "D");
+        assert_eq!(appl_ver_id.as_deref(), Some(code), "{version}");
 
-    let mut report = OutboundMessage::new(MsgType::ExecutionReport);
-    report
-        .push_str(37, "EX-1")
-        .push_str(17, "E-1")
-        .push_char(150, '0')
-        .push_char(39, '0');
-    ok(
-        venue_connection.send(report).await,
-        "the venue sends a report",
-    );
-    let (msg_type, _, appl_ver_id) = next_app_message(&mut client_rx).await;
-    assert_eq!(msg_type, "8");
-    assert_eq!(appl_ver_id.as_deref(), Some("9"));
+        let mut report = OutboundMessage::new(MsgType::ExecutionReport);
+        report
+            .push_str(37, "EX-1")
+            .push_str(17, "E-1")
+            .push_char(150, '0')
+            .push_char(39, '0');
+        ok(
+            venue_connection.send(report).await,
+            "the venue sends a report",
+        );
+        let (msg_type, _, appl_ver_id) = next_app_message(&mut client_rx).await;
+        assert_eq!(msg_type, "8");
+        assert_eq!(appl_ver_id.as_deref(), Some(code), "{version}");
 
-    ok(client.logout().await, "the client logs out");
-    ok(
-        timeout(Duration::from_secs(5), client.wait_closed()).await,
-        "the client session closes within 5s",
-    );
-    ok(
-        timeout(Duration::from_secs(5), venue_connection.wait_closed()).await,
-        "the venue session closes within 5s",
-    );
+        ok(client.logout().await, "the client logs out");
+        ok(
+            timeout(Duration::from_secs(5), client.wait_closed()).await,
+            "the client session closes within 5s",
+        );
+        ok(
+            timeout(Duration::from_secs(5), venue_connection.wait_closed()).await,
+            "the venue session closes within 5s",
+        );
+    }
+}
+
+/// An acceptor configured as FIX.5.0 or FIX.5.0SP1 accepts only its own code
+/// by default: a Logon declaring SP2 (9) is refused with a Logout, and one
+/// declaring its own code reaches Active.
+#[tokio::test]
+async fn test_fix50_and_fix50sp1_acceptors_accept_only_their_own_code() {
+    for version in [FixVersion::Fix50, FixVersion::Fix50Sp1] {
+        let code = some(version.appl_ver_id(), "a FIX 5.0 version has a code");
+        let (venue_app, _rx) = RecordingApp::new();
+        let acceptor = Arc::new(Acceptor::new(
+            venue_config(version.as_str()),
+            Arc::clone(&venue_app),
+        ));
+        let (result, frames) =
+            refused_logon(Arc::clone(&acceptor), client_fixt_logon(1, &[(1137, "9")])).await;
+        assert_appl_version_refusal(&result, &["9 (FIX.5.0SP2)", &format!("{code} ({version})")]);
+        assert_eq!(frames.len(), 1, "one Logout: {frames:?}");
+        assert_eq!(frames[0].0, "5");
+
+        let (_framed, connection, ack) =
+            establish(acceptor, client_fixt_logon(1, &[(1137, code)])).await;
+        assert_eq!(field(&ack, 1137).as_deref(), Some(code));
+        assert_eq!(
+            connection.counterparty_default_appl_version(),
+            Some(version)
+        );
+    }
 }
 
 /// An acceptor configured with an allowed set accepts a Logon declaring a
@@ -735,6 +801,79 @@ async fn test_initiator_accepts_an_ack_without_or_with_its_own_default_appl_ver_
             "venue task",
         );
     }
+}
+
+/// An acknowledgement carrying `DefaultApplVerID` twice is refused with a
+/// Reject (373 = 13, tag appears more than once; 371 = 1137) and a Logout.
+#[tokio::test]
+async fn test_initiator_refuses_an_ack_with_a_repeated_default_appl_ver_id() {
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let mut framed = fixt_venue_ack(listener, &[(1137, "9"), (1137, "9")]).await;
+        let reject = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reject), "3");
+        assert_eq!(field(&reject, 45).as_deref(), Some("1"));
+        assert_eq!(field(&reject, 373).as_deref(), Some("13"));
+        assert_eq!(field(&reject, 371).as_deref(), Some("1137"));
+        let logout = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logout), "5");
+    });
+
+    let (client_app, _rx) = RecordingApp::new();
+    let result = Initiator::new(client_config("FIX.5.0SP2"), Arc::clone(&client_app))
+        .connect(addr)
+        .await;
+    assert_appl_version_refusal(&result, &["DefaultApplVerID (1137)", "more than once"]);
+    assert!(!client_app.logged_on());
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+}
+
+/// With a store attached, the initiator's Reject and Logout for a refused
+/// `DefaultApplVerID` are filed under their numbers like every frame it
+/// sends: the Logon is 1, the Reject 2 and the Logout 3.
+#[tokio::test]
+async fn test_initiator_default_appl_ver_id_refusal_is_filed_with_a_store() {
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let mut framed = fixt_venue_ack(listener, &[(1137, "7")]).await;
+        let reject = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reject), "3");
+        assert_eq!(field(&reject, 34).as_deref(), Some("2"));
+        let logout = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logout), "5");
+        assert_eq!(field(&logout, 34).as_deref(), Some("3"));
+    });
+
+    let store = Arc::new(MemoryStore::new());
+    let (client_app, _rx) = RecordingApp::new();
+    let result = Initiator::new(client_config("FIX.5.0SP2"), Arc::clone(&client_app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+        .connect(addr)
+        .await;
+    assert_appl_version_refusal(&result, &["1137"]);
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+    for seq in 1..=3u64 {
+        assert!(store.contains(seq), "frame {seq} is filed");
+    }
+    let filed = ok(store.get_range(2, 3).await, "the store reads");
+    let types: Vec<&str> = filed
+        .iter()
+        .map(|message| message.msg_type().as_str())
+        .collect();
+    assert_eq!(types, ["3", "5"], "the Reject and the Logout");
+    assert_eq!(store.next_sender_seq(), 4);
 }
 
 /// Strict mode (`require_ack_default_appl_ver_id`): an acknowledgement
@@ -1021,20 +1160,33 @@ async fn test_initiator_rejects_a_disallowed_appl_ver_id_in_session() {
 // FIX 4.x sessions are unaffected
 // ---------------------------------------------------------------------------
 
-/// A FIX.4.2 or FIX.4.4 acceptor takes a Logon without 1137 to Active (a
-/// stray 1137 is not inspected), and delivers an application message
-/// carrying a 1128 that a FIXT session would reject: neither field belongs
-/// to FIX 4.x, so neither is checked.
+/// Every version that is not framed as FIXT.1.1 (FIX 4.0 to FIX 4.4).
+fn fix4_versions() -> impl Iterator<Item = FixVersion> {
+    FixVersion::ALL
+        .into_iter()
+        .filter(|version| !version.uses_fixt())
+}
+
+/// A FIX 4.x acceptor, for every FIX 4.x version, takes a Logon without 1137
+/// to Active (a stray 1137 is not inspected), and delivers an application
+/// message carrying a 1128 that a FIXT session would reject: neither field
+/// belongs to FIX 4.x, so neither is checked.
 #[tokio::test]
 async fn test_fix4_sessions_are_unaffected() {
-    for version in ["FIX.4.2", "FIX.4.4"] {
+    let mut covered = Vec::new();
+    for version in fix4_versions() {
+        let begin_string = version.as_str();
         for logon_extra in [&[][..], &[(1137, "7")][..]] {
             let (venue_app, mut venue_rx) = RecordingApp::new();
-            let acceptor = Arc::new(Acceptor::new(venue_config(version), Arc::clone(&venue_app)));
+            let acceptor = Arc::new(Acceptor::new(
+                venue_config(begin_string),
+                Arc::clone(&venue_app),
+            ));
             let mut body = vec![(98, "0"), (108, "30")];
             body.extend_from_slice(logon_extra);
-            let logon = peer_frame(version, "CLIENT", "VENUE", "A", 1, &[], &body);
+            let logon = peer_frame(begin_string, "CLIENT", "VENUE", "A", 1, &[], &body);
             let (mut framed, connection, ack) = establish(acceptor, logon).await;
+            assert_eq!(field(&ack, 8).as_deref(), Some(begin_string));
             assert_eq!(field(&ack, 1137), None, "{version} declares no 1137");
             assert!(venue_app.logged_on(), "{version} reaches Active");
             assert_eq!(
@@ -1046,7 +1198,7 @@ async fn test_fix4_sessions_are_unaffected() {
             ok(
                 framed
                     .send(peer_frame(
-                        version,
+                        begin_string,
                         "CLIENT",
                         "VENUE",
                         "D",
@@ -1069,49 +1221,67 @@ async fn test_fix4_sessions_are_unaffected() {
             assert_silent(&mut framed, "no Reject on a FIX 4.x session").await;
             assert_eq!(connection.next_target_seq(), 3);
         }
+        covered.push(version);
     }
+    assert_eq!(
+        covered,
+        [
+            FixVersion::Fix40,
+            FixVersion::Fix41,
+            FixVersion::Fix42,
+            FixVersion::Fix43,
+            FixVersion::Fix44,
+        ],
+        "every FIX 4.x version is covered"
+    );
 }
 
-/// A FIX.4.4 initiator accepts an acknowledgement carrying a stray 1137.
+/// A FIX 4.x initiator, for every FIX 4.x version, declares no 1137 and
+/// accepts an acknowledgement carrying a stray one, even a disallowed code.
 #[tokio::test]
-async fn test_fix44_initiator_ignores_a_stray_default_appl_ver_id() {
-    let (listener, addr) = bind_listener().await;
-    let venue = tokio::spawn(async move {
-        let (socket, _) = ok(listener.accept().await, "the venue accepts");
-        let mut framed = Framed::new(socket, FixCodec::new());
-        let logon = next_frame(&mut framed).await;
-        assert_eq!(field(&logon, 1137), None);
-        ok(
+async fn test_fix4_initiators_ignore_a_stray_default_appl_ver_id() {
+    for version in fix4_versions() {
+        let begin_string = version.as_str();
+        let (listener, addr) = bind_listener().await;
+        let venue = tokio::spawn(async move {
+            let (socket, _) = ok(listener.accept().await, "the venue accepts");
+            let mut framed = Framed::new(socket, FixCodec::new());
+            let logon = next_frame(&mut framed).await;
+            assert_eq!(field(&logon, 8).as_deref(), Some(begin_string));
+            assert_eq!(field(&logon, 1137), None, "{version} declares no 1137");
+            ok(
+                framed
+                    .send(peer_frame(
+                        begin_string,
+                        "VENUE",
+                        "CLIENT",
+                        "A",
+                        1,
+                        &[],
+                        &[(98, "0"), (108, "30"), (1137, "7")],
+                    ))
+                    .await,
+                "the venue acknowledges",
+            );
+            assert_silent(&mut framed, "no Reject on a FIX 4.x session").await;
             framed
-                .send(peer_frame(
-                    "FIX.4.4",
-                    "VENUE",
-                    "CLIENT",
-                    "A",
-                    1,
-                    &[],
-                    &[(98, "0"), (108, "30"), (1137, "7")],
-                ))
+        });
+        let (client_app, _rx) = RecordingApp::new();
+        let connection = ok(
+            Initiator::new(client_config(begin_string), Arc::clone(&client_app))
+                .connect(addr)
                 .await,
-            "the venue acknowledges",
+            "the FIX 4.x initiator logs on",
         );
-        assert_silent(&mut framed, "no Reject on a FIX 4.4 session").await;
-        framed
-    });
-    let (client_app, _rx) = RecordingApp::new();
-    let _connection = ok(
-        Initiator::new(client_config("FIX.4.4"), Arc::clone(&client_app))
-            .connect(addr)
-            .await,
-        "the FIX.4.4 initiator logs on",
-    );
-    let _framed = ok(
-        ok(
-            timeout(Duration::from_secs(5), venue).await,
-            "venue done within 5s",
-        ),
-        "venue task",
-    );
+        assert_eq!(connection.counterparty_default_appl_version(), None);
+        let _framed = ok(
+            ok(
+                timeout(Duration::from_secs(5), venue).await,
+                "venue done within 5s",
+            ),
+            "venue task",
+        );
+    }
 }
 
 /// An allowed set on a FIX 4.x session is a configuration error, reported by
