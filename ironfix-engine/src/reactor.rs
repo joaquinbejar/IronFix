@@ -73,8 +73,9 @@
 //!
 //! The writes follow the order set out in the [`persistence`](crate::persistence)
 //! module: the frame is filed and the next sender number persisted before the
-//! bytes are written; the next target number is persisted before an inbound
-//! message is acted on; any other counter change is persisted before the next
+//! number is spent and the bytes are written; the next target number is
+//! persisted before an inbound message is acted on and before the in-memory
+//! expectation moves; any other counter change is persisted before the next
 //! event; and a counter is written only when it changed. What a failed write
 //! means is the session's [`StoreFailurePolicy`].
 //!
@@ -87,6 +88,14 @@
 //! queue, so an application handler never delays a socket read, a heartbeat, or
 //! timeout detection.
 //!
+//! The attached [`MessageStore`] **does** run on the reactor: every store call
+//! is awaited inline, because its result decides whether a frame may be written
+//! or a message acted on. A slow store therefore delays this session's reads,
+//! heartbeats and timeout detection for as long as the call takes. Each call is
+//! bounded by the store timeout, and an overrun is a failed write under the
+//! [`StoreFailurePolicy`]. `to_admin`, `to_app` and `from_admin` also run
+//! inline.
+//!
 //! All sequence arithmetic goes through the checked
 //! [`SequenceManager::try_allocate_sender_seq`] /
 //! [`SequenceManager::try_increment_target_seq`]; an exhausted counter tears the
@@ -97,7 +106,9 @@ use crate::connection::{Command, SessionRuntime};
 use crate::error::EngineError;
 use crate::garbled::{GarbledFrameWindow, GarbledVerdict};
 use crate::outbound;
-use crate::persistence::{PersistedCounters, SessionStore, StoreFailurePolicy};
+use crate::persistence::{
+    HandshakeStore, PersistedCounters, SessionStore, StoreFailurePolicy, file_and_spend, timed,
+};
 use crate::wire::{
     self, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard, SendingTimeProblem,
 };
@@ -115,6 +126,7 @@ use ironfix_session::{
 use ironfix_store::MessageStore;
 use ironfix_transport::{CodecError, FixCodec};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -208,7 +220,7 @@ pub(crate) async fn send_handshake_admin<A: Application>(
     framed: &mut FixFramed,
     factory: &mut MessageFactory,
     sequences: &SequenceManager,
-    store: Option<SessionStore<'_>>,
+    store: Option<&mut HandshakeStore<'_>>,
     write_timeout: Duration,
     mut pending: PendingMessage,
 ) -> Result<(), EngineError> {
@@ -231,15 +243,15 @@ pub(crate) async fn send_handshake_admin<A: Application>(
 /// Encodes and writes one frame during the handshake, before the reactor
 /// exists.
 ///
-/// The sequence number is peeked, the frame is built, and only then is the
-/// number spent — the same order the reactor uses. A body with no legal wire
-/// form therefore costs nothing, instead of leaving a hole the counterparty
-/// would have to resend over. When a store is attached the frame is filed under
-/// its `MsgSeqNum` and the next sender number persisted **before** the frame
-/// goes on the wire, so a store reused across a reconnect can replay it and
-/// never reports a number the peer has already seen. Under
-/// [`StoreFailurePolicy::CloseSession`]
-/// a failed write stops here and nothing is written.
+/// The sequence number is peeked and the frame built; then [`file_and_spend`]
+/// files it and persists the next sender number (when a store is attached)
+/// and spends the number, the same step the reactor takes; only then does the
+/// frame go on the wire. A body with no legal wire form therefore costs
+/// nothing, instead of leaving a hole the counterparty would have to resend
+/// over, and a store reused across a reconnect can replay the frame and never
+/// reports a number the peer has already seen. Under
+/// [`StoreFailurePolicy::CloseSession`] a failed write stops here: nothing is
+/// spent and nothing is written.
 ///
 /// # Errors
 /// [`EngineError::Encode`] when the body has no legal wire form,
@@ -252,32 +264,80 @@ async fn send_handshake(
     framed: &mut FixFramed,
     factory: &mut MessageFactory,
     sequences: &SequenceManager,
-    store: Option<SessionStore<'_>>,
+    store: Option<&mut HandshakeStore<'_>>,
     write_timeout: Duration,
     pending: &PendingMessage,
 ) -> Result<(), EngineError> {
     let seq = sequences.next_sender_seq().value();
     let frame = factory.encode(seq, pending)?;
-    let allocated = sequences.try_allocate_sender_seq()?.value();
-    if allocated != seq {
-        return Err(EngineError::Sequence(format!(
-            "sender sequence moved from {seq} to {allocated} while a frame was being built"
-        )));
-    }
-    // File the frame and persist the next sender number before it reaches the
-    // wire: a message on the wire that was never stored is one this session
-    // can be asked to replay and cannot.
-    if let Some(store) = store {
-        let next = sequences.next_sender_seq().value();
-        store
-            .file_outbound(session_id, seq, pending.msg_type(), frame, next)
-            .await?;
-    }
+    let store = store.map(|store| (store.store, &mut store.persisted));
+    file_and_spend(store, sequences, session_id, seq, pending.msg_type(), frame).await?;
     match timeout(write_timeout, framed.send(frame)).await {
         Err(_) => Err(EngineError::WriteTimeout(write_timeout)),
         Ok(Err(err)) => Err(err.into()),
         Ok(Ok(())) => Ok(()),
     }
+}
+
+/// Sends the messages that refuse a Logon handshake (a Reject, then a Logout),
+/// in order and best effort.
+///
+/// The handshake is failing already, so a transport or encoding error on one
+/// of them is logged and the next one is still tried. A store failure under
+/// [`StoreFailurePolicy::CloseSession`] is different: once the store has
+/// refused a frame nothing more is written, so the remaining messages (the
+/// Logout, typically) are not sent. `refusal` says why the Logon was being
+/// refused; it is logged with the store error, because the caller then
+/// reports the store error instead.
+///
+/// # Errors
+/// The [`StoreError`] that stopped the refusal, if one did.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn refuse_handshake<A: Application, const N: usize>(
+    application: &A,
+    session_id: &SessionId,
+    framed: &mut FixFramed,
+    factory: &mut MessageFactory,
+    sequences: &SequenceManager,
+    mut store: Option<&mut HandshakeStore<'_>>,
+    write_timeout: Duration,
+    refusal: &str,
+    messages: [PendingMessage; N],
+) -> Result<(), StoreError> {
+    for pending in messages {
+        let msg_type = pending.msg_type().clone();
+        match send_handshake_admin(
+            application,
+            session_id,
+            framed,
+            factory,
+            sequences,
+            store.as_deref_mut(),
+            write_timeout,
+            pending,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(EngineError::Store(err)) => {
+                tracing::error!(
+                    session = %session_id,
+                    refusal,
+                    msg_type = msg_type.as_str(),
+                    error = %err,
+                    "cannot file a message refusing the Logon: refusing without it"
+                );
+                return Err(err);
+            }
+            Err(err) => tracing::warn!(
+                session = %session_id,
+                msg_type = msg_type.as_str(),
+                error = %err,
+                "cannot send a message refusing the Logon"
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// What waiting for one handshake frame came to.
@@ -478,11 +538,16 @@ struct AppRejection {
 ///
 /// The task ends when the reactor drops the queue's sender, which every exit
 /// path of [`run_reactor`] does.
+///
+/// After each message it stores that message's `MsgSeqNum` in `completed`, so
+/// that if the task has to be aborted the reactor can name the messages it
+/// handed over and `from_app` never finished.
 async fn run_app_dispatcher<A: Application>(
     application: Arc<A>,
     session_id: SessionId,
     mut frames: mpsc::Receiver<AppFrame>,
     rejections: mpsc::Sender<AppRejection>,
+    completed: Arc<AtomicU64>,
 ) {
     while let Some(AppFrame { frame, seq }) = frames.recv().await {
         // The reactor decoded this frame already; a failure here cannot
@@ -494,9 +559,12 @@ async fn run_app_dispatcher<A: Application>(
                 seq,
                 "dropping an application message that no longer decodes"
             );
+            completed.store(seq, Ordering::Release);
             continue;
         };
-        if let Err(reason) = application.from_app(&raw, &session_id).await {
+        let delivered = application.from_app(&raw, &session_id).await;
+        completed.store(seq, Ordering::Release);
+        if let Err(reason) = delivered {
             let rejection = AppRejection {
                 ref_seq: seq,
                 ref_msg_type: raw.msg_type().clone(),
@@ -522,6 +590,29 @@ struct ReactorChannels {
     /// The application dispatcher, joined on close so `on_logout` follows the
     /// last `from_app` rather than racing it.
     dispatcher: JoinHandle<()>,
+    /// The `MsgSeqNum` of the last message the dispatcher finished with, or 0.
+    app_completed: Arc<AtomicU64>,
+}
+
+/// The `MsgSeqNum` range of the application messages handed to the dispatcher
+/// that it did not finish, given the `(first, last)` numbers handed over and
+/// the last number it finished with (0 for none).
+///
+/// Messages reach the dispatcher in ascending `MsgSeqNum` order and it
+/// finishes them in that order, so what it did not finish is one range: from
+/// just past the last finished number (or from the first handed over, if it
+/// finished none of them) to the last handed over. The range can include the
+/// numbers of administrative messages processed in between; it names the
+/// span, not each lost message.
+#[must_use]
+fn undelivered_range(handed: Option<(u64, u64)>, completed: u64) -> Option<(u64, u64)> {
+    let (first, last) = handed?;
+    let start = if completed >= first {
+        completed.checked_add(1)?
+    } else {
+        first
+    };
+    (start <= last).then_some((start, last))
 }
 
 /// Bookkeeping for an outstanding `ResendRequest` (2).
@@ -620,8 +711,15 @@ struct Reactor<A: Application> {
     store: Option<Arc<dyn MessageStore>>,
     /// What a failed write to `store` means.
     store_policy: StoreFailurePolicy,
+    /// Bound on each call to `store`.
+    store_timeout: Duration,
     /// The counter values last written to `store`.
     persisted: PersistedCounters,
+    /// Set when the close-time store reset fails, for the engine that owns
+    /// the store to perform on its next session.
+    reset_owed: Arc<AtomicBool>,
+    /// The first and last `MsgSeqNum` handed to the application dispatcher.
+    app_handed: Option<(u64, u64)>,
     /// The outstanding ResendRequest, if a gap is being recovered.
     ///
     /// The logout deadline is *not* tracked here: `Session<LogoutPending>`
@@ -651,6 +749,7 @@ async fn run_reactor<A: Application + 'static>(
         mut app_rejects,
         closed: closed_tx,
         mut dispatcher,
+        app_completed,
     } = channels;
     let mut phase = Some(Phase::Active(session));
     let mut commands_open = true;
@@ -672,9 +771,8 @@ async fn run_reactor<A: Application + 'static>(
         );
     }
 
-    // The handshake persisted the sender counter with each frame it sent; the
-    // target counter the Logon advanced is persisted here, before any inbound
-    // message is acted on.
+    // The handshake persisted the counters it moved and handed over the record
+    // of what it wrote, so the first pass below writes only what it did not.
     let outcome = loop {
         // The phase is put back by every handler that does not close the
         // session, so it is always present here. Treating its absence as a
@@ -755,24 +853,32 @@ async fn run_reactor<A: Application + 'static>(
         }
     };
 
+    let mut write_counters = true;
     if ctx.config.reset_on_disconnect || (outcome.graceful && ctx.config.reset_on_logout) {
         ctx.runtime.sequences.reset();
         // The stored messages go with the counters. Leaving them behind would
         // file the next session's messages on top of this one's, and a resend
         // request in that session could answer with traffic from this one.
-        if let Some(store) = &ctx.store
-            && let Err(err) = store.reset().await
+        if let Some(store) = ctx.store.as_deref()
+            && let Err(err) = timed(ctx.store_timeout, store.reset()).await
         {
-            tracing::warn!(
+            // The reset counters written over a store that still holds this
+            // session's stream would describe neither, so none are written.
+            // The reset is owed instead, and the next session fails closed
+            // on it, whatever the policy.
+            write_counters = false;
+            ctx.reset_owed.store(true, Ordering::Release);
+            tracing::error!(
                 session = %ctx.session_id,
                 error = %err,
-                "cannot clear the store after a session-closing sequence reset"
+                "cannot reset the store after a session-closing sequence reset: its counters \
+                 are left untouched and the next session must reset it before it starts"
             );
         }
     }
     // The session is over, so a failure here has nothing left to close: it is
     // logged, whatever the policy.
-    if let Err(err) = ctx.persist_counters().await {
+    if write_counters && let Err(err) = ctx.persist_counters().await {
         tracing::warn!(
             session = %ctx.session_id,
             error = %err,
@@ -786,13 +892,28 @@ async fn run_reactor<A: Application + 'static>(
     // it cannot outlive `on_logout`/`wait_closed`. Awaiting `&mut dispatcher`
     // keeps ownership of the handle across the timeout: dropping it would only
     // detach the task, leaving the stuck handler running.
+    //
+    // Aborting loses the messages still queued, and the one in `from_app`:
+    // their numbers are consumed, so the counterparty will not send them again.
+    // The range is logged, since nothing else will report it (issue #105).
     drop(ctx.app_tx);
     if timeout(APP_DRAIN_TIMEOUT, &mut dispatcher).await.is_err() {
         dispatcher.abort();
-        tracing::warn!(
-            session = %ctx.session_id,
-            "application dispatcher did not drain before the session closed; aborting it"
-        );
+        let completed = app_completed.load(Ordering::Acquire);
+        match undelivered_range(ctx.app_handed, completed) {
+            Some((first, last)) => tracing::error!(
+                session = %ctx.session_id,
+                first,
+                last,
+                "application dispatcher did not drain before the session closed and was \
+                 aborted: application messages in MsgSeqNum range first..=last were accepted \
+                 but from_app did not finish with them"
+            ),
+            None => tracing::warn!(
+                session = %ctx.session_id,
+                "application dispatcher did not drain before the session closed; aborting it"
+            ),
+        }
     }
 
     ctx.application.on_logout(&ctx.session_id).await;
@@ -804,8 +925,22 @@ async fn run_reactor<A: Application + 'static>(
     }
 }
 
+/// Binds an attached store to the session's policy and timeout.
+///
+/// A free function over the fields, not a `Reactor` method: a method would
+/// borrow the whole reactor, and the callers need the counter record mutably
+/// beside it.
+#[must_use]
+fn bind_store(
+    store: Option<&Arc<dyn MessageStore>>,
+    policy: StoreFailurePolicy,
+    timeout: Duration,
+) -> Option<SessionStore<'_>> {
+    store.map(|store| SessionStore::new(store.as_ref(), policy, timeout))
+}
+
 /// Persists `next` as the next target sequence number, if it changed since the
-/// last write, under `policy`.
+/// last write, under the binding's policy.
 ///
 /// A free function over the store fields rather than a `Reactor` method, so the
 /// application path can call it while it holds a reservation on the
@@ -814,8 +949,7 @@ async fn run_reactor<A: Application + 'static>(
 /// # Errors
 /// A store error under [`StoreFailurePolicy::CloseSession`].
 async fn persist_target_with(
-    store: Option<&Arc<dyn MessageStore>>,
-    policy: StoreFailurePolicy,
+    store: Option<SessionStore<'_>>,
     persisted: &mut PersistedCounters,
     session_id: &SessionId,
     next: u64,
@@ -827,9 +961,7 @@ async fn persist_target_with(
         return Ok(());
     }
     persisted.record_target(next);
-    SessionStore::new(store, policy)
-        .persist_target(session_id, next)
-        .await
+    store.persist_target(session_id, next).await
 }
 
 /// Why an outbound message never reached the transport.
@@ -872,10 +1004,10 @@ impl<A: Application> Reactor<A> {
     /// # Errors
     /// A store error under [`StoreFailurePolicy::CloseSession`].
     async fn persist_counters(&mut self) -> Result<(), StoreError> {
-        let Some(store) = self.store.as_ref() else {
+        let Some(store) = self.store.as_deref() else {
             return Ok(());
         };
-        let store = SessionStore::new(store, self.store_policy);
+        let store = SessionStore::new(store, self.store_policy, self.store_timeout);
         let sender = self.runtime.sequences.next_sender_seq().value();
         if let Some(next) = self.persisted.sender_to_write(sender) {
             self.persisted.record_sender(next);
@@ -896,14 +1028,8 @@ impl<A: Application> Reactor<A> {
     /// A store error under [`StoreFailurePolicy::CloseSession`]: the message
     /// must then not be acted on.
     async fn persist_target(&mut self, next: u64) -> Result<(), StoreError> {
-        persist_target_with(
-            self.store.as_ref(),
-            self.store_policy,
-            &mut self.persisted,
-            &self.session_id,
-            next,
-        )
-        .await
+        let store = bind_store(self.store.as_ref(), self.store_policy, self.store_timeout);
+        persist_target_with(store, &mut self.persisted, &self.session_id, next).await
     }
 
     /// Ends the session because a store write failed under
@@ -924,11 +1050,12 @@ impl<A: Application> Reactor<A> {
     /// timeout.
     ///
     /// With `spend` set, `seq` must be the next sender number and this is the
-    /// frame that spends it, in this order: encode; file the frame under `seq`
-    /// and persist `seq + 1` as the next sender number, when a store is
-    /// attached; spend `seq` in memory; write. The store and the in-memory
-    /// counter therefore agree before any byte reaches the socket, and a write
-    /// that fails afterwards cannot lead to `seq` being reused.
+    /// frame that spends it, in this order: encode; then [`file_and_spend`],
+    /// which files the frame under `seq` and persists `seq + 1` as the next
+    /// sender number when a store is attached, and spends `seq` in memory (the
+    /// step the Logon handshakes share); then write. The store and the
+    /// in-memory counter therefore agree before any byte reaches the socket,
+    /// and a write that fails afterwards cannot lead to `seq` being reused.
     ///
     /// A gap fill passes `false`: it re-occupies a range it does not own, so
     /// filing it would overwrite a message under `seq` that is still
@@ -953,34 +1080,22 @@ impl<A: Application> Reactor<A> {
             Err(err) => return Err(WriteFailure::Encode(err)),
         };
         if spend {
-            let exhausted = || {
-                WriteFailure::Fatal(EngineError::SequenceExhausted(SequenceExhausted {
-                    counter: SequenceCounter::Sender,
-                }))
-            };
-            let next = seq.checked_add(1).ok_or_else(exhausted)?;
-            if let Some(store) = self.store.as_ref() {
-                self.persisted.record_sender(next);
-                if let Err(err) = SessionStore::new(store, self.store_policy)
-                    .file_outbound(&self.session_id, seq, pending.msg_type(), frame, next)
-                    .await
-                {
-                    return Err(WriteFailure::Fatal(EngineError::Store(err)));
-                }
-            }
             // Only the reactor allocates sender numbers and only this method
             // spends them, so nothing can take the peeked number in between;
-            // the mismatch branch exists so a wrong `MsgSeqNum` can never reach
-            // the wire, not because it is reachable.
-            let allocated = match self.runtime.sequences.try_allocate_sender_seq() {
-                Ok(allocated) => allocated.value(),
-                Err(err) => return Err(WriteFailure::Fatal(err.into())),
-            };
-            if allocated != seq {
-                return Err(WriteFailure::Fatal(EngineError::Sequence(format!(
-                    "sender sequence moved from {seq} to {allocated} while a frame was being built"
-                ))));
-            }
+            // the mismatch check inside exists so a wrong `MsgSeqNum` can never
+            // reach the wire, not because it is reachable.
+            let store = bind_store(self.store.as_ref(), self.store_policy, self.store_timeout)
+                .map(|store| (store, &mut self.persisted));
+            file_and_spend(
+                store,
+                &self.runtime.sequences,
+                &self.session_id,
+                seq,
+                pending.msg_type(),
+                frame,
+            )
+            .await
+            .map_err(WriteFailure::Fatal)?;
         }
         // A peer that stops reading parks this write forever once its receive
         // window closes, and the reactor's liveness timers park with it.
@@ -1649,6 +1764,12 @@ impl<A: Application> Reactor<A> {
     /// application: a gapped fill must produce a ResendRequest even if the
     /// application would reject it, and a too-low duplicate must be dropped
     /// without the callback ever seeing it.
+    ///
+    /// With a store attached, an in-sequence Gap Fill persists `MsgSeqNum + 1`
+    /// as the next target number before `from_admin` runs, and either mode
+    /// persists an accepted `NewSeqNo` (36) before the expectation moves to it.
+    /// A Reset reaches `from_admin` before any write: it has no place in the
+    /// sequence to persist first.
     async fn on_sequence_reset(
         &mut self,
         framed: &mut FixFramed,
@@ -1705,7 +1826,23 @@ impl<A: Application> Reactor<A> {
                         .close_on_too_low(framed, phase, expected, received)
                         .await);
                 }
-                SequenceResult::Ok => {}
+                SequenceResult::Ok => {
+                    // The fill occupies `seq` whatever happens next (accepted,
+                    // rejected, or carrying an unusable NewSeqNo), so `seq + 1`
+                    // is persisted before `from_admin` sees it, as for every
+                    // other in-sequence message.
+                    let Some(next) = seq.checked_add(1) else {
+                        return Err(exhausted(
+                            phase,
+                            SequenceExhausted {
+                                counter: SequenceCounter::Target,
+                            },
+                        ));
+                    };
+                    if let Err(err) = self.persist_target(next).await {
+                        return Err(self.close_on_store_failure(phase, &err));
+                    }
+                }
             }
         }
 
@@ -1787,6 +1924,12 @@ impl<A: Application> Reactor<A> {
         }
 
         let expected_before = self.runtime.sequences.next_target_seq().value();
+        // The new expectation is persisted before it takes effect. A Reset
+        // has no place in the sequence, so it reached `from_admin` before any
+        // write; this is its first.
+        if let Err(err) = self.persist_target(new_seq).await {
+            return Err(self.close_on_store_failure(phase, &err));
+        }
         self.runtime.sequences.set_target_seq(new_seq);
         // Only a reset that actually advances the expectation touches an
         // outstanding ResendRequest. A reset landing on the number we already
@@ -1914,7 +2057,8 @@ impl<A: Application> Reactor<A> {
     /// # Errors
     /// Returns [`EngineError`] only if writing to the socket fails; the session
     /// is then closed by the caller. Every other failure — an unreadable store,
-    /// an unrebuildable frame — degrades to a gap fill.
+    /// a read that overruns the store timeout, an unrebuildable frame —
+    /// degrades to a gap fill.
     async fn replay_range(
         &mut self,
         framed: &mut FixFramed,
@@ -1945,7 +2089,10 @@ impl<A: Application> Reactor<A> {
         let mut reply_cursor = begin_seq;
         let mut read_from = begin_seq;
         loop {
-            let page = match store.get_page(read_from, end_seq, RESEND_PAGE_LIMIT).await {
+            // Bounded like every store call; a read that overruns degrades to
+            // a gap fill like any other failed read.
+            let read = store.get_page(read_from, end_seq, RESEND_PAGE_LIMIT);
+            let page = match timed(self.store_timeout, read).await {
                 Ok(page) => page,
                 Err(err) => {
                     tracing::warn!(
@@ -2127,6 +2274,21 @@ impl<A: Application> Reactor<A> {
         match self.runtime.sequences.validate_incoming(seq) {
             SequenceResult::Ok => {
                 if msg_type.is_admin() {
+                    // The receive cursor includes this message before it is
+                    // acted on, so a restart never asks for it again; and the
+                    // in-memory expectation moves only once that write has
+                    // been accepted, as for an application message.
+                    let Some(next) = seq.checked_add(1) else {
+                        return Err(exhausted(
+                            phase,
+                            SequenceExhausted {
+                                counter: SequenceCounter::Target,
+                            },
+                        ));
+                    };
+                    if let Err(err) = self.persist_target(next).await {
+                        return Err(self.close_on_store_failure(phase, &err));
+                    }
                     // Consume the number before the admin handler runs: any
                     // reply it sends is numbered against the advanced
                     // expectation, and admin messages never queue.
@@ -2138,12 +2300,6 @@ impl<A: Application> Reactor<A> {
                     // outstanding range is filled, never on the first message
                     // back.
                     self.note_inbound_progress();
-                    // The receive cursor includes this message before it is
-                    // acted on, so a restart never asks for it again.
-                    let next = self.runtime.sequences.next_target_seq().value();
-                    if let Err(err) = self.persist_target(next).await {
-                        return Err(self.close_on_store_failure(phase, &err));
-                    }
                     self.dispatch_admin(framed, phase, &raw, seq).await
                 } else {
                     let phase = self.deliver_app(phase, seq, &frame).await?;
@@ -2192,10 +2348,13 @@ impl<A: Application> Reactor<A> {
     ///   than the message being silently lost past a number already consumed.
     /// - A target write that fails under
     ///   [`StoreFailurePolicy::CloseSession`] closes the session and the frame
-    ///   never reaches `from_app`.
-    /// - Once handed over, the message's number is durable. A crash before
-    ///   `from_app` has finished with it loses it to the application: inbound
-    ///   delivery is at most once (see the `persistence` module).
+    ///   never reaches `from_app`. Under [`StoreFailurePolicy::Continue`] the
+    ///   failure is logged and the frame is handed over anyway.
+    /// - Once handed over, the message's number is consumed (and durable, if
+    ///   the write succeeded). A crash, or a dispatcher aborted at close,
+    ///   before `from_app` has finished with it loses it to the application:
+    ///   inbound delivery is at most once (see the `persistence` module). The
+    ///   handed-over range is recorded so an abort can log what it lost.
     async fn deliver_app(
         &mut self,
         phase: Phase,
@@ -2225,20 +2384,19 @@ impl<A: Application> Reactor<A> {
                 },
             ));
         };
-        if let Err(err) = persist_target_with(
-            self.store.as_ref(),
-            self.store_policy,
-            &mut self.persisted,
-            &self.session_id,
-            next,
-        )
-        .await
+        let store = bind_store(self.store.as_ref(), self.store_policy, self.store_timeout);
+        if let Err(err) =
+            persist_target_with(store, &mut self.persisted, &self.session_id, next).await
         {
             return Err(self.close_on_store_failure(phase, &err));
         }
         permit.send(AppFrame {
             frame: frame.clone(),
             seq,
+        });
+        self.app_handed = Some(match self.app_handed {
+            Some((first, _)) => (first, seq),
+            None => (seq, seq),
         });
         Ok(phase)
     }
@@ -2303,7 +2461,14 @@ impl<A: Application> Reactor<A> {
                 }
                 Phase::Active(session) => {
                     let logout = self.factory.logout(None);
-                    let _ = self.send(framed, logout).await;
+                    // A reply the store refused under the fail-closed policy was
+                    // never written: the exchange is incomplete, so the close is
+                    // not graceful and does not trigger `reset_on_logout`. Any
+                    // other failure to reply keeps the close graceful, as the
+                    // counterparty has already logged out.
+                    if let Err(EngineError::Store(err)) = self.send(framed, logout).await {
+                        return Err(self.close_on_store_failure(Phase::Active(session), &err));
+                    }
                     let _ = session.disconnect();
                     let text = raw
                         .get_field_str(58)
@@ -2348,6 +2513,14 @@ pub(crate) struct SessionParams<A: Application> {
     pub(crate) store: Option<Arc<dyn MessageStore>>,
     /// What a failed write to `store` means.
     pub(crate) store_policy: StoreFailurePolicy,
+    /// Bound on each call to `store`.
+    pub(crate) store_timeout: Duration,
+    /// The counter values the handshake wrote to `store`, so the reactor's
+    /// first pass does not write them again.
+    pub(crate) persisted: PersistedCounters,
+    /// Set by the reactor when its close-time store reset fails; the engine
+    /// that owns the store performs the reset on its next session.
+    pub(crate) reset_owed: Arc<AtomicBool>,
     /// A gap detected during the handshake, seeded so the reactor tracks it.
     pub(crate) resend: Option<ResendState>,
     /// Bound on a single socket write.
@@ -2369,8 +2542,9 @@ pub(crate) struct SessionParams<A: Application> {
 /// This is the single place the reactor is launched, so both engines get the
 /// same dispatcher hand-off, the same store persistence order and policy, and
 /// the same shutdown path: a spawned task that always reaches a close, fires
-/// `on_logout`, and signals the `watch` channel. The counters are first
-/// persisted inside the task, before the first inbound message is acted on.
+/// `on_logout`, and signals the `watch` channel. Any counter value the
+/// handshake did not already write is persisted first inside the task, before
+/// the first inbound message is acted on.
 pub(crate) fn spawn_session<A, G>(
     params: SessionParams<A>,
     guard: G,
@@ -2391,6 +2565,9 @@ where
         session_id,
         store,
         store_policy,
+        store_timeout,
+        persisted,
+        reset_owed,
         resend,
         write_timeout,
         outbound_capacity,
@@ -2405,11 +2582,13 @@ where
 
     // The dispatcher stops when the reactor drops `app_tx`, which `run_reactor`
     // does on every exit path.
+    let app_completed = Arc::new(AtomicU64::new(0));
     let dispatcher = tokio::spawn(run_app_dispatcher(
         Arc::clone(&application),
         session_id.clone(),
         app_rx,
         reject_tx,
+        Arc::clone(&app_completed),
     ));
 
     let reactor = Reactor {
@@ -2422,7 +2601,10 @@ where
         session_id,
         store,
         store_policy,
-        persisted: PersistedCounters::default(),
+        store_timeout,
+        persisted,
+        reset_owed,
+        app_handed: None,
         resend,
         write_timeout,
         app_tx,
@@ -2434,6 +2616,7 @@ where
         app_rejects: reject_rx,
         closed: closed_tx,
         dispatcher,
+        app_completed,
     };
     tokio::spawn(async move {
         let _guard = guard;
@@ -2441,4 +2624,45 @@ where
     });
 
     (command_tx, closed_rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_undelivered_range_nothing_handed_over() {
+        assert_eq!(undelivered_range(None, 0), None);
+        assert_eq!(undelivered_range(None, 7), None);
+    }
+
+    #[test]
+    fn test_undelivered_range_none_finished_is_everything_handed_over() {
+        // The dispatcher finished nothing in this session: the range starts at
+        // the first number handed over, not at 1.
+        assert_eq!(undelivered_range(Some((5, 9)), 0), Some((5, 9)));
+    }
+
+    #[test]
+    fn test_undelivered_range_starts_past_the_last_finished() {
+        assert_eq!(undelivered_range(Some((5, 9)), 6), Some((7, 9)));
+        // Admin numbers between application messages fall inside the span.
+        assert_eq!(undelivered_range(Some((5, 12)), 8), Some((9, 12)));
+    }
+
+    #[test]
+    fn test_undelivered_range_all_finished_is_none() {
+        assert_eq!(undelivered_range(Some((5, 9)), 9), None);
+        assert_eq!(undelivered_range(Some((5, 5)), 5), None);
+    }
+
+    #[test]
+    fn test_undelivered_range_is_checked_at_the_top_of_the_space() {
+        // A finished number at u64::MAX leaves nothing past it; the
+        // arithmetic must not wrap to a range starting at 0.
+        assert_eq!(
+            undelivered_range(Some((u64::MAX, u64::MAX)), u64::MAX),
+            None
+        );
+    }
 }

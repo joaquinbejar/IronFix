@@ -9,20 +9,48 @@
 //! When a [`MessageStore`] is attached, the engine writes to it in a fixed
 //! order (see `doc/adr/0005-fallible-store-writes.md`):
 //!
-//! 1. An outbound frame is filed, then the next sender sequence number is
-//!    persisted, and only then are the frame's bytes written to the socket.
+//! 1. An outbound frame is filed and the next sender sequence number persisted,
+//!    in one [`MessageStore::file_outbound`] call, before the number is spent
+//!    in memory and before the frame's bytes are written to the socket. The
+//!    Logon handshakes and the live session share this step.
 //! 2. The next target sequence number is persisted before the inbound message
-//!    that advanced it is acted on: before an administrative message is
-//!    processed, and before an application message is handed to the
-//!    application. Any other change to a counter (a `SequenceReset`, a gap
-//!    fill) is persisted at the end of the event that made it, before the next
-//!    event.
+//!    that advanced it is acted on, and before the in-memory expectation
+//!    moves: before an administrative message is processed, before an
+//!    in-sequence `SequenceReset`-GapFill reaches `from_admin`, and before an
+//!    application message is handed to the application. Two messages are
+//!    exceptions, listed below.
 //! 3. A counter is written only when its value changed.
+//!
+//! Every store call is bounded by the store timeout
+//! ([`Initiator::with_store_timeout`](crate::Initiator::with_store_timeout));
+//! an overrun is a failed call, reported as [`StoreError::Timeout`].
 //!
 //! Every one of those writes can fail. [`StoreFailurePolicy`] decides what a
 //! failure means: carry on with a warning (the default, and the behaviour
 //! before writes were fallible), or close the session without writing the
-//! frame the failure concerns.
+//! frame, or acting on the message, that the failure concerns.
+//!
+//! # Exceptions to the inbound order
+//!
+//! - The initiator's Logon acknowledgement reaches `from_admin` before its
+//!   number is persisted: `from_admin` may refuse the Logon, and the ack's
+//!   `ResetSeqNumFlag` (141) has to be applied before its number can be
+//!   validated. The number is persisted before the session goes Active and
+//!   before `on_logon` runs.
+//! - A `SequenceReset` in Reset mode (`GapFillFlag` (123) absent or N) has no
+//!   place in the sequence, so it reaches `from_admin` first; its `NewSeqNo`
+//!   (36) is persisted once `from_admin` has accepted it, before the
+//!   expectation moves.
+//!
+//! # Crash guarantees depend on the policy
+//!
+//! Only [`StoreFailurePolicy::CloseSession`] turns the order above into a
+//! guarantee. Under [`StoreFailurePolicy::Continue`] a failed write is logged
+//! and the session carries on as if it had succeeded: the frame is still
+//! written and the message still acted on. A crash after such a failure can
+//! leave the store behind what the counterparty has seen, so Continue gives
+//! **no** crash guarantee. It keeps a session running through a store outage,
+//! and nothing more.
 //!
 //! # Inbound delivery is at most once
 //!
@@ -30,26 +58,66 @@
 //! handed over, a crash after that write and before `from_app` has finished
 //! with the message loses it to the application: on restart the engine expects
 //! the next number, and the counterparty is never asked for this one again.
-//! The window covers the messages waiting in the application queue and the one
-//! `from_app` is handling. The engine does not detect or report such a loss
-//! after a restart. A message that never had its counter persisted is never
-//! handed over, so it is never lost silently while the process runs.
+//! The window is every message waiting in the application queue, up to its
+//! capacity (1024 by default, see
+//! [`Initiator::with_app_queue_capacity`](crate::Initiator::with_app_queue_capacity)),
+//! plus the one `from_app` is handling.
+//!
+//! The same messages can be lost while the process runs, without a crash: when
+//! the session closes, the dispatcher gets a bounded time to finish its queue
+//! and is then aborted. The engine logs, at error level, the range of
+//! `MsgSeqNum`s it had handed over and `from_app` had not finished.
+//!
+//! Under [`StoreFailurePolicy::CloseSession`] a message whose counter write
+//! failed is never handed over; under [`StoreFailurePolicy::Continue`] it is.
+//!
+//! What this does **not** provide: the engine does not detect or report, after
+//! a restart, the inbound messages lost across a crash, so the "lost message
+//! is reported" requirement of issue #89 is not met for inbound traffic.
+//! Reporting needs a completion signal from the dispatcher back to the
+//! reactor, a durable application watermark (a new defaulted
+//! [`MessageStore`] method), and a typed report at restart of the numbers
+//! between that watermark and the persisted target. At-least-once delivery
+//! additionally needs an inbound journal, or redelivery through a
+//! `ResendRequest`. Both are tracked in issue #105.
+//!
+//! # A reset that could not be made
+//!
+//! `reset_on_logout` and `reset_on_disconnect` reset the store as the session
+//! closes. If that reset fails, no counter is written: the reset values
+//! written over a store still holding the previous stream would describe
+//! neither. The [`Initiator`](crate::Initiator) then records that a reset is
+//! owed, and its next `connect` resets the store before anything else,
+//! refusing the session with [`EngineError::Store`] if it still cannot,
+//! whatever the policy. The record lives in the `Initiator`, not in the
+//! store: a process restart forgets it, and the next session starts from the
+//! counters the store still holds.
 //!
 //! A store failure never logs frame bytes: an outbound Logon carries
 //! `Password` (554).
 
 use crate::application::SessionId;
+use crate::error::EngineError;
 use ironfix_core::error::StoreError;
 use ironfix_core::message::MsgType;
+use ironfix_session::SequenceManager;
+use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_store::MessageStore;
-use std::sync::Arc;
+use std::time::Duration;
 
 /// What the engine does when a write to the attached [`MessageStore`] fails.
 ///
 /// Applies to every write the engine makes during a session: filing an
-/// outbound frame, persisting the next sender sequence number, and persisting
-/// the next target sequence number. Without a store attached there is nothing
-/// to fail and the policy has no effect.
+/// outbound frame, persisting the next sender sequence number, persisting the
+/// next target sequence number, and resetting the store when the counterparty
+/// resets the sequence on its Logon acknowledgement. A call that does not
+/// finish within the store timeout counts as a failed write. Without a store
+/// attached there is nothing to fail and the policy has no effect.
+///
+/// Some store calls fail closed whatever the policy, because the session
+/// cannot start without them: the reset for a `ResetSeqNumFlag` (141) Logon,
+/// the refresh that recovers the counters, and a reset owed by the previous
+/// session (see the [module documentation](self)).
 ///
 /// # Example
 ///
@@ -74,23 +142,27 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum StoreFailurePolicy {
-    /// Log a warning and carry on: the frame is written anyway, and a counter
-    /// that could not be persisted is simply not durable.
+    /// Log a warning and carry on: the frame is written anyway, the message
+    /// is acted on anyway, and a counter that could not be persisted is simply
+    /// not durable.
     ///
     /// A frame that could not be filed cannot be replayed; a later
     /// `ResendRequest` covering it gets a `SequenceReset`-GapFill instead. This
     /// is the default, and what the engine always did before store writes were
-    /// fallible.
+    /// fallible. It gives **no** crash guarantee: after a failed write, a crash
+    /// can leave the store behind what the counterparty has seen.
     #[default]
     Continue,
     /// Fail closed: a frame whose filing or sender-counter write fails is not
     /// written at all (the counterparty reads no bytes for it), an inbound
     /// message whose target-counter write fails is not acted on, and the
-    /// session closes. During the Logon handshake the failure is returned as
-    /// [`EngineError::Store`](crate::EngineError::Store).
+    /// session closes, not gracefully. During the Logon handshake the failure
+    /// is returned as [`EngineError::Store`], also when it happens while a
+    /// Logon is being refused.
     ///
     /// No Logout is sent on the way out: it would have to be filed like any
-    /// other frame, through the store that just failed.
+    /// other frame, through the store that just failed. The failure is logged
+    /// at error level.
     CloseSession,
 }
 
@@ -103,10 +175,10 @@ impl StoreFailurePolicy {
     }
 }
 
-/// Which write failed, for the log line.
+/// Which store call failed, for the log line.
 #[derive(Debug, Clone, Copy)]
 enum StoreWrite<'m> {
-    /// Filing an outbound frame.
+    /// Filing an outbound frame together with the next sender number.
     Frame {
         /// Its `MsgSeqNum` (34).
         seq: u64,
@@ -117,41 +189,75 @@ enum StoreWrite<'m> {
     NextSender(u64),
     /// Persisting the next target sequence number.
     NextTarget(u64),
+    /// Resetting the store for a sequence reset.
+    Reset,
+}
+
+/// Runs one store call bounded by `timeout`, reporting an overrun as
+/// [`StoreError::Timeout`].
+///
+/// Every store call the engine makes goes through this: the session awaits
+/// the call, so an unbounded one would stall its reactor for as long as the
+/// store takes.
+///
+/// # Errors
+/// The call's own error, or [`StoreError::Timeout`] if it did not finish in
+/// time.
+pub(crate) async fn timed<T>(
+    timeout: Duration,
+    call: impl Future<Output = Result<T, StoreError>>,
+) -> Result<T, StoreError> {
+    match tokio::time::timeout(timeout, call).await {
+        Ok(result) => result,
+        Err(_) => Err(StoreError::Timeout { timeout }),
+    }
 }
 
 /// A store attached to a session, together with the policy for its write
-/// failures.
+/// failures and the bound on each call.
 ///
-/// Built from an [`Arc<dyn MessageStore>`] and a [`StoreFailurePolicy`]
-/// wherever the engine writes: the handshakes and the reactor share it, so
-/// the ordering and the policy cannot drift between them.
+/// Built wherever the engine writes: the handshakes and the reactor share it,
+/// so the ordering and the policy cannot drift between them.
 #[derive(Clone, Copy)]
 pub(crate) struct SessionStore<'s> {
     /// The attached store.
-    store: &'s Arc<dyn MessageStore>,
+    store: &'s dyn MessageStore,
     /// What a failed write means.
     policy: StoreFailurePolicy,
+    /// Bound on each store call; an overrun is a failed write.
+    timeout: Duration,
 }
 
 impl<'s> SessionStore<'s> {
-    /// Binds `store` to `policy`.
+    /// Binds `store` to `policy`, bounding each call by `timeout`.
     #[must_use]
-    pub(crate) const fn new(store: &'s Arc<dyn MessageStore>, policy: StoreFailurePolicy) -> Self {
-        Self { store, policy }
+    pub(crate) const fn new(
+        store: &'s dyn MessageStore,
+        policy: StoreFailurePolicy,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            store,
+            policy,
+            timeout,
+        }
     }
 
-    /// Files an outbound frame under `seq`, then persists `next_sender`, in
-    /// that order. The caller writes the frame only after this returns `Ok`.
+    /// Files an outbound frame under `seq` and persists `next_sender`,
+    /// through one [`MessageStore::file_outbound`] call. The caller writes the
+    /// frame only after this returns `Ok`.
     ///
-    /// Filing before the counter makes "counter persisted, frame not filed"
-    /// impossible: a crash between the two leaves a filed frame and the old
-    /// counter, so the number is reused for a message the peer never saw and
-    /// the filed frame is overwritten.
+    /// The store files before it persists the counter, which makes "counter
+    /// persisted, frame not filed" impossible: a crash between the two leaves
+    /// a filed frame and the old counter, so the number is reused for a
+    /// message the peer never saw and the filed frame is replaced.
     ///
     /// # Errors
-    /// Under [`StoreFailurePolicy::CloseSession`], the first failed write; the
-    /// counter is then not attempted and the frame must not be written. Under
-    /// [`StoreFailurePolicy::Continue`] failures are logged and `Ok` returned.
+    /// Under [`StoreFailurePolicy::CloseSession`], the store's error; the frame
+    /// must then not be written. Under [`StoreFailurePolicy::Continue`] the
+    /// failure is logged, the counter is written on its own as a best effort
+    /// (the combined call may have failed on the frame alone), and `Ok` is
+    /// returned.
     pub(crate) async fn file_outbound(
         self,
         session_id: &SessionId,
@@ -160,10 +266,18 @@ impl<'s> SessionStore<'s> {
         frame: &[u8],
         next_sender: u64,
     ) -> Result<(), StoreError> {
-        if let Err(err) = self.store.store(seq, msg_type, frame).await {
-            self.on_failure(session_id, StoreWrite::Frame { seq, msg_type }, err)?;
+        let filed = timed(
+            self.timeout,
+            self.store.file_outbound(seq, msg_type, frame, next_sender),
+        )
+        .await;
+        match filed {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.on_failure(session_id, StoreWrite::Frame { seq, msg_type }, err)?;
+                self.persist_sender(session_id, next_sender).await
+            }
         }
-        self.persist_sender(session_id, next_sender).await
     }
 
     /// Persists the next sender sequence number.
@@ -175,7 +289,7 @@ impl<'s> SessionStore<'s> {
         session_id: &SessionId,
         next: u64,
     ) -> Result<(), StoreError> {
-        match self.store.set_next_sender_seq(next).await {
+        match timed(self.timeout, self.store.set_next_sender_seq(next)).await {
             Ok(()) => Ok(()),
             Err(err) => self.on_failure(session_id, StoreWrite::NextSender(next), err),
         }
@@ -190,15 +304,28 @@ impl<'s> SessionStore<'s> {
         session_id: &SessionId,
         next: u64,
     ) -> Result<(), StoreError> {
-        match self.store.set_next_target_seq(next).await {
+        match timed(self.timeout, self.store.set_next_target_seq(next)).await {
             Ok(()) => Ok(()),
             Err(err) => self.on_failure(session_id, StoreWrite::NextTarget(next), err),
         }
     }
 
-    /// Applies the policy to one failed write: a warning and `Ok` to carry on,
-    /// or the error to close. The log line names the write, never the frame
-    /// bytes.
+    /// Resets the store (messages and counters) for a sequence reset.
+    ///
+    /// # Errors
+    /// The store's error under [`StoreFailurePolicy::CloseSession`]. Under
+    /// [`StoreFailurePolicy::Continue`] the failure is logged and the previous
+    /// stream stays filed, so a later resend can replay frames of it.
+    pub(crate) async fn reset(self, session_id: &SessionId) -> Result<(), StoreError> {
+        match timed(self.timeout, self.store.reset()).await {
+            Ok(()) => Ok(()),
+            Err(err) => self.on_failure(session_id, StoreWrite::Reset, err),
+        }
+    }
+
+    /// Applies the policy to one failed call: a warning and `Ok` to carry on,
+    /// or an error-level line and the error to close. The log line names the
+    /// call, never the frame bytes.
     #[cold]
     fn on_failure(
         self,
@@ -207,6 +334,13 @@ impl<'s> SessionStore<'s> {
         err: StoreError,
     ) -> Result<(), StoreError> {
         if self.policy.closes_session() {
+            tracing::error!(
+                session = %session_id,
+                write = ?write,
+                error = %err,
+                "store write failed under the fail-closed policy: nothing more is written \
+                 for it and the session is refused or closed"
+            );
             return Err(err);
         }
         match write {
@@ -229,9 +363,71 @@ impl<'s> SessionStore<'s> {
                 error = %err,
                 "cannot persist the next target sequence number: continuing"
             ),
+            StoreWrite::Reset => tracing::warn!(
+                session = %session_id,
+                error = %err,
+                "cannot reset the store for a sequence reset: continuing with the previous \
+                 stream still filed"
+            ),
         }
         Ok(())
     }
+}
+
+/// The store binding a Logon handshake writes through, with the counter values
+/// it wrote.
+///
+/// The record is handed to the reactor (see `SessionParams`), so the first
+/// pass of the live session does not write those values a second time.
+pub(crate) struct HandshakeStore<'s> {
+    /// The binding.
+    pub(crate) store: SessionStore<'s>,
+    /// The counter values written so far.
+    pub(crate) persisted: PersistedCounters,
+}
+
+/// Files an outbound frame and spends its sequence number, in the one order
+/// the Logon handshakes and the live session share.
+///
+/// `seq` is the number the frame was encoded under, read from `sequences`
+/// before encoding. The steps are: work out `seq + 1` with checked arithmetic;
+/// when a store is attached, file the frame under `seq` and persist `seq + 1`
+/// as the next sender number (recording that value in the counters); spend
+/// `seq` in memory and check that it was the number spent. The caller writes
+/// the frame only after this returns `Ok`, so the store and the in-memory
+/// counter agree before any byte reaches the socket, and a write that fails
+/// afterwards cannot lead to `seq` being reused.
+///
+/// # Errors
+/// [`EngineError::SequenceExhausted`] when `seq` is `u64::MAX`;
+/// [`EngineError::Store`] when the store write fails under
+/// [`StoreFailurePolicy::CloseSession`], in which case nothing is spent; and
+/// [`EngineError::Sequence`] if the number spent is not `seq`, which cannot
+/// happen while only the reactor and the handshake allocate sender numbers.
+pub(crate) async fn file_and_spend(
+    store: Option<(SessionStore<'_>, &mut PersistedCounters)>,
+    sequences: &SequenceManager,
+    session_id: &SessionId,
+    seq: u64,
+    msg_type: &MsgType,
+    frame: &[u8],
+) -> Result<(), EngineError> {
+    let next = seq.checked_add(1).ok_or(SequenceExhausted {
+        counter: SequenceCounter::Sender,
+    })?;
+    if let Some((store, persisted)) = store {
+        persisted.record_sender(next);
+        store
+            .file_outbound(session_id, seq, msg_type, frame, next)
+            .await?;
+    }
+    let allocated = sequences.try_allocate_sender_seq()?.value();
+    if allocated != seq {
+        return Err(EngineError::Sequence(format!(
+            "sender sequence moved from {seq} to {allocated} while a frame was being built"
+        )));
+    }
+    Ok(())
 }
 
 /// The counter values last written to the store, so that a counter is written

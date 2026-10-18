@@ -61,8 +61,9 @@
 //!   the acceptor attaches no store, so its resends are gap-filled. Store
 //!   writes are ordered and fallible, and [`StoreFailurePolicy`] decides
 //!   whether a failed one is tolerated or closes the session (see
-//!   [`persistence`]). Inbound application messages are delivered at most once
-//!   across a crash.
+//!   [`persistence`]). Inbound application messages are delivered at most
+//!   once: a crash, or a close whose application queue does not drain in
+//!   time, loses the messages still queued.
 
 pub mod acceptor;
 pub mod application;
