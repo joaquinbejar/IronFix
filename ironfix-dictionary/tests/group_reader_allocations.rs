@@ -18,7 +18,8 @@
 //! - reads an absent group;
 //! - iterates the layout's top-level groups;
 //! - reads a malformed group, which fails with a count mismatch;
-//! - repeats the first read through a static [`GroupSet`];
+//! - repeats the first read through a static [`GroupSet`], with and without
+//!   the message level's tags;
 //! - looks message-level fields up past both groups with
 //!   [`GroupSet::field`], through the layout and the static set, including a
 //!   tag that appears only inside a group entry.
@@ -49,6 +50,13 @@ const PARTIES: GroupSpec<'static> =
         Err(_) => panic!("bad NoPartyIDs table"),
     };
 const ORDER_GROUPS: GroupSet<'static> = match GroupSet::new(&[PARTIES]) {
+    Ok(set) => set,
+    Err(_) => panic!("bad NewOrderSingle group table"),
+};
+/// The same set with (part of) the message level's tags, as generated code
+/// builds it.
+const LEVEL_GROUPS: GroupSet<'static> = match GroupSet::with_level_tags(&[PARTIES], &[11, 55, 453])
+{
     Ok(set) => set,
     Err(_) => panic!("bad NewOrderSingle group table"),
 };
@@ -158,6 +166,11 @@ fn main() {
     };
     let symbol = layout.groups().field(&msg, 55).map(|field| field.value);
     let static_symbol = ORDER_GROUPS.field(&msg, 55).map(|field| field.value);
+    let from_level = match LEVEL_GROUPS.read(&msg, 453) {
+        Ok(Some(parties)) => walk_parties(parties),
+        other => panic!("NoPartyIDs must read through the level-tag set: {other:?}"),
+    };
+    let level_symbol = LEVEL_GROUPS.field(&msg, 55).map(|field| field.value);
     let party_at_top = layout.groups().field(&msg, 448).is_some();
 
     let after = dhat::HeapStats::get();
@@ -187,5 +200,7 @@ fn main() {
     assert!(mismatch, "the malformed NoPartyIDs is a count mismatch");
     assert_eq!(symbol, Some(&b"EURUSD"[..]));
     assert_eq!(static_symbol, symbol);
+    assert_eq!(from_level, from_layout);
+    assert_eq!(level_symbol, symbol);
     assert!(!party_at_top, "PartyID(448) appears only inside NoPartyIDs");
 }

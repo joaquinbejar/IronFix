@@ -19,7 +19,7 @@
 use ironfix_codegen::CodeGenerator;
 use ironfix_dictionary::schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef as SchemaFieldRef, FieldType,
-    GroupDef, MessageCategory, MessageDef, Version,
+    GroupDef, Member, MessageCategory, MessageDef, Version,
 };
 use std::collections::HashMap;
 
@@ -179,162 +179,139 @@ pub fn views_sample_dictionary() -> Dictionary {
         field_ref(34, "MsgSeqNum", true),
         field_ref(52, "SendingTime", true),
     ];
-    dict.header_groups = vec![GroupDef {
-        count_tag: 627,
-        name: "NoHops".to_string(),
-        delimiter_tag: 628,
-        fields: vec![field_ref(628, "HopCompID", false)],
-        groups: Vec::new(),
-        components: Vec::new(),
-        required: false,
-    }];
+    dict.header_groups = vec![GroupDef::new(
+        627,
+        "NoHops".to_string(),
+        628,
+        false,
+        vec![Member::Field(field_ref(628, "HopCompID", false))],
+    )];
     dict.trailer = vec![field_ref(10, "CheckSum", true)];
 
-    dict.add_component(ComponentDef {
-        name: "Instrument".to_string(),
-        fields: vec![
-            field_ref(55, "Symbol", true),
-            field_ref(167, "SecurityType", false),
+    dict.add_component(ComponentDef::new(
+        "Instrument".to_string(),
+        vec![
+            Member::Field(field_ref(55, "Symbol", true)),
+            Member::Field(field_ref(167, "SecurityType", false)),
         ],
-        groups: Vec::new(),
-        components: Vec::new(),
-    });
-    dict.add_component(ComponentDef {
-        name: "PtysSubGrp".to_string(),
-        fields: Vec::new(),
-        groups: vec![GroupDef {
-            count_tag: 802,
-            name: "NoPartySubIDs".to_string(),
-            delimiter_tag: 523,
-            fields: vec![
-                field_ref(523, "PartySubID", false),
-                field_ref(803, "PartySubIDType", false),
+    ));
+    dict.add_component(ComponentDef::new(
+        "PtysSubGrp".to_string(),
+        vec![Member::Group(GroupDef::new(
+            802,
+            "NoPartySubIDs".to_string(),
+            523,
+            false,
+            vec![
+                Member::Field(field_ref(523, "PartySubID", false)),
+                Member::Field(field_ref(803, "PartySubIDType", false)),
             ],
-            groups: Vec::new(),
-            components: Vec::new(),
-            required: false,
-        }],
-        components: Vec::new(),
-    });
-    dict.add_component(ComponentDef {
-        name: "Parties".to_string(),
-        fields: Vec::new(),
-        groups: vec![GroupDef {
-            count_tag: 453,
-            name: "NoPartyIDs".to_string(),
-            delimiter_tag: 448,
-            fields: vec![
-                field_ref(448, "PartyID", false),
-                field_ref(447, "PartyIDSource", false),
-                field_ref(452, "PartyRole", true),
-                field_ref(58, "Text", false),
+        ))],
+    ));
+    dict.add_component(ComponentDef::new(
+        "Parties".to_string(),
+        vec![Member::Group(GroupDef::new(
+            453,
+            "NoPartyIDs".to_string(),
+            448,
+            false,
+            vec![
+                Member::Field(field_ref(448, "PartyID", false)),
+                Member::Field(field_ref(447, "PartyIDSource", false)),
+                Member::Field(field_ref(452, "PartyRole", true)),
+                Member::Field(field_ref(58, "Text", false)),
+                Member::Component(ComponentRef::new("PtysSubGrp", false)),
             ],
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("PtysSubGrp", false)],
-            required: false,
-        }],
-        components: Vec::new(),
-    });
+        ))],
+    ));
 
-    dict.add_message(MessageDef {
-        msg_type: "D".to_string(),
-        name: "NewOrderSingle".to_string(),
-        category: MessageCategory::App,
-        fields: vec![
-            field_ref(11, "ClOrdID", true),
-            field_ref(12, "ClOrdId", false),
-            field_ref(1, "Account", false),
-            field_ref(54, "Side", true),
-            field_ref(60, "TransactTime", true),
-            field_ref(38, "OrderQty", false),
-            field_ref(44, "Price", false),
-            field_ref(18, "ExecInst", false),
-            field_ref(114, "LocateReqd", false),
-            field_ref(95, "RawDataLength", false),
-            field_ref(96, "RawData", false),
-            field_ref(236, "Yield", false),
-            field_ref(58, "Text", false),
-            field_ref(5000, "ToVenue", false),
-            field_ref(5001, "Get", false),
-            field_ref(5002, "Flag", false),
+    dict.add_message(MessageDef::new(
+        "D".to_string(),
+        "NewOrderSingle".to_string(),
+        MessageCategory::App,
+        vec![
+            Member::Field(field_ref(11, "ClOrdID", true)),
+            Member::Field(field_ref(12, "ClOrdId", false)),
+            Member::Field(field_ref(1, "Account", false)),
+            Member::Field(field_ref(54, "Side", true)),
+            Member::Field(field_ref(60, "TransactTime", true)),
+            Member::Field(field_ref(38, "OrderQty", false)),
+            Member::Field(field_ref(44, "Price", false)),
+            Member::Field(field_ref(18, "ExecInst", false)),
+            Member::Field(field_ref(114, "LocateReqd", false)),
+            Member::Field(field_ref(95, "RawDataLength", false)),
+            Member::Field(field_ref(96, "RawData", false)),
+            Member::Field(field_ref(236, "Yield", false)),
+            Member::Field(field_ref(58, "Text", false)),
+            Member::Field(field_ref(5000, "ToVenue", false)),
+            Member::Field(field_ref(5001, "Get", false)),
+            Member::Field(field_ref(5002, "Flag", false)),
+            Member::Group(GroupDef::new(
+                78,
+                "NoAllocs".to_string(),
+                79,
+                false,
+                vec![
+                    Member::Field(field_ref(79, "AllocAccount", false)),
+                    Member::Field(field_ref(80, "AllocQty", false)),
+                ],
+            )),
+            Member::Component(ComponentRef::new("Instrument", true)),
+            Member::Component(ComponentRef::new("Parties", false)),
         ],
-        groups: vec![GroupDef {
-            count_tag: 78,
-            name: "NoAllocs".to_string(),
-            delimiter_tag: 79,
-            fields: vec![
-                field_ref(79, "AllocAccount", false),
-                field_ref(80, "AllocQty", false),
-            ],
-            groups: Vec::new(),
-            components: Vec::new(),
-            required: false,
-        }],
-        components: vec![
-            ComponentRef::new("Instrument", true),
-            ComponentRef::new("Parties", false),
+    ));
+    dict.add_message(MessageDef::new(
+        "8".to_string(),
+        "ExecutionReport".to_string(),
+        MessageCategory::App,
+        vec![
+            Member::Field(field_ref(11, "ClOrdID", true)),
+            Member::Field(field_ref(54, "Side", true)),
+            Member::Field(field_ref(58, "Text", false)),
+            Member::Component(ComponentRef::new("Instrument", true)),
+            Member::Component(ComponentRef::new("Parties", false)),
         ],
-    });
-    dict.add_message(MessageDef {
-        msg_type: "8".to_string(),
-        name: "ExecutionReport".to_string(),
-        category: MessageCategory::App,
-        fields: vec![
-            field_ref(11, "ClOrdID", true),
-            field_ref(54, "Side", true),
-            field_ref(58, "Text", false),
-        ],
-        groups: Vec::new(),
-        components: vec![
-            ComponentRef::new("Instrument", true),
-            ComponentRef::new("Parties", false),
-        ],
-    });
-    dict.add_message(MessageDef {
-        msg_type: "0".to_string(),
-        name: "Heartbeat".to_string(),
-        category: MessageCategory::Admin,
-        fields: Vec::new(),
-        groups: Vec::new(),
-        components: Vec::new(),
-    });
+    ));
+    dict.add_message(MessageDef::new(
+        "0".to_string(),
+        "Heartbeat".to_string(),
+        MessageCategory::Admin,
+        Vec::new(),
+    ));
     // One field per FIX type with a grammar, and a required group whose
     // entries open with the length of a LENGTH/DATA pair (as FIX 5.0 SP2
     // NoPaymentStreamFormulas entries do).
-    dict.add_message(MessageDef {
-        msg_type: "U1".to_string(),
-        name: "TypeSampler".to_string(),
-        category: MessageCategory::App,
-        fields: vec![
-            field_ref(60, "TransactTime", false),
-            field_ref(5010, "SampleTime", false),
-            field_ref(5011, "SampleDate", false),
-            field_ref(75, "TradeDate", false),
-            field_ref(200, "MaturityMonthYear", false),
-            field_ref(205, "MaturityDay", false),
-            field_ref(421, "Country", false),
-            field_ref(15, "Currency", false),
-            field_ref(44, "Price", false),
-            field_ref(5012, "ExpireSeconds", false),
-            field_ref(5013, "Labels", false),
-            field_ref(5014, "Flags", false),
-            field_ref(5015, "Mode", false),
+    dict.add_message(MessageDef::new(
+        "U1".to_string(),
+        "TypeSampler".to_string(),
+        MessageCategory::App,
+        vec![
+            Member::Field(field_ref(60, "TransactTime", false)),
+            Member::Field(field_ref(5010, "SampleTime", false)),
+            Member::Field(field_ref(5011, "SampleDate", false)),
+            Member::Field(field_ref(75, "TradeDate", false)),
+            Member::Field(field_ref(200, "MaturityMonthYear", false)),
+            Member::Field(field_ref(205, "MaturityDay", false)),
+            Member::Field(field_ref(421, "Country", false)),
+            Member::Field(field_ref(15, "Currency", false)),
+            Member::Field(field_ref(44, "Price", false)),
+            Member::Field(field_ref(5012, "ExpireSeconds", false)),
+            Member::Field(field_ref(5013, "Labels", false)),
+            Member::Field(field_ref(5014, "Flags", false)),
+            Member::Field(field_ref(5015, "Mode", false)),
+            Member::Group(GroupDef::new(
+                5020,
+                "NoDocs".to_string(),
+                354,
+                true,
+                vec![
+                    Member::Field(field_ref(354, "EncodedTextLen", false)),
+                    Member::Field(field_ref(355, "EncodedText", false)),
+                    Member::Field(field_ref(5023, "DocName", false)),
+                ],
+            )),
         ],
-        groups: vec![GroupDef {
-            count_tag: 5020,
-            name: "NoDocs".to_string(),
-            delimiter_tag: 354,
-            fields: vec![
-                field_ref(354, "EncodedTextLen", false),
-                field_ref(355, "EncodedText", false),
-                field_ref(5023, "DocName", false),
-            ],
-            groups: Vec::new(),
-            components: Vec::new(),
-            required: true,
-        }],
-        components: Vec::new(),
-    });
+    ));
 
     dict
 }

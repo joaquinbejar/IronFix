@@ -2837,6 +2837,7 @@ mod tests {
 
     use crate::CodeGenerator;
     use crate::generator::GeneratorConfig;
+    use ironfix_dictionary::schema::Member as SchemaMember;
     use ironfix_dictionary::schema::{ComponentDef, MessageCategory, Version};
 
     /// Generates views, failing the test with the generator error.
@@ -2966,14 +2967,16 @@ mod tests {
         ] {
             dict.add_field(FieldDef::new(tag, name, field_type));
         }
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "NewOrderSingle".to_string(),
-            category: MessageCategory::App,
-            fields,
-            groups,
-            components,
-        });
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            fields
+                .into_iter()
+                .map(SchemaMember::Field)
+                .chain(groups.into_iter().map(SchemaMember::Group))
+                .chain(components.into_iter().map(SchemaMember::Component)),
+        ));
         dict
     }
 
@@ -2986,15 +2989,13 @@ mod tests {
     }
 
     fn allocs(required: bool, delimiter_tag: u32) -> GroupDef {
-        GroupDef {
-            count_tag: 78,
-            name: "NoAllocs".to_string(),
+        GroupDef::new(
+            78,
+            "NoAllocs",
             delimiter_tag,
-            fields: vec![reference(79, "AllocAccount", false)],
-            groups: Vec::new(),
-            components: Vec::new(),
             required,
-        }
+            [SchemaMember::Field(reference(79, "AllocAccount", false))],
+        )
     }
 
     #[test]
@@ -3027,10 +3028,13 @@ mod tests {
 
     /// A NoAllocs group with the given delimiter and fields.
     fn allocs_with(delimiter_tag: u32, fields: Vec<SchemaFieldRef>) -> GroupDef {
-        GroupDef {
-            fields,
-            ..allocs(false, delimiter_tag)
-        }
+        GroupDef::new(
+            78,
+            "NoAllocs",
+            delimiter_tag,
+            false,
+            fields.into_iter().map(SchemaMember::Field),
+        )
     }
 
     #[test]
@@ -3151,12 +3155,10 @@ mod tests {
             Vec::new(),
             vec![ComponentRef::new("Looper", false)],
         );
-        dict.add_component(ComponentDef {
-            name: "Looper".to_string(),
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("Looper", false)],
-        });
+        dict.add_component(ComponentDef::new(
+            "Looper".to_string(),
+            vec![SchemaMember::Component(ComponentRef::new("Looper", false))],
+        ));
         assert_eq!(
             CodeGenerator::new().generate_views(&dict),
             Err(GeneratorError::ComponentCycle {
@@ -3173,12 +3175,10 @@ mod tests {
         );
         let mut group = allocs(false, 79);
         group.components = vec![ComponentRef::new("Allocs", false)];
-        dict.add_component(ComponentDef {
-            name: "Allocs".to_string(),
-            fields: Vec::new(),
-            groups: vec![group],
-            components: Vec::new(),
-        });
+        dict.add_component(ComponentDef::new(
+            "Allocs".to_string(),
+            vec![SchemaMember::Group(group)],
+        ));
         assert_eq!(
             CodeGenerator::new().generate_views(&dict),
             Err(GeneratorError::ComponentCycle {
@@ -3202,12 +3202,10 @@ mod tests {
             } else {
                 Vec::new()
             };
-            dict.add_component(ComponentDef {
-                name: format!("Comp{index}"),
-                fields: Vec::new(),
-                groups: Vec::new(),
-                components: next,
-            });
+            dict.add_component(ComponentDef::new(
+                format!("Comp{index}"),
+                next.into_iter().map(SchemaMember::Component),
+            ));
         }
         assert!(matches!(
             CodeGenerator::new().generate_views(&dict),
@@ -3225,12 +3223,7 @@ mod tests {
             Vec::new(),
             vec![ComponentRef::new("Bad-Name", false)],
         );
-        dict.add_component(ComponentDef {
-            name: "Bad-Name".to_string(),
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: Vec::new(),
-        });
+        dict.add_component(ComponentDef::new("Bad-Name".to_string(), Vec::new()));
         assert_eq!(
             CodeGenerator::new().generate_views(&dict),
             Err(GeneratorError::UnnameableItem {
