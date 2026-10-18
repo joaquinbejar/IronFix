@@ -37,7 +37,8 @@ pub struct Disconnected;
 impl private::Sealed for Disconnected {}
 impl SessionState for Disconnected {}
 
-/// Connecting state - TCP connection in progress.
+/// Connecting state: the transport is being opened or is open, and no Logon
+/// has been exchanged.
 #[derive(Debug, Clone, Copy)]
 pub struct Connecting;
 
@@ -154,7 +155,7 @@ impl Session<Disconnected> {
     }
 
     /// Transitions to the Connecting state after accepting an inbound
-    /// TCP connection (acceptor side).
+    /// connection (acceptor side).
     #[must_use]
     pub fn accept(self) -> Session<Connecting> {
         self.transition(Connecting)

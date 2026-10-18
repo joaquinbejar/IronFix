@@ -13,25 +13,27 @@
 //!
 //! This crate provides:
 //! - **[`Initiator`]**: the client-side engine. [`Initiator::connect`] dials
-//!   the counterparty over TCP, runs the Logon handshake, and hands the socket
-//!   to a background reactor that owns framing, heartbeats and TestRequests,
-//!   CompID validation, sequence-gap detection, `ResendRequest` /
+//!   the counterparty over TCP ([`Initiator::establish`] takes a stream the
+//!   caller connected instead), runs the Logon handshake, and hands the
+//!   stream to a background reactor that owns framing, heartbeats and
+//!   TestRequests, CompID validation, sequence-gap detection, `ResendRequest` /
 //!   `SequenceReset` / gap fill, `PossDupFlag` and `OrigSendingTime`,
 //!   `ResetSeqNumFlag`, resend-from-store replay, and session-level `Reject`.
 //! - **[`Acceptor`]**: the server-side engine for one configured session.
 //!   [`Acceptor::serve`] runs the acceptor half of the Logon handshake on an
-//!   inbound connection and hands the socket to the same reactor.
+//!   inbound TCP connection ([`Acceptor::serve_stream`] on any accepted
+//!   stream) and hands it to the same reactor.
 //! - **[`AcceptorRegistry`]**: many acceptor sessions on one listener.
-//!   [`AcceptorRegistry::serve`] reads the inbound Logon once, routes it by
-//!   the CompIDs (and configured sub and location IDs) it claims, read from
-//!   the standard header and bounded before anything is looked up, to a
-//!   registered [`Acceptor`] or one a [`SessionLookup`] admits, and runs that
-//!   session's handshake on it. A Logon that cannot be routed is closed
-//!   without a reply, touching no store and running no callback. A session
-//!   the lookup admits is kept only once a Logon for it gets past
-//!   `from_admin`, and [`AcceptorRegistry::with_max_sessions`] caps how many
-//!   it holds. Each session keeps its own sequence numbers, store and
-//!   heartbeat.
+//!   [`AcceptorRegistry::serve`] (or [`AcceptorRegistry::serve_stream`]) reads
+//!   the inbound Logon once, routes it by the CompIDs (and configured sub and
+//!   location IDs) it claims, read from the standard header and bounded
+//!   before anything is looked up, to a registered [`Acceptor`] or one a
+//!   [`SessionLookup`] admits, and runs that session's handshake on it. A
+//!   Logon that cannot be routed is closed without a reply, touching no store
+//!   and running no callback. A session the lookup admits is kept only once a
+//!   Logon for it gets past `from_admin`, and
+//!   [`AcceptorRegistry::with_max_sessions`] caps how many it holds. Each
+//!   session keeps its own sequence numbers, store and heartbeat.
 //! - **[`Connection`]**: a cheap-clone handle returned by both engines — send,
 //!   logout, await close, read sequence numbers and, on a FIX 5.0 session,
 //!   the counterparty's declared default application version.
@@ -83,9 +85,40 @@
 //! garbling. Only a frame above `max_message_size` (after a Logout saying so)
 //! or an I/O error still ends the session at the codec.
 //!
+//! ## Transports
+//!
+//! A session runs over any byte stream that is
+//! `AsyncRead + AsyncWrite + Unpin + Send + 'static`, not only TCP. The TCP
+//! entry points ([`Initiator::connect`], [`Acceptor::serve`] and
+//! [`Acceptor::accept`], [`AcceptorRegistry::serve`] and
+//! [`AcceptorRegistry::accept`]) dial or accept a `TcpStream` and set
+//! `TCP_NODELAY` on it. [`Initiator::establish`], [`Acceptor::serve_stream`]
+//! and [`AcceptorRegistry::serve_stream`] take a stream the caller has already
+//! connected or accepted: a TLS stream built with the TLS stack of the
+//! caller's choice, a Unix socket, a proxied connection, or an in-memory
+//! [`tokio::io::duplex`] pipe (see the example on [`Initiator::establish`]).
+//! Everything else is the same on both paths: the handshake checks and their
+//! order, the logon and write timeouts, the store order, and the reactor. Only
+//! socket options are not: the engine cannot reach one through an arbitrary
+//! stream, so those are the caller's. A TLS handshake the caller runs before
+//! handing the stream over is outside the engine's logon timeout.
+//!
+//! No public type gains a stream type parameter, [`Connection`] included. The
+//! TCP path is unaffected by the seam: its socket is held by value, with no
+//! allocation and no dynamic call. A caller's stream is boxed once, when the
+//! session starts; each outbound frame written in one piece then costs three
+//! dynamic calls (`is_write_vectored`, `poll_write_vectored`, `poll_flush`)
+//! and each read poll one, the `Pending` poll on every wakeup included.
+//! Nothing has measured that cost. The decision is recorded in ADR-0007
+//! (`doc/adr/0007-engine-over-any-stream.md`).
+//!
 //! ## Current limitations
 //!
-//! - **There is no TLS**, and no dictionary validation: `ironfix-dictionary`'s
+//! - **There is no TLS** in the workspace: no TLS dependency and no TLS
+//!   setting. A caller that needs it builds the TLS stream itself, with the
+//!   TLS stack and crypto provider of its choice, and hands it to
+//!   [`Initiator::establish`] or [`Acceptor::serve_stream`].
+//! - **There is no dictionary validation**: `ironfix-dictionary`'s
 //!   `Validator` is never invoked on the session path.
 //! - **The store is opt-in.** Attaching one with [`Initiator::with_store`],
 //!   [`Acceptor::with_store`] or [`EngineBuilder::with_store`] enables
@@ -119,6 +152,7 @@ pub mod outbound;
 pub mod persistence;
 mod reactor;
 pub mod registry;
+mod stream;
 mod wire;
 
 pub use acceptor::Acceptor;

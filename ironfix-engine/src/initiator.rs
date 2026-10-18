@@ -4,18 +4,25 @@
    Date: 14/7/26
 ******************************************************************************/
 
-//! Client-side (initiator) FIX engine: TCP dial, framing, and a live
-//! session reactor.
+//! Client-side (initiator) FIX engine: TCP dial or a caller's stream,
+//! framing, and a live session reactor.
 //!
 //! [`Initiator::connect`] dials the counterparty over TCP, frames the byte
 //! stream with [`ironfix_transport::FixCodec`], drives the
 //! [`ironfix_session`] typestate machine through
 //! `connect() -> send_logon() -> on_logon_ack()`, and spawns a background
-//! reactor task that owns the socket. The returned [`Connection`] handle is
+//! reactor task that owns the stream. The returned [`Connection`] handle is
 //! the outbound message sink and exposes `wait_closed()` / `is_timed_out()`.
 //!
+//! [`Initiator::establish`] does the same on a stream the caller has already
+//! connected, of any type that is `AsyncRead + AsyncWrite + Unpin + Send +
+//! 'static`: a TLS stream, a Unix socket, a proxied connection, an in-memory
+//! [`tokio::io::duplex`] pipe. `connect` is the TCP dial (with `TCP_NODELAY`
+//! set) followed by exactly the handshake `establish` runs.
+//!
 //! Reconnection is deliberately out of scope: the consumer owns supervision
-//! and backoff, and calls [`Initiator::connect`] again for a new session.
+//! and backoff, and calls [`Initiator::connect`] (or
+//! [`Initiator::establish`]) again for a new session.
 //!
 //! # Inbound conformance
 //!
@@ -199,6 +206,7 @@ use crate::reactor::{
     SessionParams, TICK_INTERVAL, lock_heartbeat, read_handshake_frame, refuse_handshake,
     send_handshake_admin, session_codec, spawn_session,
 };
+use crate::stream::SessionStream;
 use crate::wire::{
     self, ApplVersionGuard, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion,
 };
@@ -208,11 +216,12 @@ use ironfix_core::version::FixVersion;
 use ironfix_session::config::SessionConfigError;
 use ironfix_session::heartbeat::negotiate_interval;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
-use ironfix_session::{Disconnected, HeartbeatManager, Session, SessionConfig};
+use ironfix_session::{Connecting, Disconnected, HeartbeatManager, Session, SessionConfig};
 use ironfix_store::MessageStore;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
@@ -220,8 +229,8 @@ use tokio_util::codec::Framed;
 /// Client-side FIX engine.
 ///
 /// Owns the session configuration and the [`Application`] callbacks. Each
-/// call to [`Initiator::connect`] establishes one live session and returns
-/// a [`Connection`] handle for it.
+/// call to [`Initiator::connect`] or [`Initiator::establish`] establishes one
+/// live session and returns a [`Connection`] handle for it.
 pub struct Initiator<A: Application = NoOpApplication> {
     /// Session configuration.
     config: SessionConfig,
@@ -527,6 +536,10 @@ impl<A: Application + 'static> Initiator<A> {
     /// Dials the counterparty, completes the Logon handshake, and spawns
     /// the session reactor.
     ///
+    /// `TCP_NODELAY` is set on the dialled socket, and the socket is held by
+    /// value. To run the session over a stream you opened yourself, see
+    /// [`Initiator::establish`].
+    ///
     /// On success the session is Active: `on_logon` has fired and the
     /// returned [`Connection`] can send application messages. The reactor
     /// owns the socket and handles heartbeats, TestRequests, sequence
@@ -576,45 +589,9 @@ impl<A: Application + 'static> Initiator<A> {
     /// [`EngineError::InvalidInitialSequence`], all before the socket is
     /// dialled.
     pub async fn connect(&self, addr: impl ToSocketAddrs) -> Result<Connection, EngineError> {
-        // Refuse before dialling: a knob outside its documented range corrupts
-        // the session's own messages — an identity string carrying SOH breaks
-        // every header, and a fractional HeartBtInt negotiates one interval
-        // while the local timers run another.
-        if let Err(err) = &self.config_check {
-            return Err(EngineError::Config(err.clone()));
-        }
-
-        // Refuse before dialling: an unsupported version cannot produce a
-        // conforming Logon, and guessing one would put a fabricated version on
-        // the wire.
-        let version = match &self.version {
-            Ok(version) => *version,
-            Err(err) => {
-                return Err(EngineError::UnsupportedVersion {
-                    version: err.version.clone(),
-                    detail: err.detail.clone(),
-                });
-            }
-        };
-
-        // Refuse before dialling: a seeded sequence number of zero would put
-        // MsgSeqNum (34) = 0 on the wire, which every conforming counterparty
-        // rejects. The seed is ignored entirely when the Logon declares a reset
-        // (reset_on_logon, or a reset owed by an earlier session), so a zero
-        // is only refused when it would actually be used. The validated seed
-        // is applied by `seed_session`, which reads the same fields; this is
-        // only the guard.
-        if let Some((sender, target)) = self.initial_sequences
-            && !self.config.reset_on_logon
-            && !self.store.reset_is_owed()
-        {
-            NonZeroU64::new(sender).ok_or(EngineError::InvalidInitialSequence {
-                counter: SequenceCounter::Sender,
-            })?;
-            NonZeroU64::new(target).ok_or(EngineError::InvalidInitialSequence {
-                counter: SequenceCounter::Target,
-            })?;
-        }
+        // Refused before dialling: nothing is worth a connection with a
+        // configuration, version or seed the session cannot run on.
+        let version = self.preflight()?;
 
         let session_id = self.session_id.clone();
         self.application.on_create(&session_id).await;
@@ -633,8 +610,173 @@ impl<A: Application + 'static> Initiator<A> {
             }
             Ok(Ok(stream)) => stream,
         };
-        let _ = stream.set_nodelay(true);
 
+        // The only way to a TCP session: it sets TCP_NODELAY.
+        self.logon(version, session, SessionStream::tcp(stream))
+            .await
+    }
+
+    /// Establishes a session on a byte stream the caller has already
+    /// connected: runs the Logon handshake over it and spawns the session
+    /// reactor, exactly as [`Initiator::connect`] does once it has dialled.
+    ///
+    /// This is the seam for any transport the engine does not open itself: a
+    /// TLS stream built with the TLS stack of your choice, a Unix socket, a
+    /// connection through a proxy, or an in-memory [`tokio::io::duplex`] pipe
+    /// for tests. Everything after the dial is the same as on
+    /// [`Initiator::connect`]: the configuration, version and seed checks, the
+    /// Logon and its acknowledgement checks, the logon timeout, the write
+    /// timeout, the store order and the reactor. Only the dial is missing, so
+    /// [`Initiator::with_connect_timeout`] does not apply, and no socket option
+    /// is set: `TCP_NODELAY`, which [`Initiator::connect`] sets, is the
+    /// caller's to set on a TCP socket under the stream.
+    ///
+    /// The session owns the stream from here on and closes it when the
+    /// session ends; on an error the stream is dropped, which closes it. The
+    /// logon and write timeouts bound only what happens from this call on: a
+    /// TLS handshake, or anything else, run on the stream before it is not
+    /// bounded by them and is the caller's to bound.
+    ///
+    /// The stream must be a well-behaved [`AsyncRead`]: `poll_read` fills the
+    /// `ReadBuf` it is handed and never swaps it for another one. The framing
+    /// layer (tokio-util) asserts this, and a stream that breaks it panics the
+    /// task reading it (the whole process, under `panic = "abort"`).
+    ///
+    /// The stream is boxed once, here, and the TCP path of
+    /// [`Initiator::connect`] is not: it holds its socket by value. Each
+    /// outbound frame written in one piece then costs three dynamic calls
+    /// (`is_write_vectored`, `poll_write_vectored`, `poll_flush`), and each
+    /// read poll one, the `Pending` poll on every wakeup included. Nothing has
+    /// measured that cost. Pass the stream's concrete type: a stream that is
+    /// already boxed (`Box<dyn ...>`, `Pin<Box<dyn ...>>`) is boxed again, for
+    /// two allocations and two vtable hops on every call.
+    ///
+    /// Everything [`Initiator::connect`] says about the returned
+    /// [`Connection`] (dropping every handle logs out) and about one session
+    /// at a time with a store applies here too.
+    ///
+    /// # Arguments
+    /// * `stream` - A connected byte stream to the counterparty
+    ///
+    /// # Errors
+    /// Every error [`Initiator::connect`] documents except
+    /// [`EngineError::ConnectTimeout`] and a dial failure. A stream that
+    /// closes before the Logon acknowledgement arrives is
+    /// [`EngineError::Closed`], or [`EngineError::Codec`] carrying the I/O
+    /// error when it closes partway through a frame or a write or read on it
+    /// fails. The configuration, version and seed are checked before the
+    /// stream is written to.
+    ///
+    /// # Examples
+    ///
+    /// Both roles over an in-memory pipe, with no socket at all:
+    ///
+    /// ```
+    /// use ironfix_core::types::CompId;
+    /// use ironfix_engine::{Acceptor, Initiator, NoOpApplication, SessionConfig};
+    /// use std::sync::Arc;
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = SessionConfig::new(CompId::new("CLIENT")?, CompId::new("VENUE")?, "FIX.4.4");
+    /// let venue = SessionConfig::new(CompId::new("VENUE")?, CompId::new("CLIENT")?, "FIX.4.4");
+    ///
+    /// let (client_io, venue_io) = tokio::io::duplex(64 * 1024);
+    /// let acceptor = Acceptor::new(venue, Arc::new(NoOpApplication));
+    /// let served = tokio::spawn(async move { acceptor.serve_stream(venue_io).await });
+    ///
+    /// let initiator = Initiator::new(client, Arc::new(NoOpApplication));
+    /// let connection = initiator.establish(client_io).await?;
+    /// let venue_connection = served.await??;
+    /// assert_eq!(connection.next_sender_seq(), 2);
+    ///
+    /// connection.logout().await?;
+    /// connection.wait_closed().await;
+    /// venue_connection.wait_closed().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn establish<S>(&self, stream: S) -> Result<Connection, EngineError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        // Refused before the stream is written to, as `connect` refuses
+        // before dialling.
+        let version = self.preflight()?;
+
+        let session_id = self.session_id.clone();
+        self.application.on_create(&session_id).await;
+
+        // Typestate: Disconnected -> Connecting. The transport is already
+        // connected; what `Connecting` means is that the Logon is not sent.
+        let session = Session::<Disconnected>::new(session_id.to_string()).connect();
+
+        self.logon(version, session, SessionStream::erased(stream))
+            .await
+    }
+
+    /// The checks [`Initiator::connect`] and [`Initiator::establish`] make
+    /// before they touch a transport.
+    ///
+    /// # Errors
+    /// [`EngineError::Config`], [`EngineError::UnsupportedVersion`] and
+    /// [`EngineError::InvalidInitialSequence`].
+    fn preflight(&self) -> Result<FixVersion, EngineError> {
+        // A knob outside its documented range corrupts the session's own
+        // messages: an identity string carrying SOH breaks every header, and
+        // a fractional HeartBtInt negotiates one interval while the local
+        // timers run another.
+        if let Err(err) = &self.config_check {
+            return Err(EngineError::Config(err.clone()));
+        }
+
+        // An unsupported version cannot produce a conforming Logon, and
+        // guessing one would put a fabricated version on the wire.
+        let version = match &self.version {
+            Ok(version) => *version,
+            Err(err) => {
+                return Err(EngineError::UnsupportedVersion {
+                    version: err.version.clone(),
+                    detail: err.detail.clone(),
+                });
+            }
+        };
+
+        // A seeded sequence number of zero would put MsgSeqNum (34) = 0 on
+        // the wire, which every conforming counterparty rejects. The seed is
+        // ignored entirely when the Logon declares a reset (reset_on_logon,
+        // or a reset owed by an earlier session), so a zero is only refused
+        // when it would actually be used. The validated seed is applied by
+        // `seed_session`, which reads the same fields; this is only the
+        // guard.
+        if let Some((sender, target)) = self.initial_sequences
+            && !self.config.reset_on_logon
+            && !self.store.reset_is_owed()
+        {
+            NonZeroU64::new(sender).ok_or(EngineError::InvalidInitialSequence {
+                counter: SequenceCounter::Sender,
+            })?;
+            NonZeroU64::new(target).ok_or(EngineError::InvalidInitialSequence {
+                counter: SequenceCounter::Target,
+            })?;
+        }
+        Ok(version)
+    }
+
+    /// The initiator half of the Logon handshake on a connected stream, up to
+    /// the spawned reactor. Shared by [`Initiator::connect`] and
+    /// [`Initiator::establish`], so a session is checked, persisted and run
+    /// the same way whichever transport it came over.
+    ///
+    /// # Errors
+    /// Every handshake error [`Initiator::connect`] documents after the dial.
+    async fn logon(
+        &self,
+        version: FixVersion,
+        session: Session<Connecting>,
+        stream: SessionStream,
+    ) -> Result<Connection, EngineError> {
+        let session_id = self.session_id.clone();
         let mut framed = Framed::new(stream, session_codec(&self.config, version));
 
         // Seeding fails closed: a store that cannot be reset or refreshed leaves
