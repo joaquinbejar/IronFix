@@ -106,17 +106,17 @@ past its Logon.
   `on_logon` never runs, and `connect` / `serve` return the new
   `EngineError::NextExpectedMsgSeqNum { detail }`.
 - `789 < own_logon_seq`: the counterparty missed `789 .. own_logon_seq - 1`.
-  Once the session is Active the reactor resends exactly that range through
-  `Reactor::resend_range`, the answer an inbound `ResendRequest` gets
-  (factored out of `on_resend_request`): stored application messages replayed
+  Once the session is Active the reactor resends exactly that range, as it
+  answers an inbound `ResendRequest`: stored application messages replayed
   under their original numbers with `PossDupFlag` (43) = Y and
   `OrigSendingTime` (122), administrative messages, holes and unrebuildable
   frames gap-filled, one gap fill without a store, and a store reporting
-  itself corrupted closes the session. The replay is the reactor's second
-  opening act, right after the `ResendRequest` for any gap the exchange found
-  (unchanged: ADR-0005 item 6), so a failure in it closes the session through
-  the normal close path with `on_logout`. The range is checked again against
-  the next sender number before it is sent.
+  itself corrupted closes the session. The resend is queued as the reactor
+  opens, right after the `ResendRequest` for any gap the exchange found
+  (unchanged: ADR-0005 item 6), and written by the reactor loop (see "Writing
+  a resend" below), so a failure in it closes the session through the normal
+  close path with `on_logout`. The range is checked again against the next
+  sender number before it is queued.
 - otherwise: nothing to do.
 
 789 never moves a counter. It is a body field of the Logon, so it is read
@@ -158,6 +158,15 @@ acknowledgement never resets it. A malformed value is refused like the
 acknowledgement's other malformed fields: a session Reject (`SessionRejectReason`
 13 repeated, 6 not a number, 5 for 0; `RefTagID` 789) and a Logout. A value
 above what was sent gets the Logout alone, as FIX prescribes for that error.
+When the initiator declared a reset (`reset_on_logon`, or a reset an earlier
+session owes) and the acknowledgement does not echo `141=Y`, the reset rule
+takes the acknowledgement as the acceptor's message 1 whatever its number,
+and its 789 may describe the stream the reset discards: a well-formed value is
+ignored, as the acceptor ignores the Logon's 789 for a reset it drives alone.
+A malformed value is still refused, and an acknowledgement that echoes `141=Y`
+knew of the reset, so its 789 is still held to the new stream. (Found in
+review: an acknowledgement at 7 with 789 = 9 used to be refused against a next
+outbound number of 2 before the reset rule ran.)
 
 ### A gapped Logon or acknowledgement
 
@@ -221,10 +230,44 @@ a queued Logon or `ResendRequest`):
   so a counterparty that does not cover them gets the one request once that
   gap has made no progress for the resend timeout. QuickFIX/C++ has no such
   timer; this fallback is IronFix's.
+- **A real request ends the hold.** Once a real `ResendRequest` goes out (the
+  fallback, or a later retry), the hold is dropped rather than the Logon
+  consumed locally: the open-ended request covers the Logon's own number, and
+  its answer fills it (an administrative Logon is gap-filled), so that number
+  then arrives in sequence. Consuming it locally made the answer's gap fill,
+  numbered with the Logon's number, land below the expectation and be
+  dropped as a possible duplicate, leaving any administrative message past the
+  Logon that arrived during the hold missing; with `max_resend_requests` = 1
+  the session was then logged out despite a complete answer (found in
+  review). Duplicates of the counterparty's own 789 resend that arrive after
+  the request are dropped as possible duplicates as usual.
 
 The replay range is unchanged: `plan` still answers `789 .. own_logon_seq`,
 stopping before the session's own Logon, which the counterparty holds and
 consumes in the same way.
+
+### Writing a resend
+
+A resend used to be written to completion before the reactor read again: the
+789 resend as an opening act, and the answer to a `ResendRequest` inside the
+inbound handler. When both sides owe each other more than the socket buffers
+hold (both missed messages, with or without 789), each blocked writing while
+neither read, until the write timeout closed both sessions (found in review).
+
+Resends are now queued (`Reactor::queue_resend`) and written by the reactor
+loop one frame per pass (`Reactor::resend_step`), reading the store a page at a
+time as before. While one is queued, the loop reads any frame the counterparty
+has already sent before writing the next resend frame, so each side keeps
+draining the other, and inbound frames take the normal path. Live outbound
+application messages, and a Logout the consumer asks for, wait in the command
+queue until the resend is done, so a resend always stays ahead of them;
+administrative replies to inbound messages are still written as they arise.
+Requests are answered in the order they arrived; past 64 queued, a new request
+is merged into the last unstarted one, widening it to cover both, so a
+counterparty cannot grow the queue without bound (a number neither request
+asked for reaches it as a possible duplicate). A session that sends a Logout
+drops what it still owes. This applies to every resend the reactor writes,
+with or without 789.
 
 ### What does not change
 
@@ -245,14 +288,17 @@ past it.
   `EngineError::NextExpectedMsgSeqNum` (both enums `#[non_exhaustive]`). No
   existing item changes signature. The `next_expected` module, the factory's
   extra Logon parameter, `SessionParams::opening_replay` and
-  `SessionParams::held_logon`, `ResendState::implied`, `Reactor::resend_range`
-  and `Reactor::release_held_logon` are crate-private.
+  `SessionParams::held_logon`, `ResendState::implied`, the resend queue
+  (`ResendJob`, `Reactor::queue_resend`, `Reactor::resend_step`) and
+  `Reactor::release_held_logon` are crate-private.
 - **Behaviour:** none with the flag off. With it on, the Logon exchange
   carries 789, a counterparty's 789 can replay a range after `on_logon` or
   refuse the Logon before it, and a gapped Logon from a counterparty that
   declared 789 is held instead of requested. Between two IronFix engines with
   the flag on, a restarted side gets back what it missed with no
   `ResendRequest` either way, and the next live message is in sequence.
+  Whatever the flag, a resend is now written interleaved with inbound reads,
+  and live application messages sent while it is under way follow it.
 - The crate DAG is unchanged: `session` gains a flag and a check over `core`
   types, `engine` the decisions. No dependency was added.
 - No performance claim (ADR-0001): the Logon exchange reads one more field,
@@ -261,13 +307,6 @@ past it.
   Logon's number is held, and a general queue of messages received across a
   gap is #71; the joint crash and takeover suite that exercises 789 across
   injected crashes is #89.
-- **Known limit, until #71:** when the fallback request has gone out and
-  administrative messages from beyond the held Logon arrived live during the
-  hold, the answer to that request covers the held Logon and those messages
-  with one gap fill numbered with the Logon's number. That number is consumed
-  as soon as the gap below it fills, so the gap fill arrives below the
-  expectation and is dropped as a possible duplicate, and the messages beyond
-  the Logon stay missing until the request's next retry asks for them. Nothing
-  is lost and no number is reused; recovery takes one more resend timeout. A
-  test pins it
-  (`test_acceptor_fill_from_the_held_logon_after_the_fallback_waits_for_the_retry`).
+- The overlapping gap fill recorded here as a known limit in an earlier
+  revision (after the fallback request, a fill numbered with an already
+  consumed Logon was dropped) is gone: a real request now ends the hold.

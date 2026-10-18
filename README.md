@@ -104,10 +104,13 @@ messages and the engine wiring do not exist yet.
   application messages with `PossDupFlag = Y` and the original `SendingTime`
   in `OrigSendingTime`; administrative messages, and anything the store
   cannot produce, are covered by gap fill (a store that reports itself
-  corrupted closes the session instead). A session starts from the store's counters unless it resets the
-  sequence. Store writes are fallible and ordered: a frame is filed and the
-  next sender number persisted before its bytes are written, and the next
-  target number is persisted before an inbound message is acted on.
+  corrupted closes the session instead). A resend is written one frame at a time
+  between inbound reads, so two sides resending large backlogs at once do not
+  block each other, and live application messages follow it. A session
+  starts from the store's counters unless it resets the sequence. Store
+  writes are fallible and ordered: a frame is filed and the next sender number
+  persisted before its bytes are written, and the next target number is
+  persisted before an inbound message is acted on.
   `with_store_failure_policy` chooses between warning and continuing (the
   default, which gives no crash guarantee) or failing closed, writing nothing
   the store has not accepted. Every store call is bounded by

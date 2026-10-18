@@ -132,8 +132,12 @@ and stops at the first failure:
    number we send fails the handshake with a Logout alone; a 789 that is 0, not
    a number or repeated with a session Reject (reason 5, 6 or 13, `RefTagID` =
    789) and a Logout; both as `EngineError::NextExpectedMsgSeqNum`. A 789 below
-   our Logon makes the session resend the missed range once Active. See
-   "NextExpectedMsgSeqNum (789), both roles" below.
+   our Logon makes the session resend the missed range once Active. When our
+   Logon declared a reset (`reset_on_logon`, or one an earlier session owes)
+   and the ack does not echo `141=Y`, the reset rule (step 9) takes the ack as
+   message 1 whatever its number, and its 789 may describe the discarded
+   stream: a well-formed value is ignored; a malformed one is still refused.
+   See "NextExpectedMsgSeqNum (789), both roles" below.
 9. **`MsgSeqNum` (34).** The header 34 is read positionally, *before* identity —
    the same standard-header contract step 2 applies to the CompIDs — so a 34 that
    occurs only after the body is treated as missing and fails the handshake. The
@@ -327,8 +331,11 @@ moves a counter.
 | 0, not a number (a sign included), above `u64::MAX`, or repeated | refused without a panic: a Logout (the initiator first sends a session Reject, reason 5, 6 or 13, `RefTagID` = 789) and `EngineError::NextExpectedMsgSeqNum` |
 | from the session's own Logon up to the next number it sends | nothing to resend |
 
-The resend is the session reactor's second opening act, right after the
-`ResendRequest` for a gap the Logon exchange found, if one was requested.
+The resend is queued as the session reactor opens, right after the
+`ResendRequest` for a gap the Logon exchange found, if one was requested, and
+written like the answer to any `ResendRequest`: one frame per pass of the
+reactor loop, between inbound reads, ahead of any live application message
+(see "Resend Request").
 
 *A gapped Logon or acknowledgement, held.* 789 is the Logon sender's built-in
 `ResendRequest`: the counterparty that reads this session's 789 resends the
@@ -360,12 +367,11 @@ which would cross that resend (QuickFIX/C++ behaves the same):
   Logon covers them, and a request would cross that resend. The recovery stays
   armed at the next number with a fresh clock, so frames nobody resends are
   requested once that gap has made no progress for the resend timeout.
-- Known limit, until a queue of messages received across a gap exists (#71):
-  if the fallback request went out and administrative messages from beyond
-  the held Logon arrived during the hold, the answer covers the Logon and those
-  messages with one gap fill numbered with the Logon's number, which is
-  already consumed, so the fill is dropped and those numbers wait for the
-  request's next retry.
+- A real `ResendRequest` ends the hold: once one goes out (the fallback, or a
+  later retry), the Logon is no longer consumed locally. The open-ended
+  request covers the Logon's own number and its answer fills it, so that
+  number arrives in sequence, together with any administrative message past
+  the Logon that arrived during the hold.
 - A counterparty whose Logon or acknowledgement declares no 789, or a session
   with the flag off, gets the immediate `ResendRequest` as before.
 
@@ -692,6 +698,21 @@ has nothing to replay from — and the whole requested range is answered with a
 single `SequenceReset`-GapFill with `MsgSeqNum` = BeginSeqNo and `NewSeqNo` as
 above. A counterparty asking for business traffic then receives a gap fill
 rather than the traffic.
+
+**How a resend is written.** A valid request is queued and answered by the
+session reactor one frame per pass of its loop, reading the store a page at a
+time; before each resend frame the reactor reads any frame the counterparty
+has already sent, which then takes the normal inbound path. Two sides that
+owe each other more than the socket buffers hold, and resend at once, keep
+draining each other instead of both blocking on a full socket until the write
+timeout. Until the resend is done, live application messages (and a Logout the
+consumer asks for) wait in the outbound queue, so they always follow it;
+administrative replies to inbound messages are written as they arise. Requests
+are answered in the order they arrive; past 64 queued, a new request is merged
+into the last one not yet under way, widening it to cover both, so every
+number asked for is still answered (a number neither asked for reaches the
+counterparty as a possible duplicate). A session that sends a Logout drops
+what it still owes.
 
 **A resend asked for at Logon.** With
 `SessionConfig::send_next_expected_msg_seq_num` set, a counterparty whose
