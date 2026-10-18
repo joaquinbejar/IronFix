@@ -352,6 +352,10 @@ pub trait MessageStore: Send + Sync {
 
     /// Reset messages and sequence numbers (new session)
     async fn reset(&self) -> Result<(), StoreError>;
+
+    /// Reset, then set both counters; defaulted to the three calls, one
+    /// atomic write in a durable store
+    async fn reset_to(&self, next_sender: u64, next_target: u64) -> Result<(), StoreError>;
 }
 
 /// High-performance memory-mapped store for persistence

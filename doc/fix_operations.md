@@ -405,7 +405,8 @@ only. Replay therefore works within a live process, but no message and no
 sequence number survives a restart. A durable store is separate, tracked work.
 
 **Store write order.** Every store call (`store`, `file_outbound`,
-`set_next_sender_seq`, `set_next_target_seq`, `reset`, `refresh`, `get_page`)
+`set_next_sender_seq`, `set_next_target_seq`, `reset`, `reset_to`, `refresh`,
+`get_page`)
 is asynchronous and can fail, and the session awaits each one inline: a slow
 store delays the session for as long as the call takes. Each call is bounded
 by the store timeout (`Initiator::with_store_timeout`, default: the write
@@ -437,9 +438,15 @@ alike, through one shared step (`doc/adr/0005-fallible-store-writes.md`):
    reactor the record of what it wrote, so an idle session makes no counter
    write at all.
 5. A Logon ack with `ResetSeqNumFlag` (141) = Y, when our Logon did not ask for
-   a reset, resets the store (under the policy) and persists next sender 2 and
-   next target 2 before `on_logon` runs, so a connect abandoned from there on
-   cannot leave the previous stream for a later session to replay.
+   a reset, resets the store and sets next sender 2 and next target 2 (one
+   `reset_to` call) before `on_logon` runs, so a connect abandoned from there
+   on cannot leave the previous stream for a later session to replay. If that
+   fails, `connect` fails with `EngineError::Store` whatever the policy, and
+   the reset is owed to the next connect (below).
+6. A gap found in the Logon exchange is requested by the session reactor as
+   its first act, so a failure to send that `ResendRequest` after `on_logon`
+   closes the session through the normal close path (`on_logout`, the
+   close-time reset, the last counter writes).
 
 *Inbound delivery is at most once.* Because M+1 is durable before M is handed
 over, a crash after that write and before `from_app` has finished with M
@@ -483,12 +490,27 @@ failed write (or one that overran the store timeout) means:
   sender seed below the store's next sender number is refused with
   `EngineError::InitialSequenceBelowStore`.
 
-Whatever the policy, the reset for a `ResetSeqNumFlag` Logon, the refresh
-that recovers the counters, and a reset owed by the previous session fail the
-connect with `EngineError::Store`. A reset is owed when the close-time reset of
-`reset_on_logout` / `reset_on_disconnect` fails: no counter is then written,
-and the `Initiator` resets the store on its next `connect` before anything
-else. The record lives in the `Initiator`, so a process restart forgets it.
+Whatever the policy, the resets and the refresh fail the connect with
+`EngineError::Store`: the reset for a `ResetSeqNumFlag` Logon, the reset for
+the counterparty's `ResetSeqNumFlag` on its Logon ack, a reset owed by an
+earlier session, and the refresh that recovers the counters. Carrying on past
+any of them runs one sequence stream over another. A reset is owed when the
+close-time reset of `reset_on_logout` / `reset_on_disconnect` fails (no
+counter is then written) or when the reset for the counterparty's
+`ResetSeqNumFlag` fails. The `Initiator`'s next `connect` then resets the
+store before anything else, and its Logon declares `ResetSeqNumFlag` (141) = Y
+at `MsgSeqNum` 1, so the counterparty restarts the sequence with it. The
+record is cleared once that Logon is acknowledged, and lives in the
+`Initiator`, so a process restart forgets it.
+
+With a store attached, call `Initiator::connect` again only once the previous
+session's `Connection::wait_closed` has returned: until then the closing
+session still writes to the store and may record a reset owed to the next one.
+
+The default `MessageStore::reset_to` is three calls, not one atomic write: a
+crash between them leaves the store cleared with its initial counters, and the
+next Logon goes out at 1 without `ResetSeqNumFlag`. A durable store should
+override it.
 
 The `Acceptor` attaches no store yet, so the policy has nothing to act on
 there. Not done: inbound frames are not filed (only the target counter is

@@ -62,6 +62,15 @@ calls `store()` and then `set_next_sender_seq()`, stopping at the first error.
 A durable store can override it to make both changes in one atomic write, and
 the engine then pays one call per outbound message instead of two.
 
+A second defaulted method, `reset_to(next_sender, next_target)`, resets the
+store and then sets both counters, for the counterparty's reset on its Logon
+ack (see the order below). The default calls `reset()`, then the two setters,
+stopping at the first error, and is **not atomic**: a crash between the calls
+leaves the store cleared with its initial counters, and the next session's
+Logon goes out at `MsgSeqNum` 1 without `ResetSeqNumFlag`, which the
+counterparty reads as too low. A durable store (#78) should override it with
+one atomic write.
+
 `store()` has **replace** semantics: filing under a number that is already
 filed replaces the frame there. The engine relies on it, because a crash after
 a frame is filed and before its number is persisted makes the next session
@@ -123,11 +132,22 @@ The handshakes and the reactor go through the same step,
    every tick.
 5. **A counterparty reset on the Logon ack.** When the ack carries
    `ResetSeqNumFlag` = Y and our Logon did not ask for a reset, the store is
-   reset (under the policy) and the reset counters (next sender 2, next target
-   2) are persisted before `on_logon`. Before this, the store kept the previous
-   stream until the reactor's first pass: a connect abandoned inside
+   reset and set to the new stream's counters (next sender 2, next target 2)
+   in one `reset_to` call, before `on_logon`. Before this, the store kept the
+   previous stream until the reactor's first pass: a connect abandoned inside
    `on_logon` and then retried replayed the previous stream's frames into the
-   new session.
+   new session. A failure fails `connect` with `EngineError::Store`
+   **whatever the policy**, and the reset is owed to the next connect (see "A
+   reset that could not be made"): under `Continue`, carrying on with the
+   previous stream filed let a `ResendRequest` in the new stream replay a
+   previous-stream order at `MsgSeqNum` 1, live.
+6. **A gap in the Logon exchange** is requested by the reactor as its first
+   act, not by the handshake after `on_logon`. A failure to send that
+   `ResendRequest` (a store refusal under `CloseSession`, a peer that stopped
+   reading) then closes the session through the reactor's close path, which
+   runs `on_logout`, the close-time reset and the last counter writes; before,
+   `connect` returned the error after `on_logon` had fired, and none of them
+   ran. Both roles do this.
 
 ### Store calls run on the reactor
 
@@ -139,10 +159,15 @@ takes. Every call is bounded by the store timeout
 is `StoreError::Timeout`:
 
 - a write that overruns is a failed write under the policy;
-- the reset and the refresh `connect` makes before the Logon fail the connect
-  with `EngineError::Store`, whatever the policy;
+- a reset or refresh that overruns fails the connect with
+  `EngineError::Store`, whatever the policy;
 - a resend read (`get_page`) that overruns is answered with a gap fill, like
   any other failed read.
+
+A session that is closing still uses the store until `Connection::wait_closed`
+returns: its close-time reset, its last counter writes, and the record of a
+reset it owes. `Initiator::connect` documents that, with a store attached, it
+must be called again only after that; the engine does not enforce it.
 
 ### The policy
 
@@ -168,9 +193,11 @@ re-exported at the crate root) with `Initiator::with_store_failure_policy`:
   non-graceful, so `reset_on_logout` does not run. Only this policy turns the
   order above into a guarantee.
 
-Some calls fail closed whatever the policy, because the session cannot start
-without them: the reset for a `ResetSeqNumFlag` Logon, the refresh that
-recovers the counters, and a reset owed by the previous session.
+The resets and the refresh fail closed whatever the policy, because carrying
+on past any of them runs one sequence stream over another: the reset for a
+`ResetSeqNumFlag` Logon, the reset for the counterparty's `ResetSeqNumFlag`
+on its Logon ack, a reset owed by an earlier session, and the refresh that
+recovers the counters.
 
 Under `CloseSession`, a sender seed from `with_initial_sequences` below the
 store's next sender number is refused with
@@ -182,14 +209,26 @@ take it unchanged when it gets a store (#60).
 
 ### A reset that could not be made
 
-`reset_on_logout` and `reset_on_disconnect` reset the store as the session
-closes. If that reset fails, **no counter is written**: the reset values
-written over a store still holding the previous stream would describe
-neither. The `Initiator` records that a reset is owed, and its next `connect`
+Two resets can fail after the decision to reset has been taken:
+
+- `reset_on_logout` and `reset_on_disconnect` reset the store as the session
+  closes. If that reset fails, **no counter is written**: the reset values
+  written over a store still holding the previous stream would describe
+  neither.
+- The reset for the counterparty's `ResetSeqNumFlag` on its Logon ack (order
+  item 5). The connect fails.
+
+Either way the `Initiator` records that a reset is owed. Its next `connect`
 resets the store before anything else, refusing the session with
-`EngineError::Store` if it still cannot, whatever the policy. The record lives
-in the `Initiator`, not in the store: a process restart forgets it, and the
-next session starts from the counters the store still holds.
+`EngineError::Store` if it still cannot, whatever the policy, and its Logon
+then declares `ResetSeqNumFlag` = Y and starts at 1. Without the flag the
+retry would be stuck: after a failed ack reset the store still holds the old
+counters (Logon at 7 against a counterparty expecting 2, and a `ResendRequest`
+replaying old orders), and after a successful owed reset our Logon at 1 is
+too low for a counterparty that did not reset. The record is cleared once that
+Logon is acknowledged, so a connect that fails before then still owes it. It
+lives in the `Initiator`, not in the store: a process restart forgets it, and
+the next session starts from the counters the store still holds.
 
 ### Inbound delivery semantics
 
@@ -248,15 +287,20 @@ tracked in #105.
   `trait_method_return_value_added` on both setters; it is also declared here
   and in the commit footer, because the tool does not describe the `async`
   half of the change.
-- **Semver (additive):** `MessageStore::file_outbound` (defaulted),
-  `StoreError::Timeout`, `ironfix_engine::persistence` module,
+- **Semver (additive):** `MessageStore::file_outbound` and
+  `MessageStore::reset_to` (both defaulted), `StoreError::Timeout`,
+  `ironfix_engine::persistence` module,
   `StoreFailurePolicy` (with `closes_session`),
   `Initiator::with_store_failure_policy`, `Initiator::with_store_timeout`,
   and `EngineError::InitialSequenceBelowStore`.
-- **Behaviour:** with the default policy nothing changes on the wire. The
-  sender counter is now persisted before the write in the reactor, as it
-  already was in the handshake, and counters are no longer rewritten on every
-  tick or on the reactor's first pass.
+- **Behaviour:** with the default policy and a working store nothing changes
+  on the wire. The sender counter is now persisted before the write in the
+  reactor, as it already was in the handshake, and counters are no longer
+  rewritten on every tick or on the reactor's first pass. With a failing
+  store, whatever the policy, a failed reset now refuses the session and the
+  next Logon of the same `Initiator` declares `ResetSeqNumFlag` = Y at 1; and
+  a failure to request a gap found in the Logon exchange now closes the
+  session after `on_logon` (with `on_logout`) instead of failing `connect`.
 - **Cost of the trait shape.** `MessageStore` is an `async_trait`, so every
   call allocates one boxed future. The outbound path makes one call per
   sequenced message (`file_outbound`), and each counter that moved costs one
