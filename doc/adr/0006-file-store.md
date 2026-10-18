@@ -78,6 +78,15 @@ system (the default on macOS and Windows) two names that differ only in case
 are the same files; the lock refuses the second store while the first is
 open, but two sessions opened one after the other would share one journal.
 
+A journal holds complete outbound frames, an outbound Logon's `Password` (554)
+included. On Unix every file the store creates (the journal, the replacement a
+reset writes, the lock file) is created `0600`, readable and writable by its
+owner only, and every directory it creates is `0700`. The replacement is
+always a new file, so a reset never loosens the journal's permissions,
+whatever a leftover temporary file or a hand-loosened journal had. Files and
+directories that already exist keep their permissions. Off Unix the
+platform's defaults apply.
+
 A missing journal is an error unless `FileStoreConfig::with_create_if_missing`
 is set (default off), so a store that was expected to exist (a wrong
 directory, an unmounted volume) is never silently replaced by a fresh one at
@@ -267,6 +276,12 @@ the policy it was written under.
   flush is treated as not filed: under `EveryWrite` that is only the write
   whose flush failed, so its `Err` means "not filed"; under `EveryN` it is
   every unflushed write.
+- **A failed flush during a refresh.** A refresh flushes what it loaded
+  (under `EveryN`, the writes left unflushed). That flush goes through the
+  same step as any other, so a failure cuts back to the last successful flush
+  and leaves the cut pending; the next refresh makes it durable before it
+  rereads anything, and never adopts the unflushed bytes. A failure to read
+  or scan the journal is not a flush failure and leaves the store as it was.
 - **A failed directory flush** after a reset's rename leaves the rename
   committed (the store reports the new stream) but not known durable; the
   directory flush is left pending.
@@ -298,7 +313,8 @@ Three engine changes come with the store (`ironfix-engine/src/persistence.rs`,
   `StoreAttachment`.
 - **A corrupted resend read closes the session.** When `get_page` reports
   `StoreError::Corrupted` (a `FileStore` record failing its checks on read,
-  which fails the whole page), the engine closes the session instead of
+  or no longer whole because the file was cut under the open store, which
+  fails the whole page), the engine closes the session instead of
   gap-filling the rest of the range: a gap fill would tell the counterparty
   that application messages it may never have received do not exist. Other
   read errors still degrade to a gap fill (ADR-0005).

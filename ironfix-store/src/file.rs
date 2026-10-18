@@ -84,11 +84,29 @@
 //!   on an operator's decision, after which the session must reset its
 //!   sequence (`ResetSeqNumFlag` (141) = Y).
 //!
-//! A failed write is undone. A failed flush cuts the journal back to the end
-//! of its last successful flush, because after a failed flush the operating
-//! system may have dropped writes it had accepted, and leaves the store
-//! refusing every call except a reset until [`MessageStore::refresh`] has made
-//! that cut durable: an error from a write means it was not filed.
+//! A failed write is undone. A failed flush, including the one a refresh makes
+//! of writes left unflushed, cuts the journal back to the end of its last
+//! successful flush, because after a failed flush the operating system may
+//! have dropped writes it had accepted, and leaves the store refusing every
+//! call except a reset until [`MessageStore::refresh`] has made that cut
+//! durable: an error from a write means it was not filed, and a refresh never
+//! adopts bytes a failed flush left behind.
+//!
+//! A record that a read finds damaged or no longer whole (the file was cut
+//! under the open store) is reported as [`StoreError::Corrupted`], never as
+//! an I/O error, so the engine closes the session rather than gap-filling the
+//! resend.
+//!
+//! # Permissions
+//!
+//! A journal holds complete outbound frames, an outbound Logon's `Password`
+//! (554) included. On Unix every file the store creates (the journal, the
+//! replacement a reset writes, the lock file) is created readable and
+//! writable by its owner only (`0600`), and every directory it creates is the
+//! owner's only (`0700`). A reset writes a new file with those permissions, so
+//! it never loosens the journal's, whatever a leftover file had. Files and
+//! directories that already exist keep their permissions. Off Unix the
+//! platform's defaults apply.
 //!
 //! # One store, one owner
 //!
@@ -142,6 +160,26 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// Most frames a page read reserves room for up front.
 const PAGE_CAPACITY_HINT: usize = 256;
+
+/// Permission bits of every file a `FileStore` creates, on Unix: read and
+/// write for the owner only. A journal holds complete outbound frames, an
+/// outbound Logon's `Password` (554) included.
+#[cfg(unix)]
+const FILE_MODE: u32 = 0o600;
+
+/// Permission bits of every directory a `FileStore` creates, on Unix: the
+/// owner only.
+#[cfg(unix)]
+const DIRECTORY_MODE: u32 = 0o700;
+
+/// Options that create a file readable and writable by its owner only, on
+/// Unix; elsewhere the platform's default applies.
+fn owner_only_file() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, FILE_MODE);
+    options
+}
 
 /// A persistent [`MessageStore`] backed by one append-only journal file.
 ///
@@ -500,8 +538,15 @@ impl Journal {
     }
 
     /// Completes what a failed write left pending, then rereads the journal
-    /// from disk, cutting what recovery allows and flushing it unless the
+    /// from disk, cutting what recovery allows, and flushes it unless the
     /// policy is [`SyncPolicy::Never`].
+    ///
+    /// The flush goes through [`Journal::flush`]: if it fails, the journal is
+    /// cut back to its last successful flush and the cut left pending, as for
+    /// any failed flush, so writes left unflushed under
+    /// [`SyncPolicy::EveryN`] are never adopted by a later refresh. A failure
+    /// to read or scan the journal is not a flush failure: it leaves the store
+    /// as it was.
     fn reload(&mut self) -> Result<(), StoreError> {
         if self.pending.directory_flush {
             flush_directory(self.config.directory())?;
@@ -512,20 +557,24 @@ impl Journal {
             cut_back(&self.config, offset)?;
             self.probe.file_flush();
             self.pending.cut_back_to = None;
+            self.durable_end = self.durable_end.min(offset);
         }
-        let Loaded { file, scan } = load(
-            &self.config,
-            self.config.sync_policy().damage_rule(),
-            &mut self.probe,
-        )?;
+        let Loaded { file, scan } = load(&self.config, self.config.sync_policy().damage_rule())?;
         self.shared.install(&scan);
         self.file = file;
         self.index = scan.index;
         self.end = scan.end;
-        self.durable_end = scan.end;
         self.unsynced = 0;
         self.pending = Pending::default();
-        Ok(())
+        if self.config.sync_policy().flushes() {
+            // Only what was flushed before stays known durable until this
+            // flush succeeds.
+            self.durable_end = self.durable_end.min(scan.end);
+            self.flush()
+        } else {
+            self.durable_end = scan.end;
+            Ok(())
+        }
     }
 }
 
@@ -570,15 +619,10 @@ fn open_journal_file(config: &FileStoreConfig) -> Result<File, StoreError> {
         })
 }
 
-/// Reads the journal from disk, cuts what `rule` allows, and flushes the
-/// result unless the policy is [`SyncPolicy::Never`] (a salvage is always
-/// flushed). Flushing at load makes what was loaded the durable starting
-/// point, whatever the previous owner left unflushed.
-fn load(
-    config: &FileStoreConfig,
-    rule: DamageRule,
-    probe: &mut Probe,
-) -> Result<Loaded, StoreError> {
+/// Reads the journal from disk and cuts what `rule` allows. Does not flush:
+/// the caller does, opening a store directly and refreshing one through
+/// [`Journal::flush`].
+fn load(config: &FileStoreConfig, rule: DamageRule) -> Result<Loaded, StoreError> {
     let mut file = open_journal_file(config)?;
     let file_len = file
         .metadata()
@@ -588,11 +632,6 @@ fn load(
     if let Some(truncation) = scan.truncation {
         file.set_len(truncation.offset())
             .map_err(|err| io_error("cannot cut the journal", &err))?;
-    }
-    if config.sync_policy().flushes() || rule == DamageRule::Salvage {
-        probe.file_flush();
-        file.sync_data()
-            .map_err(|err| io_error("cannot flush the journal", &err))?;
     }
     Ok(Loaded { file, scan })
 }
@@ -625,11 +664,14 @@ fn write_replacement(
 ) -> Result<(), StoreError> {
     let temp = config.temp_path();
     let written = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp)?;
+        // Always a new file, so it takes the owner-only mode rather than
+        // whatever a leftover one had; renamed into place, it becomes the
+        // journal, so a reset never loosens the journal's permissions.
+        match std::fs::remove_file(&temp) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
+            _ => {}
+        }
+        let mut file = owner_only_file().write(true).create_new(true).open(&temp)?;
         file.write_all(&format::encode_header(header))?;
         file.sync_all()
     })();
@@ -689,7 +731,12 @@ fn create_directory(directory: &Path, probe: &mut Probe) -> Result<(), StoreErro
         missing.push(path.to_path_buf());
         at = path.parent();
     }
-    std::fs::create_dir_all(directory)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, DIRECTORY_MODE);
+    builder
+        .create(directory)
         .map_err(|err| io_error(&format!("cannot create {}", directory.display()), &err))?;
     for created in missing.iter().rev() {
         if let Some(parent) = created.parent() {
@@ -740,7 +787,7 @@ fn open_journal(
         return Err(missing_store(&config));
     }
 
-    let lock = OpenOptions::new()
+    let lock = owner_only_file()
         .read(true)
         .write(true)
         .create(true)
@@ -793,7 +840,15 @@ fn open_journal(
         probe.dir_flush();
     }
 
-    let Loaded { file, scan } = load(&config, rule, &mut probe)?;
+    let Loaded { file, scan } = load(&config, rule)?;
+    // Flushing at open makes what was loaded the durable starting point,
+    // whatever the previous owner left unflushed. A salvage is always
+    // flushed. A failure refuses the open: there is no store to poison yet.
+    if config.sync_policy().flushes() || rule == DamageRule::Salvage {
+        probe.file_flush();
+        file.sync_data()
+            .map_err(|err| io_error("cannot flush the journal", &err))?;
+    }
     shared.install(&scan);
     Ok(Journal {
         config,
@@ -2299,6 +2354,119 @@ mod tests {
         let store = open(config).await;
         assert_eq!(store.next_target_seq(), 7);
         assert_eq!(store.next_sender_seq(), 1, "the dropped call wrote nothing");
+    }
+
+    /// The permission bits of `path`.
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        ok(std::fs::metadata(path), "metadata").permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_file_store_creates_owner_only_files_and_directories() {
+        let dir = TempDir::new("permissions");
+        let Ok(config) = FileStoreConfig::try_new(dir.0.join("nested"), "session") else {
+            panic!("valid name");
+        };
+        let store = open(config.clone().with_create_if_missing(true)).await;
+        // A journal holds complete outbound frames, a Logon's Password
+        // included: nobody but the owner reads it.
+        assert_eq!(mode(&config.journal_path()), 0o600);
+        assert_eq!(mode(&config.lock_path()), 0o600);
+        assert_eq!(mode(&dir.0), 0o700);
+        assert_eq!(mode(config.directory()), 0o700);
+        file(&store, 1).await;
+        assert_eq!(mode(&config.journal_path()), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_file_store_reset_keeps_the_journal_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("permissions-reset");
+        let config = dir.config();
+        let store = open(config.clone()).await;
+        file(&store, 1).await;
+        ok(store.reset_to(2, 2).await, "reset_to");
+        assert_eq!(mode(&config.journal_path()), 0o600);
+
+        // A reset writes a new file: a leftover or loosened one never passes
+        // its permissions on.
+        ok(
+            std::fs::set_permissions(
+                config.journal_path(),
+                std::fs::Permissions::from_mode(0o644),
+            ),
+            "loosen the journal",
+        );
+        ok(
+            std::fs::write(config.temp_path(), b"leftover"),
+            "a leftover temporary file",
+        );
+        ok(
+            std::fs::set_permissions(config.temp_path(), std::fs::Permissions::from_mode(0o666)),
+            "loosen the leftover",
+        );
+        ok(store.reset().await, "reset");
+        assert_eq!(mode(&config.journal_path()), 0o600);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_record_cut_after_it_was_indexed_is_corrupted_not_io() {
+        let dir = TempDir::new("cut-after-index");
+        let config = dir.config();
+        let store = open(config.clone()).await;
+        for seq in 1..=3 {
+            file(&store, seq).await;
+        }
+        // The journal is cut under the open store, inside record 3.
+        cut_journal(&config, journal_len(&config) - 10);
+        assert!(matches!(
+            store.get_page(1, 3, 10).await,
+            Err(StoreError::Corrupted { reason }) if reason.contains("MsgSeqNum 3")
+        ));
+        // Records before the cut are still served.
+        assert_eq!(seqs(&store, 1, 2, 10).await, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_failed_flush_during_refresh_cuts_back_and_poisons() {
+        let dir = TempDir::new("refresh-flush");
+        let Some(ten) = NonZeroU32::new(10) else {
+            panic!("non-zero");
+        };
+        let config = dir.config_with(SyncPolicy::EveryN(ten));
+        let store = open(config.clone()).await;
+        let durable = journal_len(&config);
+        file(&store, 1).await;
+        file(&store, 2).await;
+        store.fail_next_flush().await;
+        // The refresh flushes the two pending writes and that flush fails.
+        assert!(matches!(store.refresh().await, Err(StoreError::Io(_))));
+        // Cut back to the last successful flush, and unusable until a refresh
+        // has made the cut durable.
+        assert_eq!(journal_len(&config), durable);
+        assert!(matches!(
+            store.set_next_target_seq(2).await,
+            Err(StoreError::Io(_))
+        ));
+        assert!(matches!(
+            store.get_page(1, 10, 10).await,
+            Err(StoreError::Io(_))
+        ));
+        ok(
+            store.refresh().await,
+            "the second refresh completes the cut",
+        );
+        // The unflushed writes are never adopted again.
+        assert!(seqs(&store, 1, 10, 10).await.is_empty());
+        assert_eq!(store.next_sender_seq(), 1);
+        file(&store, 1).await;
+        drop(store);
+        let store = open(config).await;
+        assert_eq!(seqs(&store, 1, 10, 10).await, vec![1]);
     }
 
     #[tokio::test]

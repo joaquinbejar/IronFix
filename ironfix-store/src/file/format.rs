@@ -733,8 +733,15 @@ pub(crate) fn read_frame<F: ReadAt>(
         .and_then(|len| len.checked_add(RECORD_HEADER_LEN))
         .ok_or_else(|| mismatch("is too long to read"))?;
     let mut record = vec![0u8; record_len];
-    file.read_record_at(&mut record, offset)
-        .map_err(|err| io_error("cannot read a journal record", &err))?;
+    file.read_record_at(&mut record, offset).map_err(|err| {
+        // The record was indexed whole, so a file that now ends inside it
+        // was cut under the store: that is damage, not a failed read.
+        if err.kind() == std::io::ErrorKind::UnexpectedEof {
+            mismatch("is no longer whole in the journal: it was cut after it was indexed")
+        } else {
+            io_error("cannot read a journal record", &err)
+        }
+    })?;
 
     let (msg_type, frame_at) = {
         let (head, body) = record
