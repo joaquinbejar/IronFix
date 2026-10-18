@@ -22,14 +22,27 @@
 //! - **[`StoredMessage`]**: one message as it was filed — verbatim frame bytes,
 //!   its sequence number, and its recorded `MsgType`
 //! - **[`MemoryStore`]**: an in-memory implementation, backed by a
-//!   `parking_lot::RwLock<BTreeMap<..>>` and two atomics
+//!   `parking_lot::RwLock<BTreeMap<..>>` and two atomics. Nothing in it
+//!   survives the process.
+//! - **[`FileStore`]**: a persistent implementation, one append-only journal
+//!   file per store holding the filed frames and both sequence counters, so a
+//!   session resumes from its counters after a restart and a `ResendRequest`
+//!   is answered with the original frames. Configured by [`FileStoreConfig`].
 //!
-//! ## Not persistent
+//! ## What survives what
 //!
-//! [`MemoryStore`] is the **only** implementation — there is no file-based or
-//! memory-mapped store, so nothing here survives a process restart. A durable
-//! implementation is separate, tracked work; until it lands, restart recovery
-//! is a gap, not a feature.
+//! | Store | Process crash | OS crash or power loss |
+//! |---|---|---|
+//! | [`MemoryStore`] | nothing | nothing |
+//! | [`FileStore`], [`SyncPolicy::EveryWrite`] (default) | every write that returned `Ok` | every write that returned `Ok` |
+//! | [`FileStore`], [`SyncPolicy::EveryN`] | every write that returned `Ok` | all but at most the last `n - 1` |
+//! | [`FileStore`], [`SyncPolicy::Never`] | every write that returned `Ok` | nothing is promised |
+//!
+//! Only [`SyncPolicy::EveryWrite`] makes the engine's write order a guarantee
+//! against an OS crash or a power loss. A [`FileStore`] cuts a torn or damaged
+//! journal tail when it opens, and never returns a record it cannot vouch for
+//! (see the [`file`](mod@file) module and `doc/adr/0006-file-store.md`). There
+//! is no memory-mapped store.
 
 pub mod file;
 pub mod memory;

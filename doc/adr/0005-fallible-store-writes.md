@@ -60,7 +60,8 @@ A new defaulted method, `file_outbound(seq, msg_type, frame, next_sender)`,
 files an outbound frame and then persists the next sender number. The default
 calls `store()` and then `set_next_sender_seq()`, stopping at the first error.
 A durable store can override it to make both changes in one atomic write, and
-the engine then pays one call per outbound message instead of two.
+the engine then pays one call per outbound message instead of two. `FileStore`
+does, with one journal record (ADR-0006).
 
 A second defaulted method, `reset_to(next_sender, next_target)`, resets the
 store and then sets both counters, for the counterparty's reset on its Logon
@@ -69,7 +70,8 @@ stopping at the first error, and is **not atomic**: a crash between the calls
 leaves the store cleared with its initial counters, and the next session's
 Logon goes out at `MsgSeqNum` 1 without `ResetSeqNumFlag`, which the
 counterparty reads as too low. A durable store (#78) should override it with
-one atomic write.
+one atomic write; `FileStore` does, by renaming a new journal into place
+(ADR-0006).
 
 `store()` has **replace** semantics: filing under a number that is already
 filed replaces the frame there. The engine relies on it, because a crash after

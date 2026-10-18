@@ -41,8 +41,10 @@
 //!   (`into_initiator()` / `into_acceptor()`). Only `fix44_server` runs on the
 //!   `Acceptor`; the other server-side examples hand-roll their accept loop.
 //! - Both engines file outbound frames in an attached [`store::MessageStore`]
-//!   and replay them on a `ResendRequest`, but [`store::MemoryStore`] is the
-//!   only store and it is not persistent: nothing survives a restart.
+//!   and replay them on a `ResendRequest`. [`store::MemoryStore`] keeps
+//!   nothing across a restart; [`store::FileStore`] keeps the frames and the
+//!   counters in a journal file, as durably as its [`store::SyncPolicy`]
+//!   promises. There is no memory-mapped store.
 //! - [`transport`] contains only a framing codec — no TCP connector or
 //!   acceptor and no TLS.
 //! - Only FIX 4.2, FIX 4.4, FIXT 1.1 and FIX 5.0 SP2 have embedded
@@ -138,10 +140,11 @@ pub mod session {
 }
 
 pub mod store {
-    //! The `MessageStore` trait and its in-memory implementation.
+    //! The `MessageStore` trait and its implementations.
     //!
-    //! Both engines use a store attached with `with_store`; `MemoryStore` is
-    //! the only implementation and is not persistent.
+    //! Both engines use a store attached with `with_store`. `MemoryStore`
+    //! keeps everything in memory; `FileStore` persists the outbound journal
+    //! and both sequence counters in a file, so they survive a restart.
     pub use ironfix_store::*;
 }
 

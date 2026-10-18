@@ -325,8 +325,11 @@ pub trait Application: Send + Sync {
 > touches its store only once the peer is authenticated (`from_admin`
 > accepted it), and resets it only for a Logon that passes every check
 > (`doc/adr/0017-acceptor-message-store.md`).
-> `MemoryStore` is the only implementation and is not persistent, so nothing
-> survives a restart yet. There is no file-backed or memory-mapped store.
+> Two implementations exist: `MemoryStore`, which keeps nothing across a
+> restart, and `FileStore`, one append-only journal file per store holding the
+> filed frames and both counters, with a configurable `SyncPolicy`
+> (`doc/adr/0006-file-store.md`). The memory-mapped store sketched below does
+> not exist.
 
 ```rust
 // ironfix-store/src/traits.rs (abridged)

@@ -61,8 +61,10 @@ exists yet.
   clears a pending TestRequest.
 - **Resend from store** in both roles. Attach a `MessageStore` with
   `Initiator::with_store`, `Acceptor::with_store` or `EngineBuilder::with_store`
-  and an inbound `ResendRequest` replays the stored application messages with
-  `PossDupFlag = Y` and the original `SendingTime` in `OrigSendingTime`;
+  (`MemoryStore` in memory, or `FileStore`, a journal file that survives a
+  restart) and an inbound `ResendRequest` replays the stored application
+  messages with `PossDupFlag = Y` and the original `SendingTime` in
+  `OrigSendingTime`;
   administrative messages, and anything the store cannot produce, are covered
   by gap fill. A session starts from the store's counters unless it resets the
   sequence. Store writes are fallible and ordered: a frame is filed and the
@@ -124,9 +126,12 @@ This list is deliberately explicit. If a capability is not named under "What
 works today" and appears below, it does not exist in the code — do not plan
 around it.
 
-- **No persistent store.** `MemoryStore` is the only `MessageStore`; there is
-  no `FileStore` and no memory-mapped store, so stored messages and sequence
-  numbers do not survive a restart (`ironfix-store/src/lib.rs`). Inbound
+- **Store limits.** There is no memory-mapped store, and `FileStore`'s
+  journal is never compacted: it grows until the sequence is reset. Only its
+  `SyncPolicy::EveryWrite` (the default) makes every acknowledged write
+  survive an OS crash or a power loss; `EveryN` and `Never` survive a process
+  crash only (`doc/adr/0006-file-store.md`). The record of a reset owed to
+  the next session lives in the engine's memory, not in the store. Inbound
   application messages are delivered at most once: a crash, or a session
   close whose application queue does not drain in time, loses the messages
   still queued. The close logs the lost range; nothing reports a loss across
@@ -211,7 +216,7 @@ by quickfixengine.org (<http://www.quickfixengine.org/>).
 | `ironfix-dictionary` | QuickFIX XML loading, schema types, and the opt-in `Validator` |
 | `ironfix-tagvalue` | Zero-copy tag=value decoding and encoding; dictionary-free |
 | `ironfix-session` | Session-layer protocol logic: typestate FSM, sequences, heartbeats. No I/O |
-| `ironfix-store` | The `MessageStore` trait and `MemoryStore` |
+| `ironfix-store` | The `MessageStore` trait, `MemoryStore`, and the persistent `FileStore` |
 | `ironfix-transport` | `FixCodec`, a Tokio codec that frames FIX messages. No TCP helpers, no TLS |
 | `ironfix-fast` | FAST encoding/decoding primitives: stop-bit, presence maps, the operator table. No template layer |
 | `ironfix-codegen` | Build-time Rust generation from a `Dictionary` (no in-workspace consumer) |

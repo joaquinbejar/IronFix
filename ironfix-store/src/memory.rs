@@ -24,8 +24,7 @@ use std::time::SystemTime;
 ///
 /// Stores messages in a `BTreeMap` for efficient range queries.
 /// Not persistent - all data is lost when the process exits, so it cannot
-/// carry a session across a restart. It is the only implementation in this
-/// crate today.
+/// carry a session across a restart; [`FileStore`](crate::FileStore) can.
 #[derive(Debug)]
 pub struct MemoryStore {
     /// Stored frames and their recorded `MsgType`, indexed by sequence number.

@@ -55,14 +55,17 @@
 //!
 //! - **There is no TLS**, and no dictionary validation: `ironfix-dictionary`'s
 //!   `Validator` is never invoked on the session path.
-//! - **The store is opt-in and in-memory.** Attaching an
-//!   [`ironfix_store::MemoryStore`] with [`Initiator::with_store`],
+//! - **The store is opt-in.** Attaching one with [`Initiator::with_store`],
 //!   [`Acceptor::with_store`] or [`EngineBuilder::with_store`] enables
-//!   resend-from-store replay and seeds each session's counters in both roles,
-//!   but there is no persistent implementation yet. A store belongs to
-//!   exactly one engine. The acceptor touches its store only once the peer is
-//!   authenticated (`from_admin` accepted it), and resets it only for a Logon
-//!   that passes every check. Store writes are ordered and fallible, and
+//!   resend-from-store replay and seeds each session's counters in both roles.
+//!   [`ironfix_store::MemoryStore`] keeps them in memory only;
+//!   [`ironfix_store::FileStore`] keeps them in a journal file, so they
+//!   survive a restart as durably as its sync policy promises (only
+//!   `SyncPolicy::EveryWrite` covers an OS crash or power loss for every
+//!   write). A store belongs to exactly one engine. The acceptor touches its
+//!   store only once the peer is authenticated (`from_admin` accepted it), and
+//!   resets it only for a Logon that passes every check. Store writes are
+//!   ordered and fallible, and
 //!   [`StoreFailurePolicy`] decides
 //!   whether a failed one is tolerated or closes the session (see
 //!   [`persistence`]). Inbound application messages are delivered at most

@@ -448,10 +448,16 @@ single `SequenceReset`-GapFill with `MsgSeqNum` = BeginSeqNo and `NewSeqNo` as
 above. A counterparty asking for business traffic then receives a gap fill
 rather than the traffic.
 
-**Restart caveat.** `MemoryStore` is the only `MessageStore` implementation and
-is not persistent: it holds messages and sequence numbers in process memory
-only. Replay therefore works within a live process, but no message and no
-sequence number survives a restart. A durable store is separate, tracked work.
+**Across a restart.** `MemoryStore` holds messages and sequence numbers in
+process memory only, so with it replay works within a live process and
+nothing survives a restart. `FileStore` keeps the filed frames and both
+counters in a journal file: a session started on a reopened `FileStore`
+resumes from its counters, and a `ResendRequest` after the restart replays the
+original frames. What survives depends on its `SyncPolicy`: every write that
+returned `Ok` survives a process crash under every policy, and an OS crash or
+power loss only under `SyncPolicy::EveryWrite` (the default). A torn or
+damaged journal tail is cut when the store opens and is never replayed
+(`doc/adr/0006-file-store.md`).
 
 **Store write order.** Every store call (`store`, `file_outbound`,
 `set_next_sender_seq`, `set_next_target_seq`, `reset`, `reset_to`, `refresh`,
@@ -555,8 +561,10 @@ record is cleared once that Logon is acknowledged. On the `Acceptor` (whose
 reset fails closed the same way for a session that resets), the next accepted
 Logon resets the store and its acknowledgement declares `141=Y` at 1; the
 record is cleared once that acknowledgement is sent. The record lives in the
-engine, in memory, so a process restart forgets it (#78, #89). For the same
-reason a store must belong to exactly one engine instance.
+engine, in memory, so a process restart forgets it whichever store is
+attached; `FileStore` does not persist it (#89). For the same reason a store
+must belong to exactly one engine instance; `FileStore` enforces this with a
+lock file.
 
 With a store attached, call `Initiator::connect` again only once the previous
 session's `Connection::wait_closed` has returned: until then the closing
@@ -573,14 +581,18 @@ reset is pending still leaves it owed. A store write that overruns the store
 timeout may still land later, so it too leaves a reset owed, and the next
 session starts with a reset and `ResetSeqNumFlag` (141) = Y. This relies on
 the store applying its mutations in call order even when a call is dropped,
-which `MessageStore` now requires and `MemoryStore` satisfies; a store that
+which `MessageStore` now requires and `MemoryStore` and `FileStore` satisfy
+(`FileStore` runs each call behind a first-in, first-out lock held until its
+file I/O is done); a store that
 does not must not be reused after a timed-out write
 (`doc/adr/0005-fallible-store-writes.md`, "Cancellation and timeouts").
 
 The default `MessageStore::reset_to` is three calls, not one atomic write: a
 crash between them leaves the store cleared with its initial counters, and the
 next Logon goes out at 1 without `ResetSeqNumFlag`. A durable store should
-override it.
+override it. `FileStore` does: its `reset_to` writes a new journal and renames
+it into place, and its `file_outbound` writes the frame and the next sender
+number as one record.
 
 Not done: inbound frames are not filed (only the target counter is kept).
 
@@ -1489,15 +1501,14 @@ ADR-0011.
 - [x] Reject
 - [x] Sequence Reset
 - [x] Resend Request — inbound requests are validated, and with a
-  `MessageStore` attached (`Initiator::with_store`) the stored application
-  messages in the range are replayed with `PossDupFlag` (43) = Y and the
-  original `SendingTime` in `OrigSendingTime` (122), with administrative
-  messages and unavailable sequence numbers gap-filled. Three limits are worth
-  stating: the store is **opt-in**, and without one the whole range is still
-  answered with a single gap fill; the store can be attached to the
-  **initiator only**, since the `Acceptor` attaches none and so answers every
-  resend with gap fill; and `MemoryStore` is not persistent, so nothing is
-  replayable after a restart. Store writes are ordered (frame and next sender
+  `MessageStore` attached (`Initiator::with_store`, `Acceptor::with_store`)
+  the stored application messages in the range are replayed with
+  `PossDupFlag` (43) = Y and the original `SendingTime` in `OrigSendingTime`
+  (122), with administrative messages and unavailable sequence numbers
+  gap-filled. Two limits are worth stating: the store is **opt-in**, and
+  without one the whole range is still answered with a single gap fill; and
+  only `FileStore` replays after a restart (`MemoryStore` is not persistent),
+  as durably as its `SyncPolicy` promises. Store writes are ordered (frame and next sender
   number before the bytes, next target number before an inbound message is
   acted on) and fallible, under a `StoreFailurePolicy` that either warns and
   continues or fails closed; inbound delivery is at most once across a crash.

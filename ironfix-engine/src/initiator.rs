@@ -294,9 +294,11 @@ impl<A: Application + 'static> Initiator<A> {
     /// or [`Initiator::with_initial_sequences`] is called, the session starts
     /// from the counters the store reports, and both counters are persisted
     /// back into it as the session runs, in the order described in the
-    /// [`persistence`](crate::persistence) module. Note that
-    /// [`MemoryStore`](ironfix_store::MemoryStore) is the only implementation
-    /// today and is **not** persistent, so this does not yet survive a restart.
+    /// [`persistence`](crate::persistence) module. With a
+    /// [`FileStore`](ironfix_store::FileStore) the counters and the filed
+    /// frames survive a restart, as durably as its
+    /// [`SyncPolicy`](ironfix_store::SyncPolicy) promises; a
+    /// [`MemoryStore`](ironfix_store::MemoryStore) holds them in memory only.
     ///
     /// **One store, one engine.** The store must belong to this initiator
     /// alone: two engines, or two processes, writing to one store would
