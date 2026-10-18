@@ -2709,7 +2709,10 @@ impl<A: Application> Reactor<A> {
                 if message.msg_type().is_admin() {
                     continue;
                 }
-                let frame = match wire::resend_frame(message.payload()) {
+                // Replayed in the precision the session stamps everything
+                // else in: whole seconds on FIX 4.0 and FIX 4.1.
+                let precision = self.factory.sending_time_precision();
+                let frame = match wire::resend_frame(message.payload(), precision) {
                     Ok(frame) => frame,
                     Err(err) => {
                         tracing::warn!(

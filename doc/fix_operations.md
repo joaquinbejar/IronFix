@@ -669,7 +669,10 @@ can be rebuilt is resent with:
 - `PossDupFlag` (43) = Y (mandate item 2);
 - `OrigSendingTime` (122) = the `SendingTime` (52) recorded on the original
   frame, while 52 is restamped with the time of this retransmission (mandate
-  item 4);
+  item 4). Both are in the session's precision (see "Version-Specific
+  Considerations"): on a FIX 4.0 or FIX 4.1 session a stored millisecond
+  time, such as one journaled before the session wrote whole seconds, is
+  replayed with its fraction truncated;
 - `BodyLength` (9) and `CheckSum` (10) recomputed, since 43 and 122 change both.
 
 *What is gap-filled.* Everything else in the range is covered by
@@ -1894,6 +1897,19 @@ ADR-0011.
 - No DefaultApplVerID
 - Limited execution report fields
 - Tag 20 (ExecTransType) required in Execution Reports
+- FIX 4.0 and FIX 4.1 type `SendingTime` (52) and `OrigSendingTime` (122) as
+  `time`, `YYYYMMDD-HH:MM:SS` in whole seconds. FIX 4.2 replaced it with
+  `UTCTimestamp`, which may also carry milliseconds
+  (`YYYYMMDD-HH:MM:SS.sss`).
+
+**What IronFix implements today.** Both engines, in both roles, write 52 and
+122 in whole seconds on a FIX 4.0 or FIX 4.1 session, truncated rather than
+rounded (`Timestamp::format_seconds`), and in milliseconds on FIX 4.2 and
+every later version (`Timestamp::format_millis`). That covers the Logon and
+every other admin message, application messages, the 52 and 122 of a
+SequenceReset-GapFill, and the 52 and 122 of a replayed message. Inbound,
+`SendingTime` is read in either form, with or without a fraction of one to
+nine digits, whatever the session's version.
 
 ### FIX 4.3 - 4.4
 - Enhanced execution report

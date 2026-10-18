@@ -24,6 +24,10 @@ use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 /// Maximum length for CompID strings in bytes.
 pub const COMP_ID_MAX_LEN: usize = 32;
 
+/// Length of `YYYYMMDD-HH:MM:SS`, a FIX UTCTimestamp in whole seconds, in
+/// bytes.
+const UTC_TIMESTAMP_SECONDS_LEN: usize = 17;
+
 /// Length of `YYYYMMDD-HH:MM:SS.`, the part of a FIX UTCTimestamp before its
 /// fractional-second digits, in bytes.
 const UTC_TIMESTAMP_PREFIX_LEN: usize = 18;
@@ -34,39 +38,39 @@ const MAX_FRACTION_DIGITS: usize = 9;
 /// Nanoseconds in one second.
 const NANOS_PER_SECOND: u32 = 1_000_000_000;
 
-/// Formats `dt` as a FIX UTCTimestamp of exactly `LEN` bytes:
-/// `YYYYMMDD-HH:MM:SS.` followed by `LEN - 18` fractional-second digits,
-/// truncated rather than rounded (`LEN` 21 is milliseconds, 24 microseconds,
-/// 27 nanoseconds).
+/// Formats `dt` as a FIX UTCTimestamp of exactly `LEN` bytes, truncated
+/// rather than rounded: `YYYYMMDD-HH:MM:SS` in whole seconds when `LEN` is 17,
+/// otherwise `YYYYMMDD-HH:MM:SS.` followed by `LEN - 18` fractional-second
+/// digits (`LEN` 21 is milliseconds, 24 microseconds, 27 nanoseconds).
 ///
 /// The calendar fields come from chrono's plain accessors and the digits are
 /// written into a fixed-size array, so the call allocates nothing.
 ///
-/// The output is byte-identical to chrono's `%Y%m%d-%H:%M:%S%.3f` (and
-/// `%.6f` / `%.9f`), leap second included: chrono represents a leap second as
-/// a nanosecond count of 1_000_000_000 or more, prints its second as `60`,
-/// and takes the fractional digits from the count modulo one second.
+/// The output is byte-identical to chrono's `%Y%m%d-%H:%M:%S` (and
+/// `%Y%m%d-%H:%M:%S%.3f` / `%.6f` / `%.9f`), leap second included: chrono
+/// represents a leap second as a nanosecond count of 1_000_000_000 or more,
+/// prints its second as `60`, and takes the fractional digits from the count
+/// modulo one second.
 ///
 /// Returns `None`, never a truncated value, when the year has no four-digit
-/// form (outside `0..=9999`) or `LEN` leaves room for no fractional digit or
-/// for more than nine.
+/// form (outside `0..=9999`) or `LEN` is neither 17 nor room for one to nine
+/// fractional digits.
 #[must_use]
 fn format_utc_timestamp<const LEN: usize>(dt: DateTime<Utc>) -> Option<ArrayString<LEN>> {
-    let fraction_digits = LEN.checked_sub(UTC_TIMESTAMP_PREFIX_LEN)?;
-    if !(1..=MAX_FRACTION_DIGITS).contains(&fraction_digits) {
-        return None;
-    }
-    // Nanoseconds per unit of the last fractional digit: 10^(9 - digits).
-    let dropped_digits = u32::try_from(MAX_FRACTION_DIGITS.checked_sub(fraction_digits)?).ok()?;
-    let fraction_unit = 10_u32.checked_pow(dropped_digits)?;
+    // Whole seconds carry no '.'; a fraction has one to nine digits after it.
+    let fraction_digits = match LEN.checked_sub(UTC_TIMESTAMP_PREFIX_LEN) {
+        None if LEN == UTC_TIMESTAMP_SECONDS_LEN => 0,
+        Some(digits @ 1..=MAX_FRACTION_DIGITS) => digits,
+        _ => return None,
+    };
 
     let naive = dt.naive_utc();
     let nanos = naive.nanosecond();
     let second = naive.second().checked_add(nanos / NANOS_PER_SECOND)?;
-    let fraction = (nanos % NANOS_PER_SECOND).checked_div(fraction_unit)?;
 
     // Byte offsets: YYYY 0..4, MM 4..6, DD 6..8, '-' 8, HH 9..11, ':' 11,
-    // MM 12..14, ':' 14, SS 15..17, '.' 17, then the fraction to the end.
+    // MM 12..14, ':' 14, SS 15..17, then '.' 17 and the fraction to the end
+    // when there is one.
     let mut out = [b'0'; LEN];
     put_digits(out.get_mut(0..4)?, u32::try_from(naive.year()).ok()?)?;
     put_digits(out.get_mut(4..6)?, naive.month())?;
@@ -76,9 +80,16 @@ fn format_utc_timestamp<const LEN: usize>(dt: DateTime<Utc>) -> Option<ArrayStri
     *out.get_mut(11)? = b':';
     put_digits(out.get_mut(12..14)?, naive.minute())?;
     *out.get_mut(14)? = b':';
-    put_digits(out.get_mut(15..17)?, second)?;
-    *out.get_mut(17)? = b'.';
-    put_digits(out.get_mut(UTC_TIMESTAMP_PREFIX_LEN..)?, fraction)?;
+    put_digits(out.get_mut(15..UTC_TIMESTAMP_SECONDS_LEN)?, second)?;
+    if fraction_digits > 0 {
+        // Nanoseconds per unit of the last fractional digit: 10^(9 - digits).
+        let dropped_digits =
+            u32::try_from(MAX_FRACTION_DIGITS.checked_sub(fraction_digits)?).ok()?;
+        let fraction_unit = 10_u32.checked_pow(dropped_digits)?;
+        let fraction = (nanos % NANOS_PER_SECOND).checked_div(fraction_unit)?;
+        *out.get_mut(UTC_TIMESTAMP_SECONDS_LEN)? = b'.';
+        put_digits(out.get_mut(UTC_TIMESTAMP_PREFIX_LEN..)?, fraction)?;
+    }
     ArrayString::from_byte_string(&out).ok()
 }
 
@@ -187,8 +198,10 @@ impl fmt::Display for SeqNum {
 
 /// FIX protocol timestamp with nanosecond precision.
 ///
-/// Timestamps in FIX are formatted as `YYYYMMDD-HH:MM:SS.sss` (milliseconds)
-/// or `YYYYMMDD-HH:MM:SS.ssssss` (microseconds) or `YYYYMMDD-HH:MM:SS.sssssssss` (nanoseconds).
+/// Timestamps in FIX are formatted as `YYYYMMDD-HH:MM:SS` (whole seconds, the
+/// only form FIX 4.0 and FIX 4.1 define), `YYYYMMDD-HH:MM:SS.sss`
+/// (milliseconds), `YYYYMMDD-HH:MM:SS.ssssss` (microseconds) or
+/// `YYYYMMDD-HH:MM:SS.sssssssss` (nanoseconds).
 ///
 /// # Representable range
 ///
@@ -392,11 +405,39 @@ impl Timestamp {
         }
     }
 
+    /// Formats the timestamp in FIX format with whole-second precision.
+    ///
+    /// Format: `YYYYMMDD-HH:MM:SS`, the fraction truncated, not rounded, so it
+    /// is always the first 17 bytes of [`Timestamp::format_millis`]. It is
+    /// the only form of `time`, the type FIX 4.0 and FIX 4.1 give
+    /// `SendingTime` (52) and `OrigSendingTime` (122); FIX 4.2 replaced that
+    /// type with a `UTCTimestamp` that may also carry milliseconds. The digits
+    /// are written straight into the returned buffer, so the call allocates
+    /// nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironfix_core::Timestamp;
+    ///
+    /// // 2024-02-29T12:34:56.789012345Z
+    /// let ts = Timestamp::from_nanos(1_709_210_096_789_012_345)?;
+    /// assert_eq!(ts.format_seconds().as_str(), "20240229-12:34:56");
+    /// assert_eq!(ts.format_millis().as_str(), "20240229-12:34:56.789");
+    /// # Ok::<(), ironfix_core::error::TimestampError>(())
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn format_seconds(self) -> ArrayString<17> {
+        self.format_fixed()
+    }
+
     /// Formats the timestamp in FIX format with millisecond precision.
     ///
     /// Format: `YYYYMMDD-HH:MM:SS.sss`, the fraction truncated, not rounded.
     /// The digits are written straight into the returned buffer, so the call
-    /// allocates nothing; it runs for every outbound `SendingTime` (52).
+    /// allocates nothing; it runs for every outbound `SendingTime` (52) on a
+    /// FIX 4.2 or later session.
     #[inline]
     #[must_use]
     pub fn format_millis(self) -> ArrayString<21> {
@@ -418,10 +459,10 @@ impl Timestamp {
     ///
     /// Total for every timestamp: the constructors bound the instant to
     /// `1970..=2262`, whose years all have four digits, and the callers pass
-    /// a `LEN` with one to nine fractional digits. Were that ever violated,
-    /// the result would be empty, which is also what the chrono-based
-    /// formatter this replaced produced for a year without four digits:
-    /// never a truncated or wrapped value.
+    /// a `LEN` of whole seconds or one with one to nine fractional digits.
+    /// Were that ever violated, the result would be empty, which is also what
+    /// the chrono-based formatter this replaced produced for a year without
+    /// four digits: never a truncated or wrapped value.
     #[must_use]
     fn format_fixed<const LEN: usize>(self) -> ArrayString<LEN> {
         let formatted = format_utc_timestamp(self.to_datetime());
@@ -950,6 +991,26 @@ mod tests {
     }
 
     #[test]
+    fn test_timestamp_format_seconds_at_epoch() {
+        let ts = ok(Timestamp::from_millis(0), "0ms is representable");
+        assert_eq!(ts.format_seconds().as_str(), "19700101-00:00:00");
+    }
+
+    #[test]
+    fn test_timestamp_format_seconds_truncates_the_fraction() {
+        // 23:59:59.999999999 stays in its second: truncated, never rounded up
+        // into the next minute, hour, day or year.
+        let ts = ok(
+            Timestamp::from_nanos(946_684_799_999_999_999),
+            "1999-12-31T23:59:59.999999999Z is representable",
+        );
+        assert_eq!(ts.format_seconds().as_str(), "19991231-23:59:59");
+        // No '.', and nothing after the seconds.
+        assert_eq!(ts.format_seconds().len(), 17);
+        assert!(!ts.format_seconds().contains('.'));
+    }
+
+    #[test]
     fn test_timestamp_format_micros_at_known_instant() {
         // 2023-11-14T22:13:20.123456Z
         let ts = ok(
@@ -959,6 +1020,8 @@ mod tests {
         assert_eq!(ts.format_micros().as_str(), "20231114-22:13:20.123456");
     }
 
+    /// chrono's pattern for a whole-second UTCTimestamp.
+    const SECONDS_PATTERN: &str = "%Y%m%d-%H:%M:%S";
     /// chrono's pattern for a millisecond UTCTimestamp.
     const MILLIS_PATTERN: &str = "%Y%m%d-%H:%M:%S%.3f";
     /// chrono's pattern for a microsecond UTCTimestamp.
@@ -967,8 +1030,10 @@ mod tests {
     const NANOS_PATTERN: &str = "%Y%m%d-%H:%M:%S%.9f";
 
     /// The chrono-based formatter `format_millis` / `format_micros` used
-    /// before #127, kept verbatim as the byte-for-byte reference. It formats
-    /// into a `String` first, and writes nothing when that does not fit `LEN`.
+    /// before #127, kept verbatim as the byte-for-byte reference; with
+    /// [`SECONDS_PATTERN`] it is the reference for `format_seconds` too. It
+    /// formats into a `String` first, and writes nothing when that does not
+    /// fit `LEN`.
     fn chrono_reference<const LEN: usize>(dt: DateTime<Utc>, pattern: &str) -> ArrayString<LEN> {
         let mut buf = ArrayString::new();
         let _ = std::fmt::write(&mut buf, format_args!("{}", dt.format(pattern)));
@@ -1019,9 +1084,11 @@ mod tests {
     #[test]
     fn test_format_utc_timestamp_edges_match_chrono() {
         for dt in representable_edges() {
+            let seconds: Option<ArrayString<17>> = format_utc_timestamp(dt);
             let millis: Option<ArrayString<21>> = format_utc_timestamp(dt);
             let micros: Option<ArrayString<24>> = format_utc_timestamp(dt);
             let nanos: Option<ArrayString<27>> = format_utc_timestamp(dt);
+            assert_eq!(seconds, Some(chrono_reference(dt, SECONDS_PATTERN)), "{dt}");
             assert_eq!(millis, Some(chrono_reference(dt, MILLIS_PATTERN)), "{dt}");
             assert_eq!(micros, Some(chrono_reference(dt, MICROS_PATTERN)), "{dt}");
             assert_eq!(nanos, Some(chrono_reference(dt, NANOS_PATTERN)), "{dt}");
@@ -1032,8 +1099,10 @@ mod tests {
     fn test_timestamp_format_edges_match_chrono() {
         for dt in representable_edges() {
             let ts = ok(Timestamp::try_from(dt), "edge instant is representable");
+            let seconds: ArrayString<17> = chrono_reference(dt, SECONDS_PATTERN);
             let millis: ArrayString<21> = chrono_reference(dt, MILLIS_PATTERN);
             let micros: ArrayString<24> = chrono_reference(dt, MICROS_PATTERN);
+            assert_eq!(ts.format_seconds(), seconds, "{dt}");
             assert_eq!(ts.format_millis(), millis, "{dt}");
             assert_eq!(ts.format_micros(), micros, "{dt}");
             assert_eq!(ts.to_string(), millis.as_str(), "{dt}");
@@ -1043,30 +1112,40 @@ mod tests {
     #[test]
     fn test_timestamp_format_edges_exact_bytes() {
         let cases = [
-            (0, "19700101-00:00:00.000", "19700101-00:00:00.000000"),
+            (
+                0,
+                "19700101-00:00:00",
+                "19700101-00:00:00.000",
+                "19700101-00:00:00.000000",
+            ),
             (
                 1_709_210_096_789_012_345,
+                "20240229-12:34:56",
                 "20240229-12:34:56.789",
                 "20240229-12:34:56.789012",
             ),
             (
                 946_684_799_999_999_999,
+                "19991231-23:59:59",
                 "19991231-23:59:59.999",
                 "19991231-23:59:59.999999",
             ),
             (
                 981_173_106_007_008_009,
+                "20010203-04:05:06",
                 "20010203-04:05:06.007",
                 "20010203-04:05:06.007008",
             ),
             (
                 Timestamp::MAX_NANOS,
+                "22620411-23:47:16",
                 "22620411-23:47:16.854",
                 "22620411-23:47:16.854775",
             ),
         ];
-        for (nanos, millis, micros) in cases {
+        for (nanos, seconds, millis, micros) in cases {
             let ts = ok(Timestamp::from_nanos(nanos), "instant is representable");
+            assert_eq!(ts.format_seconds().as_str(), seconds);
             assert_eq!(ts.format_millis().as_str(), millis);
             assert_eq!(ts.format_micros().as_str(), micros);
         }
@@ -1080,10 +1159,18 @@ mod tests {
         let mut nanos = 0_u64;
         while let Ok(ts) = Timestamp::from_nanos(nanos) {
             let dt = ts.to_datetime();
+            let seconds: ArrayString<17> = chrono_reference(dt, SECONDS_PATTERN);
             let millis: ArrayString<21> = chrono_reference(dt, MILLIS_PATTERN);
             let micros: ArrayString<24> = chrono_reference(dt, MICROS_PATTERN);
+            assert_eq!(ts.format_seconds(), seconds, "{nanos}");
             assert_eq!(ts.format_millis(), millis, "{nanos}");
             assert_eq!(ts.format_micros(), micros, "{nanos}");
+            // Whole seconds is the millisecond form with its fraction cut off.
+            assert_eq!(
+                Some(ts.format_seconds().as_str()),
+                ts.format_millis().get(..17),
+                "{nanos}"
+            );
             let Some(next) = nanos.checked_add(step) else {
                 break;
             };
@@ -1101,10 +1188,18 @@ mod tests {
         while nanos <= end {
             let ts = ok(Timestamp::from_nanos(nanos), "instant is representable");
             let dt = ts.to_datetime();
+            let seconds: ArrayString<17> = chrono_reference(dt, SECONDS_PATTERN);
             let millis: ArrayString<21> = chrono_reference(dt, MILLIS_PATTERN);
             let micros: ArrayString<24> = chrono_reference(dt, MICROS_PATTERN);
+            assert_eq!(ts.format_seconds(), seconds, "{nanos}");
             assert_eq!(ts.format_millis(), millis, "{nanos}");
             assert_eq!(ts.format_micros(), micros, "{nanos}");
+            // Whole seconds is the millisecond form with its fraction cut off.
+            assert_eq!(
+                Some(ts.format_seconds().as_str()),
+                ts.format_millis().get(..17),
+                "{nanos}"
+            );
             let Some(next) = nanos.checked_add(7_398_765_431) else {
                 break;
             };
@@ -1135,6 +1230,12 @@ mod tests {
         ];
         for (nano, millis, micros) in cases {
             let dt = utc((2016, 12, 31), (23, 59, 59), nano);
+            let ours_seconds: Option<ArrayString<17>> = format_utc_timestamp(dt);
+            assert_eq!(ours_seconds, Some(chrono_reference(dt, SECONDS_PATTERN)));
+            assert_eq!(
+                ours_seconds.as_ref().map(ArrayString::as_str),
+                Some("20161231-23:59:60")
+            );
             let ours_millis: Option<ArrayString<21>> = format_utc_timestamp(dt);
             let ours_micros: Option<ArrayString<24>> = format_utc_timestamp(dt);
             let ours_nanos: Option<ArrayString<27>> = format_utc_timestamp(dt);
@@ -1154,10 +1255,13 @@ mod tests {
         let leap = utc((2016, 12, 31), (23, 59, 59), 1_500_000_000);
         let ts = ok(Timestamp::try_from(leap), "a leap second is representable");
         let dt = ts.to_datetime();
+        let seconds: ArrayString<17> = chrono_reference(dt, SECONDS_PATTERN);
         let millis: ArrayString<21> = chrono_reference(dt, MILLIS_PATTERN);
         let micros: ArrayString<24> = chrono_reference(dt, MICROS_PATTERN);
+        assert_eq!(ts.format_seconds(), seconds);
         assert_eq!(ts.format_millis(), millis);
         assert_eq!(ts.format_micros(), micros);
+        assert_eq!(ts.format_seconds().as_str(), "20170101-00:00:00");
         assert_eq!(ts.format_millis().as_str(), "20170101-00:00:00.500");
     }
 
@@ -1178,8 +1282,15 @@ mod tests {
             ),
         ];
         for (dt, expected) in cases {
+            let seconds: Option<ArrayString<17>> = format_utc_timestamp(dt);
             let millis: Option<ArrayString<21>> = format_utc_timestamp(dt);
             let micros: Option<ArrayString<24>> = format_utc_timestamp(dt);
+            assert_eq!(seconds, Some(chrono_reference(dt, SECONDS_PATTERN)), "{dt}");
+            assert_eq!(
+                seconds.as_ref().map(ArrayString::as_str),
+                expected.get(..17),
+                "{dt}"
+            );
             assert_eq!(millis, Some(chrono_reference(dt, MILLIS_PATTERN)), "{dt}");
             assert_eq!(micros, Some(chrono_reference(dt, MICROS_PATTERN)), "{dt}");
             assert_eq!(millis.as_ref().map(ArrayString::as_str), Some(expected));
@@ -1199,10 +1310,15 @@ mod tests {
             DateTime::<Utc>::MAX_UTC,
         ];
         for dt in cases {
+            let seconds: Option<ArrayString<17>> = format_utc_timestamp(dt);
             let millis: Option<ArrayString<21>> = format_utc_timestamp(dt);
             let micros: Option<ArrayString<24>> = format_utc_timestamp(dt);
+            let reference_seconds: ArrayString<17> = chrono_reference(dt, SECONDS_PATTERN);
             let reference_millis: ArrayString<21> = chrono_reference(dt, MILLIS_PATTERN);
             let reference_micros: ArrayString<24> = chrono_reference(dt, MICROS_PATTERN);
+            assert_eq!(seconds, None, "{dt}");
+            assert_eq!(reference_seconds.as_str(), "", "{dt}");
+            assert_eq!(seconds.unwrap_or_default(), reference_seconds, "{dt}");
             assert_eq!(millis, None, "{dt}");
             assert_eq!(micros, None, "{dt}");
             assert_eq!(reference_millis.as_str(), "", "{dt}");
@@ -1213,12 +1329,29 @@ mod tests {
     }
 
     #[test]
-    fn test_format_utc_timestamp_length_without_fraction_digits_is_none() {
+    fn test_format_utc_timestamp_length_of_no_utc_timestamp_form_is_none() {
         let dt = utc((2024, 2, 29), (12, 34, 56), 789_012_345);
-        // Too short for the prefix, a bare dot, and ten fractional digits.
-        assert_eq!(format_utc_timestamp::<17>(dt), None);
+        // Too short for whole seconds, a bare dot, and ten fractional digits.
+        assert_eq!(format_utc_timestamp::<0>(dt), None);
+        assert_eq!(format_utc_timestamp::<16>(dt), None);
         assert_eq!(format_utc_timestamp::<18>(dt), None);
         assert_eq!(format_utc_timestamp::<28>(dt), None);
+    }
+
+    #[test]
+    fn test_format_utc_timestamp_seventeen_bytes_is_whole_seconds() {
+        let dt = utc((2024, 2, 29), (12, 34, 56), 789_012_345);
+        let seconds: Option<ArrayString<17>> = format_utc_timestamp(dt);
+        assert_eq!(
+            seconds.as_ref().map(ArrayString::as_str),
+            Some("20240229-12:34:56")
+        );
+        // One fractional digit is the shortest fraction there is.
+        let tenths: Option<ArrayString<19>> = format_utc_timestamp(dt);
+        assert_eq!(
+            tenths.as_ref().map(ArrayString::as_str),
+            Some("20240229-12:34:56.7")
+        );
     }
 
     #[test]

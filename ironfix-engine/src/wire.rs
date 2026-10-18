@@ -1157,6 +1157,96 @@ pub(crate) const fn decode_defect(error: &DecodeError) -> &'static str {
     }
 }
 
+/// Length of a whole-second `UTCTimestamp`, `YYYYMMDD-HH:MM:SS`, in bytes.
+const WHOLE_SECONDS_LEN: usize = 17;
+
+/// The precision of the `UTCTimestamp`s the engine writes into `SendingTime`
+/// (52) and `OrigSendingTime` (122), which the session's FIX version decides.
+///
+/// FIX 4.0 and FIX 4.1 type both fields as `time`: `YYYYMMDD-HH:MM:SS`, whole
+/// seconds with nothing after them. FIX 4.2 replaced that type with
+/// `UTCTimestamp`, which is either the same whole-second form or one with
+/// milliseconds (FIX Repository 2010 edition, `Datatypes.xml`: `time` in
+/// FIX.4.0 and FIX.4.1, `UTCTimestamp` from FIX.4.2; the QuickFIX `FIX40.xml`
+/// and `FIX41.xml` type 52 and 122 as `TIME`). A strict FIX 4.0 or FIX 4.1
+/// counterparty may reject a millisecond value as malformed, so those
+/// sessions write whole seconds and every later one keeps milliseconds. That
+/// is the cut QuickFIX makes too (`Session::supportsSubSecondTimestamps`).
+///
+/// Only what the engine writes depends on it: inbound parsing
+/// ([`parse_utc_timestamp_millis`]) accepts both forms on every version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendingTimePrecision {
+    /// `YYYYMMDD-HH:MM:SS`: FIX 4.0 and FIX 4.1.
+    Seconds,
+    /// `YYYYMMDD-HH:MM:SS.sss`: FIX 4.2 and later, FIXT.1.1 included.
+    Millis,
+}
+
+impl SendingTimePrecision {
+    /// Returns the precision a session in `version` writes.
+    ///
+    /// The match names every version, so a new [`FixVersion`] does not
+    /// compile until it has been given a precision.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn for_version(version: FixVersion) -> Self {
+        match version {
+            FixVersion::Fix40 | FixVersion::Fix41 => Self::Seconds,
+            FixVersion::Fix42
+            | FixVersion::Fix43
+            | FixVersion::Fix44
+            | FixVersion::Fix50
+            | FixVersion::Fix50Sp1
+            | FixVersion::Fix50Sp2
+            | FixVersion::Fixt11 => Self::Millis,
+        }
+    }
+
+    /// Formats `at` in this precision and passes the text to `write`,
+    /// returning whatever `write` returns.
+    ///
+    /// The text sits in a fixed-size buffer on the stack for the length of
+    /// the call, so this allocates nothing; it runs for every outbound frame.
+    #[inline]
+    fn with_formatted<R>(self, at: Timestamp, write: impl FnOnce(&str) -> R) -> R {
+        match self {
+            Self::Seconds => write(at.format_seconds().as_str()),
+            Self::Millis => write(at.format_millis().as_str()),
+        }
+    }
+
+    /// Returns a stored `UTCTimestamp` in this precision, for the
+    /// `OrigSendingTime` (122) of a resend.
+    ///
+    /// At whole seconds, a value that parses as a `UTCTimestamp` and carries
+    /// a fraction is cut back to its first 17 bytes, `YYYYMMDD-HH:MM:SS`. That
+    /// is the same instant truncated exactly as [`Timestamp::format_seconds`]
+    /// truncates, so it is what the session would have written had it sent
+    /// the original at this precision. It covers a frame stored before the
+    /// session wrote whole seconds, for example in a journal kept across an
+    /// upgrade.
+    ///
+    /// Everything else comes back unchanged and borrowed: any value at
+    /// millisecond precision (FIX 4.2 and later accept both forms), a value
+    /// already in whole seconds, and a value that does not parse as a
+    /// `UTCTimestamp`, which is not this function's to repair.
+    #[must_use]
+    fn narrow(self, value: &str) -> &str {
+        match self {
+            Self::Millis => value,
+            Self::Seconds => {
+                let has_fraction = value.as_bytes().get(WHOLE_SECONDS_LEN) == Some(&b'.');
+                if has_fraction && parse_utc_timestamp_millis(value).is_some() {
+                    value.get(..WHOLE_SECONDS_LEN).unwrap_or(value)
+                } else {
+                    value
+                }
+            }
+        }
+    }
+}
+
 /// Why a stored message could not be rebuilt as a resend.
 ///
 /// Every variant means the same thing to the reactor — this particular message
@@ -1200,6 +1290,14 @@ pub(crate) enum ResendError {
 /// existing 122 is preferred and copied through unchanged. Overwriting it with
 /// 52 would silently move `OrigSendingTime` forward to the last replay.
 ///
+/// Both times are written in the session's `precision`, the one
+/// [`MessageFactory::encode`] stamps its own 52 with: the new 52 is formatted
+/// in it, and the copied 122 is narrowed to it by
+/// [`SendingTimePrecision::narrow`]. On a FIX 4.2 or later session that copy
+/// is verbatim; on a FIX 4.0 or FIX 4.1 one a stored millisecond time loses
+/// its fraction, so a frame stored before the session wrote whole seconds
+/// still replays with a 122 that session's counterparty accepts.
+///
 /// Every other field is copied through verbatim in its original order, so the
 /// business content of the replayed message is byte-identical to what was
 /// sent. `BodyLength` (9) and `CheckSum` (10) are restamped by the encoder,
@@ -1209,7 +1307,10 @@ pub(crate) enum ResendError {
 /// Returns [`ResendError`] if the stored frame does not decode, carries no
 /// `SendingTime` (52), or cannot be re-encoded. The caller must gap-fill the
 /// sequence number instead of skipping it.
-pub(crate) fn resend_frame(stored: &[u8]) -> Result<BytesMut, ResendError> {
+pub(crate) fn resend_frame(
+    stored: &[u8],
+    precision: SendingTimePrecision,
+) -> Result<BytesMut, ResendError> {
     let raw = decode_frame(stored)?;
     let begin_string = raw.begin_string()?;
     // 52 is both the emission trigger below and the fallback source for 122, so
@@ -1220,8 +1321,8 @@ pub(crate) fn resend_frame(stored: &[u8]) -> Result<BytesMut, ResendError> {
     // Prefer an existing OrigSendingTime (122): on a resend-of-a-resend it holds
     // the *first* transmission's time, whereas 52 by then is the prior replay's.
     // Falling back to 52 covers the first resend, where no 122 is present yet.
-    let orig_sending_time = raw.get_field_str(122).unwrap_or(sending_time_52);
-    let sending_time = Timestamp::now().format_millis();
+    let orig_sending_time = precision.narrow(raw.get_field_str(122).unwrap_or(sending_time_52));
+    let now = Timestamp::now();
 
     // The rebuilt frame is the original plus 43 and 122; the extra headroom
     // keeps the encoder from reallocating while it copies the body across.
@@ -1242,7 +1343,9 @@ pub(crate) fn resend_frame(stored: &[u8]) -> Result<BytesMut, ResendError> {
             43 | 122 => {}
             52 => {
                 encoder.try_put_raw(43, b"Y")?;
-                encoder.try_put_raw(52, sending_time.as_str().as_bytes())?;
+                precision.with_formatted(now, |sending_time| {
+                    encoder.try_put_raw(52, sending_time.as_bytes())
+                })?;
                 encoder.try_put_raw(122, orig_sending_time.as_bytes())?;
             }
             tag => {
@@ -1366,6 +1469,17 @@ impl MessageFactory {
         }
     }
 
+    /// Returns the precision this session writes `SendingTime` (52) and
+    /// `OrigSendingTime` (122) in, decided by its FIX version.
+    ///
+    /// [`resend_frame`] takes it too, so a replayed message carries the same
+    /// precision as everything else the session sends.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn sending_time_precision(&self) -> SendingTimePrecision {
+        SendingTimePrecision::for_version(self.version)
+    }
+
     /// Frames `pending` under `seq` and returns the finished frame, which
     /// borrows the factory's own buffer until the next call.
     ///
@@ -1386,6 +1500,10 @@ impl MessageFactory {
     /// for an unavailable OrigSendingTime. A genuine replay of a stored message
     /// goes through [`resend_frame`], which copies the real original 52 into
     /// 122.
+    ///
+    /// `SendingTime` (52), and 122 with it, is written in the precision of
+    /// [`MessageFactory::sending_time_precision`]: whole seconds on a FIX 4.0
+    /// or FIX 4.1 session, milliseconds on every later one.
     ///
     /// `ApplVerID` (1128) is stamped immediately after MsgType, its position in
     /// the FIXT.1.1 standard header, and only for application messages;
@@ -1435,11 +1553,14 @@ impl MessageFactory {
         if poss_dup {
             self.encoder.put_bool(43, true);
         }
-        let sending_time = Timestamp::now().format_millis();
-        self.encoder.put_str(52, sending_time.as_str());
-        if poss_dup {
-            self.encoder.put_str(122, sending_time.as_str());
-        }
+        let precision = self.sending_time_precision();
+        let encoder = &mut self.encoder;
+        precision.with_formatted(Timestamp::now(), |sending_time| {
+            encoder.put_str(52, sending_time);
+            if poss_dup {
+                encoder.put_str(122, sending_time);
+            }
+        });
 
         for field in message.fields() {
             match field {
@@ -2072,7 +2193,7 @@ mod tests {
             "the original must carry SendingTime",
         );
 
-        let resent = match resend_frame(&original) {
+        let resent = match resend_frame(&original, SendingTimePrecision::Millis) {
             Ok(frame) => frame,
             Err(err) => panic!("a factory frame must rebuild as a resend: {err}"),
         };
@@ -2113,7 +2234,7 @@ mod tests {
         encoder.put_str(11, "ORDER-1");
         let once = built(into_frame(&mut encoder));
 
-        let twice = match resend_frame(&once) {
+        let twice = match resend_frame(&once, SendingTimePrecision::Millis) {
             Ok(frame) => frame,
             Err(err) => panic!("second resend must build: {err}"),
         };
@@ -2144,7 +2265,7 @@ mod tests {
         encoder.put_uint(34, 4);
         let frame = built(into_frame(&mut encoder));
 
-        match resend_frame(&frame) {
+        match resend_frame(&frame, SendingTimePrecision::Millis) {
             Err(ResendError::MissingSendingTime) => {}
             Err(err) => panic!("expected MissingSendingTime, got {err}"),
             Ok(_) => panic!("a frame with no SendingTime must not be replayed"),
@@ -2153,7 +2274,7 @@ mod tests {
 
     #[test]
     fn test_resend_frame_of_undecodable_bytes_is_a_typed_error() {
-        match resend_frame(b"not a fix message") {
+        match resend_frame(b"not a fix message", SendingTimePrecision::Millis) {
             Err(ResendError::Decode(_)) => {}
             Err(err) => panic!("expected a decode error, got {err}"),
             Ok(_) => panic!("garbage must not rebuild into a frame"),
@@ -2174,7 +2295,7 @@ mod tests {
         encoder.put_data(95, 96, b"opaque\x01payload");
         let original = built(into_frame(&mut encoder));
 
-        let resent = match resend_frame(&original) {
+        let resent = match resend_frame(&original, SendingTimePrecision::Millis) {
             Ok(frame) => frame,
             Err(err) => panic!("a frame with a LENGTH/DATA pair must rebuild: {err}"),
         };
@@ -2187,6 +2308,254 @@ mod tests {
         );
         assert_eq!(raw.get_field_str(43), Some("Y"));
         assert_eq!(raw.get_field_str(122), Some("20260721-10:00:00.000"));
+    }
+
+    /// Asserts `value` is a whole-second `UTCTimestamp`, `YYYYMMDD-HH:MM:SS`
+    /// with nothing after the seconds, that the inbound parser reads.
+    #[track_caller]
+    fn assert_whole_seconds(value: Option<&str>, what: &str) {
+        let value = some(value, what);
+        assert_eq!(value.len(), 17, "{what}: '{value}' is not whole seconds");
+        assert!(!value.contains('.'), "{what}: '{value}' carries a fraction");
+        assert!(
+            parse_utc_timestamp_millis(value).is_some(),
+            "{what}: '{value}' does not parse"
+        );
+    }
+
+    /// Asserts `value` is a millisecond `UTCTimestamp`,
+    /// `YYYYMMDD-HH:MM:SS.sss`, that the inbound parser reads.
+    #[track_caller]
+    fn assert_millis(value: Option<&str>, what: &str) {
+        let value = some(value, what);
+        assert_eq!(value.len(), 21, "{what}: '{value}' is not milliseconds");
+        assert_eq!(value.as_bytes().get(17), Some(&b'.'), "{what}: '{value}'");
+        assert!(
+            parse_utc_timestamp_millis(value).is_some(),
+            "{what}: '{value}' does not parse"
+        );
+    }
+
+    /// Every framable version, by the precision its 52 and 122 carry.
+    const WHOLE_SECOND_VERSIONS: [&str; 2] = ["FIX.4.0", "FIX.4.1"];
+    const MILLISECOND_VERSIONS: [&str; 6] = [
+        "FIX.4.2",
+        "FIX.4.3",
+        "FIX.4.4",
+        "FIX.5.0",
+        "FIX.5.0SP1",
+        "FIX.5.0SP2",
+    ];
+
+    #[test]
+    fn test_sending_time_precision_is_whole_seconds_only_before_fix42() {
+        use SendingTimePrecision::{Millis, Seconds};
+        let expected = [
+            (FixVersion::Fix40, Seconds),
+            (FixVersion::Fix41, Seconds),
+            (FixVersion::Fix42, Millis),
+            (FixVersion::Fix43, Millis),
+            (FixVersion::Fix44, Millis),
+            (FixVersion::Fix50, Millis),
+            (FixVersion::Fix50Sp1, Millis),
+            (FixVersion::Fix50Sp2, Millis),
+            // The transport of FIX 5.0, which carries UTCTimestamp.
+            (FixVersion::Fixt11, Millis),
+        ];
+        // The table names every version, in order.
+        assert_eq!(expected.map(|(version, _)| version), FixVersion::ALL);
+        for (version, precision) in expected {
+            assert_eq!(
+                SendingTimePrecision::for_version(version),
+                precision,
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fix40_and_fix41_frames_stamp_whole_second_sending_times() {
+        for begin_string in WHOLE_SECOND_VERSIONS {
+            let mut factory = factory_for(begin_string);
+            assert_eq!(
+                factory.sending_time_precision(),
+                SendingTimePrecision::Seconds
+            );
+
+            let logon = factory.logon(30, false, None);
+            let frame = framed(&mut factory, 1, &logon);
+            let raw = decode(&frame);
+            assert_eq!(raw.begin_string(), Ok(begin_string));
+            assert_whole_seconds(raw.get_field_str(52), begin_string);
+
+            let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+            order.push_str(11, "ORDER-1");
+            let frame = framed(&mut factory, 2, &PendingMessage::application(order));
+            assert_whole_seconds(decode(&frame).get_field_str(52), begin_string);
+
+            // A GapFill carries 43=Y and its 122 equals its 52: both in
+            // whole seconds.
+            let gap_fill = factory.sequence_reset_gap_fill(10);
+            let frame = framed(&mut factory, 3, &gap_fill);
+            let raw = decode(&frame);
+            assert_eq!(raw.get_field_str(43), Some("Y"));
+            assert_whole_seconds(raw.get_field_str(52), begin_string);
+            assert_whole_seconds(raw.get_field_str(122), begin_string);
+            assert_eq!(raw.get_field_str(122), raw.get_field_str(52));
+        }
+    }
+
+    #[test]
+    fn test_fix42_and_later_frames_keep_millisecond_sending_times() {
+        for configured in MILLISECOND_VERSIONS {
+            let mut factory = factory_for(configured);
+            assert_eq!(
+                factory.sending_time_precision(),
+                SendingTimePrecision::Millis
+            );
+
+            let heartbeat = factory.heartbeat(None);
+            let frame = framed(&mut factory, 1, &heartbeat);
+            assert_millis(decode(&frame).get_field_str(52), configured);
+
+            let gap_fill = factory.sequence_reset_gap_fill(10);
+            let frame = framed(&mut factory, 2, &gap_fill);
+            let raw = decode(&frame);
+            assert_millis(raw.get_field_str(52), configured);
+            assert_millis(raw.get_field_str(122), configured);
+            assert_eq!(raw.get_field_str(122), raw.get_field_str(52));
+        }
+    }
+
+    #[test]
+    fn test_resend_frame_on_fix40_and_fix41_stamps_whole_seconds() {
+        for begin_string in WHOLE_SECOND_VERSIONS {
+            let mut factory = factory_for(begin_string);
+            let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+            order.push_str(11, "ORDER-1");
+            let original = framed(&mut factory, 7, &PendingMessage::application(order));
+            let original_sending_time = some(
+                field_of(&original, 52),
+                "the original must carry SendingTime",
+            );
+
+            let resent = match resend_frame(&original, factory.sending_time_precision()) {
+                Ok(frame) => frame,
+                Err(err) => panic!("a {begin_string} frame must rebuild: {err}"),
+            };
+            let raw = decode(&resent);
+            assert_eq!(raw.begin_string(), Ok(begin_string));
+            assert_eq!(raw.get_field_str(43), Some("Y"));
+            assert_whole_seconds(raw.get_field_str(52), begin_string);
+            // Copied from the original 52, which was already whole seconds.
+            assert_whole_seconds(raw.get_field_str(122), begin_string);
+            assert_eq!(raw.get_field_str(122), Some(original_sending_time.as_str()));
+        }
+    }
+
+    /// A stored FIX 4.0 or FIX 4.1 frame from before the session wrote
+    /// whole seconds, built by hand with the fields `resend_frame` reads.
+    fn legacy_frame(begin_string: &str, sending_time: &str, orig: Option<&str>) -> BytesMut {
+        let mut encoder = Encoder::new(begin_string);
+        encoder.put_str(35, "D");
+        encoder.put_str(49, "CLIENT");
+        encoder.put_str(56, "VENUE");
+        encoder.put_uint(34, 5);
+        if let Some(orig) = orig {
+            encoder.put_bool(43, true);
+            encoder.put_str(52, sending_time);
+            encoder.put_str(122, orig);
+        } else {
+            encoder.put_str(52, sending_time);
+        }
+        encoder.put_str(11, "ORDER-1");
+        built(into_frame(&mut encoder))
+    }
+
+    #[test]
+    fn test_resend_frame_narrows_a_stored_millisecond_time_at_whole_seconds() {
+        for begin_string in WHOLE_SECOND_VERSIONS {
+            // First resend: 122 comes from the stored 52, without its fraction.
+            let stored = legacy_frame(begin_string, "20260721-10:00:00.999", None);
+            let resent = match resend_frame(&stored, SendingTimePrecision::Seconds) {
+                Ok(frame) => frame,
+                Err(err) => panic!("a stored {begin_string} frame must rebuild: {err}"),
+            };
+            let raw = decode(&resent);
+            assert_whole_seconds(raw.get_field_str(52), begin_string);
+            // Truncated, as format_seconds truncates: never rounded up.
+            assert_eq!(raw.get_field_str(122), Some("20260721-10:00:00"));
+
+            // Resend of a resend: the existing 122 still wins over the prior
+            // replay's 52, and is narrowed the same way.
+            let stored = legacy_frame(
+                begin_string,
+                "20260721-11:30:45.500",
+                Some("20260721-09:15:30.250"),
+            );
+            let resent = match resend_frame(&stored, SendingTimePrecision::Seconds) {
+                Ok(frame) => frame,
+                Err(err) => panic!("a stored {begin_string} resend must rebuild: {err}"),
+            };
+            let raw = decode(&resent);
+            assert_eq!(raw.fields().filter(|field| field.tag == 122).count(), 1);
+            assert_eq!(raw.get_field_str(122), Some("20260721-09:15:30"));
+            assert_whole_seconds(raw.get_field_str(52), begin_string);
+            assert_eq!(raw.get_field_str(11), Some("ORDER-1"));
+        }
+    }
+
+    #[test]
+    fn test_resend_frame_copies_a_stored_time_verbatim_at_milliseconds() {
+        // FIX 4.2 and later accept both forms, so nothing is rewritten: a
+        // whole-second original stays whole seconds, a millisecond one stays
+        // milliseconds.
+        for stored_time in ["20260721-10:00:00", "20260721-10:00:00.999"] {
+            let stored = legacy_frame("FIX.4.4", stored_time, None);
+            let resent = match resend_frame(&stored, SendingTimePrecision::Millis) {
+                Ok(frame) => frame,
+                Err(err) => panic!("a stored FIX.4.4 frame must rebuild: {err}"),
+            };
+            let raw = decode(&resent);
+            assert_eq!(raw.get_field_str(122), Some(stored_time));
+            assert_millis(raw.get_field_str(52), "FIX.4.4");
+        }
+    }
+
+    #[test]
+    fn test_sending_time_precision_narrow_cuts_only_a_parsed_fraction() {
+        let seconds = SendingTimePrecision::Seconds;
+        // Every fraction length FIX defines loses its fraction.
+        for value in [
+            "20260721-10:00:00.1",
+            "20260721-10:00:00.123",
+            "20260721-10:00:00.123456",
+            "20260721-10:00:00.123456789",
+        ] {
+            assert_eq!(seconds.narrow(value), "20260721-10:00:00", "{value}");
+        }
+        // Already whole seconds: unchanged.
+        assert_eq!(seconds.narrow("20260721-10:00:00"), "20260721-10:00:00");
+        // A leap second keeps its 60.
+        assert_eq!(seconds.narrow("20261231-23:59:60.500"), "20261231-23:59:60");
+        // Not a UTCTimestamp, or not one the parser reads: copied as it is,
+        // never cut into a value that looks valid.
+        for value in [
+            "20261399-10:00:00.123",
+            "20260721-10:00:00.",
+            "20260721-10:00:00.12a",
+            "19691231-23:59:59.999",
+            "20260721T10:00:00.123",
+            "not a time at all.123",
+            "",
+        ] {
+            assert_eq!(seconds.narrow(value), value, "{value}");
+        }
+        // At milliseconds nothing is ever rewritten.
+        let millis = SendingTimePrecision::Millis;
+        for value in ["20260721-10:00:00", "20260721-10:00:00.123", "garbage"] {
+            assert_eq!(millis.narrow(value), value, "{value}");
+        }
     }
 
     #[test]
@@ -2547,6 +2916,28 @@ mod tests {
             guard_with(Duration::from_secs(120)).validate(&decode(&frame)),
             Ok(())
         );
+    }
+
+    #[test]
+    fn test_sending_time_guard_accepts_the_current_clock_in_whole_seconds() {
+        // What a FIX 4.0 or FIX 4.1 peer, IronFix included, now sends. The
+        // guard reads both forms whatever the session's version.
+        for begin_string in ["FIX.4.0", "FIX.4.1", "FIX.4.4"] {
+            let guard = SendingTimeGuard::new(
+                &config_for(begin_string).with_sending_time_tolerance(Duration::from_secs(120)),
+            );
+            for sending_time in [
+                Timestamp::now().format_seconds().as_str(),
+                Timestamp::now().format_millis().as_str(),
+            ] {
+                let frame = frame_sent_at(sending_time);
+                assert_eq!(
+                    guard.validate(&decode(&frame)),
+                    Ok(()),
+                    "{begin_string}: {sending_time}"
+                );
+            }
+        }
     }
 
     #[test]

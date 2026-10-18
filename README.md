@@ -134,7 +134,10 @@ engine wiring (#96) does not exist.
   `Connection::counterparty_default_appl_version`; no dictionary is selected
   by it. `HeartBtInt = 0` disables heartbeating (ask for it
   with `SessionConfigBuilder::disable_heartbeats`), and any inbound message
-  clears a pending TestRequest.
+  clears a pending TestRequest. `SendingTime` and `OrigSendingTime` are
+  written in whole seconds on FIX 4.0 and FIX 4.1 sessions, whose `time` type
+  has no fraction, and in milliseconds from FIX 4.2 on; inbound, both forms
+  are accepted on every version.
 - **Resend from store** in both roles. Attach a `MessageStore` with
   `Initiator::with_store`, `Acceptor::with_store` or `EngineBuilder::with_store`
   (`MemoryStore` in memory, or `FileStore`, a journal file that survives a
