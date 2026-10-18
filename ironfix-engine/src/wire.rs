@@ -700,6 +700,10 @@ impl ApplVersionProblem {
     #[must_use]
     pub(crate) fn reject_reason(&self) -> RejectReason {
         let code = match self {
+            // Reaches the wire only from an initiator in strict mode
+            // (`require_ack_default_appl_ver_id`): the acceptor answers a
+            // Logon without 1137 with a Logout alone, and by default the
+            // initiator accepts an ack without it.
             Self::Missing { .. } => 1,
             Self::Repeated { .. } => 13,
             Self::OutsideHeader { .. } => 14,
@@ -871,10 +875,11 @@ impl ApplVersionGuard {
     /// acknowledgement, and returns the version it declares.
     ///
     /// `required` is the acceptor's rule: 1137 is a required field of the
-    /// FIXT.1.1 Logon, so a Logon without it is refused. The initiator checks
-    /// an acknowledgement's 1137 only when present (issue #67), so an absent
-    /// one is `Ok(None)` there. On a FIX 4.x session nothing is checked and
-    /// the answer is `Ok(None)`.
+    /// FIXT.1.1 Logon, so a Logon without it is refused. The initiator passes
+    /// [`SessionConfig::require_ack_default_appl_ver_id`]: by default it
+    /// checks an acknowledgement's 1137 only when present (issue #67), so an
+    /// absent one is `Ok(None)` there, and in strict mode it requires it. On
+    /// a FIX 4.x session nothing is checked and the answer is `Ok(None)`.
     ///
     /// # Errors
     /// [`ApplVersionProblem::Missing`] when `required` and 1137 is absent,

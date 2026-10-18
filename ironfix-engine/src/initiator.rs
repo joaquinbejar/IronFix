@@ -823,13 +823,15 @@ impl<A: Application + 'static> Initiator<A> {
 
             // DefaultApplVerID (1137) on the ack: on a FIXT.1.1 session, a
             // 1137 the acceptor declares must name, once, an application
-            // version this session accepts. An ack without 1137 is accepted
-            // (issue #67: "when present"); its application messages without
-            // ApplVerID (1128) then count as this session's own version.
+            // version this session accepts. By default an ack without 1137
+            // is accepted (issue #67: "when present"); its application
+            // messages without ApplVerID (1128) then count as this session's
+            // own version. In strict mode
+            // (`require_ack_default_appl_ver_id`) a missing 1137 is refused.
             // Refused like the ack's other field problems: a Reject
-            // (reason 18, or 13 for a repeated 1137; RefTagID 1137) and a
-            // Logout.
-            match appl_version.check_logon(&raw, false) {
+            // (reason 18; 13 for a repeated 1137; 1 for a missing one in
+            // strict mode; RefTagID 1137) and a Logout.
+            match appl_version.check_logon(&raw, self.config.require_ack_default_appl_ver_id) {
                 Ok(Some(declared)) => tracing::debug!(
                     session = %session_id,
                     default_appl_version = %declared,

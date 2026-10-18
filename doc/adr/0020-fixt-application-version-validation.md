@@ -162,12 +162,21 @@ outbound traffic.
 
 ### Initiator: the ack's 1137 when present
 
-The initiator checks 1137 on the acknowledgement right after `from_admin`,
-with `required = false`: an ack without 1137 is accepted (issue #67: "check
-the 1137 echoed on the Logon ack when present"). A present 1137 that fails is
-refused like the ack's other field problems (108): a Reject (18, or 13 when
-repeated; `RefTagID` 1137) and a Logout, filed when a store is attached, and
-`connect` returns `EngineError::ApplVersion`.
+The initiator checks 1137 on the acknowledgement right after `from_admin`.
+By default an ack without 1137 is accepted (issue #67: "check the 1137 echoed
+on the Logon ack when present"). A present 1137 that fails is refused like the
+ack's other field problems (108): a Reject (18, or 13 when repeated; `RefTagID`
+1137) and a Logout, filed when a store is attached, and `connect` returns
+`EngineError::ApplVersion`.
+
+Strict mode, `SessionConfig::require_ack_default_appl_ver_id` (default
+`false`, added in review), makes the initiator hold the ack to FIXT.1.1's
+requirement: an ack without 1137 is refused with a Reject (reason 1, required
+tag missing, `RefTagID` 1137) and a Logout. The flag is read by a FIX 5.0
+initiator only; an acceptor always requires 1137, and a FIX 4.x Logon carries
+none, so it is valid, and inert, everywhere else. Reason 1 for a missing 1137
+reaches the wire only in strict mode: the acceptor answers a Logon without it
+with a Logout alone.
 
 ### In session: one path to `from_app`
 
@@ -189,14 +198,16 @@ calling `deliver_app` directly; the method's documentation says so.
 
 ## Deviations
 
-- **The initiator accepts an ack without 1137.** FIXT.1.1 makes 1137 required
-  on every Logon, the acknowledgement included. The issue asks the initiator
-  to check it "when present", and the plan follows the issue. What the
-  leniency gives up is small: the initiator declared its own version in its
-  Logon, an ack without 1137 leaves that declaration unanswered rather than
-  contradicted, and every application message that names another version in
-  1128 is still rejected in session. The acceptor, the side the issue requires
-  it of, refuses a Logon without it.
+- **By default the initiator accepts an ack without 1137.** FIXT.1.1 makes
+  1137 required on every Logon, the acknowledgement included. The issue asks
+  the initiator to check it "when present", and the default follows the issue;
+  strict mode (`require_ack_default_appl_ver_id`) restores the requirement for
+  a counterparty that should honour it. What the default gives up is small:
+  the initiator declared its own version in its Logon, an ack without 1137
+  leaves that declaration unanswered rather than contradicted, and every
+  application message that names another version in 1128 is still rejected
+  in session. The acceptor, the side the issue requires it of, refuses a Logon
+  without it.
 - **The issue placed the acceptor's step "after EncryptMethod".** The approved
   plan places it after `from_admin`, for the refusal-group reason above.
 
@@ -207,12 +218,16 @@ calling `deliver_app` directly; the method's documentation says so.
   struct), `SessionConfig::accepts_appl_version`,
   `SessionConfig::with_allowed_appl_versions`,
   `SessionConfigBuilder::allowed_appl_versions`;
+  `SessionConfig::require_ack_default_appl_ver_id` (a field),
+  `SessionConfig::with_require_ack_default_appl_ver_id`,
+  `SessionConfigBuilder::require_ack_default_appl_ver_id`;
   `SessionConfigError::UnusableApplVersion` and `EngineError::ApplVersion`
   (both enums `#[non_exhaustive]`). No existing item changes signature.
 - **Behaviour, FIX 5.0 sessions only:** an acceptor refuses a Logon whose 1137
   is missing, repeated, unknown or not accepted; an initiator refuses an ack
-  whose present 1137 is; an application message whose 1128 is not accepted is
-  rejected and not delivered. A FIX 5.0 peer that previously logged on with
+  whose present 1137 is (and, in strict mode, one without 1137); an
+  application message whose 1128 is not accepted, repeated in the header or
+  placed outside it is rejected and not delivered. A FIX 5.0 peer that previously logged on with
   another version, or none, is now refused. FIX 4.x sessions are unchanged.
 - **Not done:** no dictionary is selected by `ApplVerID`; the peer's default
   is not adopted for outbound messages; FIX 4.x over FIXT.1.1 (`ApplVerID` 2 to

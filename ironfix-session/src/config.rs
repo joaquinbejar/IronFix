@@ -38,6 +38,7 @@
 //! | `sender_sub_id` / `target_sub_id` | ASCII | unset, or 1..=[`MAX_ID_LEN`] bytes, printable ASCII except `=` | unset |
 //! | `sender_location_id` / `target_location_id` | ASCII | as above | unset |
 //! | `allowed_appl_versions` | [`FixVersion`] set | empty, or FIX.5.0 / FIX.5.0SP1 / FIX.5.0SP2 on a FIX 5.0 session | empty: the configured version only |
+//! | `require_ack_default_appl_ver_id` | flag | any; read by a FIX 5.0 initiator only | `false` |
 //! | `reset_on_*`, `validate_*` | flag | any | see [`SessionConfig::new`] |
 //!
 //! # `HeartBtInt` (108) is whole seconds
@@ -601,6 +602,23 @@ pub struct SessionConfig {
     /// with [`SessionConfigError::UnusableApplVersion`]. Duplicates are
     /// harmless.
     pub allowed_appl_versions: Vec<FixVersion>,
+    /// Whether an initiator requires `DefaultApplVerID` (1137) on the Logon
+    /// acknowledgement of a FIX 5.0 session (strict mode).
+    ///
+    /// FIXT.1.1 makes 1137 a required field of every Logon, the
+    /// acknowledgement included, but by default the initiator checks the
+    /// acknowledgement's 1137 only when present, so an acceptor that omits it
+    /// is still accepted. With this flag set, an acknowledgement without 1137
+    /// fails the handshake with a session Reject (`SessionRejectReason` 1,
+    /// "required tag missing", `RefTagID` 1137) and a Logout. A present 1137
+    /// is checked the same way in either mode, against
+    /// [`SessionConfig::accepts_appl_version`].
+    ///
+    /// Range: any flag. Default: `false`. Read only by an initiator on a FIX
+    /// 5.0 session: an acceptor always requires 1137 on the Logon it
+    /// receives, and a FIX 4.x Logon carries no 1137, so the flag has no
+    /// effect there.
+    pub require_ack_default_appl_ver_id: bool,
 }
 
 impl SessionConfig {
@@ -645,6 +663,7 @@ impl SessionConfig {
             sender_location_id: None,
             target_location_id: None,
             allowed_appl_versions: Vec::new(),
+            require_ack_default_appl_ver_id: false,
         }
     }
 
@@ -748,6 +767,15 @@ impl SessionConfig {
         versions: impl IntoIterator<Item = FixVersion>,
     ) -> Self {
         self.allowed_appl_versions = versions.into_iter().collect();
+        self
+    }
+
+    /// Sets whether an initiator requires `DefaultApplVerID` (1137) on the
+    /// Logon acknowledgement of a FIX 5.0 session (strict mode). See
+    /// [`SessionConfig::require_ack_default_appl_ver_id`].
+    #[must_use]
+    pub const fn with_require_ack_default_appl_ver_id(mut self, require: bool) -> Self {
+        self.require_ack_default_appl_ver_id = require;
         self
     }
 
@@ -952,6 +980,8 @@ pub struct SessionConfigBuilder {
     target_location_id: Option<String>,
     /// Application versions accepted besides the configured one.
     allowed_appl_versions: Vec<FixVersion>,
+    /// Strict mode: require 1137 on the Logon acknowledgement.
+    require_ack_default_appl_ver_id: bool,
 }
 
 impl Default for SessionConfigBuilder {
@@ -974,6 +1004,7 @@ impl Default for SessionConfigBuilder {
             sender_location_id: None,
             target_location_id: None,
             allowed_appl_versions: Vec::new(),
+            require_ack_default_appl_ver_id: false,
         }
     }
 }
@@ -1153,6 +1184,15 @@ impl SessionConfigBuilder {
         self
     }
 
+    /// Sets whether an initiator requires `DefaultApplVerID` (1137) on the
+    /// Logon acknowledgement of a FIX 5.0 session (strict mode; default
+    /// `false`). See [`SessionConfig::require_ack_default_appl_ver_id`].
+    #[must_use = "builders do nothing unless .build() is called"]
+    pub const fn require_ack_default_appl_ver_id(mut self, require: bool) -> Self {
+        self.require_ack_default_appl_ver_id = require;
+        self
+    }
+
     /// Builds the configuration, validating every knob.
     ///
     /// # Errors
@@ -1214,6 +1254,7 @@ impl SessionConfigBuilder {
             sender_location_id: self.sender_location_id,
             target_location_id: self.target_location_id,
             allowed_appl_versions: self.allowed_appl_versions,
+            require_ack_default_appl_ver_id: self.require_ack_default_appl_ver_id,
         };
         config.validate()?;
         Ok(config)
@@ -1929,6 +1970,20 @@ mod tests {
         let cleared = set.with_allowed_appl_versions([]);
         assert!(cleared.allowed_appl_versions.is_empty());
         assert!(!cleared.accepts_appl_version(FixVersion::Fix50Sp2));
+    }
+
+    #[test]
+    fn test_require_ack_default_appl_ver_id_defaults_to_false_and_is_settable() {
+        assert!(!config().require_ack_default_appl_ver_id);
+        assert!(!built(fixt_required()).require_ack_default_appl_ver_id);
+        assert!(
+            built(fixt_required().require_ack_default_appl_ver_id(true))
+                .require_ack_default_appl_ver_id
+        );
+        let strict = config().with_require_ack_default_appl_ver_id(true);
+        assert!(strict.require_ack_default_appl_ver_id);
+        // Any flag is valid: it is read by a FIX 5.0 initiator only.
+        assert_eq!(strict.validate(), Ok(()));
     }
 
     #[test]

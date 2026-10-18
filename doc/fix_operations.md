@@ -87,10 +87,12 @@ and stops at the first failure:
    session Reject with reason 18 (Invalid/Unsupported Application
    Version), a repeated 1137 one with reason 13, `RefTagID` = 1137 in both
    cases, followed by a Logout; the handshake fails with
-   `EngineError::ApplVersion`. An ack **without** 1137 is accepted: the
-   initiator checks the acknowledgement's 1137 only when present (issue #67),
-   although FIXT.1.1 makes it required on every Logon. A FIX 4.x ack is not
-   checked.
+   `EngineError::ApplVersion`. By default an ack **without** 1137 is
+   accepted: the initiator checks the acknowledgement's 1137 only when present
+   (issue #67), although FIXT.1.1 makes it required on every Logon. Strict mode
+   (`SessionConfig::require_ack_default_appl_ver_id`, default `false`) requires
+   it: an ack without 1137 then draws a Reject with reason 1 (required tag
+   missing), `RefTagID` = 1137, and a Logout. A FIX 4.x ack is not checked.
 6. **`HeartBtInt` (108).** 108 is a *required* field of the Logon, so an ack
    that omits it (session Reject, reason 1 — required tag missing) or carries a
    non-numeric value (session Reject, reason 6 — incorrect data format for
@@ -809,7 +811,7 @@ FIX 4.x session (which carries no `ApplVerID` to reject).
 
 | Code | Emitted when |
 |---|---|
-| 1 | `SequenceReset` without `NewSeqNo` (36); `ResendRequest` without `BeginSeqNo` (7) or `EndSeqNo` (16); inbound `SendingTime` (52) absent |
+| 1 | `SequenceReset` without `NewSeqNo` (36); `ResendRequest` without `BeginSeqNo` (7) or `EndSeqNo` (16); inbound `SendingTime` (52) absent; FIX 5.0, initiator in strict mode only: a Logon acknowledgement without `DefaultApplVerID` (1137), `RefTagID` = 1137, followed by a Logout |
 | 5 | `SequenceReset` whose `NewSeqNo` would rewind or fails to advance; `ResendRequest` whose range is outside what we have sent |
 | 6 | `SequenceReset` with a malformed `GapFillFlag` (123) that is present but neither `Y` nor `N`; inbound `SendingTime` (52) present but not a `UTCTimestamp` |
 | 9 | Inbound `SenderCompID`/`TargetCompID` (and `SenderSubID`/`TargetSubID` when configured) do not match the session configuration, **or** appear outside the standard header |
@@ -1759,7 +1761,7 @@ and are refused as unknown. Both are reason 18.
 | Where | Rule | Refusal |
 |---|---|---|
 | Acceptor, inbound Logon | 1137 required, once, naming an accepted version | Logout with the reason and the accepted versions, after `from_admin` (filed when a store is attached; never resets it); `EngineError::ApplVersion` |
-| Initiator, Logon ack | 1137, when present, once and naming an accepted version | Reject (18, or 13 when repeated; `RefTagID` 1137) and Logout; `EngineError::ApplVersion` |
+| Initiator, Logon ack | 1137, when present (required in strict mode, `require_ack_default_appl_ver_id`), once and naming an accepted version | Reject (18; 13 when repeated; 1 when missing in strict mode; `RefTagID` 1137) and Logout, filed when a store is attached; `EngineError::ApplVersion` |
 | Both roles, in session | 1128 on an application message, when present, in the standard header, once, naming an accepted version | Reject (18; 13 when repeated in the header; 14 when outside it; `RefTagID` 1128; `RefApplVerID` (1130) = the code, on an 18 for a code that names a version); the number is consumed and persisted, `from_app` is not called, the session stays up |
 
 1128 is a standard-header field (`FIXT11.xml`), so it is read positionally,

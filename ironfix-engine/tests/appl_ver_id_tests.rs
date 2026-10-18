@@ -723,6 +723,63 @@ async fn test_initiator_accepts_an_ack_without_or_with_its_own_default_appl_ver_
     }
 }
 
+/// Strict mode (`require_ack_default_appl_ver_id`): an acknowledgement
+/// without `DefaultApplVerID` is refused with a Reject (373 = 1, required tag
+/// missing; 371 = 1137) and a Logout, and one declaring the session's own
+/// version is still accepted.
+#[tokio::test]
+async fn test_initiator_strict_mode_requires_default_appl_ver_id_on_the_ack() {
+    let strict = || client_config("FIX.5.0SP2").with_require_ack_default_appl_ver_id(true);
+
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let mut framed = fixt_venue_ack(listener, &[]).await;
+        let reject = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&reject), "3");
+        assert_eq!(field(&reject, 45).as_deref(), Some("1"));
+        assert_eq!(field(&reject, 372).as_deref(), Some("A"));
+        assert_eq!(field(&reject, 373).as_deref(), Some("1"));
+        assert_eq!(field(&reject, 371).as_deref(), Some("1137"));
+        let logout = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logout), "5");
+    });
+    let (client_app, _rx) = RecordingApp::new();
+    let result = Initiator::new(strict(), Arc::clone(&client_app))
+        .connect(addr)
+        .await;
+    assert_appl_version_refusal(&result, &["DefaultApplVerID (1137)", "missing"]);
+    assert!(!client_app.logged_on());
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let mut framed = fixt_venue_ack(listener, &[(1137, "9")]).await;
+        assert_silent(&mut framed, "no Reject or Logout follows the ack").await;
+        framed
+    });
+    let (client_app, _rx) = RecordingApp::new();
+    let _connection = ok(
+        Initiator::new(strict(), Arc::clone(&client_app))
+            .connect(addr)
+            .await,
+        "strict mode accepts an ack declaring the session's own version",
+    );
+    assert!(client_app.logged_on());
+    let _framed = ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // In session: ApplVerID (1128) on inbound application messages
 // ---------------------------------------------------------------------------
