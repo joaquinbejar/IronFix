@@ -11,7 +11,7 @@
 //!   the view generator has to get right (see its docs).
 //! - `fix44_order_dictionary`: the embedded FIX 4.4 dictionary with only
 //!   Heartbeat (0), Logon (A) and NewOrderSingle (D) kept. The full FIX 4.4
-//!   views are about 4.2 MB, too large to commit; every FIX 4.4 component,
+//!   views are about 5.2 MB, too large to commit; every FIX 4.4 component,
 //!   field and the header are kept, so these three messages generate exactly
 //!   as they do from the full dictionary.
 //! - the embedded FIXT 1.1 dictionary, in full.

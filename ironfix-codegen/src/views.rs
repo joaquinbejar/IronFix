@@ -3166,8 +3166,10 @@ mod tests {
 
     #[test]
     fn test_generate_views_for_every_embedded_dictionary() {
-        // FIX 4.4 views are about 4.2 MB and FIX 5.0 SP2 views about 26 MB:
-        // generated and inspected here, compiled out of tree (see ADR-0012).
+        // FIX 4.4 views are about 5.2 MB and FIX 5.0 SP2 views about 31 MB:
+        // generated and inspected here. ironfix-codegen-check compiles the
+        // FIX 4.4 views; the FIX 5.0 SP2 views are compiled out of tree only
+        // (see ADR-0012 and ADR-0019).
         for dict in [
             embedded(Dictionary::fix44()),
             embedded(Dictionary::fix42()),

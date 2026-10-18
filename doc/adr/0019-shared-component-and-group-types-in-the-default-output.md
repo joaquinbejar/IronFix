@@ -66,12 +66,19 @@ The constraints:
 - A group is one field `::std::vec::Vec<Entry>` (in an `Option` unless the
   group is required), and its entry struct is generated once, next to the
   declaring owner: `<DeclaringOwner><GroupName>Entry`, the views'
-  per-definition base followed by `Entry`. The owner is the message's or component's type
-  name, or for a group nested in an entry, the enclosing entry's base:
-  `NewOrderSingleNoAllocsEntry`, `PartiesNoPartyIDsEntry`,
-  `NewOrderSingleNoAllocsNoNestedPartyIDsEntry`. The data struct of the group
-  whose view is `PartiesNoPartyIDsView` is `PartiesNoPartyIDsEntry`. A
-  collision takes a numeric suffix after the base (`XNoA2Entry`).
+  per-definition base followed by `Entry`. The owner is the message's or
+  component's type name, or for a group nested in an entry, the enclosing
+  entry's base: `NewOrderSingleNoAllocsEntry`, `PartiesNoPartyIDsEntry`,
+  `NewOrderSingleNoAllocsNoNestedPartyIDsEntry`. A collision takes a
+  numeric suffix after the base (`XNoA2Entry`).
+- Absent a name collision, the two outputs pair by name: the data struct of
+  the group whose view is `PartiesNoPartyIDsView` is
+  `PartiesNoPartyIDsEntry`. Each output settles a collision in its own
+  namespaces (the views put messages and groups in one, the data structs
+  keep messages and components apart), so a suffix can differ between them.
+  None of the four embedded dictionaries has a collision; a test asserts,
+  for each, that the entry structs and the group views have exactly the same
+  bases.
 
 **Members in XML order.** Each struct lists its members as `members()` gives
 them, a component as one field in its place. FIX 4.4 `PreAllocGrp`'s
@@ -99,7 +106,17 @@ Rust could compile `A -> group -> A` through the `Vec`, but the loader
 rejects it as `DictionaryError::ComponentCycle` and so do the views), and
 nesting past `MAX_NESTING_DEPTH`. The second pass builds the structs and
 reports undefined fields (now scoped to the component or entry that lists
-them) and unnameable items, `what: "component"` included.
+them) and unnameable items, `what: "component"` included. Depth and name
+suffix counters use checked arithmetic and end in a typed error.
+
+The first pass expands each component once, so the nesting depth is checked
+along the first path that reaches a component, not along every path: a
+component reached first near the top and later from deep inside another
+component is not expanded again from there. The views expand components in
+place along every path, so a dictionary can pass `generate` and still fail
+`generate_views` with `GeneratorError::MaxDepthExceeded`. Both stay
+bounded, and the loader already rejects component chains deeper than
+`MAX_COMPONENT_DEPTH` in XML.
 
 **Unchanged.** `GeneratorConfig` keeps its fields. `generate_components:
 false` still drops components: no `components` module and no component field
@@ -171,13 +188,19 @@ embedded dictionaries and the Orchestra fixture.
   `fixt11.rs`, `std_names.rs`) were regenerated and still compile in
   `ironfix-codegen`'s tests; the sample dictionary gained shared components
   (one optional and one required reference), a component inside a component,
-  and a group nested in a component's group through a further component. The
-  views goldens did not change.
+  and a group nested in a component's group through a further component.
+  The standard-names fixture gained two components, `Vec` and `String`,
+  named like standard types and like two of its messages (`String` holds
+  `Vec`); its default output compiles and builds them, and its views golden
+  gained the component's field. The other views goldens did not change.
 - **Not covered.** The data structs still carry no encode or decode (that is
   the views and writers of ADR-0012); a field FIX makes conditionally required
   is not enforced; a tag a message reaches twice (listed on the message and
   inside one of its components) is a field of each struct, and nothing decides
-  which one a wire value belongs to.
+  which one a wire value belongs to. None of the four embedded dictionaries
+  has such a tag: a test asserts that no message body and no group entry of
+  FIX 4.2, FIX 4.4, FIXT 1.1 or FIX 5.0 SP2 reaches a tag twice, through its
+  own fields and its components together.
 - **Unchanged.** No new dependency, no `unsafe`, and the crate DAG is as
   before: `ironfix-codegen` depends on `ironfix-dictionary` only; the
   generated code names `rust_decimal` only at the consumer.

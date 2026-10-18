@@ -161,8 +161,9 @@ exists yet.
   `make lint` and `make doc`; golden files (a sample, FIXT 1.1, and FIX 4.4
   Heartbeat, Logon and NewOrderSingle) are exercised against real frames in
   `ironfix-codegen/tests/generated_views.rs`. The FIX 5.0 SP2 views (about
-  26 MB) were checked with clippy out of tree only
-  (`doc/adr/0012-generated-views-enums-and-writers.md`).
+  31 MB) were checked with clippy out of tree only
+  (`doc/adr/0012-generated-views-enums-and-writers.md`; why they stay out of
+  CI: `doc/adr/0019-shared-component-and-group-types-in-the-default-output.md`).
 - **FAST primitives** in `ironfix-fast`: stop-bit encode/decode of unsigned
   and signed integers, ASCII strings and byte vectors, each in nullable and
   non-nullable form, plus presence maps, all round-trip tested. The `Operator`

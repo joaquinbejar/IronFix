@@ -1,6 +1,6 @@
 [package]
 name = "ironfix-codegen-check"
-description = "Compiles the ironfix-codegen views of embedded dictionaries under the workspace lints (not published)"
+description = "Compiles the ironfix-codegen data definitions and views of embedded dictionaries under the workspace lints (not published)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -11,14 +11,16 @@ homepage.workspace = true
 # `make publish-all` (PUBLISH_ORDER) and the semver matrix.
 publish = false
 
-# The crates the generated views name.
+# The crates the generated code names: rust_decimal for both outputs,
+# ironfix-core and ironfix-dictionary for the views.
 [dependencies]
 ironfix-core.workspace = true
 ironfix-dictionary.workspace = true
 rust_decimal.workspace = true
 
-# build.rs generates the views from the embedded dictionaries, and both
-# outputs from the FIX 4.4 Orchestra test fixture.
+# build.rs generates the data definitions of the four embedded dictionaries,
+# the views of FIX 4.4, FIX 4.2 and FIXT 1.1, and both outputs from the
+# FIX 4.4 Orchestra test fixture.
 [build-dependencies]
 ironfix-codegen.workspace = true
 ironfix-dictionary.workspace = true

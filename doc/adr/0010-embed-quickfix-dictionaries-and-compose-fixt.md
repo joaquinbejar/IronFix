@@ -171,6 +171,12 @@ constructor.
   dictionaries. The full FIX 4.2 and FIXT 1.1 outputs are compiled in-repo as
   golden files; the FIX 5.0 SP2 output (about 50 MB) is generated and inspected
   in a unit test but not compiled.
+
+  > **Amended by ADR-0019 (#98), 2026-10-18.** The default output no longer
+  > copies components into every message: the FIX 5.0 SP2 output is now
+  > about 2.4 MB (1,438 structs, against 56.8 MB and 26,083 structs just
+  > before #98), and `ironfix-codegen-check` compiles it in full, with the
+  > FIX 4.4, FIX 4.2 and FIXT 1.1 outputs, under the workspace lints.
 - **Not done, stated rather than implied.** FIX 4.0, 4.1, 4.3, 5.0 and 5.0 SP1
   are not embedded (a caller-supplied dictionary of any of them composes with
   the embedded FIXT 1.1; FIX 4.4 over FIXT.1.1 is tested with the embedded
