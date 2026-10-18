@@ -243,6 +243,16 @@ members (`EmptyGroup`), ids that are not positive or do not fit a `u32`
 values past theirs (`TooManyFieldValues`), and truncated or ill-formed XML
 are each a typed error, with a unit test.
 
+Outside the root element the loader accepts only what XML 1.0 allows
+there: whitespace, comments, processing instructions, the XML declaration
+(first in the document) and one document type declaration (before the
+root; quick-xml does not process it, so it declares no entity the loader
+expands). Text, a CDATA section, a reference or a second element before or
+after the root is `Xml`, so a truncated, concatenated or corrupted
+repository is not read from its first part (issue #117). The QuickFIX
+loader applies the same check (`src/document.rs`), and also requires its
+root to be `<fix>` and closed.
+
 **Fixture.** The FIX Trading Community's `FIX Standard/OrchestraFIX44.xml` at
 commit `cd24169a2abd8daba7c360987c7a46ca11873a12` (FIX 4.4 as of Extension
 Pack 311), Apache-2.0, is vendored verbatim under

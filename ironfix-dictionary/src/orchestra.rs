@@ -109,11 +109,15 @@
 //! Dangling and duplicate ids (a code's id included, within its code set),
 //! group cycles, unknown datatypes and code sets, groups without a count
 //! field, empty groups, ids that do not fit a `u32`, oversized names and
-//! attributes (a section's own attributes included) and truncated XML are
+//! attributes (a section's own attributes included), truncated XML, and
+//! content outside the root element other than whitespace, comments,
+//! processing instructions, the XML declaration and a document type
+//! declaration (text, a CDATA section, a reference, a second element) are
 //! each a typed error. Every `base` group is checked, referenced or not: its
 //! count field and every id it references resolve, and the groups it nests
 //! form no cycle and no chain deeper than a message can hold.
 
+use crate::document::{Prolog, epilog};
 use crate::loader::{
     Assembly, ComponentIrs, DefinitionKind, DictionaryError, Item, MAX_COMPONENT_DEPTH,
     MAX_NESTING_DEPTH, MessageIr, assemble,
@@ -1060,8 +1064,12 @@ impl<'i> Parser<'i> {
         Ok(raw)
     }
 
-    /// Reads the root element, which must be an Orchestra `repository`.
+    /// Reads the prolog and the root element, which must be an Orchestra
+    /// `repository`. The prolog may hold only what XML allows there
+    /// ([`Prolog`]): whitespace, comments, processing instructions, the XML
+    /// declaration first and one document type declaration.
     fn root(&mut self) -> Result<Child<'i>, DictionaryError> {
+        let mut prolog = Prolog::default();
         loop {
             let (namespace, event) = self.reader.read_resolved_event().map_err(xml_err)?;
             let found = match &namespace {
@@ -1072,7 +1080,10 @@ impl<'i> Parser<'i> {
                 Event::Start(start) => (start, false),
                 Event::Empty(start) => (start, true),
                 Event::Eof => return Err(eof()),
-                _ => continue,
+                other => {
+                    prolog.accept(&other)?;
+                    continue;
+                }
             };
             check_element(&start)?;
             let ours = found.as_deref() == Some(ORCHESTRA_NAMESPACE);
@@ -1090,18 +1101,16 @@ impl<'i> Parser<'i> {
         }
     }
 
-    /// Reads past the root element: only comments, whitespace and processing
-    /// instructions may follow it.
+    /// Reads past the root element to the end of the document: only
+    /// whitespace, comments and processing instructions may follow it
+    /// ([`epilog`]), so text, a CDATA section, a reference or a second
+    /// element there is an error, not a repository read from part of the
+    /// document.
     fn rest(&mut self) -> Result<(), DictionaryError> {
         loop {
             match self.reader.read_event().map_err(xml_err)? {
                 Event::Eof => return Ok(()),
-                Event::Start(_) | Event::Empty(_) | Event::End(_) => {
-                    return Err(DictionaryError::Xml(
-                        "content after the root element".to_owned(),
-                    ));
-                }
-                _ => {}
+                event => epilog(&event)?,
             }
         }
     }
@@ -2971,6 +2980,69 @@ mod tests {
             Doc::default().xml()
         );
         assert!(matches!(load_err(&after), DictionaryError::Xml(_)));
+    }
+
+    #[test]
+    fn test_content_outside_the_repository_is_rejected() {
+        let xml = Doc::default().xml();
+        let xml_error = |message: &str| DictionaryError::Xml(message.to_owned());
+        // Issue #117: text after the root was read past, and the repository
+        // loaded from the document's first part.
+        assert_eq!(
+            load_err(&format!("{xml}TRAILING_CORRUPTION")),
+            xml_error("text `TRAILING_CORRUPTION` after the root element")
+        );
+        assert_eq!(
+            load_err(&format!("{xml}<other/>")),
+            xml_error("an element <other> after the root element")
+        );
+        assert_eq!(
+            load_err(&format!("{xml}<![CDATA[x]]>")),
+            xml_error("a CDATA section after the root element")
+        );
+        assert_eq!(
+            load_err(&format!("{xml}&amp;")),
+            xml_error("the reference `&amp;` after the root element")
+        );
+        assert_eq!(
+            load_err(&format!("{xml}<!DOCTYPE repository>")),
+            xml_error("a document type declaration after the root element")
+        );
+        // The prolog: before the declaration, then between it and the root.
+        assert_eq!(
+            load_err(&format!("JUNK{xml}")),
+            xml_error("text `JUNK` before the root element")
+        );
+        let (declaration, rest) = some(xml.split_once('\n'), "the document has two lines");
+        assert_eq!(
+            load_err(&format!("{declaration}\nJUNK\n{rest}")),
+            xml_error("text `JUNK` before the root element")
+        );
+        assert_eq!(
+            load_err(&format!(" {xml}")),
+            xml_error("an XML declaration that does not start the document")
+        );
+        assert_eq!(
+            load_err("<!-- no root -->"),
+            xml_error("unexpected end of file")
+        );
+    }
+
+    #[test]
+    fn test_misc_outside_the_repository_is_accepted() {
+        let xml = Doc::default().xml();
+        let (declaration, rest) = some(xml.split_once('\n'), "the document has two lines");
+        let padded = format!(
+            "{declaration}\n<!-- before -->\n<?pi before?>\n<!DOCTYPE repository>\n{rest}\
+             \n<!-- after -->\n<?pi after?>\n \t\r\n"
+        );
+        let import = load(&padded);
+        assert_eq!(import.dictionary().version, Version::Fix44);
+        assert!(import.report().is_empty(), "{:?}", import.report());
+        assert!(import.dictionary().get_message("D").is_some());
+        // Without a declaration, whitespace may lead the document.
+        let undeclared = format!("\n  {rest}");
+        assert!(load(&undeclared).dictionary().get_message("D").is_some());
     }
 
     #[test]

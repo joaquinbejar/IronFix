@@ -17,8 +17,8 @@
 //! below with its cause.
 
 use ironfix_dictionary::{
-    Dictionary, FieldType, MemberRef, MessageCategory, OrchestraImport, UnmappedConstruct,
-    Validator, Version,
+    Dictionary, DictionaryError, FieldType, MemberRef, MessageCategory, OrchestraImport,
+    UnmappedConstruct, Validator, Version,
 };
 use ironfix_tagvalue::Decoder;
 use std::collections::{BTreeMap, BTreeSet};
@@ -488,4 +488,52 @@ fn test_orchestra_fix44_session_messages_are_admin() {
         .collect();
     assert_eq!(admin, expected);
     assert!(admin.contains("A") && admin.contains("0") && admin.contains("5"));
+}
+
+/// Issue #117: the repository with text after (or before) its root element
+/// is corrupted, not a repository to read up to the root's end tag.
+#[test]
+fn test_orchestra_fix44_with_text_outside_the_root_is_rejected() {
+    let corrupted = format!("{ORCHESTRA_FIX44}TRAILING_CORRUPTION");
+    assert_eq!(
+        Dictionary::from_orchestra_xml(&corrupted).err(),
+        Some(DictionaryError::Xml(
+            "text `TRAILING_CORRUPTION` after the root element".to_owned()
+        ))
+    );
+    let prefixed = format!("TRAILING_CORRUPTION{ORCHESTRA_FIX44}");
+    assert_eq!(
+        Dictionary::from_orchestra_xml(&prefixed).err(),
+        Some(DictionaryError::Xml(
+            "text `TRAILING_CORRUPTION` before the root element".to_owned()
+        ))
+    );
+    // Two copies, back to back: the second starts with its declaration.
+    let concatenated = format!("{ORCHESTRA_FIX44}\n{ORCHESTRA_FIX44}");
+    assert_eq!(
+        Dictionary::from_orchestra_xml(&concatenated).err(),
+        Some(DictionaryError::Xml(
+            "an XML declaration after the root element".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn test_orchestra_fix44_followed_by_comments_and_whitespace_loads() {
+    let padded = format!("{ORCHESTRA_FIX44}\n<!-- trailing comment -->\n<?pi trailing?>\n \t\r\n");
+    let import = ok(
+        Dictionary::from_orchestra_xml(&padded),
+        "the repository followed by comments and whitespace loads",
+    );
+    let plain = orchestra();
+    assert_eq!(import.dictionary().version, Version::Fix44);
+    assert_eq!(
+        import.dictionary().fields.len(),
+        plain.dictionary().fields.len()
+    );
+    assert_eq!(
+        import.dictionary().messages.len(),
+        plain.dictionary().messages.len()
+    );
+    assert_eq!(import.report(), plain.report());
 }
