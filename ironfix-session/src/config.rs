@@ -606,8 +606,8 @@ pub struct SessionConfig {
     /// `begin_string` is one of them. A FIX 4.x session carries neither field,
     /// so a set there, or a set naming a version without an `ApplVerID` code
     /// (FIX 4.x, bare FIXT.1.1), is refused by [`SessionConfig::validate`]
-    /// with [`SessionConfigError::UnusableApplVersion`]. Duplicates are
-    /// harmless.
+    /// with [`SessionConfigError::UnusableApplVersion`]. It is a set held in
+    /// a `Vec`: duplicates are harmless and order is irrelevant.
     pub allowed_appl_versions: Vec<FixVersion>,
     /// Whether an initiator requires `DefaultApplVerID` (1137) on the Logon
     /// acknowledgement of a FIX 5.0 session (strict mode).
