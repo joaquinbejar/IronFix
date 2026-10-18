@@ -313,6 +313,14 @@ pub enum DictionaryError {
         /// The limit, in bytes.
         limit: usize,
     },
+    /// Copying an Orchestra repository's code sets onto the fields that name
+    /// them would produce more enumeration values than the loader accepts
+    /// ([`MAX_ORCHESTRA_FIELD_VALUES`](crate::orchestra::MAX_ORCHESTRA_FIELD_VALUES)).
+    #[error("the fields' enumerations hold more than {limit} values")]
+    TooManyFieldValues {
+        /// The limit, in values over every field.
+        limit: usize,
+    },
     /// An Orchestra repository holds more constructs the dictionary cannot
     /// hold than the report accepts
     /// ([`MAX_ORCHESTRA_REPORT_ENTRIES`](crate::orchestra::MAX_ORCHESTRA_REPORT_ENTRIES)).

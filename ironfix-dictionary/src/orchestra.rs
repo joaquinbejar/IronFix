@@ -38,7 +38,9 @@
 //! Members keep the order the repository lists them in. A group's delimiter
 //! is its first member, as in QuickFIX. A component that the standard header
 //! or trailer references is expanded in place, because the dictionary keeps
-//! the envelope as fields and groups.
+//! the envelope as fields and groups; when the reference is optional, its
+//! members become optional too (a group's entries keep their own required
+//! members).
 //!
 //! Only the `base` scenario is loaded. Two versions are
 //! [`DictionaryError::UnsupportedVersion`]: `FIX.Latest`, which names no
@@ -99,13 +101,18 @@
 //! - [`MAX_ORCHESTRA_MEMBERS`] bounds the members group expansion produces.
 //!   Orchestra groups are definitions referenced by id, and the dictionary
 //!   holds a group inline at each reference, so a few hundred bytes of nested
-//!   references could otherwise expand exponentially.
+//!   references could otherwise expand exponentially;
+//! - [`MAX_ORCHESTRA_FIELD_VALUES`] bounds the enumeration values the fields
+//!   hold together: every field naming a code set holds its own copy of the
+//!   values.
 //!
-//! Dangling and duplicate ids, group cycles, unknown datatypes and code sets,
-//! groups without a count field, empty groups, ids that do not fit a `u32`,
-//! oversized names and attributes and truncated XML are each a typed error.
-//! Every `base` group is checked (its count field and every id it
-//! references resolve), referenced or not.
+//! Dangling and duplicate ids (a code's id included, within its code set),
+//! group cycles, unknown datatypes and code sets, groups without a count
+//! field, empty groups, ids that do not fit a `u32`, oversized names and
+//! attributes (a section's own attributes included) and truncated XML are
+//! each a typed error. Every `base` group is checked, referenced or not: its
+//! count field and every id it references resolve, and the groups it nests
+//! form no cycle and no chain deeper than a message can hold.
 
 use crate::loader::{
     Assembly, ComponentIrs, DefinitionKind, DictionaryError, Item, MAX_COMPONENT_DEPTH,
@@ -150,6 +157,15 @@ pub const MAX_ORCHESTRA_NAME_LEN: usize = 255;
 /// The FIX 4.4 standard repository needs 41.
 pub const MAX_ORCHESTRA_REPORT_ENTRIES: usize = 1 << 16;
 
+/// Maximum number of enumeration values the loaded fields may hold together:
+/// 131 072.
+///
+/// A field naming a code set holds its own copy of the set's values
+/// ([`FieldDef::values`]), so a code set named by many fields is copied once
+/// per field; every copy counts. FIX Latest as of Extension Pack 312 needs
+/// 27 103; FIX 4.4 needs 2 371.
+pub const MAX_ORCHESTRA_FIELD_VALUES: usize = 1 << 17;
+
 /// Maximum number of members group expansion may produce: 262 144.
 ///
 /// Every field, component and group reference the loaded definitions hold
@@ -168,6 +184,16 @@ const TRAILER: &str = "StandardTrailer";
 
 /// Message category of the session-level (admin) messages.
 const ADMIN_CATEGORY: &str = "Session";
+
+/// The repository sections the loader maps.
+const MAPPED_SECTIONS: [&str; 6] = [
+    "datatypes",
+    "codeSets",
+    "fields",
+    "components",
+    "groups",
+    "messages",
+];
 
 /// Attributes that describe rather than constrain: pedigree, naming,
 /// grouping and documentation links. Ignored without a report entry.
@@ -474,7 +500,7 @@ impl Dictionary {
     /// `FIXT.1.1`), holds a dangling, duplicate or invalid id, a group or
     /// component cycle, a datatype or code set that maps to no FIX data type,
     /// a group without a count field or without members, or exceeds one of
-    /// the size, length, report and depth limits.
+    /// the size, length, report, field-value and depth limits.
     pub fn from_orchestra_xml(xml: &str) -> Result<OrchestraImport, DictionaryError> {
         if xml.len() > MAX_ORCHESTRA_DOCUMENT_LEN {
             return Err(DictionaryError::DocumentTooLarge {
@@ -1009,6 +1035,13 @@ impl<'i> Parser<'i> {
                     self.other(&child, "repository")?;
                     continue;
                 }
+                // A mapped section's own attributes are read like any
+                // element's: bounded, and reported unless descriptive
+                // (`latestEP`, `xml:base`), self-closing sections included.
+                let section = child.local();
+                if MAPPED_SECTIONS.contains(&section) {
+                    Attrs::read(&child.start)?.report_rest(section, &mut self.report)?;
+                }
                 match child.local() {
                     "datatypes" => self.datatypes(&child, &mut raw)?,
                     "codeSets" => self.code_sets(&child, &mut raw)?,
@@ -1143,13 +1176,17 @@ impl<'i> Parser<'i> {
             return Ok(codes);
         }
         let set_location = format!("code set {set}");
+        // The ids of the set's `base` codes: unique within the set, as the
+        // ids of every other kind of definition are (a code in another
+        // scenario may reuse a `base` code's id).
+        let mut ids = HashSet::new();
         while let Some(child) = self.next_child()? {
             if !child.is("code") {
                 self.other(&child, &set_location)?;
                 continue;
             }
             let mut attrs = Attrs::read(&child.start)?;
-            attrs.id("code")?;
+            let id = attrs.id("code")?;
             let name = attrs.required("code", "name")?;
             let value = attrs.required("code", "value")?;
             let scenario = attrs.take("scenario");
@@ -1163,6 +1200,12 @@ impl<'i> Parser<'i> {
                     scenario,
                 })?;
                 continue;
+            }
+            if !ids.insert(id) {
+                return Err(DictionaryError::DuplicateOrchestraDefinition {
+                    kind: OrchestraKind::Code,
+                    key: format!("{set} id {id}"),
+                });
             }
             codes.push((value, name));
         }
@@ -1648,7 +1691,21 @@ impl Expander<'_> {
                         });
                     }
                     if scope == Scope::Envelope {
-                        items.extend(self.envelope_component(component)?);
+                        let mut expanded = self.envelope_component(component)?;
+                        // An optional block's members are only required when
+                        // the block is there: expanded in place, they take
+                        // its presence. Members of a group's entries keep
+                        // theirs (they are required per entry).
+                        if !member.required {
+                            for item in &mut expanded {
+                                match item {
+                                    Item::Field { required, .. }
+                                    | Item::Group { required, .. }
+                                    | Item::Component { required, .. } => *required = false,
+                                }
+                            }
+                        }
+                        items.extend(expanded);
                     } else {
                         items.push(Item::Component {
                             name: component.name.clone(),
@@ -1773,6 +1830,87 @@ fn by_id<T>(
     Ok(map)
 }
 
+/// Traversal state of a group during [`check_group_graph`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupVisit {
+    /// On the current path: reaching it again is a cycle.
+    InProgress,
+    /// Checked, with the length of its longest chain of nested groups,
+    /// itself included.
+    Done(usize),
+}
+
+/// The longest chain of nested groups a message's group may start: the
+/// message is level 1 of [`MAX_NESTING_DEPTH`], as in the QuickFIX loader.
+const MAX_GROUP_CHAIN: usize = MAX_NESTING_DEPTH - 1;
+
+/// Rejects a cycle of group references and a chain of nested groups no
+/// message could hold, over every `base` group, referenced or not.
+///
+/// Depth-first from every group, in document order, with each group's chain
+/// length memoised, so the walk is linear in the group references (a group
+/// referenced twice by each of its parents is still checked once) and its
+/// recursion is bounded by [`MAX_GROUP_CHAIN`]. Groups are linked by
+/// `groupRef` only: a component a group references is expanded on its own,
+/// and its cycles are the shared component check's.
+///
+/// # Errors
+/// [`DictionaryError::GroupCycle`] for a cycle,
+/// [`DictionaryError::NestingTooDeep`] for a chain past [`MAX_GROUP_CHAIN`].
+fn check_group_graph(raw: &Raw, groups: &HashMap<u32, &RawGroup>) -> Result<(), DictionaryError> {
+    let mut state: HashMap<u32, GroupVisit> = HashMap::with_capacity(raw.groups.len());
+    for group in &raw.groups {
+        nested_chain(group, groups, &mut state, 1)?;
+    }
+    Ok(())
+}
+
+/// Visits `group`, the `position`-th of the chain being walked, returning
+/// the length of its longest chain of nested groups.
+fn nested_chain(
+    group: &RawGroup,
+    groups: &HashMap<u32, &RawGroup>,
+    state: &mut HashMap<u32, GroupVisit>,
+    position: usize,
+) -> Result<usize, DictionaryError> {
+    let too_deep = || DictionaryError::NestingTooDeep {
+        element: group.name.clone(),
+        limit: MAX_NESTING_DEPTH,
+    };
+    let chain = match state.get(&group.id) {
+        Some(GroupVisit::InProgress) => {
+            return Err(DictionaryError::GroupCycle(group.name.clone()));
+        }
+        Some(GroupVisit::Done(chain)) => *chain,
+        None => {
+            if position > MAX_GROUP_CHAIN {
+                return Err(too_deep());
+            }
+            state.insert(group.id, GroupVisit::InProgress);
+            let mut nested = 0;
+            for member in group.members.iter().filter(|m| m.kind == RefKind::Group) {
+                // Every id resolves: `check_group` ran first.
+                if let Some(child) = groups.get(&member.id) {
+                    let inner = position.checked_add(1).ok_or_else(too_deep)?;
+                    nested = nested.max(nested_chain(child, groups, state, inner)?);
+                }
+            }
+            let chain = nested.checked_add(1).ok_or_else(too_deep)?;
+            state.insert(group.id, GroupVisit::Done(chain));
+            chain
+        }
+    };
+    // Where the walk reached it, the group's chain must still fit.
+    let deepest = position
+        .checked_add(chain)
+        .and_then(|end| end.checked_sub(1))
+        .ok_or_else(too_deep)?;
+    if deepest > MAX_GROUP_CHAIN {
+        return Err(too_deep());
+    }
+    Ok(chain)
+}
+
 /// Reports the `base` groups no message or component reaches, and the code
 /// sets no field names, in document order: the dictionary does not hold
 /// them.
@@ -1835,6 +1973,10 @@ fn build(raw: &Raw, report: &mut Report) -> Result<Dictionary, DictionaryError> 
 
     let mut fields = HashMap::with_capacity(raw.fields.len());
     let mut field_defs = Vec::with_capacity(raw.fields.len());
+    // Every field naming a code set holds its own copy of the values, so a
+    // code set shared by many fields is copied once per field: the copies are
+    // counted, before they are made, against MAX_ORCHESTRA_FIELD_VALUES.
+    let mut copied: usize = 0;
     for field in &raw.fields {
         if let Some(existing) = fields.insert(field.id, field.name.as_str()) {
             return Err(DictionaryError::DuplicateFieldTag {
@@ -1846,6 +1988,12 @@ fn build(raw: &Raw, report: &mut Report) -> Result<Dictionary, DictionaryError> 
         let (field_type, values) = types.field(field)?;
         let mut def = FieldDef::new(field.id, field.name.clone(), field_type);
         if let Some(values) = values.filter(|values| !values.is_empty()) {
+            copied = copied
+                .checked_add(values.len())
+                .filter(|copied| *copied <= MAX_ORCHESTRA_FIELD_VALUES)
+                .ok_or(DictionaryError::TooManyFieldValues {
+                    limit: MAX_ORCHESTRA_FIELD_VALUES,
+                })?;
             def = def.with_values(values.clone());
         }
         field_defs.push(def);
@@ -1890,10 +2038,13 @@ fn build(raw: &Raw, report: &mut Report) -> Result<Dictionary, DictionaryError> 
         open_groups: Vec::new(),
         open_components: Vec::new(),
     };
-    // Every group, referenced or not, before any is expanded.
+    // Every group, referenced or not, before any is expanded: its ids
+    // resolve, and the groups it nests form no cycle and no chain deeper
+    // than a message can hold.
     for group in &raw.groups {
         expander.check_group(group)?;
     }
+    check_group_graph(raw, &expander.groups)?;
     report_unreferenced(raw, &expander.groups, report)?;
     let mut envelopes = [Vec::new(), Vec::new()];
     for (items, id) in envelopes.iter_mut().zip([header, trailer]) {
@@ -3256,5 +3407,227 @@ mod tests {
                 limit: MAX_ORCHESTRA_MEMBERS,
             }
         );
+    }
+
+    #[test]
+    fn test_field_values_copied_from_shared_code_sets_are_bounded() {
+        // One code set of 1 024 codes, named by `fields` fields: each field
+        // holds its own copy of the 1 024 values.
+        let shared = |fields: u32| {
+            let codes: String = (0..1024)
+                .map(|i| {
+                    format!(
+                        r#"<fixr:code id="{}" name="C{i}" value="V{i}"/>"#,
+                        90_000 + i
+                    )
+                })
+                .collect();
+            let mut doc = Doc::default();
+            doc.code_sets.push_str(&format!(
+                r#"<fixr:codeSet id="77" name="WideCodeSet" type="String">{codes}</fixr:codeSet>"#
+            ));
+            for i in 0..fields {
+                doc.fields.push_str(&format!(
+                    r#"<fixr:field id="{}" name="Wide{i}" type="WideCodeSet"/>"#,
+                    8000 + i
+                ));
+            }
+            doc.xml()
+        };
+        // The default document's Side copies 2 values: 255 fields plus Side
+        // stay under the limit, 256 more pass it.
+        let fit = (MAX_ORCHESTRA_FIELD_VALUES - 2) / 1024;
+        let fit = u32::try_from(fit).unwrap_or(u32::MAX);
+        let import = load(&shared(fit));
+        let copied: usize = import
+            .dictionary()
+            .fields()
+            .filter_map(|field| field.values.as_ref())
+            .map(HashMap::len)
+            .sum();
+        assert!(copied <= MAX_ORCHESTRA_FIELD_VALUES);
+        assert_eq!(
+            load_err(&shared(fit + 1)),
+            DictionaryError::TooManyFieldValues {
+                limit: MAX_ORCHESTRA_FIELD_VALUES,
+            }
+        );
+    }
+
+    #[test]
+    fn test_mapped_section_attributes_are_read_and_reported() {
+        let doc = Doc {
+            extra: r#"<fixr:groups custom="y" latestEP="312" xml:base="x"/>"#.to_owned(),
+            ..Doc::default()
+        };
+        let xml = doc
+            .xml()
+            .replace("<fixr:fields>", r#"<fixr:fields custom="x">"#);
+        let import = load(&xml);
+        assert_eq!(
+            import.report().entries(),
+            [
+                UnmappedConstruct::Attribute {
+                    location: "fields".to_owned(),
+                    name: "custom".to_owned(),
+                    value: "x".to_owned(),
+                },
+                UnmappedConstruct::Attribute {
+                    location: "groups".to_owned(),
+                    name: "custom".to_owned(),
+                    value: "y".to_owned(),
+                },
+            ]
+        );
+        // A section's attributes are bounded like any element's.
+        let big = "x".repeat(MAX_ORCHESTRA_ATTRIBUTES_LEN);
+        let xml = Doc::default()
+            .xml()
+            .replace("<fixr:codeSets>", &format!(r#"<fixr:codeSets a="{big}">"#));
+        assert!(matches!(
+            load_err(&xml),
+            DictionaryError::AttributesTooLong { .. }
+        ));
+        let long = "x".repeat(MAX_ORCHESTRA_NAME_LEN + 1);
+        let xml = Doc::default()
+            .xml()
+            .replace("<fixr:messages>", &format!(r#"<fixr:messages a="{long}">"#));
+        assert!(matches!(
+            load_err(&xml),
+            DictionaryError::NameTooLong { .. }
+        ));
+    }
+
+    #[test]
+    fn test_duplicate_code_ids_in_a_code_set_are_rejected() {
+        let mut doc = Doc::default();
+        doc.code_sets = doc.code_sets.replace(
+            r#"<fixr:code id="54002" name="Sell" value="2"/>"#,
+            r#"<fixr:code id="54002" name="Sell" value="2"/><fixr:code id="54001" name="Cross" value="8"/>"#,
+        );
+        assert_eq!(
+            load_err(&doc.xml()),
+            DictionaryError::DuplicateOrchestraDefinition {
+                kind: OrchestraKind::Code,
+                key: "SideCodeSet id 54001".to_owned(),
+            }
+        );
+        // A code of another scenario may reuse a base code's id.
+        let mut doc = Doc::default();
+        doc.code_sets = doc.code_sets.replace(
+            r#"<fixr:code id="54002" name="Sell" value="2"/>"#,
+            r#"<fixr:code id="54002" name="Sell" value="2"/><fixr:code id="54001" name="Cross" value="8" scenario="Equity"/>"#,
+        );
+        let import = load(&doc.xml());
+        let values = some(
+            some(import.dictionary().get_field(54), "Side")
+                .values
+                .as_ref(),
+            "Side values",
+        );
+        assert_eq!(values.len(), 2);
+    }
+
+    #[test]
+    fn test_optional_envelope_component_keeps_its_members_optional() {
+        let header = |reference: &str| {
+            let mut doc = Doc::default();
+            doc.groups = doc.groups.replace(
+                r#"<fixr:fieldRef id="448"/>"#,
+                r#"<fixr:fieldRef id="448" presence="required"/>"#,
+            );
+            doc.components.push_str(
+                r#"<fixr:component id="1004" name="Routing">
+                     <fixr:fieldRef id="55" presence="required"/>
+                     <fixr:groupRef id="2000" presence="required"/>
+                   </fixr:component>
+                   <fixr:component id="1005" name="Outer">
+                     <fixr:componentRef id="1004" presence="required"/>
+                   </fixr:component>"#,
+            );
+            doc.components = doc.components.replace(
+                r#"<fixr:fieldRef id="35" presence="required"/>"#,
+                &format!(r#"<fixr:fieldRef id="35" presence="required"/>{reference}"#),
+            );
+            load(&doc.xml())
+        };
+        let flags = |import: &OrchestraImport| {
+            let dict = import.dictionary();
+            let symbol = some(dict.header.iter().find(|f| f.tag == 55), "Symbol");
+            let group = some(dict.header_groups.first(), "NoPartyIDs");
+            let party_id = some(group.fields().iter().find(|f| f.tag == 448), "PartyID");
+            (symbol.required, group.required, party_id.required)
+        };
+        // An optional block: its members are required only with it, but a
+        // group entry's members stay required within the entry.
+        assert_eq!(
+            flags(&header(r#"<fixr:componentRef id="1004"/>"#)),
+            (false, false, true)
+        );
+        // Through a required component inside the optional one.
+        assert_eq!(
+            flags(&header(r#"<fixr:componentRef id="1005"/>"#)),
+            (false, false, true)
+        );
+        // A required block keeps them required.
+        assert_eq!(
+            flags(&header(
+                r#"<fixr:componentRef id="1005" presence="required"/>"#
+            )),
+            (true, true, true)
+        );
+    }
+
+    /// The default document plus `count` groups nothing references, each
+    /// holding the next `refs` times (the last a field), and, when
+    /// `cycle`, the last holding the first.
+    fn loose_chain(count: u32, refs: usize, cycle: bool) -> Doc {
+        let mut doc = Doc::default();
+        for level in 0..count {
+            let id = 2300 + level;
+            let members = if level + 1 == count {
+                if cycle {
+                    r#"<fixr:groupRef id="2300"/>"#.to_owned()
+                } else {
+                    r#"<fixr:fieldRef id="448"/>"#.to_owned()
+                }
+            } else {
+                format!(r#"<fixr:groupRef id="{}"/>"#, id + 1).repeat(refs)
+            };
+            doc.groups.push_str(&format!(
+                r#"<fixr:group id="{id}" name="Loose{level}"><fixr:numInGroup id="453"/>{members}</fixr:group>"#
+            ));
+        }
+        doc
+    }
+
+    #[test]
+    fn test_unreferenced_group_graph_is_checked() {
+        // A group holding itself, and a cycle of two, though nothing
+        // references them.
+        assert_eq!(
+            load_err(&loose_chain(1, 1, true).xml()),
+            DictionaryError::GroupCycle("Loose0".to_owned())
+        );
+        assert!(matches!(
+            load_err(&loose_chain(2, 1, true).xml()),
+            DictionaryError::GroupCycle(_)
+        ));
+        // A chain no message could hold, though nothing references it.
+        let deepest = u32::try_from(MAX_NESTING_DEPTH - 1).unwrap_or(u32::MAX);
+        assert!(matches!(
+            load_err(&loose_chain(deepest + 1, 1, false).xml()),
+            DictionaryError::NestingTooDeep { .. }
+        ));
+        // A chain that fits loads, reported unreferenced; doubled references
+        // are checked once each (2^30 paths otherwise).
+        let import = load(&loose_chain(deepest, 2, false).xml());
+        let unreferenced = import
+            .report()
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry, UnmappedConstruct::Unreferenced { .. }))
+            .count();
+        assert_eq!(unreferenced, MAX_NESTING_DEPTH - 1);
     }
 }

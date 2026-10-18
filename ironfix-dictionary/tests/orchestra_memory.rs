@@ -19,10 +19,14 @@
 //!    typed error;
 //! 3. a full report whose every entry carries the longest location the name
 //!    limit allows;
-//! 4. the doubling just under the member limit, which loads.
+//! 4. one code set of 4 096 codes, each named as long as the name limit
+//!    allows, named by 2 048 fields, each of which holds its own copy of the
+//!    values: stopped at [`MAX_ORCHESTRA_FIELD_VALUES`] with a typed error;
+//! 5. the doubling just under the member limit, which loads.
 //!
-//! Before the name and report limits, a review measured documents of 18 KB
-//! to 16 MB at 340 MB to 556 MB of resident memory. The bounds below are
+//! Before the name, report and field-value limits, a review measured
+//! documents of 18 KB to 16 MB at 340 MB to 556 MB of resident memory, and
+//! the shared code set would copy over 2 GB of names. The bounds below are
 //! about twice the peaks measured on aarch64-apple-darwin; they fail on a
 //! regression of that kind, not on allocator noise. Every document stays
 //! under 4 MB.
@@ -32,8 +36,8 @@
 //! never timings.
 
 use ironfix_dictionary::{
-    Dictionary, DictionaryError, MAX_ORCHESTRA_MEMBERS, MAX_ORCHESTRA_NAME_LEN,
-    MAX_ORCHESTRA_REPORT_ENTRIES, ORCHESTRA_NAMESPACE,
+    Dictionary, DictionaryError, MAX_ORCHESTRA_FIELD_VALUES, MAX_ORCHESTRA_MEMBERS,
+    MAX_ORCHESTRA_NAME_LEN, MAX_ORCHESTRA_REPORT_ENTRIES, ORCHESTRA_NAMESPACE,
 };
 
 #[global_allocator]
@@ -49,6 +53,8 @@ const BOUND_FLOOD: usize = 16 * MIB;
 const BOUND_OVER_BUDGET: usize = 80 * MIB;
 /// Peak after the full report: 39.1 MiB measured.
 const BOUND_FULL_REPORT: usize = 80 * MIB;
+/// Peak after the shared code set: 47.6 MiB measured.
+const BOUND_SHARED_CODE_SET: usize = 96 * MIB;
 /// Peak after expansion under the member limit: 87.6 MiB measured.
 const BOUND_UNDER_BUDGET: usize = 192 * MIB;
 
@@ -97,6 +103,32 @@ fn doubling(levels: u32) -> String {
     )
 }
 
+/// One code set of `codes` codes, each named as long as the loader allows,
+/// named by `fields` fields: every field holds its own copy of the values,
+/// `codes * fields` of them in all.
+fn shared_code_set(codes: u32, fields: u32) -> String {
+    let name = "N".repeat(MAX_ORCHESTRA_NAME_LEN);
+    let codes: String = (0..codes)
+        .map(|i| format!(r#"<fixr:code id="{}" name="{name}" value="{i}"/>"#, i + 1))
+        .collect();
+    let fields: String = (0..fields)
+        .map(|i| {
+            format!(
+                r#"<fixr:field id="{}" name="F{i}" type="WideCodeSet"/>"#,
+                i + 1
+            )
+        })
+        .collect();
+    format!(
+        r#"<fixr:repository xmlns:fixr="{ORCHESTRA_NAMESPACE}" name="FIX.4.4" version="FIX.4.4">
+  <fixr:datatypes><fixr:datatype name="String"/></fixr:datatypes>
+  <fixr:codeSets><fixr:codeSet id="1" name="WideCodeSet" type="String">{codes}</fixr:codeSet></fixr:codeSets>
+  <fixr:fields>{fields}</fixr:fields>
+  <fixr:messages/>
+</fixr:repository>"#
+    )
+}
+
 /// Checks the peak heap so far against `bound` bytes.
 #[track_caller]
 fn assert_peak(bound: usize, case: &str) {
@@ -122,7 +154,10 @@ fn main() {
     );
     let over_budget = doubling(18);
     let under_budget = doubling(17);
-    for document in [&flood, &full_report, &over_budget, &under_budget] {
+    // 4 096 codes named by 2 048 fields: 8 388 608 copies of 255-byte names
+    // without the limit.
+    let shared = shared_code_set(4096, 2048);
+    for document in [&flood, &full_report, &over_budget, &under_budget, &shared] {
         assert!(document.len() < 4 * MIB);
     }
 
@@ -150,6 +185,14 @@ fn main() {
     };
     assert_eq!(report, MAX_ORCHESTRA_REPORT_ENTRIES - 1);
     assert_peak(BOUND_FULL_REPORT, "a full report of long locations");
+
+    assert_eq!(
+        Dictionary::from_orchestra_xml(&shared).err(),
+        Some(DictionaryError::TooManyFieldValues {
+            limit: MAX_ORCHESTRA_FIELD_VALUES,
+        })
+    );
+    assert_peak(BOUND_SHARED_CODE_SET, "a code set shared by many fields");
 
     match Dictionary::from_orchestra_xml(&under_budget) {
         Ok(import) => assert!(import.dictionary().get_message("U9").is_some()),

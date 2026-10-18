@@ -116,9 +116,9 @@ pub use group::{
 };
 pub use loader::{DefinitionKind, DictionaryError, MAX_COMPONENT_DEPTH, MAX_NESTING_DEPTH};
 pub use orchestra::{
-    MAX_ORCHESTRA_ATTRIBUTES_LEN, MAX_ORCHESTRA_DOCUMENT_LEN, MAX_ORCHESTRA_MEMBERS,
-    MAX_ORCHESTRA_NAME_LEN, MAX_ORCHESTRA_REPORT_ENTRIES, ORCHESTRA_NAMESPACE, OrchestraImport,
-    OrchestraKind, OrchestraReport, UnmappedConstruct,
+    MAX_ORCHESTRA_ATTRIBUTES_LEN, MAX_ORCHESTRA_DOCUMENT_LEN, MAX_ORCHESTRA_FIELD_VALUES,
+    MAX_ORCHESTRA_MEMBERS, MAX_ORCHESTRA_NAME_LEN, MAX_ORCHESTRA_REPORT_ENTRIES,
+    ORCHESTRA_NAMESPACE, OrchestraImport, OrchestraKind, OrchestraReport, UnmappedConstruct,
 };
 pub use schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, Member,
