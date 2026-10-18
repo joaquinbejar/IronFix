@@ -230,6 +230,43 @@ Logon is acknowledged, so a connect that fails before then still owes it. It
 lives in the `Initiator`, not in the store: a process restart forgets it, and
 the next session starts from the counters the store still holds.
 
+### Cancellation and timeouts
+
+Two ways a store call can end without its error branch running, or without
+the store having finished:
+
+- **A dropped future.** A caller that drops a connect while a reset is
+  pending, or a runtime that drops a closing session, runs no error branch.
+  Every reset is therefore recorded as owed **before** the engine awaits it,
+  and the record is cleared only once the reset has succeeded (for a reset
+  declared on a Logon, once that Logon is acknowledged). This covers the
+  reset for a counterparty's `ResetSeqNumFlag` on the ack, the close-time
+  reset, and the reset at the start of a session that declares one.
+- **A timeout.** A timeout drops the call's future, not necessarily the work
+  the store has already submitted: a disk or replication write can land
+  later. After any **mutation** overruns the store timeout, the engine treats
+  the store as possibly holding an outstanding write and records a reset as
+  owed, so the next session starts a new stream (a reset, and
+  `ResetSeqNumFlag` = Y) rather than building on counters a late write may
+  still move.
+
+That second rule is sound only with a contract on the store, now stated in
+the `MessageStore` documentation: **mutations take effect in call order, even
+when a call's future is dropped before it completes** (a mutation takes effect
+before any mutation called after it, or not at all). Serialising mutations
+through an internal queue, or completing or aborting the submitted work
+synchronously on drop, satisfies it. `MemoryStore` satisfies it because each
+of its mutations runs to completion within one poll, under its lock and with
+no await. With a conforming store a late write lands before the next session's
+reset, which erases it. A store that does not conform can apply the late write
+after the next session's own writes, erasing a filed frame or moving a counter
+of the new stream: such a store must not be reused after a timed-out mutation.
+Both behaviours are pinned by tests with a store whose reset lands after its
+future is dropped.
+
+The cost: under `Continue`, a store that overruns its timeout once costs a
+sequence reset on the next session.
+
 ### Inbound delivery semantics
 
 At most once. With M+1 durable before M is handed over, a crash after that

@@ -507,6 +507,16 @@ With a store attached, call `Initiator::connect` again only once the previous
 session's `Connection::wait_closed` has returned: until then the closing
 session still writes to the store and may record a reset owed to the next one.
 
+*Cancellation and timeouts.* Every reset is recorded as owed before it is
+awaited and cleared only once it has succeeded, so a connect dropped while a
+reset is pending still leaves it owed. A store write that overruns the store
+timeout may still land later, so it too leaves a reset owed, and the next
+session starts with a reset and `ResetSeqNumFlag` (141) = Y. This relies on
+the store applying its mutations in call order even when a call is dropped,
+which `MessageStore` now requires and `MemoryStore` satisfies; a store that
+does not must not be reused after a timed-out write
+(`doc/adr/0005-fallible-store-writes.md`, "Cancellation and timeouts").
+
 The default `MessageStore::reset_to` is three calls, not one atomic write: a
 crash between them leaves the store cleared with its initial counters, and the
 next Logon goes out at 1 without `ResetSeqNumFlag`. A durable store should
