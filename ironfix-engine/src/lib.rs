@@ -36,6 +36,21 @@
 //! validation, gap recovery, identity and clock checks, heartbeating, and the
 //! Logout handshake — is identical for the two roles.
 //!
+//! Both also frame their socket with garbled-frame recovery on
+//! ([`ironfix_transport::FixCodec::with_garbled_recovery`], anchored on the
+//! session's own BeginString). A garbled inbound frame, including one whose
+//! header frames but does not decode (`MsgType` not third), is ignored as FIX
+//! requires: it consumes no `MsgSeqNum`, does not refresh the heartbeat clock,
+//! is logged as a count and never as bytes, and the gap it leaves is recovered
+//! by the usual `ResendRequest`. A message whose body does not decode behind a
+//! sound header is not garbled: it is dropped with a warning, as before, and
+//! not counted. During the Logon handshake both kinds are skipped, so a
+//! counterparty that never sends an intact Logon ends in
+//! [`EngineError::LogonTimeout`]. The optional
+//! [`SessionConfig::garbled_frame_limit`] logs out a session whose link keeps
+//! garbling. Only a frame above `max_message_size` (after a Logout saying so)
+//! or an I/O error still ends the session at the codec.
+//!
 //! ## Current limitations
 //!
 //! - **There is no TLS**, and no dictionary validation: `ironfix-dictionary`'s
@@ -50,6 +65,7 @@ pub mod application;
 pub mod builder;
 pub mod connection;
 pub mod error;
+mod garbled;
 pub mod initiator;
 pub mod outbound;
 mod reactor;

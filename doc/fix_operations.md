@@ -935,77 +935,198 @@ arbitrary limit is invented here.
 
 ### Garbled Messages and Transport Resynchronization
 
-**Scope**: `ironfix-transport::FixCodec` — the framing layer that turns a byte
-stream into complete FIX frames. This subsection is the codec's contract; it
-does not describe session-level rejection.
+**Scope**: `ironfix-transport::FixCodec`, the framing layer that turns a byte
+stream into complete FIX frames, and what `ironfix-engine` does with a garbled
+frame, during the Logon handshake and in session. It does not describe
+session-level rejection. The design is recorded in
+`doc/adr/0004-garbled-frame-recovery.md`.
 
-**FIX convention**: a *garbled* message — one whose framing cannot be trusted:
-BeginString (8) is not the first field, BodyLength (9) is missing or does not
-agree with the frame layout, or CheckSum (10) is absent or malformed — is
-**ignored**. The receiver does **not** send a Reject, does **not** send a
-ResendRequest for it, and does **not** increment the inbound MsgSeqNum, because
-the sequence number of a garbled message cannot be trusted either. Recovery is
-left to the normal gap-detection path on the next well-formed message.
+**FIX convention**: a *garbled* message is one whose framing cannot be
+trusted: BeginString (8) is not the first field, BodyLength (9) is not the
+second or does not agree with the frame layout, MsgType (35) is not the third,
+or CheckSum (10) is absent, malformed, wrong or not last. It is **ignored**.
+The receiver does **not** send a Reject, does **not** send a ResendRequest for
+it, and does **not** increment the inbound MsgSeqNum, because the sequence
+number of a garbled message cannot be trusted either. Recovery is left to the
+normal gap-detection path on the next well-formed message.
 
-**What IronFix implements today**
+**What IronFix implements**
 
-The codec detects garbling and, for the errors where a frame boundary can be
-inferred, decides how many bytes to discard so that a caller which keeps reading
-can make progress. The remaining variants consume nothing and a caller must
-treat them as fatal. Consumption per error:
+*Recoverable versus fatal.* `CodecError::is_recoverable()` splits the codec's
+errors in two. Every framing error the convention calls garbled is recoverable:
+`InvalidBeginString`, `MissingBodyLength`, `InvalidBodyLength`,
+`HeaderTooLong`, `InvalidTrailer`, `InvalidChecksumFormat` and
+`ChecksumMismatch`. Two errors are fatal: `MessageTooLarge`, a frame whose
+declared size exceeds `max_message_size` (skipping it would mean buffering it,
+or trusting its attacker-chosen length to size the discard), and `Io`. A frame
+that frames but whose header fails to decode (MsgType not third, BodyLength
+invalid) is garbled at the decode level; the codec cannot see it, and the
+engine treats it like a frame the codec skipped. The verdict follows where
+decoding failed: a malformed field among the first three (a third field
+`abc=0`) is garbled even though the decoder reports an invalid tag. A frame
+whose header decodes but whose body does not (an invalid tag, a bad data
+length), or whose MsgType value is unacceptable, is not garbled; see *The
+engine* below.
 
-| `CodecError` | Bytes consumed from the read buffer |
-|---|---|
-| `InvalidBeginString` | up to and including the `<SOH>` of the next `<SOH>8` pair, so the buffer restarts at the `8` (the whole buffer when there is no such pair, minus a trailing `<SOH>` that may still be the first half of one) |
-| `InvalidTrailer` | the same resync as above — the trailer is absent from the offsets BodyLength implies, so BodyLength is not corroborated and its declared length is not trusted to bound the discard |
-| `InvalidChecksumFormat`, `ChecksumMismatch` | the whole declared frame (`BodyLength` + header + 7-byte trailer) |
-| `MissingBodyLength`, `InvalidBodyLength`, `HeaderTooLong`, `MessageTooLarge`, `Io` | none — no frame boundary can be inferred |
+*Skipping inside the codec.* `tokio_util::Framed` ends its stream after any
+decoder error, so a garbled frame cannot be skipped by the caller of a
+`Framed` stream. `FixCodec::with_garbled_recovery(true)` moves the skip into the
+codec. A recoverable error is never returned. The codec discards the garbled
+bytes, counts the skip, and keeps going in the same `decode` call, returning the
+next valid frame if it is already buffered. It must not return `Ok(None)` with a
+whole frame buffered, because `Framed` would then wait for the next socket read
+before asking again. `FixCodec::take_garbled_count()` reports and resets the
+count. Recovery is off by default, so another `FixCodec` user keeps one error
+per garbled frame.
 
-Rationale for the two policies:
+*Bytes consumed per error.* "Resync" means discard up to the next candidate
+frame start. Without recovery the candidate is the `8` of a `<SOH>8` pair. With
+recovery it is a complete header opening after a plausible boundary (see the
+first rationale point). When there is no candidate the whole buffer is
+discarded, except a tail that may still become one: a trailing `<SOH>` without
+recovery, a partial header opening with it.
+
+| `CodecError` | Without recovery | With recovery |
+|---|---|---|
+| `InvalidBeginString` | resync, error returned | resync, skipped |
+| `InvalidTrailer` | resync, error returned | resync, skipped |
+| `InvalidChecksumFormat`, `ChecksumMismatch` | the whole declared frame, error returned | the whole declared frame, skipped |
+| `MissingBodyLength`, `InvalidBodyLength`, `HeaderTooLong` | none, error returned | resync, skipped |
+| `MessageTooLarge`, `Io` | none, error returned | none, error returned |
+
+Rationale:
 
 - After `InvalidBeginString` the stream position is unknown, so the only safe
-  anchor is the next byte sequence that can legally start a frame: an SOH
-  followed by `8`. Scanning to it is bounded by the buffer length and never
+  anchor is a byte sequence that can legally start a frame. A bare `8=` is not
+  one, because it occurs inside ordinary tags such as `18=` and `58=`. Without
+  recovery the anchor is therefore `<SOH>8`. The cost is that a well-formed
+  frame arriving straight after garbage is discarded with it, unless the garbage
+  ends on an SOH. With recovery that anchor is not safe either: `<SOH>8` also
+  matches tags 80 to 89 and 800 up, so a resync through one skipped frame would
+  stop at each and count it again. Recovery mode therefore accepts a candidate
+  only when the bytes open a real header (`8=`, an accepted BeginString, SOH,
+  `9=`) **and** the byte before it is SOH, the start of the buffer, or neither
+  an ASCII digit nor `=`. Accepted means the FIX family (`FIX.4.0` to
+  `FIX.4.4`, `FIXT.1.1`) by default, and only the session's own BeginString
+  with `FixCodec::with_begin_string`, which both engines set; every real frame
+  of the session carries it. The second condition excludes a tag (`448=FIX…`)
+  and an opening at the very start of a field value (`96=8=FIX…`,
+  `213=8=FIX…`), and nothing else: an embedded frame further inside a value is
+  the residual risk listed under Known limits. The byte before is remembered
+  across a read boundary when a resync empties the buffer, so an embedded frame
+  that arrives at offset 0 of the next read is still recognised as part of the
+  same garbled span. The shape is checked inside the scan, so a false start
+  costs about a dozen byte comparisons and is not counted. The scan stops at the
+  first candidate, so its cost is linear in the bytes it discards, and it never
   allocates.
 - After a checksum error the trailer literal is exactly where BodyLength said it
   would be, so the declared boundary is corroborated by the frame's own
-  structure: consuming `BodyLength`-worth of bytes keeps a stream of otherwise
-  well-formed frames aligned.
-- A missing trailer is the opposite case — nothing corroborates BodyLength, and
-  trusting it to size the discard hands an attacker a lever. A short header
-  declaring a large body would otherwise consume every well-formed frame that
-  merely follows it (tens of thousands, at the default ceiling) and report the
-  loss as a single error. So this case resyncs instead.
-- Recovery is best-effort, not lossless: because the anchor is `<SOH>8` rather
-  than a bare `8=` (which occurs inside ordinary tags such as `18=` and `58=`),
-  a well-formed frame arriving immediately after garbage is normally discarded
-  with it, unless the garbage happens to end on an SOH. Recovery resumes at the
-  frame after that one.
+  structure. Consuming that many bytes keeps a stream of otherwise well-formed
+  frames aligned, and counts one skip per garbled frame.
+- A missing trailer is the opposite case. Nothing corroborates BodyLength, and
+  trusting it to size the discard hands an attacker a lever: a short header
+  declaring a large body would consume every well-formed frame that merely
+  follows it. So this case resyncs instead.
 - Before the header is complete no boundary exists at all, so the codec keeps
-  the bytes and bounds them instead: the header region `8=…<SOH>9=…<SOH>` is
+  the bytes and bounds them instead. The header region `8=…<SOH>9=…<SOH>` is
   capped at 64 bytes and the whole frame at `max_message_size` (1 MiB by
-  default). Exceeding either is an error, never a request for more data — this
-  is what stops a peer from growing the read buffer without bound.
+  default). Exceeding either is an error, never a request for more data, which
+  is what stops a peer from growing the read buffer without bound. With
+  recovery the header ceiling is checked first, so whether malformed header
+  bytes are skipped never depends on how many good frames happen to be buffered
+  behind them.
+- Without recovery, `MissingBodyLength`, `InvalidBodyLength` and `HeaderTooLong`
+  consume nothing, because no frame boundary can be inferred and the error is
+  the caller's to act on. With recovery the codec is about to skip the frame and
+  must make progress, so it resyncs. Every skip consumes at least one byte, so
+  one `decode` call is bounded by the buffered bytes, and skipping itself never
+  allocates.
 
-**What IronFix does not implement**
+*The engine.* Both `Initiator` and `Acceptor` frame with recovery on, anchored
+on the session's own BeginString, during the Logon handshake and in the session
+reactor, and both also treat a frame whose header frames but does not decode as
+garbled. A message whose header decodes but whose body does not is **not**
+garbled: in session it is dropped with a fixed-label warning, consumes no
+`MsgSeqNum` and does not count toward the bound, as before; during the
+handshake it is skipped under the same deadline, because it cannot be read as
+a Logon either. A garbled frame:
 
-- **The MsgSeqNum half of the convention is the session layer's
-  responsibility and is not implemented.** The codec has no access to session
-  state and never touches sequence numbers; nothing in `ironfix-session` or
-  `ironfix-engine` currently distinguishes "garbled, do not count" from any
-  other failure.
-- **The resynchronization above is not reachable from the engine as built, and
-  not only because `ironfix-engine::Initiator` treats every codec error as
-  fatal.** `tokio_util::Framed` terminates its stream after *any* decoder error:
-  it latches an internal error flag and returns `None` on the next poll, so the
-  well-formed frame the resync had just aligned onto is discarded along with the
-  stream. No way of writing the caller changes that. Honouring the convention
-  from the engine would require either the codec to report garbling as
-  `Ok(None)` while skipping the bad bytes internally — which is itself a change
-  to framing semantics — or the engine to drive `Decoder::decode` by hand
-  instead of using `Framed`. The consumption policy above is therefore
-  observable today only by a caller that drives the codec directly, which is how
-  it is tested.
+- **consumes no MsgSeqNum.** The next valid frame with a higher `MsgSeqNum` is a
+  gap and gets the usual `ResendRequest`, and the gap is filled by the normal
+  resend or `SequenceReset`-GapFill path;
+- **is not proof of life.** It does not refresh the heartbeat clock or clear a
+  pending TestRequest, so a peer that sends nothing but garbage is timed out
+  exactly like a silent one;
+- **is logged without its bytes**, as a count and a static cause with the
+  session id, because a garbled Logon can still carry `Password` (554);
+- **does not end the handshake.** A garbled Logon (acceptor) or Logon ack
+  (initiator) of either kind is skipped and the wait continues against the same
+  `logon_timeout`. A counterparty that never sends an intact one ends in
+  `EngineError::LogonTimeout`, and the skips are reported when the wait ends so
+  the timeout is diagnosable.
+
+The reactor reads the codec's count before handling each inbound frame and on
+every 100 ms tick. The tick is what catches a garbled frame with nothing valid
+behind it. The read is one synchronous integer read; only a non-zero count goes
+further, and only a configured bound reads the clock.
+
+*The optional bound.* `SessionConfig::garbled_frame_limit` takes a
+`GarbledFrameLimit` of `max` frames within a sliding `window` (`max` a
+`NonZeroU32` of at most 1024, `window` non-zero and at most 24 hours; set it
+with `SessionConfigBuilder::garbled_frame_limit(max, window)` or
+`SessionConfig::with_garbled_frame_limit`). Frames garbled at the framing level
+and at the header-decode level count alike; a malformed body does not count. When `max` garbled frames arrive within
+`window`, the session sends a Logout with the reason in `Text` (58) and closes
+without waiting for the acknowledgement; a session already waiting on its own
+Logout closes without a second one. The default is no bound: the
+specification sets none, and the heartbeat already ends a session whose peer
+sends only garbage. The bound covers a link that garbles intermittently while
+its valid traffic keeps the session alive, and `HeartBtInt = 0`. Frames skipped
+during the handshake are reported but not counted against it.
+
+*Fatal errors* still close the session directly. For a frame above
+`max_message_size` an Active session first sends a Logout with `Text` (58)
+"message too large", since the write side still works; an I/O error closes it
+without one.
+
+**Known limits**
+
+The first five only show with recovery on: without it the first garbled frame
+ends a `Framed` stream.
+
+- A real frame whose BodyLength is corrupted *upward* holds every later frame
+  in the buffer until the declared span has arrived (at most
+  `max_message_size`), because only then can its trailer be checked and
+  rejected. The frames behind it are kept, not discarded, but delayed; on a
+  quiet session the heartbeat and TestRequest timeout can fire first.
+- Residual phantom-frame risk: inside a frame that is already garbled badly
+  enough to need a resync through it, a data-field value that contains a
+  complete header opening of the session's own BeginString preceded by any byte
+  other than an ASCII digit or `=` (a `|`, a space, `MSG:`, `<![CDATA[`, an
+  SOH) is a resync candidate. If a well-formed frame follows, it is handed up.
+  Only an opening at the very start of the value (`96=8=FIX…`) or after a digit
+  is excluded. An embedded frame of another FIX version is excluded too, since
+  both engines restrict anchors to their own BeginString.
+- A frame whose opening follows an ASCII digit or `=` (for example after
+  garbage that ends in a digit) is passed over by the resync, and its gap is
+  recovered by `ResendRequest`. A stream whose BeginString is not accepted
+  still frames, but a resync does not land on it.
+- Garbage that happens to spell a header whose declared span ends exactly on a
+  later frame's `<SOH>10=NNN<SOH>` has a corroborated boundary, and the
+  checksum error consumes that frame with it. The gap is then recovered by
+  `ResendRequest` like any other.
+- The skip count is one per garbled frame, with two exceptions that can only
+  make the optional bound trip earlier: garbage delivered in separate reads
+  counts once per read, and a partial header opening kept at the end of one
+  read counts once more if the next read shows it was garbage.
+- A framed message whose body does not decode is dropped without a Reject,
+  because no `MsgSeqNum` can be read to reference. A peer that answers the
+  resulting `ResendRequest` by resending the same bytes has them dropped again,
+  so that gap can stall until the bounded resend gives up and logs out.
+- After the "message too large" Logout, and after the garbled-limit Logout,
+  the socket is dropped while the peer's input may still be arriving. Closing a
+  socket with unread input can make the kernel send RST, and the peer may then
+  lose the Logout. This holds until a graceful drain exists.
 
 ---
 

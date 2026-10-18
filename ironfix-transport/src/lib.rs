@@ -17,6 +17,17 @@
 //! The codec frames, it does not interpret. It never inspects session state and
 //! never applies business logic.
 //!
+//! ## Garbled frames
+//!
+//! FIX ignores a garbled message instead of ending the session, while
+//! `tokio_util::Framed` ends its stream at the first decoder error.
+//! [`FixCodec::with_garbled_recovery`] reconciles the two: a recoverable
+//! framing error ([`CodecError::is_recoverable`]) is skipped inside the codec,
+//! which goes on to return the next valid frame in the same call, and the skip
+//! is counted for [`FixCodec::take_garbled_count`]. Only fatal errors (a frame
+//! above the size ceiling, an I/O error) still end the stream. Recovery is off
+//! by default; `ironfix-engine` turns it on for both roles.
+//!
 //! ## Not provided
 //!
 //! Despite the crate name, there are **no TCP connector or acceptor helpers and

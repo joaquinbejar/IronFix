@@ -20,11 +20,28 @@ pub enum EngineError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Framing or checksum failure at the codec layer.
+    /// Fatal failure at the codec layer.
+    ///
+    /// Both engines frame with garbled-frame recovery on, so a garbled frame
+    /// (a bad CheckSum or BodyLength, bytes before `8=`) is skipped rather than
+    /// reported here, during the Logon handshake as well as afterwards. What
+    /// remains is fatal: a frame above
+    /// [`SessionConfig::max_message_size`](ironfix_session::SessionConfig::max_message_size),
+    /// or an I/O failure inside the codec.
     #[error("codec error: {0}")]
     Codec(#[from] CodecError),
 
     /// Failure decoding a framed FIX message.
+    ///
+    /// Neither Logon handshake returns this for a frame that does not decode
+    /// any more: both skip such frames and keep waiting until
+    /// [`EngineError::LogonTimeout`]. What can still produce it: the
+    /// initiator, when a Logon ack that decodes carries a BeginString (8) value
+    /// that is not valid UTF-8; and the `?` and `From` conversions on the
+    /// handshake paths that re-read a frame already decoded once, which cannot
+    /// fail and are kept as typed errors rather than unwraps. During the Active
+    /// session a frame that does not decode never surfaces as an error: it is
+    /// dropped (and, if garbled, counted) by the reactor.
     #[error("decode error: {0}")]
     Decode(#[from] DecodeError),
 
@@ -51,7 +68,13 @@ pub enum EngineError {
     #[error("connect timed out after {0:?}")]
     ConnectTimeout(Duration),
 
-    /// The Logon acknowledgement did not arrive within the logon timeout.
+    /// The Logon (acceptor) or Logon acknowledgement (initiator) did not
+    /// arrive intact within the logon timeout.
+    ///
+    /// Garbled frames received while waiting are ignored, not reported, so a
+    /// counterparty that sends only garbled Logons ends here once the timeout
+    /// expires rather than in an immediate [`EngineError::Codec`] or
+    /// [`EngineError::Decode`].
     #[error("logon timed out after {0:?}")]
     LogonTimeout(Duration),
 

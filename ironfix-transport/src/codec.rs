@@ -33,6 +33,19 @@
 //! [`CodecError`] for what each variant does to the read buffer, and
 //! `doc/fix_operations.md` ("Garbled Messages and Transport Resynchronization")
 //! for the protocol-level policy.
+//!
+//! # Garbled-frame recovery
+//!
+//! FIX ignores a garbled message rather than ending the session over it, but
+//! `tokio_util::Framed` ends its stream after the first decoder error. The two
+//! are reconciled by [`FixCodec::with_garbled_recovery`]: with it enabled, a
+//! [recoverable](CodecError::is_recoverable) framing error is skipped *inside*
+//! [`Decoder::decode`], which then goes on to return the next valid frame if
+//! one is already buffered, and the skip is counted for
+//! [`FixCodec::take_garbled_count`]. Only a fatal error (an oversized frame, an
+//! I/O error) is still returned. Recovery is off by default, so a caller that
+//! does not ask for it keeps the error-per-garbled-frame contract. See
+//! `doc/adr/0004-garbled-frame-recovery.md` for the design.
 
 use bytes::{Buf, BufMut, BytesMut};
 use ironfix_tagvalue::checksum::{calculate_checksum, parse_checksum};
@@ -42,23 +55,40 @@ use tokio_util::codec::{Decoder, Encoder};
 
 /// Errors that can occur during codec operations.
 ///
+/// # Recoverable and fatal errors
+///
+/// [`CodecError::is_recoverable`] splits the variants in two. A *recoverable*
+/// error describes garbled input, a frame whose BeginString, BodyLength or
+/// CheckSum cannot be trusted, which FIX says to ignore. A *fatal* error is a
+/// condition the stream cannot continue past: an I/O failure, or a frame whose
+/// declared size exceeds [`FixCodec::with_max_message_size`] (skipping it would
+/// mean either buffering it or trusting its attacker-chosen length to size the
+/// discard, and the ceiling exists to refuse both).
+///
 /// # Effect on the read buffer
 ///
-/// [`Decoder::decode`] consumes bytes on some error paths so that a caller that
-/// chooses to continue reading is not stuck re-parsing the same garbage:
+/// [`Decoder::decode`] consumes bytes on the recoverable paths so that a caller
+/// that keeps reading is not stuck re-parsing the same garbage. *Resync* means:
+/// discard up to the next candidate frame start, so the buffer restarts there.
+/// Without recovery a candidate is the `8` of a `<SOH>8` pair. With
+/// [`FixCodec::with_garbled_recovery`] it is a complete header opening
+/// (`8=<BeginString><SOH>9=`) after a plausible boundary (see that method for
+/// why). When there is no candidate the whole buffer is discarded, except a
+/// tail that may still become one: a trailing `<SOH>` without recovery, a
+/// partial header opening with it.
 ///
-/// | Variant | Bytes consumed |
-/// |---|---|
-/// | [`Self::InvalidBeginString`] | up to and including the `<SOH>` of the next `<SOH>8` pair, so the buffer restarts at the `8` (the whole buffer if there is no such pair, minus a trailing `<SOH>` that may still be the start of one) |
-/// | [`Self::InvalidTrailer`] | same resync as above — BodyLength is not corroborated by anything, so the length it declares is not trusted to bound the discard |
-/// | [`Self::InvalidChecksumFormat`], [`Self::ChecksumMismatch`] | the whole declared frame — the trailer literal is exactly where BodyLength said, so the boundary is corroborated |
-/// | all other variants | none — the frame boundary is unknown |
+/// | Variant | Recoverable | Bytes consumed |
+/// |---|---|---|
+/// | [`Self::InvalidBeginString`] | yes | resync |
+/// | [`Self::InvalidTrailer`] | yes | resync: BodyLength is not corroborated by anything, so the length it declares is not trusted to bound the discard |
+/// | [`Self::InvalidChecksumFormat`], [`Self::ChecksumMismatch`] | yes | the whole declared frame: the trailer literal is exactly where BodyLength said, so the boundary is corroborated |
+/// | [`Self::MissingBodyLength`], [`Self::InvalidBodyLength`], [`Self::HeaderTooLong`] | yes | none without recovery (the frame boundary is unknown); resync with it |
+/// | [`Self::MessageTooLarge`], [`Self::Io`] | no | none |
 ///
-/// The consumption above is observable only by a caller that drives
-/// [`Decoder::decode`] itself. `tokio_util::Framed` terminates its stream after
-/// any decoder error, and the in-repo engine treats every `Err` as fatal, so
-/// neither can act on it. It is specified and tested regardless, so that a
-/// caller which does drive the codec directly has a defined contract.
+/// Without recovery, the consumption above is observable only by a caller that
+/// drives [`Decoder::decode`] itself: `tokio_util::Framed` terminates its stream
+/// after any decoder error. With recovery, recoverable errors are never
+/// returned at all; they are skipped and counted.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CodecError {
@@ -134,6 +164,39 @@ pub enum CodecError {
     Io(String),
 }
 
+impl CodecError {
+    /// Returns whether this error describes garbled input that can be skipped.
+    ///
+    /// `true` for every framing error FIX classes as a garbled message: a
+    /// BeginString (8) that is not first, a BodyLength (9) that is missing,
+    /// malformed or disagrees with the frame layout, a header that never
+    /// completes, and a CheckSum (10) that is absent, malformed or wrong. Such
+    /// a frame is ignored and the stream continues; its `MsgSeqNum` (34) is
+    /// not consumed, because it cannot be trusted.
+    ///
+    /// `false` for the conditions the stream cannot continue past:
+    /// [`Self::Io`], and [`Self::MessageTooLarge`] (a frame above the
+    /// configured ceiling is refused rather than buffered or skipped by its
+    /// declared length). The deprecated, never-emitted [`Self::Incomplete`] is
+    /// also `false`: incomplete input is `Ok(None)`, not garbling.
+    ///
+    /// This is the classification [`FixCodec::with_garbled_recovery`] acts on.
+    #[must_use]
+    #[allow(deprecated)] // `Incomplete` is matched so the classification stays exhaustive.
+    pub const fn is_recoverable(&self) -> bool {
+        match self {
+            Self::InvalidBeginString
+            | Self::MissingBodyLength
+            | Self::InvalidBodyLength
+            | Self::HeaderTooLong { .. }
+            | Self::InvalidTrailer { .. }
+            | Self::InvalidChecksumFormat
+            | Self::ChecksumMismatch { .. } => true,
+            Self::Incomplete | Self::MessageTooLarge { .. } | Self::Io(_) => false,
+        }
+    }
+}
+
 impl From<std::io::Error> for CodecError {
     fn from(err: std::io::Error) -> Self {
         Self::Io(err.to_string())
@@ -145,6 +208,25 @@ const SOH: u8 = 0x01;
 
 /// The two bytes every FIX frame starts with.
 const BEGIN_STRING_PREFIX: &[u8] = b"8=";
+
+/// The header openings recovery mode accepts as a frame start.
+///
+/// `8=`, a BeginString of the FIX family (`FIX.4.0` to `FIX.4.4`, and
+/// `FIXT.1.1` for every 5.0 session), SOH, then the `9=` that must follow. A
+/// resync only lands on one of these exact openings; see
+/// [`recovery_resync_offset`]. [`FixCodec::with_begin_string`] narrows the set
+/// to the one opening of the session's own version.
+///
+/// A `static` rather than a `const`, so a codec can hold a `'static` sub-slice
+/// of it.
+static RECOVERY_ANCHORS: [&[u8]; 6] = [
+    b"8=FIX.4.0\x019=",
+    b"8=FIX.4.1\x019=",
+    b"8=FIX.4.2\x019=",
+    b"8=FIX.4.3\x019=",
+    b"8=FIX.4.4\x019=",
+    b"8=FIXT.1.1\x019=",
+];
 
 /// The two bytes that open the BodyLength field.
 const BODY_LENGTH_PREFIX: &[u8] = b"9=";
@@ -227,6 +309,10 @@ fn parse_body_length(bytes: &[u8]) -> Option<usize> {
 /// frame arriving immediately after garbage is normally lost too — its `8=` is
 /// preceded by that garbage rather than by SOH — unless the garbage happens to
 /// end on an SOH. Recovery resumes at the frame after it.
+/// [`recovery_resync_offset`] closes that gap for recovery mode.
+///
+/// The returned offset never exceeds `src.len()`, and the scan stops at the
+/// first candidate, so its cost is linear in the bytes it discards.
 #[must_use]
 fn resync_offset(src: &[u8]) -> usize {
     let mut from = 0usize;
@@ -248,6 +334,128 @@ fn resync_offset(src: &[u8]) -> usize {
     src.len()
 }
 
+/// How the bytes at a candidate frame start compare with [`RECOVERY_ANCHORS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorShape {
+    /// The bytes open with one of the accepted headers.
+    Complete,
+    /// The buffer ends inside what could still become an accepted header.
+    Partial,
+    /// The bytes cannot open an accepted header.
+    Rejected,
+}
+
+/// Classifies `rest`, which starts at a candidate `8`, against every accepted
+/// header opening in `anchors`. At most a dozen bytes are compared per
+/// opening, and a mismatch is normally found within the first two.
+#[must_use]
+fn anchor_shape(rest: &[u8], anchors: &[&[u8]]) -> AnchorShape {
+    let mut shape = AnchorShape::Rejected;
+    for &anchor in anchors {
+        if rest.starts_with(anchor) {
+            return AnchorShape::Complete;
+        }
+        if rest.len() < anchor.len() && anchor.starts_with(rest) {
+            shape = AnchorShape::Partial;
+        }
+    }
+    shape
+}
+
+/// Returns whether a frame may start right after `prev`, the byte before a
+/// candidate `8` (`None` at the start of the buffer).
+///
+/// A frame follows an SOH, or garbage. It never follows an ASCII digit or `=`:
+/// that `8` is part of a tag (`448=`, `18=`) or the first byte of a field value
+/// (`96=8=FIX…`, `213=8=FIX…`). Only those two positions are excluded: an
+/// opening further inside a value, after a space, `|`, `MSG:` or `<![CDATA[`,
+/// passes this check (see [`recovery_resync_offset`] for the residual risk).
+#[must_use]
+const fn boundary_before(prev: Option<u8>) -> bool {
+    match prev {
+        None => true,
+        Some(byte) => !byte.is_ascii_digit() && byte != b'=',
+    }
+}
+
+/// Recovery-mode counterpart of [`resync_offset`]: returns how many bytes to
+/// discard so the buffer restarts at the next candidate frame.
+///
+/// A candidate is an `8` at offset 1 or later that passes two checks before it
+/// is returned. The byte before it must be a plausible frame boundary (see
+/// [`boundary_before`]), and the bytes from it must open a real header: `8=`, an
+/// accepted BeginString, SOH, `9=` (`anchors`, a subset of
+/// [`RECOVERY_ANCHORS`]). Checking the shape here, rather than letting the
+/// decoder find out, means a false start such as a tag `851=` after an SOH,
+/// `58=8=FIX`, or `448=FIX.4.4` costs about a dozen byte comparisons and is
+/// never counted as a garbled frame. The boundary check keeps a complete frame
+/// embedded at the very start of a data field value (`96=8=FIX…`, `213=8=FIX…`)
+/// of a garbled outer frame from being resynchronised onto and handed up as a
+/// phantom inbound message.
+///
+/// Residual risk: a data field value that carries a complete header opening
+/// of an accepted BeginString after any byte other than an ASCII digit or `=`
+/// (a space, `|`, `MSG:`, `<![CDATA[`, an SOH) inside a frame that is already
+/// garbled badly enough to be resynchronised through. That opening is a
+/// candidate, and if a well-formed frame follows it, it is handed up.
+/// Restricting `anchors` to the session's own BeginString
+/// ([`FixCodec::with_begin_string`]) narrows this to embedded frames of the
+/// same version.
+///
+/// The anchor is also what lets a well-formed frame that arrives straight
+/// after garbage survive: its opening follows the garbage, not an SOH, which
+/// [`resync_offset`] would miss. What it cannot see is a frame whose preceding
+/// byte is an ASCII digit or `=`, for example after garbage that ends in a
+/// digit; that frame is skipped and its gap recovered like any other.
+///
+/// Offset 0 is never a candidate (it is the frame that just failed), so the
+/// result is at least 1 for any buffer of two or more bytes, which is what
+/// guarantees that recovery makes progress. When there is no candidate the
+/// whole buffer is garbage, except a tail that is a partial header opening the
+/// next read may complete. Unlike [`resync_offset`], a lone trailing SOH is not
+/// kept: it would only make the next read's frame start look garbled and count
+/// the same garbage twice.
+///
+/// One forward pass that stops at the first candidate, so the cost is linear
+/// in the bytes discarded; the result never exceeds `src.len()`.
+#[must_use]
+fn recovery_resync_offset(src: &[u8], anchors: &[&[u8]]) -> usize {
+    let mut from = 1usize;
+    while let Some(relative) = src.get(from..).and_then(|rest| memchr(b'8', rest)) {
+        let Some(candidate) = from.checked_add(relative) else {
+            return src.len();
+        };
+        let prev = candidate
+            .checked_sub(1)
+            .and_then(|index| src.get(index))
+            .copied();
+        if boundary_before(prev) {
+            let shape = src
+                .get(candidate..)
+                .map_or(AnchorShape::Rejected, |rest| anchor_shape(rest, anchors));
+            if shape != AnchorShape::Rejected {
+                return candidate;
+            }
+        }
+        let Some(next) = candidate.checked_add(1) else {
+            return src.len();
+        };
+        from = next;
+    }
+    src.len()
+}
+
+/// Where a frame's body ends and the frame itself ends, as implied by its
+/// header.
+#[derive(Debug, Clone, Copy)]
+struct FrameLayout {
+    /// Offset of the CheckSum field: everything before it is covered by the
+    /// checksum.
+    body_end: usize,
+    /// Length of the whole frame, trailer included.
+    total_length: usize,
+}
+
 /// Tokio codec for FIX message framing.
 ///
 /// Handles parsing of FIX messages from a byte stream, validating
@@ -258,17 +466,60 @@ pub struct FixCodec {
     max_message_size: usize,
     /// Whether to validate checksums.
     validate_checksum: bool,
+    /// Whether recoverable framing errors are skipped instead of returned.
+    garbled_recovery: bool,
+    /// Garbled frames skipped since the last [`FixCodec::take_garbled_count`].
+    garbled_count: u64,
+    /// The header openings a recovery-mode resync may land on: all of
+    /// [`RECOVERY_ANCHORS`] by default, or the session's own one.
+    recovery_anchors: &'static [&'static [u8]],
+    /// What the last recovery-mode resync left for the next read to settle,
+    /// so its checks hold across a read boundary. Settled once the start of
+    /// the buffer has been judged, and whenever a frame is returned.
+    resync_state: ResyncState,
+}
+
+/// What a recovery-mode resync left behind for the next read to settle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResyncState {
+    /// Nothing pending: the buffer starts where a frame may start.
+    Settled,
+    /// The resync emptied the buffer, and this was the last byte it
+    /// discarded. Whatever the next read starts with follows that byte.
+    EmptiedAfter(u8),
+    /// The resync stopped on a partial header opening at the end of the
+    /// buffer. Its preceding byte passed the boundary check, but the opening
+    /// itself can only be validated once the next read completes it.
+    PartialOpening,
+}
+
+/// What judging the start of the buffer against a [`ResyncState`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpanVerdict {
+    /// The buffer starts where a frame may start: frame it normally.
+    Proceed,
+    /// Not enough bytes to decide: ask for more, keep the state.
+    NeedMore,
+    /// The start belonged to the same garbled span and was resynchronised
+    /// past (consuming at least one byte, not counted): judge again.
+    Resynced,
 }
 
 impl FixCodec {
     /// Creates a new codec with default settings.
     ///
-    /// Defaults: a 1 MiB maximum message size and checksum validation enabled.
+    /// Defaults: a 1 MiB maximum message size, checksum validation enabled,
+    /// garbled-frame recovery disabled, and, should recovery be enabled, every
+    /// FIX-family BeginString accepted as a resync anchor.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             max_message_size: 1024 * 1024, // 1MB
             validate_checksum: true,
+            garbled_recovery: false,
+            garbled_count: 0,
+            recovery_anchors: &RECOVERY_ANCHORS,
+            resync_state: ResyncState::Settled,
         }
     }
 
@@ -292,6 +543,168 @@ impl FixCodec {
         self
     }
 
+    /// Sets whether garbled frames are skipped instead of reported.
+    ///
+    /// Off (the default), every malformed frame is an `Err` from
+    /// [`Decoder::decode`], and a `tokio_util::Framed` stream ends at the
+    /// first one.
+    ///
+    /// On, a [recoverable](CodecError::is_recoverable) error is never returned:
+    /// the codec discards the garbled bytes, counts the skip (see
+    /// [`FixCodec::take_garbled_count`]), and carries on in the **same** call,
+    /// returning the next valid frame if it is already buffered and `Ok(None)`
+    /// only when it genuinely needs more bytes. Returning `Ok(None)` with a
+    /// whole frame buffered would stall `Framed`, which polls the decoder again
+    /// only after the next read. [`CodecError::MessageTooLarge`] and
+    /// [`CodecError::Io`] are still returned.
+    ///
+    /// Recovery changes three framing details, all on error paths:
+    ///
+    /// - `MissingBodyLength`, `InvalidBodyLength` and `HeaderTooLong`, which
+    ///   consume nothing without recovery, resynchronise instead, so the skip
+    ///   makes progress.
+    /// - The resync anchors on a complete header opening instead of a bare
+    ///   `<SOH>8`: `8=`, a FIX-family BeginString (`FIX.4.0` to `FIX.4.4`,
+    ///   `FIXT.1.1`; only the session's own with
+    ///   [`FixCodec::with_begin_string`]), SOH, `9=`, preceded by SOH, the start
+    ///   of the buffer, or any byte that is neither an ASCII digit nor `=`.
+    ///   Both checks hold across a read boundary: when a resync empties the
+    ///   buffer after a digit or `=`, whatever the next read starts with is
+    ///   treated as the same garbled span, whatever it opens with; and a
+    ///   partial opening a resync stopped on is validated once the next read
+    ///   completes it. A valid frame that arrives straight after garbage is
+    ///   therefore not lost with it, a tag such as `851=` inside a skipped frame
+    ///   is not mistaken for a frame start, and a frame embedded at the very
+    ///   start of a data field value (`96=8=FIX…`) or after a digit is not
+    ///   resynchronised onto. A false start is rejected inside the scan, so it
+    ///   is not counted.
+    ///
+    ///   Residual risk: inside a frame that is already garbled, a data field
+    ///   value that contains a complete opening of an accepted BeginString
+    ///   after any byte other than an ASCII digit or `=` (a space, `|`, `MSG:`,
+    ///   `<![CDATA[`, an SOH) is a candidate, and a well-formed frame after it
+    ///   is handed up. With [`FixCodec::with_begin_string`] only an opening of
+    ///   the session's own version qualifies. A stream whose BeginString is not
+    ///   accepted still frames, but a resync does not land on it.
+    /// - In the header phase, the 64-byte header ceiling is checked before the
+    ///   frame ceiling, so whether malformed header bytes are skipped never
+    ///   depends on how many good frames happen to be buffered behind them.
+    ///
+    /// Every skip consumes at least one byte, so one call does work linear in
+    /// the buffered bytes, and skipping itself never allocates. The frame
+    /// bytes are never logged: a garbled Logon can still carry `Password`
+    /// (554).
+    ///
+    /// Recovery is a framing policy only. The codec has no session state: it
+    /// is the caller that must not consume a `MsgSeqNum` (34) for a skipped
+    /// frame, nor count it as proof that the peer is alive.
+    #[must_use]
+    pub const fn with_garbled_recovery(mut self, recover: bool) -> Self {
+        self.garbled_recovery = recover;
+        self
+    }
+
+    /// Returns how many garbled frames recovery has skipped since the last
+    /// call, and resets the count to zero.
+    ///
+    /// Each skip is one recoverable framing error the codec resynchronised
+    /// past, which is one per garbled frame: false frame starts inside it are
+    /// rejected by the resync scan and never counted. The exception is a
+    /// partial header opening cut off by the end of the buffer, which is kept
+    /// for the next read; if that read shows it was garbage, it counts once.
+    /// Separately delivered chunks of garbage count separately. Always zero
+    /// when recovery is off, because every malformed frame is then returned as
+    /// an error.
+    #[must_use = "the count is reset by this call; dropping it loses the skips it reports"]
+    pub const fn take_garbled_count(&mut self) -> u64 {
+        std::mem::replace(&mut self.garbled_count, 0)
+    }
+
+    /// Restricts recovery-mode resync anchors to the header opening of one
+    /// BeginString (8), the session's own.
+    ///
+    /// Every real frame on a session carries the session's BeginString, so
+    /// this loses no real frame. What it removes is every embedded frame of
+    /// another version from the residual phantom-frame risk described on
+    /// [`FixCodec::with_garbled_recovery`]. The preceding-byte rule is kept as
+    /// it is, so a valid frame straight after garbage is still recovered.
+    ///
+    /// `begin_string` is matched against the FIX family (`FIX.4.0` to
+    /// `FIX.4.4`, `FIXT.1.1`; a FIX 5.0 session uses `FIXT.1.1` on the wire).
+    /// Any other value leaves no anchor at all: a resync then never lands
+    /// inside a buffer, and the codec waits for the next read to start on a
+    /// frame, which is what an unrecognised BeginString already got before.
+    /// Without recovery this setting has no effect.
+    #[must_use]
+    pub fn with_begin_string(mut self, begin_string: &str) -> Self {
+        let wanted = begin_string.as_bytes();
+        let position = RECOVERY_ANCHORS.iter().position(|anchor| {
+            anchor
+                .strip_prefix(BEGIN_STRING_PREFIX)
+                .and_then(|rest| rest.strip_suffix(b"\x019="))
+                == Some(wanted)
+        });
+        self.recovery_anchors = position
+            .and_then(|index| RECOVERY_ANCHORS.get(index..=index))
+            .unwrap_or(&[]);
+        self
+    }
+
+    /// Judges the start of the buffer against what the last resync left
+    /// pending, so the resync's checks hold across a read boundary.
+    ///
+    /// [`recovery_resync_offset`] only sees the current buffer. Two cases
+    /// would otherwise let a frame through that a single read would have
+    /// rejected:
+    ///
+    /// - **The resync emptied the buffer** ([`ResyncState::EmptiedAfter`]). If
+    ///   the byte it discarded last fails [`boundary_before`] (a resync that
+    ///   stopped right after `96=`), whatever the next read starts with
+    ///   continues the same garbled span: an accepted opening there would be
+    ///   an embedded frame, and any other opening, another version's
+    ///   included, would be framed by the ordinary path and delivered. It is
+    ///   resynchronised past from offset 1. If the byte passes the check, the
+    ///   start is judged like any frame start.
+    /// - **The resync stopped on a partial opening**
+    ///   ([`ResyncState::PartialOpening`]). Once the next read completes it,
+    ///   the opening is validated as the resync would have validated it in one
+    ///   read: an accepted opening proceeds, any other is resynchronised past
+    ///   from offset 1.
+    ///
+    /// Neither resync is counted again: the bytes belong to the garbled span
+    /// already counted. An ordinary aligned frame never reaches here, because
+    /// only a resync leaves a state pending.
+    #[cold]
+    fn judge_resync_start(&mut self, src: &mut BytesMut) -> SpanVerdict {
+        match self.resync_state {
+            ResyncState::Settled => SpanVerdict::Proceed,
+            ResyncState::EmptiedAfter(prev) => {
+                if src.is_empty() {
+                    return SpanVerdict::NeedMore;
+                }
+                if boundary_before(Some(prev)) {
+                    self.resync_state = ResyncState::Settled;
+                    return SpanVerdict::Proceed;
+                }
+                self.resync(src);
+                SpanVerdict::Resynced
+            }
+            ResyncState::PartialOpening => {
+                match anchor_shape(src.as_ref(), self.recovery_anchors) {
+                    AnchorShape::Partial => SpanVerdict::NeedMore,
+                    AnchorShape::Complete => {
+                        self.resync_state = ResyncState::Settled;
+                        SpanVerdict::Proceed
+                    }
+                    AnchorShape::Rejected => {
+                        self.resync(src);
+                        SpanVerdict::Resynced
+                    }
+                }
+            }
+        }
+    }
+
     /// Decides what a header-phase miss means for a buffer of `src_len` bytes.
     ///
     /// Returns `Ok(None)` ("read more") only while the buffer is still within
@@ -303,91 +716,77 @@ impl FixCodec {
     ///   the configured maximum message size.
     /// * [`CodecError::HeaderTooLong`] - no complete header within
     ///   [`MAX_HEADER_LEN`] bytes.
-    fn header_needs_more(&self, src_len: usize) -> Result<Option<BytesMut>, CodecError> {
-        // Checked first: when a single read delivers more bytes than any legal
-        // frame, the frame ceiling is the more informative diagnostic.
-        if src_len > self.max_message_size {
+    fn header_needs_more(&self, src_len: usize) -> Result<Option<FrameLayout>, CodecError> {
+        let too_large = src_len > self.max_message_size;
+        let too_long = src_len >= MAX_HEADER_LEN;
+        let header_too_long = CodecError::HeaderTooLong {
+            max_header_len: MAX_HEADER_LEN,
+        };
+        // Without recovery the frame ceiling is checked first: when a single
+        // read delivers more bytes than any legal frame, it is the more
+        // informative diagnostic. With recovery the header verdict wins, because
+        // it is the recoverable one: whether malformed header bytes end the
+        // stream must not depend on how many good frames TCP happened to
+        // deliver behind them.
+        if self.garbled_recovery && too_long {
+            return Err(header_too_long);
+        }
+        if too_large {
             return Err(CodecError::MessageTooLarge {
                 size: src_len,
                 max_size: self.max_message_size,
             });
         }
-        if src_len >= MAX_HEADER_LEN {
-            return Err(CodecError::HeaderTooLong {
-                max_header_len: MAX_HEADER_LEN,
-            });
+        if too_long {
+            return Err(header_too_long);
         }
         Ok(None)
     }
-}
 
-impl Default for FixCodec {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Decoder for FixCodec {
-    type Item = BytesMut;
-    type Error = CodecError;
-
-    /// Extracts one complete FIX frame from `src`.
+    /// Parses the `8=…<SOH>9=…<SOH>` header at the start of `bytes` and
+    /// derives the frame layout it declares.
+    ///
+    /// Pure: nothing is consumed here, so the caller decides what an error does
+    /// to the buffer. `bytes` is known to start with `8=`.
     ///
     /// # Errors
-    /// Returns a [`CodecError`] for any malformed frame; see that type for
-    /// which variants consume bytes from `src`.
-    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if src.len() < MIN_FRAME_LEN {
-            return Ok(None);
-        }
-
-        // Validate BeginString starts with "8=". A frame that does not is
-        // garbled: discard up to the next candidate frame so a caller that
-        // keeps reading makes progress instead of re-parsing these bytes.
-        if src.get(..BEGIN_STRING_PREFIX.len()) != Some(BEGIN_STRING_PREFIX) {
-            let discarded = resync_offset(src);
-            src.advance(discarded);
-            tracing::warn!(
-                discarded,
-                "garbled FIX frame: resynchronised to the next <SOH>8"
-            );
-            return Err(CodecError::InvalidBeginString);
-        }
-
+    /// [`CodecError::MissingBodyLength`], [`CodecError::InvalidBodyLength`],
+    /// [`CodecError::HeaderTooLong`] or [`CodecError::MessageTooLarge`] for a
+    /// header that cannot frame a legal message.
+    fn scan_header(&self, bytes: &[u8]) -> Result<Option<FrameLayout>, CodecError> {
         // The header is parsed inside a bounded window, so every "need more
         // data" answer below is capped by MAX_HEADER_LEN rather than by the
         // peer's willingness to send a delimiter.
-        let bytes: &[u8] = src.as_ref();
         let header = bytes.get(..MAX_HEADER_LEN).unwrap_or(bytes);
 
         // Find first SOH to get BeginString value
         let Some(first_soh) = memchr(SOH, header) else {
-            return self.header_needs_more(src.len());
+            return self.header_needs_more(bytes.len());
         };
 
         // Find BodyLength field (9=XXX|)
-        let Some(body_len_start) = first_soh.checked_add(1) else {
-            return Err(CodecError::InvalidBodyLength);
-        };
-        let Some(body_len_end) = body_len_start.checked_add(BODY_LENGTH_PREFIX.len()) else {
-            return Err(CodecError::InvalidBodyLength);
-        };
+        let body_len_start = first_soh
+            .checked_add(1)
+            .ok_or(CodecError::InvalidBodyLength)?;
+        let body_len_end = body_len_start
+            .checked_add(BODY_LENGTH_PREFIX.len())
+            .ok_or(CodecError::InvalidBodyLength)?;
         match header.get(body_len_start..body_len_end) {
             Some(prefix) if prefix == BODY_LENGTH_PREFIX => {}
             Some(_) => return Err(CodecError::MissingBodyLength),
-            None => return self.header_needs_more(src.len()),
+            None => return self.header_needs_more(bytes.len()),
         }
 
         // Find SOH after BodyLength
         let Some(after_prefix) = header.get(body_len_end..) else {
-            return self.header_needs_more(src.len());
+            return self.header_needs_more(bytes.len());
         };
         let Some(digits_len) = memchr(SOH, after_prefix) else {
-            return self.header_needs_more(src.len());
+            return self.header_needs_more(bytes.len());
         };
-        let Some(digits) = after_prefix.get(..digits_len) else {
-            return Err(CodecError::InvalidBodyLength);
-        };
+        let digits = after_prefix
+            .get(..digits_len)
+            .ok_or(CodecError::InvalidBodyLength)?;
         let body_length = parse_body_length(digits).ok_or(CodecError::InvalidBodyLength)?;
         let body_len_soh = body_len_end
             .checked_add(digits_len)
@@ -415,6 +814,165 @@ impl Decoder for FixCodec {
                 max_size: self.max_message_size,
             });
         }
+
+        Ok(Some(FrameLayout {
+            body_end,
+            total_length,
+        }))
+    }
+
+    /// Discards bytes up to the next candidate frame start and returns how
+    /// many were discarded.
+    ///
+    /// The anchor depends on the mode: [`resync_offset`] without recovery,
+    /// [`recovery_resync_offset`] with it. Both return an offset within
+    /// `src`, so the advance is always in bounds.
+    ///
+    /// In recovery mode the resync records what it leaves pending: the last
+    /// byte it discarded when it empties the buffer, or that it stopped on a
+    /// partial opening, so the next read can be judged consistently
+    /// ([`FixCodec::judge_resync_start`]).
+    #[cold]
+    fn resync(&mut self, src: &mut BytesMut) -> usize {
+        let discarded = if self.garbled_recovery {
+            let anchors = self.recovery_anchors;
+            let discarded = recovery_resync_offset(src, anchors);
+            self.resync_state = if discarded == src.len() {
+                discarded
+                    .checked_sub(1)
+                    .and_then(|last| src.get(last))
+                    .copied()
+                    .map_or(ResyncState::Settled, ResyncState::EmptiedAfter)
+            } else if src
+                .get(discarded..)
+                .is_some_and(|rest| anchor_shape(rest, anchors) == AnchorShape::Partial)
+            {
+                ResyncState::PartialOpening
+            } else {
+                ResyncState::Settled
+            };
+            discarded
+        } else {
+            resync_offset(src)
+        };
+        src.advance(discarded);
+        discarded
+    }
+
+    /// Logs a resynchronisation without recovery, naming how many bytes it
+    /// discarded and never the bytes themselves.
+    ///
+    /// Without recovery a resync accompanies a returned error, so it is a
+    /// warning. With recovery it is routine and is reported once per skip, at
+    /// debug, by [`FixCodec::record_skip`]; logging here too would double it,
+    /// and a warning per skip would let a peer streaming garbage flood the log.
+    #[cold]
+    fn log_resync(&self, discarded: usize, cause: &'static str) {
+        if !self.garbled_recovery {
+            tracing::warn!(discarded, cause, "garbled FIX frame: resynchronised");
+        }
+    }
+
+    /// Bookkeeping for one skipped garbled frame in recovery mode: count it,
+    /// guarantee progress, and emit the single debug event for the skip.
+    ///
+    /// `before` is the buffer length before the failed framing attempt, so
+    /// `before - src.len()` is what the skip discarded.
+    ///
+    /// # Errors
+    /// Returns `error` itself when the counter cannot represent another skip,
+    /// rather than hiding the frame. Unreachable in practice: every skip
+    /// consumes at least one byte, so it takes 2^64 bytes.
+    #[cold]
+    #[inline(never)]
+    fn record_skip(
+        &mut self,
+        src: &mut BytesMut,
+        before: usize,
+        error: CodecError,
+    ) -> Result<(), CodecError> {
+        let Some(count) = self.garbled_count.checked_add(1) else {
+            return Err(error);
+        };
+        self.garbled_count = count;
+
+        // Every recoverable path consumes at least one byte in recovery mode,
+        // and that is what bounds the decode loop by the buffer length. It is
+        // enforced rather than assumed: a path that consumed nothing would
+        // otherwise spin forever on the same bytes.
+        debug_assert!(
+            src.len() < before,
+            "a recoverable framing error must consume input"
+        );
+        if src.len() >= before && !src.is_empty() {
+            src.advance(1);
+        }
+        // The buffer never grows inside a framing attempt, so the subtraction
+        // always succeeds; the other arm still emits the one event per skip.
+        match before.checked_sub(src.len()) {
+            Some(discarded) => tracing::debug!(
+                cause = %error,
+                discarded,
+                skipped = count,
+                "skipped a garbled FIX frame"
+            ),
+            None => tracing::debug!(cause = %error, skipped = count, "skipped a garbled FIX frame"),
+        }
+        Ok(())
+    }
+
+    /// Reports a header that cannot frame a legal message.
+    ///
+    /// Without recovery nothing is consumed: the frame boundary is unknown and
+    /// the error is the caller's to act on. With recovery a recoverable header
+    /// error is about to be skipped, so the codec resynchronises first and the
+    /// skip makes progress. A fatal error is never resynchronised.
+    #[cold]
+    fn reject_header(
+        &mut self,
+        src: &mut BytesMut,
+        error: CodecError,
+    ) -> Result<Option<BytesMut>, CodecError> {
+        if self.garbled_recovery && error.is_recoverable() {
+            let discarded = self.resync(src);
+            self.log_resync(discarded, "malformed header");
+        }
+        Err(error)
+    }
+
+    /// Extracts one complete FIX frame from `src`, or reports why it cannot.
+    ///
+    /// This is a single framing attempt; [`Decoder::decode`] wraps it with the
+    /// recovery loop.
+    ///
+    /// # Errors
+    /// A [`CodecError`] for any malformed frame; see that type for which
+    /// variants consume bytes from `src`.
+    fn decode_one(&mut self, src: &mut BytesMut) -> Result<Option<BytesMut>, CodecError> {
+        if src.len() < MIN_FRAME_LEN {
+            return Ok(None);
+        }
+
+        // Validate BeginString starts with "8=". A frame that does not is
+        // garbled: discard up to the next candidate frame so a caller that
+        // keeps reading makes progress instead of re-parsing these bytes.
+        if src.get(..BEGIN_STRING_PREFIX.len()) != Some(BEGIN_STRING_PREFIX) {
+            let discarded = self.resync(src);
+            self.log_resync(discarded, "frame does not start with 8=");
+            return Err(CodecError::InvalidBeginString);
+        }
+
+        // Bound before matching: the borrow of `src` must end before the error
+        // arm resynchronises it.
+        let scanned = self.scan_header(src.as_ref());
+        let FrameLayout {
+            body_end,
+            total_length,
+        } = match scanned {
+            Ok(Some(layout)) => layout,
+            Ok(None) => return Ok(None),
+            Err(error) => return self.reject_header(src, error),
+        };
 
         // Check if we have the complete message
         match total_length.checked_sub(src.len()) {
@@ -448,11 +1006,10 @@ impl Decoder for FixCodec {
         let declared = match trailer {
             Ok(value) => value,
             Err(error @ CodecError::InvalidTrailer { .. }) => {
-                let discarded = resync_offset(src);
-                src.advance(discarded);
-                tracing::warn!(
+                let discarded = self.resync(src);
+                self.log_resync(
                     discarded,
-                    "FIX trailer absent at the declared BodyLength offset: resynchronised"
+                    "trailer absent at the declared BodyLength offset",
                 );
                 return Err(error);
             }
@@ -478,8 +1035,8 @@ impl Decoder for FixCodec {
                     });
                 }
                 None => {
-                    let discarded = resync_offset(src);
-                    src.advance(discarded);
+                    let discarded = self.resync(src);
+                    self.log_resync(discarded, "checksum span out of bounds");
                     return Err(CodecError::InvalidTrailer { offset: body_end });
                 }
             }
@@ -488,6 +1045,56 @@ impl Decoder for FixCodec {
         // Extract the complete message
         let message = src.split_to(total_length);
         Ok(Some(message))
+    }
+}
+
+impl Default for FixCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decoder for FixCodec {
+    type Item = BytesMut;
+    type Error = CodecError;
+
+    /// Extracts one complete FIX frame from `src`.
+    ///
+    /// With [`FixCodec::with_garbled_recovery`] enabled, recoverable framing
+    /// errors are skipped and counted within this call, which then returns the
+    /// next valid frame if one is buffered. Each skip consumes at least one
+    /// byte, so the loop is bounded by the buffer length.
+    ///
+    /// # Errors
+    /// Without recovery, a [`CodecError`] for any malformed frame. With it,
+    /// only the fatal ones ([`CodecError::is_recoverable`] is `false`). See
+    /// [`CodecError`] for which variants consume bytes from `src`.
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        loop {
+            // After a resync, the start of this buffer may still sit inside
+            // the same garbled span, or complete an opening that has yet to
+            // be validated.
+            if self.garbled_recovery && self.resync_state != ResyncState::Settled {
+                match self.judge_resync_start(src) {
+                    SpanVerdict::Proceed => {}
+                    SpanVerdict::NeedMore => return Ok(None),
+                    SpanVerdict::Resynced => continue,
+                }
+            }
+            let before = src.len();
+            let error = match self.decode_one(src) {
+                Ok(Some(frame)) => {
+                    self.resync_state = ResyncState::Settled;
+                    return Ok(Some(frame));
+                }
+                Ok(None) => return Ok(None),
+                Err(error) => error,
+            };
+            if !self.garbled_recovery || !error.is_recoverable() {
+                return Err(error);
+            }
+            self.record_skip(src, before, error)?;
+        }
     }
 }
 
@@ -1145,5 +1752,1031 @@ mod tests {
 
         assert!(matches!(codec.encode(&msg[..], &mut dst), Ok(())));
         assert_eq!(dst.len(), 16);
+    }
+
+    // --- Garbled-frame recovery ----------------------------------------------
+
+    /// A codec with garbled-frame recovery enabled and default limits.
+    fn recovering() -> FixCodec {
+        FixCodec::new().with_garbled_recovery(true)
+    }
+
+    /// Builds a frame around `body` whose CheckSum is off by one.
+    fn make_bad_checksum_message(body: &str) -> Vec<u8> {
+        let without_checksum = format!("8=FIX.4.4\x019={}\x01{}", body.len(), body);
+        let correct = u16::from(calculate_checksum(without_checksum.as_bytes()));
+        let wrong = (correct + 1) % 256;
+        format!("{without_checksum}10={wrong:03}\x01").into_bytes()
+    }
+
+    /// Decodes until the codec asks for more data or errors, collecting every
+    /// frame. Fails the test if the codec does not settle, which would mean a
+    /// recovery path that makes no progress.
+    fn drain(
+        codec: &mut FixCodec,
+        buf: &mut BytesMut,
+        out: &mut Vec<BytesMut>,
+    ) -> Option<CodecError> {
+        for _ in 0..100_000 {
+            match codec.decode(buf) {
+                Ok(Some(frame)) => out.push(frame),
+                Ok(None) => return None,
+                Err(error) => return Some(error),
+            }
+        }
+        panic!("decode did not settle: a recovery path is not making progress");
+    }
+
+    #[test]
+    #[allow(deprecated)] // `Incomplete` is classified like every other variant.
+    fn test_is_recoverable_classifies_every_variant() {
+        let recoverable = [
+            CodecError::InvalidBeginString,
+            CodecError::MissingBodyLength,
+            CodecError::InvalidBodyLength,
+            CodecError::HeaderTooLong { max_header_len: 64 },
+            CodecError::InvalidTrailer { offset: 3 },
+            CodecError::InvalidChecksumFormat,
+            CodecError::ChecksumMismatch {
+                calculated: 1,
+                declared: 2,
+            },
+        ];
+        for error in &recoverable {
+            assert!(error.is_recoverable(), "{error:?} is garbling");
+        }
+
+        let fatal = [
+            CodecError::Incomplete,
+            CodecError::MessageTooLarge {
+                size: 2,
+                max_size: 1,
+            },
+            CodecError::Io("connection reset".to_string()),
+            CodecError::from(std::io::Error::other("boom")),
+        ];
+        for error in &fatal {
+            assert!(!error.is_recoverable(), "{error:?} must end the stream");
+        }
+    }
+
+    #[test]
+    fn test_recovery_checksum_mismatch_returns_the_next_frame_in_one_call() {
+        let mut codec = recovering();
+        let bad = make_bad_checksum_message("35=0\x0149=A\x0156=B\x01");
+        let good = make_fix_message("35=1\x01112=PING\x01");
+        let mut buf = BytesMut::from(&bad[..]);
+        buf.extend_from_slice(&good);
+
+        let frame = decode_frame(&mut codec, &mut buf);
+        assert_eq!(&frame[..], &good[..]);
+        assert!(buf.is_empty());
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_short_body_length_returns_the_next_frame_in_one_call() {
+        // BodyLength says 3 where the body is 5 bytes: InvalidTrailer.
+        let mut codec = recovering();
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut buf = BytesMut::from(&b"8=FIX.4.4\x019=3\x0135=0\x0110=000\x01"[..]);
+        buf.extend_from_slice(&good);
+
+        let frame = decode_frame(&mut codec, &mut buf);
+        assert_eq!(&frame[..], &good[..]);
+        assert!(buf.is_empty());
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_long_body_length_returns_the_next_frame_once_its_span_is_buffered() {
+        // BodyLength says 60 where the body is 5 bytes. The trailer can only
+        // be checked once 82 bytes are buffered; until then the codec waits,
+        // exactly as it would for a real frame that long.
+        let mut codec = recovering();
+        let good = b"8=FIX.4.4\x019=15\x0135=0\x0149=A\x0156=B\x0110=171\x01";
+        let mut buf = BytesMut::from(&b"8=FIX.4.4\x019=60\x0135=0\x0110=000\x01"[..]);
+        buf.extend_from_slice(good);
+
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        assert_eq!(codec.take_garbled_count(), 0, "nothing is skipped yet");
+
+        buf.extend_from_slice(good);
+        buf.extend_from_slice(good);
+        // The declared span is now buffered: the trailer check fails, the
+        // hostile header is skipped, and the first good frame comes back in
+        // the same call. BodyLength was not corroborated, so it did not bound
+        // the discard and every good frame survives.
+        for index in 0..3 {
+            match codec.decode(&mut buf) {
+                Ok(Some(frame)) => assert_eq!(&frame[..], &good[..]),
+                other => panic!("good frame {index} must survive, got {other:?}"),
+            }
+        }
+        assert!(buf.is_empty());
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_leading_garbage_without_soh_returns_the_frame_in_one_call() {
+        let garbage: &[u8] = b"\x00garbage!\xff";
+        let good = make_fix_message("35=0\x0149=A\x0156=B\x01");
+
+        let mut codec = recovering();
+        let mut buf = BytesMut::from(garbage);
+        buf.extend_from_slice(&good);
+        let frame = decode_frame(&mut codec, &mut buf);
+        assert_eq!(&frame[..], &good[..]);
+        assert!(buf.is_empty());
+        assert_eq!(codec.take_garbled_count(), 1);
+
+        // Without recovery the `<SOH>8` anchor cannot see this frame: its
+        // `8=` follows the garbage, not an SOH, so it is discarded with it.
+        let mut strict = FixCodec::new();
+        let mut buf = BytesMut::from(garbage);
+        buf.extend_from_slice(&good);
+        assert_eq!(
+            strict.decode(&mut buf).err(),
+            Some(CodecError::InvalidBeginString)
+        );
+        assert!(matches!(strict.decode(&mut buf), Ok(None)));
+    }
+
+    #[test]
+    fn test_recovery_leading_garbage_ending_in_soh_returns_the_frame_in_one_call() {
+        let mut codec = recovering();
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut buf = BytesMut::from(&b"junk\x01"[..]);
+        buf.extend_from_slice(&good);
+
+        let frame = decode_frame(&mut codec, &mut buf);
+        assert_eq!(&frame[..], &good[..]);
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_missing_body_length_resyncs_to_the_next_frame() {
+        let mut codec = recovering();
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut buf = BytesMut::from(&b"8=FIX.4.4\x0135=0\x0149=A\x0110=000\x01"[..]);
+        buf.extend_from_slice(&good);
+
+        let frame = decode_frame(&mut codec, &mut buf);
+        assert_eq!(&frame[..], &good[..]);
+        assert!(buf.is_empty());
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_invalid_body_length_resyncs_to_the_next_frame() {
+        for bad in [
+            &b"8=FIX.4.4\x019=abc\x0135=0\x0110=000\x01"[..],
+            &b"8=FIX.4.4\x019=\x0135=0\x0110=000\x01"[..],
+            &b"8=FIX.4.4\x019=+5\x0135=0\x0110=000\x01"[..],
+        ] {
+            let mut codec = recovering();
+            let good = make_fix_message("35=0\x0149=A\x01");
+            let mut buf = BytesMut::from(bad);
+            buf.extend_from_slice(&good);
+
+            let frame = decode_frame(&mut codec, &mut buf);
+            assert_eq!(&frame[..], &good[..]);
+            assert_eq!(codec.take_garbled_count(), 1);
+        }
+    }
+
+    #[test]
+    fn test_recovery_body_length_overflow_resyncs_to_the_next_frame() {
+        let mut codec = recovering();
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let hostile = format!("8=FIX.4.4\x019={}\x0135=0\x0110=000\x01", usize::MAX);
+        let mut buf = BytesMut::from(hostile.as_bytes());
+        buf.extend_from_slice(&good);
+
+        let frame = decode_frame(&mut codec, &mut buf);
+        assert_eq!(&frame[..], &good[..]);
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_header_too_long_resyncs_to_the_next_frame() {
+        let mut codec = recovering();
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut buf = BytesMut::from(&b"8="[..]);
+        buf.extend_from_slice(&[b'X'; 70]);
+        buf.extend_from_slice(&good);
+
+        let frame = decode_frame(&mut codec, &mut buf);
+        assert_eq!(&frame[..], &good[..]);
+        assert!(buf.is_empty());
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_message_too_large_is_still_an_error_and_consumes_nothing() {
+        let mut codec = recovering();
+        let msg = format!("8=FIX.4.4\x019={}\x0135=0\x0110=000\x01", 10 * 1024 * 1024);
+        let mut buf = BytesMut::from(msg.as_bytes());
+        let total = buf.len();
+
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(CodecError::MessageTooLarge { .. })
+        ));
+        assert_eq!(buf.len(), total);
+        assert_eq!(codec.take_garbled_count(), 0);
+    }
+
+    #[test]
+    fn test_recovery_soh_free_buffer_over_ceiling_is_skipped_not_fatal() {
+        // Without recovery this buffer is MessageTooLarge (see
+        // `test_decode_soh_free_buffer_over_ceiling_is_message_too_large`):
+        // the frame ceiling is checked first. With recovery the header ceiling
+        // wins, so the same garbage is skipped however many bytes TCP happened
+        // to deliver with it.
+        let ceiling = 128;
+        let mut codec = recovering().with_max_message_size(ceiling);
+        let mut buf = BytesMut::from(&b"8="[..]);
+        buf.extend_from_slice(&vec![b'X'; ceiling]);
+
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        assert!(buf.is_empty());
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_eof_with_a_truncated_frame_is_a_fatal_io_error() {
+        let mut codec = recovering();
+        let msg = make_fix_message("35=0\x0149=A\x01");
+        let Some(head) = msg.get(..msg.len() - 3) else {
+            panic!("message is longer than the truncation");
+        };
+        let mut buf = BytesMut::from(head);
+
+        match codec.decode_eof(&mut buf) {
+            Err(error @ CodecError::Io(_)) => assert!(!error.is_recoverable()),
+            other => panic!("a stream ending mid-frame must be an I/O error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_recovery_off_keeps_the_error_per_frame_contract() {
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let bad: &[u8] = b"8=FIX.4.4\x0135=0\x0149=A\x0110=000\x01";
+
+        let mut strict = FixCodec::new();
+        let mut buf = BytesMut::from(bad);
+        buf.extend_from_slice(&good);
+        let total = buf.len();
+        assert_eq!(
+            strict.decode(&mut buf).err(),
+            Some(CodecError::MissingBodyLength)
+        );
+        assert_eq!(buf.len(), total, "without recovery nothing is consumed");
+        assert_eq!(strict.take_garbled_count(), 0);
+
+        let mut lenient = recovering();
+        let mut buf = BytesMut::from(bad);
+        buf.extend_from_slice(&good);
+        let frame = decode_frame(&mut lenient, &mut buf);
+        assert_eq!(&frame[..], &good[..]);
+        assert_eq!(lenient.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_garbled_count_counts_each_skip_and_resets() {
+        let mut codec = recovering();
+        let first = make_fix_message("35=0\x0149=A\x01");
+        let second = make_fix_message("35=0\x0149=B\x01");
+        let mut buf = BytesMut::from(&make_bad_checksum_message("35=0\x0149=X\x01")[..]);
+        buf.extend_from_slice(b"\x00\x00noise");
+        buf.extend_from_slice(&first);
+        buf.extend_from_slice(b"8=FIX.4.4\x019=abc\x0135=0\x0110=000\x01");
+        buf.extend_from_slice(&second);
+
+        assert_eq!(&decode_frame(&mut codec, &mut buf)[..], &first[..]);
+        assert_eq!(&decode_frame(&mut codec, &mut buf)[..], &second[..]);
+        assert_eq!(codec.take_garbled_count(), 3);
+        assert_eq!(codec.take_garbled_count(), 0, "the count resets on take");
+    }
+
+    #[test]
+    fn test_recovery_false_anchor_inside_a_field_is_not_an_anchor() {
+        // The garbled frame's Text (58) carries `8=FIX`. The resync scan
+        // rejects it (it follows `=` and is not a complete header opening), so
+        // it is never counted, and the real frame after it is still returned in
+        // the same call.
+        let mut codec = recovering();
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut buf =
+            BytesMut::from(&b"8=FIX.4.4\x019=3\x0135=0\x0158=8=FIX here\x0110=000\x01"[..]);
+        buf.extend_from_slice(&good);
+
+        let frame = decode_frame(&mut codec, &mut buf);
+        assert_eq!(&frame[..], &good[..]);
+        assert!(buf.is_empty());
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    /// Builds a well-formed frame with the given BeginString around `body`.
+    fn make_message_with(begin_string: &str, body: &str) -> Vec<u8> {
+        let without_checksum = format!("8={begin_string}\x019={}\x01{}", body.len(), body);
+        let checksum = calculate_checksum(without_checksum.as_bytes());
+        format!("{without_checksum}10={checksum:03}\x01").into_bytes()
+    }
+
+    #[test]
+    fn test_recovery_phantom_split_across_reads_is_not_delivered() {
+        // The resync through a garbled frame empties the buffer right after
+        // `96=`; the frame embedded in that field then arrives at offset 0 of
+        // the next read, where the current buffer alone shows no `=` before
+        // it. The codec remembers the discarded tail and treats the opening as
+        // the same garbled span: not delivered, not counted again.
+        let inner = make_fix_message("35=0\x0149=X\x0156=Y\x0134=99\x01");
+        let first_read = format!("8=FIX.4.4\x019=abc\x0135=D\x0195={}\x0196=", inner.len());
+        let good = make_fix_message("35=1\x0149=A\x01112=PING\x01");
+        let mut second_read = inner.clone();
+        second_read.extend_from_slice(b"\x0110=000\x01");
+        second_read.extend_from_slice(&good);
+
+        for codec in [recovering(), recovering().with_begin_string("FIX.4.4")] {
+            let mut codec = codec;
+            let mut buf = BytesMut::from(first_read.as_bytes());
+            assert!(matches!(codec.decode(&mut buf), Ok(None)));
+            assert!(buf.is_empty(), "the resync emptied the buffer");
+            buf.extend_from_slice(&second_read);
+            let mut frames = Vec::new();
+            assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+            let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+            assert_eq!(got, vec![&good[..]], "two reads");
+            assert_eq!(codec.take_garbled_count(), 1, "one garbled span, two reads");
+
+            // The same bytes in one read.
+            let mut codec = recovering();
+            let mut buf = BytesMut::from(first_read.as_bytes());
+            buf.extend_from_slice(&second_read);
+            let mut frames = Vec::new();
+            assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+            let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+            assert_eq!(got, vec![&good[..]], "one read");
+            assert_eq!(codec.take_garbled_count(), 1, "one read");
+        }
+    }
+
+    #[test]
+    fn test_recovery_other_version_frame_after_a_split_data_field_is_not_delivered() {
+        // Restricted to FIX.4.4. The resync empties the buffer right after
+        // `96=`, and the next read starts with a checksum-valid FIX.4.2 frame
+        // embedded in that field. Its opening is not an accepted anchor, but
+        // it is still a frame start the ordinary path would frame: it must be
+        // treated as the rest of the garbled span, exactly as in one read.
+        let inner = make_message_with("FIX.4.2", "35=0\x0149=X\x0156=Y\x0134=99\x01");
+        let first_read = format!("8=FIX.4.4\x019=abc\x0135=D\x0195={}\x0196=", inner.len());
+        let good = make_fix_message("35=1\x0149=A\x01112=PING\x01");
+        let mut second_read = inner.clone();
+        second_read.extend_from_slice(b"\x0110=000\x01");
+        second_read.extend_from_slice(&good);
+
+        let mut codec = recovering().with_begin_string("FIX.4.4");
+        let mut buf = BytesMut::from(first_read.as_bytes());
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        assert!(buf.is_empty());
+        buf.extend_from_slice(&second_read);
+        let mut frames = Vec::new();
+        assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+        let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+        assert_eq!(got, vec![&good[..]], "two reads");
+        assert_eq!(codec.take_garbled_count(), 1);
+
+        let mut codec = recovering().with_begin_string("FIX.4.4");
+        let mut buf = BytesMut::from(first_read.as_bytes());
+        buf.extend_from_slice(&second_read);
+        let mut frames = Vec::new();
+        assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+        let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+        assert_eq!(got, vec![&good[..]], "one read");
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_partial_opening_completed_as_another_version_is_rejected() {
+        // Restricted to FIX.4.4. The resync stops on `8=FIX.4.` at the end of
+        // the first read: a partial opening that may still become FIX.4.4.
+        // The next read completes it as FIX.4.2. In one read the resync would
+        // have rejected that opening; split across reads it must be too.
+        let other = make_message_with("FIX.4.2", "35=0\x0149=X\x0156=Y\x0134=7\x01");
+        let good = make_fix_message("35=1\x0149=A\x01112=PING\x01");
+        let mut stream = Vec::from(&b"some leading garbage!"[..]);
+        stream.extend_from_slice(&other);
+        stream.extend_from_slice(&good);
+        let split = b"some leading garbage!8=FIX.4.".len();
+        let (Some(first_read), Some(second_read)) = (stream.get(..split), stream.get(split..))
+        else {
+            panic!("split point is inside the stream");
+        };
+
+        let mut codec = recovering().with_begin_string("FIX.4.4");
+        let mut buf = BytesMut::from(first_read);
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        assert_eq!(&buf[..], b"8=FIX.4.", "the partial opening is kept");
+        buf.extend_from_slice(second_read);
+        let mut frames = Vec::new();
+        assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+        let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+        assert_eq!(got, vec![&good[..]], "two reads");
+        assert_eq!(codec.take_garbled_count(), 1);
+
+        let mut codec = recovering().with_begin_string("FIX.4.4");
+        let mut buf = BytesMut::from(&stream[..]);
+        let mut frames = Vec::new();
+        assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+        let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+        assert_eq!(got, vec![&good[..]], "one read");
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_partial_opening_completed_as_the_session_version_is_framed() {
+        // The same split, completed as the session's own version: an ordinary
+        // frame that the partial opening correctly waited for.
+        let mut codec = recovering().with_begin_string("FIX.4.4");
+        let good = make_fix_message("35=1\x0149=A\x01112=PING\x01");
+        let mut stream = Vec::from(&b"some leading garbage!"[..]);
+        stream.extend_from_slice(&good);
+        let split = b"some leading garbage!8=FIX.4.".len();
+        let (Some(first_read), Some(second_read)) = (stream.get(..split), stream.get(split..))
+        else {
+            panic!("split point is inside the stream");
+        };
+        let mut buf = BytesMut::from(first_read);
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        buf.extend_from_slice(second_read);
+        assert_eq!(&decode_frame(&mut codec, &mut buf)[..], &good[..]);
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_discarded_tail_is_forgotten_after_a_plausible_boundary() {
+        // A resync that empties the buffer on a byte that is a plausible
+        // boundary does not hold back the frame at the start of the next read.
+        let mut codec = recovering();
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut buf = BytesMut::from(&b"garbage that ends on a delimiter\x01"[..]);
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        buf.extend_from_slice(&good);
+        assert_eq!(&decode_frame(&mut codec, &mut buf)[..], &good[..]);
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_documented_residual_risk_is_pinned() {
+        // The documented residual risk, pinned so a change to it is a visible
+        // decision: inside an already garbled frame, a complete opening of
+        // the session's own BeginString after a byte other than a digit or `=`
+        // (here a space in `213=MSG: …`) IS resynchronised onto and delivered.
+        // An embedded frame of another version is not, once the codec is
+        // restricted to the session's BeginString.
+        let same = make_fix_message("35=0\x0149=X\x0156=Y\x0134=99\x01");
+        let other = make_message_with("FIX.4.2", "35=0\x0149=X\x0156=Y\x0134=99\x01");
+        let good = make_fix_message("35=1\x0149=A\x01112=PING\x01");
+        let garbled_around = |inner: &[u8]| {
+            let mut outer = format!(
+                "8=FIX.4.4\x019=5\x0135=D\x01212={}\x01213=MSG: ",
+                inner.len() + 5
+            )
+            .into_bytes();
+            outer.extend_from_slice(inner);
+            outer.extend_from_slice(b"\x0110=000\x01");
+            outer.extend_from_slice(&good);
+            outer
+        };
+        let deliver = |mut codec: FixCodec, bytes: &[u8]| {
+            let mut buf = BytesMut::from(bytes);
+            let mut frames = Vec::new();
+            assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+            frames
+        };
+
+        let session = || recovering().with_begin_string("FIX.4.4");
+        let frames = deliver(session(), &garbled_around(&same));
+        let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+        assert_eq!(got, vec![&same[..], &good[..]], "same version: the risk");
+
+        let frames = deliver(session(), &garbled_around(&other));
+        let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+        assert_eq!(got, vec![&good[..]], "other version: excluded");
+
+        // Without the restriction every family version is an anchor.
+        let frames = deliver(recovering(), &garbled_around(&other));
+        let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+        assert_eq!(got, vec![&other[..], &good[..]], "unrestricted");
+    }
+
+    #[test]
+    fn test_with_begin_string_selects_the_session_anchor() {
+        let only = |codec: FixCodec| codec.recovery_anchors.to_vec();
+        assert_eq!(
+            only(FixCodec::new().with_begin_string("FIX.4.2")),
+            vec![&b"8=FIX.4.2\x019="[..]]
+        );
+        assert_eq!(
+            only(FixCodec::new().with_begin_string("FIXT.1.1")),
+            vec![&b"8=FIXT.1.1\x019="[..]]
+        );
+        assert_eq!(only(FixCodec::new()).len(), RECOVERY_ANCHORS.len());
+        // An unrecognised BeginString leaves no anchor at all.
+        assert!(only(FixCodec::new().with_begin_string("FIX.5.0")).is_empty());
+
+        // No real frame of the session is lost: garbage then a frame of the
+        // session's version is still recovered in the same buffer.
+        let mut codec = recovering().with_begin_string("FIX.4.4");
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut buf = BytesMut::from(&b"\x00garbage!\xff"[..]);
+        buf.extend_from_slice(&good);
+        assert_eq!(&decode_frame(&mut codec, &mut buf)[..], &good[..]);
+
+        // With no anchor, a resync never lands inside the buffer: the frame
+        // behind the garbage is discarded with it.
+        let mut codec = recovering().with_begin_string("NOT.FIX");
+        let mut buf = BytesMut::from(&b"\x00garbage!\xff"[..]);
+        buf.extend_from_slice(&good);
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_recovery_execution_report_with_8xx_tags_counts_once() {
+        // One ExecutionReport whose BodyLength is wrong, carrying tags 851, 828
+        // and 880. Each of them is an `8` after an SOH; a bare `<SOH>8` anchor
+        // resynchronised onto every one and counted it, so a limit of 3 logged
+        // the session out over a single garbled fill.
+        let mut codec = recovering();
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut buf = BytesMut::from(
+            &b"8=FIX.4.4\x019=3\x0135=8\x0137=1\x01851=1\x01828=0\x01880=X\x0110=000\x01"[..],
+        );
+        buf.extend_from_slice(&good);
+
+        let mut frames = Vec::new();
+        assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+        let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+        assert_eq!(got, vec![&good[..]]);
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_frame_embedded_in_a_data_field_is_not_delivered() {
+        // A complete, checksum-valid frame inside RawData (96) or XmlData (213)
+        // of a garbled outer frame. The outer BodyLength is wrong, so the codec
+        // resyncs through the outer body; the embedded frame follows `=` and
+        // must never be resynchronised onto and handed up as a phantom.
+        let inner = make_fix_message("35=0\x0149=X\x0156=Y\x0134=99\x01");
+        for (length_tag, data_tag) in [(95u32, 96u32), (212, 213)] {
+            let mut outer = format!(
+                "8=FIX.4.4\x019=5\x0135=D\x01{length_tag}={}\x01",
+                inner.len()
+            )
+            .into_bytes();
+            outer.extend_from_slice(format!("{data_tag}=").as_bytes());
+            outer.extend_from_slice(&inner);
+            outer.extend_from_slice(b"\x0110=000\x01");
+            let good = make_fix_message("35=1\x0149=A\x01112=PING\x01");
+
+            let mut codec = recovering();
+            let mut buf = BytesMut::from(&outer[..]);
+            buf.extend_from_slice(&good);
+            let mut frames = Vec::new();
+            assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+
+            let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+            assert_eq!(got, vec![&good[..]], "data tag {data_tag}");
+            assert_eq!(codec.take_garbled_count(), 1, "data tag {data_tag}");
+        }
+    }
+
+    #[test]
+    fn test_recovery_keeps_a_partial_anchor_tail_for_the_next_read() {
+        let mut codec = recovering();
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut buf = BytesMut::from(&b"some garbage text 8=FI"[..]);
+
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        assert_eq!(&buf[..], b"8=FI", "the tail may still become a frame start");
+        assert_eq!(codec.take_garbled_count(), 1);
+
+        let Some(rest) = good.get(4..) else {
+            panic!("the frame is longer than its anchor");
+        };
+        buf.extend_from_slice(rest);
+        let frame = decode_frame(&mut codec, &mut buf);
+        assert_eq!(&frame[..], &good[..]);
+    }
+
+    #[test]
+    fn test_recovery_garbage_ending_in_soh_split_across_reads_counts_once() {
+        // The garbage arrives in one read and ends on an SOH; the frame arrives
+        // in the next. Keeping that SOH would make the frame's start look
+        // garbled and count the same garbage twice.
+        let mut codec = recovering();
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut buf = BytesMut::from(&b"garbage that ends on a delimiter\x01"[..]);
+
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        assert!(buf.is_empty());
+
+        buf.extend_from_slice(&good);
+        let frame = decode_frame(&mut codec, &mut buf);
+        assert_eq!(&frame[..], &good[..]);
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_resync_offset_anchors() {
+        // A complete header opening after garbage, after an SOH, or for every
+        // BeginString in the family is a candidate.
+        assert_eq!(
+            recovery_resync_offset(b"xx8=FIX.4.4\x019=5\x01", &RECOVERY_ANCHORS),
+            2
+        );
+        assert_eq!(
+            recovery_resync_offset(b"x\x018=FIX.4.0\x019=5\x01", &RECOVERY_ANCHORS),
+            2
+        );
+        assert_eq!(
+            recovery_resync_offset(b"x 8=FIXT.1.1\x019=5\x01", &RECOVERY_ANCHORS),
+            2
+        );
+        // None of the following holds a candidate, so all of it goes:
+        let no_candidate: [&[u8]; 7] = [
+            // tags that start with 8 after an SOH, however many;
+            b"x\x01851=1\x01828=0\x01880=X\x01",
+            // an opening inside a field value or a tag (`=` or a digit before);
+            b"x\x01213=8=FIX.4.4\x019=5\x01",
+            b"x\x01448=FIX.4.4\x019=5\x01",
+            b"x 58=1 18=2\x01",
+            // an unknown BeginString, or an opening without `<SOH>9=`;
+            b"x 8=FIX.9.9\x019=5\x01",
+            b"x 8=FIX.4.4\x0135=0\x01",
+            // offset 0, which is the frame that failed.
+            b"8=FIX.4.4\x019=5\x01",
+        ];
+        for input in no_candidate {
+            assert_eq!(
+                recovery_resync_offset(input, &RECOVERY_ANCHORS),
+                input.len(),
+                "{input:?}"
+            );
+        }
+        // A partial opening cut off by the end of the buffer is kept for the
+        // next read; anything else goes. A trailing SOH is not kept.
+        assert_eq!(recovery_resync_offset(b"abc8=", &RECOVERY_ANCHORS), 3);
+        assert_eq!(
+            recovery_resync_offset(b"abc 8=FIX.4.4\x01", &RECOVERY_ANCHORS),
+            4
+        );
+        assert_eq!(recovery_resync_offset(b"abc8=FOO", &RECOVERY_ANCHORS), 8);
+        assert_eq!(recovery_resync_offset(b"abc\x01", &RECOVERY_ANCHORS), 4);
+        assert_eq!(recovery_resync_offset(b"abcdef", &RECOVERY_ANCHORS), 6);
+        // Progress is guaranteed for every buffer of two or more bytes.
+        for input in [&b"8="[..], b"8\x01", b"\x01\x01", b"88", b"8=FIX", b"8=FI"] {
+            assert!(
+                recovery_resync_offset(input, &RECOVERY_ANCHORS) >= 1,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_anchor_shape_and_boundary_classify_candidates() {
+        assert_eq!(
+            anchor_shape(b"8=FIX.4.2\x019=12\x01", &RECOVERY_ANCHORS),
+            AnchorShape::Complete
+        );
+        assert_eq!(
+            anchor_shape(b"8=FIXT.1.1\x019=", &RECOVERY_ANCHORS),
+            AnchorShape::Complete
+        );
+        assert_eq!(
+            anchor_shape(b"8=FIX.4", &RECOVERY_ANCHORS),
+            AnchorShape::Partial
+        );
+        assert_eq!(anchor_shape(b"8", &RECOVERY_ANCHORS), AnchorShape::Partial);
+        assert_eq!(
+            anchor_shape(b"851=1", &RECOVERY_ANCHORS),
+            AnchorShape::Rejected
+        );
+        assert_eq!(
+            anchor_shape(b"8=FIX.4.4\x0135=", &RECOVERY_ANCHORS),
+            AnchorShape::Rejected
+        );
+
+        assert!(boundary_before(None));
+        assert!(boundary_before(Some(SOH)));
+        assert!(boundary_before(Some(b'!')));
+        assert!(boundary_before(Some(0xff)));
+        assert!(!boundary_before(Some(b'=')));
+        assert!(!boundary_before(Some(b'4')));
+    }
+
+    #[test]
+    fn test_recovery_soh_free_header_fed_byte_by_byte_stays_bounded() {
+        // The recovery-mode version of
+        // `test_decode_soh_free_header_is_bounded_and_never_asks_for_more`: the
+        // buffer must stay bounded and the codec must never return an error.
+        let mut codec = recovering();
+        let mut buf = BytesMut::from(&b"8="[..]);
+        for _ in 0..4096 {
+            buf.extend_from_slice(b"X");
+            match codec.decode(&mut buf) {
+                Ok(None) => {}
+                other => panic!("garbage must be skipped quietly, got {other:?}"),
+            }
+            assert!(
+                buf.len() <= MAX_HEADER_LEN,
+                "buffer grew to {} bytes",
+                buf.len()
+            );
+        }
+        assert!(codec.take_garbled_count() >= 1);
+    }
+
+    #[test]
+    fn test_recovery_byte_by_byte_feed_reassembles_one_message() {
+        let mut codec = recovering();
+        let msg = make_fix_message("35=A\x0149=SENDER\x0156=TARGET\x0198=0\x01108=30\x01");
+        let mut buf = BytesMut::new();
+        let mut frames = Vec::new();
+        for byte in &msg {
+            buf.extend_from_slice(&[*byte]);
+            assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+        }
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames.first().map(|f| &f[..]), Some(&msg[..]));
+        assert_eq!(codec.take_garbled_count(), 0);
+    }
+
+    #[test]
+    fn test_recovery_hostile_header_does_not_discard_the_frames_that_follow() {
+        // The recovery-mode version of
+        // `test_decode_invalid_trailer_does_not_discard_the_frames_that_follow`.
+        let good = b"8=FIX.4.4\x019=15\x0135=0\x0149=A\x0156=B\x0110=171\x01";
+        let mut raw = Vec::from(&b"8=FIX.4.4\x019=222\x0135=0\x01"[..]);
+        for _ in 0..6 {
+            raw.extend_from_slice(good);
+        }
+        let padding: &[u8] = b"\x01\x01\x01\x01\x01\x01\x01";
+        raw.extend_from_slice(padding);
+        let mut buf = BytesMut::from(&raw[..]);
+
+        let mut codec = recovering();
+        let mut frames = Vec::new();
+        assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+        assert_eq!(frames.len(), 6);
+        assert!(frames.iter().all(|frame| frame[..] == good[..]));
+        assert_eq!(codec.take_garbled_count(), 1);
+    }
+
+    #[test]
+    fn test_recovery_every_single_byte_corruption_is_skipped_and_the_rest_survives() {
+        // Property sweep: corrupt every byte of the first frame with every byte
+        // that matters to the framer. Whatever the corruption, the codec must
+        // not panic, must not report an error, must settle, must never hand up
+        // the corrupted frame, must count it exactly once, and must deliver
+        // every frame after it intact. B is long enough that no single-byte
+        // change to A's BodyLength can reach B's trailer, so B's survival is
+        // part of the property, with one designed exception: when A's final
+        // SOH becomes a digit or `=`, B's opening no longer follows a plausible
+        // frame boundary, so the resync passes over it (B's gap is then
+        // recovered by ResendRequest like any other).
+        let a = make_fix_message("35=0\x0149=A\x0156=B\x01");
+        let b = make_fix_message(&format!("35=0\x0149=B\x0158={}\x01", "t".repeat(120)));
+        let c = make_fix_message("35=1\x0149=C\x01112=PING\x01");
+        let filler = make_fix_message("35=0\x0149=D\x01");
+        let replacements = [0x00, SOH, b'8', b'=', b'9', b'1', b'0', b'X', 0xff];
+
+        for index in 0..a.len() {
+            for &replacement in &replacements {
+                let Some(&original) = a.get(index) else {
+                    panic!("index {index} is inside the frame");
+                };
+                if original == replacement {
+                    continue;
+                }
+                let mut corrupted = a.clone();
+                if let Some(byte) = corrupted.get_mut(index) {
+                    *byte = replacement;
+                }
+
+                let mut codec = recovering().with_max_message_size(4096);
+                let mut buf = BytesMut::from(&corrupted[..]);
+                buf.extend_from_slice(&b);
+                buf.extend_from_slice(&c);
+                let mut frames = Vec::new();
+                let first = drain(&mut codec, &mut buf, &mut frames);
+                // A corrupted BodyLength may declare a span longer than what is
+                // buffered; more traffic is what lets the codec decide.
+                for _ in 0..8 {
+                    buf.extend_from_slice(&filler);
+                }
+                let second = drain(&mut codec, &mut buf, &mut frames);
+
+                let context = format!("byte {index} -> 0x{replacement:02x}");
+                assert_eq!(first, None, "{context}: recovery must not error");
+                assert_eq!(second, None, "{context}: recovery must not error");
+                let b_hidden =
+                    index + 1 == a.len() && (replacement.is_ascii_digit() || replacement == b'=');
+                let mut expected: Vec<&[u8]> = if b_hidden {
+                    vec![&c[..]]
+                } else {
+                    vec![&b[..], &c[..]]
+                };
+                expected.extend(std::iter::repeat_n(&filler[..], 8));
+                let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+                assert_eq!(got, expected, "{context}");
+                assert_eq!(
+                    codec.take_garbled_count(),
+                    1,
+                    "{context}: A is skipped exactly once"
+                );
+                assert!(buf.is_empty(), "{context}: {} bytes left", buf.len());
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_every_single_byte_corruption_without_recovery_is_a_recoverable_error() {
+        // The same sweep without recovery: never a panic, and the error is
+        // always one recovery would have skipped, so turning recovery on can
+        // only ever change an error into a skip.
+        let a = make_fix_message("35=0\x0149=A\x0156=B\x01");
+        let b = make_fix_message("35=1\x0149=C\x01112=PING\x01");
+        let replacements = [0x00, SOH, b'8', b'=', b'9', b'1', b'0', b'X', 0xff];
+        for index in 0..a.len() {
+            for &replacement in &replacements {
+                let mut corrupted = a.clone();
+                if let Some(byte) = corrupted.get_mut(index) {
+                    if *byte == replacement {
+                        continue;
+                    }
+                    *byte = replacement;
+                }
+                let mut codec = FixCodec::new().with_max_message_size(4096);
+                let mut buf = BytesMut::from(&corrupted[..]);
+                buf.extend_from_slice(&b);
+                for _ in 0..4 {
+                    buf.extend_from_slice(&b);
+                }
+                let mut frames = Vec::new();
+                if let Some(error) = drain(&mut codec, &mut buf, &mut frames) {
+                    assert!(
+                        error.is_recoverable(),
+                        "byte {index} -> 0x{replacement:02x}: {error:?}"
+                    );
+                }
+                assert!(
+                    frames.iter().all(|frame| frame[..] != corrupted[..]),
+                    "byte {index} -> 0x{replacement:02x}: the corrupted frame was handed up"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_every_truncation_point_reassembles_in_both_modes() {
+        let a = make_fix_message("35=0\x0149=A\x0156=B\x01");
+        let b = make_fix_message("35=1\x0149=C\x01112=PING\x01");
+        let c = make_fix_message("35=0\x0149=D\x01");
+        let stream: Vec<u8> = [&a[..], &b[..], &c[..]].concat();
+
+        for recovery in [false, true] {
+            for cut in 0..=stream.len() {
+                let (Some(head), Some(tail)) = (stream.get(..cut), stream.get(cut..)) else {
+                    panic!("cut {cut} is inside the stream");
+                };
+                let mut codec = FixCodec::new().with_garbled_recovery(recovery);
+                let mut buf = BytesMut::from(head);
+                let mut frames = Vec::new();
+                assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+                buf.extend_from_slice(tail);
+                assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+
+                let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+                assert_eq!(
+                    got,
+                    vec![&a[..], &b[..], &c[..]],
+                    "recovery={recovery} cut={cut}"
+                );
+                assert_eq!(codec.take_garbled_count(), 0, "recovery={recovery}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_recovery_byte_by_byte_garbled_stream_recovers_every_valid_frame() {
+        let a = make_fix_message("35=0\x0149=A\x01");
+        let b = make_fix_message("35=0\x0149=B\x01");
+        let c = make_fix_message("35=0\x0149=C\x01");
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"\x00\x7fjunk-bytes\xff");
+        stream.extend_from_slice(&a);
+        stream.extend_from_slice(&make_bad_checksum_message("35=0\x0149=X\x01"));
+        stream.extend_from_slice(&b);
+        stream.extend_from_slice(b"more junk, with ; punctuation");
+        stream.extend_from_slice(&c);
+
+        let mut codec = recovering();
+        let mut buf = BytesMut::new();
+        let mut frames = Vec::new();
+        for byte in &stream {
+            buf.extend_from_slice(&[*byte]);
+            assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+            assert!(buf.len() <= MAX_HEADER_LEN.max(c.len()));
+        }
+        let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
+        assert_eq!(got, vec![&a[..], &b[..], &c[..]]);
+        assert!(codec.take_garbled_count() >= 3);
+    }
+
+    #[test]
+    fn test_recovery_anchor_floods_settle_in_one_call_and_stay_bounded() {
+        // Buffers dense in near-anchors: every `8=FIX`, every `<SOH>8`, every
+        // `8=FIX.4.4<SOH>` without its `9=`. Each one is rejected inside the
+        // resync scan, so one call settles, leaves a bounded remainder (the
+        // final partial opening), returns nothing, and counts the whole buffer
+        // as a single garbled span.
+        for unit in [&b"8=FIX"[..], b"\x018", b"8=FIX.4.4\x01"] {
+            let mut codec = recovering();
+            let mut buf = BytesMut::new();
+            for _ in 0..20_000 {
+                buf.extend_from_slice(unit);
+            }
+            assert!(matches!(codec.decode(&mut buf), Ok(None)), "{unit:?}");
+            assert!(
+                buf.len() < MAX_HEADER_LEN,
+                "{unit:?}: {} bytes left",
+                buf.len()
+            );
+            assert_eq!(codec.take_garbled_count(), 1, "{unit:?}");
+        }
+    }
+
+    #[test]
+    fn test_recovery_seeded_noise_never_panics_and_only_hands_up_real_frames() {
+        // Deterministic noise (xorshift, fixed seed) drawn from an alphabet
+        // heavy in the bytes the framer cares about, interleaved with one known
+        // frame. Every frame handed up must be that frame, byte for byte.
+        let good = make_fix_message("35=0\x0149=A\x0156=B\x01");
+        let alphabet: &[u8] = b"8=FIX.4\x019\x0110=35";
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut stream = Vec::new();
+        let rounds = 300;
+        // Frames whose opening follows a plausible boundary: no noise before
+        // them, or noise that ends in neither a digit nor `=`. A frame after a
+        // digit or `=` is passed over by design (it is indistinguishable from
+        // `448=FIX…` or `96=8=FIX…`), so only these can be expected back.
+        let mut eligible = 0usize;
+        for _ in 0..rounds {
+            let noise_len = next() % 48;
+            let mut last = None;
+            for _ in 0..noise_len {
+                let pick = usize::try_from(next() % 15).unwrap_or(0);
+                let byte = alphabet.get(pick).copied().unwrap_or(b'X');
+                stream.push(byte);
+                last = Some(byte);
+            }
+            if last.is_none_or(|byte| boundary_before(Some(byte))) {
+                eligible += 1;
+            }
+            stream.extend_from_slice(&good);
+        }
+
+        let mut codec = recovering().with_max_message_size(4096);
+        let mut buf = BytesMut::from(&stream[..]);
+        let mut frames = Vec::new();
+        assert_eq!(drain(&mut codec, &mut buf, &mut frames), None);
+        assert!(frames.iter().all(|frame| frame[..] == good[..]));
+        assert!(frames.len() <= rounds);
+        assert!(
+            eligible * 4 >= rounds,
+            "the seed must leave enough eligible frames to mean something"
+        );
+        // Not every eligible frame need survive either: noise that happens to
+        // spell a header whose declared BodyLength lands exactly on the next
+        // frame's `<SOH>10=NNN<SOH>` has a corroborated boundary, and a checksum
+        // error consumes that whole declared span, frame included. With this
+        // seed all 117 eligible frames (of 300) survive; the bound leaves room
+        // for that policy without letting a resync regression go unnoticed.
+        assert!(
+            frames.len() * 10 >= eligible * 9,
+            "only {} of {eligible} eligible frames survived the noise",
+            frames.len()
+        );
     }
 }
