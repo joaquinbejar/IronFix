@@ -19,19 +19,32 @@
 //! - both sides resend a backlog of frames larger than the pipe at once,
 //!   driven by `NextExpectedMsgSeqNum` (789) and by `ResendRequest` (2);
 //! - both sides' applications send frames larger than the pipe at once;
-//! - a resend completes while the counterparty keeps the inbound side busy
-//!   with a continuous stream of Heartbeats;
-//! - the write timeout still closes a session whose peer stops reading.
+//! - a resend of many steps completes while the counterparty keeps the
+//!   inbound side busy with a continuous stream of Heartbeats, and reads and
+//!   steps alternate on the way;
+//! - live frames are written through, one write each, when the stream takes
+//!   them;
+//! - the write timeout closes a session whose peer stops reading, for that
+//!   reason and in bounded time, never one whose peer reads while the
+//!   reactor is busy in a slow store call, and never a slow but steady
+//!   reader;
+//! - a Logout is sent only once it is written whole: the logout timeout
+//!   starts then, the final Logout gets out under backpressure, and a close
+//!   whose Logout never got out is not graceful (no `reset_on_logout`);
+//! - no new `MsgSeqNum` is written in the middle of a resend when the
+//!   messages held behind it fill the hold: reading stops instead;
+//! - the owed Logout's deadline is checked before every resend step.
 
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
+use ironfix_core::error::StoreError;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::{CompId, Timestamp};
 use ironfix_engine::application::{Application, RejectReason, SessionId};
 use ironfix_engine::{Acceptor, Connection, Initiator, OutboundMessage};
 use ironfix_session::SessionConfig;
-use ironfix_store::{MemoryStore, MessageStore};
+use ironfix_store::{MemoryStore, MessageStore, StoredMessage};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
 use std::io;
@@ -44,7 +57,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tokio_util::codec::Framed;
+use tokio_util::codec::{Framed, FramedRead, FramedWrite};
 
 /// Bytes a `duplex` pipe holds per direction: far less than one backlog
 /// frame, so a frame is only ever written while the other side reads.
@@ -590,27 +603,31 @@ const FLOOD_HEARTBEATS: u64 = 20_000;
 /// Reports the acceptor owes the counterparty: 2 to 301.
 const OWED_REPORTS: u64 = 300;
 
-/// The acceptor's previous stream: its Logon ack (1) and [`OWED_REPORTS`]
-/// reports (2 to 301); next sender 302, next target 3.
-async fn venue_report_backlog() -> Arc<MemoryStore> {
+/// Inbound frames the reactor handles in a row before a resend step (the
+/// engine's `MAX_READS_PER_RESEND_STEP`).
+const READS_PER_RESEND_STEP: u64 = 16;
+
+/// The acceptor's previous stream: its Logon ack (1) and `reports` reports
+/// (2 onwards), each with `padding` bytes of `Text` (58); next sender one
+/// past the last report, next target 3.
+async fn venue_backlog(reports: u64, padding: usize) -> Arc<MemoryStore> {
     let store = Arc::new(MemoryStore::new());
     let ack = peer_frame("VENUE", "CLIENT", "A", 1, &[(98, "0"), (108, "30")]);
     ok(store.store(1, &MsgType::Logon, &ack).await, "seed the ack");
-    for seq in 2..=OWED_REPORTS + 1 {
-        let report = peer_frame(
-            "VENUE",
-            "CLIENT",
-            "8",
-            seq,
-            &[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")],
-        );
+    let text = "x".repeat(padding);
+    for seq in 2..=reports + 1 {
+        let mut body = vec![(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")];
+        if padding > 0 {
+            body.push((58, text.as_str()));
+        }
+        let report = peer_frame("VENUE", "CLIENT", "8", seq, &body);
         ok(
             store.store(seq, &MsgType::ExecutionReport, &report).await,
             "seed a report",
         );
     }
     ok(
-        store.set_next_sender_seq(OWED_REPORTS + 2).await,
+        store.set_next_sender_seq(reports + 2).await,
         "seed the sender counter",
     );
     ok(
@@ -621,7 +638,9 @@ async fn venue_report_backlog() -> Arc<MemoryStore> {
 }
 
 /// Reads the next frame from a scripted peer's end of a pipe, within 10 s.
-async fn next_frame(framed: &mut Framed<DuplexStream, FixCodec>) -> BytesMut {
+async fn next_frame<S: AsyncRead + AsyncWrite + Unpin>(
+    framed: &mut Framed<S, FixCodec>,
+) -> BytesMut {
     let polled = ok(
         timeout(Duration::from_secs(10), framed.next()).await,
         "a frame arrives within 10s",
@@ -629,15 +648,74 @@ async fn next_frame(framed: &mut Framed<DuplexStream, FixCodec>) -> BytesMut {
     ok(some(polled, "the stream stays open"), "the frame decodes")
 }
 
+/// A Logon from the scripted initiator, numbered `seq`, declaring
+/// `NextExpectedMsgSeqNum` (789) = 2.
+fn client_logon_789(seq: u64) -> BytesMut {
+    peer_frame(
+        "CLIENT",
+        "VENUE",
+        "A",
+        seq,
+        &[(98, "0"), (108, "30"), (789, "2")],
+    )
+}
+
+/// Serves `acceptor` on `venue_io` while a scripted initiator on `framed`
+/// logs on with `logon`; returns the acknowledgement and the connection.
+async fn serve_scripted<A, S, V>(
+    acceptor: Acceptor<A>,
+    venue_io: V,
+    framed: &mut Framed<S, FixCodec>,
+    logon: BytesMut,
+) -> (BytesMut, Connection)
+where
+    A: Application + 'static,
+    S: AsyncRead + AsyncWrite + Unpin,
+    V: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let served = tokio::spawn(async move { acceptor.serve_stream(venue_io).await });
+    ok(framed.send(logon).await, "the client logs on");
+    let ack = next_frame(framed).await;
+    assert_eq!(
+        field(&ack, 35).as_deref(),
+        Some("A"),
+        "the Logon is acknowledged"
+    );
+    let connection = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), served).await,
+                "handshake within 5s",
+            ),
+            "venue task joins",
+        ),
+        "the acceptor establishes the session",
+    );
+    (ack, connection)
+}
+
 /// The engine's end of a pipe, logging after every write how many bytes it
 /// has written in all and how many Heartbeats its `from_admin` had seen by
 /// then: the order of the reactor's own writes and reads, whatever the
-/// scheduler did with the test's task meanwhile.
+/// scheduler did with the test's task meanwhile. It also counts the writes.
 struct WriteLogStream {
     inner: DuplexStream,
     heartbeats: Arc<AtomicU64>,
     written: usize,
+    writes: Arc<AtomicU64>,
     log: Arc<Mutex<Vec<(usize, u64)>>>,
+}
+
+impl WriteLogStream {
+    fn new(inner: DuplexStream, heartbeats: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            heartbeats,
+            written: 0,
+            writes: Arc::new(AtomicU64::new(0)),
+            log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
 }
 
 impl AsyncRead for WriteLogStream {
@@ -659,6 +737,7 @@ impl AsyncWrite for WriteLogStream {
         let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(written)) = polled {
             self.written += written;
+            self.writes.fetch_add(1, Ordering::Relaxed);
             let entry = (self.written, self.heartbeats.load(Ordering::Relaxed));
             match self.log.lock() {
                 Ok(mut log) => log.push(entry),
@@ -680,38 +759,29 @@ impl AsyncWrite for WriteLogStream {
 /// A scripted initiator logs on with `NextExpectedMsgSeqNum` (789) = 2, so
 /// the acceptor owes it 300 reports, and puts 20 000 in-sequence Heartbeats on
 /// the wire right behind its Logon: the acceptor's inbound side is never idle
-/// until it has read them all. The resend still goes out, in order, before
-/// the acceptor has read even a tenth of the Heartbeats: reads and resend
-/// writes share the reactor in a bounded ratio, so neither waits for the
-/// other to run dry. (Before #126 the resend was written only once inbound
-/// was idle, so here only after all 20 000.)
+/// until it has read them all. The reports are padded (about 200 KB in all),
+/// so the resend takes many steps. The resend still goes out, in order,
+/// before the acceptor has read a tenth of the Heartbeats, and the acceptor
+/// read at least a step's worth of them on the way: reads and resend steps
+/// alternate in a bounded ratio, so neither waits for the other to run dry.
+/// (Before #126 the resend was written only once inbound was idle, so here
+/// only after all 20 000.)
 #[tokio::test]
 async fn test_resend_progresses_under_a_continuous_inbound_stream() {
     // Large enough for the Logon and every Heartbeat, so the whole stream is
     // on the wire before the acceptor reads its first byte.
     let (client_io, venue_io) = tokio::io::duplex(8 * 1024 * 1024);
     let (venue_app, _venue_rx) = RecordingApp::new();
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let venue_io = WriteLogStream {
-        inner: venue_io,
-        heartbeats: Arc::clone(&venue_app.heartbeats),
-        written: 0,
-        log: Arc::clone(&log),
-    };
+    let venue_io = WriteLogStream::new(venue_io, Arc::clone(&venue_app.heartbeats));
+    let log = Arc::clone(&venue_io.log);
     let acceptor = Acceptor::new(
         venue_config().with_send_next_expected_msg_seq_num(true),
         Arc::clone(&venue_app),
     )
-    .with_store(venue_report_backlog().await as Arc<dyn MessageStore>);
+    .with_store(venue_backlog(OWED_REPORTS, 500).await as Arc<dyn MessageStore>);
 
     let mut wire = BytesMut::new();
-    wire.extend_from_slice(&peer_frame(
-        "CLIENT",
-        "VENUE",
-        "A",
-        3,
-        &[(98, "0"), (108, "30"), (789, "2")],
-    ));
+    wire.extend_from_slice(&client_logon_789(3));
     let first_heartbeat = 4;
     let past_the_flood = first_heartbeat + FLOOD_HEARTBEATS;
     for seq in first_heartbeat..past_the_flood {
@@ -767,6 +837,10 @@ async fn test_resend_progresses_under_a_continuous_inbound_stream() {
         "the resend was written while the inbound stream was still being read: \
          {read_when_done} of {FLOOD_HEARTBEATS} Heartbeats read by then"
     );
+    assert!(
+        read_when_done >= READS_PER_RESEND_STEP,
+        "inbound was read between the resend's steps: {read_when_done} Heartbeats read"
+    );
 
     // Nothing was dropped: the rest of the stream is read in sequence.
     ok(
@@ -785,12 +859,77 @@ async fn test_resend_progresses_under_a_continuous_inbound_stream() {
 // The write timeout
 // ---------------------------------------------------------------------------
 
+/// Records the `reason` of every "FIX session closed" event emitted on the
+/// thread it is the default subscriber of: the reactor's close reason, which
+/// nothing else exposes.
+#[derive(Debug, Clone, Default)]
+struct CloseReasons(Arc<Mutex<Vec<String>>>);
+
+impl CloseReasons {
+    #[track_caller]
+    fn reasons(&self) -> Vec<String> {
+        match self.0.lock() {
+            Ok(reasons) => reasons.clone(),
+            Err(_) => panic!("close reasons poisoned"),
+        }
+    }
+}
+
+/// Collects an event's `message` and `reason` fields.
+#[derive(Default)]
+struct CloseFields {
+    message: String,
+    reason: Option<String>,
+}
+
+impl tracing::field::Visit for CloseFields {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        match field.name() {
+            "message" => self.message = format!("{value:?}"),
+            "reason" => self.reason = Some(format!("{value:?}")),
+            _ => {}
+        }
+    }
+}
+
+impl tracing::Subscriber for CloseReasons {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut fields = CloseFields::default();
+        event.record(&mut fields);
+        if fields.message == "FIX session closed"
+            && let Some(reason) = fields.reason
+            && let Ok(mut reasons) = self.0.lock()
+        {
+            reasons.push(reason);
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
 /// A scripted initiator logs on with 789 = 2 and then never reads again, over
-/// a pipe smaller than the resend it is owed: the acceptor's writes make no
-/// progress, and the write timeout closes the session rather than leaving it
-/// open with its output stuck.
+/// a pipe smaller than the resend it is owed: the stream accepts none of the
+/// acceptor's output, and the write timeout closes the session for that
+/// reason, between the timeout and two ticks (plus scheduling slack) after
+/// the client stopped reading.
 #[tokio::test]
 async fn test_a_resend_the_peer_never_reads_is_closed_by_the_write_timeout() {
+    let reasons = CloseReasons::default();
+    let _subscriber = tracing::subscriber::set_default(reasons.clone());
     let write_timeout = Duration::from_millis(300);
     let (client_io, venue_io) = tokio::io::duplex(PIPE_BYTES);
     let (venue_app, _venue_rx) = RecordingApp::new();
@@ -798,38 +937,671 @@ async fn test_a_resend_the_peer_never_reads_is_closed_by_the_write_timeout() {
         venue_config().with_send_next_expected_msg_seq_num(true),
         Arc::clone(&venue_app),
     )
-    .with_store(venue_report_backlog().await as Arc<dyn MessageStore>)
+    .with_store(venue_backlog(OWED_REPORTS, 0).await as Arc<dyn MessageStore>)
     .with_write_timeout(write_timeout);
-    let served = tokio::spawn(async move { acceptor.serve_stream(venue_io).await });
     let mut framed = Framed::new(client_io, FixCodec::new());
+    let (_ack, venue) = serve_scripted(acceptor, venue_io, &mut framed, client_logon_789(3)).await;
+    // The client holds its end open and reads nothing more.
+    let stopped = tokio::time::Instant::now();
+    ok(
+        timeout(Duration::from_secs(5), venue.wait_closed()).await,
+        "the write timeout closes the session",
+    );
+    let took = stopped.elapsed();
+    assert!(
+        took >= write_timeout,
+        "closed only once the timeout ran out: {took:?}"
+    );
+    assert!(
+        took <= write_timeout + Duration::from_millis(700),
+        "closed within two ticks of the timeout, with slack: {took:?}"
+    );
+    assert_eq!(
+        reasons.reasons(),
+        vec!["write failed: write timed out after 300ms".to_string()],
+        "closed by the write timeout"
+    );
+    drop(framed);
+}
+
+/// A store whose filing of application messages takes [`SLOW_FILING`],
+/// standing in for an fsync, a remote store, or a store call that overruns.
+#[derive(Debug, Default)]
+struct SlowFilingStore(MemoryStore);
+
+/// How long [`SlowFilingStore`] takes to file an application message: longer
+/// than the write timeout of [`test_a_busy_reactor_does_not_time_out_a_peer_that_reads`].
+const SLOW_FILING: Duration = Duration::from_millis(500);
+
+#[async_trait]
+impl MessageStore for SlowFilingStore {
+    async fn store(&self, seq: u64, msg_type: &MsgType, message: &[u8]) -> Result<(), StoreError> {
+        if msg_type.is_app() {
+            tokio::time::sleep(SLOW_FILING).await;
+        }
+        self.0.store(seq, msg_type, message).await
+    }
+
+    async fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        self.0.get_range(begin, end).await
+    }
+
+    fn next_sender_seq(&self) -> u64 {
+        self.0.next_sender_seq()
+    }
+
+    fn next_target_seq(&self) -> u64 {
+        self.0.next_target_seq()
+    }
+
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.0.set_next_sender_seq(seq).await
+    }
+
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.0.set_next_target_seq(seq).await
+    }
+
+    async fn reset(&self) -> Result<(), StoreError> {
+        self.0.reset().await
+    }
+
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.0.creation_time()
+    }
+}
+
+/// A scripted acceptor that, once the Logon is acknowledged, reads the
+/// initiator's frames only while `gate` is open, and counts the
+/// NewOrderSingles among them in `orders`.
+fn gated_reader(
+    mut framed: Framed<DuplexStream, FixCodec>,
+    mut gate: tokio::sync::watch::Receiver<bool>,
+    orders: Arc<AtomicU64>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if gate.wait_for(|open| *open).await.is_err() {
+                return;
+            }
+            tokio::select! {
+                frame = framed.next() => match frame {
+                    Some(Ok(frame)) => {
+                        if field(&frame, 35).as_deref() == Some("D") {
+                            orders.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    _ => return,
+                },
+                changed = gate.changed() => if changed.is_err() {
+                    return;
+                },
+            }
+        }
+    })
+}
+
+/// P1-01: an order the counterparty has not read yet waits while the next
+/// order's filing (a slow store, longer than the write timeout) keeps the
+/// reactor inside an inline await; the counterparty reads again meanwhile,
+/// but nobody polls the flush. The write timeout counts only time the stream
+/// was asked for bytes and took none, so the session is never closed: each
+/// tick polls the flush first, and the bytes the counterparty made room for
+/// are progress. Five rounds, each arming the stall clock with the reader
+/// paused and then keeping the reactor busy past the timeout with the reader
+/// running. (Before the fix a tick that won the race against the socket
+/// branch after the busy period closed the session, about one round in two.)
+#[tokio::test]
+async fn test_a_busy_reactor_does_not_time_out_a_peer_that_reads() {
+    const ROUNDS: u64 = 5;
+    let write_timeout = Duration::from_millis(300);
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_BYTES);
+    let (client_app, _client_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(), Arc::clone(&client_app))
+        .with_store(Arc::new(SlowFilingStore(MemoryStore::new())) as Arc<dyn MessageStore>)
+        .with_write_timeout(write_timeout)
+        .with_store_timeout(Duration::from_secs(5));
+    let established = tokio::spawn(async move { initiator.establish(client_io).await });
+    let mut venue = Framed::new(venue_io, FixCodec::new());
+    let logon = next_frame(&mut venue).await;
+    assert_eq!(field(&logon, 35).as_deref(), Some("A"));
+    ok(
+        venue
+            .send(peer_frame(
+                "VENUE",
+                "CLIENT",
+                "A",
+                1,
+                &[(98, "0"), (108, "30")],
+            ))
+            .await,
+        "the venue acknowledges",
+    );
+    let client = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), established).await,
+                "handshake within 5s",
+            ),
+            "initiator task joins",
+        ),
+        "the initiator establishes the session",
+    );
+    let (gate, gate_rx) = tokio::sync::watch::channel(true);
+    let orders = Arc::new(AtomicU64::new(0));
+    let reader = gated_reader(venue, gate_rx, Arc::clone(&orders));
+    let padding = "x".repeat(1_000);
+    let order = |index: u64| {
+        let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+        order
+            .push_str(11, &index.to_string())
+            .push_str(58, &padding);
+        order
+    };
+
+    ok(client.send(order(0)).await, "the first order");
+    for round in 1..=ROUNDS {
+        // The previous order is about to be filed and fed: the reader pauses,
+        // so it waits in the buffer and the stall clock starts.
+        tokio::time::sleep(SLOW_FILING - Duration::from_millis(100)).await;
+        let _ = gate.send(false);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The next order keeps the reactor filing past the write timeout
+        // while the reader drains what it can.
+        ok(client.send(order(round)).await, "the next order");
+        let _ = gate.send(true);
+        assert!(!client.is_closed(), "round {round}: still logged on");
+    }
+    ok(
+        timeout(Duration::from_secs(10), async {
+            while orders.load(Ordering::Relaxed) < ROUNDS + 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await,
+        "every order reaches the counterparty",
+    );
+    assert!(
+        !client.is_closed(),
+        "a counterparty that reads is never closed by the write timeout"
+    );
+    reader.abort();
+}
+
+/// A slow but steady reader is not cut off: the acceptor resends 100 frames
+/// of about 1.6 KB over a 2 KiB pipe to a scripted initiator that reads one
+/// frame every 10 ms, a second in all, more than three times the 300 ms write
+/// timeout. Every frame arrives and the session stays up: the timeout bounds
+/// how long the stream takes no bytes, not how long the output takes.
+#[tokio::test]
+async fn test_a_slow_steady_reader_is_not_cut_off() {
+    const FRAMES: u64 = 100;
+    let (client_io, venue_io) = tokio::io::duplex(2 * 1024);
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config().with_send_next_expected_msg_seq_num(true),
+        Arc::clone(&venue_app),
+    )
+    .with_store(venue_backlog(FRAMES, BACKLOG_PADDING).await as Arc<dyn MessageStore>)
+    .with_write_timeout(Duration::from_millis(300));
+    let mut framed = Framed::new(client_io, FixCodec::new());
+    let (_ack, venue) = serve_scripted(acceptor, venue_io, &mut framed, client_logon_789(3)).await;
+    for seq in 2..=FRAMES + 1 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let frame = next_frame(&mut framed).await;
+        assert_eq!(field(&frame, 34), Some(seq.to_string()), "resent in order");
+    }
+    assert!(!venue.is_closed(), "the slow reader was not cut off");
+}
+
+/// The final Logout gets out under backpressure: the scripted initiator asks
+/// for a 789 resend of 200 frames of about 1.6 KB and logs out right behind
+/// it, then reads slowly over a 256-byte pipe (one frame every 5 ms). The
+/// acceptor answers the Logout after the resend, closes, and writes out what
+/// it left in its buffer while the reader goes on: the Logout arrives last,
+/// after every resent frame, and the close is graceful (`reset_on_logout`
+/// resets the sequence numbers), although writing the rest took longer than
+/// the 300 ms write timeout.
+#[tokio::test]
+async fn test_the_final_logout_gets_out_under_backpressure() {
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_BYTES);
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let mut config = venue_config().with_send_next_expected_msg_seq_num(true);
+    config.reset_on_logout = true;
+    let acceptor = Acceptor::new(config, Arc::clone(&venue_app))
+        .with_store(backlog_store(false).await as Arc<dyn MessageStore>)
+        .with_write_timeout(Duration::from_millis(300));
+    let mut framed = Framed::new(client_io, FixCodec::new());
+    let mut wire = BytesMut::new();
+    wire.extend_from_slice(&peer_frame(
+        "CLIENT",
+        "VENUE",
+        "A",
+        2,
+        &[(98, "0"), (108, "30"), (789, "2")],
+    ));
+    wire.extend_from_slice(&peer_frame("CLIENT", "VENUE", "5", 3, &[]));
+    let served = tokio::spawn(async move { acceptor.serve_stream(venue_io).await });
+    ok(
+        framed.get_mut().write_all(&wire).await,
+        "the Logon and the Logout",
+    );
+    let mut resent = 0;
+    let mut last = None;
+    while let Ok(Some(Ok(frame))) = timeout(Duration::from_secs(2), framed.next()).await {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        if field(&frame, 43).as_deref() == Some("Y") {
+            resent += 1;
+        }
+        last = field(&frame, 35);
+        if last.as_deref() == Some("5") {
+            break;
+        }
+    }
+    assert_eq!(resent, BACKLOG_MESSAGES, "every resent frame arrived first");
+    assert_eq!(last.as_deref(), Some("5"), "the Logout reply came last");
+    let venue = ok(
+        ok(
+            ok(timeout(Duration::from_secs(5), served).await, "handshake"),
+            "venue task joins",
+        ),
+        "the acceptor established the session",
+    );
+    ok(
+        timeout(Duration::from_secs(5), venue.wait_closed()).await,
+        "the session closes",
+    );
+    assert_eq!(
+        venue.next_sender_seq(),
+        1,
+        "a graceful close: reset_on_logout reset the sequence numbers"
+    );
+}
+
+/// P2-01: a Logout that never left the buffer was not sent. The acceptor's
+/// application sends a report larger than the 256-byte pipe to a scripted
+/// initiator that has stopped reading, then logs out; the Logout waits
+/// behind the report. Its logout timeout (100 ms) never starts, since the
+/// Logout was never written: the write timeout (600 ms) closes the session,
+/// and the close is not graceful, so `reset_on_logout` leaves the sequence
+/// numbers alone (a reset here would make the next Logon go out at
+/// `MsgSeqNum` 1 without `ResetSeqNumFlag` (141), which the counterparty
+/// would refuse as too low).
+#[tokio::test]
+async fn test_a_logout_that_never_left_is_not_a_graceful_close() {
+    let reasons = CloseReasons::default();
+    let _subscriber = tracing::subscriber::set_default(reasons.clone());
+    let write_timeout = Duration::from_millis(600);
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_BYTES);
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let mut config = venue_config().with_logout_timeout(Duration::from_millis(100));
+    config.reset_on_logout = true;
+    let acceptor = Acceptor::new(config, Arc::clone(&venue_app)).with_write_timeout(write_timeout);
+    let mut framed = Framed::new(client_io, FixCodec::new());
+    let logon = peer_frame("CLIENT", "VENUE", "A", 1, &[(98, "0"), (108, "30")]);
+    let (_ack, venue) = serve_scripted(acceptor, venue_io, &mut framed, logon).await;
+    let padding = "x".repeat(BACKLOG_PADDING);
+    let mut report = OutboundMessage::new(MsgType::ExecutionReport);
+    report
+        .push_str(37, "E")
+        .push_str(17, "E")
+        .push_char(150, '0')
+        .push_char(39, '0')
+        .push_str(58, &padding);
+    ok(venue.send(report).await, "a report the pipe cannot hold");
+    ok(venue.logout().await, "the venue logs out");
+    let started = tokio::time::Instant::now();
+    ok(
+        timeout(Duration::from_secs(5), venue.wait_closed()).await,
+        "the session closes",
+    );
+    assert!(
+        started.elapsed() >= write_timeout - Duration::from_millis(150),
+        "closed by the write timeout, not the logout timeout: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        venue.next_sender_seq(),
+        4,
+        "not a graceful close: the ack (1), the report (2) and the Logout (3) keep their numbers"
+    );
+    assert_eq!(
+        reasons.reasons(),
+        vec!["write failed: write timed out after 600ms".to_string()]
+    );
+    drop(framed);
+}
+
+/// P2-01, the reply: the scripted initiator logs out and stops reading while
+/// a report larger than the pipe is still in the acceptor's buffer. The reply
+/// to its Logout queues behind the report and never gets out, so the close
+/// is not graceful and `reset_on_logout` does not reset.
+#[tokio::test]
+async fn test_a_logout_reply_that_never_left_is_not_a_graceful_close() {
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_BYTES);
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let mut config = venue_config();
+    config.reset_on_logout = true;
+    let acceptor = Acceptor::new(config, Arc::clone(&venue_app))
+        .with_write_timeout(Duration::from_millis(300));
+    let mut framed = Framed::new(client_io, FixCodec::new());
+    let logon = peer_frame("CLIENT", "VENUE", "A", 1, &[(98, "0"), (108, "30")]);
+    let (_ack, venue) = serve_scripted(acceptor, venue_io, &mut framed, logon).await;
+    let padding = "x".repeat(BACKLOG_PADDING);
+    let mut report = OutboundMessage::new(MsgType::ExecutionReport);
+    report
+        .push_str(37, "E")
+        .push_str(17, "E")
+        .push_char(150, '0')
+        .push_char(39, '0')
+        .push_str(58, &padding);
+    ok(venue.send(report).await, "a report the pipe cannot hold");
+    tokio::time::sleep(Duration::from_millis(50)).await;
     ok(
         framed
+            .send(peer_frame("CLIENT", "VENUE", "5", 2, &[]))
+            .await,
+        "the client logs out and reads no more",
+    );
+    ok(
+        timeout(Duration::from_secs(5), venue.wait_closed()).await,
+        "the session closes",
+    );
+    assert_eq!(
+        venue.next_sender_seq(),
+        4,
+        "not a graceful close: the reply (3) never left, so nothing is reset"
+    );
+    drop(framed);
+}
+
+/// P2-02: while a resend is under way and the messages held behind it fill
+/// the hold, the acceptor stops reading instead of writing a new number in
+/// the middle of the resend. The scripted initiator asks for a 789 resend of
+/// 200 frames larger than the 256-byte pipe, reads nothing, and sends 1 100
+/// TestRequests from another task; it starts reading a second later. All 200
+/// resent frames arrive before any new number, then the 1 100 Heartbeats,
+/// numbered in order and echoing the TestReqIDs in order: the TestRequests
+/// past the hold were read only once the resend was done.
+#[tokio::test]
+async fn test_no_new_number_inside_a_resend_when_the_hold_fills() {
+    const TEST_REQUESTS: u64 = 1_100;
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_BYTES);
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config().with_send_next_expected_msg_seq_num(true),
+        Arc::clone(&venue_app),
+    )
+    .with_store(backlog_store(false).await as Arc<dyn MessageStore>);
+    let (read_half, write_half) = tokio::io::split(client_io);
+    let mut reader = FramedRead::new(read_half, FixCodec::new());
+    let mut writer = FramedWrite::new(write_half, FixCodec::new());
+    let served = tokio::spawn(async move { acceptor.serve_stream(venue_io).await });
+    ok(
+        writer
             .send(peer_frame(
                 "CLIENT",
                 "VENUE",
                 "A",
-                3,
+                2,
                 &[(98, "0"), (108, "30"), (789, "2")],
             ))
             .await,
         "the client logs on",
     );
-    let ack = next_frame(&mut framed).await;
+    let ack = ok(
+        some(
+            ok(
+                timeout(Duration::from_secs(5), reader.next()).await,
+                "the ack arrives",
+            ),
+            "the stream stays open",
+        ),
+        "the ack decodes",
+    );
     assert_eq!(field(&ack, 35).as_deref(), Some("A"));
     let venue = ok(
         ok(
-            ok(
-                timeout(Duration::from_secs(5), served).await,
-                "handshake within 5s",
-            ),
+            ok(timeout(Duration::from_secs(5), served).await, "handshake"),
             "venue task joins",
         ),
-        "the acceptor establishes the session",
+        "the acceptor established the session",
     );
-    // The client holds its end open and reads nothing more.
+    let flood = tokio::spawn(async move {
+        for seq in 3..3 + TEST_REQUESTS {
+            let id = format!("T{seq}");
+            if writer
+                .send(peer_frame(
+                    "CLIENT",
+                    "VENUE",
+                    "1",
+                    seq,
+                    &[(112, id.as_str())],
+                ))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut resent = 0;
+    while resent < BACKLOG_MESSAGES {
+        let frame = ok(
+            some(
+                ok(
+                    timeout(Duration::from_secs(10), reader.next()).await,
+                    "a frame arrives",
+                ),
+                "the stream stays open",
+            ),
+            "the frame decodes",
+        );
+        assert_eq!(
+            field(&frame, 43).as_deref(),
+            Some("Y"),
+            "after {resent} resent frames, a new number inside the resend: 35={:?} 34={:?}",
+            field(&frame, 35),
+            field(&frame, 34)
+        );
+        resent += 1;
+    }
+    let first_number = BACKLOG_MESSAGES + 3;
+    for index in 0..TEST_REQUESTS {
+        let frame = ok(
+            some(
+                ok(
+                    timeout(Duration::from_secs(10), reader.next()).await,
+                    "a Heartbeat arrives",
+                ),
+                "the stream stays open",
+            ),
+            "the frame decodes",
+        );
+        assert_eq!(field(&frame, 35).as_deref(), Some("0"), "a Heartbeat");
+        assert_eq!(field(&frame, 34), Some((first_number + index).to_string()));
+        assert_eq!(field(&frame, 112), Some(format!("T{}", 3 + index)));
+    }
+    assert!(
+        ok(
+            ok(timeout(Duration::from_secs(5), flood).await, "flood ends"),
+            "flood joins"
+        ),
+        "every TestRequest was written"
+    );
+    assert!(!venue.is_closed(), "the session is still up");
+}
+
+/// A store whose page reads take [`SLOW_PAGE`]: a resend whose first step
+/// starts after the owed Logout's deadline.
+#[derive(Debug)]
+struct SlowPageStore(Arc<MemoryStore>);
+
+/// How long [`SlowPageStore`] takes to read a page: longer than the logout
+/// timeout of [`test_the_owed_logout_deadline_is_checked_before_each_step`].
+const SLOW_PAGE: Duration = Duration::from_millis(500);
+
+#[async_trait]
+impl MessageStore for SlowPageStore {
+    async fn store(&self, seq: u64, msg_type: &MsgType, message: &[u8]) -> Result<(), StoreError> {
+        self.0.store(seq, msg_type, message).await
+    }
+
+    async fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        tokio::time::sleep(SLOW_PAGE).await;
+        self.0.get_range(begin, end).await
+    }
+
+    fn next_sender_seq(&self) -> u64 {
+        self.0.next_sender_seq()
+    }
+
+    fn next_target_seq(&self) -> u64 {
+        self.0.next_target_seq()
+    }
+
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.0.set_next_sender_seq(seq).await
+    }
+
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.0.set_next_target_seq(seq).await
+    }
+
+    async fn reset(&self) -> Result<(), StoreError> {
+        self.0.reset().await
+    }
+
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.0.creation_time()
+    }
+}
+
+/// The owed Logout's deadline is checked before every resend step, not only
+/// on the tick: the scripted initiator asks for a 789 resend of 50 reports
+/// (one page, one step's worth) and logs out right behind it. The page takes
+/// 500 ms to read, longer than the 200 ms logout timeout, so by the step that
+/// would feed the whole resend at once the reply is overdue: it goes out
+/// without the resend, and no resent frame does.
+///
+/// After the page read the overdue tick and that step are both ready, and the
+/// tick, which also checks the deadline, wins about three times in five; the
+/// scenario runs five times so that a step taken without the check would be
+/// seen (with probability about 0.92).
+#[tokio::test]
+async fn test_the_owed_logout_deadline_is_checked_before_each_step() {
+    for round in 0..5 {
+        owed_logout_past_its_deadline(round).await;
+    }
+}
+
+/// One run of [`test_the_owed_logout_deadline_is_checked_before_each_step`].
+async fn owed_logout_past_its_deadline(round: u32) {
+    let (client_io, venue_io) = tokio::io::duplex(64 * 1024);
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config()
+            .with_send_next_expected_msg_seq_num(true)
+            .with_logout_timeout(Duration::from_millis(200)),
+        Arc::clone(&venue_app),
+    )
+    .with_store(Arc::new(SlowPageStore(venue_backlog(50, 0).await)) as Arc<dyn MessageStore>);
+    let mut framed = Framed::new(client_io, FixCodec::new());
+    let mut wire = BytesMut::new();
+    wire.extend_from_slice(&client_logon_789(3));
+    wire.extend_from_slice(&peer_frame("CLIENT", "VENUE", "5", 4, &[]));
+    let served = tokio::spawn(async move { acceptor.serve_stream(venue_io).await });
+    ok(
+        framed.get_mut().write_all(&wire).await,
+        "the Logon and the Logout",
+    );
+    let mut frames = Vec::new();
+    while let Ok(Some(Ok(frame))) = timeout(Duration::from_secs(2), framed.next()).await {
+        frames.push((field(&frame, 35), field(&frame, 43)));
+    }
+    let venue = ok(
+        ok(
+            ok(timeout(Duration::from_secs(5), served).await, "handshake"),
+            "venue task joins",
+        ),
+        "the acceptor established the session",
+    );
+    assert_eq!(
+        frames.last().map(|(msg_type, _)| msg_type.as_deref()),
+        Some(Some("5")),
+        "round {round}: the Logout reply went out: {frames:?}"
+    );
+    let resent = frames
+        .iter()
+        .filter(|(_, poss_dup)| poss_dup.as_deref() == Some("Y"))
+        .count();
+    assert_eq!(
+        resent, 0,
+        "round {round}: the overdue reply went out before any resend step"
+    );
     ok(
         timeout(Duration::from_secs(5), venue.wait_closed()).await,
-        "the write timeout closes the session",
+        "the session closes",
     );
-    drop(framed);
+}
+
+/// PERF ORANGE-01: a live frame is written through as soon as it is fed when
+/// the stream takes it, rather than waiting in the buffer while the next
+/// message's callback and store call run. 256 orders queued back to back by
+/// an initiator with a store attached, over a pipe that always has room, go
+/// out in 256 writes: no frame left behind a later frame's store call.
+#[tokio::test]
+async fn test_live_frames_are_written_through_one_write_each() {
+    const ORDERS: u64 = 256;
+    let (client_io, venue_io) = tokio::io::duplex(1024 * 1024);
+    let client_io = WriteLogStream::new(client_io, Arc::new(AtomicU64::new(0)));
+    let writes = Arc::clone(&client_io.writes);
+    let (client_app, _client_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(), Arc::clone(&client_app))
+        .with_store(Arc::new(MemoryStore::new()) as Arc<dyn MessageStore>)
+        .with_outbound_capacity(2 * usize::try_from(ORDERS).unwrap_or(1024));
+    let established = tokio::spawn(async move { initiator.establish(client_io).await });
+    let mut venue = Framed::new(venue_io, FixCodec::new());
+    let logon = next_frame(&mut venue).await;
+    assert_eq!(field(&logon, 35).as_deref(), Some("A"));
+    ok(
+        venue
+            .send(peer_frame(
+                "VENUE",
+                "CLIENT",
+                "A",
+                1,
+                &[(98, "0"), (108, "30")],
+            ))
+            .await,
+        "the venue acknowledges",
+    );
+    let client = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), established).await,
+                "handshake within 5s",
+            ),
+            "initiator task joins",
+        ),
+        "the initiator establishes the session",
+    );
+    let before = writes.load(Ordering::Relaxed);
+    for index in 0..ORDERS {
+        let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+        order.push_str(11, &index.to_string());
+        ok(client.send(order).await, "an order");
+    }
+    for _ in 0..ORDERS {
+        let frame = next_frame(&mut venue).await;
+        assert_eq!(field(&frame, 35).as_deref(), Some("D"));
+    }
+    assert_eq!(
+        writes.load(Ordering::Relaxed) - before,
+        ORDERS,
+        "each order went out in a write of its own, as soon as it was fed"
+    );
 }

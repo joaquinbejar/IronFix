@@ -484,24 +484,33 @@ impl<A: Application + 'static> Acceptor<A> {
     }
 
     /// Sets the write timeout (default 10s): how long a session's output may
-    /// wait without any of it reaching the counterparty.
+    /// wait while the stream accepts none of it.
     ///
     /// A counterparty that stops reading closes its TCP receive window, and a
     /// write into a closed window never completes. During the Logon handshake
     /// a write that takes longer than this fails the call with
     /// [`EngineError::WriteTimeout`]. Once the session is established the
     /// reactor never waits inside a write: output waits in the write buffer
-    /// while the reactor goes on reading, and the session is closed once that
-    /// output has made no progress at all for this long (checked every
-    /// 100 ms, so at most 200 ms after the timeout). A long resend to a slow
-    /// counterparty that keeps reading is therefore never cut short.
+    /// while the reactor goes on reading, and the session is closed once the
+    /// stream has accepted none of that output for this long. The time a
+    /// whole resend or burst takes does not count, only time without
+    /// progress.
+    ///
+    /// "Progress" means bytes the local stream accepted: for TCP, bytes
+    /// copied into the kernel's send buffer, not bytes the counterparty
+    /// received. A stream that buffers on its own (TLS, for instance) accepts
+    /// bytes it has not sent yet, and so hides a counterparty that stopped
+    /// reading until its own buffer is full. The check runs on the reactor's
+    /// 100 ms tick, so a stall is detected about two ticks after the timeout,
+    /// later if the reactor is inside an inline await (a store call, a
+    /// callback) when the timeout runs out.
     ///
     /// A zero timeout is raised to one tick: a write that is given no time at
     /// all can never succeed.
     ///
     /// # Arguments
     /// * `timeout` - Longest a handshake write may take, and longest a
-    ///   session's output may make no progress
+    ///   session's output may wait without the stream accepting any of it
     #[must_use]
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout.max(TICK_INTERVAL);

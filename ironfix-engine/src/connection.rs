@@ -121,7 +121,9 @@ impl Connection {
     /// dropped with a warning — the session is on its way out and a new
     /// application message would arrive after the Logout the counterparty has
     /// already seen. Use [`Connection::wait_closed`] to observe the end of the
-    /// session and `next_sender_seq` to observe progress.
+    /// session, and [`Connection::next_sender_seq`] to observe what the
+    /// session has committed to send (which counts frames still waiting to
+    /// be written).
     ///
     /// # When `send` waits
     ///
@@ -140,11 +142,12 @@ impl Connection {
     ///   the queue is full, `send` waits for the whole resend, which may last
     ///   as long as the counterparty takes to read it.
     /// - **While the counterparty reads more slowly than the session
-    ///   writes.** Output waiting for the socket stops being added to at
-    ///   64 KiB, so `send` is held back by the counterparty's reading rather
-    ///   than the waiting output growing. Output that makes no progress at
-    ///   all for the write timeout closes the session, and `send` then
-    ///   returns [`EngineError::Closed`].
+    ///   writes.** A message is written through as soon as it is framed when
+    ///   the stream takes it; output that has to wait for the stream stops
+    ///   being added to at 16 KiB, so `send` is held back by the
+    ///   counterparty's reading rather than the waiting output growing.
+    ///   Output the stream accepts none of for the write timeout closes the
+    ///   session, and `send` then returns [`EngineError::Closed`].
     ///
     /// A caller that must not wait can bound the call with
     /// `tokio::time::timeout`; a message whose `send` was abandoned that way
@@ -167,12 +170,16 @@ impl Connection {
     /// [`Connection::send`], behind the messages already queued, and waits
     /// as they do (see "When `send` waits"). While the session is resending
     /// what the counterparty missed, the Logout waits behind the resend: FIX
-    /// lets the counterparty fill its gap first, so the Logout goes out once
-    /// the resend and the messages held behind it are written, and the logout
-    /// timeout starts then, not when this method was called. A resend can
-    /// therefore delay the close by as long as the counterparty takes to read
-    /// it; output that makes no progress for the write timeout still closes
-    /// the session.
+    /// lets the counterparty fill its gap first, so the Logout is framed once
+    /// the resend and the messages held behind it are. The logout timeout
+    /// starts once the Logout has been written whole to the stream, not when
+    /// this method was called nor when it was framed behind output the
+    /// counterparty had not taken yet; until then no new application message
+    /// is sent. A resend, or a counterparty that reads slowly, can therefore
+    /// delay the close by as long as the counterparty takes to read; output
+    /// the stream accepts none of for the write timeout still closes the
+    /// session, and such a close, whose Logout never got out, is not
+    /// graceful (`reset_on_logout` does not reset).
     ///
     /// # Errors
     /// Returns [`EngineError::Closed`] if the session is already closed.
@@ -223,6 +230,13 @@ impl Connection {
     }
 
     /// Returns the next outgoing (sender) sequence number.
+    ///
+    /// A number is spent when its frame is framed and filed, before it is
+    /// written: the numbers below this one include frames still waiting in
+    /// the session's write buffer for the stream to accept them, and a frame
+    /// accepted by the stream has still not necessarily reached the
+    /// counterparty. It counts what the session has committed to send, not
+    /// what was delivered.
     #[must_use]
     pub fn next_sender_seq(&self) -> u64 {
         self.runtime.sequences.next_sender_seq().value()

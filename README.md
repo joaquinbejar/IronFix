@@ -123,8 +123,10 @@ engine wiring (#96) does not exist.
   interval, CompID and `SendingTime` validation, sequence-gap detection with
   bounded `ResendRequest` recovery, `SequenceReset` / gap fill, `PossDupFlag`
   and `OrigSendingTime` handling, session-level `Reject`, a write timeout
-  (output that makes no progress closes the session), the Logout handshake,
-  and `FIXT.1.1` BeginString with `ApplVerID`
+  (output the stream accepts none of for that long closes the session), the
+  Logout handshake (whose timeout starts once the Logout has been written
+  whole; a close whose Logout never got out is not graceful), and
+  `FIXT.1.1` BeginString with `ApplVerID`
   for FIX 5.0 sessions. A FIX 5.0 session also checks the application version
   its counterparty declares and uses against its own version plus
   `SessionConfig::allowed_appl_versions`: `DefaultApplVerID` is required by
@@ -149,7 +151,8 @@ engine wiring (#96) does not exist.
   cannot produce, are covered by gap fill (a store that reports itself
   corrupted closes the session instead). The reactor never waits inside a
   write: frames go into a write buffer that is flushed while inbound is still
-  read, so two sides resending large backlogs, or sending live traffic, to
+  read (a live frame is written through at once when the stream takes it),
+  so two sides resending large backlogs, or sending live traffic, to
   each other at once do not block each other. A resend alternates with
   inbound reads in a bounded ratio, so a counterparty that never pauses
   cannot hold it back, and every message that takes a new number follows it (a

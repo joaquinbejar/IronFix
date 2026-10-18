@@ -328,9 +328,9 @@ pub enum EngineError {
     /// A peer that stops reading parks a socket write forever once its receive
     /// window closes. A handshake write is therefore bounded, and its expiry
     /// fails the call with this error. An established session never waits
-    /// inside a write; its output that makes no progress for the write timeout
-    /// closes the session for the same reason, which is the same verdict
-    /// heartbeat detection would have reached.
+    /// inside a write; output the stream accepts none of for the write
+    /// timeout closes the session for the same reason, which is the same
+    /// verdict heartbeat detection would have reached.
     #[error("write timed out after {0:?}")]
     WriteTimeout(Duration),
 
