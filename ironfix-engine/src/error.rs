@@ -102,6 +102,22 @@ pub enum EngineError {
         detail: String,
     },
 
+    /// The application version a FIXT.1.1 counterparty declared in
+    /// `DefaultApplVerID` (1137) on its Logon is not one this session accepts.
+    ///
+    /// Raised by the acceptor for a Logon whose 1137 is missing, repeated,
+    /// not an application-version code this engine frames (`7`, `8` or `9`),
+    /// or a version outside
+    /// [`SessionConfig::accepts_appl_version`](ironfix_session::SessionConfig::accepts_appl_version);
+    /// and by the initiator for an acknowledgement whose 1137, when present,
+    /// fails the same rule. Only FIX 5.0 sessions (framed as FIXT.1.1) raise
+    /// it: a FIX 4.x Logon carries no 1137.
+    #[error("unsupported application version: {detail}")]
+    ApplVersion {
+        /// Why the declared application version was refused.
+        detail: String,
+    },
+
     /// An unexpected message type arrived while awaiting the Logon
     /// acknowledgement.
     #[error("unexpected message during logon: 35={msg_type}")]

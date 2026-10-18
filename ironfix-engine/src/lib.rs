@@ -47,6 +47,14 @@
 //! validation, gap recovery, identity and clock checks, heartbeating, and the
 //! Logout handshake — is identical for the two roles.
 //!
+//! On a FIX 5.0 session (framed as FIXT.1.1) both roles also check the
+//! application version: the acceptor requires the Logon's `DefaultApplVerID`
+//! (1137) to name a version the session accepts
+//! ([`SessionConfig::accepts_appl_version`]), the initiator holds an
+//! acknowledgement's 1137 to the same rule when present, and an inbound
+//! application message whose `ApplVerID` (1128) names any other version is
+//! rejected (`SessionRejectReason` 18) without reaching `from_app`.
+//!
 //! Both also frame their socket with garbled-frame recovery on
 //! ([`ironfix_transport::FixCodec::with_garbled_recovery`], anchored on the
 //! session's own BeginString). A garbled inbound frame, including one whose

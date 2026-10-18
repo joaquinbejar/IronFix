@@ -71,6 +71,19 @@
 //! against its own `MsgSeqNum`, while Reset mode alone may ignore it; an
 //! inbound `ResendRequest` is answered within the bound set by `EndSeqNo`.
 //!
+//! # Application versions (FIX 5.0)
+//!
+//! A FIX 5.0 session is framed as FIXT.1.1. The Logon declares this session's
+//! version in `DefaultApplVerID` (1137), and an acknowledgement that declares
+//! one too must name, once, a version the session accepts
+//! ([`SessionConfig::accepts_appl_version`]); otherwise the handshake fails
+//! with a Reject (reason 18, `RefTagID` 1137) and a Logout, as
+//! [`EngineError::ApplVersion`]. An acknowledgement without 1137 is accepted.
+//! Once Active, an inbound application message whose `ApplVerID` (1128) names
+//! a version the session does not accept is rejected (reason 18, `RefTagID`
+//! 1128), its number consumed, and never reaches `from_app`. FIX 4.x
+//! sessions carry neither field and check neither.
+//!
 //! # Resend and the message store
 //!
 //! [`Initiator::with_store`] attaches a [`MessageStore`]. Every sequenced
@@ -164,7 +177,9 @@ use crate::reactor::{
     SessionParams, TICK_INTERVAL, lock_heartbeat, read_handshake_frame, refuse_handshake,
     send_handshake_admin, session_codec, spawn_session,
 };
-use crate::wire::{self, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion};
+use crate::wire::{
+    self, ApplVersionGuard, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion,
+};
 use ironfix_core::error::DecodeError;
 use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
@@ -526,7 +541,9 @@ impl<A: Application + 'static> Initiator<A> {
     /// [`EngineError::IdentityMismatch`], when the ack's CompIDs do not match
     /// the configured session, and [`EngineError::SequenceExhausted`], when a
     /// sequence counter has reached `u64::MAX` and the session must be reset
-    /// before it can number another message. A `BeginString` this engine
+    /// before it can number another message; and, on a FIX 5.0 session,
+    /// [`EngineError::ApplVersion`], when the ack carries a `DefaultApplVerID`
+    /// (1137) the session does not accept. A `BeginString` this engine
     /// cannot frame conformantly is refused up front with
     /// [`EngineError::UnsupportedVersion`], an unusable configuration with
     /// [`EngineError::Config`], and a zero initial sequence seed with
@@ -622,6 +639,7 @@ impl<A: Application + 'static> Initiator<A> {
         let mut factory = MessageFactory::new(&self.config, version);
         let identity = PeerIdentity::new(&self.config);
         let sending_time = SendingTimeGuard::new(&self.config);
+        let appl_version = ApplVersionGuard::new(&self.config, version);
         let write_timeout = self.write_timeout;
         let store_timeout = self.store.timeout(write_timeout);
         // Every handshake write goes through this binding, which also records
@@ -801,6 +819,44 @@ impl<A: Application + 'static> Initiator<A> {
                 return Err(EngineError::LogonRejected {
                     reason: reason.text,
                 });
+            }
+
+            // DefaultApplVerID (1137) on the ack: on a FIXT.1.1 session, a
+            // 1137 the acceptor declares must name, once, an application
+            // version this session accepts. An ack without 1137 is accepted
+            // (issue #67: "when present"); its application messages without
+            // ApplVerID (1128) then count as this session's own version.
+            // Refused like the ack's other field problems: a Reject
+            // (reason 18, or 13 for a repeated 1137; RefTagID 1137) and a
+            // Logout.
+            match appl_version.check_logon(&raw, false) {
+                Ok(Some(declared)) => tracing::debug!(
+                    session = %session_id,
+                    default_appl_version = %declared,
+                    "counterparty declared its default application version"
+                ),
+                Ok(None) => {}
+                Err(problem) => {
+                    let detail = problem.to_string();
+                    let reason = problem.reject_reason();
+                    let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
+                    let logout = factory.logout(Some(&detail));
+                    let refused = refuse_handshake(
+                        self.application.as_ref(),
+                        &session_id,
+                        &mut framed,
+                        &mut factory,
+                        &runtime.sequences,
+                        store.as_mut(),
+                        write_timeout,
+                        &detail,
+                        [reject, logout],
+                    )
+                    .await;
+                    let _ = session.on_logon_reject();
+                    refused?;
+                    return Err(EngineError::ApplVersion { detail });
+                }
             }
 
             // Honor the heartbeat interval confirmed by the counterparty, but
@@ -1013,6 +1069,7 @@ impl<A: Application + 'static> Initiator<A> {
             factory,
             identity,
             sending_time,
+            appl_version,
             config: self.config.clone(),
             application: Arc::clone(&self.application),
             session_id: session_id.clone(),
