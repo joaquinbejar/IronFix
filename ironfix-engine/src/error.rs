@@ -153,7 +153,7 @@ pub enum EngineError {
         stored: u64,
     },
 
-    /// The counterparty's identity fields (49/56, and 50/57 when
+    /// The counterparty's identity fields (49/56, and 50/57 and 142/143 when
     /// configured) did not match the session configuration.
     #[error("identity mismatch: {detail}")]
     IdentityMismatch {

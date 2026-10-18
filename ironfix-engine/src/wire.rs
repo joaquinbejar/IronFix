@@ -130,7 +130,7 @@ fn framable_versions() -> String {
 /// configured counterparty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IdentityMismatch {
-    /// The offending tag (49, 56, 50 or 57).
+    /// The offending tag (49, 56, 50, 57, 142 or 143).
     pub(crate) tag: u32,
     /// The value the configuration requires.
     pub(crate) expected: String,
@@ -163,7 +163,7 @@ impl std::fmt::Display for IdentityMismatch {
 /// The set is the standard header of FIX 4.0 through 5.0 SP2 taken together:
 /// the framing fields, the routing and CompID fields, `MsgSeqNum` (34), the
 /// PossDup/PossResend pair, `SendingTime` (52) and `OrigSendingTime` (122),
-/// the `NoHops` group (627 and its 628/629/630 entries), and the FIXT.1.1
+/// `OnBehalfOfSendingTime` (370), the `NoHops` group (627 and its 628/629/630 entries), and the FIXT.1.1
 /// application-version fields (1128, 1129, 1156). A tag outside this set is
 /// the first field of the message body.
 const fn is_standard_header_tag(tag: u32) -> bool {
@@ -194,6 +194,7 @@ const fn is_standard_header_tag(tag: u32) -> bool {
             | 213
             | 347
             | 369
+            | 370
             | 627
             | 628
             | 629
@@ -342,7 +343,8 @@ pub(crate) fn parse_heartbeat_interval(raw: &RawMessage<'_>) -> Result<u64, Hear
 }
 
 /// The identity every inbound message must carry, derived from the session
-/// configuration with sender and target reversed.
+/// configuration with sender and target reversed: the CompIDs always, and the
+/// sub and location IDs the session configures.
 ///
 /// A cross-wired connection that is never checked advances sequence state
 /// against the wrong counterparty and delivers another session's traffic to
@@ -359,6 +361,10 @@ pub(crate) struct PeerIdentity {
     sender_sub_id: Option<String>,
     /// Required inbound `TargetSubID` (57), when configured.
     target_sub_id: Option<String>,
+    /// Required inbound `SenderLocationID` (142), when configured.
+    sender_location_id: Option<String>,
+    /// Required inbound `TargetLocationID` (143), when configured.
+    target_location_id: Option<String>,
 }
 
 impl PeerIdentity {
@@ -370,13 +376,18 @@ impl PeerIdentity {
             target_comp_id: config.sender_comp_id.as_str().to_string(),
             sender_sub_id: config.target_sub_id.clone(),
             target_sub_id: config.sender_sub_id.clone(),
+            sender_location_id: config.target_location_id.clone(),
+            target_location_id: config.sender_location_id.clone(),
         }
     }
 
     /// Checks an inbound message's identity fields.
     ///
-    /// Sub IDs are only checked when configured; an unconfigured sub ID
-    /// places no requirement on the counterparty.
+    /// Sub and location IDs are only checked when configured; an
+    /// unconfigured one places no requirement on the counterparty. This is
+    /// the rule an [`AcceptorRegistry`](crate::AcceptorRegistry) routes a
+    /// Logon by, so a routed session enforces on every message the identity
+    /// it was routed on.
     ///
     /// Each field must both carry the expected value **and** occur in the
     /// standard header. A CompID that appears only after the message body
@@ -392,6 +403,12 @@ impl PeerIdentity {
         }
         if let Some(expected) = &self.target_sub_id {
             check_field(raw, 57, expected)?;
+        }
+        if let Some(expected) = &self.sender_location_id {
+            check_field(raw, 142, expected)?;
+        }
+        if let Some(expected) = &self.target_location_id {
+            check_field(raw, 143, expected)?;
         }
         Ok(())
     }
@@ -1897,6 +1914,78 @@ mod tests {
         assert_eq!(header_field(&raw, 142), Some(&b"LON\x80"[..]));
         assert_eq!(header_field(&raw, 57), None);
         assert_eq!(header_field(&raw, 50), None);
+    }
+
+    #[test]
+    fn test_on_behalf_of_sending_time_is_a_header_field() {
+        // 370 sits between 34 and 56; the header run must not end at it.
+        let frame = frame_with_fields(&[
+            (35, "D"),
+            (49, "VENUE"),
+            (34, "2"),
+            (370, "20260721-10:00:00.000"),
+            (56, "CLIENT"),
+            (52, "20260721-10:00:00.000"),
+            (11, "ORDER-1"),
+        ]);
+        let raw = decode(&frame);
+
+        assert!(is_standard_header_tag(370));
+        assert!(in_standard_header(&raw, 56));
+        assert_eq!(
+            PeerIdentity::new(&config_for("FIX.4.4")).validate(&raw),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_peer_identity_checks_configured_location_ids() {
+        let mut config = config_for("FIX.4.4");
+        config.sender_location_id = Some("NYC".to_string());
+        config.target_location_id = Some("LON".to_string());
+        let identity = PeerIdentity::new(&config);
+        let with_locations = |sender: &str, target: &str| {
+            frame_with_fields(&[
+                (35, "D"),
+                (49, "VENUE"),
+                (56, "CLIENT"),
+                (34, "2"),
+                (142, sender),
+                (143, target),
+                (52, "20260721-10:00:00.000"),
+                (11, "ORDER-1"),
+            ])
+        };
+
+        // Reversed: the peer's 142 is our target location, its 143 ours.
+        assert_eq!(
+            identity.validate(&decode(&with_locations("LON", "NYC"))),
+            Ok(())
+        );
+        match identity.validate(&decode(&with_locations("PAR", "NYC"))) {
+            Err(mismatch) => assert_eq!(mismatch.tag, 142),
+            Ok(()) => panic!("a wrong SenderLocationID must be refused"),
+        }
+        match identity.validate(&decode(&with_locations("LON", "PAR"))) {
+            Err(mismatch) => assert_eq!(mismatch.tag, 143),
+            Ok(()) => panic!("a wrong TargetLocationID must be refused"),
+        }
+        let without = frame_with_fields(&[
+            (35, "D"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "2"),
+            (52, "20260721-10:00:00.000"),
+        ]);
+        match identity.validate(&decode(&without)) {
+            Err(mismatch) => assert_eq!(mismatch.tag, 142),
+            Ok(()) => panic!("a configured location ID must be carried"),
+        }
+        // Unconfigured: no requirement.
+        assert_eq!(
+            PeerIdentity::new(&config_for("FIX.4.4")).validate(&decode(&without)),
+            Ok(())
+        );
     }
 
     #[test]

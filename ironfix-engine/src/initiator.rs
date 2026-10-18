@@ -20,12 +20,12 @@
 //! # Inbound conformance
 //!
 //! Every inbound frame is checked in this order: decode, `MsgSeqNum` (34)
-//! presence, counterparty identity (49/56, plus 50/57 when configured),
-//! `SendingTime` (52) accuracy, then heartbeat bookkeeping, then sequence
-//! validation. Identity and clock come before the heartbeat bookkeeping
-//! deliberately — traffic from the wrong counterparty, or from one whose clock
-//! is wrong, must not keep the session alive, reach the [`Application`], or
-//! move sequence state.
+//! presence, counterparty identity (49/56, plus 50/57 and 142/143 when
+//! configured), `SendingTime` (52) accuracy, then heartbeat bookkeeping, then
+//! sequence validation. Identity and clock come before the heartbeat
+//! bookkeeping deliberately — traffic from the wrong counterparty, or from one
+//! whose clock is wrong, must not keep the session alive, reach the
+//! [`Application`], or move sequence state.
 //!
 //! Both of those failures end the session after a Reject and a Logout, because
 //! both are systemic rather than per-message: a peer that is cross-wired, or
