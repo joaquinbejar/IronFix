@@ -93,6 +93,16 @@
 //! absorbed, and two different groups that happen to share a delimiter tag
 //! can no longer be confused for one another.
 //!
+//! One boundary is settled by the enclosing scope. Once a group holds every
+//! entry its count declares (at once, for a count of `0`), a field that would
+//! open another entry, or lead one without its delimiter, ends the group if
+//! the enclosing scope (the entry the group is nested in, or the message
+//! level) also accepts that tag: `110=0|300=X`, where `300` is a member of
+//! both the nested group and the enclosing entry, is an empty group followed
+//! by the enclosing entry's `300`. A field only the group accepts still opens
+//! an entry, so a group with more entries than it declares is still a
+//! [`ValidationError::GroupCountMismatch`].
+//!
 //! The walk is the one the repeating-group reader ([`crate::group`]) uses,
 //! so the two agree on entry boundaries and on which group instances are
 //! malformed. A count must be one or more ASCII digits fitting in a `u64`:
@@ -637,8 +647,14 @@ impl<'d> Validator<'d> {
                 });
             }
             if let Some(group) = level.group(tag) {
-                index =
-                    walk::walk_group(fields, index, GroupSpec::from_layout(group), 0, &mut checks);
+                index = walk::walk_group(
+                    fields,
+                    index,
+                    GroupSpec::from_layout(group),
+                    0,
+                    &level.members,
+                    &mut checks,
+                );
                 continue;
             }
             if !level.allows(tag) {
@@ -3746,6 +3762,79 @@ mod tests {
                 entry_missing(100, "NoX", 0, 400, "After"),
                 entry_missing(100, "NoX", 0, 300, "Inside"),
             ]
+        );
+    }
+
+    /// NoOuter(102) entries (delimiter Shared(200), optional Extra(300))
+    /// nest the optional NoInner(110), whose entries (delimiter InnerKey(210))
+    /// may carry Extra(300) as well.
+    const EMPTY_CHILD_XML: &str = r"<fix type='FIX' major='4' minor='4'>
+        <header>
+            <field name='BeginString' required='Y'/>
+            <field name='BodyLength' required='Y'/>
+            <field name='MsgType' required='Y'/>
+        </header>
+        <trailer><field name='CheckSum' required='Y'/></trailer>
+        <messages>
+            <message name='Nesting' msgtype='U5' msgcat='app'>
+                <group name='NoOuter' required='N'>
+                    <field name='Shared' required='Y'/>
+                    <field name='Extra' required='N'/>
+                    <group name='NoInner' required='N'>
+                        <field name='InnerKey' required='Y'/>
+                        <field name='Extra' required='N'/>
+                    </group>
+                </group>
+            </message>
+        </messages>
+        <fields>
+            <field number='8' name='BeginString' type='STRING'/>
+            <field number='9' name='BodyLength' type='LENGTH'/>
+            <field number='10' name='CheckSum' type='STRING'/>
+            <field number='35' name='MsgType' type='STRING'/>
+            <field number='102' name='NoOuter' type='NUMINGROUP'/>
+            <field number='110' name='NoInner' type='NUMINGROUP'/>
+            <field number='200' name='Shared' type='STRING'/>
+            <field number='210' name='InnerKey' type='STRING'/>
+            <field number='300' name='Extra' type='STRING'/>
+        </fields>
+    </fix>";
+
+    #[track_caller]
+    fn validate_empty_child(body: &[&str]) -> Result<(), Vec<ValidationError>> {
+        let dict = ok(
+            Dictionary::from_quickfix_xml(EMPTY_CHILD_XML),
+            "empty-child dialect loads",
+        );
+        let mut fields = vec!["8=FIX.4.4", "9=100", "35=U5"];
+        fields.extend_from_slice(body);
+        fields.push("10=000");
+        validate_with(&dict, &fields)
+    }
+
+    #[test]
+    fn test_validate_empty_nested_group_followed_by_an_enclosing_field_passes() {
+        // NoInner is empty; Extra(300) belongs to both NoInner and NoOuter,
+        // and with a count of 0 it is the enclosing NoOuter entry's field.
+        assert_eq!(
+            validate_empty_child(&["102=1", "200=A", "110=0", "300=OWN"]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_empty_nested_group_with_its_own_entry_is_still_malformed() {
+        // InnerKey(210) can only open a NoInner entry, which a count of 0
+        // does not declare.
+        assert_eq!(
+            validate_empty_child(&["102=1", "200=A", "110=0", "210=X"]),
+            Err(vec![ValidationError::GroupCountMismatch {
+                count_tag: 110,
+                name: "NoInner".to_string(),
+                declared: 0,
+                actual: 1,
+                delimiter_tag: 210,
+            }])
         );
     }
 }

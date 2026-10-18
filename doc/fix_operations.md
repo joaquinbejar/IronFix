@@ -1373,7 +1373,13 @@ allocate nothing, nor does a read that fails with a structural error, for any
 group with at most 512 entry-level members (every group of the embedded
 dictionaries; a wider group allocates one small buffer per walk). A few error
 paths do allocate their error value (`MsgTypeMismatch` carries two strings).
-Required
+A group nested deeper than 32 fails the read even when it sits in another
+top-level group that is only being skipped, since the walk cannot tell where
+it ends. Both the reader and the validator settle one boundary with the
+enclosing scope: once a group holds every entry its count declares (at once
+for a count of 0), a field that the enclosing entry or the message level also
+accepts ends the group rather than opening another entry, so
+`110=0|300=X` is an empty group followed by the enclosing entry's 300. Required
 members are the validator's concern; the reader does not check them. See
 ADR-0011.
 

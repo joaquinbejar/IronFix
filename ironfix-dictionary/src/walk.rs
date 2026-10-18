@@ -181,11 +181,23 @@ pub(crate) fn parse_count(value: &[u8]) -> Option<u64> {
 /// `depth` is the group's nesting depth (0 for a group at the message level);
 /// past [`MAX_SCOPE_DEPTH`] the group is reported through
 /// [`Visitor::too_deep`] and only its count field is consumed.
+///
+/// `enclosing` lists, sorted, the tags the scope around the group accepts:
+/// the members of the entry it is nested in, or the message level's tags for
+/// a top-level group (empty when unknown). It settles one ambiguity. Once the
+/// group holds as many entries as its count declares (at once, for a count of
+/// `0`), a field that would open another entry, or lead an entry without its
+/// delimiter, ends the group instead if the enclosing scope accepts that tag:
+/// `110=0|300=X` is an empty group followed by the enclosing entry's `300`,
+/// not a malformed one. A field the enclosing scope does not accept keeps its
+/// meaning as a member of the group, so a group with more entries than it
+/// declares is still reported.
 pub(crate) fn walk_group<'s, V: Visitor<'s>>(
     fields: &[FieldRef<'_>],
     index: usize,
     group: GroupSpec<'s>,
     depth: usize,
+    enclosing: &[u32],
     visitor: &mut V,
 ) -> usize {
     let Some(count_field) = fields.get(index) else {
@@ -211,12 +223,19 @@ pub(crate) fn walk_group<'s, V: Visitor<'s>>(
     let mut entries: u64 = 0;
     let mut unparseable = false;
 
+    // Whether a field after the declared entries belongs to the enclosing
+    // scope rather than to this group.
+    let ends_group =
+        |entries: u64, tag: u32| declared == Some(entries) && enclosing.binary_search(&tag).is_ok();
+
     // Members ahead of any delimiter: the first entry is not delimiter-led,
     // so the group cannot be split into entries unambiguously. They are
-    // walked as one entry so the run still ends where it would.
+    // walked as one entry so the run still ends where it would. For an empty
+    // group the field may simply be the enclosing scope's.
     if let Some(field) = fields.get(cursor)
         && field.tag != delimiter
         && group.is_member(field.tag)
+        && !ends_group(entries, field.tag)
     {
         visitor.delimiter_mismatch(group, field.tag);
         unparseable = true;
@@ -240,6 +259,11 @@ pub(crate) fn walk_group<'s, V: Visitor<'s>>(
             // The previous entry ended at a field that is not a member: the
             // group ends here, and whatever follows belongs to the outer
             // level.
+            break;
+        }
+        if ends_group(entries, field.tag) {
+            // Every declared entry is here, and the enclosing scope accepts
+            // the delimiter tag: it is the enclosing scope's field.
             break;
         }
         let Some(next) = entries.checked_add(1) else {
@@ -341,7 +365,7 @@ fn scan_entry<'s, V: Visitor<'s>>(
             // The delimiter can itself be a nested group's count tag (FIX 5.0
             // SP2 NoAsgnReqs(1499) entries open with NoPartyIDs(453)): its
             // members follow it, so it is walked like any nested group.
-            Some(nested) => walk_group(fields, cursor, nested, depth + 1, visitor),
+            Some(nested) => walk_group(fields, cursor, nested, depth + 1, members, visitor),
             None => cursor + 1,
         };
     }

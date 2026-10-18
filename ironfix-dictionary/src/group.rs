@@ -59,6 +59,14 @@
 //!   their error ([`GroupError::MsgTypeMismatch`] holds two).
 //!   `tests/group_reader_allocations.rs` proves the allocation-free paths with
 //!   a counting allocator.
+//! - **Depth is checked on the way.** A group nested deeper than
+//!   [`MAX_SCOPE_DEPTH`] is [`GroupError::TooDeep`] even when it belongs to
+//!   another top-level group that the read only skips: the walk cannot tell
+//!   where such a group ends, so nothing after it is trusted.
+//! - **Counts settle ambiguous boundaries.** A group that holds every entry
+//!   its count declares ends at a field the enclosing scope also accepts, as
+//!   the validator's walk does (see the [`validator`](crate::validator)
+//!   module docs).
 //! - **Counts are digits.** A count is one or more ASCII digits fitting in a
 //!   `u64`; `+1`, `-1`, `abc` and overflowing values are
 //!   [`GroupError::InvalidCount`].
@@ -419,6 +427,7 @@ impl<'s> GroupSpec<'s> {
                 repr: SetRepr::Layout {
                     groups: &group.entry.groups,
                     tags: &group.entry.group_tags,
+                    enclosing: &group.entry.members,
                 },
             },
         }
@@ -431,10 +440,12 @@ enum SetRepr<'s> {
     /// Static specs, searched by count tag directly.
     Static(&'s [GroupSpec<'s>]),
     /// A layout's groups, with their count tags in a dense sorted array that
-    /// is searched instead of the groups themselves.
+    /// is searched instead of the groups themselves, and the sorted tags of
+    /// the scope the groups open in (the message level, or an entry).
     Layout {
         groups: &'s [LayoutGroup],
         tags: &'s [u32],
+        enclosing: &'s [u32],
     },
 }
 
@@ -458,6 +469,15 @@ impl<'s> GroupSet<'s> {
             })
         } else {
             Err(SpecError::UnsortedGroups)
+        }
+    }
+
+    /// The sorted tags of the scope the groups open in; empty for a static
+    /// set, which does not know them.
+    const fn enclosing(&self) -> &'s [u32] {
+        match self.repr {
+            SetRepr::Static(_) => &[],
+            SetRepr::Layout { enclosing, .. } => enclosing,
         }
     }
 
@@ -485,7 +505,7 @@ impl<'s> GroupSet<'s> {
                 .ok()
                 .and_then(|index| groups.get(index))
                 .copied(),
-            SetRepr::Layout { groups, tags } => tags
+            SetRepr::Layout { groups, tags, .. } => tags
                 .binary_search(&count_tag)
                 .ok()
                 .and_then(|index| groups.get(index))
@@ -519,6 +539,12 @@ impl<'s> GroupSet<'s> {
     /// message is scanned once, to its end, so a second instance of the count
     /// field is caught.
     ///
+    /// A group that holds all the entries its count declares (at once, for a
+    /// count of `0`) ends at a field the message level also accepts, rather
+    /// than reading it as an extra entry. A layout's set knows the message
+    /// level's tags; a static set does not, so for it such a field is always
+    /// read as the group's.
+    ///
     /// # Errors
     /// [`GroupError::NotInLayout`] if `count_tag` is not a group of the set,
     /// [`GroupError::DuplicateGroup`] if its count field appears twice at the
@@ -533,6 +559,7 @@ impl<'s> GroupSet<'s> {
             return Err(GroupError::NotInLayout { count_tag });
         };
         let fields = msg.field_slice();
+        let enclosing = self.enclosing();
         let mut found: Option<GroupEntries<'m, 'a, 's>> = None;
         let mut index = 0;
         while let Some(field) = fields.get(index) {
@@ -543,13 +570,27 @@ impl<'s> GroupSet<'s> {
                 // Check the instance while locating it: one walk gives both
                 // its verdict and its extent.
                 let mut check = FirstError::default();
-                let end = walk::walk_group(fields, index, spec, 0, &mut check);
+                let end = walk::walk_group(fields, index, spec, 0, enclosing, &mut check);
                 found = Some(check.into_entries(fields, index, end, spec, 0)?);
                 index = end;
                 continue;
             }
             index = match self.get(field.tag) {
-                Some(group) => walk::walk_group(fields, index, group, 0, &mut Skip),
+                Some(group) => {
+                    // Skipping tracks no tags, so it allocates nothing, but a
+                    // group nested past the depth limit cannot be skipped: the
+                    // walk stops at it, and what follows would be misread as
+                    // message-level fields.
+                    let mut skip = DepthGuard::default();
+                    let end = walk::walk_group(fields, index, group, 0, enclosing, &mut skip);
+                    if let Some(count_tag) = skip.too_deep {
+                        return Err(GroupError::TooDeep {
+                            count_tag,
+                            limit: MAX_SCOPE_DEPTH,
+                        });
+                    }
+                    end
+                }
                 None => index + 1,
             };
         }
@@ -572,6 +613,8 @@ pub struct MessageLayout {
     groups: Vec<LayoutGroup>,
     /// Their count tags, in the same order.
     group_tags: Vec<u32>,
+    /// Every tag the message level accepts, sorted.
+    members: Vec<u32>,
 }
 
 impl MessageLayout {
@@ -622,6 +665,7 @@ impl MessageLayout {
             msg_type: msg_type.to_string(),
             groups: scope.level.groups,
             group_tags: scope.level.group_tags,
+            members: scope.level.members,
         })
     }
 
@@ -638,6 +682,7 @@ impl MessageLayout {
             repr: SetRepr::Layout {
                 groups: &self.groups,
                 tags: &self.group_tags,
+                enclosing: &self.members,
             },
         }
     }
@@ -668,6 +713,24 @@ impl MessageLayout {
             });
         }
         self.groups().read(msg, count_tag)
+    }
+}
+
+/// Skips a group without tracking its tags, recording only whether it nests
+/// past the depth limit.
+#[derive(Default)]
+struct DepthGuard {
+    /// Count tag of the group at which the limit was reached.
+    too_deep: Option<u32>,
+}
+
+impl<'s> Visitor<'s> for DepthGuard {
+    const TRACK: bool = false;
+
+    fn too_deep(&mut self, group: GroupSpec<'s>) {
+        if self.too_deep.is_none() {
+            self.too_deep = Some(group.count_tag());
+        }
     }
 }
 
@@ -932,9 +995,14 @@ impl<'m, 'a, 's> GroupEntry<'m, 'a, 's> {
                 return Some(index);
             }
             index = match nested_groups.get(field.tag) {
-                Some(nested) => {
-                    walk::walk_group(self.fields, index, nested, self.depth + 1, &mut Skip)
-                }
+                Some(nested) => walk::walk_group(
+                    self.fields,
+                    index,
+                    nested,
+                    self.depth + 1,
+                    self.spec.members(),
+                    &mut Skip,
+                ),
                 None => index + 1,
             };
         }
@@ -1780,5 +1848,119 @@ mod tests {
                 tag: 11_050,
             })
         );
+    }
+
+    #[test]
+    fn test_read_skipped_group_past_the_depth_limit_is_a_typed_error() {
+        // A 35-level chain (count tags 1000 to 1034) whose deepest group,
+        // 1034, is also listed as a top-level group. Skipping group 1000 to
+        // look for a top-level 1034 stops at the depth limit (group 1033);
+        // the read must fail there rather than resume and take the 1034
+        // nested inside group 1000 for a top-level one.
+        let Some(top) = chain(35) else {
+            panic!("the chain builds");
+        };
+        let Ok(leaf) = GroupSpec::new(1034, 2034, &[2034], &[]) else {
+            panic!("the leaf spec builds");
+        };
+        let groups = [top, leaf];
+        let Ok(set) = GroupSet::new(&groups) else {
+            panic!("the set is sorted");
+        };
+        let body = chain_body(35);
+        let body: Vec<&str> = body.iter().map(String::as_str).collect();
+        let frame = frame("U1", &body);
+        let msg = decode(&frame);
+        let too_deep = Some(GroupError::TooDeep {
+            count_tag: 1033,
+            limit: MAX_SCOPE_DEPTH,
+        });
+        assert_eq!(set.read(&msg, 1034).err(), too_deep);
+        assert_eq!(set.read(&msg, 1000).err(), too_deep);
+    }
+
+    #[test]
+    fn test_read_empty_nested_group_followed_by_an_enclosing_field() {
+        // NoInner(110) is empty, and Extra(300), a member of both NoInner and
+        // NoOuter, follows it: with a count of 0 it is NoOuter's field.
+        let layout = dialect_layout("U5");
+        let frame = frame("U5", &["102=1", "200=A", "110=0", "300=OWN"]);
+        let msg = decode(&frame);
+        let Some(mut outer) = ok(layout.read(&msg, 102), "NoOuter reads") else {
+            panic!("NoOuter is present");
+        };
+        let Some(entry) = outer.next() else {
+            panic!("one NoOuter entry");
+        };
+        assert_eq!(entry.get(300).map(|field| field.value), Some(&b"OWN"[..]));
+        let Some(inner) = ok(entry.group(110), "empty NoInner reads") else {
+            panic!("the entry carries NoInner");
+        };
+        assert_eq!(inner.len(), 0);
+    }
+
+    #[test]
+    fn test_read_empty_nested_group_with_its_own_entry_is_still_malformed() {
+        // InnerKey(210), NoInner's delimiter, cannot belong to the NoOuter
+        // entry, so it opens an entry the count of 0 does not declare.
+        let layout = dialect_layout("U5");
+        let frame = frame("U5", &["102=1", "200=A", "110=0", "210=X"]);
+        let msg = decode(&frame);
+        assert_eq!(
+            layout.read(&msg, 102).err(),
+            Some(GroupError::CountMismatch {
+                count_tag: 110,
+                declared: 0,
+                actual: 1,
+            })
+        );
+    }
+
+    /// Static specs where a nested group's delimiter is also a field of the
+    /// enclosing entry: NoOuter(102) entries (delimiter 200, field 300) nest
+    /// NoShared(110), whose delimiter is 300 too.
+    const SHARED_INNER: GroupSpec<'static> = match GroupSpec::new(110, 300, &[300], &[]) {
+        Ok(spec) => spec,
+        Err(_) => panic!("bad NoShared table"),
+    };
+    const SHARED_OUTER: GroupSpec<'static> =
+        match GroupSpec::new(102, 200, &[110, 200, 300], &[SHARED_INNER]) {
+            Ok(spec) => spec,
+            Err(_) => panic!("bad NoOuter table"),
+        };
+    const SHARED_SET: GroupSet<'static> = match GroupSet::new(&[SHARED_OUTER]) {
+        Ok(set) => set,
+        Err(_) => panic!("bad set"),
+    };
+
+    #[test]
+    fn test_read_nested_group_ends_once_its_count_is_met() {
+        // After NoShared's one declared entry, the next 300 would open a
+        // second entry; the enclosing NoOuter entry accepts 300, so the nested
+        // group ends and 300 is NoOuter's.
+        let full = frame("U1", &["102=1", "200=A", "110=1", "300=IN", "300=OWN"]);
+        let msg = decode(&full);
+        let Some(mut outer) = ok(SHARED_SET.read(&msg, 102), "NoOuter reads") else {
+            panic!("NoOuter is present");
+        };
+        let Some(entry) = outer.next() else {
+            panic!("one NoOuter entry");
+        };
+        assert_eq!(entry.get(300).map(|field| field.value), Some(&b"OWN"[..]));
+        let Some(inner) = ok(entry.group(110), "NoShared reads") else {
+            panic!("the entry carries NoShared");
+        };
+        assert_eq!(values(inner, 300), vec![&b"IN"[..]]);
+
+        // A count of 0 likewise leaves the 300 to the enclosing entry.
+        let empty = frame("U1", &["102=1", "200=A", "110=0", "300=OWN"]);
+        let msg = decode(&empty);
+        let Some(mut outer) = ok(SHARED_SET.read(&msg, 102), "NoOuter reads") else {
+            panic!("NoOuter is present");
+        };
+        let Some(entry) = outer.next() else {
+            panic!("one NoOuter entry");
+        };
+        assert_eq!(entry.get(300).map(|field| field.value), Some(&b"OWN"[..]));
     }
 }

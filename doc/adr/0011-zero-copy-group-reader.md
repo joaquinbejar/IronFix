@@ -104,7 +104,19 @@ into a compile error. A static set reads exactly like a layout.
   `DuplicateGroup`; a message of another type is `MsgTypeMismatch`.
 - Top-level lookup is positional: the runs of the other top-level groups are
   skipped, so the same tag inside one of their entries is not taken for the
-  group asked for.
+  group asked for. Skipping tracks no tags (it stays allocation-free) but
+  does watch depth: a skipped group nested past the limit is `TooDeep`, since
+  the walk cannot tell where it ends and would otherwise resume inside it.
+- The declared count settles one boundary, in the shared walk and therefore
+  in the validator too. Once a group holds every entry it declares (at once,
+  for a count of `0`), a field that would open another entry, or lead one
+  without its delimiter, ends the group if the enclosing scope accepts that
+  tag: the entry the group is nested in, or the message level (a layout knows
+  the message level's tags; a static `GroupSet` does not, and treats such a
+  field as the group's). `110=0|300=X`, with `300` a member of both, is an
+  empty group followed by the enclosing entry's `300`. A field only the group
+  accepts still opens an entry, so too many entries are still a count
+  mismatch.
 - A count is one or more ASCII digits fitting a `u64`. `+1` is refused even
   though Rust's `u64::from_str` accepts it, because a FIX `NumInGroup` has no
   sign. The validator shares this parse.
