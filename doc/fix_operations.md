@@ -893,8 +893,9 @@ leaves a reset owed, under both policies, and the next session starts with a
 reset and `ResetSeqNumFlag` (141) = Y. This relies on
 the store applying its mutations in call order even when a call is dropped,
 which `MessageStore` now requires and `MemoryStore` and `FileStore` satisfy
-(`FileStore` runs each call behind a first-in, first-out lock held until its
-file I/O is done); a store that
+(`FileStore` runs every call on its own writer thread, first in, first out,
+and finishes a call it has started even if its future is dropped); a store
+that
 does not must not be reused after a timed-out write
 (`doc/adr/0005-fallible-store-writes.md`, "Cancellation and timeouts").
 

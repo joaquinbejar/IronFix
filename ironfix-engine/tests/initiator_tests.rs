@@ -3678,12 +3678,11 @@ async fn test_corrupted_store_closes_the_session_instead_of_gap_filling_a_resend
 /// were filed: the engine closes the session rather than gap-filling orders
 /// the store may still hold.
 ///
-/// The ResendRequest's own target counter is written before the replay, at
-/// the store's end of journal, which leaves the cut region reading as zeros:
-/// the replay then finds the record failing its checksum. A read that finds
-/// the file ending inside an indexed record (nothing written after the cut)
-/// is reported corrupted the same way; that path is covered in
-/// `ironfix-store`, where no write intervenes.
+/// The ResendRequest's own target counter is written before the replay, into
+/// one of the journal's fixed counter slots, so nothing is appended after the
+/// cut: the replay finds the file ending inside the cut record, which the
+/// store reports as corrupted. A record failing its checksum is reported
+/// corrupted the same way; that path is covered in `ironfix-store`.
 #[tokio::test]
 async fn test_file_store_cut_under_the_session_closes_it_instead_of_gap_filling() {
     let dir = TestDir::new("file-store-cut");

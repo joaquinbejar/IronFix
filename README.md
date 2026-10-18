@@ -219,11 +219,17 @@ This list is deliberately explicit. If a capability is not named under "What
 works today" and appears below, it does not exist in the code — do not plan
 around it.
 
-- **Store limits.** There is no memory-mapped store, and `FileStore`'s
-  journal is never compacted: it grows until the sequence is reset (#112).
-  Only its `SyncPolicy::EveryWrite` (the default) makes every acknowledged
-  write survive an OS crash or a power loss; `EveryN` and `Never` survive a
-  process crash only. Its guarantees reach the wire only under
+- **Store limits.** There is no memory-mapped store. `FileStore`'s journal
+  grows with every outbound frame until the sequence is reset: its counters
+  sit in two fixed slots, so inbound traffic does not grow it, and compaction
+  (`FileStore::compact`, or on its own past an opt-in threshold) reclaims only
+  frames filed again under the same number. A compaction blocks the store's
+  calls while it copies the journal
+  (`doc/adr/0022-file-store-writer-thread-and-compaction.md`). Opening it
+  still reads the whole journal, and a journal in the unreleased version-1
+  format is refused, not migrated. Only its `SyncPolicy::EveryWrite` (the
+  default) makes every acknowledged write survive an OS crash or a power
+  loss; `EveryN` and `Never` survive a process crash only. Its guarantees reach the wire only under
   `StoreFailurePolicy::CloseSession`, and are stated for Unix only
   (`doc/adr/0006-file-store.md`). The record of a reset owed to the next
   session lives in the engine's memory, not in the store, so a crash forgets

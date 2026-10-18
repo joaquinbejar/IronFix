@@ -327,10 +327,12 @@ pub trait Application: Send + Sync {
 > accepted it), and resets it only for a Logon that passes every check
 > (`doc/adr/0017-acceptor-message-store.md`).
 > Two implementations exist: `MemoryStore`, which keeps nothing across a
-> restart, and `FileStore`, one append-only journal file per store holding the
-> filed frames and both counters, with a configurable `SyncPolicy`
-> (`doc/adr/0006-file-store.md`). The memory-mapped store sketched below does
-> not exist.
+> restart, and `FileStore`, one journal file per store holding the filed
+> frames (appended) and both counters (in two fixed slots), written by one
+> writer thread per store, with a configurable `SyncPolicy`
+> (`doc/adr/0006-file-store.md`,
+> `doc/adr/0022-file-store-writer-thread-and-compaction.md`). The
+> memory-mapped store sketched below does not exist.
 
 ```rust
 // ironfix-store/src/traits.rs (abridged)
