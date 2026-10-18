@@ -1353,10 +1353,13 @@ Rationale:
   of the session carries it. The second condition excludes a tag (`448=FIX…`)
   and an opening at the very start of a field value (`96=8=FIX…`,
   `213=8=FIX…`), and nothing else: an embedded frame further inside a value is
-  the residual risk listed under Known limits. The byte before is remembered
-  across a read boundary when a resync empties the buffer, so an embedded frame
-  that arrives at offset 0 of the next read is still recognised as part of the
-  same garbled span. The shape is checked inside the scan, so a false start
+  the residual risk listed under Known limits. Both conditions hold across a
+  read boundary: when a resync empties the buffer (the byte before is
+  remembered) or stops on a partial opening, the start of the next read is
+  judged exactly as the scan judges a candidate, and anything else it opens
+  with, an embedded frame of another version included, is the rest of the same
+  garbled span. Where TCP splits the bytes changes neither the frames handed up
+  nor the skip count. The shape is checked inside the scan, so a false start
   costs about a dozen byte comparisons and is not counted. The scan stops at the
   first candidate, so its cost is linear in the bytes it discards, and it never
   allocates.
@@ -1447,7 +1450,8 @@ ends a `Framed` stream.
   SOH) is a resync candidate. If a well-formed frame follows, it is handed up.
   Only an opening at the very start of the value (`96=8=FIX…`) or after a digit
   is excluded. An embedded frame of another FIX version is excluded too, since
-  both engines restrict anchors to their own BeginString.
+  both engines restrict anchors to their own BeginString, and this holds
+  however the bytes are split across reads.
 - A frame whose opening follows an ASCII digit or `=` (for example after
   garbage that ends in a digit) is passed over by the resync, and its gap is
   recovered by `ResendRequest`. A stream whose BeginString is not accepted
@@ -1456,10 +1460,12 @@ ends a `Framed` stream.
   later frame's `<SOH>10=NNN<SOH>` has a corroborated boundary, and the
   checksum error consumes that frame with it. The gap is then recovered by
   `ResendRequest` like any other.
-- The skip count is one per garbled frame, with two exceptions that can only
-  make the optional bound trip earlier: garbage delivered in separate reads
-  counts once per read, and a partial header opening kept at the end of one
-  read counts once more if the next read shows it was garbage.
+- The skip count is one per garbled frame, and a run of garbage up to the next
+  accepted frame start counts once however it is split across reads. The
+  exception is a codec restricted to a BeginString outside the FIX family,
+  which has no anchor: it frames a read that starts after a plausible
+  boundary as it is, so garbage delivered in separate reads can count once
+  per read. Neither engine builds one.
 - A framed message whose body does not decode is dropped without a Reject,
   because no `MsgSeqNum` can be read to reference. A peer that answers the
   resulting `ResendRequest` by resending the same bytes has them dropped again,
