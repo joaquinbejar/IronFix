@@ -5613,8 +5613,9 @@ pub mod writers {
         ///
         /// The writers have checked, before writing anything, that `value` is not empty and carries
         /// no SOH, that it matches its field's FIX type (`FieldType::is_valid_value`), that a character
-        /// is printable ASCII, and that every multi-value token is non-empty with no space. A number or
-        /// group count is formatted in decimal.
+        /// (an enumeration of a `char` field, or a `MultipleCharValue` token, included) is printable
+        /// ASCII, and that every multi-value token is non-empty with no space. A number or group count
+        /// is formatted in decimal.
         fn field(&mut self, tag: u32, value: &[u8]);
 
         /// Writes a LENGTH/DATA pair: the length field, holding the size of `value` in bytes, then
@@ -5700,6 +5701,15 @@ pub mod writers {
         }
     }
 
+    /// Refuses a value that is not one printable ASCII character (a control character includes SOH): an enumeration-backed `char` value or a `MultipleCharValue` token, held as bytes.
+    fn check_ascii(value: ::core::option::Option<&[u8]>, tag: u32) -> ::core::result::Result<(), EncodeError> {
+        match value {
+            Some([byte]) if byte.is_ascii() && !byte.is_ascii_control() => Ok(()),
+            Some(value) => Err(invalid(tag, format!("{:?} is not one printable ASCII character", ::std::string::String::from_utf8_lossy(value)))),
+            _ => Ok(()),
+        }
+    }
+
     /// Refuses a value that does not match the grammar of `field_type`, the rule the validator
     /// applies.
     fn check_grammar(value: ::core::option::Option<&[u8]>, field_type: FieldType, tag: u32) -> ::core::result::Result<(), EncodeError> {
@@ -5779,8 +5789,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -5839,8 +5850,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -6211,8 +6223,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -6243,10 +6256,13 @@ pub mod writers {
             check_grammar(self.account_type.map(|value| value.as_bytes()), FieldType::Int, 581)?;
             check_text(self.day_booking_inst.map(|value| value.as_bytes()), 589)?;
             check_grammar(self.day_booking_inst.map(|value| value.as_bytes()), FieldType::Char, 589)?;
+            check_ascii(self.day_booking_inst.map(|value| value.as_bytes()), 589)?;
             check_text(self.booking_unit.map(|value| value.as_bytes()), 590)?;
             check_grammar(self.booking_unit.map(|value| value.as_bytes()), FieldType::Char, 590)?;
+            check_ascii(self.booking_unit.map(|value| value.as_bytes()), 590)?;
             check_text(self.prealloc_method.map(|value| value.as_bytes()), 591)?;
             check_grammar(self.prealloc_method.map(|value| value.as_bytes()), FieldType::Char, 591)?;
+            check_ascii(self.prealloc_method.map(|value| value.as_bytes()), 591)?;
             check_text(self.alloc_id.map(str::as_bytes), 70)?;
             check_grammar(self.alloc_id.map(str::as_bytes), FieldType::String, 70)?;
             for entry in self.no_allocs {
@@ -6254,14 +6270,17 @@ pub mod writers {
             }
             check_text(self.settl_type.map(|value| value.as_bytes()), 63)?;
             check_grammar(self.settl_type.map(|value| value.as_bytes()), FieldType::Char, 63)?;
+            check_ascii(self.settl_type.map(|value| value.as_bytes()), 63)?;
             check_text(self.settl_date.map(str::as_bytes), 64)?;
             check_grammar(self.settl_date.map(str::as_bytes), FieldType::LocalMktDate, 64)?;
             check_text(self.cash_margin.map(|value| value.as_bytes()), 544)?;
             check_grammar(self.cash_margin.map(|value| value.as_bytes()), FieldType::Char, 544)?;
+            check_ascii(self.cash_margin.map(|value| value.as_bytes()), 544)?;
             check_text(self.clearing_fee_indicator.map(|value| value.as_bytes()), 635)?;
             check_grammar(self.clearing_fee_indicator.map(|value| value.as_bytes()), FieldType::String, 635)?;
             check_text(self.handl_inst.map(|value| value.as_bytes()), 21)?;
             check_grammar(self.handl_inst.map(|value| value.as_bytes()), FieldType::Char, 21)?;
+            check_ascii(self.handl_inst.map(|value| value.as_bytes()), 21)?;
             for value in self.exec_inst {
                 check_token(value.as_bytes(), 18)?;
                 check_grammar(Some(value.as_bytes()), FieldType::MultipleStringValue, 18)?;
@@ -6273,6 +6292,7 @@ pub mod writers {
             }
             check_text(self.process_code.map(|value| value.as_bytes()), 81)?;
             check_grammar(self.process_code.map(|value| value.as_bytes()), FieldType::Char, 81)?;
+            check_ascii(self.process_code.map(|value| value.as_bytes()), 81)?;
             check_text(self.symbol.map(str::as_bytes), 55)?;
             check_grammar(self.symbol.map(str::as_bytes), FieldType::String, 55)?;
             check_text(self.symbol_sfx.map(str::as_bytes), 65)?;
@@ -6364,6 +6384,7 @@ pub mod writers {
             present(self.side.is_some(), 54)?;
             check_text(self.side.map(|value| value.as_bytes()), 54)?;
             check_grammar(self.side.map(|value| value.as_bytes()), FieldType::Char, 54)?;
+            check_ascii(self.side.map(|value| value.as_bytes()), 54)?;
             present(self.transact_time.is_some(), 60)?;
             check_text(self.transact_time.map(str::as_bytes), 60)?;
             check_grammar(self.transact_time.map(str::as_bytes), FieldType::UtcTimestamp, 60)?;
@@ -6374,9 +6395,11 @@ pub mod writers {
             check_grammar(self.qty_type.map(|value| value.as_bytes()), FieldType::Int, 854)?;
             check_text(self.rounding_direction.map(|value| value.as_bytes()), 468)?;
             check_grammar(self.rounding_direction.map(|value| value.as_bytes()), FieldType::Char, 468)?;
+            check_ascii(self.rounding_direction.map(|value| value.as_bytes()), 468)?;
             present(self.ord_type.is_some(), 40)?;
             check_text(self.ord_type.map(|value| value.as_bytes()), 40)?;
             check_grammar(self.ord_type.map(|value| value.as_bytes()), FieldType::Char, 40)?;
+            check_ascii(self.ord_type.map(|value| value.as_bytes()), 40)?;
             check_text(self.price_type.map(|value| value.as_bytes()), 423)?;
             check_grammar(self.price_type.map(|value| value.as_bytes()), FieldType::Int, 423)?;
             check_text(self.benchmark_curve_currency.map(str::as_bytes), 220)?;
@@ -6405,6 +6428,7 @@ pub mod writers {
             check_grammar(self.quote_id.map(str::as_bytes), FieldType::String, 117)?;
             check_text(self.time_in_force.map(|value| value.as_bytes()), 59)?;
             check_grammar(self.time_in_force.map(|value| value.as_bytes()), FieldType::Char, 59)?;
+            check_ascii(self.time_in_force.map(|value| value.as_bytes()), 59)?;
             check_text(self.effective_time.map(str::as_bytes), 168)?;
             check_grammar(self.effective_time.map(str::as_bytes), FieldType::UtcTimestamp, 168)?;
             check_text(self.expire_date.map(str::as_bytes), 432)?;
@@ -6415,12 +6439,15 @@ pub mod writers {
             check_grammar(self.gtbooking_inst.map(|value| value.as_bytes()), FieldType::Int, 427)?;
             check_text(self.comm_type.map(|value| value.as_bytes()), 13)?;
             check_grammar(self.comm_type.map(|value| value.as_bytes()), FieldType::Char, 13)?;
+            check_ascii(self.comm_type.map(|value| value.as_bytes()), 13)?;
             check_text(self.comm_currency.map(str::as_bytes), 479)?;
             check_grammar(self.comm_currency.map(str::as_bytes), FieldType::Currency, 479)?;
             check_text(self.fund_renew_waiv.map(|value| value.as_bytes()), 497)?;
             check_grammar(self.fund_renew_waiv.map(|value| value.as_bytes()), FieldType::Char, 497)?;
+            check_ascii(self.fund_renew_waiv.map(|value| value.as_bytes()), 497)?;
             check_text(self.order_capacity.map(|value| value.as_bytes()), 528)?;
             check_grammar(self.order_capacity.map(|value| value.as_bytes()), FieldType::Char, 528)?;
+            check_ascii(self.order_capacity.map(|value| value.as_bytes()), 528)?;
             for value in self.order_restrictions {
                 check_token(value.as_bytes(), 529)?;
                 check_grammar(Some(value.as_bytes()), FieldType::MultipleStringValue, 529)?;
@@ -6438,6 +6465,7 @@ pub mod writers {
             check_grammar(self.settl_date2.map(str::as_bytes), FieldType::LocalMktDate, 193)?;
             check_text(self.position_effect.map(|value| value.as_bytes()), 77)?;
             check_grammar(self.position_effect.map(|value| value.as_bytes()), FieldType::Char, 77)?;
+            check_ascii(self.position_effect.map(|value| value.as_bytes()), 77)?;
             check_text(self.covered_or_uncovered.map(|value| value.as_bytes()), 203)?;
             check_grammar(self.covered_or_uncovered.map(|value| value.as_bytes()), FieldType::Int, 203)?;
             check_text(self.peg_move_type.map(|value| value.as_bytes()), 835)?;
@@ -6452,6 +6480,7 @@ pub mod writers {
             check_grammar(self.peg_scope.map(|value| value.as_bytes()), FieldType::Int, 840)?;
             check_text(self.discretion_inst.map(|value| value.as_bytes()), 388)?;
             check_grammar(self.discretion_inst.map(|value| value.as_bytes()), FieldType::Char, 388)?;
+            check_ascii(self.discretion_inst.map(|value| value.as_bytes()), 388)?;
             check_text(self.discretion_move_type.map(|value| value.as_bytes()), 841)?;
             check_grammar(self.discretion_move_type.map(|value| value.as_bytes()), FieldType::Int, 841)?;
             check_text(self.discretion_offset_type.map(|value| value.as_bytes()), 842)?;
@@ -6468,8 +6497,10 @@ pub mod writers {
             check_grammar(self.target_strategy_parameters.map(str::as_bytes), FieldType::String, 848)?;
             check_text(self.cancellation_rights.map(|value| value.as_bytes()), 480)?;
             check_grammar(self.cancellation_rights.map(|value| value.as_bytes()), FieldType::Char, 480)?;
+            check_ascii(self.cancellation_rights.map(|value| value.as_bytes()), 480)?;
             check_text(self.money_laundering_status.map(|value| value.as_bytes()), 481)?;
             check_grammar(self.money_laundering_status.map(|value| value.as_bytes()), FieldType::Char, 481)?;
+            check_ascii(self.money_laundering_status.map(|value| value.as_bytes()), 481)?;
             check_text(self.regist_id.map(str::as_bytes), 513)?;
             check_grammar(self.regist_id.map(str::as_bytes), FieldType::String, 513)?;
             check_text(self.designation.map(str::as_bytes), 494)?;
@@ -6694,6 +6725,7 @@ pub mod writers {
             check_grammar(self.ref_msg_type.map(str::as_bytes), FieldType::String, 372)?;
             check_text(self.msg_direction.map(|value| value.as_bytes()), 385)?;
             check_grammar(self.msg_direction.map(|value| value.as_bytes()), FieldType::Char, 385)?;
+            check_ascii(self.msg_direction.map(|value| value.as_bytes()), 385)?;
             Ok(())
         }
 
@@ -6732,6 +6764,7 @@ pub mod writers {
             check_grammar(self.party_id.map(str::as_bytes), FieldType::String, 448)?;
             check_text(self.party_idsource.map(|value| value.as_bytes()), 447)?;
             check_grammar(self.party_idsource.map(|value| value.as_bytes()), FieldType::Char, 447)?;
+            check_ascii(self.party_idsource.map(|value| value.as_bytes()), 447)?;
             check_text(self.party_role.map(|value| value.as_bytes()), 452)?;
             check_grammar(self.party_role.map(|value| value.as_bytes()), FieldType::Int, 452)?;
             for entry in self.no_party_sub_ids {

@@ -2227,6 +2227,9 @@ struct WriterUses {
     character: bool,
     /// Multi-value tokens: not empty, no space, no SOH.
     token: bool,
+    /// Enumeration-backed `char` values and `MultipleCharValue` tokens:
+    /// one printable ASCII character.
+    ascii: bool,
     /// Text, enumeration and token values checked against their FIX type.
     grammar: bool,
     /// Non-negative integers checked against their FIX type.
@@ -2248,6 +2251,7 @@ impl WriterUses {
                         uses.data |= field.kind == Kind::Bytes;
                         uses.character |= field.kind == Kind::Char;
                         uses.token |= matches!(field.kind, Kind::Tokens(_));
+                        uses.ascii |= is_ascii_char(field);
                         uses.grammar |=
                             matches!(field.kind, Kind::Str | Kind::Enum(_) | Kind::Tokens(_));
                         uses.number |= field.kind == Kind::UInt;
@@ -2289,7 +2293,7 @@ fn writer_required(level: &Level, field: &FieldMember) -> bool {
 
 /// The value checks a writer helper runs: name, doc, parameter type, and
 /// the match arms that refuse a value (the last arm accepts).
-const WRITER_CHECKS: [(&str, &str, &str, &[&str]); 4] = [
+const WRITER_CHECKS: [(&str, &str, &str, &[&str]); 5] = [
     (
         "check_text",
         "Refuses an empty value, or one carrying SOH, which would end the field early.",
@@ -2323,7 +2327,34 @@ const WRITER_CHECKS: [(&str, &str, &str, &[&str]); 4] = [
             "value if value.contains(&0x01) => Err(invalid(tag, \"a token contains SOH\".to_string())),",
         ],
     ),
+    (
+        "check_ascii",
+        "Refuses a value that is not one printable ASCII character (a control character includes SOH): an enumeration-backed `char` value or a `MultipleCharValue` token, held as bytes.",
+        "::core::option::Option<&[u8]>",
+        &[
+            "Some([byte]) if byte.is_ascii() && !byte.is_ascii_control() => Ok(()),",
+            "Some(value) => Err(invalid(tag, format!(\"{:?} is not one printable ASCII character\", ::std::string::String::from_utf8_lossy(value)))),",
+        ],
+    ),
 ];
+
+/// True for a field whose writer value must be one printable ASCII
+/// character but is held as bytes: an enumeration of a `char` field, or of a
+/// `MultipleCharValue` field (each token). A plain `char` field is a `char`
+/// and has its own check.
+fn is_ascii_char(field: &FieldMember) -> bool {
+    match field.kind {
+        Kind::Enum(_) => field.field_type == FieldType::Char,
+        Kind::Tokens(_) => field.field_type == FieldType::MultipleCharValue,
+        Kind::Str
+        | Kind::Bytes
+        | Kind::Char
+        | Kind::Bool
+        | Kind::Int
+        | Kind::UInt
+        | Kind::Decimal => false,
+    }
+}
 
 /// Emits the `writers` module.
 fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
@@ -2370,7 +2401,7 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
             line(code, text);
         }
     }
-    let emitted = [uses.text, uses.data, uses.character, uses.token];
+    let emitted = [uses.text, uses.data, uses.character, uses.token, uses.ascii];
     if emitted.contains(&true) || uses.grammar || uses.number {
         for text in [
             "",
@@ -2506,7 +2537,7 @@ fn emit_sink(code: &mut String) {
         "        ///",
         "        /// The writers have checked, before writing anything, that `value` is not empty and carries",
         "        /// no SOH, that it matches its field's FIX type (`FieldType::is_valid_value`), that a character",
-        "        /// is printable ASCII, and that every multi-value token is non-empty with no space. A number or\n        /// group count is formatted in decimal.",
+        "        /// (an enumeration of a `char` field, or a `MultipleCharValue` token, included) is printable\n        /// ASCII, and that every multi-value token is non-empty with no space. A number or group count\n        /// is formatted in decimal.",
         "        fn field(&mut self, tag: u32, value: &[u8]);",
         "",
         "        /// Writes a LENGTH/DATA pair: the length field, holding the size of `value` in bytes, then",
@@ -2688,6 +2719,13 @@ fn writer_checks(level: &Level) -> Vec<String> {
                         let bytes = format!("self.{ident}.map(|value| value.as_bytes())");
                         checks.push(format!("check_text({bytes}, {tag})?;"));
                         checks.push(format!("check_grammar({bytes}, {grammar}, {tag})?;"));
+                        // One `char` of the FIX type may still be no
+                        // printable ASCII character (`Other(b"\0")`,
+                        // `Other("é".as_bytes())`): the rule of plain `char`
+                        // fields applies.
+                        if is_ascii_char(field) {
+                            checks.push(format!("check_ascii({bytes}, {tag})?;"));
+                        }
                     }
                     Kind::Bytes => checks.push(format!("check_data(self.{ident}, {tag})?;")),
                     // A printable ASCII character is always one valid `char`.
@@ -2701,6 +2739,10 @@ fn writer_checks(level: &Level) -> Vec<String> {
                         checks.push(format!(
                             "    check_grammar(Some(value.as_bytes()), {grammar}, {tag})?;"
                         ));
+                        if is_ascii_char(field) {
+                            checks
+                                .push(format!("    check_ascii(Some(value.as_bytes()), {tag})?;"));
+                        }
                         checks.push("}".to_string());
                     }
                     // Formatted by the writer itself: always valid.
@@ -2851,8 +2893,8 @@ fn emit_writer(
             "        /// # Errors",
             "        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry",
             "        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a",
-            "        /// value other than data, a value that does not match its field's FIX type, a `char` that",
-            "        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are",
+            "        /// value other than data, a value that does not match its field's FIX type, a character (a",
+            "        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable\n        /// ASCII, or a multi-value token that is empty or carries a space. All are",
             "        /// checked before anything is written.",
         ] {
             line(code, text);

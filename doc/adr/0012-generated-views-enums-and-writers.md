@@ -156,8 +156,11 @@ core API changed.
 **Writers check every value before writing anything.** A missing required
 field, required group or entry delimiter is
 `EncodeError::MissingRequiredField`. An empty value, SOH in any value other
-than `data`, a `char` that is not printable ASCII, and a multi-value token
-that is empty or carries a space or SOH are `EncodeError::InvalidFieldValue`.
+than `data`, a character that is not printable ASCII (a `char` field, the
+enumeration of a `char` field such as `Side::Other(b"\0")`, a
+`MultipleCharValue` token such as `Flags::Other(b"\n")`), and a multi-value
+token that is empty or carries a space or SOH are
+`EncodeError::InvalidFieldValue`.
 So is a value that does not match its field's FIX type, checked with the
 validator's own `FieldType::is_valid_value`: a string (a malformed
 `UTCTimestamp`, a two-letter `Currency`), a non-negative integer (a

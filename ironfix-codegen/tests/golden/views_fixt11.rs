@@ -911,8 +911,9 @@ pub mod writers {
         ///
         /// The writers have checked, before writing anything, that `value` is not empty and carries
         /// no SOH, that it matches its field's FIX type (`FieldType::is_valid_value`), that a character
-        /// is printable ASCII, and that every multi-value token is non-empty with no space. A number or
-        /// group count is formatted in decimal.
+        /// (an enumeration of a `char` field, or a `MultipleCharValue` token, included) is printable
+        /// ASCII, and that every multi-value token is non-empty with no space. A number or group count
+        /// is formatted in decimal.
         fn field(&mut self, tag: u32, value: &[u8]);
 
         /// Writes a LENGTH/DATA pair: the length field, holding the size of `value` in bytes, then
@@ -1059,8 +1060,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -1101,8 +1103,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -1146,8 +1149,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -1207,8 +1211,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -1270,8 +1275,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -1317,8 +1323,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -1400,8 +1407,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -1480,8 +1488,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, _sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             Ok(())

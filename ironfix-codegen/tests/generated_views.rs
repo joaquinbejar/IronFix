@@ -1782,3 +1782,71 @@ fn test_writer_refuses_values_that_do_not_match_their_fix_type() {
     let dict = views_common::views_sample_dictionary();
     assert_eq!(Validator::new(&dict).validate(&msg), Ok(()));
 }
+
+#[test]
+fn test_writer_refuses_an_enumerated_character_that_is_not_printable_ascii() {
+    use sample::enums::{Flags, Side};
+    use sample::writers::{NewOrderSingleFields, TypeSamplerFields, TypeSamplerNoDocsFields};
+
+    // One `char` of the FIX type, but not printable ASCII: the rule of a
+    // plain `char` field applies to the enumeration of a `char` field and to
+    // every token of a `MultipleCharValue` field.
+    let calls = Cell::new(0usize);
+    let mut sink = |_tag: u32, _value: &[u8]| calls.set(calls.get() + 1);
+    for side in [
+        Side::Other(b"\0"),
+        Side::Other("é".as_bytes()),
+        Side::Other(b"\x7f"),
+    ] {
+        let order = NewOrderSingleFields {
+            cl_ord_id: Some("ORDER-1"),
+            side: Some(side),
+            transact_time: Some("20260712-10:00:01"),
+            symbol: Some("EURUSD"),
+            ..NewOrderSingleFields::default()
+        };
+        assert!(
+            matches!(
+                order.write(&mut sink),
+                Err(EncodeError::InvalidFieldValue { tag: 54, .. })
+            ),
+            "{side:?}"
+        );
+    }
+    let docs = [TypeSamplerNoDocsFields {
+        encoded_text: Some(&b"x"[..]),
+        doc_name: None,
+    }];
+    for token in [Flags::Other(b"\n"), Flags::Other("é".as_bytes())] {
+        let sampler = TypeSamplerFields {
+            flags: &[Flags::Alpha, token],
+            no_docs: &docs,
+            ..TypeSamplerFields::default()
+        };
+        assert!(
+            matches!(
+                sampler.write(&mut sink),
+                Err(EncodeError::InvalidFieldValue { tag: 5014, .. })
+            ),
+            "{token:?}"
+        );
+    }
+    assert_eq!(calls.get(), 0, "nothing is written when a check fails");
+
+    // A printable undeclared character, and a space-free printable token,
+    // still write.
+    let order = NewOrderSingleFields {
+        cl_ord_id: Some("ORDER-1"),
+        side: Some(Side::Other(b"Z")),
+        transact_time: Some("20260712-10:00:01"),
+        symbol: Some("EURUSD"),
+        ..NewOrderSingleFields::default()
+    };
+    assert!(order.write(&mut sink).is_ok());
+    let sampler = TypeSamplerFields {
+        flags: &[Flags::Alpha, Flags::Other(b"~")],
+        no_docs: &docs,
+        ..TypeSamplerFields::default()
+    };
+    assert!(sampler.write(&mut sink).is_ok());
+}

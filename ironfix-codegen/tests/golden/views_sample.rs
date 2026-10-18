@@ -995,8 +995,9 @@ pub mod writers {
         ///
         /// The writers have checked, before writing anything, that `value` is not empty and carries
         /// no SOH, that it matches its field's FIX type (`FieldType::is_valid_value`), that a character
-        /// is printable ASCII, and that every multi-value token is non-empty with no space. A number or
-        /// group count is formatted in decimal.
+        /// (an enumeration of a `char` field, or a `MultipleCharValue` token, included) is printable
+        /// ASCII, and that every multi-value token is non-empty with no space. A number or group count
+        /// is formatted in decimal.
         fn field(&mut self, tag: u32, value: &[u8]);
 
         /// Writes a LENGTH/DATA pair: the length field, holding the size of `value` in bytes, then
@@ -1082,6 +1083,15 @@ pub mod writers {
         }
     }
 
+    /// Refuses a value that is not one printable ASCII character (a control character includes SOH): an enumeration-backed `char` value or a `MultipleCharValue` token, held as bytes.
+    fn check_ascii(value: ::core::option::Option<&[u8]>, tag: u32) -> ::core::result::Result<(), EncodeError> {
+        match value {
+            Some([byte]) if byte.is_ascii() && !byte.is_ascii_control() => Ok(()),
+            Some(value) => Err(invalid(tag, format!("{:?} is not one printable ASCII character", ::std::string::String::from_utf8_lossy(value)))),
+            _ => Ok(()),
+        }
+    }
+
     /// Refuses a value that does not match the grammar of `field_type`, the rule the validator
     /// applies.
     fn check_grammar(value: ::core::option::Option<&[u8]>, field_type: FieldType, tag: u32) -> ::core::result::Result<(), EncodeError> {
@@ -1158,8 +1168,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, _sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             Ok(())
@@ -1196,8 +1207,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -1212,6 +1224,7 @@ pub mod writers {
             present(self.side.is_some(), 54)?;
             check_text(self.side.map(|value| value.as_bytes()), 54)?;
             check_grammar(self.side.map(|value| value.as_bytes()), FieldType::Char, 54)?;
+            check_ascii(self.side.map(|value| value.as_bytes()), 54)?;
             check_text(self.text.map(str::as_bytes), 58)?;
             check_grammar(self.text.map(str::as_bytes), FieldType::String, 58)?;
             present(self.symbol.is_some(), 55)?;
@@ -1298,8 +1311,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -1318,6 +1332,7 @@ pub mod writers {
             present(self.side.is_some(), 54)?;
             check_text(self.side.map(|value| value.as_bytes()), 54)?;
             check_grammar(self.side.map(|value| value.as_bytes()), FieldType::Char, 54)?;
+            check_ascii(self.side.map(|value| value.as_bytes()), 54)?;
             present(self.transact_time.is_some(), 60)?;
             check_text(self.transact_time.map(str::as_bytes), 60)?;
             check_grammar(self.transact_time.map(str::as_bytes), FieldType::UtcTimestamp, 60)?;
@@ -1428,8 +1443,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a value that does not match its field's FIX type, a `char` that
-        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// value other than data, a value that does not match its field's FIX type, a character (a
+        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
+        /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
         pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
@@ -1458,9 +1474,11 @@ pub mod writers {
             for value in self.flags {
                 check_token(value.as_bytes(), 5014)?;
                 check_grammar(Some(value.as_bytes()), FieldType::MultipleCharValue, 5014)?;
+                check_ascii(Some(value.as_bytes()), 5014)?;
             }
             check_text(self.mode.map(|value| value.as_bytes()), 5015)?;
             check_grammar(self.mode.map(|value| value.as_bytes()), FieldType::Char, 5015)?;
+            check_ascii(self.mode.map(|value| value.as_bytes()), 5015)?;
             present(!self.no_docs.is_empty(), 5020)?;
             for entry in self.no_docs {
                 entry.check()?;
@@ -1522,6 +1540,7 @@ pub mod writers {
             check_grammar(self.party_id.map(str::as_bytes), FieldType::String, 448)?;
             check_text(self.party_idsource.map(|value| value.as_bytes()), 447)?;
             check_grammar(self.party_idsource.map(|value| value.as_bytes()), FieldType::Char, 447)?;
+            check_ascii(self.party_idsource.map(|value| value.as_bytes()), 447)?;
             present(self.party_role.is_some(), 452)?;
             check_text(self.text.map(str::as_bytes), 58)?;
             check_grammar(self.text.map(str::as_bytes), FieldType::String, 58)?;
