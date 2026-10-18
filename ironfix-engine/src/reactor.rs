@@ -1604,7 +1604,27 @@ impl<A: Application> Reactor<A> {
             .resend
             .map_or(high_water, |state| state.high_water.max(high_water));
         self.resend = Some(ResendState::first(expected, high_water, &self.config));
+        self.drop_held_logon_for_a_request();
         Ok(phase)
+    }
+
+    /// Drops a held Logon because a real `ResendRequest` has just gone out.
+    ///
+    /// The open-ended request covers the held Logon's own number, which its
+    /// answer fills (an administrative Logon is gap-filled), so that number
+    /// must arrive in sequence rather than be consumed locally: consumed, the
+    /// answer's gap fill starting at it would land below the expectation and
+    /// be dropped as a possible duplicate, leaving whatever else it covered
+    /// missing. Duplicates of the counterparty's own 789 resend that arrive
+    /// meanwhile are dropped as possible duplicates as usual.
+    fn drop_held_logon_for_a_request(&mut self) {
+        if let Some(logon_seq) = self.held_logon.take() {
+            tracing::debug!(
+                session = %self.session_id,
+                held_logon = logon_seq,
+                "a ResendRequest went out: the held Logon is left to its answer"
+            );
+        }
     }
 
     /// Reconciles the outstanding resend, if any, with in-order inbound
@@ -1673,6 +1693,7 @@ impl<A: Application> Reactor<A> {
         if let Some(state) = self.resend.as_mut() {
             state.record_retry();
         }
+        self.drop_held_logon_for_a_request();
         tracing::debug!(
             session = %self.session_id,
             expected,
@@ -2247,6 +2268,11 @@ impl<A: Application> Reactor<A> {
     /// - Expectation equal to it: `MsgSeqNum + 1` is persisted as the next
     ///   target number and only then is the expectation moved, the order every
     ///   inbound message takes (ADR-0005), and recovery progress is noted.
+    ///
+    /// A hold lasts only while nothing has been requested: once a real
+    /// `ResendRequest` goes out (the fallback, or a retry), the hold is
+    /// dropped and the request's answer fills the Logon's number
+    /// ([`Reactor::drop_held_logon_for_a_request`]).
     ///
     /// Nothing is requested here, even when frames from beyond the held Logon
     /// arrived while it was held: a counterparty such as QuickFIX/C++ resends

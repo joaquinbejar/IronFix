@@ -915,19 +915,22 @@ async fn test_acceptor_absorbs_a_retransmit_through_the_peers_logon_without_a_re
     assert_silent(&mut framed, "no ResendRequest at any point").await;
 }
 
-/// Pins a known limit (ADR-0021, "Not done"): the fallback request went out,
-/// and an administrative frame past the held Logon (a Heartbeat at 7) had
-/// arrived live during the hold. The answer replays 3..=5 and covers 6..=7
-/// with one gap fill numbered 6, but 6, the held Logon, is consumed when 5
-/// arrives, so that fill is below the expectation and dropped as a possible
-/// duplicate. 7 stays missing until the request's next retry asks for it.
+/// Once the fallback request has gone out, the hold is dropped: the answer to
+/// that request covers the Logon itself, so the Logon is not consumed
+/// locally. Here an administrative frame past the held Logon (a Heartbeat at
+/// 7) arrived live during the hold, the fallback requests 3 onwards, and the
+/// answer replays 3..=5 and covers 6..=7 with one gap fill numbered 6. That
+/// fill is in sequence, so the recovery is complete at 8, with a limit of one
+/// request and no Logout or further request after it.
 #[tokio::test]
-async fn test_acceptor_fill_from_the_held_logon_after_the_fallback_waits_for_the_retry() {
-    let resend_timeout = Duration::from_millis(800);
+async fn test_acceptor_fallback_request_drops_the_hold_and_its_answer_completes_recovery() {
+    let resend_timeout = Duration::from_millis(400);
     let (venue_app, mut venue_rx) = RecordingApp::new();
     let acceptor = Arc::new(
         Acceptor::new(
-            venue_789().with_resend_timeout(resend_timeout),
+            venue_789()
+                .with_resend_timeout(resend_timeout)
+                .with_max_resend_requests(1),
             Arc::clone(&venue_app),
         )
         .with_initial_sequences(1, 3),
@@ -957,16 +960,70 @@ async fn test_acceptor_fill_from_the_held_logon_after_the_fallback_waits_for_the
     for expected in ["3", "4", "5"] {
         assert_eq!(next_app_message(&mut venue_rx).await.1, expected);
     }
-    assert_silent(&mut framed, "nothing until the retry").await;
-    assert_eq!(
-        connection.next_target_seq(),
-        7,
-        "the fill numbered 6 was dropped: 7 is still missing"
+    if let Ok(Some(Ok(frame))) = timeout(resend_timeout * 3, framed.next()).await {
+        panic!(
+            "the recovery is complete: unexpected MsgType {}",
+            msg_type_of(&frame)
+        );
+    }
+    assert_eq!(connection.next_target_seq(), 8, "the fill covered 6 and 7");
+    assert!(
+        !venue_app.events().contains(&"logout".to_string()),
+        "no Logout"
     );
+}
 
-    let retry = next_frame(&mut framed).await;
-    assert_eq!(msg_type_of(&retry), "2", "the retry asks for 7");
-    assert_eq!(field(&retry, 7).as_deref(), Some("7"));
+/// The fallback went out, then the initiator's own 789 resend arrives late
+/// (3..=5, stopping before its Logon), followed by the answer to the request.
+/// With the hold dropped, 6 is not consumed when 5 arrives; the answer's
+/// replays of 3..=5 are dropped as duplicates and its gap fill at 6 is in
+/// sequence, so the recovery completes at 8 with no further request.
+#[tokio::test]
+async fn test_acceptor_late_789_resend_after_the_fallback_completes_recovery() {
+    let resend_timeout = Duration::from_millis(400);
+    let (venue_app, mut venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_789()
+                .with_resend_timeout(resend_timeout)
+                .with_max_resend_requests(1),
+            Arc::clone(&venue_app),
+        )
+        .with_initial_sequences(1, 3),
+    );
+    let (mut framed, connection, _ack) = establish(acceptor, client_logon(6, &[(789, "1")])).await;
+    let request = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&request), "2", "the fallback fires");
+
+    // The late 789 resend, then the answer to the request.
+    for seq in [3u64, 4, 5] {
+        ok(
+            framed.send(client_resend("D", seq, &ORDER_BODY)).await,
+            "the 789 resend",
+        );
+    }
+    for seq in [3u64, 4, 5] {
+        ok(
+            framed.send(client_resend("D", seq, &ORDER_BODY)).await,
+            "the answer replays an order again",
+        );
+    }
+    ok(
+        framed
+            .send(client_resend("4", 6, &[(123, "Y"), (36, "8")]))
+            .await,
+        "the answer gap-fills 6..=7",
+    );
+    for expected in ["3", "4", "5"] {
+        assert_eq!(next_app_message(&mut venue_rx).await.1, expected);
+    }
+    if let Ok(Some(Ok(frame))) = timeout(resend_timeout * 3, framed.next()).await {
+        panic!(
+            "the recovery is complete: unexpected MsgType {}",
+            msg_type_of(&frame)
+        );
+    }
+    assert_eq!(connection.next_target_seq(), 8);
 }
 
 /// Partial progress keeps the recovery implied: the initiator resends 3, then
