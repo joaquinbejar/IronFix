@@ -98,6 +98,25 @@ imports, is reserved in both. A member listed twice in one definition is one
 field (the first listing wins). A component field whose name is taken gets a
 `_component` suffix.
 
+**Identifiers are reserved once escaped** (fixed in review of PR #119). A
+value identifier is checked against, and recorded as, its final escaped
+form: `crate` and `self` have no raw form and become `crate_` and `self_`,
+the plain snake case of `Crate_` and `Self_`, so checking before escaping
+gave a message listing a `Crate_` field and a `Crate` component two
+`crate_` fields, and one listing the components `Self` and `Self_` two
+`self_` fields. The same allocator now names struct fields, groups and
+component fields in the default output and accessors and writer fields in
+the views (the views had the same defect for two fields `Crate` and
+`Crate_`). A qualifier is joined with one underscore, or none after a
+trailing one (`self_6003`, `self_component`), so no identifier holds `__`.
+Type names built from an escaped one drop the escape (`Self_` and `NoLines`
+give `SelfNoLinesEntry`; the views' `SelfView`, no longer `Self_View`; a
+second `Self_` is `Self2`), so none trips `non_camel_case_types`. The
+`keyword_names` golden pair compiles every such pair in both member orders
+under `deny(non_snake_case, non_camel_case_types)` and round-trips one
+through a writer and a view; the embedded dictionaries' outputs did not
+change.
+
 **Fail closed, in two passes.** A first pass walks the messages and collects
 the components they reach, reporting an undefined component (with the scope
 that references it, for example `group NoPartyIDs of component Parties`), a

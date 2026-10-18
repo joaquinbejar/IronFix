@@ -483,7 +483,13 @@ pub(crate) fn field_doc(field: &FieldDef) -> String {
 /// Two FIX field names can collapse onto one Rust identifier (`ClOrdID` and
 /// `ClOrdId` both snake-case to `cl_ord_id`); the tag disambiguates them, and a
 /// numeric suffix settles the remaining pathological case. Nothing is ever
-/// dropped to avoid a clash.
+/// dropped to avoid a clash. Uniqueness is checked on the escaped identifier
+/// (see [`claim_ident`]), so `Crate` (`crate_`) and `Crate_` do not collide.
+///
+/// # Errors
+///
+/// [`GeneratorError::UnnameableItem`] if the name is not an identifier in
+/// snake case, or if no unique identifier is left for it.
 pub(crate) fn resolve_field_name(
     used: &mut HashSet<String>,
     name: &str,
@@ -496,7 +502,62 @@ pub(crate) fn resolve_field_name(
             name: name.to_string(),
         });
     }
-    Ok(to_field_ident(&unique_name(used, &base, tag)))
+    claim_ident(used, &base, &tag.to_string()).ok_or_else(|| GeneratorError::UnnameableItem {
+        what: "field",
+        name: name.to_string(),
+    })
+}
+
+/// Claims, in `used`, a value identifier (a struct field or an accessor)
+/// for `base`: `base`, then `base` qualified by `qualifier` (a tag, or a
+/// word such as `component`), then that followed by `2`, `3`, ...
+///
+/// Each candidate is escaped with [`to_field_ident`] *before* it is checked
+/// and reserved, and `used` holds escaped identifiers only. Escaping can
+/// fold two names onto one identifier (`crate` becomes `crate_`, the plain
+/// snake case of `Crate_`; `self` becomes `self_`), so checking the
+/// unescaped candidate would hand the same identifier out twice. Suffixes are
+/// joined with one underscore, or none after a trailing one ([`join_ident`]),
+/// so no identifier holds `__`, which `non_snake_case` rejects.
+///
+/// Returns `None` only if the numeric suffix runs out of `usize` values;
+/// each taken identifier blocks at most one candidate, so it never does.
+#[must_use]
+pub(crate) fn claim_ident(
+    used: &mut HashSet<String>,
+    base: &str,
+    qualifier: &str,
+) -> Option<String> {
+    let mut claim = |candidate: &str| {
+        let ident = to_field_ident(candidate);
+        used.insert(ident.clone()).then_some(ident)
+    };
+    if let Some(ident) = claim(base) {
+        return Some(ident);
+    }
+    let qualified = join_ident(base, qualifier);
+    if let Some(ident) = claim(&qualified) {
+        return Some(ident);
+    }
+    let mut suffix = 2usize;
+    loop {
+        if let Some(ident) = claim(&join_ident(&qualified, &suffix.to_string())) {
+            return Some(ident);
+        }
+        suffix = suffix.checked_add(1)?;
+    }
+}
+
+/// Joins `suffix` to the identifier `base` with one underscore, or with
+/// none when `base` already ends with one (`self_` and `5` give `self_5`,
+/// never `self__5`).
+#[must_use]
+pub(crate) fn join_ident(base: &str, suffix: &str) -> String {
+    if base.ends_with('_') {
+        format!("{base}{suffix}")
+    } else {
+        format!("{base}_{suffix}")
+    }
 }
 
 /// Returns a name not already in `used`, disambiguating first by `tag` and
@@ -520,18 +581,34 @@ pub(crate) fn unique_name(used: &mut HashSet<String>, base: &str, tag: u32) -> S
 }
 
 /// Returns a type name not already used in the generated module.
+///
+/// The numeric suffix is joined with [`join_type`], so an escaped candidate
+/// (`Self_`) continues as `Self2`, never `Self_2`, which
+/// `non_camel_case_types` rejects.
 pub(crate) fn unique_type_name(used: &mut HashSet<String>, candidate: &str) -> String {
     if used.insert(candidate.to_string()) {
         return candidate.to_string();
     }
     let mut suffix = 2usize;
     loop {
-        let name = format!("{candidate}{suffix}");
+        let name = join_type(candidate, &suffix.to_string());
         if used.insert(name.clone()) {
             return name;
         }
         suffix += 1;
     }
+}
+
+/// Appends `suffix` to the type name `stem`, dropping the trailing
+/// underscores that escape a keyword (`Self_` and `View` give `SelfView`),
+/// so the result never has an underscore next to a letter, which
+/// `non_camel_case_types` rejects. The result ends with `suffix`, so it is
+/// not a keyword. A stem made only of underscores is kept whole.
+#[must_use]
+pub(crate) fn join_type(stem: &str, suffix: &str) -> String {
+    let trimmed = stem.trim_end_matches('_');
+    let stem = if trimmed.is_empty() { stem } else { trimmed };
+    format!("{stem}{suffix}")
 }
 
 /// Returns true if `name` is a Rust keyword.
@@ -718,6 +795,70 @@ mod tests {
     fn test_to_pascal_case() {
         assert_eq!(to_pascal_case("new_order_single"), "NewOrderSingle");
         assert_eq!(to_pascal_case("execution_report"), "ExecutionReport");
+    }
+
+    #[test]
+    fn test_claim_ident_checks_and_reserves_the_escaped_identifier() {
+        // `crate` escapes to `crate_`, the plain snake case of `Crate_`: in
+        // either order, the second claim is qualified, never a duplicate.
+        let mut used = HashSet::new();
+        assert_eq!(
+            claim_ident(&mut used, "crate_", "6001").as_deref(),
+            Some("crate_")
+        );
+        assert_eq!(
+            claim_ident(&mut used, "crate", "6002").as_deref(),
+            Some("crate_6002")
+        );
+        let mut used = HashSet::new();
+        assert_eq!(
+            claim_ident(&mut used, "crate", "6002").as_deref(),
+            Some("crate_")
+        );
+        assert_eq!(
+            claim_ident(&mut used, "crate_", "6001").as_deref(),
+            Some("crate_6001")
+        );
+        // Same for `self` and `Self_`, qualified by a word.
+        let mut used = HashSet::new();
+        assert_eq!(
+            claim_ident(&mut used, "self", "component").as_deref(),
+            Some("self_")
+        );
+        assert_eq!(
+            claim_ident(&mut used, "self_", "component").as_deref(),
+            Some("self_component")
+        );
+        assert_eq!(
+            claim_ident(&mut used, "self", "component").as_deref(),
+            Some("self_component_2")
+        );
+        // A raw identifier is reserved as written.
+        let mut used = HashSet::new();
+        assert_eq!(
+            claim_ident(&mut used, "yield", "236").as_deref(),
+            Some("r#yield")
+        );
+        assert_eq!(
+            claim_ident(&mut used, "yield", "237").as_deref(),
+            Some("yield_237")
+        );
+        assert!(used.contains("r#yield"));
+    }
+
+    #[test]
+    fn test_join_ident_and_join_type_leave_no_lint_breaking_underscore() {
+        assert_eq!(join_ident("cl_ord_id", "12"), "cl_ord_id_12");
+        // No `__`, which `non_snake_case` rejects.
+        assert_eq!(join_ident("self_", "5"), "self_5");
+        // No underscore next to a letter, which `non_camel_case_types` rejects.
+        assert_eq!(join_type("Self_", "View"), "SelfView");
+        assert_eq!(join_type("Self_", "2"), "Self2");
+        assert_eq!(join_type("Parties", "NoPartyIDs"), "PartiesNoPartyIDs");
+        assert_eq!(join_type("_", "X"), "_X");
+        let mut used = HashSet::new();
+        assert_eq!(unique_type_name(&mut used, "Self_"), "Self_");
+        assert_eq!(unique_type_name(&mut used, "Self_"), "Self2");
     }
 
     #[test]

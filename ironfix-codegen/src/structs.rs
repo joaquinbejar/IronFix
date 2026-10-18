@@ -48,8 +48,8 @@
 //! recursion is bounded.
 
 use crate::generator::{
-    DECIMAL_ALIAS, GeneratorError, MAX_NESTING_DEPTH, field_doc, field_type_to_rust,
-    is_valid_ident, line, resolve_field_name, to_field_ident, to_pascal_case, to_snake_case,
+    DECIMAL_ALIAS, GeneratorError, MAX_NESTING_DEPTH, claim_ident, field_doc, field_type_to_rust,
+    is_valid_ident, join_type, line, resolve_field_name, to_pascal_case, to_snake_case,
     to_type_ident, unique_type_name, wrap_optional,
 };
 use ironfix_dictionary::schema::{ComponentDef, Dictionary, GroupDef, MemberRef, MessageDef};
@@ -377,7 +377,7 @@ impl<'d> Builder<'d> {
                         // A group listed twice in one definition is one field.
                         continue;
                     }
-                    let candidate = format!("{}{}", owner.base, to_pascal_case(&group.name));
+                    let candidate = join_type(&owner.base, &to_pascal_case(&group.name));
                     // The owner's base is already an identifier, so a
                     // punctuated group name is what would break it; reject it
                     // rather than emit a struct whose name will not compile.
@@ -510,9 +510,9 @@ fn entry_names(
         let base = if suffix == 1 {
             candidate.to_string()
         } else {
-            format!("{candidate}{suffix}")
+            join_type(candidate, &suffix.to_string())
         };
-        let entry = format!("{base}{ENTRY_SUFFIX}");
+        let entry = join_type(&base, ENTRY_SUFFIX);
         if !used.contains(&base) && !used.contains(&entry) {
             used.insert(base.clone());
             used.insert(entry.clone());
@@ -529,13 +529,14 @@ fn entry_names(
 
 /// Resolves the identifier of a component field, unique within its struct:
 /// the component name in snake case, then with a `_component` suffix, then
-/// with a numeric one.
+/// with a numeric one, each checked and reserved once escaped
+/// ([`claim_ident`]), so `Crate` (`crate_`) and a `Crate_` field, or the
+/// components `Self` (`self_`) and `Self_`, get distinct fields.
 ///
 /// # Errors
 ///
 /// [`GeneratorError::UnnameableItem`] if the name is not an identifier in
-/// snake case, or if the numeric suffix runs out of `usize` values (each
-/// taken name blocks at most one, so the loop ends long before).
+/// snake case, or if no unique identifier is left for it.
 fn resolve_component_name(
     used: &mut HashSet<String>,
     name: &str,
@@ -547,26 +548,10 @@ fn resolve_component_name(
             name: name.to_string(),
         });
     }
-    if used.insert(base.clone()) {
-        return Ok(to_field_ident(&base));
-    }
-    let suffixed = format!("{base}_{COMPONENT_SUFFIX}");
-    if used.insert(suffixed.clone()) {
-        return Ok(suffixed);
-    }
-    let mut suffix = 2usize;
-    loop {
-        let candidate = format!("{suffixed}_{suffix}");
-        if used.insert(candidate.clone()) {
-            return Ok(candidate);
-        }
-        suffix = suffix
-            .checked_add(1)
-            .ok_or_else(|| GeneratorError::UnnameableItem {
-                what: "component",
-                name: name.to_string(),
-            })?;
-    }
+    claim_ident(used, &base, COMPONENT_SUFFIX).ok_or_else(|| GeneratorError::UnnameableItem {
+        what: "component",
+        name: name.to_string(),
+    })
 }
 
 /// Emits the `messages` module and, when a message reaches a component, the
