@@ -17,7 +17,8 @@
 //!   docs for the ceilings that bound it.
 //! - **Runtime validation**: message validation against dictionary rules
 //!   ([`Validator`]): known message type, defined and allowed tags, required
-//!   fields, enum values, repeating-group count and delimiter
+//!   fields, enum values, repeating-group count and delimiter, and the
+//!   required members of every group entry
 //! - **Embedded dictionaries**: four QuickFIX specifications vendored verbatim
 //!   under the QuickFIX Software License, Version 1.0 (see
 //!   `spec/LICENSE-QUICKFIX` and `spec/README.md`):
@@ -86,4 +87,6 @@ pub use schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef,
     MessageCategory, MessageDef, UnknownFieldType, Version,
 };
-pub use validator::{MAX_SCOPE_DEPTH, MAX_SCOPE_NODES, ValidationError, Validator};
+pub use validator::{
+    MAX_SCOPE_DEPTH, MAX_SCOPE_NODES, MAX_VALIDATION_ERRORS, ValidationError, Validator,
+};
