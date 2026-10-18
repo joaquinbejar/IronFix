@@ -59,8 +59,8 @@ pub mod enums {
 
         /// Joins values into a multi-value field, separated by spaces. Allocates the joined value.
         #[must_use]
-        pub fn join(values: &[Self]) -> Vec<u8> {
-            let mut joined = Vec::new();
+        pub fn join(values: &[Self]) -> ::std::vec::Vec<u8> {
+            let mut joined = ::std::vec::Vec::new();
             for (index, value) in values.iter().enumerate() {
                 if index > 0 {
                     joined.push(b' ');
@@ -249,8 +249,8 @@ pub mod enums {
 
         /// Joins values into a multi-value field, separated by spaces. Allocates the joined value.
         #[must_use]
-        pub fn join(values: &[Self]) -> Vec<u8> {
-            let mut joined = Vec::new();
+        pub fn join(values: &[Self]) -> ::std::vec::Vec<u8> {
+            let mut joined = ::std::vec::Vec::new();
             for (index, value) in values.iter().enumerate() {
                 if index > 0 {
                     joined.push(b' ');
@@ -396,13 +396,13 @@ pub mod views {
     pub type Entries<'m, 'a, E> = ::core::iter::Map<GroupEntries<'m, 'a, 'static>, fn(GroupEntry<'m, 'a, 'static>) -> E>;
 
     /// Returns `field`, or the missing-field error of `tag` when it is absent.
-    fn required<'m, 'a>(field: Option<&'m FieldRef<'a>>, tag: u32) -> Result<&'m FieldRef<'a>, DecodeError> {
+    fn required<'m, 'a>(field: ::core::option::Option<&'m FieldRef<'a>>, tag: u32) -> ::core::result::Result<&'m FieldRef<'a>, DecodeError> {
         field.ok_or(DecodeError::MissingRequiredField { tag })
     }
 
     /// Returns the text of `field`, checked against the grammar of `field_type`: the rule the
     /// validator applies.
-    fn text<'a>(field: &FieldRef<'a>, field_type: FieldType) -> Result<&'a str, DecodeError> {
+    fn text<'a>(field: &FieldRef<'a>, field_type: FieldType) -> ::core::result::Result<&'a str, DecodeError> {
         let value = field.as_str()?;
         if field_type.is_valid_value(value) {
             Ok(value)
@@ -415,31 +415,31 @@ pub mod views {
     }
 
     /// Returns the value of `field` as a decimal, exactly: a value with more digits than a `Decimal` holds is an error, never rounded.
-    fn decimal(field: &FieldRef<'_>, field_type: FieldType) -> Result<Decimal, DecodeError> {
+    fn decimal(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<Decimal, DecodeError> {
         let value = text(field, field_type)?;
         Decimal::from_str_exact(value).map_err(|_| DecodeError::InvalidFieldValue { tag: field.tag, reason: format!("'{value}' does not fit a decimal exactly") })
     }
 
     /// Returns the value of `field` as a signed integer.
-    fn int(field: &FieldRef<'_>, field_type: FieldType) -> Result<i64, DecodeError> {
+    fn int(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<i64, DecodeError> {
         text(field, field_type)?;
         field.as_i64()
     }
 
     /// Returns the value of `field` as a non-negative integer.
-    fn uint(field: &FieldRef<'_>, field_type: FieldType) -> Result<u64, DecodeError> {
+    fn uint(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<u64, DecodeError> {
         text(field, field_type)?;
         field.as_u64()
     }
 
     /// Returns the value of `field` as one ASCII character.
-    fn character(field: &FieldRef<'_>, field_type: FieldType) -> Result<char, DecodeError> {
+    fn character(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<char, DecodeError> {
         text(field, field_type)?;
         field.as_char()
     }
 
     /// Returns the value of `field` as a boolean (`Y` or `N`).
-    fn boolean(field: &FieldRef<'_>, field_type: FieldType) -> Result<bool, DecodeError> {
+    fn boolean(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<bool, DecodeError> {
         text(field, field_type)?;
         field.as_bool()
     }
@@ -462,7 +462,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `0` (Heartbeat).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -492,7 +492,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `8` (ExecutionReport).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -506,38 +506,38 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::EXECUTION_REPORT.field(self.msg, tag)
         }
 
         /// ClOrdID (tag 11). Required.
-        pub fn cl_ord_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn cl_ord_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.get(11), 11)?, FieldType::String)
         }
 
         /// Side (tag 54). Required.
-        pub fn side(&self) -> Result<enums::Side<'a>, DecodeError> {
+        pub fn side(&self) -> ::core::result::Result<enums::Side<'a>, DecodeError> {
             required(self.get(54), 54).map(|field| enums::Side::from_bytes(field.value))
         }
 
         /// Text (tag 58).
-        pub fn text(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn text(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(58).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// Symbol (tag 55). Required.
-        pub fn symbol(&self) -> Result<&'a str, DecodeError> {
+        pub fn symbol(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.get(55), 55)?, FieldType::String)
         }
 
         /// SecurityType (tag 167).
         #[must_use]
-        pub fn security_type(&self) -> Option<enums::SecurityType<'a>> {
+        pub fn security_type(&self) -> ::core::option::Option<enums::SecurityType<'a>> {
             self.get(167).map(|field| enums::SecurityType::from_bytes(field.value))
         }
 
         /// NoPartyIDs (tag 453) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_party_ids(&self) -> Result<Option<Entries<'m, 'a, PartiesNoPartyIDsView<'m, 'a>>>, GroupError> {
+        pub fn no_party_ids(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, PartiesNoPartyIDsView<'m, 'a>>>, GroupError> {
             Ok(layouts::EXECUTION_REPORT.read(self.msg, 453)?.map(|entries| entries.map(PartiesNoPartyIDsView::wrap as fn(_) -> _)))
         }
     }
@@ -560,7 +560,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `D` (NewOrderSingle).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -574,109 +574,109 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::NEW_ORDER_SINGLE.field(self.msg, tag)
         }
 
         /// ClOrdID (tag 11). Required.
-        pub fn cl_ord_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn cl_ord_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.get(11), 11)?, FieldType::String)
         }
 
         /// ClOrdId (tag 12).
-        pub fn cl_ord_id_12(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn cl_ord_id_12(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(12).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// Account (tag 1).
-        pub fn account(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn account(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(1).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// Side (tag 54). Required.
-        pub fn side(&self) -> Result<enums::Side<'a>, DecodeError> {
+        pub fn side(&self) -> ::core::result::Result<enums::Side<'a>, DecodeError> {
             required(self.get(54), 54).map(|field| enums::Side::from_bytes(field.value))
         }
 
         /// TransactTime (tag 60). Required.
-        pub fn transact_time(&self) -> Result<&'a str, DecodeError> {
+        pub fn transact_time(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.get(60), 60)?, FieldType::UtcTimestamp)
         }
 
         /// OrderQty (tag 38).
-        pub fn order_qty(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn order_qty(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(38).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
 
         /// Price (tag 44).
-        pub fn price(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn price(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(44).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// ExecInst (tag 18).
-        pub fn exec_inst(&self) -> Result<Option<enums::Tokens<'a, enums::ExecInst<'a>>>, DecodeError> {
+        pub fn exec_inst(&self) -> ::core::result::Result<::core::option::Option<enums::Tokens<'a, enums::ExecInst<'a>>>, DecodeError> {
             self.get(18).map(|field| text(field, FieldType::MultipleStringValue).map(|value| enums::ExecInst::tokens(value.as_bytes()))).transpose()
         }
 
         /// LocateReqd (tag 114).
-        pub fn locate_reqd(&self) -> Result<Option<bool>, DecodeError> {
+        pub fn locate_reqd(&self) -> ::core::result::Result<::core::option::Option<bool>, DecodeError> {
             self.get(114).map(|field| boolean(field, FieldType::Boolean)).transpose()
         }
 
         /// RawDataLength (tag 95).
-        pub fn raw_data_length(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn raw_data_length(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(95).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// RawData (tag 96).
         #[must_use]
-        pub fn raw_data(&self) -> Option<&'a [u8]> {
+        pub fn raw_data(&self) -> ::core::option::Option<&'a [u8]> {
             self.get(96).map(|field| field.value)
         }
 
         /// Yield (tag 236).
-        pub fn r#yield(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn r#yield(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(236).map(|field| decimal(field, FieldType::Percentage)).transpose()
         }
 
         /// Text (tag 58).
-        pub fn text(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn text(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(58).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// ToVenue (tag 5000).
-        pub fn field_to_venue(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn field_to_venue(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(5000).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// Get (tag 5001).
-        pub fn get_5001(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn get_5001(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(5001).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// Flag (tag 5002).
-        pub fn flag(&self) -> Result<Option<char>, DecodeError> {
+        pub fn flag(&self) -> ::core::result::Result<::core::option::Option<char>, DecodeError> {
             self.get(5002).map(|field| character(field, FieldType::Char)).transpose()
         }
 
         /// NoAllocs (tag 78) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_allocs(&self) -> Result<Option<Entries<'m, 'a, NewOrderSingleNoAllocsView<'m, 'a>>>, GroupError> {
+        pub fn no_allocs(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, NewOrderSingleNoAllocsView<'m, 'a>>>, GroupError> {
             Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 78)?.map(|entries| entries.map(NewOrderSingleNoAllocsView::wrap as fn(_) -> _)))
         }
 
         /// Symbol (tag 55). Required.
-        pub fn symbol(&self) -> Result<&'a str, DecodeError> {
+        pub fn symbol(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.get(55), 55)?, FieldType::String)
         }
 
         /// SecurityType (tag 167).
         #[must_use]
-        pub fn security_type(&self) -> Option<enums::SecurityType<'a>> {
+        pub fn security_type(&self) -> ::core::option::Option<enums::SecurityType<'a>> {
             self.get(167).map(|field| enums::SecurityType::from_bytes(field.value))
         }
 
         /// NoPartyIDs (tag 453) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_party_ids(&self) -> Result<Option<Entries<'m, 'a, PartiesNoPartyIDsView<'m, 'a>>>, GroupError> {
+        pub fn no_party_ids(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, PartiesNoPartyIDsView<'m, 'a>>>, GroupError> {
             Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 453)?.map(|entries| entries.map(PartiesNoPartyIDsView::wrap as fn(_) -> _)))
         }
     }
@@ -699,7 +699,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `U1` (TypeSampler).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -713,78 +713,78 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::TYPE_SAMPLER.field(self.msg, tag)
         }
 
         /// TransactTime (tag 60).
-        pub fn transact_time(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn transact_time(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(60).map(|field| text(field, FieldType::UtcTimestamp)).transpose()
         }
 
         /// SampleTime (tag 5010).
-        pub fn sample_time(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn sample_time(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(5010).map(|field| text(field, FieldType::UtcTimeOnly)).transpose()
         }
 
         /// SampleDate (tag 5011).
-        pub fn sample_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn sample_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(5011).map(|field| text(field, FieldType::UtcDateOnly)).transpose()
         }
 
         /// TradeDate (tag 75).
-        pub fn trade_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn trade_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(75).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// MaturityMonthYear (tag 200).
-        pub fn maturity_month_year(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn maturity_month_year(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(200).map(|field| text(field, FieldType::MonthYear)).transpose()
         }
 
         /// MaturityDay (tag 205).
-        pub fn maturity_day(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn maturity_day(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(205).map(|field| uint(field, FieldType::DayOfMonth)).transpose()
         }
 
         /// Country (tag 421).
-        pub fn country(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn country(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(421).map(|field| text(field, FieldType::Country)).transpose()
         }
 
         /// Currency (tag 15).
-        pub fn currency(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn currency(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(15).map(|field| text(field, FieldType::Currency)).transpose()
         }
 
         /// Price (tag 44).
-        pub fn price(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn price(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(44).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// ExpireSeconds (tag 5012).
-        pub fn expire_seconds(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn expire_seconds(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.get(5012).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// Labels (tag 5013).
-        pub fn labels(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn labels(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(5013).map(|field| text(field, FieldType::MultipleStringValue)).transpose()
         }
 
         /// Flags (tag 5014).
-        pub fn flags(&self) -> Result<Option<enums::Tokens<'a, enums::Flags<'a>>>, DecodeError> {
+        pub fn flags(&self) -> ::core::result::Result<::core::option::Option<enums::Tokens<'a, enums::Flags<'a>>>, DecodeError> {
             self.get(5014).map(|field| text(field, FieldType::MultipleCharValue).map(|value| enums::Flags::tokens(value.as_bytes()))).transpose()
         }
 
         /// Mode (tag 5015).
         #[must_use]
-        pub fn mode(&self) -> Option<enums::Mode<'a>> {
+        pub fn mode(&self) -> ::core::option::Option<enums::Mode<'a>> {
             self.get(5015).map(|field| enums::Mode::from_bytes(field.value))
         }
 
         /// NoDocs (tag 5020) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_docs(&self) -> Result<Option<Entries<'m, 'a, TypeSamplerNoDocsView<'m, 'a>>>, GroupError> {
+        pub fn no_docs(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, TypeSamplerNoDocsView<'m, 'a>>>, GroupError> {
             Ok(layouts::TYPE_SAMPLER.read(self.msg, 5020)?.map(|entries| entries.map(TypeSamplerNoDocsView::wrap as fn(_) -> _)))
         }
     }
@@ -815,28 +815,28 @@ pub mod views {
         }
 
         /// PartyID (tag 448). Required.
-        pub fn party_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn party_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(448), 448)?, FieldType::String)
         }
 
         /// PartyIDSource (tag 447).
         #[must_use]
-        pub fn party_idsource(&self) -> Option<enums::PartyIDSource<'a>> {
+        pub fn party_idsource(&self) -> ::core::option::Option<enums::PartyIDSource<'a>> {
             self.entry.get(447).map(|field| enums::PartyIDSource::from_bytes(field.value))
         }
 
         /// PartyRole (tag 452). Required.
-        pub fn party_role(&self) -> Result<i64, DecodeError> {
+        pub fn party_role(&self) -> ::core::result::Result<i64, DecodeError> {
             int(required(self.entry.get(452), 452)?, FieldType::Int)
         }
 
         /// Text (tag 58).
-        pub fn text(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn text(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(58).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// NoPartySubIDs (tag 802) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_party_sub_ids(&self) -> Result<Option<Entries<'m, 'a, PtysSubGrpNoPartySubIDsView<'m, 'a>>>, GroupError> {
+        pub fn no_party_sub_ids(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, PtysSubGrpNoPartySubIDsView<'m, 'a>>>, GroupError> {
             Ok(self.entry.group(802)?.map(|entries| entries.map(PtysSubGrpNoPartySubIDsView::wrap as fn(_) -> _)))
         }
     }
@@ -867,12 +867,12 @@ pub mod views {
         }
 
         /// PartySubID (tag 523). Required.
-        pub fn party_sub_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn party_sub_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(523), 523)?, FieldType::String)
         }
 
         /// PartySubIDType (tag 803).
-        pub fn party_sub_idtype(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn party_sub_idtype(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.entry.get(803).map(|field| int(field, FieldType::Int)).transpose()
         }
     }
@@ -903,12 +903,12 @@ pub mod views {
         }
 
         /// AllocAccount (tag 79). Required.
-        pub fn alloc_account(&self) -> Result<&'a str, DecodeError> {
+        pub fn alloc_account(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(79), 79)?, FieldType::String)
         }
 
         /// AllocQty (tag 80).
-        pub fn alloc_qty(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn alloc_qty(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(80).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
     }
@@ -939,17 +939,17 @@ pub mod views {
         }
 
         /// EncodedTextLen (tag 354). Required.
-        pub fn encoded_text_len(&self) -> Result<u64, DecodeError> {
+        pub fn encoded_text_len(&self) -> ::core::result::Result<u64, DecodeError> {
             uint(required(self.entry.get(354), 354)?, FieldType::Length)
         }
 
         /// EncodedText (tag 355). Required.
-        pub fn encoded_text(&self) -> Result<&'a [u8], DecodeError> {
+        pub fn encoded_text(&self) -> ::core::result::Result<&'a [u8], DecodeError> {
             required(self.entry.get(355), 355).map(|field| field.value)
         }
 
         /// DocName (tag 5023).
-        pub fn doc_name(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn doc_name(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(5023).map(|field| text(field, FieldType::String)).transpose()
         }
     }
@@ -1008,7 +1008,7 @@ pub mod writers {
         fn data(&mut self, length_tag: u32, data_tag: u32, value: &[u8]);
     }
 
-    impl<F: FnMut(u32, &[u8]) + ?Sized> Sink for F {
+    impl<F: ::core::ops::FnMut(u32, &[u8]) + ?::core::marker::Sized> Sink for F {
         fn field(&mut self, tag: u32, value: &[u8]) {
             self(tag, value);
         }
@@ -1038,7 +1038,7 @@ pub mod writers {
     }
 
     /// Returns the missing-field error of `tag` unless the field is present.
-    fn present(present: bool, tag: u32) -> Result<(), EncodeError> {
+    fn present(present: bool, tag: u32) -> ::core::result::Result<(), EncodeError> {
         if present {
             Ok(())
         } else {
@@ -1047,12 +1047,12 @@ pub mod writers {
     }
 
     /// Builds the invalid-value error of `tag`.
-    fn invalid(tag: u32, reason: String) -> EncodeError {
+    fn invalid(tag: u32, reason: ::std::string::String) -> EncodeError {
         EncodeError::InvalidFieldValue { tag, reason }
     }
 
     /// Refuses an empty value, or one carrying SOH, which would end the field early.
-    fn check_text(value: Option<&[u8]>, tag: u32) -> Result<(), EncodeError> {
+    fn check_text(value: ::core::option::Option<&[u8]>, tag: u32) -> ::core::result::Result<(), EncodeError> {
         match value {
             Some([]) => Err(invalid(tag, "the value is empty".to_string())),
             Some(value) if value.contains(&0x01) => Err(invalid(tag, "the value contains SOH".to_string())),
@@ -1061,7 +1061,7 @@ pub mod writers {
     }
 
     /// Refuses an empty data value. It may carry SOH: it is written with its length.
-    fn check_data(value: Option<&[u8]>, tag: u32) -> Result<(), EncodeError> {
+    fn check_data(value: ::core::option::Option<&[u8]>, tag: u32) -> ::core::result::Result<(), EncodeError> {
         match value {
             Some([]) => Err(invalid(tag, "the value is empty".to_string())),
             _ => Ok(()),
@@ -1069,7 +1069,7 @@ pub mod writers {
     }
 
     /// Refuses a character that is not printable ASCII (a control character includes SOH).
-    fn check_char(value: Option<char>, tag: u32) -> Result<(), EncodeError> {
+    fn check_char(value: ::core::option::Option<char>, tag: u32) -> ::core::result::Result<(), EncodeError> {
         match value {
             Some(value) if !value.is_ascii() || value.is_ascii_control() => Err(invalid(tag, format!("{value:?} is not a printable ASCII character"))),
             _ => Ok(()),
@@ -1077,7 +1077,7 @@ pub mod writers {
     }
 
     /// Refuses an empty token, or one carrying a space (the separator) or SOH.
-    fn check_token(value: &[u8], tag: u32) -> Result<(), EncodeError> {
+    fn check_token(value: &[u8], tag: u32) -> ::core::result::Result<(), EncodeError> {
         match value {
             [] => Err(invalid(tag, "a token is empty".to_string())),
             value if value.contains(&b' ') => Err(invalid(tag, "a token contains a space".to_string())),
@@ -1088,7 +1088,7 @@ pub mod writers {
 
     /// Refuses a value that does not match the grammar of `field_type`, the rule the validator
     /// applies.
-    fn check_grammar(value: Option<&[u8]>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {
+    fn check_grammar(value: ::core::option::Option<&[u8]>, field_type: FieldType, tag: u32) -> ::core::result::Result<(), EncodeError> {
         let Some(bytes) = value else {
             return Ok(());
         };
@@ -1115,7 +1115,7 @@ pub mod writers {
     }
 
     /// Formats `value` on the stack and writes it as field `tag`.
-    fn put_display<S: Sink + ?Sized, T: ::core::fmt::Display>(sink: &mut S, tag: u32, value: T) -> Result<(), EncodeError> {
+    fn put_display<S: Sink + ?::core::marker::Sized, T: ::core::fmt::Display>(sink: &mut S, tag: u32, value: T) -> ::core::result::Result<(), EncodeError> {
         let mut buffer = Buffer { bytes: [0; 64], len: 0 };
         let written = ::core::fmt::Write::write_fmt(&mut buffer, format_args!("{value}"));
         match (written, buffer.bytes.get(..buffer.len)) {
@@ -1132,7 +1132,7 @@ pub mod writers {
 
     /// Refuses a number whose decimal form does not match the grammar of `field_type` (a
     /// `DayOfMonth` outside 1 to 31).
-    fn check_number<T: ::core::fmt::Display>(value: Option<T>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {
+    fn check_number<T: ::core::fmt::Display>(value: ::core::option::Option<T>, field_type: FieldType, tag: u32) -> ::core::result::Result<(), EncodeError> {
         let Some(value) = value else {
             return Ok(());
         };
@@ -1165,7 +1165,7 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, _sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, _sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             Ok(())
         }
     }
@@ -1174,15 +1174,15 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct ExecutionReportFields<'v> {
         /// ClOrdID (tag 11). Required.
-        pub cl_ord_id: Option<&'v str>,
+        pub cl_ord_id: ::core::option::Option<&'v str>,
         /// Side (tag 54). Required.
-        pub side: Option<enums::Side<'v>>,
+        pub side: ::core::option::Option<enums::Side<'v>>,
         /// Text (tag 58).
-        pub text: Option<&'v str>,
+        pub text: ::core::option::Option<&'v str>,
         /// Symbol (tag 55). Required.
-        pub symbol: Option<&'v str>,
+        pub symbol: ::core::option::Option<&'v str>,
         /// SecurityType (tag 167).
-        pub security_type: Option<enums::SecurityType<'v>>,
+        pub security_type: ::core::option::Option<enums::SecurityType<'v>>,
         /// NoPartyIDs (tag 453) repeating group: one item per entry, empty when absent.
         pub no_party_ids: &'v [PartiesNoPartyIDsFields<'v>],
     }
@@ -1203,13 +1203,13 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.cl_ord_id.is_some(), 11)?;
             check_text(self.cl_ord_id.map(str::as_bytes), 11)?;
             check_grammar(self.cl_ord_id.map(str::as_bytes), FieldType::String, 11)?;
@@ -1230,7 +1230,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.cl_ord_id { sink.field(11, value.as_bytes()); }
             if let Some(value) = self.side { sink.field(54, value.as_bytes()); }
             if let Some(value) = self.text { sink.field(58, value.as_bytes()); }
@@ -1250,41 +1250,41 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct NewOrderSingleFields<'v> {
         /// ClOrdID (tag 11). Required.
-        pub cl_ord_id: Option<&'v str>,
+        pub cl_ord_id: ::core::option::Option<&'v str>,
         /// ClOrdId (tag 12).
-        pub cl_ord_id_12: Option<&'v str>,
+        pub cl_ord_id_12: ::core::option::Option<&'v str>,
         /// Account (tag 1).
-        pub account: Option<&'v str>,
+        pub account: ::core::option::Option<&'v str>,
         /// Side (tag 54). Required.
-        pub side: Option<enums::Side<'v>>,
+        pub side: ::core::option::Option<enums::Side<'v>>,
         /// TransactTime (tag 60). Required.
-        pub transact_time: Option<&'v str>,
+        pub transact_time: ::core::option::Option<&'v str>,
         /// OrderQty (tag 38).
-        pub order_qty: Option<Decimal>,
+        pub order_qty: ::core::option::Option<Decimal>,
         /// Price (tag 44).
-        pub price: Option<Decimal>,
+        pub price: ::core::option::Option<Decimal>,
         /// ExecInst (tag 18). Empty when absent.
         pub exec_inst: &'v [enums::ExecInst<'v>],
         /// LocateReqd (tag 114).
-        pub locate_reqd: Option<bool>,
+        pub locate_reqd: ::core::option::Option<bool>,
         /// RawData (tag 96). Written with its length (tag 95), which is derived from it.
-        pub raw_data: Option<&'v [u8]>,
+        pub raw_data: ::core::option::Option<&'v [u8]>,
         /// Yield (tag 236).
-        pub r#yield: Option<Decimal>,
+        pub r#yield: ::core::option::Option<Decimal>,
         /// Text (tag 58).
-        pub text: Option<&'v str>,
+        pub text: ::core::option::Option<&'v str>,
         /// ToVenue (tag 5000).
-        pub field_to_venue: Option<&'v str>,
+        pub field_to_venue: ::core::option::Option<&'v str>,
         /// Get (tag 5001).
-        pub get_5001: Option<&'v str>,
+        pub get_5001: ::core::option::Option<&'v str>,
         /// Flag (tag 5002).
-        pub flag: Option<char>,
+        pub flag: ::core::option::Option<char>,
         /// NoAllocs (tag 78) repeating group: one item per entry, empty when absent.
         pub no_allocs: &'v [NewOrderSingleNoAllocsFields<'v>],
         /// Symbol (tag 55). Required.
-        pub symbol: Option<&'v str>,
+        pub symbol: ::core::option::Option<&'v str>,
         /// SecurityType (tag 167).
-        pub security_type: Option<enums::SecurityType<'v>>,
+        pub security_type: ::core::option::Option<enums::SecurityType<'v>>,
         /// NoPartyIDs (tag 453) repeating group: one item per entry, empty when absent.
         pub no_party_ids: &'v [PartiesNoPartyIDsFields<'v>],
     }
@@ -1305,13 +1305,13 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.cl_ord_id.is_some(), 11)?;
             check_text(self.cl_ord_id.map(str::as_bytes), 11)?;
             check_grammar(self.cl_ord_id.map(str::as_bytes), FieldType::String, 11)?;
@@ -1352,7 +1352,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.cl_ord_id { sink.field(11, value.as_bytes()); }
             if let Some(value) = self.cl_ord_id_12 { sink.field(12, value.as_bytes()); }
             if let Some(value) = self.account { sink.field(1, value.as_bytes()); }
@@ -1390,31 +1390,31 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct TypeSamplerFields<'v> {
         /// TransactTime (tag 60).
-        pub transact_time: Option<&'v str>,
+        pub transact_time: ::core::option::Option<&'v str>,
         /// SampleTime (tag 5010).
-        pub sample_time: Option<&'v str>,
+        pub sample_time: ::core::option::Option<&'v str>,
         /// SampleDate (tag 5011).
-        pub sample_date: Option<&'v str>,
+        pub sample_date: ::core::option::Option<&'v str>,
         /// TradeDate (tag 75).
-        pub trade_date: Option<&'v str>,
+        pub trade_date: ::core::option::Option<&'v str>,
         /// MaturityMonthYear (tag 200).
-        pub maturity_month_year: Option<&'v str>,
+        pub maturity_month_year: ::core::option::Option<&'v str>,
         /// MaturityDay (tag 205).
-        pub maturity_day: Option<u64>,
+        pub maturity_day: ::core::option::Option<u64>,
         /// Country (tag 421).
-        pub country: Option<&'v str>,
+        pub country: ::core::option::Option<&'v str>,
         /// Currency (tag 15).
-        pub currency: Option<&'v str>,
+        pub currency: ::core::option::Option<&'v str>,
         /// Price (tag 44).
-        pub price: Option<Decimal>,
+        pub price: ::core::option::Option<Decimal>,
         /// ExpireSeconds (tag 5012).
-        pub expire_seconds: Option<i64>,
+        pub expire_seconds: ::core::option::Option<i64>,
         /// Labels (tag 5013).
-        pub labels: Option<&'v str>,
+        pub labels: ::core::option::Option<&'v str>,
         /// Flags (tag 5014). Empty when absent.
         pub flags: &'v [enums::Flags<'v>],
         /// Mode (tag 5015).
-        pub mode: Option<enums::Mode<'v>>,
+        pub mode: ::core::option::Option<enums::Mode<'v>>,
         /// NoDocs (tag 5020) repeating group: one item per entry, empty when absent. Required.
         pub no_docs: &'v [TypeSamplerNoDocsFields<'v>],
     }
@@ -1435,13 +1435,13 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             check_text(self.transact_time.map(str::as_bytes), 60)?;
             check_grammar(self.transact_time.map(str::as_bytes), FieldType::UtcTimestamp, 60)?;
             check_text(self.sample_time.map(str::as_bytes), 5010)?;
@@ -1473,7 +1473,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.transact_time { sink.field(60, value.as_bytes()); }
             if let Some(value) = self.sample_time { sink.field(5010, value.as_bytes()); }
             if let Some(value) = self.sample_date { sink.field(5011, value.as_bytes()); }
@@ -1501,13 +1501,13 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct PartiesNoPartyIDsFields<'v> {
         /// PartyID (tag 448). Required.
-        pub party_id: Option<&'v str>,
+        pub party_id: ::core::option::Option<&'v str>,
         /// PartyIDSource (tag 447).
-        pub party_idsource: Option<enums::PartyIDSource<'v>>,
+        pub party_idsource: ::core::option::Option<enums::PartyIDSource<'v>>,
         /// PartyRole (tag 452). Required.
-        pub party_role: Option<i64>,
+        pub party_role: ::core::option::Option<i64>,
         /// Text (tag 58).
-        pub text: Option<&'v str>,
+        pub text: ::core::option::Option<&'v str>,
         /// NoPartySubIDs (tag 802) repeating group: one item per entry, empty when absent.
         pub no_party_sub_ids: &'v [PtysSubGrpNoPartySubIDsFields<'v>],
     }
@@ -1520,7 +1520,7 @@ pub mod writers {
 
     impl PartiesNoPartyIDsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.party_id.is_some(), 448)?;
             check_text(self.party_id.map(str::as_bytes), 448)?;
             check_grammar(self.party_id.map(str::as_bytes), FieldType::String, 448)?;
@@ -1536,7 +1536,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.party_id { sink.field(448, value.as_bytes()); }
             if let Some(value) = self.party_idsource { sink.field(447, value.as_bytes()); }
             if let Some(value) = self.party_role { put_display(sink, 452, value)?; }
@@ -1555,9 +1555,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct PtysSubGrpNoPartySubIDsFields<'v> {
         /// PartySubID (tag 523). Required.
-        pub party_sub_id: Option<&'v str>,
+        pub party_sub_id: ::core::option::Option<&'v str>,
         /// PartySubIDType (tag 803).
-        pub party_sub_idtype: Option<i64>,
+        pub party_sub_idtype: ::core::option::Option<i64>,
     }
 
     impl ::core::fmt::Debug for PtysSubGrpNoPartySubIDsFields<'_> {
@@ -1568,7 +1568,7 @@ pub mod writers {
 
     impl PtysSubGrpNoPartySubIDsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.party_sub_id.is_some(), 523)?;
             check_text(self.party_sub_id.map(str::as_bytes), 523)?;
             check_grammar(self.party_sub_id.map(str::as_bytes), FieldType::String, 523)?;
@@ -1576,7 +1576,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.party_sub_id { sink.field(523, value.as_bytes()); }
             if let Some(value) = self.party_sub_idtype { put_display(sink, 803, value)?; }
             Ok(())
@@ -1587,9 +1587,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct NewOrderSingleNoAllocsFields<'v> {
         /// AllocAccount (tag 79). Required.
-        pub alloc_account: Option<&'v str>,
+        pub alloc_account: ::core::option::Option<&'v str>,
         /// AllocQty (tag 80).
-        pub alloc_qty: Option<Decimal>,
+        pub alloc_qty: ::core::option::Option<Decimal>,
     }
 
     impl ::core::fmt::Debug for NewOrderSingleNoAllocsFields<'_> {
@@ -1600,7 +1600,7 @@ pub mod writers {
 
     impl NewOrderSingleNoAllocsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.alloc_account.is_some(), 79)?;
             check_text(self.alloc_account.map(str::as_bytes), 79)?;
             check_grammar(self.alloc_account.map(str::as_bytes), FieldType::String, 79)?;
@@ -1608,7 +1608,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.alloc_account { sink.field(79, value.as_bytes()); }
             if let Some(value) = self.alloc_qty { put_display(sink, 80, value)?; }
             Ok(())
@@ -1619,9 +1619,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct TypeSamplerNoDocsFields<'v> {
         /// EncodedText (tag 355). Required. Written with its length (tag 354), which is derived from it.
-        pub encoded_text: Option<&'v [u8]>,
+        pub encoded_text: ::core::option::Option<&'v [u8]>,
         /// DocName (tag 5023).
-        pub doc_name: Option<&'v str>,
+        pub doc_name: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for TypeSamplerNoDocsFields<'_> {
@@ -1632,7 +1632,7 @@ pub mod writers {
 
     impl TypeSamplerNoDocsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.encoded_text.is_some(), 355)?;
             check_data(self.encoded_text, 355)?;
             check_text(self.doc_name.map(str::as_bytes), 5023)?;
@@ -1641,7 +1641,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.encoded_text { sink.data(354, 355, value); }
             if let Some(value) = self.doc_name { sink.field(5023, value.as_bytes()); }
             Ok(())

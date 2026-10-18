@@ -321,13 +321,13 @@ pub mod views {
     use super::layouts;
 
     /// Returns `field`, or the missing-field error of `tag` when it is absent.
-    fn required<'m, 'a>(field: Option<&'m FieldRef<'a>>, tag: u32) -> Result<&'m FieldRef<'a>, DecodeError> {
+    fn required<'m, 'a>(field: ::core::option::Option<&'m FieldRef<'a>>, tag: u32) -> ::core::result::Result<&'m FieldRef<'a>, DecodeError> {
         field.ok_or(DecodeError::MissingRequiredField { tag })
     }
 
     /// Returns the text of `field`, checked against the grammar of `field_type`: the rule the
     /// validator applies.
-    fn text<'a>(field: &FieldRef<'a>, field_type: FieldType) -> Result<&'a str, DecodeError> {
+    fn text<'a>(field: &FieldRef<'a>, field_type: FieldType) -> ::core::result::Result<&'a str, DecodeError> {
         let value = field.as_str()?;
         if field_type.is_valid_value(value) {
             Ok(value)
@@ -340,19 +340,19 @@ pub mod views {
     }
 
     /// Returns the value of `field` as a signed integer.
-    fn int(field: &FieldRef<'_>, field_type: FieldType) -> Result<i64, DecodeError> {
+    fn int(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<i64, DecodeError> {
         text(field, field_type)?;
         field.as_i64()
     }
 
     /// Returns the value of `field` as a non-negative integer.
-    fn uint(field: &FieldRef<'_>, field_type: FieldType) -> Result<u64, DecodeError> {
+    fn uint(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<u64, DecodeError> {
         text(field, field_type)?;
         field.as_u64()
     }
 
     /// Returns the value of `field` as a boolean (`Y` or `N`).
-    fn boolean(field: &FieldRef<'_>, field_type: FieldType) -> Result<bool, DecodeError> {
+    fn boolean(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<bool, DecodeError> {
         text(field, field_type)?;
         field.as_bool()
     }
@@ -375,7 +375,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `0` (Heartbeat).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -389,12 +389,12 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::HEARTBEAT.field(self.msg, tag)
         }
 
         /// TestReqID (tag 112).
-        pub fn test_req_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn test_req_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(112).map(|field| text(field, FieldType::String)).transpose()
         }
     }
@@ -417,7 +417,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `1` (TestRequest).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -431,12 +431,12 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::TEST_REQUEST.field(self.msg, tag)
         }
 
         /// TestReqID (tag 112). Required.
-        pub fn test_req_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn test_req_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.get(112), 112)?, FieldType::String)
         }
     }
@@ -459,7 +459,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `2` (ResendRequest).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -473,17 +473,17 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::RESEND_REQUEST.field(self.msg, tag)
         }
 
         /// BeginSeqNo (tag 7). Required.
-        pub fn begin_seq_no(&self) -> Result<u64, DecodeError> {
+        pub fn begin_seq_no(&self) -> ::core::result::Result<u64, DecodeError> {
             uint(required(self.get(7), 7)?, FieldType::SeqNum)
         }
 
         /// EndSeqNo (tag 16). Required.
-        pub fn end_seq_no(&self) -> Result<u64, DecodeError> {
+        pub fn end_seq_no(&self) -> ::core::result::Result<u64, DecodeError> {
             uint(required(self.get(16), 16)?, FieldType::SeqNum)
         }
     }
@@ -506,7 +506,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `3` (Reject).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -520,59 +520,59 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::REJECT.field(self.msg, tag)
         }
 
         /// RefSeqNum (tag 45). Required.
-        pub fn ref_seq_num(&self) -> Result<u64, DecodeError> {
+        pub fn ref_seq_num(&self) -> ::core::result::Result<u64, DecodeError> {
             uint(required(self.get(45), 45)?, FieldType::SeqNum)
         }
 
         /// RefTagID (tag 371).
-        pub fn ref_tag_id(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn ref_tag_id(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.get(371).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// RefMsgType (tag 372).
-        pub fn ref_msg_type(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn ref_msg_type(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(372).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// RefApplVerID (tag 1130).
-        pub fn ref_appl_ver_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn ref_appl_ver_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(1130).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// RefApplExtID (tag 1406).
-        pub fn ref_appl_ext_id(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn ref_appl_ext_id(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.get(1406).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// RefCstmApplVerID (tag 1131).
-        pub fn ref_cstm_appl_ver_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn ref_cstm_appl_ver_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(1131).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// SessionRejectReason (tag 373).
         #[must_use]
-        pub fn session_reject_reason(&self) -> Option<enums::SessionRejectReason<'a>> {
+        pub fn session_reject_reason(&self) -> ::core::option::Option<enums::SessionRejectReason<'a>> {
             self.get(373).map(|field| enums::SessionRejectReason::from_bytes(field.value))
         }
 
         /// Text (tag 58).
-        pub fn text(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn text(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(58).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// EncodedTextLen (tag 354).
-        pub fn encoded_text_len(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn encoded_text_len(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(354).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// EncodedText (tag 355).
         #[must_use]
-        pub fn encoded_text(&self) -> Option<&'a [u8]> {
+        pub fn encoded_text(&self) -> ::core::option::Option<&'a [u8]> {
             self.get(355).map(|field| field.value)
         }
     }
@@ -595,7 +595,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `4` (SequenceReset).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -609,17 +609,17 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::SEQUENCE_RESET.field(self.msg, tag)
         }
 
         /// GapFillFlag (tag 123).
-        pub fn gap_fill_flag(&self) -> Result<Option<bool>, DecodeError> {
+        pub fn gap_fill_flag(&self) -> ::core::result::Result<::core::option::Option<bool>, DecodeError> {
             self.get(123).map(|field| boolean(field, FieldType::Boolean)).transpose()
         }
 
         /// NewSeqNo (tag 36). Required.
-        pub fn new_seq_no(&self) -> Result<u64, DecodeError> {
+        pub fn new_seq_no(&self) -> ::core::result::Result<u64, DecodeError> {
             uint(required(self.get(36), 36)?, FieldType::SeqNum)
         }
     }
@@ -642,7 +642,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `5` (Logout).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -656,29 +656,29 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::LOGOUT.field(self.msg, tag)
         }
 
         /// SessionStatus (tag 1409).
         #[must_use]
-        pub fn session_status(&self) -> Option<enums::SessionStatus<'a>> {
+        pub fn session_status(&self) -> ::core::option::Option<enums::SessionStatus<'a>> {
             self.get(1409).map(|field| enums::SessionStatus::from_bytes(field.value))
         }
 
         /// Text (tag 58).
-        pub fn text(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn text(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(58).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// EncodedTextLen (tag 354).
-        pub fn encoded_text_len(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn encoded_text_len(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(354).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// EncodedText (tag 355).
         #[must_use]
-        pub fn encoded_text(&self) -> Option<&'a [u8]> {
+        pub fn encoded_text(&self) -> ::core::option::Option<&'a [u8]> {
             self.get(355).map(|field| field.value)
         }
     }
@@ -701,7 +701,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `A` (Logon).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -715,127 +715,127 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::LOGON.field(self.msg, tag)
         }
 
         /// EncryptMethod (tag 98). Required.
-        pub fn encrypt_method(&self) -> Result<enums::EncryptMethod<'a>, DecodeError> {
+        pub fn encrypt_method(&self) -> ::core::result::Result<enums::EncryptMethod<'a>, DecodeError> {
             required(self.get(98), 98).map(|field| enums::EncryptMethod::from_bytes(field.value))
         }
 
         /// HeartBtInt (tag 108). Required.
-        pub fn heart_bt_int(&self) -> Result<i64, DecodeError> {
+        pub fn heart_bt_int(&self) -> ::core::result::Result<i64, DecodeError> {
             int(required(self.get(108), 108)?, FieldType::Int)
         }
 
         /// RawDataLength (tag 95).
-        pub fn raw_data_length(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn raw_data_length(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(95).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// RawData (tag 96).
         #[must_use]
-        pub fn raw_data(&self) -> Option<&'a [u8]> {
+        pub fn raw_data(&self) -> ::core::option::Option<&'a [u8]> {
             self.get(96).map(|field| field.value)
         }
 
         /// ResetSeqNumFlag (tag 141).
-        pub fn reset_seq_num_flag(&self) -> Result<Option<bool>, DecodeError> {
+        pub fn reset_seq_num_flag(&self) -> ::core::result::Result<::core::option::Option<bool>, DecodeError> {
             self.get(141).map(|field| boolean(field, FieldType::Boolean)).transpose()
         }
 
         /// NextExpectedMsgSeqNum (tag 789).
-        pub fn next_expected_msg_seq_num(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn next_expected_msg_seq_num(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(789).map(|field| uint(field, FieldType::SeqNum)).transpose()
         }
 
         /// MaxMessageSize (tag 383).
-        pub fn max_message_size(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn max_message_size(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(383).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// TestMessageIndicator (tag 464).
-        pub fn test_message_indicator(&self) -> Result<Option<bool>, DecodeError> {
+        pub fn test_message_indicator(&self) -> ::core::result::Result<::core::option::Option<bool>, DecodeError> {
             self.get(464).map(|field| boolean(field, FieldType::Boolean)).transpose()
         }
 
         /// Username (tag 553).
-        pub fn username(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn username(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(553).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// Password (tag 554).
-        pub fn password(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn password(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(554).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// NewPassword (tag 925).
-        pub fn new_password(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn new_password(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(925).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// EncryptedPasswordMethod (tag 1400).
-        pub fn encrypted_password_method(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn encrypted_password_method(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.get(1400).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// EncryptedPasswordLen (tag 1401).
-        pub fn encrypted_password_len(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn encrypted_password_len(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(1401).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// EncryptedPassword (tag 1402).
         #[must_use]
-        pub fn encrypted_password(&self) -> Option<&'a [u8]> {
+        pub fn encrypted_password(&self) -> ::core::option::Option<&'a [u8]> {
             self.get(1402).map(|field| field.value)
         }
 
         /// EncryptedNewPasswordLen (tag 1403).
-        pub fn encrypted_new_password_len(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn encrypted_new_password_len(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(1403).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// EncryptedNewPassword (tag 1404).
         #[must_use]
-        pub fn encrypted_new_password(&self) -> Option<&'a [u8]> {
+        pub fn encrypted_new_password(&self) -> ::core::option::Option<&'a [u8]> {
             self.get(1404).map(|field| field.value)
         }
 
         /// SessionStatus (tag 1409).
         #[must_use]
-        pub fn session_status(&self) -> Option<enums::SessionStatus<'a>> {
+        pub fn session_status(&self) -> ::core::option::Option<enums::SessionStatus<'a>> {
             self.get(1409).map(|field| enums::SessionStatus::from_bytes(field.value))
         }
 
         /// DefaultApplVerID (tag 1137). Required.
-        pub fn default_appl_ver_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn default_appl_ver_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.get(1137), 1137)?, FieldType::String)
         }
 
         /// DefaultApplExtID (tag 1407).
-        pub fn default_appl_ext_id(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn default_appl_ext_id(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.get(1407).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// DefaultCstmApplVerID (tag 1408).
-        pub fn default_cstm_appl_ver_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn default_cstm_appl_ver_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(1408).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// Text (tag 58).
-        pub fn text(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn text(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(58).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// EncodedTextLen (tag 354).
-        pub fn encoded_text_len(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn encoded_text_len(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(354).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// EncodedText (tag 355).
         #[must_use]
-        pub fn encoded_text(&self) -> Option<&'a [u8]> {
+        pub fn encoded_text(&self) -> ::core::option::Option<&'a [u8]> {
             self.get(355).map(|field| field.value)
         }
     }
@@ -858,7 +858,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `n` (XMLnonFIX).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -923,7 +923,7 @@ pub mod writers {
         fn data(&mut self, length_tag: u32, data_tag: u32, value: &[u8]);
     }
 
-    impl<F: FnMut(u32, &[u8]) + ?Sized> Sink for F {
+    impl<F: ::core::ops::FnMut(u32, &[u8]) + ?::core::marker::Sized> Sink for F {
         fn field(&mut self, tag: u32, value: &[u8]) {
             self(tag, value);
         }
@@ -953,7 +953,7 @@ pub mod writers {
     }
 
     /// Returns the missing-field error of `tag` unless the field is present.
-    fn present(present: bool, tag: u32) -> Result<(), EncodeError> {
+    fn present(present: bool, tag: u32) -> ::core::result::Result<(), EncodeError> {
         if present {
             Ok(())
         } else {
@@ -962,12 +962,12 @@ pub mod writers {
     }
 
     /// Builds the invalid-value error of `tag`.
-    fn invalid(tag: u32, reason: String) -> EncodeError {
+    fn invalid(tag: u32, reason: ::std::string::String) -> EncodeError {
         EncodeError::InvalidFieldValue { tag, reason }
     }
 
     /// Refuses an empty value, or one carrying SOH, which would end the field early.
-    fn check_text(value: Option<&[u8]>, tag: u32) -> Result<(), EncodeError> {
+    fn check_text(value: ::core::option::Option<&[u8]>, tag: u32) -> ::core::result::Result<(), EncodeError> {
         match value {
             Some([]) => Err(invalid(tag, "the value is empty".to_string())),
             Some(value) if value.contains(&0x01) => Err(invalid(tag, "the value contains SOH".to_string())),
@@ -976,7 +976,7 @@ pub mod writers {
     }
 
     /// Refuses an empty data value. It may carry SOH: it is written with its length.
-    fn check_data(value: Option<&[u8]>, tag: u32) -> Result<(), EncodeError> {
+    fn check_data(value: ::core::option::Option<&[u8]>, tag: u32) -> ::core::result::Result<(), EncodeError> {
         match value {
             Some([]) => Err(invalid(tag, "the value is empty".to_string())),
             _ => Ok(()),
@@ -985,7 +985,7 @@ pub mod writers {
 
     /// Refuses a value that does not match the grammar of `field_type`, the rule the validator
     /// applies.
-    fn check_grammar(value: Option<&[u8]>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {
+    fn check_grammar(value: ::core::option::Option<&[u8]>, field_type: FieldType, tag: u32) -> ::core::result::Result<(), EncodeError> {
         let Some(bytes) = value else {
             return Ok(());
         };
@@ -1012,7 +1012,7 @@ pub mod writers {
     }
 
     /// Formats `value` on the stack and writes it as field `tag`.
-    fn put_display<S: Sink + ?Sized, T: ::core::fmt::Display>(sink: &mut S, tag: u32, value: T) -> Result<(), EncodeError> {
+    fn put_display<S: Sink + ?::core::marker::Sized, T: ::core::fmt::Display>(sink: &mut S, tag: u32, value: T) -> ::core::result::Result<(), EncodeError> {
         let mut buffer = Buffer { bytes: [0; 64], len: 0 };
         let written = ::core::fmt::Write::write_fmt(&mut buffer, format_args!("{value}"));
         match (written, buffer.bytes.get(..buffer.len)) {
@@ -1029,7 +1029,7 @@ pub mod writers {
 
     /// Refuses a number whose decimal form does not match the grammar of `field_type` (a
     /// `DayOfMonth` outside 1 to 31).
-    fn check_number<T: ::core::fmt::Display>(value: Option<T>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {
+    fn check_number<T: ::core::fmt::Display>(value: ::core::option::Option<T>, field_type: FieldType, tag: u32) -> ::core::result::Result<(), EncodeError> {
         let Some(value) = value else {
             return Ok(());
         };
@@ -1046,7 +1046,7 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct HeartbeatFields<'v> {
         /// TestReqID (tag 112).
-        pub test_req_id: Option<&'v str>,
+        pub test_req_id: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for HeartbeatFields<'_> {
@@ -1065,20 +1065,20 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             check_text(self.test_req_id.map(str::as_bytes), 112)?;
             check_grammar(self.test_req_id.map(str::as_bytes), FieldType::String, 112)?;
             Ok(())
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.test_req_id { sink.field(112, value.as_bytes()); }
             Ok(())
         }
@@ -1088,7 +1088,7 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct TestRequestFields<'v> {
         /// TestReqID (tag 112). Required.
-        pub test_req_id: Option<&'v str>,
+        pub test_req_id: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for TestRequestFields<'_> {
@@ -1107,13 +1107,13 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.test_req_id.is_some(), 112)?;
             check_text(self.test_req_id.map(str::as_bytes), 112)?;
             check_grammar(self.test_req_id.map(str::as_bytes), FieldType::String, 112)?;
@@ -1121,7 +1121,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.test_req_id { sink.field(112, value.as_bytes()); }
             Ok(())
         }
@@ -1131,9 +1131,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct ResendRequestFields {
         /// BeginSeqNo (tag 7). Required.
-        pub begin_seq_no: Option<u64>,
+        pub begin_seq_no: ::core::option::Option<u64>,
         /// EndSeqNo (tag 16). Required.
-        pub end_seq_no: Option<u64>,
+        pub end_seq_no: ::core::option::Option<u64>,
     }
 
     impl ::core::fmt::Debug for ResendRequestFields {
@@ -1152,13 +1152,13 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.begin_seq_no.is_some(), 7)?;
             check_number(self.begin_seq_no, FieldType::SeqNum, 7)?;
             present(self.end_seq_no.is_some(), 16)?;
@@ -1167,7 +1167,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.begin_seq_no { put_display(sink, 7, value)?; }
             if let Some(value) = self.end_seq_no { put_display(sink, 16, value)?; }
             Ok(())
@@ -1178,23 +1178,23 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct RejectFields<'v> {
         /// RefSeqNum (tag 45). Required.
-        pub ref_seq_num: Option<u64>,
+        pub ref_seq_num: ::core::option::Option<u64>,
         /// RefTagID (tag 371).
-        pub ref_tag_id: Option<i64>,
+        pub ref_tag_id: ::core::option::Option<i64>,
         /// RefMsgType (tag 372).
-        pub ref_msg_type: Option<&'v str>,
+        pub ref_msg_type: ::core::option::Option<&'v str>,
         /// RefApplVerID (tag 1130).
-        pub ref_appl_ver_id: Option<&'v str>,
+        pub ref_appl_ver_id: ::core::option::Option<&'v str>,
         /// RefApplExtID (tag 1406).
-        pub ref_appl_ext_id: Option<i64>,
+        pub ref_appl_ext_id: ::core::option::Option<i64>,
         /// RefCstmApplVerID (tag 1131).
-        pub ref_cstm_appl_ver_id: Option<&'v str>,
+        pub ref_cstm_appl_ver_id: ::core::option::Option<&'v str>,
         /// SessionRejectReason (tag 373).
-        pub session_reject_reason: Option<enums::SessionRejectReason<'v>>,
+        pub session_reject_reason: ::core::option::Option<enums::SessionRejectReason<'v>>,
         /// Text (tag 58).
-        pub text: Option<&'v str>,
+        pub text: ::core::option::Option<&'v str>,
         /// EncodedText (tag 355). Written with its length (tag 354), which is derived from it.
-        pub encoded_text: Option<&'v [u8]>,
+        pub encoded_text: ::core::option::Option<&'v [u8]>,
     }
 
     impl ::core::fmt::Debug for RejectFields<'_> {
@@ -1213,13 +1213,13 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.ref_seq_num.is_some(), 45)?;
             check_number(self.ref_seq_num, FieldType::SeqNum, 45)?;
             check_text(self.ref_msg_type.map(str::as_bytes), 372)?;
@@ -1237,7 +1237,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.ref_seq_num { put_display(sink, 45, value)?; }
             if let Some(value) = self.ref_tag_id { put_display(sink, 371, value)?; }
             if let Some(value) = self.ref_msg_type { sink.field(372, value.as_bytes()); }
@@ -1255,9 +1255,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct SequenceResetFields {
         /// GapFillFlag (tag 123).
-        pub gap_fill_flag: Option<bool>,
+        pub gap_fill_flag: ::core::option::Option<bool>,
         /// NewSeqNo (tag 36). Required.
-        pub new_seq_no: Option<u64>,
+        pub new_seq_no: ::core::option::Option<u64>,
     }
 
     impl ::core::fmt::Debug for SequenceResetFields {
@@ -1276,20 +1276,20 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.new_seq_no.is_some(), 36)?;
             check_number(self.new_seq_no, FieldType::SeqNum, 36)?;
             Ok(())
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.gap_fill_flag { sink.field(123, if value { b"Y" } else { b"N" }); }
             if let Some(value) = self.new_seq_no { put_display(sink, 36, value)?; }
             Ok(())
@@ -1300,11 +1300,11 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct LogoutFields<'v> {
         /// SessionStatus (tag 1409).
-        pub session_status: Option<enums::SessionStatus<'v>>,
+        pub session_status: ::core::option::Option<enums::SessionStatus<'v>>,
         /// Text (tag 58).
-        pub text: Option<&'v str>,
+        pub text: ::core::option::Option<&'v str>,
         /// EncodedText (tag 355). Written with its length (tag 354), which is derived from it.
-        pub encoded_text: Option<&'v [u8]>,
+        pub encoded_text: ::core::option::Option<&'v [u8]>,
     }
 
     impl ::core::fmt::Debug for LogoutFields<'_> {
@@ -1323,13 +1323,13 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             check_text(self.session_status.map(|value| value.as_bytes()), 1409)?;
             check_grammar(self.session_status.map(|value| value.as_bytes()), FieldType::Int, 1409)?;
             check_text(self.text.map(str::as_bytes), 58)?;
@@ -1339,7 +1339,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.session_status { sink.field(1409, value.as_bytes()); }
             if let Some(value) = self.text { sink.field(58, value.as_bytes()); }
             if let Some(value) = self.encoded_text { sink.data(354, 355, value); }
@@ -1351,43 +1351,43 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct LogonFields<'v> {
         /// EncryptMethod (tag 98). Required.
-        pub encrypt_method: Option<enums::EncryptMethod<'v>>,
+        pub encrypt_method: ::core::option::Option<enums::EncryptMethod<'v>>,
         /// HeartBtInt (tag 108). Required.
-        pub heart_bt_int: Option<i64>,
+        pub heart_bt_int: ::core::option::Option<i64>,
         /// RawData (tag 96). Written with its length (tag 95), which is derived from it.
-        pub raw_data: Option<&'v [u8]>,
+        pub raw_data: ::core::option::Option<&'v [u8]>,
         /// ResetSeqNumFlag (tag 141).
-        pub reset_seq_num_flag: Option<bool>,
+        pub reset_seq_num_flag: ::core::option::Option<bool>,
         /// NextExpectedMsgSeqNum (tag 789).
-        pub next_expected_msg_seq_num: Option<u64>,
+        pub next_expected_msg_seq_num: ::core::option::Option<u64>,
         /// MaxMessageSize (tag 383).
-        pub max_message_size: Option<u64>,
+        pub max_message_size: ::core::option::Option<u64>,
         /// TestMessageIndicator (tag 464).
-        pub test_message_indicator: Option<bool>,
+        pub test_message_indicator: ::core::option::Option<bool>,
         /// Username (tag 553).
-        pub username: Option<&'v str>,
+        pub username: ::core::option::Option<&'v str>,
         /// Password (tag 554).
-        pub password: Option<&'v str>,
+        pub password: ::core::option::Option<&'v str>,
         /// NewPassword (tag 925).
-        pub new_password: Option<&'v str>,
+        pub new_password: ::core::option::Option<&'v str>,
         /// EncryptedPasswordMethod (tag 1400).
-        pub encrypted_password_method: Option<i64>,
+        pub encrypted_password_method: ::core::option::Option<i64>,
         /// EncryptedPassword (tag 1402). Written with its length (tag 1401), which is derived from it.
-        pub encrypted_password: Option<&'v [u8]>,
+        pub encrypted_password: ::core::option::Option<&'v [u8]>,
         /// EncryptedNewPassword (tag 1404). Written with its length (tag 1403), which is derived from it.
-        pub encrypted_new_password: Option<&'v [u8]>,
+        pub encrypted_new_password: ::core::option::Option<&'v [u8]>,
         /// SessionStatus (tag 1409).
-        pub session_status: Option<enums::SessionStatus<'v>>,
+        pub session_status: ::core::option::Option<enums::SessionStatus<'v>>,
         /// DefaultApplVerID (tag 1137). Required.
-        pub default_appl_ver_id: Option<&'v str>,
+        pub default_appl_ver_id: ::core::option::Option<&'v str>,
         /// DefaultApplExtID (tag 1407).
-        pub default_appl_ext_id: Option<i64>,
+        pub default_appl_ext_id: ::core::option::Option<i64>,
         /// DefaultCstmApplVerID (tag 1408).
-        pub default_cstm_appl_ver_id: Option<&'v str>,
+        pub default_cstm_appl_ver_id: ::core::option::Option<&'v str>,
         /// Text (tag 58).
-        pub text: Option<&'v str>,
+        pub text: ::core::option::Option<&'v str>,
         /// EncodedText (tag 355). Written with its length (tag 354), which is derived from it.
-        pub encoded_text: Option<&'v [u8]>,
+        pub encoded_text: ::core::option::Option<&'v [u8]>,
     }
 
     impl ::core::fmt::Debug for LogonFields<'_> {
@@ -1406,13 +1406,13 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.encrypt_method.is_some(), 98)?;
             check_text(self.encrypt_method.map(|value| value.as_bytes()), 98)?;
             check_grammar(self.encrypt_method.map(|value| value.as_bytes()), FieldType::Int, 98)?;
@@ -1442,7 +1442,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.encrypt_method { sink.field(98, value.as_bytes()); }
             if let Some(value) = self.heart_bt_int { put_display(sink, 108, value)?; }
             if let Some(value) = self.raw_data { sink.data(95, 96, value); }
@@ -1486,7 +1486,7 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, _sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, _sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             Ok(())
         }
     }

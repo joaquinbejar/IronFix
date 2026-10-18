@@ -118,16 +118,18 @@ fn test_generate_sample_dictionary_matches_the_compiled_golden_file() {
 fn test_golden_file_declares_the_shapes_it_is_meant_to_cover() {
     let golden = include_str!("golden/sample.rs");
     // A Rust keyword survives as a raw identifier.
-    assert!(golden.contains("pub r#yield: Option<FixDecimal>,"));
+    assert!(golden.contains("pub r#yield: ::core::option::Option<FixDecimal>,"));
     // A required field is bare, an optional one is wrapped.
-    assert!(golden.contains("pub cl_ord_id: String,"));
-    assert!(golden.contains("pub price: Option<FixDecimal>,"));
+    assert!(golden.contains("pub cl_ord_id: ::std::string::String,"));
+    assert!(golden.contains("pub price: ::core::option::Option<FixDecimal>,"));
     // Two field names collapsing onto one identifier are disambiguated by tag.
-    assert!(golden.contains("pub cl_ord_id_12: Option<String>,"));
+    assert!(golden.contains("pub cl_ord_id_12: ::core::option::Option<::std::string::String>,"));
     // The component contributes Symbol, as an optional field.
-    assert!(golden.contains("pub symbol: Option<String>,"));
+    assert!(golden.contains("pub symbol: ::core::option::Option<::std::string::String>,"));
     // A repeating group becomes a Vec of a generated entry struct.
-    assert!(golden.contains("pub no_party_ids: Option<Vec<NewOrderSingleNoPartyIDsEntry>>,"));
+    assert!(golden.contains(
+        "pub no_party_ids: ::core::option::Option<::std::vec::Vec<NewOrderSingleNoPartyIDsEntry>>,"
+    ));
     assert!(golden.contains("pub struct NewOrderSingleNoPartyIDsEntry {"));
     // And a group nested inside that group gets its own entry struct.
     assert!(golden.contains("pub struct NewOrderSingleNoPartyIDsEntryNoPartySubIDsEntry {"));

@@ -256,8 +256,8 @@ pub mod enums {
 
         /// Joins values into a multi-value field, separated by spaces. Allocates the joined value.
         #[must_use]
-        pub fn join(values: &[Self]) -> Vec<u8> {
-            let mut joined = Vec::new();
+        pub fn join(values: &[Self]) -> ::std::vec::Vec<u8> {
+            let mut joined = ::std::vec::Vec::new();
             for (index, value) in values.iter().enumerate() {
                 if index > 0 {
                     joined.push(b' ');
@@ -2529,8 +2529,8 @@ pub mod enums {
 
         /// Joins values into a multi-value field, separated by spaces. Allocates the joined value.
         #[must_use]
-        pub fn join(values: &[Self]) -> Vec<u8> {
-            let mut joined = Vec::new();
+        pub fn join(values: &[Self]) -> ::std::vec::Vec<u8> {
+            let mut joined = ::std::vec::Vec::new();
             for (index, value) in values.iter().enumerate() {
                 if index > 0 {
                     joined.push(b' ');
@@ -3820,13 +3820,13 @@ pub mod views {
     pub type Entries<'m, 'a, E> = ::core::iter::Map<GroupEntries<'m, 'a, 'static>, fn(GroupEntry<'m, 'a, 'static>) -> E>;
 
     /// Returns `field`, or the missing-field error of `tag` when it is absent.
-    fn required<'m, 'a>(field: Option<&'m FieldRef<'a>>, tag: u32) -> Result<&'m FieldRef<'a>, DecodeError> {
+    fn required<'m, 'a>(field: ::core::option::Option<&'m FieldRef<'a>>, tag: u32) -> ::core::result::Result<&'m FieldRef<'a>, DecodeError> {
         field.ok_or(DecodeError::MissingRequiredField { tag })
     }
 
     /// Returns the text of `field`, checked against the grammar of `field_type`: the rule the
     /// validator applies.
-    fn text<'a>(field: &FieldRef<'a>, field_type: FieldType) -> Result<&'a str, DecodeError> {
+    fn text<'a>(field: &FieldRef<'a>, field_type: FieldType) -> ::core::result::Result<&'a str, DecodeError> {
         let value = field.as_str()?;
         if field_type.is_valid_value(value) {
             Ok(value)
@@ -3839,31 +3839,31 @@ pub mod views {
     }
 
     /// Returns the value of `field` as a decimal, exactly: a value with more digits than a `Decimal` holds is an error, never rounded.
-    fn decimal(field: &FieldRef<'_>, field_type: FieldType) -> Result<Decimal, DecodeError> {
+    fn decimal(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<Decimal, DecodeError> {
         let value = text(field, field_type)?;
         Decimal::from_str_exact(value).map_err(|_| DecodeError::InvalidFieldValue { tag: field.tag, reason: format!("'{value}' does not fit a decimal exactly") })
     }
 
     /// Returns the value of `field` as a signed integer.
-    fn int(field: &FieldRef<'_>, field_type: FieldType) -> Result<i64, DecodeError> {
+    fn int(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<i64, DecodeError> {
         text(field, field_type)?;
         field.as_i64()
     }
 
     /// Returns the value of `field` as a non-negative integer.
-    fn uint(field: &FieldRef<'_>, field_type: FieldType) -> Result<u64, DecodeError> {
+    fn uint(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<u64, DecodeError> {
         text(field, field_type)?;
         field.as_u64()
     }
 
     /// Returns the value of `field` as one ASCII character.
-    fn character(field: &FieldRef<'_>, field_type: FieldType) -> Result<char, DecodeError> {
+    fn character(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<char, DecodeError> {
         text(field, field_type)?;
         field.as_char()
     }
 
     /// Returns the value of `field` as a boolean (`Y` or `N`).
-    fn boolean(field: &FieldRef<'_>, field_type: FieldType) -> Result<bool, DecodeError> {
+    fn boolean(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<bool, DecodeError> {
         text(field, field_type)?;
         field.as_bool()
     }
@@ -3886,7 +3886,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `0` (Heartbeat).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -3900,12 +3900,12 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::HEARTBEAT.field(self.msg, tag)
         }
 
         /// TestReqID (tag 112).
-        pub fn test_req_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn test_req_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(112).map(|field| text(field, FieldType::String)).transpose()
         }
     }
@@ -3928,7 +3928,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `A` (Logon).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -3942,63 +3942,63 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::LOGON.field(self.msg, tag)
         }
 
         /// EncryptMethod (tag 98). Required.
-        pub fn encrypt_method(&self) -> Result<enums::EncryptMethod<'a>, DecodeError> {
+        pub fn encrypt_method(&self) -> ::core::result::Result<enums::EncryptMethod<'a>, DecodeError> {
             required(self.get(98), 98).map(|field| enums::EncryptMethod::from_bytes(field.value))
         }
 
         /// HeartBtInt (tag 108). Required.
-        pub fn heart_bt_int(&self) -> Result<i64, DecodeError> {
+        pub fn heart_bt_int(&self) -> ::core::result::Result<i64, DecodeError> {
             int(required(self.get(108), 108)?, FieldType::Int)
         }
 
         /// RawDataLength (tag 95).
-        pub fn raw_data_length(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn raw_data_length(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(95).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// RawData (tag 96).
         #[must_use]
-        pub fn raw_data(&self) -> Option<&'a [u8]> {
+        pub fn raw_data(&self) -> ::core::option::Option<&'a [u8]> {
             self.get(96).map(|field| field.value)
         }
 
         /// ResetSeqNumFlag (tag 141).
-        pub fn reset_seq_num_flag(&self) -> Result<Option<bool>, DecodeError> {
+        pub fn reset_seq_num_flag(&self) -> ::core::result::Result<::core::option::Option<bool>, DecodeError> {
             self.get(141).map(|field| boolean(field, FieldType::Boolean)).transpose()
         }
 
         /// NextExpectedMsgSeqNum (tag 789).
-        pub fn next_expected_msg_seq_num(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn next_expected_msg_seq_num(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(789).map(|field| uint(field, FieldType::SeqNum)).transpose()
         }
 
         /// MaxMessageSize (tag 383).
-        pub fn max_message_size(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn max_message_size(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(383).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// NoMsgTypes (tag 384) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_msg_types(&self) -> Result<Option<Entries<'m, 'a, LogonNoMsgTypesView<'m, 'a>>>, GroupError> {
+        pub fn no_msg_types(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, LogonNoMsgTypesView<'m, 'a>>>, GroupError> {
             Ok(layouts::LOGON.read(self.msg, 384)?.map(|entries| entries.map(LogonNoMsgTypesView::wrap as fn(_) -> _)))
         }
 
         /// TestMessageIndicator (tag 464).
-        pub fn test_message_indicator(&self) -> Result<Option<bool>, DecodeError> {
+        pub fn test_message_indicator(&self) -> ::core::result::Result<::core::option::Option<bool>, DecodeError> {
             self.get(464).map(|field| boolean(field, FieldType::Boolean)).transpose()
         }
 
         /// Username (tag 553).
-        pub fn username(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn username(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(553).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// Password (tag 554).
-        pub fn password(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn password(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(554).map(|field| text(field, FieldType::String)).transpose()
         }
     }
@@ -4021,7 +4021,7 @@ pub mod views {
 
         /// Returns a view of `msg`, or `None` when its MsgType is not `D` (NewOrderSingle).
         #[must_use]
-        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {
+        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {
             (msg.msg_type().as_str() == Self::MSG_TYPE).then_some(Self { msg })
         }
 
@@ -4035,834 +4035,834 @@ pub mod views {
         /// Returns the first field `tag` at the message level, outside every repeating group;
         /// `None` past a group nested beyond the reader's depth limit, which a required accessor
         /// reports as `MissingRequiredField`.
-        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
+        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {
             layouts::NEW_ORDER_SINGLE.field(self.msg, tag)
         }
 
         /// ClOrdID (tag 11). Required.
-        pub fn cl_ord_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn cl_ord_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.get(11), 11)?, FieldType::String)
         }
 
         /// SecondaryClOrdID (tag 526).
-        pub fn secondary_cl_ord_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn secondary_cl_ord_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(526).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// ClOrdLinkID (tag 583).
-        pub fn cl_ord_link_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn cl_ord_link_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(583).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// NoPartyIDs (tag 453) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_party_ids(&self) -> Result<Option<Entries<'m, 'a, PartiesNoPartyIDsView<'m, 'a>>>, GroupError> {
+        pub fn no_party_ids(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, PartiesNoPartyIDsView<'m, 'a>>>, GroupError> {
             Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 453)?.map(|entries| entries.map(PartiesNoPartyIDsView::wrap as fn(_) -> _)))
         }
 
         /// TradeOriginationDate (tag 229).
-        pub fn trade_origination_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn trade_origination_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(229).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// TradeDate (tag 75).
-        pub fn trade_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn trade_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(75).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// Account (tag 1).
-        pub fn account(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn account(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(1).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// AcctIDSource (tag 660).
         #[must_use]
-        pub fn acct_idsource(&self) -> Option<enums::AcctIDSource<'a>> {
+        pub fn acct_idsource(&self) -> ::core::option::Option<enums::AcctIDSource<'a>> {
             self.get(660).map(|field| enums::AcctIDSource::from_bytes(field.value))
         }
 
         /// AccountType (tag 581).
         #[must_use]
-        pub fn account_type(&self) -> Option<enums::AccountType<'a>> {
+        pub fn account_type(&self) -> ::core::option::Option<enums::AccountType<'a>> {
             self.get(581).map(|field| enums::AccountType::from_bytes(field.value))
         }
 
         /// DayBookingInst (tag 589).
         #[must_use]
-        pub fn day_booking_inst(&self) -> Option<enums::DayBookingInst<'a>> {
+        pub fn day_booking_inst(&self) -> ::core::option::Option<enums::DayBookingInst<'a>> {
             self.get(589).map(|field| enums::DayBookingInst::from_bytes(field.value))
         }
 
         /// BookingUnit (tag 590).
         #[must_use]
-        pub fn booking_unit(&self) -> Option<enums::BookingUnit<'a>> {
+        pub fn booking_unit(&self) -> ::core::option::Option<enums::BookingUnit<'a>> {
             self.get(590).map(|field| enums::BookingUnit::from_bytes(field.value))
         }
 
         /// PreallocMethod (tag 591).
         #[must_use]
-        pub fn prealloc_method(&self) -> Option<enums::PreallocMethod<'a>> {
+        pub fn prealloc_method(&self) -> ::core::option::Option<enums::PreallocMethod<'a>> {
             self.get(591).map(|field| enums::PreallocMethod::from_bytes(field.value))
         }
 
         /// AllocID (tag 70).
-        pub fn alloc_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn alloc_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(70).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// NoAllocs (tag 78) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_allocs(&self) -> Result<Option<Entries<'m, 'a, PreAllocGrpNoAllocsView<'m, 'a>>>, GroupError> {
+        pub fn no_allocs(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, PreAllocGrpNoAllocsView<'m, 'a>>>, GroupError> {
             Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 78)?.map(|entries| entries.map(PreAllocGrpNoAllocsView::wrap as fn(_) -> _)))
         }
 
         /// SettlType (tag 63).
         #[must_use]
-        pub fn settl_type(&self) -> Option<enums::SettlType<'a>> {
+        pub fn settl_type(&self) -> ::core::option::Option<enums::SettlType<'a>> {
             self.get(63).map(|field| enums::SettlType::from_bytes(field.value))
         }
 
         /// SettlDate (tag 64).
-        pub fn settl_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn settl_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(64).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// CashMargin (tag 544).
         #[must_use]
-        pub fn cash_margin(&self) -> Option<enums::CashMargin<'a>> {
+        pub fn cash_margin(&self) -> ::core::option::Option<enums::CashMargin<'a>> {
             self.get(544).map(|field| enums::CashMargin::from_bytes(field.value))
         }
 
         /// ClearingFeeIndicator (tag 635).
         #[must_use]
-        pub fn clearing_fee_indicator(&self) -> Option<enums::ClearingFeeIndicator<'a>> {
+        pub fn clearing_fee_indicator(&self) -> ::core::option::Option<enums::ClearingFeeIndicator<'a>> {
             self.get(635).map(|field| enums::ClearingFeeIndicator::from_bytes(field.value))
         }
 
         /// HandlInst (tag 21).
         #[must_use]
-        pub fn handl_inst(&self) -> Option<enums::HandlInst<'a>> {
+        pub fn handl_inst(&self) -> ::core::option::Option<enums::HandlInst<'a>> {
             self.get(21).map(|field| enums::HandlInst::from_bytes(field.value))
         }
 
         /// ExecInst (tag 18).
-        pub fn exec_inst(&self) -> Result<Option<enums::Tokens<'a, enums::ExecInst<'a>>>, DecodeError> {
+        pub fn exec_inst(&self) -> ::core::result::Result<::core::option::Option<enums::Tokens<'a, enums::ExecInst<'a>>>, DecodeError> {
             self.get(18).map(|field| text(field, FieldType::MultipleStringValue).map(|value| enums::ExecInst::tokens(value.as_bytes()))).transpose()
         }
 
         /// MinQty (tag 110).
-        pub fn min_qty(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn min_qty(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(110).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
 
         /// MaxFloor (tag 111).
-        pub fn max_floor(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn max_floor(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(111).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
 
         /// ExDestination (tag 100).
-        pub fn ex_destination(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn ex_destination(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(100).map(|field| text(field, FieldType::Exchange)).transpose()
         }
 
         /// NoTradingSessions (tag 386) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_trading_sessions(&self) -> Result<Option<Entries<'m, 'a, TrdgSesGrpNoTradingSessionsView<'m, 'a>>>, GroupError> {
+        pub fn no_trading_sessions(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, TrdgSesGrpNoTradingSessionsView<'m, 'a>>>, GroupError> {
             Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 386)?.map(|entries| entries.map(TrdgSesGrpNoTradingSessionsView::wrap as fn(_) -> _)))
         }
 
         /// ProcessCode (tag 81).
         #[must_use]
-        pub fn process_code(&self) -> Option<enums::ProcessCode<'a>> {
+        pub fn process_code(&self) -> ::core::option::Option<enums::ProcessCode<'a>> {
             self.get(81).map(|field| enums::ProcessCode::from_bytes(field.value))
         }
 
         /// Symbol (tag 55).
-        pub fn symbol(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn symbol(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(55).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// SymbolSfx (tag 65).
-        pub fn symbol_sfx(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn symbol_sfx(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(65).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// SecurityID (tag 48).
-        pub fn security_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn security_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(48).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// SecurityIDSource (tag 22).
         #[must_use]
-        pub fn security_idsource(&self) -> Option<enums::SecurityIDSource<'a>> {
+        pub fn security_idsource(&self) -> ::core::option::Option<enums::SecurityIDSource<'a>> {
             self.get(22).map(|field| enums::SecurityIDSource::from_bytes(field.value))
         }
 
         /// NoSecurityAltID (tag 454) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_security_alt_id(&self) -> Result<Option<Entries<'m, 'a, SecAltIDGrpNoSecurityAltIDView<'m, 'a>>>, GroupError> {
+        pub fn no_security_alt_id(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, SecAltIDGrpNoSecurityAltIDView<'m, 'a>>>, GroupError> {
             Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 454)?.map(|entries| entries.map(SecAltIDGrpNoSecurityAltIDView::wrap as fn(_) -> _)))
         }
 
         /// Product (tag 460).
         #[must_use]
-        pub fn product(&self) -> Option<enums::Product<'a>> {
+        pub fn product(&self) -> ::core::option::Option<enums::Product<'a>> {
             self.get(460).map(|field| enums::Product::from_bytes(field.value))
         }
 
         /// CFICode (tag 461).
-        pub fn cficode(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn cficode(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(461).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// SecurityType (tag 167).
         #[must_use]
-        pub fn security_type(&self) -> Option<enums::SecurityType<'a>> {
+        pub fn security_type(&self) -> ::core::option::Option<enums::SecurityType<'a>> {
             self.get(167).map(|field| enums::SecurityType::from_bytes(field.value))
         }
 
         /// SecuritySubType (tag 762).
-        pub fn security_sub_type(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn security_sub_type(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(762).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// MaturityMonthYear (tag 200).
-        pub fn maturity_month_year(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn maturity_month_year(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(200).map(|field| text(field, FieldType::MonthYear)).transpose()
         }
 
         /// MaturityDate (tag 541).
-        pub fn maturity_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn maturity_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(541).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// PutOrCall (tag 201).
         #[must_use]
-        pub fn put_or_call(&self) -> Option<enums::PutOrCall<'a>> {
+        pub fn put_or_call(&self) -> ::core::option::Option<enums::PutOrCall<'a>> {
             self.get(201).map(|field| enums::PutOrCall::from_bytes(field.value))
         }
 
         /// CouponPaymentDate (tag 224).
-        pub fn coupon_payment_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn coupon_payment_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(224).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// IssueDate (tag 225).
-        pub fn issue_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn issue_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(225).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// RepoCollateralSecurityType (tag 239).
-        pub fn repo_collateral_security_type(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn repo_collateral_security_type(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(239).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// RepurchaseTerm (tag 226).
-        pub fn repurchase_term(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn repurchase_term(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.get(226).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// RepurchaseRate (tag 227).
-        pub fn repurchase_rate(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn repurchase_rate(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(227).map(|field| decimal(field, FieldType::Percentage)).transpose()
         }
 
         /// Factor (tag 228).
-        pub fn factor(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn factor(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(228).map(|field| decimal(field, FieldType::Float)).transpose()
         }
 
         /// CreditRating (tag 255).
-        pub fn credit_rating(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn credit_rating(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(255).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// InstrRegistry (tag 543).
-        pub fn instr_registry(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn instr_registry(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(543).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// CountryOfIssue (tag 470).
-        pub fn country_of_issue(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn country_of_issue(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(470).map(|field| text(field, FieldType::Country)).transpose()
         }
 
         /// StateOrProvinceOfIssue (tag 471).
-        pub fn state_or_province_of_issue(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn state_or_province_of_issue(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(471).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// LocaleOfIssue (tag 472).
-        pub fn locale_of_issue(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn locale_of_issue(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(472).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// RedemptionDate (tag 240).
-        pub fn redemption_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn redemption_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(240).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// StrikePrice (tag 202).
-        pub fn strike_price(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn strike_price(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(202).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// StrikeCurrency (tag 947).
-        pub fn strike_currency(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn strike_currency(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(947).map(|field| text(field, FieldType::Currency)).transpose()
         }
 
         /// OptAttribute (tag 206).
-        pub fn opt_attribute(&self) -> Result<Option<char>, DecodeError> {
+        pub fn opt_attribute(&self) -> ::core::result::Result<::core::option::Option<char>, DecodeError> {
             self.get(206).map(|field| character(field, FieldType::Char)).transpose()
         }
 
         /// ContractMultiplier (tag 231).
-        pub fn contract_multiplier(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn contract_multiplier(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(231).map(|field| decimal(field, FieldType::Float)).transpose()
         }
 
         /// CouponRate (tag 223).
-        pub fn coupon_rate(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn coupon_rate(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(223).map(|field| decimal(field, FieldType::Percentage)).transpose()
         }
 
         /// SecurityExchange (tag 207).
-        pub fn security_exchange(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn security_exchange(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(207).map(|field| text(field, FieldType::Exchange)).transpose()
         }
 
         /// Issuer (tag 106).
-        pub fn issuer(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn issuer(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(106).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// EncodedIssuerLen (tag 348).
-        pub fn encoded_issuer_len(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn encoded_issuer_len(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(348).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// EncodedIssuer (tag 349).
         #[must_use]
-        pub fn encoded_issuer(&self) -> Option<&'a [u8]> {
+        pub fn encoded_issuer(&self) -> ::core::option::Option<&'a [u8]> {
             self.get(349).map(|field| field.value)
         }
 
         /// SecurityDesc (tag 107).
-        pub fn security_desc(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn security_desc(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(107).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// EncodedSecurityDescLen (tag 350).
-        pub fn encoded_security_desc_len(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn encoded_security_desc_len(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(350).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// EncodedSecurityDesc (tag 351).
         #[must_use]
-        pub fn encoded_security_desc(&self) -> Option<&'a [u8]> {
+        pub fn encoded_security_desc(&self) -> ::core::option::Option<&'a [u8]> {
             self.get(351).map(|field| field.value)
         }
 
         /// Pool (tag 691).
-        pub fn pool(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn pool(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(691).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// ContractSettlMonth (tag 667).
-        pub fn contract_settl_month(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn contract_settl_month(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(667).map(|field| text(field, FieldType::MonthYear)).transpose()
         }
 
         /// CPProgram (tag 875).
         #[must_use]
-        pub fn cpprogram(&self) -> Option<enums::CPProgram<'a>> {
+        pub fn cpprogram(&self) -> ::core::option::Option<enums::CPProgram<'a>> {
             self.get(875).map(|field| enums::CPProgram::from_bytes(field.value))
         }
 
         /// CPRegType (tag 876).
-        pub fn cpreg_type(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn cpreg_type(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(876).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// NoEvents (tag 864) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_events(&self) -> Result<Option<Entries<'m, 'a, EvntGrpNoEventsView<'m, 'a>>>, GroupError> {
+        pub fn no_events(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, EvntGrpNoEventsView<'m, 'a>>>, GroupError> {
             Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 864)?.map(|entries| entries.map(EvntGrpNoEventsView::wrap as fn(_) -> _)))
         }
 
         /// DatedDate (tag 873).
-        pub fn dated_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn dated_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(873).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// InterestAccrualDate (tag 874).
-        pub fn interest_accrual_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn interest_accrual_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(874).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// AgreementDesc (tag 913).
-        pub fn agreement_desc(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn agreement_desc(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(913).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// AgreementID (tag 914).
-        pub fn agreement_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn agreement_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(914).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// AgreementDate (tag 915).
-        pub fn agreement_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn agreement_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(915).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// AgreementCurrency (tag 918).
-        pub fn agreement_currency(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn agreement_currency(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(918).map(|field| text(field, FieldType::Currency)).transpose()
         }
 
         /// TerminationType (tag 788).
         #[must_use]
-        pub fn termination_type(&self) -> Option<enums::TerminationType<'a>> {
+        pub fn termination_type(&self) -> ::core::option::Option<enums::TerminationType<'a>> {
             self.get(788).map(|field| enums::TerminationType::from_bytes(field.value))
         }
 
         /// StartDate (tag 916).
-        pub fn start_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn start_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(916).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// EndDate (tag 917).
-        pub fn end_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn end_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(917).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// DeliveryType (tag 919).
         #[must_use]
-        pub fn delivery_type(&self) -> Option<enums::DeliveryType<'a>> {
+        pub fn delivery_type(&self) -> ::core::option::Option<enums::DeliveryType<'a>> {
             self.get(919).map(|field| enums::DeliveryType::from_bytes(field.value))
         }
 
         /// MarginRatio (tag 898).
-        pub fn margin_ratio(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn margin_ratio(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(898).map(|field| decimal(field, FieldType::Percentage)).transpose()
         }
 
         /// NoUnderlyings (tag 711) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_underlyings(&self) -> Result<Option<Entries<'m, 'a, UndInstrmtGrpNoUnderlyingsView<'m, 'a>>>, GroupError> {
+        pub fn no_underlyings(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, UndInstrmtGrpNoUnderlyingsView<'m, 'a>>>, GroupError> {
             Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 711)?.map(|entries| entries.map(UndInstrmtGrpNoUnderlyingsView::wrap as fn(_) -> _)))
         }
 
         /// PrevClosePx (tag 140).
-        pub fn prev_close_px(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn prev_close_px(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(140).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// Side (tag 54). Required.
-        pub fn side(&self) -> Result<enums::Side<'a>, DecodeError> {
+        pub fn side(&self) -> ::core::result::Result<enums::Side<'a>, DecodeError> {
             required(self.get(54), 54).map(|field| enums::Side::from_bytes(field.value))
         }
 
         /// LocateReqd (tag 114).
-        pub fn locate_reqd(&self) -> Result<Option<bool>, DecodeError> {
+        pub fn locate_reqd(&self) -> ::core::result::Result<::core::option::Option<bool>, DecodeError> {
             self.get(114).map(|field| boolean(field, FieldType::Boolean)).transpose()
         }
 
         /// TransactTime (tag 60). Required.
-        pub fn transact_time(&self) -> Result<&'a str, DecodeError> {
+        pub fn transact_time(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.get(60), 60)?, FieldType::UtcTimestamp)
         }
 
         /// NoStipulations (tag 232) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_stipulations(&self) -> Result<Option<Entries<'m, 'a, StipulationsNoStipulationsView<'m, 'a>>>, GroupError> {
+        pub fn no_stipulations(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, StipulationsNoStipulationsView<'m, 'a>>>, GroupError> {
             Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 232)?.map(|entries| entries.map(StipulationsNoStipulationsView::wrap as fn(_) -> _)))
         }
 
         /// QtyType (tag 854).
         #[must_use]
-        pub fn qty_type(&self) -> Option<enums::QtyType<'a>> {
+        pub fn qty_type(&self) -> ::core::option::Option<enums::QtyType<'a>> {
             self.get(854).map(|field| enums::QtyType::from_bytes(field.value))
         }
 
         /// OrderQty (tag 38).
-        pub fn order_qty(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn order_qty(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(38).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
 
         /// CashOrderQty (tag 152).
-        pub fn cash_order_qty(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn cash_order_qty(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(152).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
 
         /// OrderPercent (tag 516).
-        pub fn order_percent(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn order_percent(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(516).map(|field| decimal(field, FieldType::Percentage)).transpose()
         }
 
         /// RoundingDirection (tag 468).
         #[must_use]
-        pub fn rounding_direction(&self) -> Option<enums::RoundingDirection<'a>> {
+        pub fn rounding_direction(&self) -> ::core::option::Option<enums::RoundingDirection<'a>> {
             self.get(468).map(|field| enums::RoundingDirection::from_bytes(field.value))
         }
 
         /// RoundingModulus (tag 469).
-        pub fn rounding_modulus(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn rounding_modulus(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(469).map(|field| decimal(field, FieldType::Float)).transpose()
         }
 
         /// OrdType (tag 40). Required.
-        pub fn ord_type(&self) -> Result<enums::OrdType<'a>, DecodeError> {
+        pub fn ord_type(&self) -> ::core::result::Result<enums::OrdType<'a>, DecodeError> {
             required(self.get(40), 40).map(|field| enums::OrdType::from_bytes(field.value))
         }
 
         /// PriceType (tag 423).
         #[must_use]
-        pub fn price_type(&self) -> Option<enums::PriceType<'a>> {
+        pub fn price_type(&self) -> ::core::option::Option<enums::PriceType<'a>> {
             self.get(423).map(|field| enums::PriceType::from_bytes(field.value))
         }
 
         /// Price (tag 44).
-        pub fn price(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn price(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(44).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// StopPx (tag 99).
-        pub fn stop_px(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn stop_px(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(99).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// Spread (tag 218).
-        pub fn spread(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn spread(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(218).map(|field| decimal(field, FieldType::PriceOffset)).transpose()
         }
 
         /// BenchmarkCurveCurrency (tag 220).
-        pub fn benchmark_curve_currency(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn benchmark_curve_currency(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(220).map(|field| text(field, FieldType::Currency)).transpose()
         }
 
         /// BenchmarkCurveName (tag 221).
-        pub fn benchmark_curve_name(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn benchmark_curve_name(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(221).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// BenchmarkCurvePoint (tag 222).
-        pub fn benchmark_curve_point(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn benchmark_curve_point(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(222).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// BenchmarkPrice (tag 662).
-        pub fn benchmark_price(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn benchmark_price(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(662).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// BenchmarkPriceType (tag 663).
-        pub fn benchmark_price_type(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn benchmark_price_type(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.get(663).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// BenchmarkSecurityID (tag 699).
-        pub fn benchmark_security_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn benchmark_security_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(699).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// BenchmarkSecurityIDSource (tag 761).
-        pub fn benchmark_security_idsource(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn benchmark_security_idsource(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(761).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// YieldType (tag 235).
         #[must_use]
-        pub fn yield_type(&self) -> Option<enums::YieldType<'a>> {
+        pub fn yield_type(&self) -> ::core::option::Option<enums::YieldType<'a>> {
             self.get(235).map(|field| enums::YieldType::from_bytes(field.value))
         }
 
         /// Yield (tag 236).
-        pub fn r#yield(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn r#yield(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(236).map(|field| decimal(field, FieldType::Percentage)).transpose()
         }
 
         /// YieldCalcDate (tag 701).
-        pub fn yield_calc_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn yield_calc_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(701).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// YieldRedemptionDate (tag 696).
-        pub fn yield_redemption_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn yield_redemption_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(696).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// YieldRedemptionPrice (tag 697).
-        pub fn yield_redemption_price(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn yield_redemption_price(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(697).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// YieldRedemptionPriceType (tag 698).
-        pub fn yield_redemption_price_type(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn yield_redemption_price_type(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.get(698).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// Currency (tag 15).
-        pub fn currency(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn currency(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(15).map(|field| text(field, FieldType::Currency)).transpose()
         }
 
         /// ComplianceID (tag 376).
-        pub fn compliance_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn compliance_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(376).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// SolicitedFlag (tag 377).
-        pub fn solicited_flag(&self) -> Result<Option<bool>, DecodeError> {
+        pub fn solicited_flag(&self) -> ::core::result::Result<::core::option::Option<bool>, DecodeError> {
             self.get(377).map(|field| boolean(field, FieldType::Boolean)).transpose()
         }
 
         /// IOIID (tag 23).
-        pub fn ioiid(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn ioiid(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(23).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// QuoteID (tag 117).
-        pub fn quote_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn quote_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(117).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// TimeInForce (tag 59).
         #[must_use]
-        pub fn time_in_force(&self) -> Option<enums::TimeInForce<'a>> {
+        pub fn time_in_force(&self) -> ::core::option::Option<enums::TimeInForce<'a>> {
             self.get(59).map(|field| enums::TimeInForce::from_bytes(field.value))
         }
 
         /// EffectiveTime (tag 168).
-        pub fn effective_time(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn effective_time(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(168).map(|field| text(field, FieldType::UtcTimestamp)).transpose()
         }
 
         /// ExpireDate (tag 432).
-        pub fn expire_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn expire_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(432).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// ExpireTime (tag 126).
-        pub fn expire_time(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn expire_time(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(126).map(|field| text(field, FieldType::UtcTimestamp)).transpose()
         }
 
         /// GTBookingInst (tag 427).
         #[must_use]
-        pub fn gtbooking_inst(&self) -> Option<enums::GTBookingInst<'a>> {
+        pub fn gtbooking_inst(&self) -> ::core::option::Option<enums::GTBookingInst<'a>> {
             self.get(427).map(|field| enums::GTBookingInst::from_bytes(field.value))
         }
 
         /// Commission (tag 12).
-        pub fn commission(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn commission(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(12).map(|field| decimal(field, FieldType::Amt)).transpose()
         }
 
         /// CommType (tag 13).
         #[must_use]
-        pub fn comm_type(&self) -> Option<enums::CommType<'a>> {
+        pub fn comm_type(&self) -> ::core::option::Option<enums::CommType<'a>> {
             self.get(13).map(|field| enums::CommType::from_bytes(field.value))
         }
 
         /// CommCurrency (tag 479).
-        pub fn comm_currency(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn comm_currency(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(479).map(|field| text(field, FieldType::Currency)).transpose()
         }
 
         /// FundRenewWaiv (tag 497).
         #[must_use]
-        pub fn fund_renew_waiv(&self) -> Option<enums::FundRenewWaiv<'a>> {
+        pub fn fund_renew_waiv(&self) -> ::core::option::Option<enums::FundRenewWaiv<'a>> {
             self.get(497).map(|field| enums::FundRenewWaiv::from_bytes(field.value))
         }
 
         /// OrderCapacity (tag 528).
         #[must_use]
-        pub fn order_capacity(&self) -> Option<enums::OrderCapacity<'a>> {
+        pub fn order_capacity(&self) -> ::core::option::Option<enums::OrderCapacity<'a>> {
             self.get(528).map(|field| enums::OrderCapacity::from_bytes(field.value))
         }
 
         /// OrderRestrictions (tag 529).
-        pub fn order_restrictions(&self) -> Result<Option<enums::Tokens<'a, enums::OrderRestrictions<'a>>>, DecodeError> {
+        pub fn order_restrictions(&self) -> ::core::result::Result<::core::option::Option<enums::Tokens<'a, enums::OrderRestrictions<'a>>>, DecodeError> {
             self.get(529).map(|field| text(field, FieldType::MultipleStringValue).map(|value| enums::OrderRestrictions::tokens(value.as_bytes()))).transpose()
         }
 
         /// CustOrderCapacity (tag 582).
         #[must_use]
-        pub fn cust_order_capacity(&self) -> Option<enums::CustOrderCapacity<'a>> {
+        pub fn cust_order_capacity(&self) -> ::core::option::Option<enums::CustOrderCapacity<'a>> {
             self.get(582).map(|field| enums::CustOrderCapacity::from_bytes(field.value))
         }
 
         /// ForexReq (tag 121).
-        pub fn forex_req(&self) -> Result<Option<bool>, DecodeError> {
+        pub fn forex_req(&self) -> ::core::result::Result<::core::option::Option<bool>, DecodeError> {
             self.get(121).map(|field| boolean(field, FieldType::Boolean)).transpose()
         }
 
         /// SettlCurrency (tag 120).
-        pub fn settl_currency(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn settl_currency(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(120).map(|field| text(field, FieldType::Currency)).transpose()
         }
 
         /// BookingType (tag 775).
         #[must_use]
-        pub fn booking_type(&self) -> Option<enums::BookingType<'a>> {
+        pub fn booking_type(&self) -> ::core::option::Option<enums::BookingType<'a>> {
             self.get(775).map(|field| enums::BookingType::from_bytes(field.value))
         }
 
         /// Text (tag 58).
-        pub fn text(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn text(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(58).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// EncodedTextLen (tag 354).
-        pub fn encoded_text_len(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn encoded_text_len(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.get(354).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// EncodedText (tag 355).
         #[must_use]
-        pub fn encoded_text(&self) -> Option<&'a [u8]> {
+        pub fn encoded_text(&self) -> ::core::option::Option<&'a [u8]> {
             self.get(355).map(|field| field.value)
         }
 
         /// SettlDate2 (tag 193).
-        pub fn settl_date2(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn settl_date2(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(193).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// OrderQty2 (tag 192).
-        pub fn order_qty2(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn order_qty2(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(192).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
 
         /// Price2 (tag 640).
-        pub fn price2(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn price2(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(640).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// PositionEffect (tag 77).
         #[must_use]
-        pub fn position_effect(&self) -> Option<enums::PositionEffect<'a>> {
+        pub fn position_effect(&self) -> ::core::option::Option<enums::PositionEffect<'a>> {
             self.get(77).map(|field| enums::PositionEffect::from_bytes(field.value))
         }
 
         /// CoveredOrUncovered (tag 203).
         #[must_use]
-        pub fn covered_or_uncovered(&self) -> Option<enums::CoveredOrUncovered<'a>> {
+        pub fn covered_or_uncovered(&self) -> ::core::option::Option<enums::CoveredOrUncovered<'a>> {
             self.get(203).map(|field| enums::CoveredOrUncovered::from_bytes(field.value))
         }
 
         /// MaxShow (tag 210).
-        pub fn max_show(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn max_show(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(210).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
 
         /// PegOffsetValue (tag 211).
-        pub fn peg_offset_value(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn peg_offset_value(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(211).map(|field| decimal(field, FieldType::Float)).transpose()
         }
 
         /// PegMoveType (tag 835).
         #[must_use]
-        pub fn peg_move_type(&self) -> Option<enums::PegMoveType<'a>> {
+        pub fn peg_move_type(&self) -> ::core::option::Option<enums::PegMoveType<'a>> {
             self.get(835).map(|field| enums::PegMoveType::from_bytes(field.value))
         }
 
         /// PegOffsetType (tag 836).
         #[must_use]
-        pub fn peg_offset_type(&self) -> Option<enums::PegOffsetType<'a>> {
+        pub fn peg_offset_type(&self) -> ::core::option::Option<enums::PegOffsetType<'a>> {
             self.get(836).map(|field| enums::PegOffsetType::from_bytes(field.value))
         }
 
         /// PegLimitType (tag 837).
         #[must_use]
-        pub fn peg_limit_type(&self) -> Option<enums::PegLimitType<'a>> {
+        pub fn peg_limit_type(&self) -> ::core::option::Option<enums::PegLimitType<'a>> {
             self.get(837).map(|field| enums::PegLimitType::from_bytes(field.value))
         }
 
         /// PegRoundDirection (tag 838).
         #[must_use]
-        pub fn peg_round_direction(&self) -> Option<enums::PegRoundDirection<'a>> {
+        pub fn peg_round_direction(&self) -> ::core::option::Option<enums::PegRoundDirection<'a>> {
             self.get(838).map(|field| enums::PegRoundDirection::from_bytes(field.value))
         }
 
         /// PegScope (tag 840).
         #[must_use]
-        pub fn peg_scope(&self) -> Option<enums::PegScope<'a>> {
+        pub fn peg_scope(&self) -> ::core::option::Option<enums::PegScope<'a>> {
             self.get(840).map(|field| enums::PegScope::from_bytes(field.value))
         }
 
         /// DiscretionInst (tag 388).
         #[must_use]
-        pub fn discretion_inst(&self) -> Option<enums::DiscretionInst<'a>> {
+        pub fn discretion_inst(&self) -> ::core::option::Option<enums::DiscretionInst<'a>> {
             self.get(388).map(|field| enums::DiscretionInst::from_bytes(field.value))
         }
 
         /// DiscretionOffsetValue (tag 389).
-        pub fn discretion_offset_value(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn discretion_offset_value(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(389).map(|field| decimal(field, FieldType::Float)).transpose()
         }
 
         /// DiscretionMoveType (tag 841).
         #[must_use]
-        pub fn discretion_move_type(&self) -> Option<enums::DiscretionMoveType<'a>> {
+        pub fn discretion_move_type(&self) -> ::core::option::Option<enums::DiscretionMoveType<'a>> {
             self.get(841).map(|field| enums::DiscretionMoveType::from_bytes(field.value))
         }
 
         /// DiscretionOffsetType (tag 842).
         #[must_use]
-        pub fn discretion_offset_type(&self) -> Option<enums::DiscretionOffsetType<'a>> {
+        pub fn discretion_offset_type(&self) -> ::core::option::Option<enums::DiscretionOffsetType<'a>> {
             self.get(842).map(|field| enums::DiscretionOffsetType::from_bytes(field.value))
         }
 
         /// DiscretionLimitType (tag 843).
         #[must_use]
-        pub fn discretion_limit_type(&self) -> Option<enums::DiscretionLimitType<'a>> {
+        pub fn discretion_limit_type(&self) -> ::core::option::Option<enums::DiscretionLimitType<'a>> {
             self.get(843).map(|field| enums::DiscretionLimitType::from_bytes(field.value))
         }
 
         /// DiscretionRoundDirection (tag 844).
         #[must_use]
-        pub fn discretion_round_direction(&self) -> Option<enums::DiscretionRoundDirection<'a>> {
+        pub fn discretion_round_direction(&self) -> ::core::option::Option<enums::DiscretionRoundDirection<'a>> {
             self.get(844).map(|field| enums::DiscretionRoundDirection::from_bytes(field.value))
         }
 
         /// DiscretionScope (tag 846).
         #[must_use]
-        pub fn discretion_scope(&self) -> Option<enums::DiscretionScope<'a>> {
+        pub fn discretion_scope(&self) -> ::core::option::Option<enums::DiscretionScope<'a>> {
             self.get(846).map(|field| enums::DiscretionScope::from_bytes(field.value))
         }
 
         /// TargetStrategy (tag 847).
         #[must_use]
-        pub fn target_strategy(&self) -> Option<enums::TargetStrategy<'a>> {
+        pub fn target_strategy(&self) -> ::core::option::Option<enums::TargetStrategy<'a>> {
             self.get(847).map(|field| enums::TargetStrategy::from_bytes(field.value))
         }
 
         /// TargetStrategyParameters (tag 848).
-        pub fn target_strategy_parameters(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn target_strategy_parameters(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(848).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// ParticipationRate (tag 849).
-        pub fn participation_rate(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn participation_rate(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.get(849).map(|field| decimal(field, FieldType::Percentage)).transpose()
         }
 
         /// CancellationRights (tag 480).
         #[must_use]
-        pub fn cancellation_rights(&self) -> Option<enums::CancellationRights<'a>> {
+        pub fn cancellation_rights(&self) -> ::core::option::Option<enums::CancellationRights<'a>> {
             self.get(480).map(|field| enums::CancellationRights::from_bytes(field.value))
         }
 
         /// MoneyLaunderingStatus (tag 481).
         #[must_use]
-        pub fn money_laundering_status(&self) -> Option<enums::MoneyLaunderingStatus<'a>> {
+        pub fn money_laundering_status(&self) -> ::core::option::Option<enums::MoneyLaunderingStatus<'a>> {
             self.get(481).map(|field| enums::MoneyLaunderingStatus::from_bytes(field.value))
         }
 
         /// RegistID (tag 513).
-        pub fn regist_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn regist_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(513).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// Designation (tag 494).
-        pub fn designation(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn designation(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(494).map(|field| text(field, FieldType::String)).transpose()
         }
     }
@@ -4893,13 +4893,13 @@ pub mod views {
         }
 
         /// RefMsgType (tag 372). Required.
-        pub fn ref_msg_type(&self) -> Result<&'a str, DecodeError> {
+        pub fn ref_msg_type(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(372), 372)?, FieldType::String)
         }
 
         /// MsgDirection (tag 385).
         #[must_use]
-        pub fn msg_direction(&self) -> Option<enums::MsgDirection<'a>> {
+        pub fn msg_direction(&self) -> ::core::option::Option<enums::MsgDirection<'a>> {
             self.entry.get(385).map(|field| enums::MsgDirection::from_bytes(field.value))
         }
     }
@@ -4930,24 +4930,24 @@ pub mod views {
         }
 
         /// PartyID (tag 448). Required.
-        pub fn party_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn party_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(448), 448)?, FieldType::String)
         }
 
         /// PartyIDSource (tag 447).
         #[must_use]
-        pub fn party_idsource(&self) -> Option<enums::PartyIDSource<'a>> {
+        pub fn party_idsource(&self) -> ::core::option::Option<enums::PartyIDSource<'a>> {
             self.entry.get(447).map(|field| enums::PartyIDSource::from_bytes(field.value))
         }
 
         /// PartyRole (tag 452).
         #[must_use]
-        pub fn party_role(&self) -> Option<enums::PartyRole<'a>> {
+        pub fn party_role(&self) -> ::core::option::Option<enums::PartyRole<'a>> {
             self.entry.get(452).map(|field| enums::PartyRole::from_bytes(field.value))
         }
 
         /// NoPartySubIDs (tag 802) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_party_sub_ids(&self) -> Result<Option<Entries<'m, 'a, PtysSubGrpNoPartySubIDsView<'m, 'a>>>, GroupError> {
+        pub fn no_party_sub_ids(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, PtysSubGrpNoPartySubIDsView<'m, 'a>>>, GroupError> {
             Ok(self.entry.group(802)?.map(|entries| entries.map(PtysSubGrpNoPartySubIDsView::wrap as fn(_) -> _)))
         }
     }
@@ -4978,13 +4978,13 @@ pub mod views {
         }
 
         /// PartySubID (tag 523). Required.
-        pub fn party_sub_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn party_sub_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(523), 523)?, FieldType::String)
         }
 
         /// PartySubIDType (tag 803).
         #[must_use]
-        pub fn party_sub_idtype(&self) -> Option<enums::PartySubIDType<'a>> {
+        pub fn party_sub_idtype(&self) -> ::core::option::Option<enums::PartySubIDType<'a>> {
             self.entry.get(803).map(|field| enums::PartySubIDType::from_bytes(field.value))
         }
     }
@@ -5015,32 +5015,32 @@ pub mod views {
         }
 
         /// AllocAccount (tag 79). Required.
-        pub fn alloc_account(&self) -> Result<&'a str, DecodeError> {
+        pub fn alloc_account(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(79), 79)?, FieldType::String)
         }
 
         /// AllocAcctIDSource (tag 661).
-        pub fn alloc_acct_idsource(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn alloc_acct_idsource(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.entry.get(661).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// AllocSettlCurrency (tag 736).
-        pub fn alloc_settl_currency(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn alloc_settl_currency(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(736).map(|field| text(field, FieldType::Currency)).transpose()
         }
 
         /// IndividualAllocID (tag 467).
-        pub fn individual_alloc_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn individual_alloc_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(467).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// NoNestedPartyIDs (tag 539) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_nested_party_ids(&self) -> Result<Option<Entries<'m, 'a, NestedPartiesNoNestedPartyIDsView<'m, 'a>>>, GroupError> {
+        pub fn no_nested_party_ids(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, NestedPartiesNoNestedPartyIDsView<'m, 'a>>>, GroupError> {
             Ok(self.entry.group(539)?.map(|entries| entries.map(NestedPartiesNoNestedPartyIDsView::wrap as fn(_) -> _)))
         }
 
         /// AllocQty (tag 80).
-        pub fn alloc_qty(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn alloc_qty(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(80).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
     }
@@ -5071,22 +5071,22 @@ pub mod views {
         }
 
         /// NestedPartyID (tag 524). Required.
-        pub fn nested_party_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn nested_party_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(524), 524)?, FieldType::String)
         }
 
         /// NestedPartyIDSource (tag 525).
-        pub fn nested_party_idsource(&self) -> Result<Option<char>, DecodeError> {
+        pub fn nested_party_idsource(&self) -> ::core::result::Result<::core::option::Option<char>, DecodeError> {
             self.entry.get(525).map(|field| character(field, FieldType::Char)).transpose()
         }
 
         /// NestedPartyRole (tag 538).
-        pub fn nested_party_role(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn nested_party_role(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.entry.get(538).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// NoNestedPartySubIDs (tag 804) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_nested_party_sub_ids(&self) -> Result<Option<Entries<'m, 'a, NstdPtysSubGrpNoNestedPartySubIDsView<'m, 'a>>>, GroupError> {
+        pub fn no_nested_party_sub_ids(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, NstdPtysSubGrpNoNestedPartySubIDsView<'m, 'a>>>, GroupError> {
             Ok(self.entry.group(804)?.map(|entries| entries.map(NstdPtysSubGrpNoNestedPartySubIDsView::wrap as fn(_) -> _)))
         }
     }
@@ -5117,12 +5117,12 @@ pub mod views {
         }
 
         /// NestedPartySubID (tag 545). Required.
-        pub fn nested_party_sub_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn nested_party_sub_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(545), 545)?, FieldType::String)
         }
 
         /// NestedPartySubIDType (tag 805).
-        pub fn nested_party_sub_idtype(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn nested_party_sub_idtype(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.entry.get(805).map(|field| int(field, FieldType::Int)).transpose()
         }
     }
@@ -5153,12 +5153,12 @@ pub mod views {
         }
 
         /// TradingSessionID (tag 336). Required.
-        pub fn trading_session_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn trading_session_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(336), 336)?, FieldType::String)
         }
 
         /// TradingSessionSubID (tag 625).
-        pub fn trading_session_sub_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn trading_session_sub_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(625).map(|field| text(field, FieldType::String)).transpose()
         }
     }
@@ -5189,12 +5189,12 @@ pub mod views {
         }
 
         /// SecurityAltID (tag 455). Required.
-        pub fn security_alt_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn security_alt_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(455), 455)?, FieldType::String)
         }
 
         /// SecurityAltIDSource (tag 456).
-        pub fn security_alt_idsource(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn security_alt_idsource(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(456).map(|field| text(field, FieldType::String)).transpose()
         }
     }
@@ -5225,22 +5225,22 @@ pub mod views {
         }
 
         /// EventType (tag 865). Required.
-        pub fn event_type(&self) -> Result<enums::EventType<'a>, DecodeError> {
+        pub fn event_type(&self) -> ::core::result::Result<enums::EventType<'a>, DecodeError> {
             required(self.entry.get(865), 865).map(|field| enums::EventType::from_bytes(field.value))
         }
 
         /// EventDate (tag 866).
-        pub fn event_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn event_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(866).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// EventPx (tag 867).
-        pub fn event_px(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn event_px(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(867).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// EventText (tag 868).
-        pub fn event_text(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn event_text(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(868).map(|field| text(field, FieldType::String)).transpose()
         }
     }
@@ -5271,239 +5271,239 @@ pub mod views {
         }
 
         /// UnderlyingSymbol (tag 311). Required.
-        pub fn underlying_symbol(&self) -> Result<&'a str, DecodeError> {
+        pub fn underlying_symbol(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(311), 311)?, FieldType::String)
         }
 
         /// UnderlyingSymbolSfx (tag 312).
-        pub fn underlying_symbol_sfx(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_symbol_sfx(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(312).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingSecurityID (tag 309).
-        pub fn underlying_security_id(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_security_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(309).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingSecurityIDSource (tag 305).
-        pub fn underlying_security_idsource(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_security_idsource(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(305).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// NoUnderlyingSecurityAltID (tag 457) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_underlying_security_alt_id(&self) -> Result<Option<Entries<'m, 'a, UndSecAltIDGrpNoUnderlyingSecurityAltIDView<'m, 'a>>>, GroupError> {
+        pub fn no_underlying_security_alt_id(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, UndSecAltIDGrpNoUnderlyingSecurityAltIDView<'m, 'a>>>, GroupError> {
             Ok(self.entry.group(457)?.map(|entries| entries.map(UndSecAltIDGrpNoUnderlyingSecurityAltIDView::wrap as fn(_) -> _)))
         }
 
         /// UnderlyingProduct (tag 462).
-        pub fn underlying_product(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn underlying_product(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.entry.get(462).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// UnderlyingCFICode (tag 463).
-        pub fn underlying_cficode(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_cficode(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(463).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingSecurityType (tag 310).
-        pub fn underlying_security_type(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_security_type(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(310).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingSecuritySubType (tag 763).
-        pub fn underlying_security_sub_type(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_security_sub_type(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(763).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingMaturityMonthYear (tag 313).
-        pub fn underlying_maturity_month_year(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_maturity_month_year(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(313).map(|field| text(field, FieldType::MonthYear)).transpose()
         }
 
         /// UnderlyingMaturityDate (tag 542).
-        pub fn underlying_maturity_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_maturity_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(542).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// UnderlyingPutOrCall (tag 315).
-        pub fn underlying_put_or_call(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn underlying_put_or_call(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.entry.get(315).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// UnderlyingCouponPaymentDate (tag 241).
-        pub fn underlying_coupon_payment_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_coupon_payment_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(241).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// UnderlyingIssueDate (tag 242).
-        pub fn underlying_issue_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_issue_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(242).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// UnderlyingRepoCollateralSecurityType (tag 243).
-        pub fn underlying_repo_collateral_security_type(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_repo_collateral_security_type(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(243).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingRepurchaseTerm (tag 244).
-        pub fn underlying_repurchase_term(&self) -> Result<Option<i64>, DecodeError> {
+        pub fn underlying_repurchase_term(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
             self.entry.get(244).map(|field| int(field, FieldType::Int)).transpose()
         }
 
         /// UnderlyingRepurchaseRate (tag 245).
-        pub fn underlying_repurchase_rate(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_repurchase_rate(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(245).map(|field| decimal(field, FieldType::Percentage)).transpose()
         }
 
         /// UnderlyingFactor (tag 246).
-        pub fn underlying_factor(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_factor(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(246).map(|field| decimal(field, FieldType::Float)).transpose()
         }
 
         /// UnderlyingCreditRating (tag 256).
-        pub fn underlying_credit_rating(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_credit_rating(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(256).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingInstrRegistry (tag 595).
-        pub fn underlying_instr_registry(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_instr_registry(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(595).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingCountryOfIssue (tag 592).
-        pub fn underlying_country_of_issue(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_country_of_issue(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(592).map(|field| text(field, FieldType::Country)).transpose()
         }
 
         /// UnderlyingStateOrProvinceOfIssue (tag 593).
-        pub fn underlying_state_or_province_of_issue(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_state_or_province_of_issue(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(593).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingLocaleOfIssue (tag 594).
-        pub fn underlying_locale_of_issue(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_locale_of_issue(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(594).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingRedemptionDate (tag 247).
-        pub fn underlying_redemption_date(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_redemption_date(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(247).map(|field| text(field, FieldType::LocalMktDate)).transpose()
         }
 
         /// UnderlyingStrikePrice (tag 316).
-        pub fn underlying_strike_price(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_strike_price(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(316).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// UnderlyingStrikeCurrency (tag 941).
-        pub fn underlying_strike_currency(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_strike_currency(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(941).map(|field| text(field, FieldType::Currency)).transpose()
         }
 
         /// UnderlyingOptAttribute (tag 317).
-        pub fn underlying_opt_attribute(&self) -> Result<Option<char>, DecodeError> {
+        pub fn underlying_opt_attribute(&self) -> ::core::result::Result<::core::option::Option<char>, DecodeError> {
             self.entry.get(317).map(|field| character(field, FieldType::Char)).transpose()
         }
 
         /// UnderlyingContractMultiplier (tag 436).
-        pub fn underlying_contract_multiplier(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_contract_multiplier(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(436).map(|field| decimal(field, FieldType::Float)).transpose()
         }
 
         /// UnderlyingCouponRate (tag 435).
-        pub fn underlying_coupon_rate(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_coupon_rate(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(435).map(|field| decimal(field, FieldType::Percentage)).transpose()
         }
 
         /// UnderlyingSecurityExchange (tag 308).
-        pub fn underlying_security_exchange(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_security_exchange(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(308).map(|field| text(field, FieldType::Exchange)).transpose()
         }
 
         /// UnderlyingIssuer (tag 306).
-        pub fn underlying_issuer(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_issuer(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(306).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// EncodedUnderlyingIssuerLen (tag 362).
-        pub fn encoded_underlying_issuer_len(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn encoded_underlying_issuer_len(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.entry.get(362).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// EncodedUnderlyingIssuer (tag 363).
         #[must_use]
-        pub fn encoded_underlying_issuer(&self) -> Option<&'a [u8]> {
+        pub fn encoded_underlying_issuer(&self) -> ::core::option::Option<&'a [u8]> {
             self.entry.get(363).map(|field| field.value)
         }
 
         /// UnderlyingSecurityDesc (tag 307).
-        pub fn underlying_security_desc(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_security_desc(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(307).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// EncodedUnderlyingSecurityDescLen (tag 364).
-        pub fn encoded_underlying_security_desc_len(&self) -> Result<Option<u64>, DecodeError> {
+        pub fn encoded_underlying_security_desc_len(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
             self.entry.get(364).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
         /// EncodedUnderlyingSecurityDesc (tag 365).
         #[must_use]
-        pub fn encoded_underlying_security_desc(&self) -> Option<&'a [u8]> {
+        pub fn encoded_underlying_security_desc(&self) -> ::core::option::Option<&'a [u8]> {
             self.entry.get(365).map(|field| field.value)
         }
 
         /// UnderlyingCPProgram (tag 877).
-        pub fn underlying_cpprogram(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_cpprogram(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(877).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingCPRegType (tag 878).
-        pub fn underlying_cpreg_type(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_cpreg_type(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(878).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// UnderlyingCurrency (tag 318).
-        pub fn underlying_currency(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_currency(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(318).map(|field| text(field, FieldType::Currency)).transpose()
         }
 
         /// UnderlyingQty (tag 879).
-        pub fn underlying_qty(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_qty(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(879).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
 
         /// UnderlyingPx (tag 810).
-        pub fn underlying_px(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_px(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(810).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// UnderlyingDirtyPrice (tag 882).
-        pub fn underlying_dirty_price(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_dirty_price(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(882).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// UnderlyingEndPrice (tag 883).
-        pub fn underlying_end_price(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_end_price(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(883).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// UnderlyingStartValue (tag 884).
-        pub fn underlying_start_value(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_start_value(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(884).map(|field| decimal(field, FieldType::Amt)).transpose()
         }
 
         /// UnderlyingCurrentValue (tag 885).
-        pub fn underlying_current_value(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_current_value(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(885).map(|field| decimal(field, FieldType::Amt)).transpose()
         }
 
         /// UnderlyingEndValue (tag 886).
-        pub fn underlying_end_value(&self) -> Result<Option<Decimal>, DecodeError> {
+        pub fn underlying_end_value(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {
             self.entry.get(886).map(|field| decimal(field, FieldType::Amt)).transpose()
         }
 
         /// NoUnderlyingStips (tag 887) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_underlying_stips(&self) -> Result<Option<Entries<'m, 'a, UnderlyingStipulationsNoUnderlyingStipsView<'m, 'a>>>, GroupError> {
+        pub fn no_underlying_stips(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, UnderlyingStipulationsNoUnderlyingStipsView<'m, 'a>>>, GroupError> {
             Ok(self.entry.group(887)?.map(|entries| entries.map(UnderlyingStipulationsNoUnderlyingStipsView::wrap as fn(_) -> _)))
         }
     }
@@ -5534,12 +5534,12 @@ pub mod views {
         }
 
         /// UnderlyingSecurityAltID (tag 458). Required.
-        pub fn underlying_security_alt_id(&self) -> Result<&'a str, DecodeError> {
+        pub fn underlying_security_alt_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(458), 458)?, FieldType::String)
         }
 
         /// UnderlyingSecurityAltIDSource (tag 459).
-        pub fn underlying_security_alt_idsource(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_security_alt_idsource(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(459).map(|field| text(field, FieldType::String)).transpose()
         }
     }
@@ -5570,12 +5570,12 @@ pub mod views {
         }
 
         /// UnderlyingStipType (tag 888). Required.
-        pub fn underlying_stip_type(&self) -> Result<&'a str, DecodeError> {
+        pub fn underlying_stip_type(&self) -> ::core::result::Result<&'a str, DecodeError> {
             text(required(self.entry.get(888), 888)?, FieldType::String)
         }
 
         /// UnderlyingStipValue (tag 889).
-        pub fn underlying_stip_value(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn underlying_stip_value(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(889).map(|field| text(field, FieldType::String)).transpose()
         }
     }
@@ -5606,12 +5606,12 @@ pub mod views {
         }
 
         /// StipulationType (tag 233). Required.
-        pub fn stipulation_type(&self) -> Result<enums::StipulationType<'a>, DecodeError> {
+        pub fn stipulation_type(&self) -> ::core::result::Result<enums::StipulationType<'a>, DecodeError> {
             required(self.entry.get(233), 233).map(|field| enums::StipulationType::from_bytes(field.value))
         }
 
         /// StipulationValue (tag 234).
-        pub fn stipulation_value(&self) -> Result<Option<&'a str>, DecodeError> {
+        pub fn stipulation_value(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.entry.get(234).map(|field| text(field, FieldType::String)).transpose()
         }
     }
@@ -5670,7 +5670,7 @@ pub mod writers {
         fn data(&mut self, length_tag: u32, data_tag: u32, value: &[u8]);
     }
 
-    impl<F: FnMut(u32, &[u8]) + ?Sized> Sink for F {
+    impl<F: ::core::ops::FnMut(u32, &[u8]) + ?::core::marker::Sized> Sink for F {
         fn field(&mut self, tag: u32, value: &[u8]) {
             self(tag, value);
         }
@@ -5700,7 +5700,7 @@ pub mod writers {
     }
 
     /// Returns the missing-field error of `tag` unless the field is present.
-    fn present(present: bool, tag: u32) -> Result<(), EncodeError> {
+    fn present(present: bool, tag: u32) -> ::core::result::Result<(), EncodeError> {
         if present {
             Ok(())
         } else {
@@ -5709,12 +5709,12 @@ pub mod writers {
     }
 
     /// Builds the invalid-value error of `tag`.
-    fn invalid(tag: u32, reason: String) -> EncodeError {
+    fn invalid(tag: u32, reason: ::std::string::String) -> EncodeError {
         EncodeError::InvalidFieldValue { tag, reason }
     }
 
     /// Refuses an empty value, or one carrying SOH, which would end the field early.
-    fn check_text(value: Option<&[u8]>, tag: u32) -> Result<(), EncodeError> {
+    fn check_text(value: ::core::option::Option<&[u8]>, tag: u32) -> ::core::result::Result<(), EncodeError> {
         match value {
             Some([]) => Err(invalid(tag, "the value is empty".to_string())),
             Some(value) if value.contains(&0x01) => Err(invalid(tag, "the value contains SOH".to_string())),
@@ -5723,7 +5723,7 @@ pub mod writers {
     }
 
     /// Refuses an empty data value. It may carry SOH: it is written with its length.
-    fn check_data(value: Option<&[u8]>, tag: u32) -> Result<(), EncodeError> {
+    fn check_data(value: ::core::option::Option<&[u8]>, tag: u32) -> ::core::result::Result<(), EncodeError> {
         match value {
             Some([]) => Err(invalid(tag, "the value is empty".to_string())),
             _ => Ok(()),
@@ -5731,7 +5731,7 @@ pub mod writers {
     }
 
     /// Refuses a character that is not printable ASCII (a control character includes SOH).
-    fn check_char(value: Option<char>, tag: u32) -> Result<(), EncodeError> {
+    fn check_char(value: ::core::option::Option<char>, tag: u32) -> ::core::result::Result<(), EncodeError> {
         match value {
             Some(value) if !value.is_ascii() || value.is_ascii_control() => Err(invalid(tag, format!("{value:?} is not a printable ASCII character"))),
             _ => Ok(()),
@@ -5739,7 +5739,7 @@ pub mod writers {
     }
 
     /// Refuses an empty token, or one carrying a space (the separator) or SOH.
-    fn check_token(value: &[u8], tag: u32) -> Result<(), EncodeError> {
+    fn check_token(value: &[u8], tag: u32) -> ::core::result::Result<(), EncodeError> {
         match value {
             [] => Err(invalid(tag, "a token is empty".to_string())),
             value if value.contains(&b' ') => Err(invalid(tag, "a token contains a space".to_string())),
@@ -5750,7 +5750,7 @@ pub mod writers {
 
     /// Refuses a value that does not match the grammar of `field_type`, the rule the validator
     /// applies.
-    fn check_grammar(value: Option<&[u8]>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {
+    fn check_grammar(value: ::core::option::Option<&[u8]>, field_type: FieldType, tag: u32) -> ::core::result::Result<(), EncodeError> {
         let Some(bytes) = value else {
             return Ok(());
         };
@@ -5777,7 +5777,7 @@ pub mod writers {
     }
 
     /// Formats `value` on the stack and writes it as field `tag`.
-    fn put_display<S: Sink + ?Sized, T: ::core::fmt::Display>(sink: &mut S, tag: u32, value: T) -> Result<(), EncodeError> {
+    fn put_display<S: Sink + ?::core::marker::Sized, T: ::core::fmt::Display>(sink: &mut S, tag: u32, value: T) -> ::core::result::Result<(), EncodeError> {
         let mut buffer = Buffer { bytes: [0; 64], len: 0 };
         let written = ::core::fmt::Write::write_fmt(&mut buffer, format_args!("{value}"));
         match (written, buffer.bytes.get(..buffer.len)) {
@@ -5794,7 +5794,7 @@ pub mod writers {
 
     /// Refuses a number whose decimal form does not match the grammar of `field_type` (a
     /// `DayOfMonth` outside 1 to 31).
-    fn check_number<T: ::core::fmt::Display>(value: Option<T>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {
+    fn check_number<T: ::core::fmt::Display>(value: ::core::option::Option<T>, field_type: FieldType, tag: u32) -> ::core::result::Result<(), EncodeError> {
         let Some(value) = value else {
             return Ok(());
         };
@@ -5811,7 +5811,7 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct HeartbeatFields<'v> {
         /// TestReqID (tag 112).
-        pub test_req_id: Option<&'v str>,
+        pub test_req_id: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for HeartbeatFields<'_> {
@@ -5830,20 +5830,20 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             check_text(self.test_req_id.map(str::as_bytes), 112)?;
             check_grammar(self.test_req_id.map(str::as_bytes), FieldType::String, 112)?;
             Ok(())
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.test_req_id { sink.field(112, value.as_bytes()); }
             Ok(())
         }
@@ -5853,25 +5853,25 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct LogonFields<'v> {
         /// EncryptMethod (tag 98). Required.
-        pub encrypt_method: Option<enums::EncryptMethod<'v>>,
+        pub encrypt_method: ::core::option::Option<enums::EncryptMethod<'v>>,
         /// HeartBtInt (tag 108). Required.
-        pub heart_bt_int: Option<i64>,
+        pub heart_bt_int: ::core::option::Option<i64>,
         /// RawData (tag 96). Written with its length (tag 95), which is derived from it.
-        pub raw_data: Option<&'v [u8]>,
+        pub raw_data: ::core::option::Option<&'v [u8]>,
         /// ResetSeqNumFlag (tag 141).
-        pub reset_seq_num_flag: Option<bool>,
+        pub reset_seq_num_flag: ::core::option::Option<bool>,
         /// NextExpectedMsgSeqNum (tag 789).
-        pub next_expected_msg_seq_num: Option<u64>,
+        pub next_expected_msg_seq_num: ::core::option::Option<u64>,
         /// MaxMessageSize (tag 383).
-        pub max_message_size: Option<u64>,
+        pub max_message_size: ::core::option::Option<u64>,
         /// NoMsgTypes (tag 384) repeating group: one item per entry, empty when absent.
         pub no_msg_types: &'v [LogonNoMsgTypesFields<'v>],
         /// TestMessageIndicator (tag 464).
-        pub test_message_indicator: Option<bool>,
+        pub test_message_indicator: ::core::option::Option<bool>,
         /// Username (tag 553).
-        pub username: Option<&'v str>,
+        pub username: ::core::option::Option<&'v str>,
         /// Password (tag 554).
-        pub password: Option<&'v str>,
+        pub password: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for LogonFields<'_> {
@@ -5890,13 +5890,13 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.encrypt_method.is_some(), 98)?;
             check_text(self.encrypt_method.map(|value| value.as_bytes()), 98)?;
             check_grammar(self.encrypt_method.map(|value| value.as_bytes()), FieldType::Int, 98)?;
@@ -5915,7 +5915,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.encrypt_method { sink.field(98, value.as_bytes()); }
             if let Some(value) = self.heart_bt_int { put_display(sink, 108, value)?; }
             if let Some(value) = self.raw_data { sink.data(95, 96, value); }
@@ -5939,311 +5939,311 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct NewOrderSingleFields<'v> {
         /// ClOrdID (tag 11). Required.
-        pub cl_ord_id: Option<&'v str>,
+        pub cl_ord_id: ::core::option::Option<&'v str>,
         /// SecondaryClOrdID (tag 526).
-        pub secondary_cl_ord_id: Option<&'v str>,
+        pub secondary_cl_ord_id: ::core::option::Option<&'v str>,
         /// ClOrdLinkID (tag 583).
-        pub cl_ord_link_id: Option<&'v str>,
+        pub cl_ord_link_id: ::core::option::Option<&'v str>,
         /// NoPartyIDs (tag 453) repeating group: one item per entry, empty when absent.
         pub no_party_ids: &'v [PartiesNoPartyIDsFields<'v>],
         /// TradeOriginationDate (tag 229).
-        pub trade_origination_date: Option<&'v str>,
+        pub trade_origination_date: ::core::option::Option<&'v str>,
         /// TradeDate (tag 75).
-        pub trade_date: Option<&'v str>,
+        pub trade_date: ::core::option::Option<&'v str>,
         /// Account (tag 1).
-        pub account: Option<&'v str>,
+        pub account: ::core::option::Option<&'v str>,
         /// AcctIDSource (tag 660).
-        pub acct_idsource: Option<enums::AcctIDSource<'v>>,
+        pub acct_idsource: ::core::option::Option<enums::AcctIDSource<'v>>,
         /// AccountType (tag 581).
-        pub account_type: Option<enums::AccountType<'v>>,
+        pub account_type: ::core::option::Option<enums::AccountType<'v>>,
         /// DayBookingInst (tag 589).
-        pub day_booking_inst: Option<enums::DayBookingInst<'v>>,
+        pub day_booking_inst: ::core::option::Option<enums::DayBookingInst<'v>>,
         /// BookingUnit (tag 590).
-        pub booking_unit: Option<enums::BookingUnit<'v>>,
+        pub booking_unit: ::core::option::Option<enums::BookingUnit<'v>>,
         /// PreallocMethod (tag 591).
-        pub prealloc_method: Option<enums::PreallocMethod<'v>>,
+        pub prealloc_method: ::core::option::Option<enums::PreallocMethod<'v>>,
         /// AllocID (tag 70).
-        pub alloc_id: Option<&'v str>,
+        pub alloc_id: ::core::option::Option<&'v str>,
         /// NoAllocs (tag 78) repeating group: one item per entry, empty when absent.
         pub no_allocs: &'v [PreAllocGrpNoAllocsFields<'v>],
         /// SettlType (tag 63).
-        pub settl_type: Option<enums::SettlType<'v>>,
+        pub settl_type: ::core::option::Option<enums::SettlType<'v>>,
         /// SettlDate (tag 64).
-        pub settl_date: Option<&'v str>,
+        pub settl_date: ::core::option::Option<&'v str>,
         /// CashMargin (tag 544).
-        pub cash_margin: Option<enums::CashMargin<'v>>,
+        pub cash_margin: ::core::option::Option<enums::CashMargin<'v>>,
         /// ClearingFeeIndicator (tag 635).
-        pub clearing_fee_indicator: Option<enums::ClearingFeeIndicator<'v>>,
+        pub clearing_fee_indicator: ::core::option::Option<enums::ClearingFeeIndicator<'v>>,
         /// HandlInst (tag 21).
-        pub handl_inst: Option<enums::HandlInst<'v>>,
+        pub handl_inst: ::core::option::Option<enums::HandlInst<'v>>,
         /// ExecInst (tag 18). Empty when absent.
         pub exec_inst: &'v [enums::ExecInst<'v>],
         /// MinQty (tag 110).
-        pub min_qty: Option<Decimal>,
+        pub min_qty: ::core::option::Option<Decimal>,
         /// MaxFloor (tag 111).
-        pub max_floor: Option<Decimal>,
+        pub max_floor: ::core::option::Option<Decimal>,
         /// ExDestination (tag 100).
-        pub ex_destination: Option<&'v str>,
+        pub ex_destination: ::core::option::Option<&'v str>,
         /// NoTradingSessions (tag 386) repeating group: one item per entry, empty when absent.
         pub no_trading_sessions: &'v [TrdgSesGrpNoTradingSessionsFields<'v>],
         /// ProcessCode (tag 81).
-        pub process_code: Option<enums::ProcessCode<'v>>,
+        pub process_code: ::core::option::Option<enums::ProcessCode<'v>>,
         /// Symbol (tag 55).
-        pub symbol: Option<&'v str>,
+        pub symbol: ::core::option::Option<&'v str>,
         /// SymbolSfx (tag 65).
-        pub symbol_sfx: Option<&'v str>,
+        pub symbol_sfx: ::core::option::Option<&'v str>,
         /// SecurityID (tag 48).
-        pub security_id: Option<&'v str>,
+        pub security_id: ::core::option::Option<&'v str>,
         /// SecurityIDSource (tag 22).
-        pub security_idsource: Option<enums::SecurityIDSource<'v>>,
+        pub security_idsource: ::core::option::Option<enums::SecurityIDSource<'v>>,
         /// NoSecurityAltID (tag 454) repeating group: one item per entry, empty when absent.
         pub no_security_alt_id: &'v [SecAltIDGrpNoSecurityAltIDFields<'v>],
         /// Product (tag 460).
-        pub product: Option<enums::Product<'v>>,
+        pub product: ::core::option::Option<enums::Product<'v>>,
         /// CFICode (tag 461).
-        pub cficode: Option<&'v str>,
+        pub cficode: ::core::option::Option<&'v str>,
         /// SecurityType (tag 167).
-        pub security_type: Option<enums::SecurityType<'v>>,
+        pub security_type: ::core::option::Option<enums::SecurityType<'v>>,
         /// SecuritySubType (tag 762).
-        pub security_sub_type: Option<&'v str>,
+        pub security_sub_type: ::core::option::Option<&'v str>,
         /// MaturityMonthYear (tag 200).
-        pub maturity_month_year: Option<&'v str>,
+        pub maturity_month_year: ::core::option::Option<&'v str>,
         /// MaturityDate (tag 541).
-        pub maturity_date: Option<&'v str>,
+        pub maturity_date: ::core::option::Option<&'v str>,
         /// PutOrCall (tag 201).
-        pub put_or_call: Option<enums::PutOrCall<'v>>,
+        pub put_or_call: ::core::option::Option<enums::PutOrCall<'v>>,
         /// CouponPaymentDate (tag 224).
-        pub coupon_payment_date: Option<&'v str>,
+        pub coupon_payment_date: ::core::option::Option<&'v str>,
         /// IssueDate (tag 225).
-        pub issue_date: Option<&'v str>,
+        pub issue_date: ::core::option::Option<&'v str>,
         /// RepoCollateralSecurityType (tag 239).
-        pub repo_collateral_security_type: Option<&'v str>,
+        pub repo_collateral_security_type: ::core::option::Option<&'v str>,
         /// RepurchaseTerm (tag 226).
-        pub repurchase_term: Option<i64>,
+        pub repurchase_term: ::core::option::Option<i64>,
         /// RepurchaseRate (tag 227).
-        pub repurchase_rate: Option<Decimal>,
+        pub repurchase_rate: ::core::option::Option<Decimal>,
         /// Factor (tag 228).
-        pub factor: Option<Decimal>,
+        pub factor: ::core::option::Option<Decimal>,
         /// CreditRating (tag 255).
-        pub credit_rating: Option<&'v str>,
+        pub credit_rating: ::core::option::Option<&'v str>,
         /// InstrRegistry (tag 543).
-        pub instr_registry: Option<&'v str>,
+        pub instr_registry: ::core::option::Option<&'v str>,
         /// CountryOfIssue (tag 470).
-        pub country_of_issue: Option<&'v str>,
+        pub country_of_issue: ::core::option::Option<&'v str>,
         /// StateOrProvinceOfIssue (tag 471).
-        pub state_or_province_of_issue: Option<&'v str>,
+        pub state_or_province_of_issue: ::core::option::Option<&'v str>,
         /// LocaleOfIssue (tag 472).
-        pub locale_of_issue: Option<&'v str>,
+        pub locale_of_issue: ::core::option::Option<&'v str>,
         /// RedemptionDate (tag 240).
-        pub redemption_date: Option<&'v str>,
+        pub redemption_date: ::core::option::Option<&'v str>,
         /// StrikePrice (tag 202).
-        pub strike_price: Option<Decimal>,
+        pub strike_price: ::core::option::Option<Decimal>,
         /// StrikeCurrency (tag 947).
-        pub strike_currency: Option<&'v str>,
+        pub strike_currency: ::core::option::Option<&'v str>,
         /// OptAttribute (tag 206).
-        pub opt_attribute: Option<char>,
+        pub opt_attribute: ::core::option::Option<char>,
         /// ContractMultiplier (tag 231).
-        pub contract_multiplier: Option<Decimal>,
+        pub contract_multiplier: ::core::option::Option<Decimal>,
         /// CouponRate (tag 223).
-        pub coupon_rate: Option<Decimal>,
+        pub coupon_rate: ::core::option::Option<Decimal>,
         /// SecurityExchange (tag 207).
-        pub security_exchange: Option<&'v str>,
+        pub security_exchange: ::core::option::Option<&'v str>,
         /// Issuer (tag 106).
-        pub issuer: Option<&'v str>,
+        pub issuer: ::core::option::Option<&'v str>,
         /// EncodedIssuer (tag 349). Written with its length (tag 348), which is derived from it.
-        pub encoded_issuer: Option<&'v [u8]>,
+        pub encoded_issuer: ::core::option::Option<&'v [u8]>,
         /// SecurityDesc (tag 107).
-        pub security_desc: Option<&'v str>,
+        pub security_desc: ::core::option::Option<&'v str>,
         /// EncodedSecurityDesc (tag 351). Written with its length (tag 350), which is derived from it.
-        pub encoded_security_desc: Option<&'v [u8]>,
+        pub encoded_security_desc: ::core::option::Option<&'v [u8]>,
         /// Pool (tag 691).
-        pub pool: Option<&'v str>,
+        pub pool: ::core::option::Option<&'v str>,
         /// ContractSettlMonth (tag 667).
-        pub contract_settl_month: Option<&'v str>,
+        pub contract_settl_month: ::core::option::Option<&'v str>,
         /// CPProgram (tag 875).
-        pub cpprogram: Option<enums::CPProgram<'v>>,
+        pub cpprogram: ::core::option::Option<enums::CPProgram<'v>>,
         /// CPRegType (tag 876).
-        pub cpreg_type: Option<&'v str>,
+        pub cpreg_type: ::core::option::Option<&'v str>,
         /// NoEvents (tag 864) repeating group: one item per entry, empty when absent.
         pub no_events: &'v [EvntGrpNoEventsFields<'v>],
         /// DatedDate (tag 873).
-        pub dated_date: Option<&'v str>,
+        pub dated_date: ::core::option::Option<&'v str>,
         /// InterestAccrualDate (tag 874).
-        pub interest_accrual_date: Option<&'v str>,
+        pub interest_accrual_date: ::core::option::Option<&'v str>,
         /// AgreementDesc (tag 913).
-        pub agreement_desc: Option<&'v str>,
+        pub agreement_desc: ::core::option::Option<&'v str>,
         /// AgreementID (tag 914).
-        pub agreement_id: Option<&'v str>,
+        pub agreement_id: ::core::option::Option<&'v str>,
         /// AgreementDate (tag 915).
-        pub agreement_date: Option<&'v str>,
+        pub agreement_date: ::core::option::Option<&'v str>,
         /// AgreementCurrency (tag 918).
-        pub agreement_currency: Option<&'v str>,
+        pub agreement_currency: ::core::option::Option<&'v str>,
         /// TerminationType (tag 788).
-        pub termination_type: Option<enums::TerminationType<'v>>,
+        pub termination_type: ::core::option::Option<enums::TerminationType<'v>>,
         /// StartDate (tag 916).
-        pub start_date: Option<&'v str>,
+        pub start_date: ::core::option::Option<&'v str>,
         /// EndDate (tag 917).
-        pub end_date: Option<&'v str>,
+        pub end_date: ::core::option::Option<&'v str>,
         /// DeliveryType (tag 919).
-        pub delivery_type: Option<enums::DeliveryType<'v>>,
+        pub delivery_type: ::core::option::Option<enums::DeliveryType<'v>>,
         /// MarginRatio (tag 898).
-        pub margin_ratio: Option<Decimal>,
+        pub margin_ratio: ::core::option::Option<Decimal>,
         /// NoUnderlyings (tag 711) repeating group: one item per entry, empty when absent.
         pub no_underlyings: &'v [UndInstrmtGrpNoUnderlyingsFields<'v>],
         /// PrevClosePx (tag 140).
-        pub prev_close_px: Option<Decimal>,
+        pub prev_close_px: ::core::option::Option<Decimal>,
         /// Side (tag 54). Required.
-        pub side: Option<enums::Side<'v>>,
+        pub side: ::core::option::Option<enums::Side<'v>>,
         /// LocateReqd (tag 114).
-        pub locate_reqd: Option<bool>,
+        pub locate_reqd: ::core::option::Option<bool>,
         /// TransactTime (tag 60). Required.
-        pub transact_time: Option<&'v str>,
+        pub transact_time: ::core::option::Option<&'v str>,
         /// NoStipulations (tag 232) repeating group: one item per entry, empty when absent.
         pub no_stipulations: &'v [StipulationsNoStipulationsFields<'v>],
         /// QtyType (tag 854).
-        pub qty_type: Option<enums::QtyType<'v>>,
+        pub qty_type: ::core::option::Option<enums::QtyType<'v>>,
         /// OrderQty (tag 38).
-        pub order_qty: Option<Decimal>,
+        pub order_qty: ::core::option::Option<Decimal>,
         /// CashOrderQty (tag 152).
-        pub cash_order_qty: Option<Decimal>,
+        pub cash_order_qty: ::core::option::Option<Decimal>,
         /// OrderPercent (tag 516).
-        pub order_percent: Option<Decimal>,
+        pub order_percent: ::core::option::Option<Decimal>,
         /// RoundingDirection (tag 468).
-        pub rounding_direction: Option<enums::RoundingDirection<'v>>,
+        pub rounding_direction: ::core::option::Option<enums::RoundingDirection<'v>>,
         /// RoundingModulus (tag 469).
-        pub rounding_modulus: Option<Decimal>,
+        pub rounding_modulus: ::core::option::Option<Decimal>,
         /// OrdType (tag 40). Required.
-        pub ord_type: Option<enums::OrdType<'v>>,
+        pub ord_type: ::core::option::Option<enums::OrdType<'v>>,
         /// PriceType (tag 423).
-        pub price_type: Option<enums::PriceType<'v>>,
+        pub price_type: ::core::option::Option<enums::PriceType<'v>>,
         /// Price (tag 44).
-        pub price: Option<Decimal>,
+        pub price: ::core::option::Option<Decimal>,
         /// StopPx (tag 99).
-        pub stop_px: Option<Decimal>,
+        pub stop_px: ::core::option::Option<Decimal>,
         /// Spread (tag 218).
-        pub spread: Option<Decimal>,
+        pub spread: ::core::option::Option<Decimal>,
         /// BenchmarkCurveCurrency (tag 220).
-        pub benchmark_curve_currency: Option<&'v str>,
+        pub benchmark_curve_currency: ::core::option::Option<&'v str>,
         /// BenchmarkCurveName (tag 221).
-        pub benchmark_curve_name: Option<&'v str>,
+        pub benchmark_curve_name: ::core::option::Option<&'v str>,
         /// BenchmarkCurvePoint (tag 222).
-        pub benchmark_curve_point: Option<&'v str>,
+        pub benchmark_curve_point: ::core::option::Option<&'v str>,
         /// BenchmarkPrice (tag 662).
-        pub benchmark_price: Option<Decimal>,
+        pub benchmark_price: ::core::option::Option<Decimal>,
         /// BenchmarkPriceType (tag 663).
-        pub benchmark_price_type: Option<i64>,
+        pub benchmark_price_type: ::core::option::Option<i64>,
         /// BenchmarkSecurityID (tag 699).
-        pub benchmark_security_id: Option<&'v str>,
+        pub benchmark_security_id: ::core::option::Option<&'v str>,
         /// BenchmarkSecurityIDSource (tag 761).
-        pub benchmark_security_idsource: Option<&'v str>,
+        pub benchmark_security_idsource: ::core::option::Option<&'v str>,
         /// YieldType (tag 235).
-        pub yield_type: Option<enums::YieldType<'v>>,
+        pub yield_type: ::core::option::Option<enums::YieldType<'v>>,
         /// Yield (tag 236).
-        pub r#yield: Option<Decimal>,
+        pub r#yield: ::core::option::Option<Decimal>,
         /// YieldCalcDate (tag 701).
-        pub yield_calc_date: Option<&'v str>,
+        pub yield_calc_date: ::core::option::Option<&'v str>,
         /// YieldRedemptionDate (tag 696).
-        pub yield_redemption_date: Option<&'v str>,
+        pub yield_redemption_date: ::core::option::Option<&'v str>,
         /// YieldRedemptionPrice (tag 697).
-        pub yield_redemption_price: Option<Decimal>,
+        pub yield_redemption_price: ::core::option::Option<Decimal>,
         /// YieldRedemptionPriceType (tag 698).
-        pub yield_redemption_price_type: Option<i64>,
+        pub yield_redemption_price_type: ::core::option::Option<i64>,
         /// Currency (tag 15).
-        pub currency: Option<&'v str>,
+        pub currency: ::core::option::Option<&'v str>,
         /// ComplianceID (tag 376).
-        pub compliance_id: Option<&'v str>,
+        pub compliance_id: ::core::option::Option<&'v str>,
         /// SolicitedFlag (tag 377).
-        pub solicited_flag: Option<bool>,
+        pub solicited_flag: ::core::option::Option<bool>,
         /// IOIID (tag 23).
-        pub ioiid: Option<&'v str>,
+        pub ioiid: ::core::option::Option<&'v str>,
         /// QuoteID (tag 117).
-        pub quote_id: Option<&'v str>,
+        pub quote_id: ::core::option::Option<&'v str>,
         /// TimeInForce (tag 59).
-        pub time_in_force: Option<enums::TimeInForce<'v>>,
+        pub time_in_force: ::core::option::Option<enums::TimeInForce<'v>>,
         /// EffectiveTime (tag 168).
-        pub effective_time: Option<&'v str>,
+        pub effective_time: ::core::option::Option<&'v str>,
         /// ExpireDate (tag 432).
-        pub expire_date: Option<&'v str>,
+        pub expire_date: ::core::option::Option<&'v str>,
         /// ExpireTime (tag 126).
-        pub expire_time: Option<&'v str>,
+        pub expire_time: ::core::option::Option<&'v str>,
         /// GTBookingInst (tag 427).
-        pub gtbooking_inst: Option<enums::GTBookingInst<'v>>,
+        pub gtbooking_inst: ::core::option::Option<enums::GTBookingInst<'v>>,
         /// Commission (tag 12).
-        pub commission: Option<Decimal>,
+        pub commission: ::core::option::Option<Decimal>,
         /// CommType (tag 13).
-        pub comm_type: Option<enums::CommType<'v>>,
+        pub comm_type: ::core::option::Option<enums::CommType<'v>>,
         /// CommCurrency (tag 479).
-        pub comm_currency: Option<&'v str>,
+        pub comm_currency: ::core::option::Option<&'v str>,
         /// FundRenewWaiv (tag 497).
-        pub fund_renew_waiv: Option<enums::FundRenewWaiv<'v>>,
+        pub fund_renew_waiv: ::core::option::Option<enums::FundRenewWaiv<'v>>,
         /// OrderCapacity (tag 528).
-        pub order_capacity: Option<enums::OrderCapacity<'v>>,
+        pub order_capacity: ::core::option::Option<enums::OrderCapacity<'v>>,
         /// OrderRestrictions (tag 529). Empty when absent.
         pub order_restrictions: &'v [enums::OrderRestrictions<'v>],
         /// CustOrderCapacity (tag 582).
-        pub cust_order_capacity: Option<enums::CustOrderCapacity<'v>>,
+        pub cust_order_capacity: ::core::option::Option<enums::CustOrderCapacity<'v>>,
         /// ForexReq (tag 121).
-        pub forex_req: Option<bool>,
+        pub forex_req: ::core::option::Option<bool>,
         /// SettlCurrency (tag 120).
-        pub settl_currency: Option<&'v str>,
+        pub settl_currency: ::core::option::Option<&'v str>,
         /// BookingType (tag 775).
-        pub booking_type: Option<enums::BookingType<'v>>,
+        pub booking_type: ::core::option::Option<enums::BookingType<'v>>,
         /// Text (tag 58).
-        pub text: Option<&'v str>,
+        pub text: ::core::option::Option<&'v str>,
         /// EncodedText (tag 355). Written with its length (tag 354), which is derived from it.
-        pub encoded_text: Option<&'v [u8]>,
+        pub encoded_text: ::core::option::Option<&'v [u8]>,
         /// SettlDate2 (tag 193).
-        pub settl_date2: Option<&'v str>,
+        pub settl_date2: ::core::option::Option<&'v str>,
         /// OrderQty2 (tag 192).
-        pub order_qty2: Option<Decimal>,
+        pub order_qty2: ::core::option::Option<Decimal>,
         /// Price2 (tag 640).
-        pub price2: Option<Decimal>,
+        pub price2: ::core::option::Option<Decimal>,
         /// PositionEffect (tag 77).
-        pub position_effect: Option<enums::PositionEffect<'v>>,
+        pub position_effect: ::core::option::Option<enums::PositionEffect<'v>>,
         /// CoveredOrUncovered (tag 203).
-        pub covered_or_uncovered: Option<enums::CoveredOrUncovered<'v>>,
+        pub covered_or_uncovered: ::core::option::Option<enums::CoveredOrUncovered<'v>>,
         /// MaxShow (tag 210).
-        pub max_show: Option<Decimal>,
+        pub max_show: ::core::option::Option<Decimal>,
         /// PegOffsetValue (tag 211).
-        pub peg_offset_value: Option<Decimal>,
+        pub peg_offset_value: ::core::option::Option<Decimal>,
         /// PegMoveType (tag 835).
-        pub peg_move_type: Option<enums::PegMoveType<'v>>,
+        pub peg_move_type: ::core::option::Option<enums::PegMoveType<'v>>,
         /// PegOffsetType (tag 836).
-        pub peg_offset_type: Option<enums::PegOffsetType<'v>>,
+        pub peg_offset_type: ::core::option::Option<enums::PegOffsetType<'v>>,
         /// PegLimitType (tag 837).
-        pub peg_limit_type: Option<enums::PegLimitType<'v>>,
+        pub peg_limit_type: ::core::option::Option<enums::PegLimitType<'v>>,
         /// PegRoundDirection (tag 838).
-        pub peg_round_direction: Option<enums::PegRoundDirection<'v>>,
+        pub peg_round_direction: ::core::option::Option<enums::PegRoundDirection<'v>>,
         /// PegScope (tag 840).
-        pub peg_scope: Option<enums::PegScope<'v>>,
+        pub peg_scope: ::core::option::Option<enums::PegScope<'v>>,
         /// DiscretionInst (tag 388).
-        pub discretion_inst: Option<enums::DiscretionInst<'v>>,
+        pub discretion_inst: ::core::option::Option<enums::DiscretionInst<'v>>,
         /// DiscretionOffsetValue (tag 389).
-        pub discretion_offset_value: Option<Decimal>,
+        pub discretion_offset_value: ::core::option::Option<Decimal>,
         /// DiscretionMoveType (tag 841).
-        pub discretion_move_type: Option<enums::DiscretionMoveType<'v>>,
+        pub discretion_move_type: ::core::option::Option<enums::DiscretionMoveType<'v>>,
         /// DiscretionOffsetType (tag 842).
-        pub discretion_offset_type: Option<enums::DiscretionOffsetType<'v>>,
+        pub discretion_offset_type: ::core::option::Option<enums::DiscretionOffsetType<'v>>,
         /// DiscretionLimitType (tag 843).
-        pub discretion_limit_type: Option<enums::DiscretionLimitType<'v>>,
+        pub discretion_limit_type: ::core::option::Option<enums::DiscretionLimitType<'v>>,
         /// DiscretionRoundDirection (tag 844).
-        pub discretion_round_direction: Option<enums::DiscretionRoundDirection<'v>>,
+        pub discretion_round_direction: ::core::option::Option<enums::DiscretionRoundDirection<'v>>,
         /// DiscretionScope (tag 846).
-        pub discretion_scope: Option<enums::DiscretionScope<'v>>,
+        pub discretion_scope: ::core::option::Option<enums::DiscretionScope<'v>>,
         /// TargetStrategy (tag 847).
-        pub target_strategy: Option<enums::TargetStrategy<'v>>,
+        pub target_strategy: ::core::option::Option<enums::TargetStrategy<'v>>,
         /// TargetStrategyParameters (tag 848).
-        pub target_strategy_parameters: Option<&'v str>,
+        pub target_strategy_parameters: ::core::option::Option<&'v str>,
         /// ParticipationRate (tag 849).
-        pub participation_rate: Option<Decimal>,
+        pub participation_rate: ::core::option::Option<Decimal>,
         /// CancellationRights (tag 480).
-        pub cancellation_rights: Option<enums::CancellationRights<'v>>,
+        pub cancellation_rights: ::core::option::Option<enums::CancellationRights<'v>>,
         /// MoneyLaunderingStatus (tag 481).
-        pub money_laundering_status: Option<enums::MoneyLaunderingStatus<'v>>,
+        pub money_laundering_status: ::core::option::Option<enums::MoneyLaunderingStatus<'v>>,
         /// RegistID (tag 513).
-        pub regist_id: Option<&'v str>,
+        pub regist_id: ::core::option::Option<&'v str>,
         /// Designation (tag 494).
-        pub designation: Option<&'v str>,
+        pub designation: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for NewOrderSingleFields<'_> {
@@ -6262,13 +6262,13 @@ pub mod writers {
         /// value other than data, a value that does not match its field's FIX type, a `char` that
         /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
         }
 
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.cl_ord_id.is_some(), 11)?;
             check_text(self.cl_ord_id.map(str::as_bytes), 11)?;
             check_grammar(self.cl_ord_id.map(str::as_bytes), FieldType::String, 11)?;
@@ -6526,7 +6526,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.cl_ord_id { sink.field(11, value.as_bytes()); }
             if let Some(value) = self.secondary_cl_ord_id { sink.field(526, value.as_bytes()); }
             if let Some(value) = self.cl_ord_link_id { sink.field(583, value.as_bytes()); }
@@ -6723,9 +6723,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct LogonNoMsgTypesFields<'v> {
         /// RefMsgType (tag 372). Required.
-        pub ref_msg_type: Option<&'v str>,
+        pub ref_msg_type: ::core::option::Option<&'v str>,
         /// MsgDirection (tag 385).
-        pub msg_direction: Option<enums::MsgDirection<'v>>,
+        pub msg_direction: ::core::option::Option<enums::MsgDirection<'v>>,
     }
 
     impl ::core::fmt::Debug for LogonNoMsgTypesFields<'_> {
@@ -6736,7 +6736,7 @@ pub mod writers {
 
     impl LogonNoMsgTypesFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.ref_msg_type.is_some(), 372)?;
             check_text(self.ref_msg_type.map(str::as_bytes), 372)?;
             check_grammar(self.ref_msg_type.map(str::as_bytes), FieldType::String, 372)?;
@@ -6746,7 +6746,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.ref_msg_type { sink.field(372, value.as_bytes()); }
             if let Some(value) = self.msg_direction { sink.field(385, value.as_bytes()); }
             Ok(())
@@ -6757,11 +6757,11 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct PartiesNoPartyIDsFields<'v> {
         /// PartyID (tag 448). Required.
-        pub party_id: Option<&'v str>,
+        pub party_id: ::core::option::Option<&'v str>,
         /// PartyIDSource (tag 447).
-        pub party_idsource: Option<enums::PartyIDSource<'v>>,
+        pub party_idsource: ::core::option::Option<enums::PartyIDSource<'v>>,
         /// PartyRole (tag 452).
-        pub party_role: Option<enums::PartyRole<'v>>,
+        pub party_role: ::core::option::Option<enums::PartyRole<'v>>,
         /// NoPartySubIDs (tag 802) repeating group: one item per entry, empty when absent.
         pub no_party_sub_ids: &'v [PtysSubGrpNoPartySubIDsFields<'v>],
     }
@@ -6774,7 +6774,7 @@ pub mod writers {
 
     impl PartiesNoPartyIDsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.party_id.is_some(), 448)?;
             check_text(self.party_id.map(str::as_bytes), 448)?;
             check_grammar(self.party_id.map(str::as_bytes), FieldType::String, 448)?;
@@ -6789,7 +6789,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.party_id { sink.field(448, value.as_bytes()); }
             if let Some(value) = self.party_idsource { sink.field(447, value.as_bytes()); }
             if let Some(value) = self.party_role { sink.field(452, value.as_bytes()); }
@@ -6807,9 +6807,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct PtysSubGrpNoPartySubIDsFields<'v> {
         /// PartySubID (tag 523). Required.
-        pub party_sub_id: Option<&'v str>,
+        pub party_sub_id: ::core::option::Option<&'v str>,
         /// PartySubIDType (tag 803).
-        pub party_sub_idtype: Option<enums::PartySubIDType<'v>>,
+        pub party_sub_idtype: ::core::option::Option<enums::PartySubIDType<'v>>,
     }
 
     impl ::core::fmt::Debug for PtysSubGrpNoPartySubIDsFields<'_> {
@@ -6820,7 +6820,7 @@ pub mod writers {
 
     impl PtysSubGrpNoPartySubIDsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.party_sub_id.is_some(), 523)?;
             check_text(self.party_sub_id.map(str::as_bytes), 523)?;
             check_grammar(self.party_sub_id.map(str::as_bytes), FieldType::String, 523)?;
@@ -6830,7 +6830,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.party_sub_id { sink.field(523, value.as_bytes()); }
             if let Some(value) = self.party_sub_idtype { sink.field(803, value.as_bytes()); }
             Ok(())
@@ -6841,17 +6841,17 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct PreAllocGrpNoAllocsFields<'v> {
         /// AllocAccount (tag 79). Required.
-        pub alloc_account: Option<&'v str>,
+        pub alloc_account: ::core::option::Option<&'v str>,
         /// AllocAcctIDSource (tag 661).
-        pub alloc_acct_idsource: Option<i64>,
+        pub alloc_acct_idsource: ::core::option::Option<i64>,
         /// AllocSettlCurrency (tag 736).
-        pub alloc_settl_currency: Option<&'v str>,
+        pub alloc_settl_currency: ::core::option::Option<&'v str>,
         /// IndividualAllocID (tag 467).
-        pub individual_alloc_id: Option<&'v str>,
+        pub individual_alloc_id: ::core::option::Option<&'v str>,
         /// NoNestedPartyIDs (tag 539) repeating group: one item per entry, empty when absent.
         pub no_nested_party_ids: &'v [NestedPartiesNoNestedPartyIDsFields<'v>],
         /// AllocQty (tag 80).
-        pub alloc_qty: Option<Decimal>,
+        pub alloc_qty: ::core::option::Option<Decimal>,
     }
 
     impl ::core::fmt::Debug for PreAllocGrpNoAllocsFields<'_> {
@@ -6862,7 +6862,7 @@ pub mod writers {
 
     impl PreAllocGrpNoAllocsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.alloc_account.is_some(), 79)?;
             check_text(self.alloc_account.map(str::as_bytes), 79)?;
             check_grammar(self.alloc_account.map(str::as_bytes), FieldType::String, 79)?;
@@ -6877,7 +6877,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.alloc_account { sink.field(79, value.as_bytes()); }
             if let Some(value) = self.alloc_acct_idsource { put_display(sink, 661, value)?; }
             if let Some(value) = self.alloc_settl_currency { sink.field(736, value.as_bytes()); }
@@ -6897,11 +6897,11 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct NestedPartiesNoNestedPartyIDsFields<'v> {
         /// NestedPartyID (tag 524). Required.
-        pub nested_party_id: Option<&'v str>,
+        pub nested_party_id: ::core::option::Option<&'v str>,
         /// NestedPartyIDSource (tag 525).
-        pub nested_party_idsource: Option<char>,
+        pub nested_party_idsource: ::core::option::Option<char>,
         /// NestedPartyRole (tag 538).
-        pub nested_party_role: Option<i64>,
+        pub nested_party_role: ::core::option::Option<i64>,
         /// NoNestedPartySubIDs (tag 804) repeating group: one item per entry, empty when absent.
         pub no_nested_party_sub_ids: &'v [NstdPtysSubGrpNoNestedPartySubIDsFields<'v>],
     }
@@ -6914,7 +6914,7 @@ pub mod writers {
 
     impl NestedPartiesNoNestedPartyIDsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.nested_party_id.is_some(), 524)?;
             check_text(self.nested_party_id.map(str::as_bytes), 524)?;
             check_grammar(self.nested_party_id.map(str::as_bytes), FieldType::String, 524)?;
@@ -6926,7 +6926,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.nested_party_id { sink.field(524, value.as_bytes()); }
             if let Some(value) = self.nested_party_idsource { sink.field(525, value.encode_utf8(&mut [0; 4]).as_bytes()); }
             if let Some(value) = self.nested_party_role { put_display(sink, 538, value)?; }
@@ -6944,9 +6944,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct NstdPtysSubGrpNoNestedPartySubIDsFields<'v> {
         /// NestedPartySubID (tag 545). Required.
-        pub nested_party_sub_id: Option<&'v str>,
+        pub nested_party_sub_id: ::core::option::Option<&'v str>,
         /// NestedPartySubIDType (tag 805).
-        pub nested_party_sub_idtype: Option<i64>,
+        pub nested_party_sub_idtype: ::core::option::Option<i64>,
     }
 
     impl ::core::fmt::Debug for NstdPtysSubGrpNoNestedPartySubIDsFields<'_> {
@@ -6957,7 +6957,7 @@ pub mod writers {
 
     impl NstdPtysSubGrpNoNestedPartySubIDsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.nested_party_sub_id.is_some(), 545)?;
             check_text(self.nested_party_sub_id.map(str::as_bytes), 545)?;
             check_grammar(self.nested_party_sub_id.map(str::as_bytes), FieldType::String, 545)?;
@@ -6965,7 +6965,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.nested_party_sub_id { sink.field(545, value.as_bytes()); }
             if let Some(value) = self.nested_party_sub_idtype { put_display(sink, 805, value)?; }
             Ok(())
@@ -6976,9 +6976,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct TrdgSesGrpNoTradingSessionsFields<'v> {
         /// TradingSessionID (tag 336). Required.
-        pub trading_session_id: Option<&'v str>,
+        pub trading_session_id: ::core::option::Option<&'v str>,
         /// TradingSessionSubID (tag 625).
-        pub trading_session_sub_id: Option<&'v str>,
+        pub trading_session_sub_id: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for TrdgSesGrpNoTradingSessionsFields<'_> {
@@ -6989,7 +6989,7 @@ pub mod writers {
 
     impl TrdgSesGrpNoTradingSessionsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.trading_session_id.is_some(), 336)?;
             check_text(self.trading_session_id.map(str::as_bytes), 336)?;
             check_grammar(self.trading_session_id.map(str::as_bytes), FieldType::String, 336)?;
@@ -6999,7 +6999,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.trading_session_id { sink.field(336, value.as_bytes()); }
             if let Some(value) = self.trading_session_sub_id { sink.field(625, value.as_bytes()); }
             Ok(())
@@ -7010,9 +7010,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct SecAltIDGrpNoSecurityAltIDFields<'v> {
         /// SecurityAltID (tag 455). Required.
-        pub security_alt_id: Option<&'v str>,
+        pub security_alt_id: ::core::option::Option<&'v str>,
         /// SecurityAltIDSource (tag 456).
-        pub security_alt_idsource: Option<&'v str>,
+        pub security_alt_idsource: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for SecAltIDGrpNoSecurityAltIDFields<'_> {
@@ -7023,7 +7023,7 @@ pub mod writers {
 
     impl SecAltIDGrpNoSecurityAltIDFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.security_alt_id.is_some(), 455)?;
             check_text(self.security_alt_id.map(str::as_bytes), 455)?;
             check_grammar(self.security_alt_id.map(str::as_bytes), FieldType::String, 455)?;
@@ -7033,7 +7033,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.security_alt_id { sink.field(455, value.as_bytes()); }
             if let Some(value) = self.security_alt_idsource { sink.field(456, value.as_bytes()); }
             Ok(())
@@ -7044,13 +7044,13 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct EvntGrpNoEventsFields<'v> {
         /// EventType (tag 865). Required.
-        pub event_type: Option<enums::EventType<'v>>,
+        pub event_type: ::core::option::Option<enums::EventType<'v>>,
         /// EventDate (tag 866).
-        pub event_date: Option<&'v str>,
+        pub event_date: ::core::option::Option<&'v str>,
         /// EventPx (tag 867).
-        pub event_px: Option<Decimal>,
+        pub event_px: ::core::option::Option<Decimal>,
         /// EventText (tag 868).
-        pub event_text: Option<&'v str>,
+        pub event_text: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for EvntGrpNoEventsFields<'_> {
@@ -7061,7 +7061,7 @@ pub mod writers {
 
     impl EvntGrpNoEventsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.event_type.is_some(), 865)?;
             check_text(self.event_type.map(|value| value.as_bytes()), 865)?;
             check_grammar(self.event_type.map(|value| value.as_bytes()), FieldType::Int, 865)?;
@@ -7073,7 +7073,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.event_type { sink.field(865, value.as_bytes()); }
             if let Some(value) = self.event_date { sink.field(866, value.as_bytes()); }
             if let Some(value) = self.event_px { put_display(sink, 867, value)?; }
@@ -7086,93 +7086,93 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct UndInstrmtGrpNoUnderlyingsFields<'v> {
         /// UnderlyingSymbol (tag 311). Required.
-        pub underlying_symbol: Option<&'v str>,
+        pub underlying_symbol: ::core::option::Option<&'v str>,
         /// UnderlyingSymbolSfx (tag 312).
-        pub underlying_symbol_sfx: Option<&'v str>,
+        pub underlying_symbol_sfx: ::core::option::Option<&'v str>,
         /// UnderlyingSecurityID (tag 309).
-        pub underlying_security_id: Option<&'v str>,
+        pub underlying_security_id: ::core::option::Option<&'v str>,
         /// UnderlyingSecurityIDSource (tag 305).
-        pub underlying_security_idsource: Option<&'v str>,
+        pub underlying_security_idsource: ::core::option::Option<&'v str>,
         /// NoUnderlyingSecurityAltID (tag 457) repeating group: one item per entry, empty when absent.
         pub no_underlying_security_alt_id: &'v [UndSecAltIDGrpNoUnderlyingSecurityAltIDFields<'v>],
         /// UnderlyingProduct (tag 462).
-        pub underlying_product: Option<i64>,
+        pub underlying_product: ::core::option::Option<i64>,
         /// UnderlyingCFICode (tag 463).
-        pub underlying_cficode: Option<&'v str>,
+        pub underlying_cficode: ::core::option::Option<&'v str>,
         /// UnderlyingSecurityType (tag 310).
-        pub underlying_security_type: Option<&'v str>,
+        pub underlying_security_type: ::core::option::Option<&'v str>,
         /// UnderlyingSecuritySubType (tag 763).
-        pub underlying_security_sub_type: Option<&'v str>,
+        pub underlying_security_sub_type: ::core::option::Option<&'v str>,
         /// UnderlyingMaturityMonthYear (tag 313).
-        pub underlying_maturity_month_year: Option<&'v str>,
+        pub underlying_maturity_month_year: ::core::option::Option<&'v str>,
         /// UnderlyingMaturityDate (tag 542).
-        pub underlying_maturity_date: Option<&'v str>,
+        pub underlying_maturity_date: ::core::option::Option<&'v str>,
         /// UnderlyingPutOrCall (tag 315).
-        pub underlying_put_or_call: Option<i64>,
+        pub underlying_put_or_call: ::core::option::Option<i64>,
         /// UnderlyingCouponPaymentDate (tag 241).
-        pub underlying_coupon_payment_date: Option<&'v str>,
+        pub underlying_coupon_payment_date: ::core::option::Option<&'v str>,
         /// UnderlyingIssueDate (tag 242).
-        pub underlying_issue_date: Option<&'v str>,
+        pub underlying_issue_date: ::core::option::Option<&'v str>,
         /// UnderlyingRepoCollateralSecurityType (tag 243).
-        pub underlying_repo_collateral_security_type: Option<&'v str>,
+        pub underlying_repo_collateral_security_type: ::core::option::Option<&'v str>,
         /// UnderlyingRepurchaseTerm (tag 244).
-        pub underlying_repurchase_term: Option<i64>,
+        pub underlying_repurchase_term: ::core::option::Option<i64>,
         /// UnderlyingRepurchaseRate (tag 245).
-        pub underlying_repurchase_rate: Option<Decimal>,
+        pub underlying_repurchase_rate: ::core::option::Option<Decimal>,
         /// UnderlyingFactor (tag 246).
-        pub underlying_factor: Option<Decimal>,
+        pub underlying_factor: ::core::option::Option<Decimal>,
         /// UnderlyingCreditRating (tag 256).
-        pub underlying_credit_rating: Option<&'v str>,
+        pub underlying_credit_rating: ::core::option::Option<&'v str>,
         /// UnderlyingInstrRegistry (tag 595).
-        pub underlying_instr_registry: Option<&'v str>,
+        pub underlying_instr_registry: ::core::option::Option<&'v str>,
         /// UnderlyingCountryOfIssue (tag 592).
-        pub underlying_country_of_issue: Option<&'v str>,
+        pub underlying_country_of_issue: ::core::option::Option<&'v str>,
         /// UnderlyingStateOrProvinceOfIssue (tag 593).
-        pub underlying_state_or_province_of_issue: Option<&'v str>,
+        pub underlying_state_or_province_of_issue: ::core::option::Option<&'v str>,
         /// UnderlyingLocaleOfIssue (tag 594).
-        pub underlying_locale_of_issue: Option<&'v str>,
+        pub underlying_locale_of_issue: ::core::option::Option<&'v str>,
         /// UnderlyingRedemptionDate (tag 247).
-        pub underlying_redemption_date: Option<&'v str>,
+        pub underlying_redemption_date: ::core::option::Option<&'v str>,
         /// UnderlyingStrikePrice (tag 316).
-        pub underlying_strike_price: Option<Decimal>,
+        pub underlying_strike_price: ::core::option::Option<Decimal>,
         /// UnderlyingStrikeCurrency (tag 941).
-        pub underlying_strike_currency: Option<&'v str>,
+        pub underlying_strike_currency: ::core::option::Option<&'v str>,
         /// UnderlyingOptAttribute (tag 317).
-        pub underlying_opt_attribute: Option<char>,
+        pub underlying_opt_attribute: ::core::option::Option<char>,
         /// UnderlyingContractMultiplier (tag 436).
-        pub underlying_contract_multiplier: Option<Decimal>,
+        pub underlying_contract_multiplier: ::core::option::Option<Decimal>,
         /// UnderlyingCouponRate (tag 435).
-        pub underlying_coupon_rate: Option<Decimal>,
+        pub underlying_coupon_rate: ::core::option::Option<Decimal>,
         /// UnderlyingSecurityExchange (tag 308).
-        pub underlying_security_exchange: Option<&'v str>,
+        pub underlying_security_exchange: ::core::option::Option<&'v str>,
         /// UnderlyingIssuer (tag 306).
-        pub underlying_issuer: Option<&'v str>,
+        pub underlying_issuer: ::core::option::Option<&'v str>,
         /// EncodedUnderlyingIssuer (tag 363). Written with its length (tag 362), which is derived from it.
-        pub encoded_underlying_issuer: Option<&'v [u8]>,
+        pub encoded_underlying_issuer: ::core::option::Option<&'v [u8]>,
         /// UnderlyingSecurityDesc (tag 307).
-        pub underlying_security_desc: Option<&'v str>,
+        pub underlying_security_desc: ::core::option::Option<&'v str>,
         /// EncodedUnderlyingSecurityDesc (tag 365). Written with its length (tag 364), which is derived from it.
-        pub encoded_underlying_security_desc: Option<&'v [u8]>,
+        pub encoded_underlying_security_desc: ::core::option::Option<&'v [u8]>,
         /// UnderlyingCPProgram (tag 877).
-        pub underlying_cpprogram: Option<&'v str>,
+        pub underlying_cpprogram: ::core::option::Option<&'v str>,
         /// UnderlyingCPRegType (tag 878).
-        pub underlying_cpreg_type: Option<&'v str>,
+        pub underlying_cpreg_type: ::core::option::Option<&'v str>,
         /// UnderlyingCurrency (tag 318).
-        pub underlying_currency: Option<&'v str>,
+        pub underlying_currency: ::core::option::Option<&'v str>,
         /// UnderlyingQty (tag 879).
-        pub underlying_qty: Option<Decimal>,
+        pub underlying_qty: ::core::option::Option<Decimal>,
         /// UnderlyingPx (tag 810).
-        pub underlying_px: Option<Decimal>,
+        pub underlying_px: ::core::option::Option<Decimal>,
         /// UnderlyingDirtyPrice (tag 882).
-        pub underlying_dirty_price: Option<Decimal>,
+        pub underlying_dirty_price: ::core::option::Option<Decimal>,
         /// UnderlyingEndPrice (tag 883).
-        pub underlying_end_price: Option<Decimal>,
+        pub underlying_end_price: ::core::option::Option<Decimal>,
         /// UnderlyingStartValue (tag 884).
-        pub underlying_start_value: Option<Decimal>,
+        pub underlying_start_value: ::core::option::Option<Decimal>,
         /// UnderlyingCurrentValue (tag 885).
-        pub underlying_current_value: Option<Decimal>,
+        pub underlying_current_value: ::core::option::Option<Decimal>,
         /// UnderlyingEndValue (tag 886).
-        pub underlying_end_value: Option<Decimal>,
+        pub underlying_end_value: ::core::option::Option<Decimal>,
         /// NoUnderlyingStips (tag 887) repeating group: one item per entry, empty when absent.
         pub no_underlying_stips: &'v [UnderlyingStipulationsNoUnderlyingStipsFields<'v>],
     }
@@ -7185,7 +7185,7 @@ pub mod writers {
 
     impl UndInstrmtGrpNoUnderlyingsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.underlying_symbol.is_some(), 311)?;
             check_text(self.underlying_symbol.map(str::as_bytes), 311)?;
             check_grammar(self.underlying_symbol.map(str::as_bytes), FieldType::String, 311)?;
@@ -7250,7 +7250,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.underlying_symbol { sink.field(311, value.as_bytes()); }
             if let Some(value) = self.underlying_symbol_sfx { sink.field(312, value.as_bytes()); }
             if let Some(value) = self.underlying_security_id { sink.field(309, value.as_bytes()); }
@@ -7314,9 +7314,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct UndSecAltIDGrpNoUnderlyingSecurityAltIDFields<'v> {
         /// UnderlyingSecurityAltID (tag 458). Required.
-        pub underlying_security_alt_id: Option<&'v str>,
+        pub underlying_security_alt_id: ::core::option::Option<&'v str>,
         /// UnderlyingSecurityAltIDSource (tag 459).
-        pub underlying_security_alt_idsource: Option<&'v str>,
+        pub underlying_security_alt_idsource: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for UndSecAltIDGrpNoUnderlyingSecurityAltIDFields<'_> {
@@ -7327,7 +7327,7 @@ pub mod writers {
 
     impl UndSecAltIDGrpNoUnderlyingSecurityAltIDFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.underlying_security_alt_id.is_some(), 458)?;
             check_text(self.underlying_security_alt_id.map(str::as_bytes), 458)?;
             check_grammar(self.underlying_security_alt_id.map(str::as_bytes), FieldType::String, 458)?;
@@ -7337,7 +7337,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.underlying_security_alt_id { sink.field(458, value.as_bytes()); }
             if let Some(value) = self.underlying_security_alt_idsource { sink.field(459, value.as_bytes()); }
             Ok(())
@@ -7348,9 +7348,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct UnderlyingStipulationsNoUnderlyingStipsFields<'v> {
         /// UnderlyingStipType (tag 888). Required.
-        pub underlying_stip_type: Option<&'v str>,
+        pub underlying_stip_type: ::core::option::Option<&'v str>,
         /// UnderlyingStipValue (tag 889).
-        pub underlying_stip_value: Option<&'v str>,
+        pub underlying_stip_value: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for UnderlyingStipulationsNoUnderlyingStipsFields<'_> {
@@ -7361,7 +7361,7 @@ pub mod writers {
 
     impl UnderlyingStipulationsNoUnderlyingStipsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.underlying_stip_type.is_some(), 888)?;
             check_text(self.underlying_stip_type.map(str::as_bytes), 888)?;
             check_grammar(self.underlying_stip_type.map(str::as_bytes), FieldType::String, 888)?;
@@ -7371,7 +7371,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.underlying_stip_type { sink.field(888, value.as_bytes()); }
             if let Some(value) = self.underlying_stip_value { sink.field(889, value.as_bytes()); }
             Ok(())
@@ -7382,9 +7382,9 @@ pub mod writers {
     #[derive(Clone, Copy, Default)]
     pub struct StipulationsNoStipulationsFields<'v> {
         /// StipulationType (tag 233). Required.
-        pub stipulation_type: Option<enums::StipulationType<'v>>,
+        pub stipulation_type: ::core::option::Option<enums::StipulationType<'v>>,
         /// StipulationValue (tag 234).
-        pub stipulation_value: Option<&'v str>,
+        pub stipulation_value: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for StipulationsNoStipulationsFields<'_> {
@@ -7395,7 +7395,7 @@ pub mod writers {
 
     impl StipulationsNoStipulationsFields<'_> {
         /// Checks required fields, groups and entries before anything is written.
-        fn check(&self) -> Result<(), EncodeError> {
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.stipulation_type.is_some(), 233)?;
             check_text(self.stipulation_type.map(|value| value.as_bytes()), 233)?;
             check_grammar(self.stipulation_type.map(|value| value.as_bytes()), FieldType::String, 233)?;
@@ -7405,7 +7405,7 @@ pub mod writers {
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
-        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.stipulation_type { sink.field(233, value.as_bytes()); }
             if let Some(value) = self.stipulation_value { sink.field(234, value.as_bytes()); }
             Ok(())

@@ -1523,8 +1523,11 @@ fn emit_enum(code: &mut String, model: &EnumModel) {
             "        /// Joins values into a multi-value field, separated by spaces. Allocates the joined value.",
         );
         line(code, "        #[must_use]");
-        line(code, "        pub fn join(values: &[Self]) -> Vec<u8> {");
-        line(code, "            let mut joined = Vec::new();");
+        line(
+            code,
+            "        pub fn join(values: &[Self]) -> ::std::vec::Vec<u8> {",
+        );
+        line(code, "            let mut joined = ::std::vec::Vec::new();");
         line(
             code,
             "            for (index, value) in values.iter().enumerate() {",
@@ -1828,7 +1831,7 @@ fn emit_views(code: &mut String, model: &Model, visibility: &str) {
         );
         line(
             code,
-            "    fn required<'m, 'a>(field: Option<&'m FieldRef<'a>>, tag: u32) -> Result<&'m FieldRef<'a>, DecodeError> {",
+            "    fn required<'m, 'a>(field: ::core::option::Option<&'m FieldRef<'a>>, tag: u32) -> ::core::result::Result<&'m FieldRef<'a>, DecodeError> {",
         );
         line(
             code,
@@ -1841,7 +1844,7 @@ fn emit_views(code: &mut String, model: &Model, visibility: &str) {
             "",
             "    /// Returns the text of `field`, checked against the grammar of `field_type`: the rule the",
             "    /// validator applies.",
-            "    fn text<'a>(field: &FieldRef<'a>, field_type: FieldType) -> Result<&'a str, DecodeError> {",
+            "    fn text<'a>(field: &FieldRef<'a>, field_type: FieldType) -> ::core::result::Result<&'a str, DecodeError> {",
             "        let value = field.as_str()?;",
             "        if field_type.is_valid_value(value) {",
             "            Ok(value)",
@@ -1865,7 +1868,7 @@ fn emit_views(code: &mut String, model: &Model, visibility: &str) {
         line(
             code,
             &format!(
-                "    fn {name}(field: &FieldRef<'_>, field_type: FieldType) -> Result<{ty}, DecodeError> {{"
+                "    fn {name}(field: &FieldRef<'_>, field_type: FieldType) -> ::core::result::Result<{ty}, DecodeError> {{"
             ),
         );
         if body.contains("value") {
@@ -1948,7 +1951,7 @@ fn emit_message_view(code: &mut String, model: &Model, message: &MessageModel) {
     line(code, "        #[must_use]");
     line(
         code,
-        "        pub fn from_message(msg: &'m RawMessage<'a>) -> Option<Self> {",
+        "        pub fn from_message(msg: &'m RawMessage<'a>) -> ::core::option::Option<Self> {",
     );
     line(
         code,
@@ -1980,7 +1983,7 @@ fn emit_message_view(code: &mut String, model: &Model, message: &MessageModel) {
         );
         line(
             code,
-            "        fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {",
+            "        fn get(&self, tag: u32) -> ::core::option::Option<&'m FieldRef<'a>> {",
         );
         line(
             code,
@@ -2083,7 +2086,7 @@ fn emit_accessor(
             line(
                 code,
                 &format!(
-                    "        pub fn {ident}(&self) -> Result<Option<Entries<'m, 'a, {}View<'m, 'a>>>, GroupError> {{",
+                    "        pub fn {ident}(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, {}View<'m, 'a>>>, GroupError> {{",
                     site.base
                 ),
             );
@@ -2110,12 +2113,14 @@ fn emit_accessor(
                 (Some((convert, ty)), _) => {
                     if field.required {
                         (
-                            format!("Result<{ty}, DecodeError>"),
+                            format!("::core::result::Result<{ty}, DecodeError>"),
                             format!("{convert}({present}?, {grammar})"),
                         )
                     } else {
                         (
-                            format!("Result<Option<{ty}>, DecodeError>"),
+                            format!(
+                                "::core::result::Result<::core::option::Option<{ty}>, DecodeError>"
+                            ),
                             format!(
                                 "{lookup}.map(|field| {convert}(field, {grammar})).transpose()"
                             ),
@@ -2138,12 +2143,14 @@ fn emit_accessor(
                         format!("map(|value| enums::{enum_name}::tokens(value.as_bytes()))");
                     if field.required {
                         (
-                            format!("Result<{ty}, DecodeError>"),
+                            format!("::core::result::Result<{ty}, DecodeError>"),
                             format!("text({present}?, {grammar}).{tokens}"),
                         )
                     } else {
                         (
-                            format!("Result<Option<{ty}>, DecodeError>"),
+                            format!(
+                                "::core::result::Result<::core::option::Option<{ty}>, DecodeError>"
+                            ),
                             format!(
                                 "{lookup}.map(|field| text(field, {grammar}).{tokens}).transpose()"
                             ),
@@ -2159,7 +2166,7 @@ fn emit_accessor(
                 ),
             };
             line(code, &format!("        /// {doc}"));
-            if !ret.starts_with("Result") {
+            if !ret.starts_with("::core::result::Result") {
                 line(code, "        #[must_use]");
             }
             line(code, &format!("        pub fn {ident}(&self) -> {ret} {{"));
@@ -2179,11 +2186,14 @@ fn infallible(
 ) -> (String, String) {
     if required {
         (
-            format!("Result<{ty}, DecodeError>"),
+            format!("::core::result::Result<{ty}, DecodeError>"),
             format!("{present}.{map}"),
         )
     } else {
-        (format!("Option<{ty}>"), format!("{lookup}.{map}"))
+        (
+            format!("::core::option::Option<{ty}>"),
+            format!("{lookup}.{map}"),
+        )
     }
 }
 
@@ -2265,7 +2275,7 @@ const WRITER_CHECKS: [(&str, &str, &str, &[&str]); 4] = [
     (
         "check_text",
         "Refuses an empty value, or one carrying SOH, which would end the field early.",
-        "Option<&[u8]>",
+        "::core::option::Option<&[u8]>",
         &[
             "Some([]) => Err(invalid(tag, \"the value is empty\".to_string())),",
             "Some(value) if value.contains(&0x01) => Err(invalid(tag, \"the value contains SOH\".to_string())),",
@@ -2274,13 +2284,13 @@ const WRITER_CHECKS: [(&str, &str, &str, &[&str]); 4] = [
     (
         "check_data",
         "Refuses an empty data value. It may carry SOH: it is written with its length.",
-        "Option<&[u8]>",
+        "::core::option::Option<&[u8]>",
         &["Some([]) => Err(invalid(tag, \"the value is empty\".to_string())),"],
     ),
     (
         "check_char",
         "Refuses a character that is not printable ASCII (a control character includes SOH).",
-        "Option<char>",
+        "::core::option::Option<char>",
         &[
             "Some(value) if !value.is_ascii() || value.is_ascii_control() => Err(invalid(tag, format!(\"{value:?} is not a printable ASCII character\"))),",
         ],
@@ -2331,7 +2341,7 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
         for text in [
             "",
             "    /// Returns the missing-field error of `tag` unless the field is present.",
-            "    fn present(present: bool, tag: u32) -> Result<(), EncodeError> {",
+            "    fn present(present: bool, tag: u32) -> ::core::result::Result<(), EncodeError> {",
             "        if present {",
             "            Ok(())",
             "        } else {",
@@ -2347,7 +2357,7 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
         for text in [
             "",
             "    /// Builds the invalid-value error of `tag`.",
-            "    fn invalid(tag: u32, reason: String) -> EncodeError {",
+            "    fn invalid(tag: u32, reason: ::std::string::String) -> EncodeError {",
             "        EncodeError::InvalidFieldValue { tag, reason }",
             "    }",
         ] {
@@ -2362,7 +2372,9 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
         line(code, &format!("    /// {doc}"));
         line(
             code,
-            &format!("    fn {name}(value: {parameter}, tag: u32) -> Result<(), EncodeError> {{"),
+            &format!(
+                "    fn {name}(value: {parameter}, tag: u32) -> ::core::result::Result<(), EncodeError> {{"
+            ),
         );
         line(code, "        match value {");
         for refusal in refusals {
@@ -2377,7 +2389,7 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
             "",
             "    /// Refuses a value that does not match the grammar of `field_type`, the rule the validator",
             "    /// applies.",
-            "    fn check_grammar(value: Option<&[u8]>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {",
+            "    fn check_grammar(value: ::core::option::Option<&[u8]>, field_type: FieldType, tag: u32) -> ::core::result::Result<(), EncodeError> {",
             "        let Some(bytes) = value else {",
             "            return Ok(());",
             "        };",
@@ -2400,7 +2412,7 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
             "",
             "    /// Refuses a number whose decimal form does not match the grammar of `field_type` (a",
             "    /// `DayOfMonth` outside 1 to 31).",
-            "    fn check_number<T: ::core::fmt::Display>(value: Option<T>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {",
+            "    fn check_number<T: ::core::fmt::Display>(value: ::core::option::Option<T>, field_type: FieldType, tag: u32) -> ::core::result::Result<(), EncodeError> {",
             "        let Some(value) = value else {",
             "            return Ok(());",
             "        };",
@@ -2484,7 +2496,7 @@ fn emit_sink(code: &mut String) {
         "        fn data(&mut self, length_tag: u32, data_tag: u32, value: &[u8]);",
         "    }",
         "",
-        "    impl<F: FnMut(u32, &[u8]) + ?Sized> Sink for F {",
+        "    impl<F: ::core::ops::FnMut(u32, &[u8]) + ?::core::marker::Sized> Sink for F {",
         "        fn field(&mut self, tag: u32, value: &[u8]) {",
         "            self(tag, value);",
         "        }",
@@ -2559,7 +2571,7 @@ fn emit_display_helper(code: &mut String) {
     );
     line(
         code,
-        "    fn put_display<S: Sink + ?Sized, T: ::core::fmt::Display>(sink: &mut S, tag: u32, value: T) -> Result<(), EncodeError> {",
+        "    fn put_display<S: Sink + ?::core::marker::Sized, T: ::core::fmt::Display>(sink: &mut S, tag: u32, value: T) -> ::core::result::Result<(), EncodeError> {",
     );
     line(
         code,
@@ -2617,14 +2629,17 @@ fn writer_type(model: &Model, member: &Member) -> String {
             }
         }
         Member::Field(field) => match field.kind {
-            Kind::Str => "Option<&'v str>".to_string(),
-            Kind::Bytes => "Option<&'v [u8]>".to_string(),
-            Kind::Char => "Option<char>".to_string(),
-            Kind::Bool => "Option<bool>".to_string(),
-            Kind::Int => "Option<i64>".to_string(),
-            Kind::UInt => "Option<u64>".to_string(),
-            Kind::Decimal => "Option<Decimal>".to_string(),
-            Kind::Enum(tag) => format!("Option<enums::{}<'v>>", model.enum_name(tag)),
+            Kind::Str => "::core::option::Option<&'v str>".to_string(),
+            Kind::Bytes => "::core::option::Option<&'v [u8]>".to_string(),
+            Kind::Char => "::core::option::Option<char>".to_string(),
+            Kind::Bool => "::core::option::Option<bool>".to_string(),
+            Kind::Int => "::core::option::Option<i64>".to_string(),
+            Kind::UInt => "::core::option::Option<u64>".to_string(),
+            Kind::Decimal => "::core::option::Option<Decimal>".to_string(),
+            Kind::Enum(tag) => format!(
+                "::core::option::Option<enums::{}<'v>>",
+                model.enum_name(tag)
+            ),
             Kind::Tokens(tag) => format!("&'v [enums::{}<'v>]", model.enum_name(tag)),
         },
     }
@@ -2827,13 +2842,13 @@ fn emit_writer(
         if emits.is_empty() {
             line(
                 code,
-                "        pub fn write<S: Sink + ?Sized>(&self, _sink: &mut S) -> Result<(), EncodeError> {",
+                "        pub fn write<S: Sink + ?::core::marker::Sized>(&self, _sink: &mut S) -> ::core::result::Result<(), EncodeError> {",
             );
             line(code, "            Ok(())");
         } else {
             line(
                 code,
-                "        pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {",
+                "        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {",
             );
             if !checks.is_empty() {
                 line(code, "            self.check()?;");
@@ -2850,7 +2865,10 @@ fn emit_writer(
             code,
             "        /// Checks required fields, groups and entries before anything is written.",
         );
-        line(code, "        fn check(&self) -> Result<(), EncodeError> {");
+        line(
+            code,
+            "        fn check(&self) -> ::core::result::Result<(), EncodeError> {",
+        );
         for statement in &checks {
             line(code, &format!("            {statement}"));
         }
@@ -2865,7 +2883,7 @@ fn emit_writer(
         );
         line(
             code,
-            "        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {",
+            "        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {",
         );
         for statement in &emits {
             line(code, &format!("            {statement}"));
@@ -3106,8 +3124,8 @@ mod tests {
             "(it calls GroupSet::field, GroupSet::with_level_tags and FieldType::is_valid_value)."
         ));
         assert!(fix44.contains("pub struct NewOrderSingleFields<'v> {"));
-        assert!(fix44.contains("pub fn price(&self) -> Result<Option<Decimal>, DecodeError> {"));
-        assert!(fix44.contains("pub price: Option<Decimal>,"));
+        assert!(fix44.contains("pub fn price(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {"));
+        assert!(fix44.contains("pub price: ::core::option::Option<Decimal>,"));
         // One view per group definition: Parties is used by many messages.
         assert_eq!(
             fix44
@@ -3214,7 +3232,9 @@ mod tests {
         // The delimiter opens every entry, so its writer requires it even
         // though the dictionary marks it optional.
         assert!(code.contains("present(self.alloc_account.is_some(), 79)?;"));
-        assert!(code.contains("pub fn alloc_account(&self) -> Result<&'a str, DecodeError> {"));
+        assert!(code.contains(
+            "pub fn alloc_account(&self) -> ::core::result::Result<&'a str, DecodeError> {"
+        ));
     }
 
     #[test]
@@ -3232,7 +3252,11 @@ mod tests {
         assert!(!code.contains("pub raw_data_length:"));
         // The view reads both.
         assert!(code.contains("pub fn raw_data_length(&self)"));
-        assert!(code.contains("pub fn raw_data(&self) -> Result<&'a [u8], DecodeError> {"));
+        assert!(
+            code.contains(
+                "pub fn raw_data(&self) -> ::core::result::Result<&'a [u8], DecodeError> {"
+            )
+        );
     }
 
     /// A NoAllocs group with the given delimiter and fields.
@@ -3268,8 +3292,14 @@ mod tests {
         let account = entry.find("sink.field(79, value.as_bytes());");
         assert!(pair.is_some() && pair < account, "the pair opens the entry");
         // The view reads the delimiter and requires the data.
-        assert!(code.contains("pub fn raw_data_length(&self) -> Result<u64, DecodeError> {"));
-        assert!(code.contains("pub fn raw_data(&self) -> Result<&'a [u8], DecodeError> {"));
+        assert!(code.contains(
+            "pub fn raw_data_length(&self) -> ::core::result::Result<u64, DecodeError> {"
+        ));
+        assert!(
+            code.contains(
+                "pub fn raw_data(&self) -> ::core::result::Result<&'a [u8], DecodeError> {"
+            )
+        );
         assert!(!code.contains("pub raw_data_length:"));
     }
 

@@ -299,7 +299,7 @@ impl CodeGenerator {
             line(
                 &mut code,
                 &format!(
-                    "{} type {DECIMAL_ALIAS} = rust_decimal::Decimal;",
+                    "{} type {DECIMAL_ALIAS} = ::rust_decimal::Decimal;",
                     self.config.visibility
                 ),
             );
@@ -697,7 +697,7 @@ impl CodeGenerator {
                             def.name, def.count_tag
                         ),
                         name: ident,
-                        ty: wrap_optional(&format!("Vec<{entry_name}>"), *required),
+                        ty: wrap_optional(&format!("::std::vec::Vec<{entry_name}>"), *required),
                         uses_decimal: false,
                     });
                 }
@@ -771,7 +771,7 @@ fn wrap_optional(ty: &str, required: bool) -> String {
     if required {
         ty.to_string()
     } else {
-        format!("Option<{ty}>")
+        format!("::core::option::Option<{ty}>")
     }
 }
 
@@ -978,8 +978,8 @@ fn field_type_to_rust(field_type: FieldType) -> &'static str {
         | FieldType::LocalMktTime
         | FieldType::TzTimeOnly
         | FieldType::TzTimestamp
-        | FieldType::Reserved => "String",
-        FieldType::Data | FieldType::XmlData => "Vec<u8>",
+        | FieldType::Reserved => "::std::string::String",
+        FieldType::Data | FieldType::XmlData => "::std::vec::Vec<u8>",
     }
 }
 
@@ -1049,10 +1049,10 @@ mod tests {
     #[test]
     fn test_generate_fix44_maps_price_and_qty_to_decimal() {
         let code = generate(&CodeGenerator::new(), fix44());
-        assert!(code.contains("pub type FixDecimal = rust_decimal::Decimal;"));
+        assert!(code.contains("pub type FixDecimal = ::rust_decimal::Decimal;"));
         // Price (44) and OrderQty (38) both reach NewOrderSingle directly.
-        assert!(code.contains("pub price: Option<FixDecimal>,"));
-        assert!(code.contains("pub order_qty: Option<FixDecimal>,"));
+        assert!(code.contains("pub price: ::core::option::Option<FixDecimal>,"));
+        assert!(code.contains("pub order_qty: ::core::option::Option<FixDecimal>,"));
         // A price must never be binary floating point.
         assert!(!code.contains("f64"));
         assert!(!code.contains("f32"));
@@ -1070,9 +1070,9 @@ mod tests {
     fn test_generate_fix44_wraps_optional_fields_and_leaves_required_bare() {
         let code = generate(&CodeGenerator::new(), fix44());
         // ClOrdID (11) is required in NewOrderSingle.
-        assert!(code.contains("pub cl_ord_id: String,"));
+        assert!(code.contains("pub cl_ord_id: ::std::string::String,"));
         // Account (1) is optional there.
-        assert!(code.contains("pub account: Option<String>,"));
+        assert!(code.contains("pub account: ::core::option::Option<::std::string::String>,"));
     }
 
     #[test]
@@ -1100,7 +1100,7 @@ mod tests {
     fn test_generate_fix44_emits_a_struct_per_repeating_group_entry() {
         let code = generate(&CodeGenerator::new(), fix44());
         assert!(code.contains("pub struct NewOrderSingleNoAllocsEntry {"));
-        assert!(code.contains("Vec<NewOrderSingleNoAllocsEntry>"));
+        assert!(code.contains("::std::vec::Vec<NewOrderSingleNoAllocsEntry>"));
     }
 
     #[test]
@@ -1253,13 +1253,16 @@ mod tests {
             embedded(Dictionary::fix42(), "FIX 4.2"),
         );
         assert!(code.starts_with("// Generated FIX.4.2 definitions."));
-        assert!(code.contains("pub type FixDecimal = rust_decimal::Decimal;"));
+        assert!(code.contains("pub type FixDecimal = ::rust_decimal::Decimal;"));
         let body = struct_body(&code, "NewOrderSingle");
         // HandlInst(21) is required in FIX 4.2 NewOrderSingle.
         assert!(body.contains("pub handl_inst: char,"), "{body}");
-        assert!(body.contains("pub price: Option<FixDecimal>,"), "{body}");
         assert!(
-            body.contains("pub order_qty: Option<FixDecimal>,"),
+            body.contains("pub price: ::core::option::Option<FixDecimal>,"),
+            "{body}"
+        );
+        assert!(
+            body.contains("pub order_qty: ::core::option::Option<FixDecimal>,"),
             "{body}"
         );
         assert!(!code.contains("f64"));
@@ -1277,7 +1280,7 @@ mod tests {
         assert!(!code.contains("FixDecimal"));
         let logon = struct_body(&code, "Logon");
         assert!(
-            logon.contains("pub default_appl_ver_id: String,"),
+            logon.contains("pub default_appl_ver_id: ::std::string::String,"),
             "{logon}"
         );
         assert!(logon.contains("pub heart_bt_int: i64,"), "{logon}");
@@ -1293,12 +1296,22 @@ mod tests {
             embedded(Dictionary::fix50sp2(), "FIX 5.0 SP2"),
         );
         assert!(code.starts_with("// Generated FIX.5.0SP2 definitions."));
-        assert!(code.contains("pub type FixDecimal = rust_decimal::Decimal;"));
+        assert!(code.contains("pub type FixDecimal = ::rust_decimal::Decimal;"));
         let body = struct_body(&code, "NewOrderSingle");
-        assert!(body.contains("pub cl_ord_id: String,"), "{body}");
-        assert!(body.contains("pub price: Option<FixDecimal>,"), "{body}");
+        assert!(
+            body.contains("pub cl_ord_id: ::std::string::String,"),
+            "{body}"
+        );
+        assert!(
+            body.contains("pub price: ::core::option::Option<FixDecimal>,"),
+            "{body}"
+        );
         // XID-typed fields (FIX 5.0 SP2 only) are emitted as String.
-        assert!(code.contains("pub cash_settl_term_xid: Option<String>,"));
+        assert!(
+            code.contains(
+                "pub cash_settl_term_xid: ::core::option::Option<::std::string::String>,"
+            )
+        );
         assert!(!code.contains("f64"));
         assert!(!code.contains("f32"));
     }
@@ -1415,7 +1428,7 @@ mod tests {
         let code = generate(&CodeGenerator::new(), &dict);
         // The dictionary does not record whether the component reference is
         // required, so the safe representation is Option.
-        assert!(code.contains("pub symbol: Option<String>,"));
+        assert!(code.contains("pub symbol: ::core::option::Option<::std::string::String>,"));
     }
 
     #[test]
@@ -1449,9 +1462,12 @@ mod tests {
             ],
         ));
         let code = generate(&CodeGenerator::new(), &dict);
-        assert!(code.contains("pub no_party_ids: Option<i64>,"), "{code}");
         assert!(
-            code.contains("pub no_party_ids_453: Option<Vec<NewOrderSingleNoPartyIDsEntry>>,"),
+            code.contains("pub no_party_ids: ::core::option::Option<i64>,"),
+            "{code}"
+        );
+        assert!(
+            code.contains("pub no_party_ids_453: ::core::option::Option<::std::vec::Vec<NewOrderSingleNoPartyIDsEntry>>,"),
             "{code}"
         );
     }
@@ -1484,7 +1500,7 @@ mod tests {
         let code = generate(&CodeGenerator::new(), &dict);
         assert_eq!(code.matches("pub symbol:").count(), 1);
         // The direct reference wins, so it keeps its required-ness.
-        assert!(code.contains("pub symbol: String,"));
+        assert!(code.contains("pub symbol: ::std::string::String,"));
     }
 
     #[test]

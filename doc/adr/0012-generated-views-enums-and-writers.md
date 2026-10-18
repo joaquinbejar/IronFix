@@ -178,6 +178,17 @@ nor takes a generated method's name (`get`, `message`, `entry`, `clone`, ...;
 it takes the tag as suffix); `#[must_use]` is put only where the return type
 is not already must-use.
 
+**Standard items by absolute path.** An enumeration is named after its field
+and a default-output struct after its message, so a dictionary can name one
+`Vec`, `String`, `Option` or `Result`. Both outputs therefore name every
+standard item they use by its absolute path (`::std::vec::Vec`,
+`::std::string::String`, `::core::option::Option`, `::core::result::Result`,
+`::core::ops::FnMut`, `::core::marker::Sized`, `::rust_decimal::Decimal`),
+never by the bare name a generated type could capture. Derive macros and
+value constructors (`Some`, `Ok`, ...) live in namespaces a generated type
+cannot occupy. The `std_names` golden files, generated from a dictionary
+with fields and messages so named, compile and round-trip a message.
+
 **Variant naming is deterministic.** The first acceptable candidate wins: the
 description in PascalCase; then followed by the wire value; then `Value` and
 the wire value; then `Value`, the description and the value; then `Value1`,
