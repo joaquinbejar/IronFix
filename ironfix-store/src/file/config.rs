@@ -9,7 +9,7 @@
 //! flushed to stable storage.
 
 use crate::file::format::DamageRule;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -100,6 +100,14 @@ pub enum SyncPolicy {
     /// is refreshed or closed, or [`FileStore::sync`](super::FileStore::sync)
     /// is called (the engine never calls it). `EveryN(1)` behaves as
     /// [`SyncPolicy::EveryWrite`].
+    ///
+    /// The counters sit in fixed slots and the frames in records, in
+    /// different blocks of the file, which an operating-system crash can
+    /// bring back in either order. A counter slot that survives can therefore
+    /// be ahead of a frame record that was lost: the frame cannot be resent,
+    /// and the engine answers a `ResendRequest` for its number with a gap
+    /// fill although the counterparty received it. `EveryWrite` does not have
+    /// this problem.
     EveryN(NonZeroU32),
     /// Never flush the journal's writes, except through an explicit
     /// [`FileStore::sync`](super::FileStore::sync), which the engine never
@@ -107,7 +115,10 @@ pub enum SyncPolicy {
     ///
     /// Survives a process crash only. On an operating-system crash or a power
     /// loss any number of writes that returned `Ok` can be lost, and damage
-    /// anywhere in the journal is cut at the next open rather than refused.
+    /// anywhere in the journal is cut at the next open rather than refused. As
+    /// under [`SyncPolicy::EveryN`], a counter slot that survives can be ahead
+    /// of a lost frame record, whose number a resend then answers with a gap
+    /// fill.
     Never,
 }
 
@@ -194,8 +205,9 @@ pub enum FileStoreConfigError {
 /// the store's [`name`](Self::name):
 ///
 /// - `<name>.journal`: the message journal and the sequence counters;
-/// - `<name>.journal.tmp`: a replacement journal while a reset is being
-///   written, removed at the next open if a crash left it behind;
+/// - `<name>.journal.tmp`: a replacement journal while a reset or a
+///   compaction is being written, removed at the next open if a crash left
+///   it behind;
 /// - `<name>.lock`: held locked while the store is open, so a second store on
 ///   the same files fails to open instead of interleaving two sequence
 ///   streams.
@@ -243,6 +255,9 @@ pub struct FileStoreConfig {
     /// Whether opening creates the directory and an empty journal when they
     /// are missing.
     create_if_missing: bool,
+    /// Bytes of superseded records at which the journal is compacted on its
+    /// own; `None` (the default) compacts only on demand.
+    compaction_threshold: Option<NonZeroU64>,
 }
 
 impl FileStoreConfig {
@@ -275,6 +290,7 @@ impl FileStoreConfig {
             sync_policy: SyncPolicy::default(),
             max_frame_size: DEFAULT_MAX_FRAME,
             create_if_missing: false,
+            compaction_threshold: None,
         })
     }
 
@@ -285,6 +301,38 @@ impl FileStoreConfig {
     #[must_use = "builders do nothing unless the result is used"]
     pub const fn with_create_if_missing(mut self, create: bool) -> Self {
         self.create_if_missing = create;
+        self
+    }
+
+    /// Sets when the journal is compacted on its own: `Some(threshold)`, any
+    /// non-zero number of bytes with no upper bound, or `None` (the default),
+    /// which compacts only when
+    /// [`FileStore::compact`](super::FileStore::compact) is called.
+    ///
+    /// A frame filed again under a number already filed (after a failed
+    /// write, the engine files the next frame under the number it did not
+    /// spend) leaves the earlier record in the journal as a superseded
+    /// record. Once the superseded records take at least `threshold` bytes
+    /// **and** at least as many bytes as the live records, the store rewrites
+    /// the journal without them, through the same temporary file and rename
+    /// as a reset. The second condition bounds the work: a compaction copies
+    /// no more bytes than were superseded since the last one.
+    ///
+    /// The compaction runs on the store's writer thread after the call that
+    /// crossed the threshold has been answered, so that call is not delayed,
+    /// but **it blocks every call queued behind it** for as long as it takes
+    /// to copy the live records. Under `ironfix-engine` a call that waits past
+    /// the store timeout (`with_store_timeout`, default the 10-second write
+    /// timeout) counts as a failed write: the next session owes a sequence
+    /// reset, and under `StoreFailurePolicy::CloseSession` the session
+    /// closes. **A failed automatic compaction is silent**: it reaches no
+    /// caller (the crate does not log), leaves the journal as it was, and is
+    /// not tried again until another `threshold` bytes are superseded; one
+    /// that fails after its rename leaves the store refusing calls until a
+    /// refresh, as a failed reset does.
+    #[must_use = "builders do nothing unless the result is used"]
+    pub const fn with_compaction_threshold(mut self, threshold: Option<NonZeroU64>) -> Self {
+        self.compaction_threshold = threshold;
         self
     }
 
@@ -348,6 +396,13 @@ impl FileStoreConfig {
     #[must_use]
     pub const fn create_if_missing(&self) -> bool {
         self.create_if_missing
+    }
+
+    /// Returns the bytes of superseded records at which the journal is
+    /// compacted on its own, or `None` if it is compacted only on demand.
+    #[must_use]
+    pub const fn compaction_threshold(&self) -> Option<NonZeroU64> {
+        self.compaction_threshold
     }
 
     /// Returns the path of the journal, `<directory>/<name>.journal`.
@@ -537,6 +592,27 @@ mod tests {
         // Only the whole first part is reserved.
         for name in ["CONSOLE", "com10", "session.NUL", "LPT"] {
             assert!(FileStoreConfig::try_new("/tmp", name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_file_store_config_compaction_threshold_is_off_by_default() {
+        let Ok(config) = FileStoreConfig::try_new("/tmp", "session") else {
+            panic!("valid name");
+        };
+        assert_eq!(config.compaction_threshold(), None);
+        for bytes in [1, 1024 * 1024, u64::MAX] {
+            let Some(threshold) = NonZeroU64::new(bytes) else {
+                panic!("non-zero");
+            };
+            let config = config.clone().with_compaction_threshold(Some(threshold));
+            assert_eq!(config.compaction_threshold(), Some(threshold));
+            assert_eq!(
+                config
+                    .with_compaction_threshold(None)
+                    .compaction_threshold(),
+                None
+            );
         }
     }
 

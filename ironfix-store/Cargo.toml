@@ -17,10 +17,19 @@ async-trait.workspace = true
 tokio.workspace = true
 parking_lot.workspace = true
 bytes.workspace = true
+crossbeam-channel.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+dhat.workspace = true
 
 [[bench]]
 name = "file_store"
+harness = false
+
+# Installs dhat as the global allocator to count the allocations of a store
+# call, so it runs as its own binary without the libtest harness: no other
+# test and no harness thread allocates while it measures.
+[[test]]
+name = "allocations"
 harness = false

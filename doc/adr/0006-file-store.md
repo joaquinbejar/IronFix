@@ -2,7 +2,18 @@
 
 - **Status:** Accepted (issue #78, in the plan the owner approved, revised in
   the #78 review round; the layout deviates from that plan in one respect,
-  recorded under "Deviation from the plan")
+  recorded under "Deviation from the plan"). Amended by ADR-0022 (#112):
+  format version 2 keeps the counters in two fixed slots instead of counter
+  records, every call runs on one writer thread per store instead of behind
+  a lock on Tokio's blocking pool, the index is dense, and the journal can be
+  compacted. The sections below on the format, the call order, the limits
+  and the compatibility promise describe version 1 as #78 built it, and so
+  does the sentence on dropping a store under "One store, one owner": a
+  dropped store now releases its lock once any call or automatic compaction
+  its writer thread is running finishes. Version 1 was never released; this
+  build reads version 2 only and refuses version 1, like any other version,
+  with `StoreError::Corrupted` naming it. The recovery rules, the sync
+  policies and the crash table hold unchanged for version 2.
 - **Date:** 2026-10-18
 
 ## Context

@@ -24,10 +24,12 @@
 //! - **[`MemoryStore`]**: an in-memory implementation, backed by a
 //!   `parking_lot::RwLock<BTreeMap<..>>` and two atomics. Nothing in it
 //!   survives the process.
-//! - **[`FileStore`]**: a persistent implementation, one append-only journal
-//!   file per store holding the filed frames and both sequence counters, so a
-//!   session resumes from its counters after a restart and a `ResendRequest`
-//!   is answered with the original frames. Configured by [`FileStoreConfig`].
+//! - **[`FileStore`]**: a persistent implementation, one journal file per
+//!   store holding the filed frames (appended) and both sequence counters (in
+//!   two fixed slots, so inbound traffic does not grow the file), written by
+//!   one writer thread per store, so a session resumes from its counters
+//!   after a restart and a `ResendRequest` is answered with the original
+//!   frames. Configured by [`FileStoreConfig`].
 //!
 //! ## What survives what
 //!

@@ -14,7 +14,14 @@
 //!   cost of a flush can be told from the cost of the write;
 //! - a 256-frame `get_page`, the engine's resend page;
 //! - opening (and closing) a store whose journal holds 10 000 frames, which
-//!   reads and checks the whole journal.
+//!   reads and checks the whole journal;
+//! - `file_outbound` and `set_next_target_seq` under `SyncPolicy::Never` from
+//!   a task spawned on a multi-thread runtime, as the engine's reactor calls
+//!   them, timed inside the task (`iter_custom`) so the cost of the call and
+//!   of the hand-off to the store's writer thread is measured without the
+//!   runtime's `block_on` around each call;
+//! - `FileStore::compact` over journals of 1 000 and 10 000 frames, which
+//!   copies every live record and flushes the new journal and its directory.
 //!
 //! The journals live in the system temporary directory, so what a flush costs
 //! depends on the file system and device behind it. This harness only makes
@@ -24,7 +31,9 @@
 use std::hint::black_box;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use ironfix_core::message::MsgType;
@@ -137,11 +146,16 @@ fn bench_writes(c: &mut Criterion) {
 
 /// Builds a journal of [`JOURNAL_FRAMES`] frames, unflushed, and closes it.
 fn build_journal(rt: &Runtime, dir: &BenchDir) {
+    build_journal_of(rt, dir, JOURNAL_FRAMES);
+}
+
+/// Builds a journal of `frames` frames, unflushed, and closes it.
+fn build_journal_of(rt: &Runtime, dir: &BenchDir, frames: u64) {
     let store = ok(
         rt.block_on(FileStore::open(dir.config(SyncPolicy::Never))),
         "open",
     );
-    for seq in 1..=JOURNAL_FRAMES {
+    for seq in 1..=frames {
         ok(
             rt.block_on(store.file_outbound(seq, &MsgType::NewOrderSingle, &frame(seq), seq + 1)),
             "file_outbound",
@@ -184,5 +198,106 @@ fn bench_reads(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_writes, bench_reads);
+/// A multi-thread runtime, as an engine runs on.
+fn multi_thread_runtime() -> Runtime {
+    ok(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build(),
+        "multi-thread runtime",
+    )
+}
+
+/// Runs `iters` calls of `call` in one task spawned on `rt`, and returns the
+/// time they took, measured inside the task.
+fn timed_in_task<F, Fut>(rt: &Runtime, store: &Arc<FileStore>, iters: u64, call: F) -> Duration
+where
+    F: Fn(Arc<FileStore>, u64) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let store = Arc::clone(store);
+    let task = rt.spawn(async move {
+        let start = Instant::now();
+        for iteration in 0..iters {
+            call(Arc::clone(&store), iteration).await;
+        }
+        start.elapsed()
+    });
+    ok(rt.block_on(task), "benchmark task")
+}
+
+fn bench_multi_thread(c: &mut Criterion) {
+    let rt = multi_thread_runtime();
+    let mut group = c.benchmark_group("file_store_multi_thread");
+    let dir = BenchDir::new("multi-thread");
+    let store = Arc::new(ok(
+        rt.block_on(FileStore::open(dir.config(SyncPolicy::Never))),
+        "open",
+    ));
+    let next = Arc::new(AtomicU64::new(1));
+    let payload = Arc::new(frame(1));
+
+    group.bench_function("file_outbound/never", |b| {
+        b.iter_custom(|iters| {
+            let next = Arc::clone(&next);
+            let payload = Arc::clone(&payload);
+            timed_in_task(&rt, &store, iters, move |store, _| {
+                let at = next.fetch_add(1, Ordering::Relaxed);
+                let payload = Arc::clone(&payload);
+                async move {
+                    let filed = store
+                        .file_outbound(at, &MsgType::NewOrderSingle, black_box(&payload), at + 1)
+                        .await;
+                    ok(filed, "file_outbound");
+                }
+            })
+        });
+    });
+    group.bench_function("set_next_target_seq/never", |b| {
+        b.iter_custom(|iters| {
+            let next = Arc::clone(&next);
+            timed_in_task(&rt, &store, iters, move |store, _| {
+                let at = next.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    ok(
+                        store.set_next_target_seq(black_box(at)).await,
+                        "set_next_target_seq",
+                    );
+                }
+            })
+        });
+    });
+    group.finish();
+    drop(store);
+}
+
+fn bench_compaction(c: &mut Criterion) {
+    let rt = runtime();
+    let mut group = c.benchmark_group("file_store_compact");
+    group.sample_size(10);
+    for frames in [1_000u64, 10_000] {
+        let dir = BenchDir::new(&format!("compact-{frames}"));
+        build_journal_of(&rt, &dir, frames);
+        let store = ok(
+            rt.block_on(FileStore::open(dir.config(SyncPolicy::Never))),
+            "open",
+        );
+        // Every iteration rewrites all `frames` live records and flushes the
+        // new journal and its directory.
+        group.bench_function(format!("compact/{frames}_frames"), |b| {
+            b.iter(|| black_box(ok(rt.block_on(store.compact()), "compact")));
+        });
+        ok(rt.block_on(store.close()), "close");
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_writes,
+    bench_reads,
+    bench_multi_thread,
+    bench_compaction
+);
 criterion_main!(benches);
