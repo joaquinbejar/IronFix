@@ -56,9 +56,11 @@
 //! - **There is no TLS**, and no dictionary validation: `ironfix-dictionary`'s
 //!   `Validator` is never invoked on the session path.
 //! - **The store is opt-in and in-memory.** Attaching an
-//!   [`ironfix_store::MemoryStore`] with [`Initiator::with_store`] enables
-//!   resend-from-store replay, but there is no persistent implementation yet;
-//!   the acceptor attaches no store, so its resends are gap-filled. Store
+//!   [`ironfix_store::MemoryStore`] with [`Initiator::with_store`],
+//!   [`Acceptor::with_store`] or [`EngineBuilder::with_store`] enables
+//!   resend-from-store replay and seeds each session's counters in both roles,
+//!   but there is no persistent implementation yet. The acceptor touches its
+//!   store only once the Logon is authenticated. Store
 //!   writes are ordered and fallible, and [`StoreFailurePolicy`] decides
 //!   whether a failed one is tolerated or closes the session (see
 //!   [`persistence`]). Inbound application messages are delivered at most
