@@ -44,8 +44,11 @@ pub enum Output {
 }
 
 /// Which side started the unbinding of a transport.
+///
+/// Not named `Initiator`: `ironfix_engine::Initiator` is the tag=value
+/// client engine, and the engine's FIXP wiring imports both crates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Initiator {
+pub enum TerminatedBy {
     /// This side.
     Local,
     /// The counterparty.
@@ -54,12 +57,14 @@ pub enum Initiator {
 
 /// Which handshake ran out of time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HandshakeStage {
     /// Negotiation: a client waiting for NegotiationResponse, or a server
-    /// waiting for Negotiate.
+    /// waiting for Negotiate or for the application's answer to one.
     Negotiation,
     /// Establishment: a client waiting for EstablishmentAck, or a server
-    /// waiting for the first Establish after a negotiation.
+    /// waiting for an Establish on a transport or for the application's
+    /// answer to one.
     Establishment,
 }
 
@@ -167,7 +172,10 @@ pub enum Event {
         reason: String,
     },
     /// This side's RetransmitRequest went `retransmit_timeout` without a
-    /// retransmitted message; what is still missing is requested again.
+    /// retransmitted message. What happens next depends on
+    /// [`RetransmitStallPolicy`](crate::RetransmitStallPolicy): nothing more,
+    /// a new request for what is missing (visible as a queued
+    /// RetransmitRequest), or a Terminate. Reported once per stall.
     RetransmitTimedOut {
         /// The first sequence number of the request that stalled.
         from: SeqNum,
@@ -199,7 +207,7 @@ pub enum Event {
         /// Its reason text, empty if none.
         reason: String,
         /// Which side started it.
-        initiator: Initiator,
+        by: TerminatedBy,
     },
     /// The counterparty was silent longer than its keepalive interval plus
     /// the grace period; the session terminated (FIXP v1.1 section 4.5).
@@ -211,19 +219,21 @@ pub enum Event {
         /// What the counterparty did.
         reason: &'static str,
     },
-    /// The counterparty sent a message this implementation does not support
-    /// (FinishedSending or FinishedReceiving: the finalization handshake of
-    /// FIXP v1.1 section 4.7 is not implemented). The session terminated
-    /// with `UnspecifiedError`; the logical session is not finalized.
-    Unsupported {
-        /// The message name.
-        message: &'static str,
+    /// The counterparty sent FinishedSending: its flow is ending (FIXP v1.1
+    /// section 4.7.1). The session answers with FinishedReceiving once every
+    /// message up to `last_seq_no` is accounted for (retransmitted, or
+    /// reported with NotApplied), then waits for the counterparty's
+    /// Terminate. Application messages after it are protocol violations.
+    PeerFinishedSending {
+        /// The counterparty's last sequence number, as received.
+        last_seq_no: Option<u64>,
     },
     /// The driver reported the transport closed.
     TransportClosed,
-    /// A message was ignored without answering, as FIXP v1.1 Appendix A
-    /// 7.1.7.5 and 7.1.12.8 ask for a response that does not match the
-    /// request outstanding.
+    /// A message was ignored without answering: a response that matches no
+    /// outstanding request (FIXP v1.1 Appendix A 7.1.7.5 and 7.1.12.8),
+    /// anything after a Terminate (section 4.4), or anything still arriving
+    /// on a transport this side has asked the driver to close.
     Ignored {
         /// The message name.
         message: &'static str,
@@ -253,6 +263,7 @@ pub enum Delivery {
 
 /// The messages to replay after a `retransmit` call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RetransmitBatch {
     /// The sequence number of the first message to replay.
     pub from: SeqNum,

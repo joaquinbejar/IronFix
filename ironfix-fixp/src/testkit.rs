@@ -244,6 +244,72 @@ pub(crate) fn send_apps(
     deliveries
 }
 
+/// A `tracing` subscriber that records every event and span field as text,
+/// so a test can check what the crate logs. Built on `tracing`'s own traits:
+/// no subscriber crate is needed.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LogCapture {
+    lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl LogCapture {
+    /// Everything captured so far.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        match self.lines.lock() {
+            Ok(lines) => lines.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn push(&self, line: String) {
+        match self.lines.lock() {
+            Ok(mut lines) => lines.push(line),
+            Err(poisoned) => poisoned.into_inner().push(line),
+        }
+    }
+}
+
+/// Renders the fields of an event or span as `name=value` pairs.
+struct FieldText(String);
+
+impl tracing::field::Visit for FieldText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={:?} ", field.name(), value);
+    }
+}
+
+impl tracing::Subscriber for LogCapture {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let mut text = FieldText(format!("span {} ", span.metadata().name()));
+        span.record(&mut text);
+        self.push(text.0);
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        let mut text = FieldText(String::from("record "));
+        values.record(&mut text);
+        self.push(text.0);
+    }
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut text = FieldText(format!("{} ", event.metadata().level()));
+        event.record(&mut text);
+        self.push(text.0);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
 /// A role that can send application messages.
 pub(crate) trait Sender {
     fn send_app(&mut self, now: Instant) -> Result<Option<ironfix_core::SeqNum>, crate::FixpError>;

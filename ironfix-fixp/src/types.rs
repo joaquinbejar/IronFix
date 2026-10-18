@@ -26,6 +26,14 @@ pub const MAX_VAR_DATA_LEN: usize = u16::MAX as usize;
 /// UUID. This type carries any 16 bytes so that a counterparty using another
 /// UUID version is not refused for it; the all-zero (nil) UUID is the one
 /// value the server rejects (Appendix A 7.1.7.3).
+///
+/// # Naming hazard
+///
+/// `ironfix_engine::SessionId` is a different type with the same name: the
+/// identity of a tag=value session (`BeginString` and CompIDs). Code that uses
+/// both, as the engine's FIXP wiring will, should qualify them
+/// (`ironfix_fixp::SessionId`, `ironfix_engine::SessionId`) or rename one on
+/// import.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SessionId([u8; 16]);
 
@@ -76,14 +84,17 @@ impl fmt::Debug for SessionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum FlowType {
-    /// Exactly-once delivery: gaps are recovered by retransmission.
+    /// Numbered, and a hole in the numbering is filled again by
+    /// retransmission (sections 3.4.4 and 4.6).
     Recoverable = 0,
-    /// At-most-once delivery: gaps are reported with NotApplied and recovery
-    /// is up to the application.
+    /// Numbered so that a hole is noticed, but not filled: the receiver
+    /// reports it with NotApplied and the sender decides what to do
+    /// (sections 3.4.4 and 4.8).
     Idempotent = 1,
-    /// Best effort: no sequence numbers at the session layer.
+    /// Not numbered by the session layer, so a hole goes unnoticed here
+    /// (section 3.4.4).
     Unsequenced = 2,
-    /// No application messages in this direction.
+    /// This direction carries no application messages (section 3.4.4).
     None = 3,
 }
 
@@ -242,66 +253,92 @@ macro_rules! wire_enum {
     };
 }
 
+// The four reject and termination code enumerations below are
+// `#[non_exhaustive]`: a later schema version may define more codes. This
+// crate decodes a value it does not know as a typed error
+// (`FixpDecodeError::InvalidEnumValue`), never as one of these variants.
+
 wire_enum! {
-    /// Why a server refused a Negotiate (FIXP v1.1 section 4.2.3). Schema
-    /// enum `NegotiationRejectCode`.
+    /// The code a server gives when it turns down a Negotiate (FIXP v1.1
+    /// section 4.2.3). Schema enum `NegotiationRejectCode`.
+    #[non_exhaustive]
     NegotiationRejectCode {
-        /// Identity not recognised, or not authorised for the service.
+        /// The server did not accept the credentials the client presented.
         Credentials = 0,
-        /// The server does not support the requested client flow type.
+        /// The server will not serve the flow type the client asked for.
         FlowTypeNotSupported = 1,
-        /// The session ID is not unique.
+        /// The identifier names a session that exists already. This crate's
+        /// server sends it for a second Negotiate of the session it holds.
         DuplicateId = 2,
-        /// Any other reason the server cannot create the session.
+        /// A refusal no other code describes. This crate's server sends it
+        /// for a nil session identifier and for a second session on one
+        /// transport.
         Unspecified = 3,
     }
 }
 
 wire_enum! {
-    /// Why a server refused an Establish (FIXP v1.1 section 4.3.3). Schema
-    /// enum `EstablishmentRejectCode`.
+    /// The code a server gives when it turns down an Establish (FIXP v1.1
+    /// section 4.3.3). Schema enum `EstablishmentRejectCode`.
+    #[non_exhaustive]
     EstablishmentRejectCode {
-        /// Establish was not preceded by a negotiation, or the session was
-        /// finalized and must be renegotiated.
+        /// The server holds no negotiated session under this identifier, so
+        /// the client must negotiate first. This crate's server sends it for
+        /// an Establish before any Negotiate, or naming another session.
         Unnegotiated = 0,
-        /// EstablishmentAck was already sent; the Establish was redundant.
+        /// The session is bound to a transport already. This crate's server
+        /// sends it for an Establish on a live binding.
         AlreadyEstablished = 1,
-        /// The user is not authorised.
+        /// The server's own rules forbid this session from binding.
         SessionBlocked = 2,
-        /// The KeepaliveInterval is out of the accepted range.
+        /// The client's keepalive interval falls outside what the server
+        /// takes; for this crate's server, outside
+        /// [`FixpConfig::min_peer_keepalive`](crate::FixpConfig::min_peer_keepalive)
+        /// to [`FixpConfig::max_peer_keepalive`](crate::FixpConfig::max_peer_keepalive).
         KeepaliveInterval = 3,
-        /// Identity not recognised, or not authorised for the service.
+        /// The server did not accept the credentials the client presented.
         Credentials = 4,
-        /// Any other reason the server cannot establish the session.
+        /// A refusal no other code describes. This crate's server sends it
+        /// for a `NextSeqNo` of zero or one that goes backwards.
         Unspecified = 5,
     }
 }
 
 wire_enum! {
-    /// Why a RetransmitRequest was refused (FIXP v1.1 section 4.6.2.3).
-    /// Schema enum `RetransmitRejectCode`.
+    /// The code a provider gives when it turns down a RetransmitRequest
+    /// (FIXP v1.1 section 4.6.2.3). Schema enum `RetransmitRejectCode`.
+    #[non_exhaustive]
     RetransmitRejectCode {
-        /// FromSeqNo + Count is beyond the range of sequence numbers.
+        /// The provider cannot serve the numbers asked for. This crate sends
+        /// it for a count of zero, a first number of zero, and numbers it has
+        /// not sent yet.
         OutOfRange = 0,
-        /// The SessionId is unknown or not authorised for the requester.
+        /// The request names a session the provider does not serve to this
+        /// requester. This crate sends it for any identifier but its own.
         InvalidSession = 1,
-        /// Count exceeds the local limit on a retransmission.
+        /// The request asks for more messages than the provider serves in
+        /// one go; in this crate, more than
+        /// [`FixpConfig::max_retransmit_count`](crate::FixpConfig::max_retransmit_count).
         RequestLimitExceeded = 2,
     }
 }
 
 wire_enum! {
-    /// Why a transport is being unbound (FIXP v1.1 section 4.4). Schema enum
+    /// The code carried by a Terminate (FIXP v1.1 section 4.4). Schema enum
     /// `TerminationCode`.
+    #[non_exhaustive]
     TerminationCode {
-        /// Normal unbinding.
+        /// An orderly unbinding; the side that sends it waits for the answer.
         Finished = 0,
-        /// An error, such as a protocol violation or a lapsed keepalive.
+        /// An unbinding forced by a fault. This crate uses it for protocol
+        /// violations, a lapsed keepalive and a stalled retransmission.
         UnspecifiedError = 1,
-        /// A RetransmitRequest for messages out of bounds (section 4.6.5).
+        /// Named by the retransmission-violation rules (sections 4.6.4 and
+        /// 4.6.5). This crate answers an out-of-bounds request with a
+        /// RetransmitReject instead and never sends this code.
         ReRequestOutOfBounds = 2,
-        /// A RetransmitRequest while another was being answered
-        /// (section 4.6.4).
+        /// Sent when a RetransmitRequest arrives while an earlier one is
+        /// still being answered (section 4.6.4).
         ReRequestInProgress = 3,
     }
 }

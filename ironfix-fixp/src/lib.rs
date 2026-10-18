@@ -14,10 +14,10 @@
 //! ## Specification
 //!
 //! This crate implements the **FIX Performance Session Layer Technical
-//! Specification, version 1.1, Draft Standard of April 18, 2019**, the latest
-//! version FIX Trading Community publishes
+//! Specification, version 1.1, Draft Standard of April 18, 2019**, the
+//! highest version FIX Trading Community publishes
 //! (<https://www.fixtrading.org/standards/fixp/>). Version 1.0 is the
-//! Technical Standard (approved April 15, 2021); its point-to-point chapter
+//! Technical Standard, approved in April 2021; its point-to-point chapter
 //! says the same as v1.1 save for wording and the WebSocket guidance v1.1
 //! adds. Section numbers in this crate refer to the v1.1 Draft Standard PDF.
 //!
@@ -27,11 +27,12 @@
 //! <https://github.com/FIXTradingCommunity/fixp-specification>, file
 //! `v1-1/resources/SBEschemaForFIXP.xml` at commit `af0e9d7e`, identical to
 //! the v1.0 Technical Standard's copy. The schema is © FIX Protocol Ltd. and
-//! licensed CC BY-ND 4.0. It is vendored verbatim in the IronFix repository
-//! under `ironfix-fixp/spec/`, with its license and provenance, as the input
-//! of a conformance test; it is **not** part of the published package, which
-//! is all MIT. The codec here is written by hand on `ironsbe-core`'s SBE
-//! primitives, and that test checks it field by field against the schema.
+//! licensed CC BY-ND 4.0. It is vendored byte for byte in the IronFix
+//! repository under `ironfix-fixp/spec/`, with its license and provenance, as
+//! the input of a conformance test; it is **not** part of the published
+//! package, which is all MIT. The codec here is written by hand on
+//! `ironsbe-core`'s SBE primitives, and that test checks it field by field
+//! against the schema.
 //!
 //! ## Sans-IO
 //!
@@ -45,6 +46,8 @@
 //! - local commands: `negotiate` / `establish` (client),
 //!   `accept_*` / `reject_*` (server), `send_application`, `terminate`,
 //!   `retransmit`;
+//! - transport changes: `on_transport_closed` (both roles) and, on a server
+//!   whose session waits for its client to come back, `on_transport_opened`;
 //! - timer ticks, through `handle_timeout`, at the instant `poll_timeout`
 //!   names.
 //!
@@ -53,6 +56,25 @@
 //! from a [`ClockAnchor`] the driver supplies once. After each input the
 //! driver drains `poll_output` and carries out each [`Output`] in order:
 //! encode and write a message, close the transport, or report an [`Event`].
+//!
+//! ### Which transport an output belongs to
+//!
+//! A session has at most one transport at a time, and its outputs go to that
+//! one:
+//!
+//! - the outputs drained right after `handle_message` or
+//!   `on_application_message` belong to the transport that input came from;
+//! - the outputs of `handle_timeout` and of a command belong to the
+//!   transport currently bound to the session (for a client's `negotiate` or
+//!   `establish`, the transport the driver has just opened).
+//!
+//! After [`Output::CloseTransport`] the session considers that transport
+//! gone: what still arrives on it is reported as [`Event::Ignored`], and a
+//! command that would send ([`FixpClient::establish`], for instance) fails
+//! with [`FixpError::TransportClosing`] until the driver calls
+//! `on_transport_closed`. Only then may it attach a new transport. A server
+//! session left negotiated without a transport has no timer at all; the
+//! driver that routes sessions decides when to evict it.
 //!
 //! The core does not frame bytes (`ironfix-sofh` does, and the engine will
 //! compose the two) and does not store application messages: on a
@@ -70,33 +92,42 @@
 //!   on a new transport with its sequence numbers. The server refuses on its
 //!   own an Establish without negotiation (`Unnegotiated`), a keepalive
 //!   interval out of the configured range (`KeepaliveInterval`), a redundant
-//!   Establish (`AlreadyEstablished`) and a `NextSeqNo` that goes backwards;
-//!   the application decides the rest (`accept_establishment` or
-//!   `reject_establishment`).
+//!   Establish (`AlreadyEstablished`) and a `NextSeqNo` of zero or one that
+//!   goes backwards (`Unspecified`); the application decides the rest
+//!   (`accept_establishment` or `reject_establishment`).
+//! - **Handshake timeouts**: every wait, on either side, is bounded by
+//!   `handshake_timeout`, and a lapse closes the transport.
 //! - **Sequencing** (section 3.5): implicit numbering after Sequence,
-//!   EstablishmentAck or Retransmission; a Sequence before the first
+//!   EstablishmentAck or Retransmission, from 1 unless the first
+//!   establishment announces another start; a Sequence before the first
 //!   application message after any context switch; Context accepted as a
 //!   Sequence when it names this session.
 //! - **Recoverable flow** (section 4.6): gap detection, RetransmitRequest
-//!   with one request in flight, chunked to the configured maximum, bounded
-//!   unrecovered gaps, Retransmission batches validated against the request,
-//!   RetransmitReject. As the provider: requests validated and refused with
-//!   `InvalidSession`, `RequestLimitExceeded` or `OutOfRange`, a request
-//!   while one is answered terminated with `ReRequestInProgress`, answers in
-//!   one or several batches.
+//!   with one request in flight, chunked to `max_retransmit_count`, at most
+//!   `max_pending_gaps` gaps of at most `max_gap_len` each, Retransmission
+//!   batches validated against the request, RetransmitReject, and a
+//!   configurable [`RetransmitStallPolicy`]. As the provider: requests
+//!   validated and refused with `InvalidSession`, `RequestLimitExceeded` or
+//!   `OutOfRange`, a request while one is answered terminated with
+//!   `ReRequestInProgress`, answers in one or several batches.
 //! - **Idempotent flow** (section 4.8): a gap is reported with NotApplied,
 //!   numbered on this side's return flow; NotApplied and Applied from the
 //!   counterparty are reported as events.
 //! - **Unsequenced and None flows**: they fall out of the same machine.
-//!   UnsequencedHeartbeat is their keepalive; Sequence, Context and
-//!   Retransmission on them, and any application message on a None flow, are
-//!   protocol violations.
+//!   UnsequencedHeartbeat is their keepalive; Sequence, Context with a
+//!   number and Retransmission on them, and any application message on a
+//!   None flow, are protocol violations.
 //! - **Keepalive** (section 4.5): a heartbeat whenever this side's interval
 //!   passes without an application message, and termination when the
 //!   counterparty is silent longer than its interval plus a grace period.
 //! - **Termination** (section 4.4): Terminate and its answer, the initiator
-//!   closing the transport, a keepalive interval to wait for the answer, and
-//!   messages after a Terminate ignored.
+//!   closing the transport, a keepalive interval to wait for the answer,
+//!   in-flight messages (retransmitted ones included) still numbered while
+//!   waiting, and messages after a Terminate ignored.
+//! - **Receiving a finalization** (section 4.7): a counterparty's
+//!   FinishedSending is answered with FinishedReceiving once every message
+//!   up to its `LastSeqNo` is accounted for, after which this side waits for
+//!   the counterparty's Terminate.
 //!
 //! ## Untrusted input
 //!
@@ -107,12 +138,16 @@
 //! closed) and reported as [`Event::ProtocolViolation`]. Every sequence
 //! number is computed with checked arithmetic: the outbound counter stops
 //! with [`FixpError::SequenceExhausted`] before it would reach the `uint64`
-//! null value, and an inbound counter that would overflow terminates the
-//! session. Every `match` on a state or a message names its variants, and
-//! the crate denies `clippy::wildcard_enum_match_arm` so it stays that way.
+//! null value, an inbound counter that would overflow terminates the session,
+//! and a single jump in the counterparty's numbering above `max_gap_len`
+//! terminates rather than being requested. Every timer setting is bounded by
+//! [`MAX_TIMER`], so no deadline overflows and silently never fires. Every
+//! `match` on a state or a message names its variants, and the crate denies
+//! `clippy::wildcard_enum_match_arm` so it stays that way.
 //!
 //! Credentials are never logged or shown: [`Credentials`] prints only its
-//! length in `Debug`.
+//! length in `Debug`, and a test captures every `tracing` line the session
+//! emits through a handshake with credentials and checks none contains them.
 //!
 //! ## Decisions the specification leaves open
 //!
@@ -126,10 +161,12 @@
 //! - A `NextSeqNo` lower than expected terminates (Appendix A 7.2.2, 7.2.3);
 //!   on a server's re-establishment it is refused with EstablishmentReject
 //!   `Unspecified` instead.
-//! - A Sequence in the middle of a retransmission batch ends the batch
-//!   (section 3.5.4); the rest is requested again if it never comes. A
-//!   request that goes `retransmit_timeout` without a retransmitted message
-//!   is requested again for what is still missing.
+//! - Numbering starts at 1 unless the first establishment announces another
+//!   start (Appendix A 7.2.2 and 7.3.1 start at 100, 200 and 1000).
+//! - A stalled RetransmitRequest is handled by the [`RetransmitStallPolicy`];
+//!   the default asks again only after a Sequence cut a batch short
+//!   (section 3.5.4), because a second request while the provider is still
+//!   serving is a violation (sections 4.6.1, 4.6.4, 6.3).
 //! - A RetransmitReject abandons the requested range: those messages are not
 //!   requested again, and [`Event::RetransmitRejected`] says so.
 //! - The counterparty's silence ends the session after its keepalive
@@ -137,14 +174,16 @@
 //! - Session identifiers: any 16 bytes but the nil UUID are accepted; the
 //!   RFC 4122 version bits are not checked.
 //! - NotApplied is sent on this side's flow, and not at all when this side's
-//!   flow is None.
+//!   flow is None. Applied is reported whatever this side's flow: FIXP names
+//!   no violation for it, unlike NotApplied.
+//! - A Context `NextSeqNo` of `u64::MAX`, the SBE null value, means "no
+//!   number given".
 //!
 //! ## Not implemented
 //!
-//! - **Finalization** (section 4.7): FinishedSending and FinishedReceiving
-//!   are encoded and decoded, but the session does not run the handshake.
-//!   Receiving either terminates the binding with `UnspecifiedError` and
-//!   [`Event::Unsupported`]; a logical session is never finalized.
+//! - **Sending a finalization** (section 4.7): this side never sends
+//!   FinishedSending, so it never finalizes a logical session itself; a
+//!   FinishedReceiving from the counterparty is therefore a violation.
 //! - **Multiplexing** (section 3.5.3): one session per transport. A Context
 //!   naming another session terminates.
 //! - **Datagram transports** (section 3.5.2): the core assumes a stream; it
@@ -240,9 +279,10 @@ pub use client::FixpClient;
 pub use clock::ClockAnchor;
 pub use codec::is_session_message;
 pub use config::{
-    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_MAX_PEER_KEEPALIVE,
-    DEFAULT_MAX_PENDING_GAPS, DEFAULT_MAX_RETRANSMIT_COUNT, DEFAULT_MIN_PEER_KEEPALIVE,
-    DEFAULT_RETRANSMIT_TIMEOUT, FixpConfig, FixpConfigBuilder, FixpConfigError,
+    DEFAULT_HANDSHAKE_TIMEOUT, DEFAULT_KEEPALIVE_INTERVAL, DEFAULT_MAX_GAP_LEN,
+    DEFAULT_MAX_PEER_KEEPALIVE, DEFAULT_MAX_PENDING_GAPS, DEFAULT_MAX_RETRANSMIT_COUNT,
+    DEFAULT_MIN_PEER_KEEPALIVE, DEFAULT_RETRANSMIT_TIMEOUT, FixpConfig, FixpConfigBuilder,
+    FixpConfigError, MAX_TIMER, RetransmitStallPolicy,
 };
 pub use error::{FixpDecodeError, FixpEncodeError, FixpError};
 pub use messages::{
@@ -252,10 +292,15 @@ pub use messages::{
     Sequence, SessionMessage, Terminate, Topic, UnsequencedHeartbeat,
 };
 pub use output::{
-    Delivery, Event, HandshakeStage, Initiator, Output, RetransmitBatch, SessionStatus,
+    Delivery, Event, HandshakeStage, Output, RetransmitBatch, SessionStatus, TerminatedBy,
 };
 pub use server::FixpServer;
 pub use types::{
     Credentials, EstablishmentRejectCode, FlowType, MAX_VAR_DATA_LEN, Nanotime,
     NegotiationRejectCode, RetransmitRejectCode, SessionId, TerminationCode,
 };
+
+/// Re-exported from `ironfix-core`: [`ClockAnchor::new`] takes a
+/// [`Timestamp`], and sequence numbers in this API are [`SeqNum`]s, so a
+/// driver does not need its own `ironfix-core` dependency.
+pub use ironfix_core::{SeqNum, Timestamp};

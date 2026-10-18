@@ -5,13 +5,16 @@
 ******************************************************************************/
 
 //! Session configuration: keepalive, accepted counterparty keepalive range,
-//! retransmission limits and handshake timeout.
+//! retransmission limits and policy, gap bounds and handshake timeout.
 //!
 //! The same [`FixpConfig`] serves both roles. Every knob has a default, a
 //! documented unit and range, and is validated by
-//! [`FixpConfigBuilder::build`].
+//! [`FixpConfigBuilder::build`]. Every duration is bounded by
+//! [`MAX_TIMER`], the range of FIXP's `DeltaMillisecs` wire type, so no
+//! deadline the session computes from it can overflow and silently never
+//! fire.
 
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -38,15 +41,61 @@ pub const DEFAULT_MAX_PENDING_GAPS: NonZeroUsize = match NonZeroUsize::new(256) 
     None => NonZeroUsize::MIN,
 };
 
+/// Default largest single sequence gap accepted: 1 000 000 messages.
+pub const DEFAULT_MAX_GAP_LEN: NonZeroU64 = match NonZeroU64::new(1_000_000) {
+    Some(len) => len,
+    None => NonZeroU64::MIN,
+};
+
 /// Default time a RetransmitRequest may go without a retransmitted message
-/// before the rest of it is requested again: 10 seconds.
+/// before it counts as stalled: 10 seconds.
 pub const DEFAULT_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default time allowed for a handshake response: 10 seconds.
+/// Default time allowed for each handshake step: 10 seconds.
 pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The largest keepalive interval a `DeltaMillisecs` field can carry.
-const MAX_WIRE_KEEPALIVE: Duration = Duration::from_millis(u32::MAX as u64);
+/// The longest duration any setting takes: `u32::MAX` milliseconds (about
+/// 49.7 days), the range of the `DeltaMillisecs` wire type.
+pub const MAX_TIMER: Duration = Duration::from_millis(u32::MAX as u64);
+
+/// What a requester does when its RetransmitRequest stalls: no retransmitted
+/// message for [`FixpConfig::retransmit_timeout`].
+///
+/// FIXP gives the requester two duties that can pull apart. It must not send
+/// a second RetransmitRequest while a retransmission is in progress (sections
+/// 4.6.1, 4.6.4 and 6.3: a strict provider terminates with
+/// `ReRequestInProgress`), yet it is "the requester's responsibility" to ask
+/// again when a batch did not fill the gap (section 4.6.2.2). The requester
+/// cannot see whether a quiet provider has finished or is pacing its batches,
+/// so the policy is the operator's call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum RetransmitStallPolicy {
+    /// Report [`Event::RetransmitTimedOut`](crate::Event::RetransmitTimedOut)
+    /// and keep waiting. The request stays outstanding; the application may
+    /// terminate and re-establish, which requests the gap again.
+    EventOnly,
+    /// Report the stall and terminate the binding with `UnspecifiedError`.
+    /// Unrecovered gaps survive and are requested again after the next
+    /// establishment, when no retransmission can still be in progress.
+    Terminate,
+    /// The default. Ask again for what is still missing only when the
+    /// provider has visibly stopped serving: a Sequence or Context arrived
+    /// while a batch was still short of its `Count` (a context switch ends
+    /// the batch, section 3.5.4) and `retransmit_timeout` has passed since.
+    /// Otherwise report the stall and keep waiting, as `EventOnly` does.
+    ///
+    /// Residual risk: a provider that cut a batch short but still considers
+    /// the request in progress (IronFix's own provider does, if its driver
+    /// writes fewer messages than a batch announced and does not call
+    /// `end_retransmission`) sees the new request as premature, and a strict
+    /// one terminates with `ReRequestInProgress`. Conversely, a provider that
+    /// answers with one short but complete batch and expects a new request
+    /// (one reading of section 4.6.2.2) is never asked again under this
+    /// policy; use `Terminate` with such a counterparty.
+    #[default]
+    ReRequestAfterContextSwitch,
+}
 
 /// Configuration of a FIXP session, either role.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +108,9 @@ pub struct FixpConfig {
     peer_silence_grace: Option<Duration>,
     max_retransmit_count: NonZeroU32,
     max_pending_gaps: NonZeroUsize,
+    max_gap_len: NonZeroU64,
     retransmit_timeout: Duration,
+    retransmit_stall_policy: RetransmitStallPolicy,
     handshake_timeout: Duration,
 }
 
@@ -73,7 +124,9 @@ impl Default for FixpConfig {
             peer_silence_grace: None,
             max_retransmit_count: DEFAULT_MAX_RETRANSMIT_COUNT,
             max_pending_gaps: DEFAULT_MAX_PENDING_GAPS,
+            max_gap_len: DEFAULT_MAX_GAP_LEN,
             retransmit_timeout: DEFAULT_RETRANSMIT_TIMEOUT,
+            retransmit_stall_policy: RetransmitStallPolicy::ReRequestAfterContextSwitch,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
     }
@@ -139,15 +192,30 @@ impl FixpConfig {
         self.max_pending_gaps
     }
 
+    /// The largest single gap, in messages, the session accepts in the
+    /// counterparty's numbering; a larger jump terminates.
+    #[must_use]
+    pub const fn max_gap_len(&self) -> NonZeroU64 {
+        self.max_gap_len
+    }
+
     /// How long a RetransmitRequest may go without a retransmitted message
-    /// before the rest of it is requested again.
+    /// before it counts as stalled.
     #[must_use]
     pub const fn retransmit_timeout(&self) -> Duration {
         self.retransmit_timeout
     }
 
-    /// How long a handshake may wait: a client for NegotiationResponse or
-    /// EstablishmentAck, a server for Negotiate and for the first Establish.
+    /// What the session does when a RetransmitRequest stalls.
+    #[must_use]
+    pub const fn retransmit_stall_policy(&self) -> RetransmitStallPolicy {
+        self.retransmit_stall_policy
+    }
+
+    /// How long each handshake step may wait: a client for
+    /// NegotiationResponse or EstablishmentAck; a server for Negotiate, for
+    /// an Establish on a transport, and for the application's answer to
+    /// either.
     #[must_use]
     pub const fn handshake_timeout(&self) -> Duration {
         self.handshake_timeout
@@ -164,17 +232,17 @@ pub struct FixpConfigBuilder {
 impl FixpConfigBuilder {
     /// Sets the keepalive interval this side announces and keeps to.
     ///
-    /// Whole milliseconds, from 1 ms to `u32::MAX` ms (the range of the
-    /// `DeltaMillisecs` wire type). Default 5 s.
+    /// Whole milliseconds, from 1 ms to [`MAX_TIMER`]. Default 5 s.
     pub const fn keepalive_interval(mut self, interval: Duration) -> Self {
         self.config.keepalive_interval = interval;
         self
     }
 
     /// Sets the range of counterparty keepalive intervals accepted, both ends
-    /// inclusive. A server refuses an Establish outside it with
-    /// EstablishmentReject `KeepaliveInterval`; a client terminates on an
-    /// EstablishmentAck outside it. Default 100 ms to 1 hour.
+    /// inclusive, each in whole milliseconds from 1 ms to [`MAX_TIMER`]. A
+    /// server refuses an Establish outside it with EstablishmentReject
+    /// `KeepaliveInterval`; a client terminates on an EstablishmentAck
+    /// outside it. Default 100 ms to 1 hour.
     ///
     /// The upper bound matters: the counterparty's interval drives this
     /// side's dead-peer detection, so an unbounded one would let the
@@ -187,7 +255,7 @@ impl FixpConfigBuilder {
 
     /// Sets the leniency added to the counterparty's keepalive interval
     /// before its silence terminates the session (FIXP v1.1 section 4.4
-    /// recommends some).
+    /// recommends some), at most [`MAX_TIMER`].
     ///
     /// Default: equal to the counterparty's interval, so the session ends
     /// after two intervals without a message. FIXP asks for a heartbeat in
@@ -214,15 +282,35 @@ impl FixpConfigBuilder {
         self
     }
 
+    /// Sets the largest single jump in the counterparty's numbering the
+    /// session accepts as a gap, in messages; a larger one terminates.
+    /// Default 1 000 000.
+    ///
+    /// It bounds the work a counterparty can cause with one `NextSeqNo`:
+    /// the requests a Recoverable gap leads to, and the size a NotApplied
+    /// reports.
+    pub const fn max_gap_len(mut self, len: NonZeroU64) -> Self {
+        self.config.max_gap_len = len;
+        self
+    }
+
     /// Sets how long a RetransmitRequest may go without a retransmitted
-    /// message before the rest of it is requested again. Non-zero.
+    /// message before it counts as stalled. From 1 ns to [`MAX_TIMER`].
     /// Default 10 s.
     pub const fn retransmit_timeout(mut self, timeout: Duration) -> Self {
         self.config.retransmit_timeout = timeout;
         self
     }
 
-    /// Sets how long a handshake may wait. Non-zero. Default 10 s.
+    /// Sets what the session does when a RetransmitRequest stalls. Default
+    /// [`RetransmitStallPolicy::ReRequestAfterContextSwitch`].
+    pub const fn retransmit_stall_policy(mut self, policy: RetransmitStallPolicy) -> Self {
+        self.config.retransmit_stall_policy = policy;
+        self
+    }
+
+    /// Sets how long each handshake step may wait. From 1 ns to
+    /// [`MAX_TIMER`]. Default 10 s.
     pub const fn handshake_timeout(mut self, timeout: Duration) -> Self {
         self.config.handshake_timeout = timeout;
         self
@@ -244,16 +332,11 @@ impl FixpConfigBuilder {
                 max: config.max_peer_keepalive,
             });
         }
-        if config.retransmit_timeout.is_zero() {
-            return Err(FixpConfigError::ZeroTimeout {
-                setting: "retransmit_timeout",
-            });
+        if let Some(grace) = config.peer_silence_grace {
+            validate_upper_bound("peer_silence_grace", grace)?;
         }
-        if config.handshake_timeout.is_zero() {
-            return Err(FixpConfigError::ZeroTimeout {
-                setting: "handshake_timeout",
-            });
-        }
+        validate_timeout("retransmit_timeout", config.retransmit_timeout)?;
+        validate_timeout("handshake_timeout", config.handshake_timeout)?;
         Ok(config)
     }
 }
@@ -263,7 +346,7 @@ impl FixpConfigBuilder {
 fn validate_keepalive(setting: &'static str, interval: Duration) -> Result<u32, FixpConfigError> {
     let invalid = FixpConfigError::InvalidKeepalive { setting, interval };
     if interval < Duration::from_millis(1)
-        || interval > MAX_WIRE_KEEPALIVE
+        || interval > MAX_TIMER
         || !interval.subsec_nanos().is_multiple_of(1_000_000)
     {
         return Err(invalid);
@@ -271,12 +354,32 @@ fn validate_keepalive(setting: &'static str, interval: Duration) -> Result<u32, 
     u32::try_from(interval.as_millis()).map_err(|_| invalid)
 }
 
+/// Checks a timeout is neither zero nor above [`MAX_TIMER`].
+fn validate_timeout(setting: &'static str, timeout: Duration) -> Result<(), FixpConfigError> {
+    if timeout.is_zero() {
+        return Err(FixpConfigError::ZeroTimeout { setting });
+    }
+    validate_upper_bound(setting, timeout)
+}
+
+/// Checks a duration is at most [`MAX_TIMER`].
+fn validate_upper_bound(setting: &'static str, duration: Duration) -> Result<(), FixpConfigError> {
+    if duration > MAX_TIMER {
+        return Err(FixpConfigError::TimerTooLong {
+            setting,
+            duration,
+            max: MAX_TIMER,
+        });
+    }
+    Ok(())
+}
+
 /// An invalid [`FixpConfig`] setting.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum FixpConfigError {
     /// A keepalive interval that is not a whole number of milliseconds from
-    /// 1 ms to `u32::MAX` ms.
+    /// 1 ms to [`MAX_TIMER`].
     #[error("{setting} of {interval:?} is not whole milliseconds from 1 ms to u32::MAX ms")]
     InvalidKeepalive {
         /// The setting name.
@@ -298,6 +401,16 @@ pub enum FixpConfigError {
         /// The setting name.
         setting: &'static str,
     },
+    /// A duration above [`MAX_TIMER`].
+    #[error("{setting} of {duration:?} exceeds the maximum of {max:?}")]
+    TimerTooLong {
+        /// The setting name.
+        setting: &'static str,
+        /// The value given.
+        duration: Duration,
+        /// The largest accepted, [`MAX_TIMER`].
+        max: Duration,
+    },
 }
 
 #[cfg(test)]
@@ -313,8 +426,17 @@ mod tests {
         assert_eq!(config.keepalive_millis(), 5_000);
         assert_eq!(config.max_retransmit_count().get(), 1_000);
         assert_eq!(config.max_pending_gaps().get(), 256);
+        assert_eq!(config.max_gap_len().get(), 1_000_000);
         assert_eq!(config.peer_silence_grace(), None);
         assert_eq!(config.retransmit_timeout(), Duration::from_secs(10));
+        assert_eq!(
+            config.retransmit_stall_policy(),
+            RetransmitStallPolicy::ReRequestAfterContextSwitch
+        );
+        assert_eq!(
+            RetransmitStallPolicy::default(),
+            config.retransmit_stall_policy()
+        );
         assert_eq!(config.handshake_timeout(), Duration::from_secs(10));
         assert_eq!(config.min_peer_keepalive(), Duration::from_millis(100));
         assert_eq!(config.max_peer_keepalive(), Duration::from_secs(3_600));
@@ -328,7 +450,9 @@ mod tests {
             .peer_silence_grace(Duration::from_millis(50))
             .max_retransmit_count(NonZeroU32::MIN)
             .max_pending_gaps(NonZeroUsize::MIN)
+            .max_gap_len(NonZeroU64::MIN)
             .retransmit_timeout(Duration::from_secs(1))
+            .retransmit_stall_policy(RetransmitStallPolicy::Terminate)
             .handshake_timeout(Duration::from_secs(2))
             .build();
         assert!(built.is_ok());
@@ -341,6 +465,11 @@ mod tests {
             assert_eq!(config.peer_silence_grace(), Some(Duration::from_millis(50)));
             assert_eq!(config.max_retransmit_count().get(), 1);
             assert_eq!(config.max_pending_gaps().get(), 1);
+            assert_eq!(config.max_gap_len().get(), 1);
+            assert_eq!(
+                config.retransmit_stall_policy(),
+                RetransmitStallPolicy::Terminate
+            );
         }
     }
 
@@ -397,6 +526,57 @@ mod tests {
             Err(FixpConfigError::ZeroTimeout {
                 setting: "handshake_timeout"
             })
+        );
+    }
+
+    #[test]
+    fn test_builder_rejects_timers_above_the_wire_range() {
+        // An unbounded timer would overflow `Instant` arithmetic and never
+        // fire: a grace of Duration::MAX would disable dead-peer detection.
+        let too_long = MAX_TIMER + Duration::from_millis(1);
+        assert_eq!(
+            FixpConfig::builder()
+                .peer_silence_grace(Duration::MAX)
+                .build(),
+            Err(FixpConfigError::TimerTooLong {
+                setting: "peer_silence_grace",
+                duration: Duration::MAX,
+                max: MAX_TIMER,
+            })
+        );
+        assert_eq!(
+            FixpConfig::builder().retransmit_timeout(too_long).build(),
+            Err(FixpConfigError::TimerTooLong {
+                setting: "retransmit_timeout",
+                duration: too_long,
+                max: MAX_TIMER,
+            })
+        );
+        assert_eq!(
+            FixpConfig::builder().handshake_timeout(too_long).build(),
+            Err(FixpConfigError::TimerTooLong {
+                setting: "handshake_timeout",
+                duration: too_long,
+                max: MAX_TIMER,
+            })
+        );
+        // The bound itself is accepted.
+        assert!(
+            FixpConfig::builder()
+                .peer_silence_grace(MAX_TIMER)
+                .retransmit_timeout(MAX_TIMER)
+                .handshake_timeout(MAX_TIMER)
+                .build()
+                .is_ok()
+        );
+        assert!(
+            FixpConfigError::TimerTooLong {
+                setting: "handshake_timeout",
+                duration: too_long,
+                max: MAX_TIMER,
+            }
+            .to_string()
+            .contains("handshake_timeout")
         );
     }
 }

@@ -64,8 +64,9 @@ engine wiring (#96) does not exist.
   fatal for the stream: SOFH has no resynchronisation anchor. It does not
   interpret payloads and nothing in the engine uses it yet.
 - **A FIXP session core** in `ironfix-fixp`: the FIX Performance Session
-  Layer v1.1 (the Draft Standard of April 2019, the latest published) for
-  point-to-point sessions, client (`FixpClient`) and server (`FixpServer`).
+  Layer v1.1 (the Draft Standard of April 2019, the highest version
+  published; v1.0 is the April 2021 Technical Standard) for point-to-point
+  sessions, client (`FixpClient`) and server (`FixpServer`).
   It is sans-IO: decoded session messages, application-message arrivals,
   commands and timer ticks go in with an explicit `Instant`, and messages to
   write, transport closes and events come out; it reads no clock and does no
@@ -75,11 +76,14 @@ engine wiring (#96) does not exist.
   (re-establishment included) with credentials left to the application,
   implicit sequencing with checked arithmetic, the Recoverable flow (gap
   detection, one bounded RetransmitRequest in flight, Retransmission
-  validation and RetransmitReject, both as requester and as provider), the
-  Idempotent flow (NotApplied), Unsequenced and None flows, keepalive
-  heartbeats and termination on counterparty silence, and the Terminate
-  handshake. Malformed input is a typed error and protocol violations are
-  answered on the wire. What is implemented and tested, and every decision
+  validation and RetransmitReject, both as requester and as provider, with a
+  configurable policy for a stalled retransmission), the Idempotent flow
+  (NotApplied), Unsequenced and None flows, keepalive heartbeats and
+  termination on counterparty silence, bounded handshake timeouts, the
+  Terminate handshake, and the receiving side of a finalization (a
+  counterparty's FinishedSending is answered with FinishedReceiving).
+  Malformed input is a typed error and protocol violations are answered on
+  the wire. What is implemented and tested, and every decision
   the specification leaves open, are listed in `doc/fixp_operations.md`.
   No driver uses it yet.
 - **A client engine and a server engine** in `ironfix-engine`. `Initiator`
@@ -321,9 +325,9 @@ around it.
 - **No binary order-entry session can run yet.** `ironfix-sofh` frames and
   `ironfix-fixp` runs the FIXP session logic, but no driver composes them
   over a socket: the engine wiring behind a `fixp` feature is #96. Of FIXP
-  itself, the finalization handshake (FinishedSending / FinishedReceiving:
-  receiving either terminates the binding), multiplexing several sessions on
-  one transport, datagram transports, multicast, WebSocket and session
+  itself, sending a finalization (this side never sends FinishedSending, so
+  it never finalizes a session itself), multiplexing several sessions on one
+  transport, datagram transports, multicast, WebSocket and session
   persistence across process restarts are not implemented; the application
   SBE schemas a venue uses are out of `ironfix-fixp`'s scope. The SOFH v1.1
   Release Candidate is not implemented: the header is read and written
@@ -371,6 +375,14 @@ Community's, under the Apache License, Version 2.0
 (`ironfix-dictionary/tests/fixtures/orchestra/LICENSE`; provenance and
 checksums in `ironfix-dictionary/tests/fixtures/orchestra/README.md`). It is a
 test fixture only, left out of the published `ironfix-dictionary` package.
+
+The FIXP SBE message schema the `ironfix-fixp` conformance test reads is FIX
+Protocol Ltd.'s, published by FIX Trading Community under the Creative Commons
+Attribution-NoDerivatives 4.0 International License, and is vendored
+unmodified (`ironfix-fixp/spec/LICENSE-FIXP`; provenance and checksums in
+`ironfix-fixp/spec/README.md`). It is a test input only, left out of the
+published `ironfix-fixp` package; the codec is written by hand and checked
+against it.
 
 ## Crate Organization
 
@@ -662,12 +674,21 @@ We appreciate your interest and look forward to your contributions!
 
 **License**: MIT. The QuickFIX data dictionaries vendored in
 `ironfix-dictionary/spec/` remain under the QuickFIX Software License,
-Version 1.0 (`ironfix-dictionary/spec/LICENSE-QUICKFIX`).
+Version 1.0 (`ironfix-dictionary/spec/LICENSE-QUICKFIX`). The FIXP SBE schema
+vendored in `ironfix-fixp/spec/` remains under CC BY-ND 4.0
+(`ironfix-fixp/spec/LICENSE-FIXP`) and, like the Orchestra test fixture, is
+not part of any published package.
 
 <!-- related-projects:start -->
 ## Related projects
 
 Repositories by the same author that this project depends on, and repositories that depend on it.
+
+### Depends on
+
+| Repository | Description |
+|------------|-------------|
+| [IronSBE](https://github.com/joaquinbejar/IronSBE) | Simple Binary Encoding for Rust: `ironfix-fixp` encodes the FIXP session messages with `ironsbe-core`. |
 
 ### Used by
 

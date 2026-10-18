@@ -34,6 +34,13 @@
 //! and returns how many bytes it used. Whatever follows (on a datagram
 //! transport, the application messages a Sequence precedes) is left to the
 //! caller.
+//!
+//! That length counts the header, the root block as long as its declared
+//! `blockLength` (extension fields included), and the variable-length fields
+//! schema version 0 defines. A later schema version that appended
+//! variable-length fields would make a message longer than this count: a
+//! driver that reads several messages from one buffer relies on version 0,
+//! or on framing that delimits each message (SOFH) instead.
 
 use crate::error::{FixpDecodeError, FixpEncodeError};
 use crate::messages::{
@@ -80,7 +87,9 @@ pub fn is_session_message(src: &[u8]) -> bool {
 impl SessionMessage {
     /// Decodes the FIXP session message at the start of `src`.
     ///
-    /// Returns the message and the number of bytes it occupies.
+    /// Returns the message and the number of bytes it occupies as far as
+    /// schema version 0 describes it: the header, the declared root block and
+    /// the version-0 variable-length fields (see the module documentation).
     ///
     /// # Errors
     /// Returns a [`FixpDecodeError`] when `src` is not a complete, valid FIXP
@@ -174,11 +183,17 @@ impl SessionMessage {
     ///
     /// # Errors
     /// Returns [`FixpEncodeError::VarDataTooLong`] for a variable-length field
-    /// above its length prefix; `dst` is left unchanged.
+    /// above its length prefix, or [`FixpEncodeError::CapacityOverflow`] if
+    /// `dst` cannot grow by the encoded length; `dst` is left unchanged.
     pub fn encode(&self, dst: &mut Vec<u8>) -> Result<usize, FixpEncodeError> {
         let len = self.encoded_len()?;
         let start = dst.len();
-        dst.resize(start + len, 0);
+        let end = start
+            .checked_add(len)
+            .ok_or(FixpEncodeError::CapacityOverflow { needed: len })?;
+        dst.try_reserve(len)
+            .map_err(|_| FixpEncodeError::CapacityOverflow { needed: len })?;
+        dst.resize(end, 0);
         let written = match dst.get_mut(start..) {
             Some(buf) => self.write(buf),
             None => Ok(()),
@@ -343,6 +358,9 @@ impl SessionMessage {
                 out.u64(4, m.effective_time.map_or(NULL_U64, Nanotime::as_nanos));
             }
         }
+        // Offsets below stay within `buf`, which is `encoded_len` bytes long,
+        // so they are at most 8 + 65 535 + 2 * (2 + 65 535) and cannot
+        // overflow; `ironsbe-core`'s writers index `buf` at them.
         let mut position = HEADER_LEN + usize::from(block);
         for (field, bytes) in var_fields.into_iter().flatten() {
             let len = u16::try_from(bytes.len()).map_err(|_| FixpEncodeError::VarDataTooLong {

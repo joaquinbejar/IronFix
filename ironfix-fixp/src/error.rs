@@ -117,6 +117,14 @@ pub enum FixpEncodeError {
         /// Length of the destination slice in bytes.
         available: usize,
     },
+
+    /// The destination vector cannot grow by the encoded length: its length
+    /// would overflow or the allocation failed.
+    #[error("cannot grow the destination by {needed} bytes")]
+    CapacityOverflow {
+        /// Encoded length of the message in bytes.
+        needed: usize,
+    },
 }
 
 /// A local command the session cannot carry out.
@@ -178,6 +186,16 @@ pub enum FixpError {
     /// fit a 64-bit nanosecond count.
     #[error("the session clock is out of range")]
     ClockOutOfRange,
+
+    /// The session has asked the driver to close the transport
+    /// ([`crate::Output::CloseTransport`]) and the driver has not reported it
+    /// closed yet. Anything sent now would go to the closing transport:
+    /// report it closed (`on_transport_closed`) and use a new one.
+    #[error("{operation} needs a new transport: the current one is closing")]
+    TransportClosing {
+        /// The command that was refused.
+        operation: &'static str,
+    },
 }
 
 #[cfg(test)]

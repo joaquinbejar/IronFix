@@ -150,9 +150,16 @@ impl FixpClient {
     /// Sends Negotiate (FIXP v1.1 section 4.2.1).
     ///
     /// # Errors
-    /// [`FixpError::InvalidState`] unless idle, and
+    /// [`FixpError::InvalidState`] unless idle,
+    /// [`FixpError::TransportClosing`] while the session waits for the
+    /// driver to report the transport closed, and
     /// [`FixpError::ClockOutOfRange`].
     pub fn negotiate(&mut self, now: Instant) -> Result<(), FixpError> {
+        if self.core.transport_closing() {
+            return Err(FixpError::TransportClosing {
+                operation: "negotiate",
+            });
+        }
         match self.state {
             ClientState::Idle => {}
             ClientState::Negotiating { .. }
@@ -188,9 +195,16 @@ impl FixpClient {
     /// number as `NextSeqNo`.
     ///
     /// # Errors
-    /// [`FixpError::InvalidState`] unless negotiated and unbound, and
+    /// [`FixpError::InvalidState`] unless negotiated and unbound,
+    /// [`FixpError::TransportClosing`] while the session waits for the
+    /// driver to report the previous transport closed, and
     /// [`FixpError::ClockOutOfRange`].
     pub fn establish(&mut self, now: Instant) -> Result<(), FixpError> {
+        if self.core.transport_closing() {
+            return Err(FixpError::TransportClosing {
+                operation: "establish",
+            });
+        }
         let state = std::mem::replace(&mut self.state, ClientState::Idle);
         match state {
             ClientState::Negotiated { session } => match self.core.request_timestamp(now) {
@@ -231,7 +245,17 @@ impl FixpClient {
     }
 
     /// Handles a session message decoded from the transport.
+    ///
+    /// After the session has asked for the transport to be closed
+    /// ([`Output::CloseTransport`](crate::Output::CloseTransport)), and until
+    /// [`on_transport_closed`](Self::on_transport_closed), whatever still
+    /// arrives on it is ignored with
+    /// [`Event::Ignored`].
     pub fn handle_message(&mut self, message: &SessionMessage, now: Instant) {
+        if self.core.transport_closing() {
+            self.core.ignore(message.name(), "the transport is closing");
+            return;
+        }
         let state = std::mem::replace(&mut self.state, ClientState::Idle);
         self.state = match classify(message) {
             Classified::Handshake(message) => self.on_handshake(state, message, now),
@@ -251,6 +275,10 @@ impl FixpClient {
                     self.core.event(Event::HandshakeTimedOut {
                         stage: HandshakeStage::Negotiation,
                     });
+                    // A late answer would arrive on this transport; a new
+                    // negotiation needs a new identifier and transport
+                    // (Appendix A 7.1.7.6).
+                    self.core.close_transport();
                     ClientState::Closed(ClosedReason::NegotiationTimedOut)
                 } else {
                     ClientState::Negotiating { request, sent_at }
@@ -266,6 +294,9 @@ impl FixpClient {
                     self.core.event(Event::HandshakeTimedOut {
                         stage: HandshakeStage::Establishment,
                     });
+                    // The session stays negotiated; the retry of Appendix A
+                    // 7.1.12.9 goes on a new transport.
+                    self.core.close_transport();
                     ClientState::Negotiated { session }
                 } else {
                     ClientState::Establishing {
@@ -307,6 +338,7 @@ impl FixpClient {
     /// failure. A bound session becomes negotiated and can be established
     /// again on a new transport (FIXP v1.1 section 3.4.3).
     pub fn on_transport_closed(&mut self) {
+        self.core.transport_closed();
         let state = std::mem::replace(&mut self.state, ClientState::Idle);
         self.state = match state {
             ClientState::Idle => ClientState::Idle,
@@ -369,6 +401,11 @@ impl FixpClient {
     }
 
     fn application_before_established(&mut self) {
+        // Still arriving on a transport this side asked to close: nothing to
+        // answer, it is simply dropped.
+        if self.core.transport_closing() {
+            return;
+        }
         let state = std::mem::replace(&mut self.state, ClientState::Idle);
         self.state = self.violation(state, "application message before establishment");
     }
@@ -400,7 +437,7 @@ impl FixpClient {
                     self.core.event(Event::Terminated {
                         code: terminate.code,
                         reason: terminate.reason.clone(),
-                        initiator: crate::output::Initiator::Peer,
+                        by: crate::output::TerminatedBy::Peer,
                     });
                     self.core.close_transport();
                     Self::after_unbound_failure(unbound)
@@ -412,7 +449,7 @@ impl FixpClient {
                 | PeerMessage::RetransmitRequest(_)
                 | PeerMessage::Retransmission(_)
                 | PeerMessage::RetransmitReject(_)
-                | PeerMessage::FinishedSending
+                | PeerMessage::FinishedSending(_)
                 | PeerMessage::FinishedReceiving
                 | PeerMessage::Applied(_)
                 | PeerMessage::NotApplied(_) => {
@@ -673,7 +710,7 @@ pub(crate) fn elapsed(since: Instant, timeout: Duration, now: Instant) -> bool {
 mod tests {
     use super::*;
     use crate::messages::{MessageTemplate, Sequence, Terminate};
-    use crate::output::{Delivery, Initiator, Output};
+    use crate::output::{Delivery, Output, TerminatedBy};
     use crate::testkit::{
         HANDSHAKE, KEEPALIVE, OTHER_SESSION, SESSION, WALL, anchor, at, client, closes, config,
         deliver_all, drain, established_pair, events, negotiated_pair, sent,
@@ -791,7 +828,9 @@ mod tests {
         assert_eq!(client.server_flow(), Some(FlowType::Recoverable));
         assert_eq!(client.poll_timeout(), None);
         assert_eq!(client.next_outbound_seq(), Some(SeqNum::new(1)));
-        assert_eq!(client.next_inbound_seq(), None);
+        // A sequenced flow numbers from 1 unless the first establishment
+        // says otherwise.
+        assert_eq!(client.next_inbound_seq(), Some(SeqNum::new(1)));
     }
 
     #[test]
@@ -884,6 +923,15 @@ mod tests {
         );
         assert!(closes(&outputs));
         assert_eq!(client.status(), SessionStatus::Closed);
+        // Nothing more goes on the closing transport...
+        assert_eq!(
+            client.establish(origin),
+            Err(FixpError::TransportClosing {
+                operation: "establish"
+            })
+        );
+        // ...and once it is closed, a rejected client stays closed.
+        client.on_transport_closed();
         assert!(matches!(
             client.establish(origin),
             Err(FixpError::InvalidState { .. })
@@ -904,11 +952,16 @@ mod tests {
         assert!(drain(&mut client).is_empty());
         assert_eq!(client.status(), SessionStatus::Negotiating);
         client.handle_timeout(origin + HANDSHAKE);
+        let outputs = drain(&mut client);
         assert_eq!(
-            events(&drain(&mut client)),
+            events(&outputs),
             vec![Event::HandshakeTimedOut {
                 stage: HandshakeStage::Negotiation
             }]
+        );
+        assert!(
+            closes(&outputs),
+            "a late answer must not reach a new client"
         );
         assert_eq!(client.status(), SessionStatus::Closed);
         assert_eq!(client.poll_timeout(), None);
@@ -1110,13 +1163,23 @@ mod tests {
         let origin = Instant::now();
         let (mut client, _request) = establishing(origin);
         client.handle_timeout(origin + HANDSHAKE);
+        let outputs = drain(&mut client);
         assert_eq!(
-            events(&drain(&mut client)),
+            events(&outputs),
             vec![Event::HandshakeTimedOut {
                 stage: HandshakeStage::Establishment
             }]
         );
+        assert!(closes(&outputs), "the retry goes on a new transport");
         assert_eq!(client.status(), SessionStatus::Negotiated);
+        assert_eq!(
+            client.establish(origin + HANDSHAKE),
+            Err(FixpError::TransportClosing {
+                operation: "establish"
+            })
+        );
+        client.on_transport_closed();
+        assert_eq!(events(&drain(&mut client)), vec![Event::TransportClosed]);
         assert_eq!(client.establish(origin + HANDSHAKE), Ok(()));
     }
 
@@ -1187,7 +1250,24 @@ mod tests {
         ));
         assert!(closes(&outputs));
         assert_eq!(client.status(), SessionStatus::Closed);
+        // Until the driver reports the transport closed, what still arrives
+        // on it is ignored: no second violation, no second close.
+        client.handle_message(
+            &SessionMessage::Sequence(Sequence { next_seq_no: 1 }),
+            origin,
+        );
+        assert_eq!(
+            drain(&mut client),
+            vec![Output::Event(Event::Ignored {
+                message: "Sequence",
+                reason: "the transport is closing",
+            })]
+        );
+        assert_eq!(client.on_application_message(origin), Delivery::Discard);
+        assert!(drain(&mut client).is_empty());
         // A closed client ignores everything.
+        client.on_transport_closed();
+        let _ = drain(&mut client);
         client.handle_message(
             &SessionMessage::Sequence(Sequence { next_seq_no: 1 }),
             origin,
@@ -1213,7 +1293,7 @@ mod tests {
             vec![Event::Terminated {
                 code: TerminationCode::Finished,
                 reason: String::new(),
-                initiator: Initiator::Peer,
+                by: TerminatedBy::Peer,
             }]
         );
         assert!(closes(&outputs));
@@ -1337,6 +1417,66 @@ mod tests {
         let rendered = format!("{outputs:?}");
         assert!(!rendered.contains("s3cr3t"), "{rendered}");
         assert!(matches!(outputs.first(), Some(Output::Send(_))));
+    }
+
+    #[test]
+    fn test_tracing_output_never_contains_credentials() {
+        // Captures every log line both roles emit through a handshake with
+        // credentials both ways, a violation and a termination.
+        let capture = crate::testkit::LogCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let origin = Instant::now();
+            let mut client = FixpClient::new(
+                config(),
+                anchor(origin),
+                SESSION,
+                FlowType::Idempotent,
+                Credentials::try_new(b"s3cr3t-client".to_vec()).ok(),
+            );
+            let mut server = crate::testkit::server(origin);
+            assert_eq!(client.negotiate(origin), Ok(()));
+            deliver_all(&drain(&mut client), &mut server, origin);
+            let _ = drain(&mut server);
+            assert_eq!(
+                server.accept_negotiation(
+                    FlowType::Recoverable,
+                    Credentials::try_new(b"s3cr3t-server".to_vec()).ok(),
+                    origin,
+                ),
+                Ok(())
+            );
+            deliver_all(&drain(&mut server), &mut client, origin);
+            let _ = drain(&mut client);
+            assert_eq!(client.establish(origin), Ok(()));
+            deliver_all(&drain(&mut client), &mut server, origin);
+            let _ = drain(&mut server);
+            assert_eq!(server.accept_establishment(origin), Ok(()));
+            deliver_all(&drain(&mut server), &mut client, origin);
+            let _ = drain(&mut client);
+            client.handle_message(
+                &SessionMessage::Sequence(Sequence { next_seq_no: 0 }),
+                origin,
+            );
+            let _ = drain(&mut client);
+            assert_eq!(
+                server.terminate(TerminationCode::Finished, "", origin),
+                Ok(())
+            );
+            let _ = drain(&mut server);
+        });
+        let lines = capture.lines();
+        assert!(
+            lines.iter().any(|line| line.contains("fixp negotiate")),
+            "the capture saw the session's logs: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("fixp protocol violation"))
+        );
+        for line in &lines {
+            assert!(!line.contains("s3cr3t"), "credentials logged: {line}");
+        }
     }
 
     #[test]

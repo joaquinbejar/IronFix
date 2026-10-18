@@ -26,11 +26,29 @@
 //! Establish (FIXP v1.1 sections 4.2.3 and 4.3.3; Appendix A 7.1.7.3 and
 //! 7.1.12).
 //!
+//! Every wait is bounded by [`FixpConfig::handshake_timeout`]: for a
+//! Negotiate, for the application's answer to it, for an Establish on a
+//! transport, and for the application's answer to that. When one lapses the
+//! server asks for the transport to be closed.
+//!
 //! One `FixpServer` serves one session. A driver serving several routes each
 //! Negotiate and Establish by session identifier
 //! ([`SessionMessage::session_id`]); duplicate-identifier detection across
 //! sessions (`DuplicateId`) needs that registry and is the application's
 //! call through `reject_negotiation`.
+//!
+//! # Transports
+//!
+//! A negotiated session outlives its transport. When a client comes back on
+//! a new one, the driver reports the old transport closed
+//! (`on_transport_closed`), then the new one opened (`on_transport_opened`,
+//! which arms the Establish deadline), then routes the Establish here. A
+//! Negotiate or Establish still arriving on a transport that is being
+//! unbound (this side terminating, or answering the counterparty's
+//! Terminate) is not answered: it is reported as
+//! [`Event::Ignored`], and the client must retry on a
+//! new transport. A session left negotiated with no transport has no timer;
+//! evicting it is the driver's policy.
 
 use crate::client::elapsed;
 use crate::clock::{ClockAnchor, RequestClock};
@@ -40,7 +58,7 @@ use crate::messages::{
     Establish, EstablishmentAck, EstablishmentReject, Negotiate, NegotiationReject,
     NegotiationResponse, SessionMessage,
 };
-use crate::output::{Event, HandshakeStage, Initiator, SessionStatus};
+use crate::output::{Event, HandshakeStage, SessionStatus, TerminatedBy};
 use crate::role::bound_api;
 use crate::session::{
     Binding, Bound, Classified, Core, HandshakeMessage, PeerMessage, Session, check_reason,
@@ -70,6 +88,8 @@ enum ServerState {
         session_id: SessionId,
         request: Nanotime,
         client_flow: FlowType,
+        /// When the transport is closed if the application has not answered.
+        deadline: Option<Instant>,
     },
     Negotiated {
         session: Box<Session>,
@@ -81,6 +101,8 @@ enum ServerState {
         request: Nanotime,
         keepalive: u32,
         next_seq_no: Option<u64>,
+        /// When the transport is closed if the application has not answered.
+        deadline: Option<Instant>,
     },
     Bound {
         session: Box<Session>,
@@ -184,12 +206,14 @@ impl FixpServer {
                 session_id,
                 request,
                 client_flow,
+                deadline,
             } => {
                 if client_flow == FlowType::None && server_flow == FlowType::None {
                     self.state = ServerState::NegotiationPending {
                         session_id,
                         request,
                         client_flow,
+                        deadline,
                     };
                     return Err(FixpError::BothFlowsNone);
                 }
@@ -284,6 +308,7 @@ impl FixpServer {
                 request,
                 keepalive,
                 next_seq_no,
+                ..
             } => {
                 let local = self.core.config().keepalive_interval();
                 let remote = Duration::from_millis(u64::from(keepalive));
@@ -364,15 +389,63 @@ impl FixpServer {
     }
 
     /// Handles a session message decoded from the transport.
+    ///
+    /// After the session has asked for the transport to be closed
+    /// ([`Output::CloseTransport`](crate::Output::CloseTransport)), and until
+    /// [`on_transport_closed`](Self::on_transport_closed), whatever still
+    /// arrives on it is ignored with
+    /// [`Event::Ignored`].
     pub fn handle_message(&mut self, message: &SessionMessage, now: Instant) {
+        if self.core.transport_closing() {
+            self.core.ignore(message.name(), "the transport is closing");
+            return;
+        }
         let state = std::mem::replace(
             &mut self.state,
             ServerState::Closed(ClosedReason::TransportClosed),
         );
         self.state = match classify(message) {
-            Classified::Handshake(message) => self.on_handshake(state, message),
+            Classified::Handshake(message) => self.on_handshake(state, message, now),
             Classified::Peer(message) => self.on_peer(state, message, now),
         };
+    }
+
+    /// Tells a negotiated session without a transport that the driver has
+    /// routed a new transport to it, at `now`: an Establish must arrive on it
+    /// within the handshake timeout, or the server asks for it to be closed.
+    ///
+    /// # Errors
+    /// [`FixpError::TransportClosing`] until the previous transport is
+    /// reported closed, and [`FixpError::InvalidState`] unless the session
+    /// is negotiated with no transport attached.
+    pub fn on_transport_opened(&mut self, now: Instant) -> Result<(), FixpError> {
+        if self.core.transport_closing() {
+            return Err(FixpError::TransportClosing {
+                operation: "on_transport_opened",
+            });
+        }
+        let handshake_timeout = self.core.config().handshake_timeout();
+        let status = self.state.status();
+        match &mut self.state {
+            ServerState::Negotiated {
+                deadline: deadline @ None,
+                ..
+            } => {
+                *deadline = now.checked_add(handshake_timeout);
+                Ok(())
+            }
+            ServerState::Negotiated {
+                deadline: Some(_), ..
+            }
+            | ServerState::AwaitingNegotiate { .. }
+            | ServerState::NegotiationPending { .. }
+            | ServerState::EstablishPending { .. }
+            | ServerState::Bound { .. }
+            | ServerState::Closed(_) => Err(FixpError::InvalidState {
+                operation: "on_transport_opened",
+                status,
+            }),
+        }
     }
 
     /// Runs the timers due at `now`: heartbeats, the counterparty silence
@@ -411,6 +484,55 @@ impl FixpServer {
                     ServerState::Negotiated { session, deadline }
                 }
             }
+            ServerState::NegotiationPending {
+                session_id,
+                request,
+                client_flow,
+                deadline,
+            } => {
+                if deadline.is_some_and(|deadline| now >= deadline) {
+                    tracing::warn!(%session_id, "fixp server: the application did not answer the Negotiate in time");
+                    self.core.event(Event::HandshakeTimedOut {
+                        stage: HandshakeStage::Negotiation,
+                    });
+                    self.core.close_transport();
+                    ServerState::Closed(ClosedReason::HandshakeTimedOut)
+                } else {
+                    ServerState::NegotiationPending {
+                        session_id,
+                        request,
+                        client_flow,
+                        deadline,
+                    }
+                }
+            }
+            ServerState::EstablishPending {
+                session,
+                request,
+                keepalive,
+                next_seq_no,
+                deadline,
+            } => {
+                if deadline.is_some_and(|deadline| now >= deadline) {
+                    tracing::warn!(session_id = %session.id(), "fixp server: the application did not answer the Establish in time");
+                    self.core.event(Event::HandshakeTimedOut {
+                        stage: HandshakeStage::Establishment,
+                    });
+                    self.core.close_transport();
+                    ServerState::Negotiated {
+                        session,
+                        deadline: None,
+                    }
+                } else {
+                    ServerState::EstablishPending {
+                        session,
+                        request,
+                        keepalive,
+                        next_seq_no,
+                        deadline,
+                    }
+                }
+            }
             ServerState::Bound {
                 mut session,
                 mut binding,
@@ -421,9 +543,7 @@ impl FixpServer {
                     deadline: None,
                 },
             },
-            other @ (ServerState::NegotiationPending { .. }
-            | ServerState::EstablishPending { .. }
-            | ServerState::Closed(_)) => other,
+            other @ ServerState::Closed(_) => other,
         };
     }
 
@@ -435,13 +555,13 @@ impl FixpServer {
             ServerState::AwaitingNegotiate { since } => {
                 since.checked_add(self.core.config().handshake_timeout())
             }
-            ServerState::Negotiated { deadline, .. } => *deadline,
+            ServerState::Negotiated { deadline, .. }
+            | ServerState::NegotiationPending { deadline, .. }
+            | ServerState::EstablishPending { deadline, .. } => *deadline,
             ServerState::Bound { session, binding } => {
                 session.next_deadline(self.core.config(), binding)
             }
-            ServerState::NegotiationPending { .. }
-            | ServerState::EstablishPending { .. }
-            | ServerState::Closed(_) => None,
+            ServerState::Closed(_) => None,
         }
     }
 
@@ -449,6 +569,7 @@ impl FixpServer {
     /// negotiated: the client may establish it again on a new transport,
     /// which the driver routes here by session identifier.
     pub fn on_transport_closed(&mut self) {
+        self.core.transport_closed();
         let state = std::mem::replace(
             &mut self.state,
             ServerState::Closed(ClosedReason::TransportClosed),
@@ -528,6 +649,11 @@ impl FixpServer {
     }
 
     fn application_before_established(&mut self) {
+        // Still arriving on a transport this side asked to close: nothing to
+        // answer, it is simply dropped.
+        if self.core.transport_closing() {
+            return;
+        }
         let state = std::mem::replace(
             &mut self.state,
             ServerState::Closed(ClosedReason::TransportClosed),
@@ -576,7 +702,7 @@ impl FixpServer {
                     self.core.event(Event::Terminated {
                         code: terminate.code,
                         reason: terminate.reason.clone(),
-                        initiator: Initiator::Peer,
+                        by: TerminatedBy::Peer,
                     });
                     self.core.close_transport();
                     Self::after_unbound_failure(unbound)
@@ -588,7 +714,7 @@ impl FixpServer {
                 | PeerMessage::RetransmitRequest(_)
                 | PeerMessage::Retransmission(_)
                 | PeerMessage::RetransmitReject(_)
-                | PeerMessage::FinishedSending
+                | PeerMessage::FinishedSending(_)
                 | PeerMessage::FinishedReceiving
                 | PeerMessage::Applied(_)
                 | PeerMessage::NotApplied(_) => {
@@ -598,10 +724,15 @@ impl FixpServer {
         }
     }
 
-    fn on_handshake(&mut self, state: ServerState, message: HandshakeMessage<'_>) -> ServerState {
+    fn on_handshake(
+        &mut self,
+        state: ServerState,
+        message: HandshakeMessage<'_>,
+        now: Instant,
+    ) -> ServerState {
         match message {
-            HandshakeMessage::Negotiate(m) => self.on_negotiate(state, m),
-            HandshakeMessage::Establish(m) => self.on_establish(state, m),
+            HandshakeMessage::Negotiate(m) => self.on_negotiate(state, m, now),
+            HandshakeMessage::Establish(m) => self.on_establish(state, m, now),
             HandshakeMessage::NegotiationResponse(_)
             | HandshakeMessage::NegotiationReject(_)
             | HandshakeMessage::EstablishmentAck(_)
@@ -611,7 +742,7 @@ impl FixpServer {
         }
     }
 
-    fn on_negotiate(&mut self, state: ServerState, m: &Negotiate) -> ServerState {
+    fn on_negotiate(&mut self, state: ServerState, m: &Negotiate, now: Instant) -> ServerState {
         match state {
             ServerState::AwaitingNegotiate { .. } => {
                 // Appendix A 7.1.7.3: a session id that is no UUID is refused.
@@ -633,6 +764,7 @@ impl FixpServer {
                     session_id: m.session_id,
                     request: m.timestamp,
                     client_flow: m.client_flow,
+                    deadline: now.checked_add(self.core.config().handshake_timeout()),
                 }
             }
             ServerState::NegotiationPending { .. } => {
@@ -647,6 +779,7 @@ impl FixpServer {
                 request,
                 keepalive,
                 next_seq_no,
+                deadline,
             } => {
                 self.refuse_renegotiation(&session, m);
                 ServerState::EstablishPending {
@@ -654,11 +787,16 @@ impl FixpServer {
                     request,
                     keepalive,
                     next_seq_no,
+                    deadline,
                 }
             }
             ServerState::Bound { session, binding } => {
                 if binding.status() == SessionStatus::Established {
                     self.refuse_renegotiation(&session, m);
+                } else {
+                    // The binding is ending: nothing more may be sent on it.
+                    self.core
+                        .ignore(Negotiate::NAME, "the transport is being unbound");
                 }
                 ServerState::Bound { session, binding }
             }
@@ -704,7 +842,7 @@ impl FixpServer {
         });
     }
 
-    fn on_establish(&mut self, state: ServerState, m: &Establish) -> ServerState {
+    fn on_establish(&mut self, state: ServerState, m: &Establish, now: Instant) -> ServerState {
         match state {
             // Appendix A 7.1.12.1: Establish without negotiation.
             ServerState::AwaitingNegotiate { since } => {
@@ -740,6 +878,15 @@ impl FixpServer {
                     );
                     return ServerState::Negotiated { session, deadline };
                 }
+                // A sequenced flow numbers from 1 at least (section 3.5.1).
+                if session.remote_flow().is_sequenced() && m.next_seq_no == Some(0) {
+                    self.refuse_establish(
+                        m,
+                        EstablishmentRejectCode::Unspecified,
+                        "NextSeqNo of zero",
+                    );
+                    return ServerState::Negotiated { session, deadline };
+                }
                 if session.regresses(m.next_seq_no) {
                     self.refuse_establish(
                         m,
@@ -760,6 +907,7 @@ impl FixpServer {
                     request: m.timestamp,
                     keepalive: m.keepalive_interval,
                     next_seq_no: m.next_seq_no,
+                    deadline: now.checked_add(self.core.config().handshake_timeout()),
                 }
             }
             ServerState::EstablishPending { .. } => {
@@ -773,6 +921,11 @@ impl FixpServer {
                         EstablishmentRejectCode::AlreadyEstablished,
                         "session already established",
                     );
+                } else {
+                    // The binding is ending: nothing more may be sent on it.
+                    // The client retries on a new transport.
+                    self.core
+                        .ignore(Establish::NAME, "the transport is being unbound");
                 }
                 ServerState::Bound { session, binding }
             }
@@ -914,7 +1067,8 @@ mod tests {
         assert_eq!(server.session_id(), Some(SESSION));
         assert_eq!(server.client_flow(), Some(FlowType::Idempotent));
         assert_eq!(server.server_flow(), None);
-        assert_eq!(server.poll_timeout(), None, "the application decides");
+        // The application's answer is bounded by the handshake timeout too.
+        assert_eq!(server.poll_timeout(), Some(origin + HANDSHAKE));
     }
 
     #[test]
@@ -1322,6 +1476,8 @@ mod tests {
         ));
         assert!(closes(&outputs));
         assert_eq!(server.status(), SessionStatus::Negotiated);
+        // The transport is closing: what still arrives is ignored, with no
+        // second violation and no second close.
         assert_eq!(server.on_application_message(origin), Delivery::Discard);
         server.handle_message(
             &SessionMessage::Terminate(Terminate {
@@ -1331,7 +1487,171 @@ mod tests {
             }),
             origin,
         );
+        assert_eq!(
+            drain(&mut server),
+            vec![Output::Event(Event::Ignored {
+                message: "Terminate",
+                reason: "the transport is closing",
+            })]
+        );
+        // On a fresh transport a Terminate before establishment closes it.
+        server.on_transport_closed();
+        let _ = drain(&mut server);
+        server.handle_message(
+            &SessionMessage::Terminate(Terminate {
+                session_id: SESSION,
+                code: TerminationCode::Finished,
+                reason: String::new(),
+            }),
+            origin,
+        );
         assert!(closes(&drain(&mut server)));
+    }
+
+    #[test]
+    fn test_server_application_answers_are_bounded_by_the_handshake_timeout() {
+        let origin = Instant::now();
+        // A Negotiate the application never answers.
+        let mut negotiating = pending(origin, FlowType::Recoverable);
+        negotiating.handle_timeout(origin + HANDSHAKE - Duration::from_millis(1));
+        assert!(drain(&mut negotiating).is_empty());
+        negotiating.handle_timeout(origin + HANDSHAKE);
+        let outputs = drain(&mut negotiating);
+        assert_eq!(
+            events(&outputs),
+            vec![Event::HandshakeTimedOut {
+                stage: HandshakeStage::Negotiation
+            }]
+        );
+        assert!(closes(&outputs));
+        assert_eq!(negotiating.status(), SessionStatus::Closed);
+        // An Establish the application never answers.
+        let (_client, mut establishing) =
+            negotiated_pair(origin, FlowType::Recoverable, FlowType::Recoverable);
+        let received = at(origin, 100);
+        establishing.handle_message(&establish_message(SESSION, 1_000, Some(1)), received);
+        let _ = drain(&mut establishing);
+        assert_eq!(establishing.poll_timeout(), Some(received + HANDSHAKE));
+        establishing.handle_timeout(received + HANDSHAKE);
+        let outputs = drain(&mut establishing);
+        assert_eq!(
+            events(&outputs),
+            vec![Event::HandshakeTimedOut {
+                stage: HandshakeStage::Establishment
+            }]
+        );
+        assert!(closes(&outputs));
+        assert_eq!(establishing.status(), SessionStatus::Negotiated);
+        assert!(matches!(
+            establishing.accept_establishment(received + HANDSHAKE),
+            Err(FixpError::InvalidState { .. })
+        ));
+    }
+
+    #[test]
+    fn test_server_on_transport_opened_arms_the_establish_deadline() {
+        let origin = Instant::now();
+        let (mut client, mut server) =
+            established_pair(origin, FlowType::Recoverable, FlowType::Recoverable);
+        server.on_transport_closed();
+        client.on_transport_closed();
+        let _ = drain(&mut server);
+        let _ = drain(&mut client);
+        assert_eq!(server.poll_timeout(), None, "no transport, no timer");
+        let opened = at(origin, 1_000);
+        assert_eq!(server.on_transport_opened(opened), Ok(()));
+        assert_eq!(server.poll_timeout(), Some(opened + HANDSHAKE));
+        assert!(matches!(
+            server.on_transport_opened(opened),
+            Err(FixpError::InvalidState { .. })
+        ));
+        // No Establish on the new transport in time: it is closed again.
+        server.handle_timeout(opened + HANDSHAKE);
+        let outputs = drain(&mut server);
+        assert!(closes(&outputs));
+        assert_eq!(
+            server.on_transport_opened(opened + HANDSHAKE),
+            Err(FixpError::TransportClosing {
+                operation: "on_transport_opened"
+            })
+        );
+        server.on_transport_closed();
+        let _ = drain(&mut server);
+        // A new transport, and this time the client establishes.
+        let again = opened + HANDSHAKE + Duration::from_millis(10);
+        assert_eq!(server.on_transport_opened(again), Ok(()));
+        establish(&mut client, &mut server, again);
+        let mut fresh = super::super::testkit::server(origin);
+        assert!(matches!(
+            fresh.on_transport_opened(origin),
+            Err(FixpError::InvalidState { .. })
+        ));
+    }
+
+    #[test]
+    fn test_server_rejects_an_establish_with_next_seq_zero() {
+        let origin = Instant::now();
+        let (_client, mut server) =
+            negotiated_pair(origin, FlowType::Recoverable, FlowType::Recoverable);
+        server.handle_message(&establish_message(SESSION, 1_000, Some(0)), origin);
+        let outputs = drain(&mut server);
+        let reject = establishment_reject(&outputs);
+        assert_eq!(reject.code, EstablishmentRejectCode::Unspecified);
+        assert_eq!(reject.reason, "NextSeqNo of zero");
+        assert!(!closes(&outputs));
+        assert_eq!(server.status(), SessionStatus::Negotiated);
+        // On an unsequenced client flow NextSeqNo is not looked at.
+        let (_client, mut unsequenced) =
+            negotiated_pair(origin, FlowType::Unsequenced, FlowType::Recoverable);
+        unsequenced.handle_message(&establish_message(SESSION, 1_000, Some(0)), origin);
+        assert_eq!(unsequenced.status(), SessionStatus::EstablishPending);
+    }
+
+    #[test]
+    fn test_server_handshake_messages_while_unbinding_are_ignored() {
+        // A client retrying on a transport that is being unbound gets no
+        // answer there; it must use a new transport.
+        let origin = Instant::now();
+        let (mut client, mut server) =
+            established_pair(origin, FlowType::Recoverable, FlowType::Recoverable);
+        assert_eq!(
+            client.terminate(TerminationCode::Finished, "", origin),
+            Ok(())
+        );
+        crate::testkit::deliver_all(&drain(&mut client), &mut server, origin);
+        let _ = drain(&mut server);
+        assert_eq!(server.status(), SessionStatus::Closing);
+        server.handle_message(&establish_message(SESSION, 1_000, Some(1)), origin);
+        server.handle_message(&negotiate(SESSION, FlowType::Recoverable), origin);
+        assert_eq!(
+            drain(&mut server),
+            vec![
+                Output::Event(Event::Ignored {
+                    message: "Establish",
+                    reason: "the transport is being unbound",
+                }),
+                Output::Event(Event::Ignored {
+                    message: "Negotiate",
+                    reason: "the transport is being unbound",
+                }),
+            ]
+        );
+        // The same while this side is the one terminating.
+        let (_client, mut terminating) =
+            established_pair(origin, FlowType::Recoverable, FlowType::Recoverable);
+        assert_eq!(
+            terminating.terminate(TerminationCode::Finished, "", origin),
+            Ok(())
+        );
+        let _ = drain(&mut terminating);
+        terminating.handle_message(&establish_message(SESSION, 1_000, Some(1)), origin);
+        assert!(matches!(
+            drain(&mut terminating).as_slice(),
+            [Output::Event(Event::Ignored {
+                message: "Establish",
+                ..
+            })]
+        ));
     }
 
     #[test]

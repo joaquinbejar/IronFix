@@ -67,11 +67,14 @@ macro_rules! layout {
 pub struct Negotiate {
     /// The identifier of the session being created, assigned by the client.
     pub session_id: SessionId,
-    /// Time of the request; the response echoes it as `RequestTimestamp`.
+    /// Wall-clock time of the request. The answer carries it back as
+    /// `RequestTimestamp`, which is how the two are matched.
     pub timestamp: Nanotime,
-    /// Type of the flow from client to server.
+    /// The delivery guarantee the client wants for the messages it sends
+    /// (section 3.4.4).
     pub client_flow: FlowType,
-    /// Optional credentials identifying the client. Never logged.
+    /// The client's proof of identity, in a format the counterparties agree
+    /// on (section 3.4.2). Never logged.
     pub credentials: Option<Credentials>,
 }
 layout!(Negotiate, "Negotiate", template = 1, block = 25);
@@ -84,9 +87,11 @@ pub struct NegotiationResponse {
     pub session_id: SessionId,
     /// The `Timestamp` of the Negotiate being answered.
     pub request_timestamp: Nanotime,
-    /// Type of the flow from server to client.
+    /// The delivery guarantee the server gives the messages it sends
+    /// (section 3.4.4).
     pub server_flow: FlowType,
-    /// Optional credentials identifying the server. Never logged.
+    /// The server's proof of identity, for mutual authentication
+    /// (section 4.2.2). Never logged.
     pub credentials: Option<Credentials>,
 }
 layout!(
@@ -104,9 +109,9 @@ pub struct NegotiationReject {
     pub session_id: SessionId,
     /// The `Timestamp` of the Negotiate being answered.
     pub request_timestamp: Nanotime,
-    /// Why the session was refused.
+    /// The reason code.
     pub code: NegotiationRejectCode,
-    /// Optional detail; empty when absent.
+    /// Free text for people; empty if the sender gave none.
     pub reason: String,
 }
 layout!(
@@ -121,13 +126,14 @@ layout!(
 /// protocol violation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Topic {
-    /// The session identifier of the flow.
+    /// The identifier of the multicast flow.
     pub session_id: SessionId,
-    /// Type of the flow from the publisher.
+    /// The delivery guarantee of the flow (section 5.1.1.1).
     pub flow: FlowType,
     /// The publisher's keepalive interval, in milliseconds.
     pub keepalive_interval: u32,
-    /// The category of the application messages that follow.
+    /// Opaque bytes naming what the flow is about, for instance a product
+    /// or a symbol (section 5.1.1.1).
     pub classification: Vec<u8>,
 }
 layout!(Topic, "Topic", template = 4, block = 21);
@@ -138,14 +144,19 @@ layout!(Topic, "Topic", template = 4, block = 21);
 pub struct Establish {
     /// The identifier of the session being bound.
     pub session_id: SessionId,
-    /// Time of the request; the response echoes it as `RequestTimestamp`.
+    /// Wall-clock time of the request. The answer carries it back as
+    /// `RequestTimestamp`, which is how the two are matched.
     pub timestamp: Nanotime,
-    /// The longest time the client may stay silent, in milliseconds.
+    /// The client's keepalive interval in milliseconds: it sends a heartbeat
+    /// whenever this long passes without an application message
+    /// (section 4.5).
     pub keepalive_interval: u32,
-    /// The next application sequence number the client will produce, on a
-    /// sequenced client flow.
+    /// Where the client's own numbering stands: the number its next
+    /// application message will carry. Used to spot messages the server
+    /// missed on a re-establishment (section 4.3.1).
     pub next_seq_no: Option<u64>,
-    /// Optional credentials identifying the client. Never logged.
+    /// The client's proof of identity, in a format the counterparties agree
+    /// on (section 3.4.2). Never logged.
     pub credentials: Option<Credentials>,
 }
 layout!(Establish, "Establish", template = 5, block = 36);
@@ -158,10 +169,11 @@ pub struct EstablishmentAck {
     pub session_id: SessionId,
     /// The `Timestamp` of the Establish being answered.
     pub request_timestamp: Nanotime,
-    /// The longest time the server may stay silent, in milliseconds.
+    /// The server's keepalive interval in milliseconds (section 4.5).
     pub keepalive_interval: u32,
-    /// The next application sequence number the server will produce, on a
-    /// sequenced server flow.
+    /// Where the server's own numbering stands: the number its next
+    /// application message will carry. Used to spot messages the client
+    /// missed (section 4.3.2).
     pub next_seq_no: Option<u64>,
 }
 layout!(
@@ -179,9 +191,9 @@ pub struct EstablishmentReject {
     pub session_id: SessionId,
     /// The `Timestamp` of the Establish being answered.
     pub request_timestamp: Nanotime,
-    /// Why the binding was refused.
+    /// The reason code.
     pub code: EstablishmentRejectCode,
-    /// Optional detail; empty when absent.
+    /// Free text for people; empty if the sender gave none.
     pub reason: String,
 }
 layout!(
@@ -196,7 +208,8 @@ layout!(
 /// Template 8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sequence {
-    /// The sequence number of the next application message.
+    /// The number the receiver gives to the first application message
+    /// after this one; later ones count up from it (section 3.5.1).
     pub next_seq_no: u64,
 }
 layout!(Sequence, "Sequence", template = 8, block = 8);
@@ -211,7 +224,8 @@ layout!(Sequence, "Sequence", template = 8, block = 8);
 pub struct Context {
     /// The session the following messages belong to.
     pub session_id: SessionId,
-    /// The sequence number of the next application message.
+    /// As in [`Sequence::next_seq_no`]. The session core reads `u64::MAX`,
+    /// the SBE null value of an optional `uint64`, as "no number given".
     pub next_seq_no: u64,
 }
 layout!(Context, "Context", template = 9, block = 24);
@@ -233,11 +247,12 @@ layout!(
 pub struct RetransmitRequest {
     /// The session the messages belong to.
     pub session_id: SessionId,
-    /// Identifies the request; responses echo it as `RequestTimestamp`.
+    /// Wall-clock time of the request. Answers carry it back as
+    /// `RequestTimestamp`, which is how they are matched to it.
     pub timestamp: Nanotime,
-    /// The sequence number of the first message requested.
+    /// Start of the range asked for (section 4.6.1).
     pub from_seq_no: u64,
-    /// The number of messages requested.
+    /// Length of the range asked for, in messages.
     pub count: u32,
 }
 layout!(
@@ -255,9 +270,10 @@ pub struct Retransmission {
     pub session_id: SessionId,
     /// The `Timestamp` of the RetransmitRequest being answered.
     pub request_timestamp: Nanotime,
-    /// The sequence number of the first message of the batch.
+    /// The number the receiver gives to the first replayed message that
+    /// follows (section 4.6.2).
     pub next_seq_no: u64,
-    /// The number of messages in the batch.
+    /// How many replayed messages follow this header.
     pub count: u32,
 }
 layout!(Retransmission, "Retransmission", template = 12, block = 36);
@@ -274,9 +290,9 @@ pub struct RetransmitReject {
     pub session_id: SessionId,
     /// The `Timestamp` of the RetransmitRequest being answered.
     pub request_timestamp: Nanotime,
-    /// Why the request was refused.
+    /// The reason code.
     pub code: RetransmitRejectCode,
-    /// Optional detail; empty when absent.
+    /// Free text for people; empty if the sender gave none.
     pub reason: String,
 }
 layout!(
@@ -292,22 +308,22 @@ layout!(
 pub struct Terminate {
     /// The session being unbound.
     pub session_id: SessionId,
-    /// Why.
+    /// The termination code.
     pub code: TerminationCode,
-    /// Optional detail; empty when absent.
+    /// Free text for people; empty if the sender gave none.
     pub reason: String,
 }
 layout!(Terminate, "Terminate", template = 14, block = 17);
 
-/// FinishedSending: the sender has sent its last application message
-/// (FIXP v1.1 section 4.7.1). Template 15. The session core does not run the
-/// finalization handshake; see the crate documentation.
+/// FinishedSending: the sender starts closing its flow for good (FIXP v1.1
+/// section 4.7.1). Template 15. The session core answers it; it never sends
+/// one (see the crate documentation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FinishedSending {
     /// The session being finalized.
     pub session_id: SessionId,
-    /// The sequence number of the last application message, on a sequenced
-    /// flow.
+    /// On a numbered flow, the number of the sender's final application
+    /// message, which lets the receiver check it is missing nothing.
     pub last_seq_no: Option<u64>,
 }
 layout!(
@@ -331,26 +347,27 @@ layout!(
     block = 16
 );
 
-/// Applied: positive acknowledgement of operations on an idempotent flow
-/// (FIXP v1.1 section 4.8.1). Template 17. An application message: it
-/// consumes a sequence number of the flow that carries it.
+/// Applied: tells the sender of an Idempotent flow that a range of its
+/// operations took effect (FIXP v1.1 section 4.8.1). Template 17. It travels
+/// as an application message, so on a numbered flow it takes a number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Applied {
-    /// The first applied sequence number.
+    /// Start of the range that took effect.
     pub from_seq_no: u64,
-    /// How many messages were applied.
+    /// Length of that range, in messages.
     pub count: u32,
 }
 layout!(Applied, "Applied", template = 17, block = 12);
 
-/// NotApplied: reports a sequence gap on an idempotent flow (FIXP v1.1
-/// section 4.8.2). Template 18. An application message: it consumes a
-/// sequence number of the flow that carries it.
+/// NotApplied: tells the sender of an Idempotent flow that a range of its
+/// numbers never arrived, so those operations did not take effect (FIXP v1.1
+/// section 4.8.2). Template 18. It travels as an application message, so on
+/// a numbered flow it takes a number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotApplied {
-    /// The first sequence number not applied.
+    /// Start of the range that never arrived.
     pub from_seq_no: u64,
-    /// How many messages were not applied.
+    /// Length of that range, in messages.
     pub count: u32,
 }
 layout!(NotApplied, "NotApplied", template = 18, block = 12);
@@ -359,13 +376,16 @@ layout!(NotApplied, "NotApplied", template = 18, block = 12);
 /// section 3.6). Template 19. Passed through by the session core.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageTemplate {
-    /// The SOFH encoding type the template is for.
+    /// The encoding the template belongs to, as a SOFH `Encoding_Type`
+    /// code (section 3.6).
     pub encoding_type: u32,
-    /// When the template takes effect; immediately when absent.
+    /// Wall-clock time from which the template applies, or `None` to apply
+    /// it at once.
     pub effective_time: Option<Nanotime>,
-    /// Version and format description; empty when absent.
+    /// Opaque bytes identifying which revision of the template this is;
+    /// empty if the sender gave none.
     pub version: Vec<u8>,
-    /// The template or schema itself.
+    /// The template or schema document, as opaque bytes.
     pub template: Vec<u8>,
 }
 layout!(
