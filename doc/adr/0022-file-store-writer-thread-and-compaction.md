@@ -213,8 +213,8 @@ same way.
 | Offset | Size | Content |
 |---|---|---|
 | 0 | 44 | header, the version-1 layout declaring version `2`; its counters are the ones the journal was written with, superseded by the slots |
-| 4 096 | 28 | counter slot 0 |
-| 8 192 | 28 | counter slot 1 |
+| 4 096 | 36 | counter slot 0 |
+| 8 192 | 36 | counter slot 1 |
 | 12 288 | | records |
 
 The bytes between are zeros. The header and each slot sit alone in their own
@@ -224,15 +224,15 @@ or the header on a device that writes blocks of at most 4 KiB. The cost is
 agreement.
 
 A **counter slot** is a generation (u64), the next sender number (u64), the
-next target number (u64) and a CRC-32 of those 24 bytes. A **record** is kind
+next target number (u64), the durable boundary (u64, see below) and a CRC-32
+of those 32 bytes. A **record** is kind
 1 (a frame) or kind 5 (a frame with a generation and the next sender number,
 written by `file_outbound`); any other kind is refused.
 
 **Generations.** Every write that changes a counter takes the next number of
 one sequence the journal shares between its slots and its kind-5 records. A
 counter write (`set_next_sender_seq`, `set_next_target_seq`) carries both
-counters and overwrites the slot that does **not** hold the newest valid one,
-so the newest one is never written over. Loading takes:
+counters. Loading takes:
 
 - the next target from the newest valid slot (only slots carry it);
 - the next sender from whichever is newer, that slot or the kind-5 record
@@ -240,12 +240,50 @@ so the newest one is never written over. Loading takes:
   record (the engine's close-time write after a failed `file_outbound`) and a
   frame record after a seed are both ordered correctly.
 
-**A torn slot write** damages only the older slot, and the store reopens from
-the other one: the counters as they were before the write that did not
-return. That is not a cut, so `last_truncation` does not report it, and the
+**Slot rotation: the durable checkpoint is never overwritten.** One slot
+holds the last checkpoint known to be on stable storage (the newest slot at
+the last successful flush). Every counter write until the next flush goes
+into the **other** slot, overwriting it again and again; after a successful
+flush that slot becomes the durable one, and the writes move to the opposite
+slot. Under `EveryWrite`, which flushes every write, the slots alternate.
+This rule came from review (thread 4307678227): the first version simply
+alternated on every write, and under `EveryN` the second unflushed write
+went over the slot holding the flushed checkpoint, so a power loss that
+discarded the first and tore the second recovered counters older than the
+flush, and one that tore both refused the journal. Now only one slot block
+is written between flushes; whatever a power loss does to it, loading finds
+at least the flushed checkpoint, and never refuses. A test enumerates every
+discarded, kept and torn state of the slot blocks after two unflushed
+counter writes.
+
+**A torn slot write** damages only the slot being written, and the store
+reopens from the other one: the counters as they were before the write that
+did not return. That is not a cut, so `last_truncation` does not report it, and the
 next counter write goes into the damaged slot. Both slots failing their check
 is damage no single torn write leaves: the journal is refused with
 `StoreError::Corrupted`, by `FileStore::repair` too, as a damaged header is.
+
+**Durable boundary: damage the slots vouch for is refused.** Each slot
+records the offset up to which the records were known to be on stable
+storage when it was written (the end of the last successful flush; under
+`EveryWrite`, the end of the journal). A record that starts below the
+boundary of the newest valid slot was acknowledged before that slot was:
+under the tail rules of `EveryWrite` and `EveryN`, damage to it, or a journal
+that ends before the boundary, refuses the journal with
+`StoreError::Corrupted`, and only damage past the boundary may be cut as a
+torn tail. This rule also came from review (thread 4307678262): with counters
+in slots, a damaged frame record could become the last record of the file
+although a later counter write had acknowledged it, and recovery cut it while
+keeping the sender number that said it was filed, so a resend gap-filled an
+acknowledged frame. #78 refused the same damage, because the counter record
+appended after the frame made it non-tail damage; the boundary restores that.
+`FileStore::repair` (and `Never`, which cuts damage wherever it is) still cut
+below the boundary; the store then writes both slots again, with the cut
+journal's end as their boundary, so the journal is consistent for any policy
+afterwards. A reset starts the boundary at the first record; a compaction
+sets it to the end of the records it copied, all flushed before its rename;
+the cut back after a failed flush leaves the slots on disk as the last
+successful flush left them, whose boundaries are no higher than the cut.
 
 **Failures.** A slot write that fails puts the slot's previous bytes back (or
 leaves that pending). A failed flush, as in ADR-0006, cuts the records back to

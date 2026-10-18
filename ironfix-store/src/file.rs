@@ -51,9 +51,12 @@
 //!   neither is.
 //! - [`MessageStore::set_next_sender_seq`] and
 //!   [`MessageStore::set_next_target_seq`] overwrite the counter slot that
-//!   does not hold the newest counters, with the next generation: a write torn
-//!   by a crash damages only that slot, and the store reopens from the other
-//!   one, the counters as they were before that write.
+//!   does not hold the last checkpoint known to be on stable storage, with
+//!   the next generation; until the next flush every counter write goes to
+//!   that same slot. A write torn or lost by a crash damages only that slot,
+//!   and the store reopens from the other one: at least the last flushed
+//!   counters. Each slot also records the offset up to which the records were
+//!   durable when it was written (its durable boundary).
 //! - [`MessageStore::reset`] and [`MessageStore::reset_to`] write a complete
 //!   new journal (no records, carrying the new counters) to
 //!   `<name>.journal.tmp`, flush it, rename it over the journal and flush the
@@ -105,10 +108,15 @@
 //!   is not a cut: the counters come from the other slot.
 //! - **Refuse** with [`StoreError::Corrupted`], cutting nothing: damage
 //!   outside that window (data already written, and acknowledged, is damaged);
-//!   a well-formed record header declaring a body larger than the configured
-//!   limit; a record that passes its CRC but does not decode; both counter
-//!   slots failing their check; a header that is not a version-2 journal
-//!   header.
+//!   under [`SyncPolicy::EveryWrite`] and [`SyncPolicy::EveryN`], any damage
+//!   to a record below the durable boundary of the newest counter slot, or a
+//!   journal that ends before it (the slot vouches for those records, so
+//!   their damage is never a torn tail); a well-formed record header
+//!   declaring a body larger than the configured limit; a record that passes
+//!   its CRC but does not decode; both counter slots failing their check; a
+//!   header that is not a version-2 journal header. Under
+//!   [`SyncPolicy::Never`] and in a repair, a cut below the boundary writes
+//!   the slots again with the new end as their boundary.
 //!   [`FileStore::repair`] cuts such a journal at its first unreadable record,
 //!   on an operator's decision, after which the session must reset its
 //!   sequence (`ResetSeqNumFlag` (141) = Y).
@@ -537,6 +545,11 @@ struct Journal {
     slots: SlotImages,
     /// The position of the slot holding the newest counters.
     active_slot: usize,
+    /// The position of the slot holding the last checkpoint known to be on
+    /// stable storage. Counter writes go to the other slot until the next
+    /// successful flush, so it is never overwritten before its replacement
+    /// is durable.
+    durable_slot: usize,
     /// Both counter slots as the last successful flush left them.
     durable_slots: SlotImages,
     /// Bytes taken by records a later record for the same number replaced.
@@ -704,6 +717,7 @@ impl Journal {
             next_generation: scan.next_generation,
             slots: scan.slots,
             active_slot: scan.active,
+            durable_slot: scan.active,
             durable_slots: scan.slots,
             dead_bytes: scan.dead_bytes,
             failed_compaction_at: None,
@@ -792,21 +806,28 @@ impl Journal {
         self.append(record)
     }
 
-    /// Writes both counters into the slot that does not hold the newest
-    /// ones, with the next generation, flushes as the policy requires, and
-    /// publishes them.
+    /// Writes both counters into the slot that does not hold the last
+    /// durable checkpoint, with the next generation and the current durable
+    /// boundary, flushes as the policy requires, and publishes them.
+    ///
+    /// Until a flush succeeds every counter write goes to that same slot, so
+    /// the durable checkpoint is never overwritten before its replacement is
+    /// durable (see the `format` module, "Slot rotation"). The boundary is the
+    /// offset up to which the records are known to be on stable storage: what
+    /// the slot vouches for once it is itself durable.
     ///
     /// A failed write puts the slot back as it was; if that fails too, the
     /// restore is left pending. A failed flush is handled by
     /// [`Journal::flush`].
     fn write_counters(&mut self, next_sender: u64, next_target: u64) -> Result<(), StoreError> {
         let generation = self.take_generation()?;
-        let target = usize::from(self.active_slot == 0);
+        let target = usize::from(self.durable_slot == 0);
         let offset = slot_offset(target)?;
         let image = format::encode_slot(&Slot {
             generation,
             next_sender,
             next_target,
+            durable_end: self.durable_end,
         });
         if let Err(err) = write_at(&mut self.file, &image, offset) {
             let restored = self
@@ -868,6 +889,9 @@ impl Journal {
             Ok(()) => {
                 self.durable_end = self.end;
                 self.durable_slots = self.slots;
+                // The newest slot is now on stable storage: the next counter
+                // writes go to the other one.
+                self.durable_slot = self.active_slot;
                 self.unsynced = 0;
                 Ok(())
             }
@@ -882,6 +906,7 @@ impl Journal {
                     self.slots = self.durable_slots;
                     if let Ok((active, _)) = format::newest_slot(&self.slots) {
                         self.active_slot = active;
+                        self.durable_slot = active;
                     }
                 }
                 Err(io_error(
@@ -918,7 +943,8 @@ impl Journal {
             next_sender,
             next_target,
         };
-        let (slots, next_generation) = format::fresh_slots(0, next_sender, next_target)?;
+        let (slots, next_generation) =
+            format::fresh_slots(0, next_sender, next_target, DATA_START)?;
         write_replacement(&self.config, &header, &slots, &mut self.probe)?;
         // The rename is the commit point: past it, the journal on disk is the
         // new one whether or not what follows works.
@@ -939,12 +965,13 @@ impl Journal {
         self.after_rename()
     }
 
-    /// Takes freshly written counter slots, the second one the newest, as
-    /// both the current and the durable ones.
+    /// Takes freshly written and flushed counter slots, the second one the
+    /// newest, as both the current and the durable ones.
     const fn install_slots(&mut self, slots: SlotImages) {
         self.slots = slots;
         self.durable_slots = slots;
         self.active_slot = 1;
+        self.durable_slot = 1;
     }
 
     /// Completes a rename that replaced the journal: flushes the directory
@@ -995,8 +1022,22 @@ impl Journal {
             next_sender: self.next_sender,
             next_target: self.next_target,
         };
-        let (slots, next_generation) =
-            format::fresh_slots(self.next_generation, self.next_sender, self.next_target)?;
+        // The compacted journal's end, known before it is written: its slots
+        // vouch for every record in it, all flushed before the rename.
+        let live = self
+            .index
+            .iter()
+            .try_fold(0u64, |total, (_, entry)| {
+                total.checked_add(entry.record_len())
+            })
+            .and_then(|live| live.checked_add(DATA_START))
+            .ok_or_else(|| StoreError::Io("compacted journal length overflows".to_string()))?;
+        let (slots, next_generation) = format::fresh_slots(
+            self.next_generation,
+            self.next_sender,
+            self.next_target,
+            live,
+        )?;
         let mut replacement = Replacement::create(&self.config, &header, &slots)?;
         let mut index = Index::new();
         let mut record = Vec::new();
@@ -1021,6 +1062,13 @@ impl Journal {
             replacement.abandon();
             self.pending.reopen = true;
             return Err(compaction_stopped());
+        }
+        if replacement.end != live {
+            return Err(StoreError::Io(format!(
+                "compaction wrote {} bytes where its counter slots vouch for {live}; the journal \
+                 is unchanged",
+                replacement.end
+            )));
         }
         let end = replacement.rename_into_place(&self.config)?;
         if self.probe.crashes_after(CompactionStep::Renamed) {
@@ -1120,6 +1168,7 @@ impl Journal {
         self.next_generation = self.next_generation.max(scan.next_generation);
         self.slots = scan.slots;
         self.active_slot = scan.active;
+        self.durable_slot = scan.active;
         self.dead_bytes = scan.dead_bytes;
         self.failed_compaction_at = None;
         if !self.config.sync_policy().flushes() {
@@ -1323,11 +1372,38 @@ fn load(
         max_body(config),
         rule,
     )?;
+    let mut scan = scan;
     if let Some(truncation) = scan.truncation {
         file.set_len(truncation.offset())
             .map_err(|err| io_error("cannot cut the journal", &err))?;
     }
+    if scan.slots_stale {
+        restamp_slots(&mut file, &mut scan)?;
+    }
     Ok(Loaded { file, scan })
+}
+
+/// Writes both counter slots again, for a journal a `Never` or repair scan
+/// cut below the durable boundary of its slots: the same counters, new
+/// generations above every one in the journal, and the cut journal's end as
+/// the boundary. Without it the slots would claim records the journal no
+/// longer holds, and a later open would refuse it. The caller flushes.
+fn restamp_slots(file: &mut File, scan: &mut format::Scan) -> Result<(), StoreError> {
+    let (slots, next_generation) = format::fresh_slots(
+        scan.next_generation,
+        scan.next_sender,
+        scan.next_target,
+        scan.end,
+    )?;
+    for (image, at) in slots.iter().zip(SLOT_OFFSETS) {
+        write_at(file, image, at)
+            .map_err(|err| io_error("cannot write the journal's counter slots", &err))?;
+    }
+    scan.slots = slots;
+    scan.active = 1;
+    scan.next_generation = next_generation;
+    scan.slots_stale = false;
+    Ok(())
 }
 
 /// Completes the undo a failed write or flush left pending: cuts the journal
@@ -1631,7 +1707,7 @@ fn open_journal(
             next_sender: 1,
             next_target: 1,
         };
-        let (slots, _) = format::fresh_slots(0, 1, 1)?;
+        let (slots, _) = format::fresh_slots(0, 1, 1, DATA_START)?;
         write_replacement(&config, &header, &slots, &mut probe)?;
         flush_directory(config.directory())?;
         probe.dir_flush();
@@ -3907,5 +3983,280 @@ mod v2_tests {
         let store = open(config.clone()).await;
         assert_eq!(page(&store).await, vec![(1, frame(1)), (2, frame(2))]);
         assert_eq!(store.last_truncation(), None, "no gap to cut");
+    }
+
+    /// Where the counter slot at `position` is in a journal image.
+    fn slot_bytes(position: usize) -> std::ops::Range<usize> {
+        let start = SLOT_OFFSETS[position] as usize;
+        start..start + format::SLOT_LEN
+    }
+
+    /// Review thread 4307678227: under `EveryN`, counter writes made after a
+    /// flush must never overwrite the slot holding the flushed checkpoint, so
+    /// a power loss that discards, keeps or tears any of them recovers at
+    /// least that checkpoint, and never refuses the journal.
+    #[tokio::test]
+    async fn test_file_store_unflushed_counter_writes_never_overwrite_the_flushed_slot() {
+        let dir = TempDir::new("slot-rotation");
+        let Some(three) = std::num::NonZeroU32::new(3) else {
+            panic!("non-zero");
+        };
+        let config = dir.config().with_sync_policy(SyncPolicy::EveryN(three));
+        let (durable, after_five, dirty);
+        {
+            let store = open(config.clone()).await;
+            file(&store, 1).await;
+            ok(store.set_next_target_seq(3).await, "target 3");
+            ok(store.set_next_target_seq(4).await, "target 4");
+            ok(
+                store.sync().await,
+                "flush: target 4 is the durable checkpoint",
+            );
+            durable = journal_bytes(&config);
+            // Two acknowledged counter writes the policy leaves unflushed.
+            ok(store.set_next_target_seq(5).await, "target 5");
+            after_five = journal_bytes(&config);
+            ok(store.set_next_target_seq(6).await, "target 6");
+            dirty = journal_bytes(&config);
+        }
+        assert_eq!(durable.len(), dirty.len(), "counter writes append nothing");
+        // Between flushes only one slot block is written, again and again:
+        // the one that does not hold the flushed checkpoint. So no power loss
+        // can tear both, or discard one write and tear the other.
+        let changed: Vec<usize> = (0..2)
+            .filter(|&position| durable[slot_bytes(position)] != dirty[slot_bytes(position)])
+            .collect();
+        assert_eq!(changed.len(), 1, "exactly one slot block is dirty");
+        for position in 0..2 {
+            if !changed.contains(&position) {
+                assert_eq!(
+                    durable[slot_bytes(position)],
+                    after_five[slot_bytes(position)],
+                    "the flushed checkpoint is never overwritten"
+                );
+            }
+        }
+
+        // Every way a power loss can leave each slot block: as flushed, after
+        // the first unflushed write, after the second, or torn between any
+        // two of those.
+        let outcomes = |position: usize| -> Vec<Vec<u8>> {
+            let range = slot_bytes(position);
+            let states = [
+                durable[range.clone()].to_vec(),
+                after_five[range.clone()].to_vec(),
+                dirty[range].to_vec(),
+            ];
+            let half = format::SLOT_LEN / 2;
+            let mut all: Vec<Vec<u8>> = states.to_vec();
+            for newer in &states {
+                for older in &states {
+                    let mut torn = newer[..half].to_vec();
+                    torn.extend_from_slice(&older[half..]);
+                    all.push(torn);
+                }
+            }
+            all.sort();
+            all.dedup();
+            all
+        };
+        let mut images = 0;
+        for first in outcomes(0) {
+            for second in outcomes(1) {
+                let mut image = durable.clone();
+                image[slot_bytes(0)].copy_from_slice(&first);
+                image[slot_bytes(1)].copy_from_slice(&second);
+                write_journal(&config, &image);
+                let opened = FileStore::open(config.clone()).await;
+                let Ok(store) = opened else {
+                    panic!("image {images}: the journal must open: {opened:?}");
+                };
+                assert!(
+                    [4, 5, 6].contains(&store.next_target_seq()),
+                    "image {images}: target {} is behind the flushed checkpoint 4",
+                    store.next_target_seq()
+                );
+                assert_eq!(store.next_sender_seq(), 2, "image {images}");
+                drop(store);
+                images += 1;
+            }
+        }
+        assert!(images >= 5, "the unflushed writes changed a slot");
+
+        // After the next flush the writes move to the other slot.
+        let store = open(config.clone()).await;
+        let before = journal_bytes(&config);
+        ok(store.set_next_target_seq(7).await, "target 7");
+        ok(store.sync().await, "flush");
+        ok(store.set_next_target_seq(8).await, "target 8");
+        let now = journal_bytes(&config);
+        drop(store);
+        let moved: Vec<usize> = (0..2)
+            .filter(|&position| before[slot_bytes(position)] != now[slot_bytes(position)])
+            .collect();
+        assert_eq!(moved, vec![0, 1], "one slot per flush interval");
+    }
+
+    /// Review thread 4307678262: a frame record damaged after a later
+    /// counter write made it durable is damage to acknowledged data, not a
+    /// torn tail: the journal is refused, as #78 refused it, rather than
+    /// cut back behind counters that say the frame was filed. A repair
+    /// salvages it, and leaves slots that no longer vouch for the cut frame.
+    #[tokio::test]
+    async fn test_file_store_damaged_frame_below_the_slots_durable_boundary_is_refused() {
+        let dir = TempDir::new("durable-boundary");
+        let config = dir.config();
+        {
+            let store = open(config.clone()).await;
+            file(&store, 1).await;
+            ok(store.set_next_target_seq(2).await, "target 2");
+        }
+        let mut bytes = journal_bytes(&config);
+        // A payload byte of frame 1, the only record.
+        let at = DATA_START as usize + 40;
+        bytes[at] ^= 0x01;
+        write_journal(&config, &bytes);
+        let opened = FileStore::open(config.clone()).await;
+        assert!(
+            matches!(opened, Err(StoreError::Corrupted { ref reason }) if reason.contains("repair")),
+            "{opened:?}"
+        );
+        assert_eq!(journal_bytes(&config), bytes, "refused, not cut");
+
+        // The operator's repair cuts it and writes the slots again, so the
+        // journal opens afterwards under the default policy.
+        let repaired = ok(FileStore::repair(config.clone()).await, "repair");
+        assert_eq!(repaired.map(|cut| cut.offset()), Some(DATA_START));
+        let store = open(config).await;
+        assert!(page(&store).await.is_empty());
+        assert_eq!(store.next_target_seq(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_journal_cut_below_the_durable_boundary_is_refused() {
+        let dir = TempDir::new("boundary-cut");
+        let config = dir.config();
+        {
+            let store = open(config.clone()).await;
+            file(&store, 1).await;
+            file(&store, 2).await;
+            ok(store.set_next_target_seq(2).await, "target 2");
+        }
+        // The file loses its last record whole, at a record boundary: nothing
+        // looks torn, but the slots vouch for it.
+        let cut = DATA_START + record_len(1);
+        ok(
+            OpenOptions::new()
+                .write(true)
+                .open(config.journal_path())
+                .and_then(|file| file.set_len(cut)),
+            "cut the journal",
+        );
+        assert!(matches!(
+            FileStore::open(config.clone()).await,
+            Err(StoreError::Corrupted { reason }) if reason.contains("journal ends")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_file_store_durable_boundary_follows_cut_backs_compactions_and_resets() {
+        // After a failed flush cut the journal back, the boundary is no
+        // higher than what is left: the journal reopens.
+        let dir = TempDir::new("boundary-cut-back");
+        let config = dir.config();
+        {
+            let store = open(config.clone()).await;
+            file(&store, 1).await;
+            ok(store.set_next_target_seq(2).await, "target 2");
+            store.fail_next_flush().await;
+            assert!(
+                store
+                    .file_outbound(2, &MsgType::NewOrderSingle, &frame(2), 3)
+                    .await
+                    .is_err()
+            );
+            ok(
+                store.refresh().await,
+                "refresh after the frame's failed flush",
+            );
+            store.fail_next_flush().await;
+            assert!(store.set_next_target_seq(3).await.is_err());
+            ok(
+                store.refresh().await,
+                "refresh after the counter's failed flush",
+            );
+        }
+        let store = open(config.clone()).await;
+        assert_eq!(page(&store).await, vec![(1, frame(1))]);
+        assert_eq!(store.next_target_seq(), 2);
+        drop(store);
+
+        // A compaction's slots vouch for every record it copied: damage to
+        // its last record is refused, not cut as a torn tail.
+        let dir = TempDir::new("boundary-compaction");
+        let config = dir.config();
+        {
+            let store = open(config.clone()).await;
+            for seq in 1..=3 {
+                file(&store, seq).await;
+            }
+            ok(store.compact().await, "compact");
+        }
+        let mut bytes = journal_bytes(&config);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        write_journal(&config, &bytes);
+        assert!(matches!(
+            FileStore::open(config.clone()).await,
+            Err(StoreError::Corrupted { reason }) if reason.contains("repair")
+        ));
+
+        // A reset starts a new boundary: the previous stream's does not
+        // carry over, so the new stream's last record is a tail again.
+        let dir = TempDir::new("boundary-reset");
+        let config = dir.config();
+        {
+            let store = open(config.clone()).await;
+            for seq in 1..=3 {
+                file(&store, seq).await;
+            }
+            ok(store.set_next_target_seq(9).await, "target 9");
+            ok(store.reset_to(5, 5).await, "reset");
+            file(&store, 5).await;
+        }
+        let mut bytes = journal_bytes(&config);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        write_journal(&config, &bytes);
+        let store = open(config).await;
+        assert!(page(&store).await.is_empty(), "the torn tail is cut");
+        assert_eq!(
+            store.last_truncation().map(|cut| cut.offset()),
+            Some(DATA_START)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_store_never_policy_cut_below_the_boundary_rewrites_the_slots() {
+        let dir = TempDir::new("boundary-never");
+        let config = dir.config();
+        {
+            let store = open(config.clone()).await;
+            file(&store, 1).await;
+            ok(store.set_next_target_seq(2).await, "target 2");
+        }
+        let mut bytes = journal_bytes(&config);
+        bytes[DATA_START as usize + 40] ^= 0x01;
+        write_journal(&config, &bytes);
+        // `Never` cuts damage wherever it is, and then writes the slots
+        // again, so the journal is consistent for any policy afterwards.
+        {
+            let store = open(config.clone().with_sync_policy(SyncPolicy::Never)).await;
+            assert!(page(&store).await.is_empty());
+            assert_eq!(store.next_target_seq(), 2);
+        }
+        let store = open(config).await;
+        assert!(page(&store).await.is_empty());
+        assert_eq!(store.next_target_seq(), 2);
     }
 }

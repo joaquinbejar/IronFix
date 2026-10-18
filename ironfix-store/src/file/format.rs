@@ -15,10 +15,10 @@
 //! |---|---|---|
 //! | 0 | 44 | header |
 //! | 44 | 4 052 | zero bytes |
-//! | 4 096 | 28 | counter slot 0 |
-//! | 4 124 | 4 068 | zero bytes |
-//! | 8 192 | 28 | counter slot 1 |
-//! | 8 220 | 4 068 | zero bytes |
+//! | 4 096 | 36 | counter slot 0 |
+//! | 4 132 | 4 060 | zero bytes |
+//! | 8 192 | 36 | counter slot 1 |
+//! | 8 228 | 4 060 | zero bytes |
 //! | 12 288 | | records, back to back, to the end of the file |
 //!
 //! The header and each counter slot sit alone in their own 4 KiB block, so
@@ -41,14 +41,15 @@
 //! The header's counters are the ones the journal was written with (created,
 //! reset or compacted); the counter slots supersede them.
 //!
-//! # Counter slot (28 bytes)
+//! # Counter slot (36 bytes)
 //!
 //! | Offset | Size | Field |
 //! |---|---|---|
 //! | 0 | 8 | generation |
 //! | 8 | 8 | next sender `MsgSeqNum` |
 //! | 16 | 8 | next target `MsgSeqNum` |
-//! | 24 | 4 | CRC-32 of bytes 0..24 |
+//! | 24 | 8 | durable boundary: the file offset up to which the records were on stable storage when the slot was written |
+//! | 32 | 4 | CRC-32 of bytes 0..32 |
 //!
 //! # Records
 //!
@@ -77,14 +78,36 @@
 //!
 //! Every write that changes a counter takes the next number of one
 //! generation sequence the journal shares between its slots and its kind-5
-//! records. A counter write overwrites the slot that does **not** hold the
-//! newest valid slot, so the newest one is never written over: a write torn
-//! by a crash damages only the older slot, and loading falls back to the
-//! newer one, which is the state before the torn write. Loading takes the
-//! next target from the newest valid slot, and the next sender from whichever
-//! is newer, that slot or the kind-5 record with the highest generation. Both
-//! slots failing their check is damage no single torn write can leave, and
-//! refuses the journal.
+//! records. Loading takes the next target from the newest valid slot, and the
+//! next sender from whichever is newer, that slot or the kind-5 record with
+//! the highest generation. Both slots failing their check is damage no single
+//! torn write can leave, and refuses the journal.
+//!
+//! # Slot rotation
+//!
+//! One slot holds the last checkpoint known to be on stable storage (the
+//! newest slot when the journal was last flushed). Every counter write until
+//! the next flush goes into the **other** slot, overwriting it again and
+//! again; after a successful flush that slot becomes the durable one, and the
+//! writes move to the opposite slot. The durable checkpoint is therefore
+//! never overwritten before its replacement is durable: whatever a power loss
+//! does to the counter writes since the last flush (discards them, keeps
+//! them, tears them), loading finds at least that checkpoint. Under
+//! `EveryWrite`, which flushes every write, the slots simply alternate.
+//!
+//! # Durable boundary
+//!
+//! Each slot records the offset up to which the records were known to be on
+//! stable storage when it was written. A record that starts below the
+//! boundary of the newest valid slot was acknowledged before that slot was:
+//! damage to it, or a file that ends before the boundary, is damage to data
+//! already written, never a torn tail. Under the tail rules of `EveryWrite`
+//! and `EveryN` the journal is then refused with [`StoreError::Corrupted`]
+//! (as #78 refused damage followed by a later counter record), and only
+//! damage past the boundary may be cut. Under `Never` and in a repair, which
+//! cut damage wherever it is, a cut below the boundary leaves the slots
+//! claiming more than the file holds, so the store writes them again with the
+//! new end as their boundary.
 //!
 //! # Other versions
 //!
@@ -136,10 +159,10 @@ pub(crate) const DATA_START: u64 = 12_288;
 const PREFIX_LEN: usize = 3 * BLOCK_LEN;
 
 /// Length of a counter slot, in bytes.
-pub(crate) const SLOT_LEN: usize = 28;
+pub(crate) const SLOT_LEN: usize = 36;
 
 /// Length of the part of a counter slot its CRC covers, in bytes.
-const SLOT_CHECKED_LEN: usize = 24;
+const SLOT_CHECKED_LEN: usize = 32;
 
 // The layout constants agree: the prefix is three blocks, the header fits the
 // first one, and each slot starts its own block and fits in it.
@@ -294,6 +317,9 @@ pub(crate) struct Slot {
     pub(crate) next_sender: u64,
     /// Next target sequence number.
     pub(crate) next_target: u64,
+    /// The file offset up to which the records were on stable storage when
+    /// the slot was written, in bytes.
+    pub(crate) durable_end: u64,
 }
 
 /// What a journal holds, as recovered by [`scan`].
@@ -320,6 +346,10 @@ pub(crate) struct Scan {
     pub(crate) truncation: Option<Truncation>,
     /// Bytes taken by records a later record for the same number replaced.
     pub(crate) dead_bytes: u64,
+    /// Whether the journal ends before the durable boundary of its newest
+    /// slot: a cut a `Never` or repair scan made below it. The slots must be
+    /// written again before they are trusted.
+    pub(crate) slots_stale: bool,
 }
 
 /// One decoded record body.
@@ -383,6 +413,19 @@ fn refused(offset: u64, what: &str, remaining: u64) -> StoreError {
          the journal are more than an interrupted write can leave: this is damage to data \
          already written, so the store refuses to open. FileStore::repair cuts the journal \
          there; the session must then reset its sequence (ResetSeqNumFlag 141=Y)"
+    ))
+}
+
+/// Builds the [`StoreError::Corrupted`] for damage below the durable boundary
+/// the counter slots record.
+#[cold]
+#[inline(never)]
+fn refused_durable(offset: u64, what: &str, boundary: u64) -> StoreError {
+    corrupted(format!(
+        "{what} at offset {offset}, inside the first {boundary} bytes the counter slots record \
+         as durable: this is damage to data already written and acknowledged, so the store \
+         refuses to open. FileStore::repair cuts the journal there; the session must then \
+         reset its sequence (ResetSeqNumFlag 141=Y)"
     ))
 }
 
@@ -486,6 +529,7 @@ pub(crate) fn encode_slot(slot: &Slot) -> [u8; SLOT_LEN] {
     out.put(&slot.generation.to_le_bytes());
     out.put(&slot.next_sender.to_le_bytes());
     out.put(&slot.next_target.to_le_bytes());
+    out.put(&slot.durable_end.to_le_bytes());
     let crc = crc32(out.written());
     out.put(&crc.to_le_bytes());
     bytes
@@ -505,6 +549,7 @@ pub(crate) fn decode_slot(bytes: &[u8; SLOT_LEN]) -> Option<Slot> {
         generation: input.u64().ok()?,
         next_sender: input.u64().ok()?,
         next_target: input.u64().ok()?,
+        durable_end: input.u64().ok()?,
     })
 }
 
@@ -540,8 +585,9 @@ pub(crate) fn newest_slot(images: &SlotImages) -> Result<(usize, Slot), StoreErr
     }
 }
 
-/// Two slots for a journal that starts from the given counters: generations
-/// `first` and `first + 1`. Returns them with the next generation to use.
+/// Two slots for a journal that starts from the given counters, with every
+/// record up to `durable_end` on stable storage: generations `first` and
+/// `first + 1`. Returns them with the next generation to use.
 ///
 /// # Errors
 /// [`StoreError::Io`] if the generation sequence is exhausted.
@@ -549,6 +595,7 @@ pub(crate) fn fresh_slots(
     first: u64,
     next_sender: u64,
     next_target: u64,
+    durable_end: u64,
 ) -> Result<(SlotImages, u64), StoreError> {
     let exhausted = || {
         StoreError::Io(
@@ -562,6 +609,7 @@ pub(crate) fn fresh_slots(
             generation,
             next_sender,
             next_target,
+            durable_end,
         })
     };
     Ok(([slot(first), slot(second)], next))
@@ -856,14 +904,18 @@ impl Replay {
 /// damage among the records is cut (reported in [`Scan::truncation`]) and
 /// which refuses the journal. The scan does not modify the file.
 ///
+/// Under the tail rules, the newest slot's durable boundary is a floor:
+/// damage to a record that starts below it, or a file that ends before it,
+/// refuses the journal (see the module documentation, "Durable boundary").
+///
 /// # Errors
 /// [`StoreError::Corrupted`] if the file is shorter than [`DATA_START`], its
 /// header is not a journal header of this format version, both counter slots
 /// are unreadable (whatever `rule`), damage `rule` does not allow to be cut
-/// is found, or, unless `rule` is [`DamageRule::Salvage`], a record with a
-/// well-formed header declares a body of 0 bytes or above `max_body`, or a
-/// record that passes its CRC does not decode. [`StoreError::Io`] if reading
-/// fails.
+/// is found (below the durable boundary, under a tail rule, any damage), or,
+/// unless `rule` is [`DamageRule::Salvage`], a record with a well-formed
+/// header declares a body of 0 bytes or above `max_body`, or a record that
+/// passes its CRC does not decode. [`StoreError::Io`] if reading fails.
 pub(crate) fn scan<R: Read>(
     mut reader: R,
     file_len: u64,
@@ -907,14 +959,20 @@ pub(crate) fn scan<R: Read>(
         newest_counter: None,
         highest_generation: None,
     };
+    let boundary = slot.durable_end;
     let (end, truncation) = scan_records(
         &mut reader,
         DATA_START,
         file_len,
         max_body,
         rule,
+        boundary,
         |offset, len, body| replay.record(offset, len, body),
     )?;
+    let slots_stale = end < boundary;
+    if slots_stale && matches!(rule, DamageRule::Tail { .. }) {
+        return Err(refused_durable(end, "the journal ends", boundary));
+    }
 
     let next_sender = match replay.newest_counter {
         Some((generation, next_sender)) if generation > slot.generation => next_sender,
@@ -941,6 +999,7 @@ pub(crate) fn scan<R: Read>(
         end,
         truncation,
         dead_bytes: replay.dead_bytes,
+        slots_stale,
     })
 }
 
@@ -948,6 +1007,9 @@ pub(crate) fn scan<R: Read>(
 /// positioned) to `file_len`, hands each whole record whose CRC passes to
 /// `record`, and stops at the first one it cannot read. Returns the offset
 /// past the last good record and the cut recovery has to make, if any.
+///
+/// Under a tail rule, damage to a record that starts below `boundary` (the
+/// durable boundary of the newest slot) is never cut.
 ///
 /// # Errors
 /// As [`scan`], for the records.
@@ -957,8 +1019,10 @@ fn scan_records<R: Read>(
     file_len: u64,
     max_body: u64,
     rule: DamageRule,
+    boundary: u64,
     mut record: impl FnMut(u64, u32, &[u8]) -> Result<(), String>,
 ) -> Result<(u64, Option<Truncation>), StoreError> {
+    let tail_rule = matches!(rule, DamageRule::Tail { .. });
     let mut end = start;
     let mut truncation = None;
     let mut body = Vec::new();
@@ -976,8 +1040,18 @@ fn scan_records<R: Read>(
             dropped_bytes: remaining,
             cause,
         };
-        // A partial record header is always an interrupted write at the tail.
+        // Below the durable boundary, a record was acknowledged before the
+        // newest slot was written: its damage is never a torn tail.
+        let durable = tail_rule && offset < boundary;
+        // A partial record header is an interrupted write at the tail.
         if remaining < RECORD_HEADER_LEN_U64 {
+            if durable {
+                return Err(refused_durable(
+                    offset,
+                    "the journal ends inside a record",
+                    boundary,
+                ));
+            }
             truncation = Some(cut(TruncationCause::Incomplete));
             break;
         }
@@ -991,6 +1065,9 @@ fn scan_records<R: Read>(
         let crc = fields.u32()?;
 
         if check != !len {
+            if durable {
+                return Err(refused_durable(offset, "a damaged record header", boundary));
+            }
             let may_cut = match rule {
                 DamageRule::Anywhere | DamageRule::Salvage => true,
                 DamageRule::Tail { records } => {
@@ -1018,6 +1095,13 @@ fn scan_records<R: Read>(
         let record_len = RECORD_HEADER_LEN_U64 + u64::from(len);
         // The file ends inside a well-formed record: an interrupted write.
         if remaining < record_len {
+            if durable {
+                return Err(refused_durable(
+                    offset,
+                    "the journal ends inside a record",
+                    boundary,
+                ));
+            }
             truncation = Some(cut(TruncationCause::Incomplete));
             break;
         }
@@ -1029,6 +1113,13 @@ fn scan_records<R: Read>(
             .read_exact(&mut body)
             .map_err(|err| io_error("cannot read a journal record", &err))?;
         if crc32(&body) != crc {
+            if durable {
+                return Err(refused_durable(
+                    offset,
+                    "a record failing its checksum",
+                    boundary,
+                ));
+            }
             let after = remaining - record_len;
             let may_cut = match rule {
                 DamageRule::Anywhere | DamageRule::Salvage => true,
@@ -1269,11 +1360,18 @@ mod tests {
         }
     }
 
+    /// A slot whose durable boundary is the start of the records: it vouches
+    /// for no record.
     fn slot(generation: u64, next_sender: u64, next_target: u64) -> Slot {
+        bounded_slot(generation, next_sender, next_target, DATA_START)
+    }
+
+    fn bounded_slot(generation: u64, next_sender: u64, next_target: u64, durable_end: u64) -> Slot {
         Slot {
             generation,
             next_sender,
             next_target,
+            durable_end,
         }
     }
 
@@ -1284,7 +1382,7 @@ mod tests {
     /// The slots a new journal starts with: counters 7 and 9, generations 0
     /// and 1.
     fn fresh() -> SlotImages {
-        ok(fresh_slots(0, 7, 9), "fresh slots").0
+        ok(fresh_slots(0, 7, 9, DATA_START), "fresh slots").0
     }
 
     fn journal_with(slots: &SlotImages, records: &[Vec<u8>]) -> Vec<u8> {
@@ -1422,7 +1520,7 @@ mod tests {
 
     #[test]
     fn test_slot_round_trips_and_detects_damage() {
-        let value = slot(9, 12, 40);
+        let value = bounded_slot(9, 12, 40, 70_000);
         let mut bytes = encode_slot(&value);
         assert_eq!(bytes.len(), SLOT_LEN);
         assert_eq!(decode_slot(&bytes), Some(value));
@@ -1526,6 +1624,81 @@ mod tests {
             scan_bytes(&bytes[..5000]),
             Err(StoreError::Corrupted { reason }) if reason.contains("12288")
         ));
+    }
+
+    /// A frame record and the slot written after it, which vouches for it:
+    /// the journal, and the offset just past the frame.
+    fn vouched_frame() -> (Vec<u8>, u64) {
+        let record = sealed(1, Some(2), 2, b"frame one");
+        let past = DATA_START + record.len() as u64;
+        let slots = slots(bounded_slot(3, 2, 2, past), slot(1, 1, 1));
+        (journal_with(&slots, &[record]), past)
+    }
+
+    #[test]
+    fn test_scan_refuses_damage_below_the_durable_boundary_under_the_tail_rules() {
+        let (mut bytes, past) = vouched_frame();
+        // A payload byte of the only record: as the last record it would be
+        // cut as a torn write, but the newest slot vouches for it.
+        bytes[DATA_START as usize + 30] ^= 0x01;
+        for rule in [EVERY_WRITE, DamageRule::Tail { records: 64 }] {
+            assert!(matches!(
+                scan_with(&bytes, rule),
+                Err(StoreError::Corrupted { reason })
+                    if reason.contains(&format!("first {past} bytes")) && reason.contains("repair")
+            ));
+        }
+        // A policy that promises nothing, and a repair, still cut it, and
+        // report the slots as claiming more than the journal holds.
+        for rule in [DamageRule::Anywhere, DamageRule::Salvage] {
+            let scan = ok(scan_with(&bytes, rule), "cut");
+            assert_eq!(scan.end, DATA_START);
+            assert!(scan.slots_stale);
+            assert_eq!(
+                scan.truncation.map(|cut| cut.cause()),
+                Some(TruncationCause::Damaged)
+            );
+        }
+        // Intact, the journal opens and its slots are not stale.
+        let (bytes, _) = vouched_frame();
+        let scan = ok(scan_bytes(&bytes), "intact");
+        assert!(!scan.slots_stale);
+        assert_eq!(scan.next_sender, 2);
+    }
+
+    #[test]
+    fn test_scan_refuses_a_journal_ending_before_the_durable_boundary() {
+        let (bytes, _) = vouched_frame();
+        // Cut at a record boundary (the record is gone whole), and inside the
+        // record: both lose data the slot vouches for.
+        for cut in [
+            DATA_START as usize,
+            DATA_START as usize + 5,
+            bytes.len() - 1,
+        ] {
+            assert!(
+                matches!(
+                    scan_bytes(&bytes[..cut]),
+                    Err(StoreError::Corrupted { reason }) if reason.contains("repair")
+                ),
+                "cut at {cut}"
+            );
+            let scan = ok(scan_with(&bytes[..cut], DamageRule::Anywhere), "anywhere");
+            assert!(scan.slots_stale, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn test_scan_cuts_damage_past_the_durable_boundary() {
+        let (mut bytes, past) = vouched_frame();
+        bytes.extend_from_slice(&sealed(2, Some(3), 4, b"frame two"));
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        let scan = ok(scan_bytes(&bytes), "a torn tail past the boundary");
+        assert_eq!(scan.truncation.map(|cut| cut.offset()), Some(past));
+        assert_eq!(scan.end, past);
+        assert!(!scan.slots_stale);
+        assert_eq!(seqs(&scan), vec![1]);
     }
 
     #[test]
