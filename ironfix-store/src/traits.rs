@@ -24,7 +24,8 @@
 //! Each call through this `async_trait` interface allocates one boxed future.
 //! [`MessageStore::file_outbound`] exists so the per-message outbound write is
 //! one call (and, for a durable store, can be one atomic write) rather than
-//! two.
+//! two, and [`MessageStore::reset_to`] does the same for a reset that sets
+//! both counters.
 //!
 //! `ironfix-engine` relies on the following ordering, which a durable store
 //! makes meaningful (see `doc/adr/0005-fallible-store-writes.md`):
@@ -259,6 +260,36 @@ pub trait MessageStore: Send + Sync {
     /// Returns `StoreError` if the reset fails.
     async fn reset(&self) -> Result<(), StoreError>;
 
+    /// Resets the store and then sets both sequence counters, as one change.
+    ///
+    /// The engine calls this when the counterparty resets the sequence on its
+    /// Logon acknowledgement (`ResetSeqNumFlag` (141) = Y) although the Logon
+    /// did not ask for it: the previous stream is cleared, and the counters
+    /// are set for the new one, whose message 1 in each direction (the Logon
+    /// and its acknowledgement) has already been exchanged.
+    ///
+    /// The default runs [`reset`](MessageStore::reset), then
+    /// [`set_next_sender_seq`](MessageStore::set_next_sender_seq), then
+    /// [`set_next_target_seq`](MessageStore::set_next_target_seq), stopping at
+    /// the first error. It is **not** atomic: a crash between the calls leaves
+    /// the store cleared with its initial counters, and the next session's
+    /// Logon then goes out at `MsgSeqNum` 1 without a reset, which the
+    /// counterparty reads as too low. A durable store should override it to
+    /// make the three changes in one atomic write.
+    ///
+    /// # Arguments
+    /// * `next_sender` - The next `MsgSeqNum` (34) to send after the reset
+    /// * `next_target` - The next inbound `MsgSeqNum` (34) expected after it
+    ///
+    /// # Errors
+    /// Returns `StoreError` if any of the changes fails. The error must not
+    /// contain frame bytes.
+    async fn reset_to(&self, next_sender: u64, next_target: u64) -> Result<(), StoreError> {
+        self.reset().await?;
+        self.set_next_sender_seq(next_sender).await?;
+        self.set_next_target_seq(next_target).await
+    }
+
     /// Returns the creation time of the store/session.
     fn creation_time(&self) -> std::time::SystemTime;
 
@@ -337,5 +368,7 @@ mod tests {
                 .is_ok()
         );
         assert!(store.reset().await.is_ok());
+        // The default `reset_to` composes the reset and the two setters.
+        assert!(store.reset_to(2, 2).await.is_ok());
     }
 }

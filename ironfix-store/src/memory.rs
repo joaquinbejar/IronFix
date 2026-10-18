@@ -471,6 +471,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_memory_store_reset_to_clears_messages_then_sets_both_counters() {
+        let store = MemoryStore::new();
+        ok(
+            store
+                .file_outbound(41, &MsgType::NewOrderSingle, b"previous stream", 42)
+                .await,
+            "file_outbound",
+        );
+        ok(store.set_next_target_seq(17).await, "target counter");
+
+        ok(store.reset_to(2, 2).await, "reset_to");
+        assert_eq!(store.message_count(), 0, "the previous stream is gone");
+        assert_eq!(store.next_sender_seq(), 2);
+        assert_eq!(store.next_target_seq(), 2);
+    }
+
+    #[tokio::test]
     async fn test_memory_store_sequence_numbers_round_trip() {
         let store = MemoryStore::new();
 
