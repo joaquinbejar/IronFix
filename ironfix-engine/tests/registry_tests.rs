@@ -11,12 +11,16 @@
 //! CompIDs reach Active on the right session with independent sequence
 //! numbers and stores; a Logon for an unregistered CompID pair is closed with
 //! no reply, no callback and no store access; a second concurrent Logon for a
-//! live session is refused while the first continues; a `SessionLookup` can
-//! admit a session not registered at startup, keeps one admission slot for it
-//! when two lookups race, and can refuse one; an over-long or illegal CompID
-//! is refused before the lookup is asked; and the routing phase is bounded by
-//! the registry's logon timeout. Scripted peers play the counterparty where a
-//! real `Initiator` cannot send what the test needs.
+//! live session is refused while the first continues, even when its version
+//! or encryption is wrong; a `SessionLookup` can admit a session not
+//! registered at startup, keeps one admission slot for it when two lookups
+//! race, can refuse one, and can fail; a session it admits is evicted unless
+//! a handshake gets past `from_admin`, and the cap bounds how many it holds;
+//! an over-long, illegal or repeated CompID is refused before the lookup is
+//! asked; and the routing phase is bounded by the registry's logon timeout.
+//! The routing codec, the switch to the session's codec, FIXT.1.1, sub-ID and
+//! location-ID routing are exercised over real sockets. Scripted peers play
+//! the counterparty where a real `Initiator` cannot send what the test needs.
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -26,16 +30,17 @@ use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::{CompId, Timestamp};
 use ironfix_engine::application::{Application, RejectReason, SessionId};
 use ironfix_engine::{
-    Acceptor, AcceptorRegistry, Connection, EngineError, Initiator, LogonIdentity, OutboundMessage,
-    SessionLookup,
+    Acceptor, AcceptorRegistry, Connection, EngineError, Initiator, LogonIdentity, LookupError,
+    OutboundMessage, SessionLookup,
 };
 use ironfix_session::SessionConfig;
 use ironfix_store::{MemoryStore, MessageStore, StoredMessage};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Barrier, mpsc};
 use tokio::time::timeout;
@@ -87,12 +92,21 @@ fn member_config(member: &str) -> SessionConfig {
         .with_heartbeat_interval(Duration::from_secs(30))
 }
 
+/// `config` with checksum validation off.
+fn without_checksums(mut config: SessionConfig) -> SessionConfig {
+    config.validate_checksum = false;
+    config
+}
+
 /// Records every callback with the session it ran for, and forwards each
-/// application message as `(session, MsgType)`.
+/// application message as `(session, MsgType)`. On demand it refuses every
+/// Logon in `from_admin`, or parks there.
 #[derive(Debug)]
 struct RecordingApp {
     events: Mutex<Vec<String>>,
     app_tx: mpsc::UnboundedSender<(String, String)>,
+    refuse_logons: AtomicBool,
+    hang_logons: AtomicBool,
 }
 
 impl RecordingApp {
@@ -102,6 +116,8 @@ impl RecordingApp {
             Arc::new(Self {
                 events: Mutex::new(Vec::new()),
                 app_tx,
+                refuse_logons: AtomicBool::new(false),
+                hang_logons: AtomicBool::new(false),
             }),
             app_rx,
         )
@@ -121,6 +137,14 @@ impl RecordingApp {
             Ok(events) => events.clone(),
             Err(_) => panic!("event lock poisoned"),
         }
+    }
+
+    #[track_caller]
+    fn count(&self, event: &str) -> usize {
+        self.events()
+            .iter()
+            .filter(|recorded| recorded.starts_with(&format!("{event} ")))
+            .count()
     }
 }
 
@@ -142,9 +166,18 @@ impl Application for RecordingApp {
 
     async fn from_admin(
         &self,
-        _message: &RawMessage<'_>,
-        _session_id: &SessionId,
+        message: &RawMessage<'_>,
+        session_id: &SessionId,
     ) -> Result<(), RejectReason> {
+        if message.msg_type() == &MsgType::Logon {
+            self.record("from_admin", session_id);
+            if self.hang_logons.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self.refuse_logons.load(Ordering::SeqCst) {
+                return Err(RejectReason::new(0, "credentials refused"));
+            }
+        }
         Ok(())
     }
 
@@ -241,15 +274,19 @@ impl MessageStore for ProbeStore {
     }
 }
 
-/// A lookup that admits any member asking for VENUE (unless told to refuse),
-/// recording every identity it is asked about. With a barrier it waits until
-/// that many lookups are in flight, so a race is forced rather than hoped for.
+/// A lookup that admits any member asking for VENUE (unless told to refuse
+/// or to fail), recording every identity it is asked about. With a barrier it
+/// waits until that many lookups are in flight, so a race is forced rather
+/// than hoped for. With `stores` it gives each admitted session a fresh store
+/// of its own and keeps it, so a test can check it was never touched.
 struct Directory {
     application: Arc<RecordingApp>,
     asked: Mutex<Vec<String>>,
     admit: bool,
+    fail: bool,
     barrier: Option<Barrier>,
     hang: bool,
+    stores: Option<Mutex<Vec<Arc<ProbeStore>>>>,
 }
 
 impl Directory {
@@ -258,8 +295,10 @@ impl Directory {
             application: Arc::clone(application),
             asked: Mutex::new(Vec::new()),
             admit: true,
+            fail: false,
             barrier: None,
             hang: false,
+            stores: None,
         }
     }
 
@@ -270,11 +309,25 @@ impl Directory {
             Err(_) => panic!("lookup lock poisoned"),
         }
     }
+
+    #[track_caller]
+    fn stores(&self) -> Vec<Arc<ProbeStore>> {
+        match &self.stores {
+            Some(stores) => match stores.lock() {
+                Ok(stores) => stores.clone(),
+                Err(_) => panic!("store lock poisoned"),
+            },
+            None => Vec::new(),
+        }
+    }
 }
 
 #[async_trait]
 impl SessionLookup<RecordingApp> for Directory {
-    async fn lookup(&self, identity: &LogonIdentity) -> Option<Acceptor<RecordingApp>> {
+    async fn lookup(
+        &self,
+        identity: &LogonIdentity,
+    ) -> Result<Option<Acceptor<RecordingApp>>, LookupError> {
         match self.asked.lock() {
             Ok(mut asked) => asked.push(identity.to_string()),
             Err(_) => panic!("lookup lock poisoned"),
@@ -285,8 +338,11 @@ impl SessionLookup<RecordingApp> for Directory {
         if let Some(barrier) = &self.barrier {
             barrier.wait().await;
         }
+        if self.fail {
+            return Err(LookupError::new("directory unavailable"));
+        }
         if !self.admit || identity.target_comp_id().as_str() != "VENUE" {
-            return None;
+            return Ok(None);
         }
         let config = SessionConfig::new(
             identity.target_comp_id().clone(),
@@ -294,20 +350,34 @@ impl SessionLookup<RecordingApp> for Directory {
             "FIX.4.4",
         )
         .with_heartbeat_interval(Duration::from_secs(30));
-        Some(Acceptor::new(config, Arc::clone(&self.application)))
+        let acceptor = Acceptor::new(config, Arc::clone(&self.application));
+        let acceptor = match &self.stores {
+            Some(stores) => {
+                let store = ProbeStore::new();
+                match stores.lock() {
+                    Ok(mut stores) => stores.push(Arc::clone(&store)),
+                    Err(_) => panic!("store lock poisoned"),
+                }
+                acceptor.with_store(store as Arc<dyn MessageStore>)
+            }
+            None => acceptor,
+        };
+        Ok(Some(acceptor))
     }
 }
 
-/// A scripted counterparty's frame from `sender` to `target`, numbered `seq`.
+/// A scripted counterparty's frame in `begin_string` from `sender` to
+/// `target`, numbered `seq`.
 #[track_caller]
-fn peer_msg(
+fn peer_msg_in(
+    begin_string: &str,
     sender: &str,
     target: &str,
     msg_type: &str,
     seq: u64,
     extra: &[(u32, &str)],
 ) -> BytesMut {
-    let mut encoder = Encoder::new("FIX.4.4");
+    let mut encoder = Encoder::new(begin_string);
     encoder.put_str(35, msg_type);
     encoder.put_str(49, sender);
     encoder.put_str(56, target);
@@ -319,6 +389,18 @@ fn peer_msg(
     let mut frame = BytesMut::new();
     ok(encoder.finish_into(&mut frame), "test frame must encode");
     frame
+}
+
+/// A scripted counterparty's FIX.4.4 frame from `sender` to `target`.
+#[track_caller]
+fn peer_msg(
+    sender: &str,
+    target: &str,
+    msg_type: &str,
+    seq: u64,
+    extra: &[(u32, &str)],
+) -> BytesMut {
+    peer_msg_in("FIX.4.4", sender, target, msg_type, seq, extra)
 }
 
 /// A Logon numbered 1 from `sender` to `target`.
@@ -338,6 +420,20 @@ fn raw_frame(body: &[u8]) -> BytesMut {
     BytesMut::from(&frame[..])
 }
 
+/// Returns `frame` with its CheckSum (10) value off by one: it still frames,
+/// but fails checksum validation.
+#[track_caller]
+fn with_wrong_checksum(frame: &[u8]) -> BytesMut {
+    let digits_at = some(frame.len().checked_sub(4), "frame must carry a trailer");
+    let (head, trailer) = frame.split_at(digits_at);
+    let digits = some(trailer.get(..3), "trailer must carry three digits");
+    let text = ok(std::str::from_utf8(digits), "checksum digits are ASCII");
+    let declared: u16 = ok(text.parse(), "checksum digits are decimal");
+    let mut garbled = BytesMut::from(head);
+    garbled.extend_from_slice(format!("{:03}\x01", (declared + 1) % 256).as_bytes());
+    garbled
+}
+
 /// Extracts a field from a framed message.
 fn field(frame: &[u8], tag: u32) -> Option<String> {
     let mut decoder = Decoder::new(frame);
@@ -351,6 +447,13 @@ fn field(frame: &[u8], tag: u32) -> Option<String> {
 async fn connect_peer(addr: std::net::SocketAddr) -> Framed<TcpStream, FixCodec> {
     let stream = ok(TcpStream::connect(addr).await, "peer connects");
     Framed::new(stream, FixCodec::new())
+}
+
+/// Connects a scripted counterparty whose own codec does not validate
+/// checksums, so it can receive whatever a session sends back.
+async fn connect_lenient_peer(addr: std::net::SocketAddr) -> Framed<TcpStream, FixCodec> {
+    let stream = ok(TcpStream::connect(addr).await, "peer connects");
+    Framed::new(stream, FixCodec::new().with_checksum_validation(false))
 }
 
 /// Reads the next frame the registry's session sends, within 5 s.
@@ -400,18 +503,24 @@ fn serve_connections(
     rx
 }
 
+/// Awaits the next result `serve` reports.
+async fn next_result(
+    rx: &mut mpsc::UnboundedReceiver<Result<Connection, EngineError>>,
+) -> Result<Connection, EngineError> {
+    some(
+        ok(
+            timeout(Duration::from_secs(5), rx.recv()).await,
+            "a connection is decided within 5s",
+        ),
+        "the server must stay up",
+    )
+}
+
 /// Awaits the next served connection, which must have succeeded.
 async fn next_served(
     rx: &mut mpsc::UnboundedReceiver<Result<Connection, EngineError>>,
 ) -> Connection {
-    let served = some(
-        ok(
-            timeout(Duration::from_secs(5), rx.recv()).await,
-            "a connection is served within 5s",
-        ),
-        "the server must stay up",
-    );
-    ok(served, "the routed session is established")
+    ok(next_result(rx).await, "the routed session is established")
 }
 
 /// Sends `count` NewOrderSingles on `connection`.
@@ -456,6 +565,26 @@ async fn receive(
         received.push(message);
     }
     received
+}
+
+/// Asserts that a scripted peer's session is alive: a TestRequest numbered
+/// `seq` is answered with a Heartbeat echoing it.
+async fn assert_alive(framed: &mut Framed<TcpStream, FixCodec>, member: &str, seq: u64) {
+    ok(
+        framed
+            .send(peer_msg(member, "VENUE", "1", seq, &[(112, "STILL-THERE")]))
+            .await,
+        "the peer sends a TestRequest",
+    );
+    let heartbeat = next_frame(framed).await;
+    assert_eq!(field(&heartbeat, 35).as_deref(), Some("0"));
+    assert_eq!(field(&heartbeat, 112).as_deref(), Some("STILL-THERE"));
+}
+
+/// A registry whose lookup is `directory`.
+fn looked_up(directory: &Arc<Directory>) -> AcceptorRegistry<RecordingApp> {
+    AcceptorRegistry::new()
+        .with_lookup(Arc::clone(directory) as Arc<dyn SessionLookup<RecordingApp>>)
 }
 
 /// Two sessions on one listener: two real initiators with different CompIDs
@@ -591,7 +720,8 @@ async fn test_registry_unregistered_comp_ids_are_closed_without_reply() {
 
     match joined(venue, "venue task").await {
         Err(EngineError::UnknownSession { identity }) => {
-            assert_eq!(identity, "49=STRANGER 56=VENUE");
+            assert_eq!(identity.sender_comp_id().as_str(), "STRANGER");
+            assert_eq!(identity.to_string(), "49=STRANGER 56=VENUE");
         }
         other => panic!("expected UnknownSession, got {other:?}"),
     }
@@ -653,14 +783,7 @@ async fn test_registry_second_logon_for_a_live_session_is_refused() {
         "the second peer logs on",
     );
     assert_closed_without_reply(&mut second).await;
-    let refused = some(
-        ok(
-            timeout(Duration::from_secs(5), served.recv()).await,
-            "the refusal is reported within 5s",
-        ),
-        "the server must stay up",
-    );
-    match refused {
+    match next_result(&mut served).await {
         Err(EngineError::LogonRejected { reason }) => {
             assert!(reason.contains("already active"), "got {reason}");
         }
@@ -668,43 +791,92 @@ async fn test_registry_second_logon_for_a_live_session_is_refused() {
     }
 
     // The first session is untouched: a TestRequest is still answered.
+    assert_alive(&mut first, "MEMBER_A", 2).await;
+    assert!(!live.is_closed());
+    assert_eq!(venue_app.count("logon"), 1);
+}
+
+/// While a session is live, a second Logon for it gets no reply even when its
+/// BeginString or EncryptMethod is wrong (no store attached, where a refused
+/// Logon would otherwise be answered): anything it could be sent would be
+/// numbered from the live session's stream.
+#[tokio::test]
+async fn test_registry_live_session_answers_no_wrong_version_or_encryption_logon() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let registry = Arc::new(AcceptorRegistry::new());
     ok(
-        first
+        registry.register(Acceptor::new(venue_for("MEMBER_A"), Arc::clone(&venue_app))),
+        "MEMBER_A registers",
+    );
+    let mut served = serve_connections(&registry, listener, 3);
+
+    let mut first = connect_peer(addr).await;
+    ok(
+        first.send(logon("MEMBER_A", "VENUE")).await,
+        "the first peer logs on",
+    );
+    let _ack = next_frame(&mut first).await;
+    let live = next_served(&mut served).await;
+
+    // The wrong version, routed to the live session.
+    let mut wrong_version = connect_peer(addr).await;
+    ok(
+        wrong_version
+            .send(peer_msg_in(
+                "FIX.4.2",
+                "MEMBER_A",
+                "VENUE",
+                "A",
+                1,
+                &[(98, "0"), (108, "30")],
+            ))
+            .await,
+        "a FIX.4.2 Logon is sent",
+    );
+    assert_closed_without_reply(&mut wrong_version).await;
+    match next_result(&mut served).await {
+        Err(EngineError::LogonRejected { reason }) => {
+            assert!(reason.contains("BeginString"), "got {reason}");
+        }
+        other => panic!("expected a version refusal, got {other:?}"),
+    }
+
+    // An encryption method the engine does not implement.
+    let mut wrong_encryption = connect_peer(addr).await;
+    ok(
+        wrong_encryption
             .send(peer_msg(
                 "MEMBER_A",
                 "VENUE",
-                "1",
-                2,
-                &[(112, "STILL-THERE")],
+                "A",
+                1,
+                &[(98, "1"), (108, "30")],
             ))
             .await,
-        "the first peer sends a TestRequest",
+        "an encrypted Logon is sent",
     );
-    let heartbeat = next_frame(&mut first).await;
-    assert_eq!(field(&heartbeat, 35).as_deref(), Some("0"));
-    assert_eq!(field(&heartbeat, 112).as_deref(), Some("STILL-THERE"));
-    assert_eq!(field(&heartbeat, 34).as_deref(), Some("2"));
+    assert_closed_without_reply(&mut wrong_encryption).await;
+    match next_result(&mut served).await {
+        Err(EngineError::LogonRejected { reason }) => {
+            assert!(reason.contains("EncryptMethod"), "got {reason}");
+        }
+        other => panic!("expected an encryption refusal, got {other:?}"),
+    }
+
+    assert_alive(&mut first, "MEMBER_A", 2).await;
     assert!(!live.is_closed());
-    let logons = venue_app
-        .events()
-        .iter()
-        .filter(|event| event.starts_with("logon "))
-        .count();
-    assert_eq!(logons, 1);
 }
 
-/// The lookup admits a session that was not registered at startup; the
-/// session is then registered, so a later Logon for it is routed without
+/// The lookup admits a session that was not registered at startup; once a
+/// Logon for it is authenticated it stays, so a later Logon is routed without
 /// asking the lookup again.
 #[tokio::test]
 async fn test_registry_lookup_admits_an_unknown_session() {
     let (listener, addr) = bind_listener().await;
     let (venue_app, _venue_rx) = RecordingApp::new();
     let directory = Arc::new(Directory::admitting(&venue_app));
-    let registry = Arc::new(
-        AcceptorRegistry::new()
-            .with_lookup(Arc::clone(&directory) as Arc<dyn SessionLookup<RecordingApp>>),
-    );
+    let registry = Arc::new(looked_up(&directory));
     let mut served = serve_connections(&registry, listener, 2);
 
     for round in 0..2 {
@@ -747,8 +919,7 @@ async fn test_registry_lookup_can_refuse_a_session() {
         admit: false,
         ..Directory::admitting(&venue_app)
     });
-    let registry: AcceptorRegistry<RecordingApp> = AcceptorRegistry::new()
-        .with_lookup(Arc::clone(&directory) as Arc<dyn SessionLookup<RecordingApp>>);
+    let registry = looked_up(&directory);
     let venue = tokio::spawn(async move { registry.accept(&listener).await });
 
     let mut peer = connect_peer(addr).await;
@@ -774,6 +945,33 @@ async fn test_registry_lookup_can_refuse_a_session() {
     assert!(venue_app.events().is_empty());
 }
 
+/// A lookup that cannot decide is reported as such, not as a refusal, and the
+/// Logon is closed without a reply.
+#[tokio::test]
+async fn test_registry_lookup_failure_is_reported_apart_from_a_refusal() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let directory = Arc::new(Directory {
+        fail: true,
+        ..Directory::admitting(&venue_app)
+    });
+    let registry = looked_up(&directory);
+    let venue = tokio::spawn(async move { registry.accept(&listener).await });
+
+    let mut peer = connect_peer(addr).await;
+    ok(
+        peer.send(logon("NEWCOMER", "VENUE")).await,
+        "the peer logs on",
+    );
+    assert_closed_without_reply(&mut peer).await;
+
+    match joined(venue, "venue task").await {
+        Err(EngineError::Lookup(err)) => assert_eq!(err.reason(), "directory unavailable"),
+        other => panic!("expected a lookup failure, got {other:?}"),
+    }
+    assert!(venue_app.events().is_empty());
+}
+
 /// Two concurrent Logons for the same unknown identity, each looked up while
 /// the other is: the registry keeps one acceptor for the session, so exactly
 /// one is admitted and the other is refused as a duplicate.
@@ -785,10 +983,7 @@ async fn test_registry_racing_lookups_admit_one_session() {
         barrier: Some(Barrier::new(2)),
         ..Directory::admitting(&venue_app)
     });
-    let registry = Arc::new(
-        AcceptorRegistry::new()
-            .with_lookup(Arc::clone(&directory) as Arc<dyn SessionLookup<RecordingApp>>),
-    );
+    let registry = Arc::new(looked_up(&directory));
     let mut served = serve_connections(&registry, listener, 2);
 
     let mut peer_a = connect_peer(addr).await;
@@ -804,13 +999,7 @@ async fn test_registry_racing_lookups_admit_one_session() {
 
     let mut results = Vec::new();
     for _ in 0..2 {
-        results.push(some(
-            ok(
-                timeout(Duration::from_secs(5), served.recv()).await,
-                "both Logons are decided within 5s",
-            ),
-            "the server must stay up",
-        ));
+        results.push(next_result(&mut served).await);
     }
     let admitted = results.iter().filter(|result| result.is_ok()).count();
     let duplicates = results
@@ -838,26 +1027,162 @@ async fn test_registry_racing_lookups_admit_one_session() {
     assert_eq!((acked, closed), (1, 1));
 }
 
-/// An over-long or illegal CompID is refused before any session or the
-/// lookup is consulted, with no reply.
+/// A peer cycling fresh identities the lookup admits, whose credentials
+/// `from_admin` refuses each time, leaves the registry as it found it: every
+/// provisional session is evicted, and the store each one was given was
+/// never touched.
+#[tokio::test]
+async fn test_registry_failed_authentication_evicts_lookup_sessions() {
+    const ATTEMPTS: usize = 5;
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    venue_app.refuse_logons.store(true, Ordering::SeqCst);
+    let directory = Arc::new(Directory {
+        stores: Some(Mutex::new(Vec::new())),
+        ..Directory::admitting(&venue_app)
+    });
+    let registry = Arc::new(looked_up(&directory));
+    let mut served = serve_connections(&registry, listener, ATTEMPTS);
+
+    for attempt in 0..ATTEMPTS {
+        let mut peer = connect_peer(addr).await;
+        let identity = format!("FRESH_{attempt}");
+        ok(
+            peer.send(logon(&identity, "VENUE")).await,
+            "the peer logs on",
+        );
+        match next_result(&mut served).await {
+            Err(EngineError::LogonRejected { reason }) => {
+                assert!(reason.contains("credentials refused"), "got {reason}");
+            }
+            other => panic!("expected a credentials refusal, got {other:?}"),
+        }
+        // With a store attached the refusal gets no reply.
+        assert_closed_without_reply(&mut peer).await;
+        assert!(
+            registry.session_ids().is_empty(),
+            "attempt {attempt}: {:?}",
+            registry.session_ids()
+        );
+    }
+
+    assert_eq!(directory.asked().len(), ATTEMPTS);
+    assert_eq!(venue_app.count("from_admin"), ATTEMPTS);
+    let stores = directory.stores();
+    assert_eq!(stores.len(), ATTEMPTS);
+    assert!(stores.iter().all(|store| store.touched() == 0));
+    // Evicted sessions dropped their acceptors, and with them their store
+    // references: only the directory's record and this test's copy remain.
+    assert!(stores.iter().all(|store| Arc::strong_count(store) == 2));
+}
+
+/// A Logon refused after `from_admin` accepted it (here for its HeartBtInt)
+/// confirms the lookup-admitted session: the peer was authenticated, so the
+/// session stays and the lookup is not asked about it again.
+#[tokio::test]
+async fn test_registry_authenticated_refusal_keeps_the_lookup_session() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let directory = Arc::new(Directory::admitting(&venue_app));
+    let registry = Arc::new(looked_up(&directory));
+    let mut served = serve_connections(&registry, listener, 2);
+
+    let mut peer = connect_peer(addr).await;
+    ok(
+        peer.send(peer_msg("NEWCOMER", "VENUE", "A", 1, &[(98, "0")]))
+            .await,
+        "a Logon without HeartBtInt is sent",
+    );
+    match next_result(&mut served).await {
+        Err(EngineError::LogonRejected { reason }) => {
+            assert!(reason.contains("HeartBtInt"), "got {reason}");
+        }
+        other => panic!("expected a HeartBtInt refusal, got {other:?}"),
+    }
+    assert_eq!(registry.session_ids().len(), 1);
+
+    // The next Logon is routed to the kept session without a lookup.
+    let mut retry = connect_peer(addr).await;
+    ok(
+        retry.send(logon("NEWCOMER", "VENUE")).await,
+        "the peer logs on again",
+    );
+    let _connection = next_served(&mut served).await;
+    assert_eq!(directory.asked().len(), 1);
+}
+
+/// A `serve` dropped while a lookup-admitted session's handshake is waiting
+/// on `from_admin` settles the session as unauthenticated: it is evicted.
+#[tokio::test]
+async fn test_registry_dropped_serve_evicts_a_provisional_session() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    venue_app.hang_logons.store(true, Ordering::SeqCst);
+    let directory = Arc::new(Directory::admitting(&venue_app));
+    let registry = looked_up(&directory);
+
+    let mut peer = connect_peer(addr).await;
+    ok(
+        peer.send(logon("NEWCOMER", "VENUE")).await,
+        "the peer logs on",
+    );
+    let (stream, _) = ok(listener.accept().await, "the connection is taken");
+    let served = timeout(Duration::from_millis(500), registry.serve(stream)).await;
+
+    assert!(served.is_err(), "serve must still be in from_admin");
+    assert_eq!(venue_app.count("from_admin"), 1);
+    assert!(registry.session_ids().is_empty());
+}
+
+/// The cap bounds the lookup-admitted sessions held at once: beyond it a
+/// lookup admission is refused without a reply.
+#[tokio::test]
+async fn test_registry_max_sessions_refuses_beyond_the_cap() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let directory = Arc::new(Directory::admitting(&venue_app));
+    let registry = Arc::new(looked_up(&directory).with_max_sessions(2));
+    let mut served = serve_connections(&registry, listener, 3);
+
+    let mut live = Vec::new();
+    for member in ["NEW_A", "NEW_B"] {
+        let mut peer = connect_peer(addr).await;
+        ok(peer.send(logon(member, "VENUE")).await, "a member logs on");
+        let _ack = next_frame(&mut peer).await;
+        live.push((peer, next_served(&mut served).await));
+    }
+
+    let mut third = connect_peer(addr).await;
+    ok(
+        third.send(logon("NEW_C", "VENUE")).await,
+        "a third member logs on",
+    );
+    assert_closed_without_reply(&mut third).await;
+    match next_result(&mut served).await {
+        Err(EngineError::SessionLimit { max }) => assert_eq!(max, 2),
+        other => panic!("expected the session cap, got {other:?}"),
+    }
+    assert_eq!(registry.session_ids().len(), 2);
+    assert_eq!(venue_app.count("create"), 2);
+}
+
+/// An over-long, illegal or repeated CompID is refused before any session or
+/// the lookup is consulted, with no reply.
 #[tokio::test]
 async fn test_registry_refuses_an_unroutable_comp_id_before_the_lookup() {
     let (listener, addr) = bind_listener().await;
     let (venue_app, _venue_rx) = RecordingApp::new();
     let directory = Arc::new(Directory::admitting(&venue_app));
-    let registry = Arc::new(
-        AcceptorRegistry::new()
-            .with_lookup(Arc::clone(&directory) as Arc<dyn SessionLookup<RecordingApp>>),
-    );
-    let mut served = serve_connections(&registry, listener, 2);
+    let registry = Arc::new(looked_up(&directory));
+    let mut served = serve_connections(&registry, listener, 3);
 
     // A SenderCompID one byte above the bound.
     let long = "M".repeat(33);
     let mut peer = connect_peer(addr).await;
     ok(peer.send(logon(&long, "VENUE")).await, "the peer logs on");
     assert_closed_without_reply(&mut peer).await;
-    match served.recv().await {
-        Some(Err(EngineError::UnroutableLogon { tag, detail })) => {
+    match next_result(&mut served).await {
+        Err(EngineError::UnroutableLogon { tag, detail }) => {
             assert_eq!(tag, 49);
             assert!(!detail.contains(&long), "the value must not be quoted");
         }
@@ -874,12 +1199,30 @@ async fn test_registry_refuses_an_unroutable_comp_id_before_the_lookup() {
         "the peer logs on",
     );
     assert_closed_without_reply(&mut peer).await;
-    match served.recv().await {
-        Some(Err(EngineError::UnroutableLogon { tag, detail })) => {
+    match next_result(&mut served).await {
+        Err(EngineError::UnroutableLogon { tag, detail }) => {
             assert_eq!(tag, 56);
             assert!(detail.contains("0xff"), "got {detail}");
         }
         other => panic!("expected UnroutableLogon for 56, got {other:?}"),
+    }
+
+    // A SenderCompID repeated in the header (SessionRejectReason 13).
+    let mut peer = connect_peer(addr).await;
+    ok(
+        peer.send(raw_frame(
+            b"35=A\x0149=NEWCOMER\x0156=VENUE\x0149=OTHER\x0134=1\x0152=20261018-10:00:00.000\x0198=0\x01108=30\x01",
+        ))
+        .await,
+        "the peer logs on",
+    );
+    assert_closed_without_reply(&mut peer).await;
+    match next_result(&mut served).await {
+        Err(EngineError::UnroutableLogon { tag, detail }) => {
+            assert_eq!(tag, 49);
+            assert!(detail.contains("more than once"), "got {detail}");
+        }
+        other => panic!("expected UnroutableLogon for a repeated 49, got {other:?}"),
     }
 
     assert!(directory.asked().is_empty(), "the lookup must not be asked");
@@ -919,9 +1262,7 @@ async fn test_registry_logon_timeout_bounds_the_lookup() {
         hang: true,
         ..Directory::admitting(&venue_app)
     });
-    let registry: AcceptorRegistry<RecordingApp> = AcceptorRegistry::new()
-        .with_logon_timeout(Duration::from_millis(300))
-        .with_lookup(Arc::clone(&directory) as Arc<dyn SessionLookup<RecordingApp>>);
+    let registry = looked_up(&directory).with_logon_timeout(Duration::from_millis(300));
     let venue = tokio::spawn(async move { registry.accept(&listener).await });
 
     let mut peer = connect_peer(addr).await;
@@ -1005,6 +1346,316 @@ async fn test_registry_logon_is_held_to_the_session_ceiling() {
     }
     let events = venue_app.events();
     assert_eq!(events, ["create FIX.4.4:VENUE->MEMBER_A"]);
+}
+
+/// The Logon's checksum is validated while it is routed, even for a session
+/// configured not to validate checksums: the frame comes from an unknown
+/// peer. A Logon with a bad checksum is skipped as garbled, so the read ends
+/// in the logon timeout.
+#[tokio::test]
+async fn test_registry_validates_the_logon_checksum_whatever_the_session() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let registry: AcceptorRegistry<RecordingApp> =
+        AcceptorRegistry::new().with_logon_timeout(Duration::from_millis(300));
+    ok(
+        registry.register(Acceptor::new(
+            without_checksums(venue_for("MEMBER_A")),
+            Arc::clone(&venue_app),
+        )),
+        "MEMBER_A registers",
+    );
+    let venue = tokio::spawn(async move { registry.accept(&listener).await });
+
+    let mut peer = connect_peer(addr).await;
+    ok(
+        peer.send(with_wrong_checksum(&logon("MEMBER_A", "VENUE")))
+            .await,
+        "the peer sends a Logon with a bad checksum",
+    );
+    assert_closed_without_reply(&mut peer).await;
+
+    assert!(matches!(
+        joined(venue, "venue task").await,
+        Err(EngineError::LogonTimeout(_))
+    ));
+    assert!(venue_app.events().is_empty());
+}
+
+/// A garbled frame before the Logon is skipped on the registry path, as on
+/// `Acceptor::serve`, and the Logon behind it is routed.
+#[tokio::test]
+async fn test_registry_skips_a_garbled_frame_before_the_logon() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let registry: AcceptorRegistry<RecordingApp> = AcceptorRegistry::new();
+    ok(
+        registry.register(Acceptor::new(venue_for("MEMBER_A"), Arc::clone(&venue_app))),
+        "MEMBER_A registers",
+    );
+    let venue = tokio::spawn(async move { registry.accept(&listener).await });
+
+    let mut peer = connect_peer(addr).await;
+    let mut bytes = with_wrong_checksum(&logon("MEMBER_A", "VENUE"));
+    bytes.extend_from_slice(&logon("MEMBER_A", "VENUE"));
+    ok(
+        peer.get_mut().write_all_buf(&mut bytes).await,
+        "garbage and a Logon are sent",
+    );
+    let ack = next_frame(&mut peer).await;
+    assert_eq!(field(&ack, 35).as_deref(), Some("A"));
+
+    let connection = ok(
+        joined(venue, "venue task").await,
+        "the session is established",
+    );
+    assert_eq!(connection.next_target_seq(), 2);
+}
+
+/// A frame pipelined right behind the Logon, in the same write, is decoded
+/// by the session's codec once the Logon is routed. The session does not
+/// validate checksums, the registry does: the TestRequest, sent with a bad
+/// checksum, is answered only because the session's codec framed it.
+#[tokio::test]
+async fn test_registry_frame_after_the_logon_is_framed_by_the_session_codec() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let registry: AcceptorRegistry<RecordingApp> = AcceptorRegistry::new();
+    ok(
+        registry.register(Acceptor::new(
+            without_checksums(venue_for("MEMBER_A")),
+            Arc::clone(&venue_app),
+        )),
+        "MEMBER_A registers",
+    );
+    let venue = tokio::spawn(async move { registry.accept(&listener).await });
+
+    let mut peer = connect_lenient_peer(addr).await;
+    let mut bytes = logon("MEMBER_A", "VENUE");
+    bytes.extend_from_slice(&with_wrong_checksum(&peer_msg(
+        "MEMBER_A",
+        "VENUE",
+        "1",
+        2,
+        &[(112, "PIPELINED")],
+    )));
+    ok(
+        peer.get_mut().write_all_buf(&mut bytes).await,
+        "a Logon and a TestRequest are sent in one write",
+    );
+    let ack = next_frame(&mut peer).await;
+    assert_eq!(field(&ack, 35).as_deref(), Some("A"));
+    let heartbeat = next_frame(&mut peer).await;
+    assert_eq!(field(&heartbeat, 35).as_deref(), Some("0"));
+    assert_eq!(field(&heartbeat, 112).as_deref(), Some("PIPELINED"));
+
+    let _connection = ok(
+        joined(venue, "venue task").await,
+        "the session is established",
+    );
+}
+
+/// A Logon routed to a session but carrying another BeginString is refused by
+/// the session's own version check (no store, so with a Logout).
+#[tokio::test]
+async fn test_registry_routed_session_refuses_a_mismatched_begin_string() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let registry: AcceptorRegistry<RecordingApp> = AcceptorRegistry::new();
+    ok(
+        registry.register(Acceptor::new(venue_for("MEMBER_A"), Arc::clone(&venue_app))),
+        "MEMBER_A registers",
+    );
+    let venue = tokio::spawn(async move { registry.accept(&listener).await });
+
+    let mut peer = connect_peer(addr).await;
+    ok(
+        peer.send(peer_msg_in(
+            "FIX.4.2",
+            "MEMBER_A",
+            "VENUE",
+            "A",
+            1,
+            &[(98, "0"), (108, "30")],
+        ))
+        .await,
+        "a FIX.4.2 Logon is sent",
+    );
+
+    match joined(venue, "venue task").await {
+        Err(EngineError::LogonRejected { reason }) => {
+            assert!(reason.contains("BeginString"), "got {reason}");
+        }
+        other => panic!("expected a version refusal, got {other:?}"),
+    }
+    assert_eq!(venue_app.count("create"), 1);
+    assert_eq!(venue_app.count("logon"), 0);
+}
+
+/// A FIX 5.0 SP2 session (`FIXT.1.1` on the wire) routes end to end.
+#[tokio::test]
+async fn test_registry_routes_a_fixt_session_end_to_end() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, mut venue_rx) = RecordingApp::new();
+    let registry = Arc::new(AcceptorRegistry::new());
+    ok(
+        registry.register(Acceptor::new(
+            SessionConfig::new(comp_id("VENUE"), comp_id("MEMBER_A"), "FIX.5.0SP2")
+                .with_heartbeat_interval(Duration::from_secs(30)),
+            Arc::clone(&venue_app),
+        )),
+        "the FIXT session registers",
+    );
+    ok(
+        registry.register(Acceptor::new(venue_for("MEMBER_B"), Arc::clone(&venue_app))),
+        "a FIX.4.4 session registers beside it",
+    );
+    let mut served = serve_connections(&registry, listener, 1);
+
+    let (member_app, _member_rx) = RecordingApp::new();
+    let member = ok(
+        Initiator::new(
+            SessionConfig::new(comp_id("MEMBER_A"), comp_id("VENUE"), "FIX.5.0SP2")
+                .with_heartbeat_interval(Duration::from_secs(30)),
+            member_app,
+        )
+        .connect(addr)
+        .await,
+        "the FIXT member logs on",
+    );
+    let venue = next_served(&mut served).await;
+    assert_eq!(venue.session_id().to_string(), "FIX.5.0SP2:VENUE->MEMBER_A");
+
+    send_orders(&member, 1).await;
+    let received = receive(&mut venue_rx, 1).await;
+    assert_eq!(
+        received,
+        [("FIX.5.0SP2:VENUE->MEMBER_A".to_string(), "D".to_string())]
+    );
+}
+
+/// Two sessions with the same CompIDs and different sub IDs on one listener:
+/// each real initiator is routed by the `SenderSubID` (50) it stamps.
+#[tokio::test]
+async fn test_registry_routes_by_sub_id_over_a_socket() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let registry = Arc::new(AcceptorRegistry::new());
+    for desk in ["DESK1", "DESK2"] {
+        ok(
+            registry.register(Acceptor::new(
+                venue_for("MEMBER").with_target_sub_id(desk),
+                Arc::clone(&venue_app),
+            )),
+            "a desk session registers",
+        );
+    }
+    let mut served = serve_connections(&registry, listener, 2);
+
+    for desk in ["DESK2", "DESK1"] {
+        let (member_app, _member_rx) = RecordingApp::new();
+        let member = ok(
+            Initiator::new(member_config("MEMBER").with_sender_sub_id(desk), member_app)
+                .connect(addr)
+                .await,
+            "the desk logs on",
+        );
+        let venue = next_served(&mut served).await;
+        assert_eq!(venue.session_id().target_sub_id.as_deref(), Some(desk));
+        assert_eq!(member.next_sender_seq(), 2);
+    }
+}
+
+/// Location IDs route a Logon and are enforced by the routed session: a real
+/// initiator stamping the configured locations reaches Active (each side
+/// checks the other's 142/143), and a Logon from another location is unknown.
+#[tokio::test]
+async fn test_registry_routes_by_location_id_and_the_session_enforces_it() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let mut venue = venue_for("MEMBER");
+    venue.sender_location_id = Some("NYC".to_string());
+    venue.target_location_id = Some("LON".to_string());
+    let registry = Arc::new(AcceptorRegistry::new());
+    ok(
+        registry.register(Acceptor::new(venue, Arc::clone(&venue_app))),
+        "the located session registers",
+    );
+    let mut served = serve_connections(&registry, listener, 2);
+
+    let mut member = member_config("MEMBER");
+    member.sender_location_id = Some("LON".to_string());
+    member.target_location_id = Some("NYC".to_string());
+    let (member_app, _member_rx) = RecordingApp::new();
+    let connection = ok(
+        Initiator::new(member, member_app).connect(addr).await,
+        "the located member logs on",
+    );
+    let _venue = next_served(&mut served).await;
+    send_orders(&connection, 1).await;
+
+    let mut elsewhere = connect_peer(addr).await;
+    ok(
+        elsewhere
+            .send(peer_msg(
+                "MEMBER",
+                "VENUE",
+                "A",
+                1,
+                &[(142, "PAR"), (98, "0"), (108, "30")],
+            ))
+            .await,
+        "a Logon from another location is sent",
+    );
+    assert_closed_without_reply(&mut elsewhere).await;
+    assert!(matches!(
+        next_result(&mut served).await,
+        Err(EngineError::UnknownSession { .. })
+    ));
+}
+
+/// A lookup returning a session that overlaps a registered one is refused:
+/// the registry would otherwise hold two sessions one Logon could match.
+#[tokio::test]
+async fn test_registry_lookup_overlapping_a_registered_session_is_refused() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let directory = Arc::new(Directory::admitting(&venue_app));
+    let registry = looked_up(&directory);
+    ok(
+        registry.register(Acceptor::new(
+            venue_for("MEMBER").with_target_sub_id("DESK1"),
+            Arc::clone(&venue_app),
+        )),
+        "the DESK1 session registers",
+    );
+    let registry = Arc::new(registry);
+    let mut served = serve_connections(&registry, listener, 1);
+
+    // DESK2 matches nothing registered; the lookup answers with a catch-all
+    // session for MEMBER, which overlaps DESK1.
+    let mut peer = connect_peer(addr).await;
+    ok(
+        peer.send(peer_msg(
+            "MEMBER",
+            "VENUE",
+            "A",
+            1,
+            &[(50, "DESK2"), (98, "0"), (108, "30")],
+        ))
+        .await,
+        "the DESK2 Logon is sent",
+    );
+    assert_closed_without_reply(&mut peer).await;
+    match next_result(&mut served).await {
+        Err(EngineError::Configuration(detail)) => {
+            assert!(detail.contains("overlaps"), "got {detail}");
+        }
+        other => panic!("expected an overlap refusal, got {other:?}"),
+    }
+    assert_eq!(directory.asked().len(), 1);
+    assert_eq!(registry.session_ids().len(), 1);
+    assert!(venue_app.events().is_empty());
 }
 
 /// Unusable registry settings are reported before a connection is taken.

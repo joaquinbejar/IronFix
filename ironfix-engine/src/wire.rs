@@ -223,24 +223,42 @@ fn in_standard_header(raw: &RawMessage<'_>, tag: u32) -> bool {
     false
 }
 
-/// Returns the value of the first `tag` in the standard header of `raw`, or
-/// `None` when the header carries no `tag`.
+/// How often a tag occurs in the standard header of a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeaderField<'a> {
+    /// The header does not carry the tag.
+    Absent,
+    /// The header carries the tag once, with this raw value.
+    Once(&'a [u8]),
+    /// The header carries the tag more than once (`SessionRejectReason` 13,
+    /// "tag appears more than once"): no occurrence can be trusted over the
+    /// others.
+    Repeated,
+}
+
+/// Reads `tag` from the standard header of `raw`.
 ///
 /// The header is the leading run of standard-header tags, as for
-/// [`in_standard_header`]: a `tag` that occurs only in the body is not found.
-/// One scan, no allocation, and the value is returned as raw bytes, so a
-/// caller bounding an untrusted value sees every byte before deciding whether
-/// it is text at all.
-pub(crate) fn header_field<'a>(raw: &RawMessage<'a>, tag: u32) -> Option<&'a [u8]> {
+/// [`in_standard_header`]: a `tag` that occurs only in the body is
+/// [`HeaderField::Absent`], and a tag outside the standard header set is never
+/// found. The whole header is scanned, so a tag repeated in it is
+/// [`HeaderField::Repeated`] rather than its first value. One scan, no
+/// allocation, and the value is returned as raw bytes, so a caller bounding an
+/// untrusted value sees every byte before deciding whether it is text at all.
+pub(crate) fn header_field<'a>(raw: &RawMessage<'a>, tag: u32) -> HeaderField<'a> {
+    let mut found = HeaderField::Absent;
     for field in raw.fields() {
-        if field.tag == tag {
-            return Some(field.value);
-        }
         if !is_standard_header_tag(field.tag) {
-            return None;
+            break;
+        }
+        if field.tag == tag {
+            if found != HeaderField::Absent {
+                return HeaderField::Repeated;
+            }
+            found = HeaderField::Once(field.value);
         }
     }
-    None
+    found
 }
 
 /// Reads `MsgSeqNum` (34) from the standard header of `raw`.
@@ -1908,12 +1926,33 @@ mod tests {
         ]);
         let raw = decode(&frame);
 
-        assert_eq!(header_field(&raw, 49), Some(&b"CLIENT"[..]));
-        assert_eq!(header_field(&raw, 56), Some(&b"VENUE"[..]));
+        assert_eq!(header_field(&raw, 49), HeaderField::Once(b"CLIENT"));
+        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"VENUE"));
         // Not UTF-8, returned as bytes for the caller to bound.
-        assert_eq!(header_field(&raw, 142), Some(&b"LON\x80"[..]));
-        assert_eq!(header_field(&raw, 57), None);
-        assert_eq!(header_field(&raw, 50), None);
+        assert_eq!(header_field(&raw, 142), HeaderField::Once(b"LON\x80"));
+        assert_eq!(header_field(&raw, 57), HeaderField::Absent);
+        assert_eq!(header_field(&raw, 50), HeaderField::Absent);
+        // A body tag is never a header field, even as the first body field.
+        assert_eq!(header_field(&raw, 98), HeaderField::Absent);
+    }
+
+    #[test]
+    fn test_header_field_reports_a_repeated_tag() {
+        let frame = frame_with_fields(&[
+            (35, "A"),
+            (49, "CLIENT"),
+            (56, "VENUE"),
+            (34, "1"),
+            (49, "OTHER"),
+            (52, "20260721-10:00:00.000"),
+            (98, "0"),
+            // A body copy does not make the header's 56 repeated.
+            (56, "VENUE"),
+        ]);
+        let raw = decode(&frame);
+
+        assert_eq!(header_field(&raw, 49), HeaderField::Repeated);
+        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"VENUE"));
     }
 
     #[test]
@@ -1931,7 +1970,7 @@ mod tests {
         let raw = decode(&frame);
 
         assert!(is_standard_header_tag(370));
-        assert!(in_standard_header(&raw, 56));
+        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"CLIENT"));
         assert_eq!(
             PeerIdentity::new(&config_for("FIX.4.4")).validate(&raw),
             Ok(())

@@ -27,8 +27,11 @@
 //!   the standard header and bounded before anything is looked up, to a
 //!   registered [`Acceptor`] or one a [`SessionLookup`] admits, and runs that
 //!   session's handshake on it. A Logon that cannot be routed is closed
-//!   without a reply, touching no store and running no callback. Each session
-//!   keeps its own sequence numbers, store and heartbeat.
+//!   without a reply, touching no store and running no callback. A session
+//!   the lookup admits is kept only once a Logon for it gets past
+//!   `from_admin`, and [`AcceptorRegistry::with_max_sessions`] caps how many
+//!   it holds. Each session keeps its own sequence numbers, store and
+//!   heartbeat.
 //! - **[`Connection`]**: a cheap-clone handle returned by both engines — send,
 //!   logout, await close, read sequence numbers.
 //! - **[`OutboundMessage`]**: the body you hand to [`Connection::send`]; the
@@ -104,7 +107,7 @@ pub use error::EngineError;
 pub use initiator::Initiator;
 pub use outbound::{OutboundField, OutboundMessage};
 pub use persistence::StoreFailurePolicy;
-pub use registry::{AcceptorRegistry, LogonIdentity, SessionLookup};
+pub use registry::{AcceptorRegistry, LogonIdentity, LookupError, SessionLookup};
 
 // Re-exported for convenience: the per-session configuration consumed by
 // [`Initiator`].

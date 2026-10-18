@@ -6,6 +6,7 @@
 
 //! Engine error types.
 
+use crate::registry::{LogonIdentity, LookupError};
 use ironfix_core::error::{DecodeError, EncodeError, StoreError};
 use ironfix_session::config::SessionConfigError;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
@@ -164,7 +165,8 @@ pub enum EngineError {
     /// An inbound Logon cannot be routed to a session by an
     /// [`AcceptorRegistry`](crate::AcceptorRegistry): one of its identity
     /// fields is absent from the standard header (`SenderCompID` (49),
-    /// `TargetCompID` (56)), empty, longer than
+    /// `TargetCompID` (56)), repeated in it (`SessionRejectReason` 13, "tag
+    /// appears more than once"), empty, longer than
     /// [`MAX_ID_LEN`](ironfix_session::config::MAX_ID_LEN) bytes, or carries
     /// a byte outside printable ASCII.
     ///
@@ -190,9 +192,32 @@ pub enum EngineError {
     UnknownSession {
         /// The identity the Logon claimed, in its own orientation (its
         /// `SenderCompID` (49) first). Every value in it has passed the
-        /// routing bounds, so it is at most a few hundred printable bytes.
-        identity: String,
+        /// routing bounds.
+        identity: Box<LogonIdentity>,
     },
+
+    /// A [`SessionLookup`](crate::SessionLookup) admitted a session, but the
+    /// [`AcceptorRegistry`](crate::AcceptorRegistry) already holds as many
+    /// lookup-admitted sessions as
+    /// [`AcceptorRegistry::with_max_sessions`](crate::AcceptorRegistry::with_max_sessions)
+    /// allows.
+    ///
+    /// The connection is closed without a reply; no store is touched and no
+    /// [`Application`](crate::Application) callback runs.
+    #[error("the registry already holds {max} lookup-admitted sessions")]
+    SessionLimit {
+        /// The configured maximum number of lookup-admitted sessions.
+        max: usize,
+    },
+
+    /// A [`SessionLookup`](crate::SessionLookup) could not decide whether to
+    /// admit a session: its directory is unavailable, as opposed to refusing
+    /// the identity.
+    ///
+    /// The connection is closed without a reply; no store is touched and no
+    /// [`Application`](crate::Application) callback runs.
+    #[error("session lookup failed: {0}")]
+    Lookup(#[from] LookupError),
 
     /// The Logon acknowledgement carried a `BeginString` (8) that does not
     /// match the configured session version.

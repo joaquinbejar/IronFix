@@ -2485,3 +2485,61 @@ async fn test_acceptor_ack_filing_failure_still_owes_a_reset_after_one_is_paid()
     );
     assert_eq!(field(&ack, 141).as_deref(), Some("Y"), "and is declared");
 }
+
+/// While a session is live, a second Logon refused for its BeginString gets
+/// no reply even without a store, where a refused Logon is otherwise answered
+/// with a Logout: that Logout would be numbered from the provisional
+/// counters, a stream the live session owns. The live session carries on.
+#[tokio::test]
+async fn test_acceptor_live_session_answers_no_wrong_version_logon() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    ));
+    let (mut live, connection, _ack) = establish_shared(&acceptor, 1, &[]).await;
+
+    let (listener, addr) = bind_listener().await;
+    let shared = Arc::clone(&acceptor);
+    let venue = tokio::spawn(async move { shared.accept(&listener).await });
+    let stream = ok(TcpStream::connect(addr).await, "client connects");
+    let mut newcomer = Framed::new(stream, FixCodec::new());
+    let mut encoder = Encoder::new("FIX.4.2");
+    encoder.put_str(35, "A");
+    encoder.put_str(49, "CLIENT");
+    encoder.put_str(56, "VENUE");
+    encoder.put_uint(34, 1);
+    encoder.put_str(52, Timestamp::now().format_millis().as_str());
+    encoder.put_uint(98, 0);
+    encoder.put_uint(108, 30);
+    let mut logon = BytesMut::new();
+    ok(encoder.finish_into(&mut logon), "logon must encode");
+    ok(newcomer.send(logon).await, "the newcomer logs on");
+
+    assert!(
+        timeout(Duration::from_secs(5), newcomer.next())
+            .await
+            .ok()
+            .flatten()
+            .is_none(),
+        "the newcomer gets no reply"
+    );
+    match ok(
+        timeout(Duration::from_secs(5), venue).await,
+        "the refusal within 5s",
+    ) {
+        Ok(Err(EngineError::LogonRejected { reason })) => {
+            assert!(reason.contains("BeginString"), "got {reason}");
+        }
+        other => panic!("expected a version refusal, got {other:?}"),
+    }
+
+    ok(
+        live.send(client_msg("1", 2, &[(112, "STILL-THERE")])).await,
+        "the live peer sends a TestRequest",
+    );
+    let heartbeat = next_frame(&mut live).await;
+    assert_eq!(msg_type_of(&heartbeat), "0");
+    assert_eq!(field(&heartbeat, 112).as_deref(), Some("STILL-THERE"));
+    assert!(!connection.is_closed());
+}

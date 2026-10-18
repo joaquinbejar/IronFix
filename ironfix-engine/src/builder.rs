@@ -121,8 +121,9 @@ impl<A: Application + 'static> EngineBuilder<A> {
     /// [`Initiator::with_store`] and [`EngineBuilder::into_acceptor`] to
     /// [`Acceptor::with_store`]; see those for what a store changes. The store
     /// failure policy and the store timeout are set on the engine itself.
-    /// [`EngineBuilder::into_acceptor_registry`] attaches it only to a
-    /// registry of exactly one session: a store belongs to one session.
+    /// [`EngineBuilder::into_acceptor_registry`] accepts it only for exactly
+    /// one session: a store belongs to one session, and with none it would
+    /// be silently dropped.
     #[must_use]
     pub fn with_store(mut self, store: Arc<dyn MessageStore>) -> Self {
         self.store = Some(store);
@@ -193,23 +194,25 @@ impl<A: Application + 'static> EngineBuilder<A> {
     ///
     /// Any number of sessions may be added, none included (sessions can also
     /// be registered later with [`AcceptorRegistry::register`]). A store set
-    /// with [`EngineBuilder::with_store`] is attached when exactly one session
-    /// is configured. For several sessions with stores, or with per-session
-    /// settings (failure policy, timeouts, initial sequences), build each
-    /// [`Acceptor`] and register it on the registry directly.
+    /// with [`EngineBuilder::with_store`] requires exactly one session, to
+    /// which it is attached. For several sessions with stores, or with
+    /// per-session settings (failure policy, timeouts, initial sequences),
+    /// build each [`Acceptor`] and register it on the registry directly.
     ///
     /// # Errors
-    /// [`EngineError::Configuration`] when a store has been set and more than
-    /// one session is configured: a store belongs to exactly one session, and
-    /// two sessions writing to one store would interleave their sequence
-    /// streams. Otherwise any error [`AcceptorRegistry::register`] returns for
-    /// a session: an unusable configuration or version, two sessions whose
+    /// [`EngineError::Configuration`] when a store has been set and the number
+    /// of sessions is not exactly one: a store belongs to exactly one session
+    /// (two sessions writing to one store would interleave their sequence
+    /// streams), and with no session it would be dropped without a word.
+    /// Otherwise any error [`AcceptorRegistry::register`] returns for a
+    /// session: an unusable configuration or version, two sessions whose
     /// identities overlap, or the same session twice.
     pub fn into_acceptor_registry(self) -> Result<AcceptorRegistry<A>, EngineError> {
-        if self.store.is_some() && self.sessions.len() > 1 {
+        if self.store.is_some() && self.sessions.len() != 1 {
             return Err(EngineError::Configuration(format!(
                 "a store was set for {} sessions, but a store belongs to exactly one session: \
-                 attach one store per session with AcceptorRegistry::register",
+                 add exactly one session, or attach one store per session with \
+                 AcceptorRegistry::register",
                 self.sessions.len()
             )));
         }
@@ -369,6 +372,20 @@ mod tests {
                 assert!(detail.contains("exactly one session"), "got {detail}");
             }
             other => panic!("one store for two sessions must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_into_acceptor_registry_refuses_a_store_without_a_session() {
+        let store: Arc<dyn MessageStore> = Arc::new(ironfix_store::MemoryStore::new());
+        match EngineBuilder::new()
+            .with_store(store)
+            .into_acceptor_registry()
+        {
+            Err(EngineError::Configuration(detail)) => {
+                assert!(detail.contains("0 sessions"), "got {detail}");
+            }
+            other => panic!("a store with no session must be refused: {other:?}"),
         }
     }
 

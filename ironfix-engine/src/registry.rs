@@ -22,63 +22,78 @@
 //! configures them, its `SenderSubID` (50), `TargetSubID` (57),
 //! `SenderLocationID` (142) and `TargetLocationID` (143) are the session's
 //! target and sender sub and location IDs. A sub or location ID the session
-//! does not configure places no requirement on the Logon. `BeginString` (8) is
-//! not part of the key: the routed session checks it, as
-//! [`Acceptor::serve`] does.
+//! does not configure places no requirement on the Logon. The routed session
+//! then enforces the same identity on every inbound message, its configured
+//! sub and location IDs included, so a peer cannot be routed on one identity
+//! and send under another. `BeginString` (8) is not part of the key: the
+//! routed session checks it, as [`Acceptor::serve`] does.
 //!
 //! The Logon is not validated yet when it is routed, so its identity is read
 //! from the **standard header** only (a 49 or 56 that occurs only in the body
-//! names nobody) and every value is bounded **before** any session or the
-//! lookup is consulted: 1 to [`MAX_ID_LEN`] bytes of printable ASCII. A Logon
-//! that fails is refused with [`EngineError::UnroutableLogon`]. Only the
-//! identity fields are ever logged, bounded that way (an invalid one as a
-//! short escaped prefix); the Logon itself never is, so `Password` (554),
-//! `NewPassword` (925) and `RawData` (96) never reach a log line.
+//! names nobody, and a field repeated in the header names nobody either) and
+//! every value is bounded **before** any session or the lookup is consulted:
+//! 1 to [`MAX_ID_LEN`] bytes of printable ASCII. A Logon that fails is refused
+//! with [`EngineError::UnroutableLogon`]. Only the identity fields are ever
+//! logged, bounded that way (an invalid one as a short escaped prefix); the
+//! Logon itself never is, so `Password` (554), `NewPassword` (925) and
+//! `RawData` (96) never reach a log line.
 //!
 //! [`AcceptorRegistry::register`] refuses a session whose key overlaps one
-//! already registered (some Logon could match both), so a Logon matches at
-//! most one session and routing never depends on registration order.
+//! already registered (some Logon could match both), one whose [`SessionId`]
+//! is already registered, and one whose store another session already uses,
+//! so a Logon matches at most one session, routing never depends on
+//! registration order, and every store belongs to one session.
 //!
 //! # Sessions not known at startup
 //!
 //! A [`SessionLookup`] set with [`AcceptorRegistry::with_lookup`] is asked
 //! about an identity no registered session matches. It may admit the session,
-//! by returning the [`Acceptor`] that serves it, or refuse it. An admitted
-//! session joins the registry for the registry's lifetime, exactly as if it
-//! had been registered: its admission slot (one live session at a time) and
-//! the record of a reset it owes must outlive the connection, and an
-//! `Acceptor` built afresh for each Logon would admit two concurrent Logons
-//! for the same session. Later Logons for it are routed without asking the
-//! lookup again; authenticating each one remains
-//! [`Application::from_admin`]'s job. When two Logons for the same unknown
-//! identity are looked up at once, the first admitted session is kept and the
-//! other `Acceptor` is dropped, so the two still compete for one admission
-//! slot.
+//! by returning the [`Acceptor`] that serves it, refuse it, or report that it
+//! cannot decide ([`LookupError`]). An admitted session is held
+//! **provisionally** while its first handshake runs, since the lookup admits
+//! before [`Application::from_admin`] has authenticated anyone. If that
+//! handshake ends before `from_admin` accepts the Logon, and no other
+//! connection is routed to the session, the session is evicted: nothing is
+//! lost, because before authentication its store is untouched. Once a
+//! handshake gets past `from_admin`, the session stays for the registry's
+//! lifetime, like a registered one, so its admission slot (one live session at
+//! a time) and the record of a reset it owes outlive the connection. See
+//! [`SessionLookup`] ("Resource use") for what this costs and how to bound
+//! it.
 //!
 //! # Refusals
 //!
 //! Before the Logon is routed there is no session: no sequence stream to
 //! number a reply from, no store to file one in, and no configured identity to
 //! stamp on it. A Logon that cannot be routed (an unroutable identity, an
-//! unknown session, a lookup that refuses or does not answer in time, a first
-//! frame that is not a Logon) is therefore closed **without a reply**, no
-//! store is touched and no [`Application`] callback runs. This is the policy
-//! ADR-0017 gives an unauthenticated peer when a store is attached, applied
-//! here in both modes. Once routed, the session's own handshake answers the
-//! Logon exactly as [`Acceptor::serve`] would, its refusals included; in
-//! particular a second Logon for a session that is already live is refused
-//! without a reply while the live session continues.
+//! unknown session, a lookup that refuses, fails or does not answer in time,
+//! the session cap, a first frame that is not a Logon) is therefore closed
+//! **without a reply**, no store is touched and no [`Application`] callback
+//! runs. This is the policy ADR-0017 gives an unauthenticated peer when a
+//! store is attached, applied here in both modes. These refusals are logged at
+//! debug level, since any peer can provoke them at will; a lookup that fails
+//! or overruns, returns a session the registry cannot hold, or meets the
+//! session cap is logged as a warning, being the operator's to fix.
+//!
+//! Once routed, the session's own handshake answers the Logon exactly as
+//! [`Acceptor::serve`] would, its refusals included; in particular a second
+//! Logon for a session that is already live gets no reply, even if its
+//! version or encryption is wrong, while the live session continues.
 //!
 //! # Limits
 //!
-//! Reading the Logon and resolving its session are bounded together by the
-//! registry's logon timeout ([`AcceptorRegistry::with_logon_timeout`]). The
-//! Logon is framed under the registry's own ceiling
-//! ([`AcceptorRegistry::with_max_message_size`]) with checksum validation and
-//! garbled-frame recovery on; a garbled frame is skipped as it is on
-//! [`Acceptor::serve`]. Once routed, the socket switches to the session's own
-//! codec settings, and the Logon is held to the session's `max_message_size`
-//! as well.
+//! Reading the Logon and resolving its session are bounded together by one
+//! deadline, the registry's logon timeout
+//! ([`AcceptorRegistry::with_logon_timeout`]). The Logon is framed under the
+//! registry's own ceiling ([`AcceptorRegistry::with_max_message_size`]) with
+//! checksum validation and garbled-frame recovery on; a garbled frame is
+//! skipped as it is on [`Acceptor::serve`]. Once routed, the socket switches
+//! to the session's own codec settings, and the Logon is held to the
+//! session's `max_message_size` as well.
+//!
+//! The registry bounds each connection, not how many there are: capping the
+//! connections whose Logon is still being read or routed is the consumer's
+//! job, as the accept loop is (see the example).
 //!
 //! Every session keeps its own sequence numbers, store, heartbeat and
 //! settings: the registry only chooses which [`Acceptor`] serves a connection.
@@ -92,6 +107,7 @@
 //! use ironfix_session::SessionConfig;
 //! use std::sync::Arc;
 //! use tokio::net::TcpListener;
+//! use tokio::sync::Semaphore;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let application = Arc::new(NoOpApplication);
@@ -104,11 +120,22 @@
 //! }
 //! let listener = TcpListener::bind("127.0.0.1:9876").await?;
 //!
+//! // The cap on connections still in their Logon handshake is the
+//! // consumer's: past it, a new connection is closed at once instead of
+//! // holding a socket and a task while it is read and routed.
+//! let handshakes = Arc::new(Semaphore::new(64));
 //! loop {
 //!     let (stream, _) = listener.accept().await?;
+//!     let Ok(permit) = Arc::clone(&handshakes).try_acquire_owned() else {
+//!         drop(stream);
+//!         continue;
+//!     };
 //!     let registry = Arc::clone(&registry);
 //!     tokio::spawn(async move {
-//!         if let Ok(connection) = registry.serve(stream).await {
+//!         let served = registry.serve(stream).await;
+//!         // The handshake is over, routed or not: free its place.
+//!         drop(permit);
+//!         if let Ok(connection) = served {
 //!             connection.wait_closed().await;
 //!         }
 //!     });
@@ -120,8 +147,8 @@ use crate::acceptor::Acceptor;
 use crate::application::{Application, NoOpApplication, SessionId};
 use crate::connection::Connection;
 use crate::error::EngineError;
-use crate::reactor::{HandshakeRead, read_handshake_frame};
-use crate::wire;
+use crate::reactor::{HandshakeRead, read_handshake_frame_until};
+use crate::wire::{self, HeaderField};
 use async_trait::async_trait;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::CompId;
@@ -131,6 +158,7 @@ use ironfix_session::config::{
 };
 use ironfix_transport::FixCodec;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -164,9 +192,9 @@ const LOGGED_PREFIX_LEN: usize = 16;
 /// Logon's `TargetCompID` (56), which a session configures as its
 /// `sender_comp_id`. The sub and location IDs are reversed the same way.
 ///
-/// Every value is 1 to [`MAX_ID_LEN`] bytes of printable ASCII and comes from
-/// the standard header. Nothing in it has been authenticated: it is what the
-/// peer claims, and matching CompIDs authenticate nobody.
+/// Every value is 1 to [`MAX_ID_LEN`] bytes of printable ASCII and occurs
+/// once in the standard header. Nothing in it has been authenticated: it is
+/// what the peer claims, and matching CompIDs authenticate nobody.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LogonIdentity {
     /// `SenderCompID` (49): the counterparty.
@@ -229,12 +257,12 @@ impl LogonIdentity {
     /// Reads and bounds the identity of an inbound Logon.
     ///
     /// Pure, and reads no clock (ADR-0002). Each field is taken from the
-    /// standard header only; 49 and 56 are required, and every field present
-    /// must pass [`bounded_value`].
+    /// standard header only and must occur there at most once; 49 and 56 are
+    /// required, and every field present must pass [`bounded_value`].
     ///
     /// # Errors
-    /// The first field that fails, with what is wrong with it and its raw
-    /// bytes for the caller's truncated log line.
+    /// The first field that fails, with what is wrong with it and, when it
+    /// has one value, its raw bytes for the caller's truncated log line.
     fn from_logon<'a>(raw: &RawMessage<'a>) -> Result<Self, RoutingRefusal<'a>> {
         let sender_comp_id = required_comp_id(raw, 49)?;
         let target_comp_id = required_comp_id(raw, 56)?;
@@ -271,6 +299,40 @@ impl std::fmt::Display for LogonIdentity {
     }
 }
 
+/// Why a [`SessionLookup`] could not decide whether to admit a session: its
+/// directory is unavailable, as opposed to refusing the identity (which is
+/// `Ok(None)`).
+///
+/// The reason is the lookup's own text. It is logged as a warning and
+/// returned in [`EngineError::Lookup`]; the lookup never sees the Logon, so
+/// it holds no credentials of the peer's, and must not be given any of the
+/// lookup's own.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{reason}")]
+pub struct LookupError {
+    /// Why the lookup could not decide.
+    reason: String,
+}
+
+impl LookupError {
+    /// Creates a lookup error with the reason the lookup could not decide.
+    ///
+    /// # Arguments
+    /// * `reason` - Why the lookup could not decide, for the log and the error
+    #[must_use]
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    /// Returns why the lookup could not decide.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 /// Why an inbound Logon's identity cannot be routed, before it becomes an
 /// [`EngineError::UnroutableLogon`].
 #[derive(Debug)]
@@ -284,8 +346,9 @@ struct RoutingRefusal<'a> {
 }
 
 impl RoutingRefusal<'_> {
-    /// Logs the refusal with at most [`LOGGED_PREFIX_LEN`] escaped bytes of
-    /// the value, and turns it into the error `serve` returns.
+    /// Logs the refusal at debug level (any peer can provoke it) with at most
+    /// [`LOGGED_PREFIX_LEN`] escaped bytes of the value, and turns it into the
+    /// error `serve` returns.
     #[cold]
     #[inline(never)]
     fn into_error(self) -> EngineError {
@@ -293,7 +356,7 @@ impl RoutingRefusal<'_> {
             let prefix = value.get(..LOGGED_PREFIX_LEN).unwrap_or(value);
             prefix.escape_ascii().to_string()
         });
-        tracing::warn!(
+        tracing::debug!(
             tag = self.tag,
             detail = %self.detail,
             prefix = shown.as_deref().unwrap_or(""),
@@ -336,24 +399,45 @@ fn bounded_value(value: &[u8]) -> Result<&str, String> {
     std::str::from_utf8(value).map_err(|_| "is not text".to_string())
 }
 
+/// Reads one identity field from the standard header: absent is `None`, a
+/// single occurrence must be bounded, a repeated one is refused.
+///
+/// # Errors
+/// The field repeated in the header (`SessionRejectReason` 13), or a value
+/// that fails [`bounded_value`].
+fn header_value<'a>(raw: &RawMessage<'a>, tag: u32) -> Result<Option<&'a str>, RoutingRefusal<'a>> {
+    match wire::header_field(raw, tag) {
+        HeaderField::Absent => Ok(None),
+        HeaderField::Repeated => Err(RoutingRefusal {
+            tag,
+            detail: "occurs more than once in the standard header".to_string(),
+            value: None,
+        }),
+        HeaderField::Once(value) => {
+            bounded_value(value)
+                .map(Some)
+                .map_err(|detail| RoutingRefusal {
+                    tag,
+                    detail,
+                    value: Some(value),
+                })
+        }
+    }
+}
+
 /// Reads a required CompID (49 or 56) from the standard header.
 fn required_comp_id<'a>(raw: &RawMessage<'a>, tag: u32) -> Result<CompId, RoutingRefusal<'a>> {
-    let Some(value) = wire::header_field(raw, tag) else {
+    let Some(text) = header_value(raw, tag)? else {
         return Err(RoutingRefusal {
             tag,
             detail: "is absent from the standard header".to_string(),
             value: None,
         });
     };
-    let text = bounded_value(value).map_err(|detail| RoutingRefusal {
-        tag,
-        detail,
-        value: Some(value),
-    })?;
     CompId::new(text).map_err(|err| RoutingRefusal {
         tag,
         detail: err.to_string(),
-        value: Some(value),
+        value: Some(text.as_bytes()),
     })
 }
 
@@ -363,16 +447,7 @@ fn optional_value<'a>(
     raw: &RawMessage<'a>,
     tag: u32,
 ) -> Result<Option<String>, RoutingRefusal<'a>> {
-    let Some(value) = wire::header_field(raw, tag) else {
-        return Ok(None);
-    };
-    bounded_value(value)
-        .map(|text| Some(text.to_string()))
-        .map_err(|detail| RoutingRefusal {
-            tag,
-            detail,
-            value: Some(value),
-        })
+    Ok(header_value(raw, tag)?.map(str::to_string))
 }
 
 /// The identity a session's counterparty must claim to be routed to it: the
@@ -468,50 +543,149 @@ impl std::fmt::Display for RoutePattern {
     }
 }
 
-/// One registered session: the pattern it is routed by and the acceptor that
-/// serves it.
+/// How a session came to be in the registry, and whether it is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteState {
+    /// Registered with [`AcceptorRegistry::register`]: kept for the
+    /// registry's lifetime.
+    Registered,
+    /// Admitted by the lookup, and no handshake has got past `from_admin`
+    /// yet: evicted when a handshake ends before that while no other
+    /// connection is routed to it.
+    Provisional,
+    /// Admitted by the lookup, and a handshake got past `from_admin`: kept
+    /// for the registry's lifetime.
+    Confirmed,
+}
+
+/// One session in the registry: the pattern it is routed by, the acceptor
+/// that serves it, and whether it is kept.
 struct Route<A: Application> {
     /// What a Logon must claim to be routed here.
     pattern: RoutePattern,
     /// The session's acceptor, shared by every connection routed to it, so
     /// its admission slot and owed-reset record are one per session.
     acceptor: Arc<Acceptor<A>>,
+    /// Whether the route is kept or still provisional.
+    state: RouteState,
 }
 
-/// Registered sessions, bucketed by the (49, 56) pair they are routed by.
-type RouteTable<A> = HashMap<(CompId, CompId), Vec<Route<A>>>;
+/// Every session in the registry, and how many the lookup admitted.
+struct RouteTable<A: Application> {
+    /// Sessions, bucketed by the (49, 56) pair they are routed by. Within a
+    /// bucket no two patterns overlap, so a Logon matches at most one route.
+    buckets: HashMap<(CompId, CompId), Vec<Route<A>>>,
+    /// Lookup-admitted sessions in the table, provisional or confirmed: what
+    /// [`AcceptorRegistry::with_max_sessions`] caps.
+    from_lookup: usize,
+}
 
-/// What [`AcceptorRegistry::insert`] does with a session whose pattern equals
-/// one already registered.
+impl<A: Application> RouteTable<A> {
+    /// An empty table.
+    fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            from_lookup: 0,
+        }
+    }
+
+    /// Every route, in no particular order.
+    fn routes(&self) -> impl Iterator<Item = &Route<A>> {
+        self.buckets.values().flatten()
+    }
+}
+
+/// Where a session being inserted comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SamePattern {
-    /// Refuse it: a static registration of the same identity twice.
-    Refuse,
-    /// Keep the registered session and drop the new one: two lookups for the
-    /// same unknown identity raced, and the first admitted wins.
-    KeepRegistered,
+enum Origin {
+    /// [`AcceptorRegistry::register`]: the same pattern twice is refused.
+    Registered,
+    /// The lookup: the session is provisional, counts toward the cap, and an
+    /// equal pattern already present (a lookup that raced this one) is kept
+    /// instead.
+    Lookup,
+}
+
+/// The session a Logon was routed to.
+struct Routed<A: Application> {
+    /// The session's acceptor.
+    acceptor: Arc<Acceptor<A>>,
+    /// Whether the session was provisional when the Logon was routed, so the
+    /// end of this handshake has to settle it.
+    provisional: bool,
+}
+
+/// A connection's claim on a provisional, lookup-admitted session, settled
+/// when it drops: when the handshake ends, however it ends, a `serve` future
+/// dropped mid-handshake included.
+struct ProvisionalAdmission<'r, A: Application + 'static> {
+    /// The registry that holds the session.
+    registry: &'r AcceptorRegistry<A>,
+    /// The session's acceptor; this connection's reference to it.
+    acceptor: Arc<Acceptor<A>>,
+    /// Set by the handshake once `from_admin` has accepted the Logon.
+    authenticated: AtomicBool,
+}
+
+impl<A: Application + 'static> Drop for ProvisionalAdmission<'_, A> {
+    fn drop(&mut self) {
+        self.registry
+            .settle(&self.acceptor, self.authenticated.load(Ordering::Acquire));
+    }
 }
 
 /// Resolves sessions an [`AcceptorRegistry`] does not know at startup.
 ///
-/// Asked about an inbound Logon whose identity no registered session matches.
-/// Return the [`Acceptor`] that serves it to admit the session, or `None` to
-/// refuse the Logon, which is then closed without a reply.
+/// Asked about an inbound Logon whose identity no session in the registry
+/// matches. Return `Ok(Some(acceptor))` with the [`Acceptor`] that serves it
+/// to admit the session, `Ok(None)` to refuse the Logon, or a [`LookupError`]
+/// when the directory cannot decide (it is unavailable, say). A refusal and
+/// an error both close the connection without a reply; they differ in how
+/// they are logged and reported ([`EngineError::UnknownSession`] against
+/// [`EngineError::Lookup`]).
 ///
 /// The lookup sees the routing identity only, never the Logon: credentials
 /// such as `Username` (553) and `Password` (554) are checked by
 /// [`Application::from_admin`] once the Logon has been routed, so the lookup
 /// cannot leak them and need not handle them.
 ///
-/// An admitted session joins the registry for the registry's lifetime and the
-/// lookup is not asked about it again. The returned acceptor's configuration
-/// must route the identity it was asked about (its `target_comp_id` is the
-/// Logon's `SenderCompID` (49), its `sender_comp_id` the Logon's
-/// `TargetCompID` (56), and any sub or location ID it configures is the one
-/// the Logon carries, reversed the same way), and it must not overlap a
-/// session already registered; otherwise the Logon is refused with
-/// [`EngineError::Configuration`]. The call is bounded by the registry's logon
-/// timeout.
+/// The returned acceptor's configuration must route the identity it was
+/// asked about (its `target_comp_id` is the Logon's `SenderCompID` (49), its
+/// `sender_comp_id` the Logon's `TargetCompID` (56), and any sub or location
+/// ID it configures is the one the Logon carries, reversed the same way), it
+/// must not overlap a session already in the registry, and its store, if any,
+/// must not be one another session uses; otherwise the Logon is refused with
+/// [`EngineError::Configuration`]. The call is bounded by the registry's
+/// logon timeout.
+///
+/// # Resource use
+///
+/// - **When it is called.** Once per Logon whose identity no session in the
+///   registry matches, so an unauthenticated peer can make it run once per
+///   connection by cycling identities. Keep it cheap (a bounded, in-memory or
+///   cached directory), and cap the connections still in their handshake in
+///   the accept loop (see the [module documentation](self)).
+/// - **What admission costs, and when.** The lookup admits **before**
+///   [`Application::from_admin`] has authenticated anyone. An admitted session
+///   is provisional while its first handshake runs: it holds one `Acceptor`
+///   and whatever the lookup built for it (a store, say), and it counts
+///   toward [`AcceptorRegistry::with_max_sessions`].
+/// - **How long it lives.** If that handshake ends before `from_admin`
+///   accepts the Logon (refused, timed out, or the `serve` future dropped)
+///   while no other connection is routed to the session, the session is
+///   evicted and everything it held is dropped. Nothing is lost: before
+///   authentication the store is never touched. Once a handshake gets past
+///   `from_admin`, the session stays for the registry's lifetime, so its
+///   admission slot and owed-reset record persist across connections, and the
+///   lookup is not asked about it again; it cannot then be revoked, so refuse
+///   a revoked member in `from_admin`.
+/// - **How many.** Admit only identities from a bounded directory, as the
+///   example does, and set [`AcceptorRegistry::with_max_sessions`] to bound
+///   the lookup-admitted sessions held at once, provisional and confirmed.
+///
+/// When two Logons for the same unknown identity are looked up at once, the
+/// first admitted session is kept and the other `Acceptor` is dropped, so the
+/// two still compete for one admission slot.
 ///
 /// # Example
 ///
@@ -519,38 +693,50 @@ enum SamePattern {
 /// use async_trait::async_trait;
 /// use ironfix_core::types::CompId;
 /// use ironfix_engine::application::NoOpApplication;
-/// use ironfix_engine::{Acceptor, LogonIdentity, SessionLookup};
+/// use ironfix_engine::{Acceptor, LogonIdentity, LookupError, SessionLookup};
 /// use ironfix_session::SessionConfig;
+/// use std::collections::HashSet;
 /// use std::sync::Arc;
 ///
-/// /// Admits any member that asks for this venue.
+/// /// Admits the members of a fixed directory that ask for this venue, and no
+/// /// one else.
 /// struct MemberDirectory {
 ///     venue: CompId,
+///     members: HashSet<CompId>,
 ///     application: Arc<NoOpApplication>,
 /// }
 ///
 /// #[async_trait]
 /// impl SessionLookup<NoOpApplication> for MemberDirectory {
-///     async fn lookup(&self, identity: &LogonIdentity) -> Option<Acceptor<NoOpApplication>> {
-///         if identity.target_comp_id() != &self.venue {
-///             return None;
+///     async fn lookup(
+///         &self,
+///         identity: &LogonIdentity,
+///     ) -> Result<Option<Acceptor<NoOpApplication>>, LookupError> {
+///         if identity.target_comp_id() != &self.venue
+///             || !self.members.contains(identity.sender_comp_id())
+///         {
+///             return Ok(None);
 ///         }
 ///         let config = SessionConfig::new(
 ///             self.venue.clone(),
 ///             identity.sender_comp_id().clone(),
 ///             "FIX.4.4",
 ///         );
-///         Some(Acceptor::new(config, Arc::clone(&self.application)))
+///         Ok(Some(Acceptor::new(config, Arc::clone(&self.application))))
 ///     }
 /// }
 /// ```
 #[async_trait]
 pub trait SessionLookup<A: Application>: Send + Sync {
-    /// Resolves the session for `identity`, or refuses it with `None`.
+    /// Resolves the session for `identity`: `Ok(Some(_))` admits it,
+    /// `Ok(None)` refuses it.
     ///
     /// # Arguments
     /// * `identity` - The bounded identity the inbound Logon claims
-    async fn lookup(&self, identity: &LogonIdentity) -> Option<Acceptor<A>>;
+    ///
+    /// # Errors
+    /// A [`LookupError`] when the lookup cannot decide.
+    async fn lookup(&self, identity: &LogonIdentity) -> Result<Option<Acceptor<A>>, LookupError>;
 }
 
 /// Server-side FIX engine for many sessions on one listener.
@@ -565,32 +751,37 @@ pub trait SessionLookup<A: Application>: Send + Sync {
 /// registry is typically wrapped in an [`Arc`] and shared across the tasks
 /// serving each connection.
 pub struct AcceptorRegistry<A: Application = NoOpApplication> {
-    /// Registered sessions, bucketed by their (49, 56) pair. Within a bucket
-    /// no two patterns overlap, so a Logon matches at most one route.
+    /// Every session in the registry.
+    ///
+    /// A `std::sync::RwLock`, not `tokio::sync` or `DashMap`: every critical
+    /// section is synchronous and short (a lookup, a push, a retain), no guard
+    /// is ever held across an `.await`, and `register`, `Debug` and the drop
+    /// of a provisional admission need the lock outside any async context.
     routes: RwLock<RouteTable<A>>,
-    /// Resolves an identity no registered session matches.
+    /// Resolves an identity no session in the registry matches.
     lookup: Option<Arc<dyn SessionLookup<A>>>,
     /// Bound on reading and routing one inbound Logon.
     logon_timeout: Duration,
     /// Ceiling, in bytes, on the Logon frame read before routing.
     max_message_size: usize,
+    /// Most lookup-admitted sessions held at once, if capped.
+    max_sessions: Option<usize>,
 }
 
 /// Written by hand rather than derived: `dyn SessionLookup` is not `Debug`.
 impl<A: Application> std::fmt::Debug for AcceptorRegistry<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let sessions = self
-            .routes
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .map(Vec::len)
-            .sum::<usize>();
+        let (sessions, from_lookup) = {
+            let routes = self.routes.read().unwrap_or_else(PoisonError::into_inner);
+            (routes.routes().count(), routes.from_lookup)
+        };
         f.debug_struct("AcceptorRegistry")
             .field("sessions", &sessions)
+            .field("from_lookup", &from_lookup)
             .field("lookup", &self.lookup.is_some())
             .field("logon_timeout", &self.logon_timeout)
             .field("max_message_size", &self.max_message_size)
+            .field("max_sessions", &self.max_sessions)
             .finish()
     }
 }
@@ -602,20 +793,22 @@ impl<A: Application + 'static> Default for AcceptorRegistry<A> {
 }
 
 impl<A: Application + 'static> AcceptorRegistry<A> {
-    /// Creates an empty registry with no lookup, a 10 s logon timeout and a
-    /// 64 KiB ceiling on the Logon frame.
+    /// Creates an empty registry with no lookup, a 10 s logon timeout, a
+    /// 64 KiB ceiling on the Logon frame and no cap on lookup-admitted
+    /// sessions.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            routes: RwLock::new(HashMap::new()),
+            routes: RwLock::new(RouteTable::new()),
             lookup: None,
             logon_timeout: DEFAULT_LOGON_TIMEOUT,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_sessions: None,
         }
     }
 
-    /// Sets the [`SessionLookup`] asked about identities no registered
-    /// session matches. Without one, such a Logon is refused.
+    /// Sets the [`SessionLookup`] asked about identities no session in the
+    /// registry matches. Without one, such a Logon is refused.
     ///
     /// # Arguments
     /// * `lookup` - Resolves sessions not known at startup
@@ -625,8 +818,26 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
         self
     }
 
+    /// Caps the sessions a [`SessionLookup`] may add to the registry, held at
+    /// once: provisional ones (whose first handshake is still running) and
+    /// confirmed ones together (default: no cap). Registered sessions do not
+    /// count.
+    ///
+    /// A lookup admission beyond the cap is refused with
+    /// [`EngineError::SessionLimit`], closing the connection without a reply.
+    /// An evicted provisional session frees its place. Zero refuses every
+    /// lookup admission.
+    ///
+    /// # Arguments
+    /// * `max` - Most lookup-admitted sessions held at once
+    #[must_use]
+    pub const fn with_max_sessions(mut self, max: usize) -> Self {
+        self.max_sessions = Some(max);
+        self
+    }
+
     /// Sets the bound on reading an inbound Logon and resolving its session
-    /// (default 10 s): the wait for an intact Logon and the
+    /// (default 10 s): one deadline for the wait for an intact Logon and the
     /// [`SessionLookup`] call together. Expiry is
     /// [`EngineError::LogonTimeout`].
     ///
@@ -675,14 +886,19 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
         self.max_message_size
     }
 
+    /// Returns the cap on lookup-admitted sessions, if one is set.
+    #[must_use]
+    pub const fn max_sessions(&self) -> Option<usize> {
+        self.max_sessions
+    }
+
     /// Registers a session.
     ///
     /// The acceptor carries everything the session needs (configuration,
     /// application, optional store and failure policy, timeouts, initial
     /// sequences) and is served exactly as [`Acceptor::serve`] would serve it.
-    /// Its store, if any, must belong to this session alone. The session is
-    /// routed by its configured identity, reversed (see the
-    /// [module documentation](self)).
+    /// The session is routed by its configured identity, reversed (see the
+    /// [module documentation](self)), and kept for the registry's lifetime.
     ///
     /// # Arguments
     /// * `acceptor` - The acceptor of the session to register
@@ -691,22 +907,23 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     /// [`EngineError::Config`] or [`EngineError::UnsupportedVersion`] for a
     /// configuration the acceptor would refuse to serve, and
     /// [`EngineError::Configuration`] when the session's identity overlaps a
-    /// session already registered (a Logon could match both), or its
-    /// [`SessionId`] is already registered.
+    /// session already in the registry (a Logon could match both; two
+    /// sessions that differ only by `BeginString` do), its [`SessionId`] is
+    /// already in the registry, or its store is one another session in the
+    /// registry uses: a store belongs to exactly one session.
     pub fn register(&self, acceptor: Acceptor<A>) -> Result<(), EngineError> {
         acceptor.preflight()?;
         let pattern = RoutePattern::for_session(acceptor.config());
-        self.insert(pattern, acceptor, SamePattern::Refuse)
+        self.insert(pattern, acceptor, Origin::Registered)
             .map(|_| ())
     }
 
-    /// Returns the identifiers of every registered session, those a
-    /// [`SessionLookup`] admitted included, in no particular order.
+    /// Returns the identifiers of every session in the registry, provisional
+    /// lookup admissions included, in no particular order.
     #[must_use]
     pub fn session_ids(&self) -> Vec<SessionId> {
         self.read_routes()
-            .values()
-            .flatten()
+            .routes()
             .map(|route| route.acceptor.session_id().clone())
             .collect()
     }
@@ -752,9 +969,12 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     /// [`EngineError::UnexpectedMessage`] when the first frame is not a
     /// Logon; [`EngineError::UnroutableLogon`] for an identity that fails the
     /// routing bounds; [`EngineError::UnknownSession`] when no session matches
-    /// and no lookup admits one; [`EngineError::Configuration`] when a lookup
-    /// returns a session for another identity, or one that overlaps a
-    /// registered session; and [`EngineError::Config`] or
+    /// and no lookup admits one; [`EngineError::Lookup`] when the lookup cannot
+    /// decide; [`EngineError::SessionLimit`] when the lookup admits a session
+    /// beyond [`AcceptorRegistry::with_max_sessions`];
+    /// [`EngineError::Configuration`] when a lookup returns a session for
+    /// another identity, one that overlaps a session in the registry, or one
+    /// sharing another session's store; and [`EngineError::Config`] or
     /// [`EngineError::UnsupportedVersion`] for a looked-up session the
     /// acceptor could not serve. After routing: [`EngineError::Codec`] for a
     /// Logon above the session's `max_message_size`, and every error
@@ -778,37 +998,51 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
         let _ = stream.set_nodelay(true);
         let mut framed = Framed::new(stream, routing_codec(self.max_message_size));
 
-        let logon_frame =
-            match read_handshake_frame(&mut framed, self.logon_timeout, UNROUTED).await {
-                HandshakeRead::Frame(frame) => frame,
-                HandshakeRead::TimedOut => {
-                    return Err(EngineError::LogonTimeout(self.logon_timeout));
-                }
-                HandshakeRead::Closed => return Err(EngineError::Closed),
-                HandshakeRead::Codec(err) => return Err(err.into()),
-            };
+        let logon_frame = match read_handshake_frame_until(&mut framed, deadline, UNROUTED).await {
+            HandshakeRead::Frame(frame) => frame,
+            HandshakeRead::TimedOut => {
+                tracing::debug!("no intact Logon within the registry's logon timeout");
+                return Err(EngineError::LogonTimeout(self.logon_timeout));
+            }
+            HandshakeRead::Closed => return Err(EngineError::Closed),
+            HandshakeRead::Codec(err) => return Err(err.into()),
+        };
 
-        let acceptor = self.route(&logon_frame, deadline).await?;
-        acceptor.serve_logon(framed, logon_frame).await
+        let Routed {
+            acceptor,
+            provisional,
+        } = self.route(&logon_frame, deadline).await?;
+        if !provisional {
+            return acceptor.serve_logon(framed, logon_frame, None).await;
+        }
+        // A lookup-admitted session not yet authenticated: whatever ends this
+        // handshake, dropping the claim settles the session (kept once
+        // `from_admin` accepted, evicted otherwise if no other connection is
+        // routed to it).
+        let admission = ProvisionalAdmission {
+            registry: self,
+            acceptor,
+            authenticated: AtomicBool::new(false),
+        };
+        admission
+            .acceptor
+            .serve_logon(framed, logon_frame, Some(&admission.authenticated))
+            .await
     }
 
-    /// Resolves the session a Logon frame is routed to: a registered one, or
-    /// one the lookup admits before `deadline`.
+    /// Resolves the session a Logon frame is routed to: one in the registry,
+    /// or one the lookup admits before `deadline`.
     ///
     /// # Errors
     /// The routing refusals [`AcceptorRegistry::serve`] documents.
-    async fn route(
-        &self,
-        frame: &[u8],
-        deadline: Instant,
-    ) -> Result<Arc<Acceptor<A>>, EngineError> {
+    async fn route(&self, frame: &[u8], deadline: Instant) -> Result<Routed<A>, EngineError> {
         let identity = {
             // Decoded once already by the read, which skips what does not
             // decode; the error is kept typed rather than unwrapped.
             let raw = wire::decode_frame(frame)?;
             if raw.msg_type() != &MsgType::Logon {
                 let msg_type: String = raw.msg_type().as_str().chars().take(16).collect();
-                tracing::warn!(
+                tracing::debug!(
                     msg_type = %msg_type,
                     "refusing a connection whose first message is not a Logon, without a reply"
                 );
@@ -817,17 +1051,17 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
             LogonIdentity::from_logon(&raw).map_err(RoutingRefusal::into_error)?
         };
 
-        if let Some(acceptor) = self.find(&identity) {
-            return Ok(acceptor);
+        if let Some(routed) = self.find(&identity) {
+            return Ok(routed);
         }
 
         let Some(lookup) = &self.lookup else {
-            tracing::warn!(
+            tracing::debug!(
                 identity = %identity,
                 "refusing a Logon for an unknown session without a reply"
             );
             return Err(EngineError::UnknownSession {
-                identity: identity.to_string(),
+                identity: Box::new(identity),
             });
         };
         let resolved = match tokio::time::timeout_at(deadline, lookup.lookup(&identity)).await {
@@ -839,41 +1073,55 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
                 );
                 return Err(EngineError::LogonTimeout(self.logon_timeout));
             }
-            Ok(None) => {
+            Ok(Err(err)) => {
                 tracing::warn!(
+                    identity = %identity,
+                    error = %err,
+                    "the session lookup could not decide; closing without a reply"
+                );
+                return Err(EngineError::Lookup(err));
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(
                     identity = %identity,
                     "the session lookup refused the Logon; closing without a reply"
                 );
                 return Err(EngineError::UnknownSession {
-                    identity: identity.to_string(),
+                    identity: Box::new(identity),
                 });
             }
-            Ok(Some(acceptor)) => acceptor,
+            Ok(Ok(Some(acceptor))) => acceptor,
         };
-        self.admit_resolved(&identity, resolved)
+        self.admit_resolved(&identity, resolved).inspect_err(|err| {
+            // The cap logs its own refusal; anything else is a session the
+            // lookup should not have returned, which is the operator's to fix.
+            if !matches!(err, EngineError::SessionLimit { .. }) {
+                tracing::warn!(
+                    identity = %identity,
+                    error = %err,
+                    "the session lookup returned a session the registry cannot hold; closing \
+                     without a reply"
+                );
+            }
+        })
     }
 
-    /// Registers a session the lookup resolved for `identity`, or returns the
-    /// session already registered for the same identity by a lookup that
-    /// raced this one.
+    /// Adds a session the lookup resolved for `identity`, provisionally, or
+    /// returns the session already in the registry for the same identity
+    /// (a lookup that raced this one).
     ///
     /// # Errors
     /// [`EngineError::Configuration`] when the acceptor does not route
-    /// `identity` or overlaps another session; the acceptor's own
+    /// `identity`, overlaps another session or shares another session's
+    /// store; [`EngineError::SessionLimit`] beyond the cap; the acceptor's own
     /// configuration errors.
     fn admit_resolved(
         &self,
         identity: &LogonIdentity,
         acceptor: Acceptor<A>,
-    ) -> Result<Arc<Acceptor<A>>, EngineError> {
+    ) -> Result<Routed<A>, EngineError> {
         let pattern = RoutePattern::for_session(acceptor.config());
         if !pattern.admits(identity) {
-            tracing::warn!(
-                identity = %identity,
-                session = %acceptor.session_id(),
-                "the session lookup returned a session for another identity; closing without \
-                 a reply"
-            );
             return Err(EngineError::Configuration(format!(
                 "the session lookup returned session {} (routed by {pattern}) for a Logon \
                  claiming {identity}",
@@ -881,52 +1129,65 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
             )));
         }
         acceptor.preflight()?;
-        let admitted = self.insert(pattern, acceptor, SamePattern::KeepRegistered)?;
-        tracing::info!(
-            session = %admitted.session_id(),
+        let routed = self.insert(pattern, acceptor, Origin::Lookup)?;
+        tracing::debug!(
+            session = %routed.acceptor.session_id(),
+            provisional = routed.provisional,
             "session admitted by the session lookup"
         );
-        Ok(admitted)
+        Ok(routed)
     }
 
-    /// The registered session a Logon claiming `identity` is routed to.
-    fn find(&self, identity: &LogonIdentity) -> Option<Arc<Acceptor<A>>> {
+    /// The session in the registry a Logon claiming `identity` is routed to.
+    fn find(&self, identity: &LogonIdentity) -> Option<Routed<A>> {
         let key = (
             identity.sender_comp_id.clone(),
             identity.target_comp_id.clone(),
         );
+        // The reference is cloned under the read lock, so a settle (which
+        // takes the write lock) never sees a count that is about to grow.
         self.read_routes()
+            .buckets
             .get(&key)
             .and_then(|routes| routes.iter().find(|route| route.pattern.admits(identity)))
-            .map(|route| Arc::clone(&route.acceptor))
+            .map(|route| Routed {
+                acceptor: Arc::clone(&route.acceptor),
+                provisional: route.state == RouteState::Provisional,
+            })
     }
 
-    /// Adds a session under `pattern`, keeping the bucket free of overlaps
-    /// and of duplicate session identifiers.
+    /// Adds a session under `pattern`, keeping every bucket free of overlaps
+    /// and the registry free of duplicate session identifiers and shared
+    /// stores.
     ///
     /// # Errors
-    /// [`EngineError::Configuration`] for an overlap, a duplicate
-    /// [`SessionId`], or (under [`SamePattern::Refuse`]) the same pattern
-    /// registered twice.
+    /// [`EngineError::Configuration`] for an overlap (the same pattern
+    /// registered twice included), a duplicate [`SessionId`] or a shared
+    /// store; [`EngineError::SessionLimit`] for a lookup admission beyond the
+    /// cap.
     fn insert(
         &self,
         pattern: RoutePattern,
         acceptor: Acceptor<A>,
-        same: SamePattern,
-    ) -> Result<Arc<Acceptor<A>>, EngineError> {
+        origin: Origin,
+    ) -> Result<Routed<A>, EngineError> {
         let key = pattern.comp_ids();
+        let store = acceptor.store_address();
         let mut routes = self.write_routes();
-        if let Some(bucket) = routes.get(&key) {
-            if same == SamePattern::KeepRegistered
+        if let Some(bucket) = routes.buckets.get(&key) {
+            if origin == Origin::Lookup
                 && let Some(route) = bucket.iter().find(|route| route.pattern == pattern)
             {
-                return Ok(Arc::clone(&route.acceptor));
+                return Ok(Routed {
+                    acceptor: Arc::clone(&route.acceptor),
+                    provisional: route.state == RouteState::Provisional,
+                });
             }
             for route in bucket {
                 if route.pattern.overlaps(&pattern) {
                     return Err(EngineError::Configuration(format!(
-                        "session {} (routed by {pattern}) overlaps the registered session {} \
-                         (routed by {}): a Logon could match both",
+                        "session {} (routed by {pattern}) overlaps the session {} (routed by {}): \
+                         a Logon could match both",
                         acceptor.session_id(),
                         route.acceptor.session_id(),
                         route.pattern
@@ -934,18 +1195,106 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
                 }
                 if route.acceptor.session_id() == acceptor.session_id() {
                     return Err(EngineError::Configuration(format!(
-                        "session {} is already registered",
+                        "session {} is already in the registry",
                         acceptor.session_id()
                     )));
                 }
             }
         }
+        if store.is_some()
+            && let Some(route) = routes
+                .routes()
+                .find(|route| route.acceptor.store_address() == store)
+        {
+            return Err(EngineError::Configuration(format!(
+                "session {} uses the store of the session {}: a store belongs to exactly one \
+                 session",
+                acceptor.session_id(),
+                route.acceptor.session_id()
+            )));
+        }
+        let state = match origin {
+            Origin::Registered => RouteState::Registered,
+            Origin::Lookup => {
+                if let Some(max) = self.max_sessions
+                    && routes.from_lookup >= max
+                {
+                    tracing::warn!(
+                        session = %acceptor.session_id(),
+                        max,
+                        "refusing a lookup admission beyond the session cap, without a reply"
+                    );
+                    return Err(EngineError::SessionLimit { max });
+                }
+                // Bounded by the number of sessions in memory: cannot reach
+                // `usize::MAX`, and is still added with a checked call.
+                routes.from_lookup = routes
+                    .from_lookup
+                    .checked_add(1)
+                    .ok_or(EngineError::SessionLimit { max: usize::MAX })?;
+                RouteState::Provisional
+            }
+        };
         let acceptor = Arc::new(acceptor);
-        routes.entry(key).or_default().push(Route {
+        routes.buckets.entry(key).or_default().push(Route {
             pattern,
             acceptor: Arc::clone(&acceptor),
+            state,
         });
-        Ok(acceptor)
+        Ok(Routed {
+            acceptor,
+            provisional: state == RouteState::Provisional,
+        })
+    }
+
+    /// Settles a provisional session when one of its handshakes ends.
+    ///
+    /// Confirms the session if this handshake got past `from_admin`.
+    /// Otherwise evicts it if it is still provisional and no other connection
+    /// is routed to it: the table's reference and the caller's are the only
+    /// ones. References are cloned only under the read lock, which this write
+    /// lock excludes, so the count cannot grow while it is read. Before
+    /// authentication the session's store was never touched, so eviction
+    /// loses nothing.
+    fn settle(&self, acceptor: &Arc<Acceptor<A>>, authenticated: bool) {
+        let config = acceptor.config();
+        let key = (config.target_comp_id.clone(), config.sender_comp_id.clone());
+        let mut routes = self.write_routes();
+        let table = &mut *routes;
+        let Some(bucket) = table.buckets.get_mut(&key) else {
+            return;
+        };
+        let Some(route) = bucket
+            .iter_mut()
+            .find(|route| Arc::ptr_eq(&route.acceptor, acceptor))
+        else {
+            return;
+        };
+        if route.state != RouteState::Provisional {
+            return;
+        }
+        if authenticated {
+            route.state = RouteState::Confirmed;
+            tracing::debug!(
+                session = %acceptor.session_id(),
+                "lookup-admitted session confirmed: a Logon for it was authenticated"
+            );
+            return;
+        }
+        if Arc::strong_count(acceptor) > 2 {
+            return;
+        }
+        bucket.retain(|route| !Arc::ptr_eq(&route.acceptor, acceptor));
+        if bucket.is_empty() {
+            table.buckets.remove(&key);
+        }
+        if let Some(remaining) = table.from_lookup.checked_sub(1) {
+            table.from_lookup = remaining;
+        }
+        tracing::debug!(
+            session = %acceptor.session_id(),
+            "evicted a lookup-admitted session whose handshake ended before authentication"
+        );
     }
 
     /// The registry settings `serve` runs with, checked before a connection
@@ -971,8 +1320,9 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     }
 
     /// Read access to the routes. A poisoned lock means a holder panicked;
-    /// every write is a single push after its checks, so no half-applied
-    /// state can be left behind and the guard is recovered.
+    /// every write is a single push, retain or state change after its checks,
+    /// so no half-applied state can be left behind and the guard is
+    /// recovered.
     fn read_routes(&self) -> RwLockReadGuard<'_, RouteTable<A>> {
         self.routes.read().unwrap_or_else(PoisonError::into_inner)
     }
@@ -1001,6 +1351,7 @@ fn routing_codec(max_message_size: usize) -> FixCodec {
 mod tests {
     use super::*;
     use crate::application::NoOpApplication;
+    use ironfix_store::{MemoryStore, MessageStore};
     use ironfix_tagvalue::Encoder;
 
     /// Fails the test with context instead of `.unwrap()` / `.expect()`.
@@ -1069,6 +1420,20 @@ mod tests {
         }
     }
 
+    /// Admits `config` as the lookup would for `identity`, failing the test
+    /// otherwise.
+    #[track_caller]
+    fn admitted(
+        registry: &AcceptorRegistry<NoOpApplication>,
+        identity: &LogonIdentity,
+        config: SessionConfig,
+    ) -> Routed<NoOpApplication> {
+        match registry.admit_resolved(identity, acceptor(config)) {
+            Ok(routed) => routed,
+            Err(err) => panic!("the lookup admission must succeed: {err}"),
+        }
+    }
+
     #[test]
     fn test_logon_identity_reads_every_header_field() {
         let identity = routed(&logon(
@@ -1118,6 +1483,25 @@ mod tests {
     }
 
     #[test]
+    fn test_logon_identity_refuses_a_repeated_field() {
+        for tag in [49_u32, 56, 50, 57, 142, 143] {
+            let value: &[u8] = match tag {
+                49 => b"MEMBER",
+                56 => b"VENUE",
+                _ => b"X",
+            };
+            let repeated = [(tag, value), (tag, value)];
+            match identity_of(&logon(b"MEMBER", b"VENUE", &repeated)) {
+                Err((refused, detail)) => {
+                    assert_eq!(refused, tag);
+                    assert!(detail.contains("more than once"), "got {detail}");
+                }
+                Ok(identity) => panic!("a repeated {tag} must not route: {identity}"),
+            }
+        }
+    }
+
+    #[test]
     fn test_logon_identity_refuses_an_over_long_comp_id() {
         let long = "M".repeat(MAX_ID_LEN + 1);
         match identity_of(&logon(long.as_bytes(), b"VENUE", &[])) {
@@ -1160,6 +1544,16 @@ mod tests {
         assert_eq!(bounded_value(exact.as_bytes()), Ok(exact.as_str()));
         assert_eq!(bounded_value(b"A B=C"), Ok("A B=C"));
         assert_eq!(bounded_value(b""), Err("is empty".to_string()));
+    }
+
+    #[test]
+    fn test_lookup_error_carries_its_reason() {
+        let err = LookupError::new("directory unavailable");
+        assert_eq!(err.reason(), "directory unavailable");
+        assert_eq!(
+            EngineError::from(err).to_string(),
+            "session lookup failed: directory unavailable"
+        );
     }
 
     #[test]
@@ -1247,6 +1641,25 @@ mod tests {
     }
 
     #[test]
+    fn test_register_refuses_sessions_differing_only_by_begin_string() {
+        // BeginString is not part of the routing key: a FIX.4.2 and a
+        // FIX.4.4 session for the same CompIDs would match the same Logons.
+        let registry = AcceptorRegistry::new();
+        assert!(registry.register(acceptor(session("MEMBER"))).is_ok());
+
+        match registry.register(acceptor(SessionConfig::new(
+            comp_id("VENUE"),
+            comp_id("MEMBER"),
+            "FIX.4.2",
+        ))) {
+            Err(EngineError::Configuration(detail)) => {
+                assert!(detail.contains("overlaps"), "got {detail}");
+            }
+            other => panic!("a version-only difference must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_register_refuses_a_duplicate_session_id() {
         // Disjoint by location, which a SessionId does not carry: the
         // application could not tell the two sessions apart.
@@ -1259,10 +1672,36 @@ mod tests {
 
         match registry.register(acceptor(nyc)) {
             Err(EngineError::Configuration(detail)) => {
-                assert!(detail.contains("already registered"), "got {detail}");
+                assert!(detail.contains("already in the registry"), "got {detail}");
             }
             other => panic!("a duplicate SessionId must be refused: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_register_refuses_two_sessions_sharing_a_store() {
+        let store: Arc<dyn MessageStore> = Arc::new(MemoryStore::new());
+        let registry = AcceptorRegistry::new();
+        assert!(
+            registry
+                .register(acceptor(session("MEMBER_A")).with_store(Arc::clone(&store)))
+                .is_ok()
+        );
+
+        match registry.register(acceptor(session("MEMBER_B")).with_store(Arc::clone(&store))) {
+            Err(EngineError::Configuration(detail)) => {
+                assert!(detail.contains("store"), "got {detail}");
+            }
+            other => panic!("a shared store must be refused: {other:?}"),
+        }
+        // A store of its own is fine.
+        let own: Arc<dyn MessageStore> = Arc::new(MemoryStore::new());
+        assert!(
+            registry
+                .register(acceptor(session("MEMBER_B")).with_store(own))
+                .is_ok()
+        );
+        assert_eq!(registry.session_ids().len(), 2);
     }
 
     #[test]
@@ -1280,7 +1719,13 @@ mod tests {
         assert_eq!(registry.session_ids().len(), 4);
         let found = registry.find(&routed(&logon(b"MEMBER_C", b"VENUE", &[(50, b"DESK2")])));
         match found {
-            Some(acceptor) => assert_eq!(acceptor.config().target_sub_id.as_deref(), Some("DESK2")),
+            Some(routed) => {
+                assert_eq!(
+                    routed.acceptor.config().target_sub_id.as_deref(),
+                    Some("DESK2")
+                );
+                assert!(!routed.provisional);
+            }
             None => panic!("the DESK2 session must be found"),
         }
         assert!(
@@ -1319,28 +1764,151 @@ mod tests {
             Err(EngineError::Configuration(detail)) => {
                 assert!(detail.contains("49=MEMBER"), "got {detail}");
             }
-            other => panic!("a session for another identity must be refused: {other:?}"),
+            other => panic!(
+                "a session for another identity must be refused: {:?}",
+                other.err()
+            ),
         }
         assert!(registry.session_ids().is_empty());
     }
 
     #[test]
-    fn test_admit_resolved_keeps_the_first_admitted_session() {
+    fn test_admit_resolved_is_provisional_and_keeps_the_first_admitted_session() {
         let registry = AcceptorRegistry::new();
         let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
 
-        let first = match registry.admit_resolved(&claimed, acceptor(session("MEMBER"))) {
-            Ok(first) => first,
-            Err(err) => panic!("the first lookup must be admitted: {err}"),
-        };
-        let second = match registry.admit_resolved(&claimed, acceptor(session("MEMBER"))) {
-            Ok(second) => second,
-            Err(err) => panic!("a racing lookup must reuse the session: {err}"),
-        };
+        let first = admitted(&registry, &claimed, session("MEMBER"));
+        let second = admitted(&registry, &claimed, session("MEMBER"));
 
         // One acceptor, so one admission slot for the session.
-        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.provisional);
+        assert!(second.provisional);
+        assert!(Arc::ptr_eq(&first.acceptor, &second.acceptor));
         assert_eq!(registry.session_ids().len(), 1);
+        assert_eq!(registry.read_routes().from_lookup, 1);
+    }
+
+    #[test]
+    fn test_admit_resolved_refuses_a_shared_store() {
+        let store: Arc<dyn MessageStore> = Arc::new(MemoryStore::new());
+        let registry = AcceptorRegistry::new();
+        assert!(
+            registry
+                .register(acceptor(session("MEMBER_A")).with_store(Arc::clone(&store)))
+                .is_ok()
+        );
+        let claimed = routed(&logon(b"MEMBER_B", b"VENUE", &[]));
+
+        match registry.admit_resolved(&claimed, acceptor(session("MEMBER_B")).with_store(store)) {
+            Err(EngineError::Configuration(detail)) => {
+                assert!(detail.contains("store"), "got {detail}");
+            }
+            other => panic!("a shared store must be refused: {:?}", other.err()),
+        }
+        assert_eq!(registry.read_routes().from_lookup, 0);
+    }
+
+    #[test]
+    fn test_settle_evicts_an_unauthenticated_provisional_session() {
+        let registry = AcceptorRegistry::new();
+        let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
+        let routed = admitted(&registry, &claimed, session("MEMBER"));
+
+        registry.settle(&routed.acceptor, false);
+
+        assert!(registry.session_ids().is_empty());
+        assert_eq!(registry.read_routes().from_lookup, 0);
+    }
+
+    #[test]
+    fn test_settle_keeps_a_provisional_session_another_connection_uses() {
+        let registry = AcceptorRegistry::new();
+        let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
+        let first = admitted(&registry, &claimed, session("MEMBER"));
+        let Some(second) = registry.find(&claimed) else {
+            panic!("the provisional session must be found");
+        };
+        assert!(second.provisional);
+
+        // The first connection fails while the second is still routed here.
+        registry.settle(&first.acceptor, false);
+        assert_eq!(registry.session_ids().len(), 1);
+
+        // Then the second fails too, and nobody is left.
+        drop(first);
+        registry.settle(&second.acceptor, false);
+        assert!(registry.session_ids().is_empty());
+    }
+
+    #[test]
+    fn test_settle_confirms_an_authenticated_session_for_good() {
+        let registry = AcceptorRegistry::new();
+        let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
+        let routed = admitted(&registry, &claimed, session("MEMBER"));
+
+        registry.settle(&routed.acceptor, true);
+        // A later unauthenticated handshake no longer evicts it.
+        registry.settle(&routed.acceptor, false);
+
+        assert_eq!(registry.session_ids().len(), 1);
+        match registry.find(&claimed) {
+            Some(found) => assert!(!found.provisional),
+            None => panic!("the confirmed session must stay"),
+        }
+        assert_eq!(registry.read_routes().from_lookup, 1);
+    }
+
+    #[test]
+    fn test_settle_never_evicts_a_registered_session() {
+        let registry = AcceptorRegistry::new();
+        assert!(registry.register(acceptor(session("MEMBER"))).is_ok());
+        let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
+        let Some(found) = registry.find(&claimed) else {
+            panic!("the registered session must be found");
+        };
+
+        registry.settle(&found.acceptor, false);
+
+        assert_eq!(registry.session_ids().len(), 1);
+    }
+
+    #[test]
+    fn test_max_sessions_caps_lookup_admissions_only() {
+        let registry = AcceptorRegistry::new().with_max_sessions(1);
+        assert_eq!(registry.max_sessions(), Some(1));
+        // Registered sessions do not count.
+        assert!(registry.register(acceptor(session("STATIC"))).is_ok());
+        let first = routed(&logon(b"MEMBER_A", b"VENUE", &[]));
+        let second = routed(&logon(b"MEMBER_B", b"VENUE", &[]));
+        let held = admitted(&registry, &first, session("MEMBER_A"));
+
+        match registry.admit_resolved(&second, acceptor(session("MEMBER_B"))) {
+            Err(EngineError::SessionLimit { max }) => assert_eq!(max, 1),
+            other => panic!("the cap must refuse a second admission: {:?}", other.err()),
+        }
+        // The same identity again is the session already held, not a new one.
+        assert!(
+            registry
+                .admit_resolved(&first, acceptor(session("MEMBER_A")))
+                .is_ok()
+        );
+
+        // An eviction frees the place.
+        registry.settle(&held.acceptor, false);
+        drop(held);
+        let _ = admitted(&registry, &second, session("MEMBER_B"));
+        assert_eq!(registry.session_ids().len(), 2);
+    }
+
+    #[test]
+    fn test_max_sessions_zero_refuses_every_lookup_admission() {
+        let registry = AcceptorRegistry::new().with_max_sessions(0);
+        let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
+
+        assert!(matches!(
+            registry.admit_resolved(&claimed, acceptor(session("MEMBER"))),
+            Err(EngineError::SessionLimit { max: 0 })
+        ));
     }
 
     #[test]
@@ -1373,6 +1941,7 @@ mod tests {
         assert!(registry.settings_check().is_ok());
         assert_eq!(registry.logon_timeout(), DEFAULT_LOGON_TIMEOUT);
         assert_eq!(registry.max_message_size(), DEFAULT_MAX_MESSAGE_SIZE);
+        assert_eq!(registry.max_sessions(), None);
         let bounds: AcceptorRegistry = AcceptorRegistry::new()
             .with_logon_timeout(MAX_TIMEOUT)
             .with_max_message_size(MIN_MESSAGE_SIZE_LIMIT);
@@ -1386,6 +1955,7 @@ mod tests {
         let shown = format!("{registry:?}");
         assert!(shown.contains("sessions: 1"), "got {shown}");
         assert!(shown.contains("lookup: false"), "got {shown}");
+        assert!(!shown.contains("MEMBER"), "got {shown}");
     }
 
     #[test]
