@@ -475,7 +475,7 @@ pub struct FixCodec {
     recovery_anchors: &'static [&'static [u8]],
     /// What the last recovery-mode resync left for the next read to settle,
     /// so its checks hold across a read boundary. Settled once the start of
-    /// the buffer has been judged, and whenever a frame is returned.
+    /// the buffer is judged a frame start, and whenever a frame is returned.
     resync_state: ResyncState,
 }
 
@@ -569,10 +569,12 @@ impl FixCodec {
     ///   [`FixCodec::with_begin_string`]), SOH, `9=`, preceded by SOH, the start
     ///   of the buffer, or any byte that is neither an ASCII digit nor `=`.
     ///   Both checks hold across a read boundary: when a resync empties the
-    ///   buffer after a digit or `=`, whatever the next read starts with is
-    ///   treated as the same garbled span, whatever it opens with; and a
-    ///   partial opening a resync stopped on is validated once the next read
-    ///   completes it. A valid frame that arrives straight after garbage is
+    ///   buffer, or stops on a partial opening the next read completes, the
+    ///   start of that read is judged exactly as the scan judges a candidate,
+    ///   and anything else it opens with (another version's frame included)
+    ///   is treated as the rest of the same garbled span. Where TCP splits the
+    ///   bytes therefore changes neither the frames handed up nor the skip
+    ///   count. A valid frame that arrives straight after garbage is
     ///   therefore not lost with it, a tag such as `851=` inside a skipped frame
     ///   is not mistaken for a frame start, and a frame embedded at the very
     ///   start of a data field value (`96=8=FIX…`) or after a digit is not
@@ -609,12 +611,13 @@ impl FixCodec {
     ///
     /// Each skip is one recoverable framing error the codec resynchronised
     /// past, which is one per garbled frame: false frame starts inside it are
-    /// rejected by the resync scan and never counted. The exception is a
-    /// partial header opening cut off by the end of the buffer, which is kept
-    /// for the next read; if that read shows it was garbage, it counts once.
-    /// Separately delivered chunks of garbage count separately. Always zero
-    /// when recovery is off, because every malformed frame is then returned as
-    /// an error.
+    /// rejected by the resync scan and never counted. A run of garbage up to
+    /// the next accepted frame start is one span and counts once, however it
+    /// is split across reads: a partial header opening kept for the next read,
+    /// or garbage that keeps arriving in later reads, joins the span already
+    /// counted. (A codec with no anchor at all is the exception, see
+    /// [`FixCodec::with_begin_string`].) Always zero when recovery is off,
+    /// because every malformed frame is then returned as an error.
     #[must_use = "the count is reset by this call; dropping it loses the skips it reports"]
     pub const fn take_garbled_count(&mut self) -> u64 {
         std::mem::replace(&mut self.garbled_count, 0)
@@ -634,6 +637,9 @@ impl FixCodec {
     /// Any other value leaves no anchor at all: a resync then never lands
     /// inside a buffer, and the codec waits for the next read to start on a
     /// frame, which is what an unrecognised BeginString already got before.
+    /// With nothing to compare a read's start with, a read that starts after
+    /// a plausible boundary is framed as it is, so that fallback is the one
+    /// case where the outcome depends on how the bytes are split across reads.
     /// Without recovery this setting has no effect.
     #[must_use]
     pub fn with_begin_string(mut self, begin_string: &str) -> Self {
@@ -653,56 +659,63 @@ impl FixCodec {
     /// Judges the start of the buffer against what the last resync left
     /// pending, so the resync's checks hold across a read boundary.
     ///
-    /// [`recovery_resync_offset`] only sees the current buffer. Two cases
-    /// would otherwise let a frame through that a single read would have
-    /// rejected:
+    /// [`recovery_resync_offset`] only sees the current buffer, so the byte at
+    /// offset 0 of the next read is never one of its candidates. Left to the
+    /// ordinary path, that byte would be framed whatever it opens with:
+    /// another version's frame embedded in the garbled span, say, which the
+    /// same bytes in one read would have resynchronised past. So the start is
+    /// judged here exactly as the scan judges a candidate, and the outcome
+    /// never depends on where the bytes were split:
     ///
-    /// - **The resync emptied the buffer** ([`ResyncState::EmptiedAfter`]). If
-    ///   the byte it discarded last fails [`boundary_before`] (a resync that
-    ///   stopped right after `96=`), whatever the next read starts with
-    ///   continues the same garbled span: an accepted opening there would be
-    ///   an embedded frame, and any other opening, another version's
-    ///   included, would be framed by the ordinary path and delivered. It is
-    ///   resynchronised past from offset 1. If the byte passes the check, the
-    ///   start is judged like any frame start.
-    /// - **The resync stopped on a partial opening**
-    ///   ([`ResyncState::PartialOpening`]). Once the next read completes it,
-    ///   the opening is validated as the resync would have validated it in one
-    ///   read: an accepted opening proceeds, any other is resynchronised past
-    ///   from offset 1.
+    /// 1. **Boundary.** The byte before it must pass [`boundary_before`]. For
+    ///    [`ResyncState::EmptiedAfter`] that is the byte the resync discarded
+    ///    last (a resync that stopped right after `96=` fails it). For
+    ///    [`ResyncState::PartialOpening`] the scan already checked it.
+    /// 2. **Shape.** The bytes must open an accepted header ([`anchor_shape`]
+    ///    against the codec's anchors, so with
+    ///    [`FixCodec::with_begin_string`] only the session's own BeginString).
+    ///    A complete opening proceeds and is framed; a partial one waits for
+    ///    the bytes that settle it, keeping the state.
     ///
-    /// Neither resync is counted again: the bytes belong to the garbled span
-    /// already counted. An ordinary aligned frame never reaches here, because
-    /// only a resync leaves a state pending.
+    /// A start that fails either check continues the same garbled span: it is
+    /// resynchronised past from offset 1, as the scan would have continued,
+    /// and is not counted again, since that span is already counted. An
+    /// ordinary aligned frame never reaches here, because only a resync leaves
+    /// a state pending.
+    ///
+    /// The one exception is a codec with no anchor at all (a BeginString
+    /// outside the FIX family passed to [`FixCodec::with_begin_string`]).
+    /// There is nothing to compare the shape with, and a resync can never land
+    /// inside a buffer, so a start after a plausible boundary is framed as it
+    /// is: a read boundary is the only frame start such a codec can find.
     #[cold]
     fn judge_resync_start(&mut self, src: &mut BytesMut) -> SpanVerdict {
-        match self.resync_state {
-            ResyncState::Settled => SpanVerdict::Proceed,
-            ResyncState::EmptiedAfter(prev) => {
-                if src.is_empty() {
-                    return SpanVerdict::NeedMore;
-                }
-                if boundary_before(Some(prev)) {
+        let after_boundary = match self.resync_state {
+            ResyncState::Settled => return SpanVerdict::Proceed,
+            ResyncState::EmptiedAfter(prev) => boundary_before(Some(prev)),
+            ResyncState::PartialOpening => true,
+        };
+        if src.is_empty() {
+            return SpanVerdict::NeedMore;
+        }
+        if after_boundary {
+            let anchors = self.recovery_anchors;
+            let shape = if anchors.is_empty() {
+                AnchorShape::Complete
+            } else {
+                anchor_shape(src.as_ref(), anchors)
+            };
+            match shape {
+                AnchorShape::Complete => {
                     self.resync_state = ResyncState::Settled;
                     return SpanVerdict::Proceed;
                 }
-                self.resync(src);
-                SpanVerdict::Resynced
-            }
-            ResyncState::PartialOpening => {
-                match anchor_shape(src.as_ref(), self.recovery_anchors) {
-                    AnchorShape::Partial => SpanVerdict::NeedMore,
-                    AnchorShape::Complete => {
-                        self.resync_state = ResyncState::Settled;
-                        SpanVerdict::Proceed
-                    }
-                    AnchorShape::Rejected => {
-                        self.resync(src);
-                        SpanVerdict::Resynced
-                    }
-                }
+                AnchorShape::Partial => return SpanVerdict::NeedMore,
+                AnchorShape::Rejected => {}
             }
         }
+        self.resync(src);
+        SpanVerdict::Resynced
     }
 
     /// Decides what a header-phase miss means for a buffer of `src_len` bytes.
@@ -2270,6 +2283,259 @@ mod tests {
         let frames = deliver(recovering(), &garbled_around(&other));
         let got: Vec<&[u8]> = frames.iter().map(|frame| &frame[..]).collect();
         assert_eq!(got, vec![&other[..], &good[..]], "unrestricted");
+    }
+
+    /// What a codec made of a sequence of reads: the frames it handed up, the
+    /// garbled frames it counted, and the bytes it left buffered.
+    type Outcome = (Vec<Vec<u8>>, u64, Vec<u8>);
+
+    /// Feeds `reads` to `codec` one read at a time, draining after each, as
+    /// `Framed` does, and reports the [`Outcome`]. Fails the test if the codec
+    /// returns an error: recovery must skip every garbled frame here.
+    fn feed(mut codec: FixCodec, reads: &[&[u8]]) -> Outcome {
+        let mut buf = BytesMut::new();
+        let mut frames = Vec::new();
+        for read in reads {
+            buf.extend_from_slice(read);
+            if let Some(error) = drain(&mut codec, &mut buf, &mut frames) {
+                panic!("recovery must not return an error, got {error:?}");
+            }
+        }
+        let frames = frames.iter().map(|frame| frame.to_vec()).collect();
+        (frames, codec.take_garbled_count(), buf.to_vec())
+    }
+
+    #[test]
+    fn test_recovery_foreign_frame_after_a_split_at_a_plausible_boundary_is_not_delivered() {
+        // Issue #116. Restricted to FIX.4.4. The first read ends inside a
+        // garbled frame right after a byte that IS a plausible boundary (a
+        // space, an SOH, a `|`), and the resync through it empties the
+        // buffer. The next read starts with a checksum-valid FIX.4.2 frame.
+        // In one read the resync rejects that opening (not the session's
+        // version); split across reads it must be rejected too, never framed
+        // by the ordinary path and handed up as a phantom.
+        let foreign = make_message_with("FIX.4.2", "35=0\x0134=2\x0149=VENUE\x0156=CLIENT\x01");
+        let good = make_fix_message("35=1\x0149=A\x01112=PING\x01");
+        let session = || recovering().with_begin_string("FIX.4.4");
+
+        for first_read in [
+            &b"8=FIX.4.4\x01not-nine=1\x0196= "[..],
+            b"8=FIX.4.4\x01not-nine=1\x0196=\x01",
+            b"8=FIX.4.4\x01not-nine=1\x0196=|",
+        ] {
+            let context = String::from_utf8_lossy(first_read);
+
+            // The exact probe from the review: nothing after the foreign frame.
+            let split = feed(session(), &[first_read, &foreign]);
+            let whole = feed(session(), &[&[first_read, &foreign[..]].concat()]);
+            assert!(
+                split.0.is_empty(),
+                "{context}: two reads delivered {split:?}"
+            );
+            assert_eq!(split, whole, "{context}: two reads differ from one");
+            assert_eq!(whole, (Vec::new(), 1, Vec::new()), "{context}: one read");
+
+            // The stream goes on: the session's next frame is still delivered,
+            // and the garbled span counts once however it was split.
+            let rest = [&foreign[..], &good[..]].concat();
+            let split = feed(session(), &[first_read, &rest]);
+            let whole = feed(session(), &[&[first_read, &rest[..]].concat()]);
+            assert_eq!(split, whole, "{context}: two reads differ from one");
+            assert_eq!(whole, (vec![good.clone()], 1, Vec::new()), "{context}");
+        }
+    }
+
+    #[test]
+    fn test_recovery_every_split_point_matches_the_single_read_result() {
+        // Issue #116, as a property: the outcome of a resync never depends on
+        // where TCP splits the bytes. A garbled outer frame carries a complete,
+        // checksum-valid frame in a data field, then a valid frame follows.
+        // For every combination below, the bytes are delivered in one read, in
+        // two reads split at every offset, and one byte per read; the frames
+        // handed up, the garbled count and the bytes left over must agree.
+        //
+        // The single-read result itself is pinned to the documented rule: an
+        // embedded opening after `=` (the very start of the value) is never a
+        // candidate; after any other byte it is, but only for a BeginString
+        // the codec accepts. Restricted to FIX.4.4, an embedded FIX.4.2 frame
+        // is therefore never delivered, and an embedded FIX.4.4 frame after a
+        // plausible boundary is (the residual risk ADR-0004 documents).
+        let foreign = make_message_with("FIX.4.2", "35=0\x0134=2\x0149=VENUE\x0156=CLIENT\x01");
+        let same = make_fix_message("35=0\x0134=99\x0149=X\x0156=Y\x01");
+        let good = make_fix_message("35=1\x0149=A\x01112=PING\x01");
+        // Two ways a frame is garbled before its data field: no BodyLength
+        // (resynchronised as soon as the header is seen), and a BodyLength
+        // that does not reach the trailer (resynchronised once its span is in).
+        let openings: [&[u8]; 2] = [
+            b"8=FIX.4.4\x01not-nine=1\x0196=",
+            b"8=FIX.4.4\x019=5\x0135=D\x01212=60\x01213=",
+        ];
+        // What the data field value holds before the embedded frame. Empty is
+        // the very start of the value, after `=`.
+        let separators: [&[u8]; 5] = [b"", b" ", b"\x01", b"|", b"MSG: "];
+
+        let mut checked = 0usize;
+        for restricted in [true, false] {
+            let codec = || {
+                if restricted {
+                    recovering().with_begin_string("FIX.4.4")
+                } else {
+                    recovering()
+                }
+            };
+            for (inner, accepted) in [(&foreign, !restricted), (&same, true)] {
+                for opening in openings {
+                    for separator in separators {
+                        let stream =
+                            [opening, separator, &inner[..], b"\x0110=000\x01", &good[..]].concat();
+                        let context = format!(
+                            "restricted={restricted} {:?}",
+                            String::from_utf8_lossy(&stream)
+                        );
+
+                        let whole = feed(codec(), &[&stream]);
+                        let delivered = accepted && !separator.is_empty();
+                        let expected = if delivered {
+                            (vec![inner.clone(), good.clone()], 2, Vec::new())
+                        } else {
+                            (vec![good.clone()], 1, Vec::new())
+                        };
+                        assert_eq!(whole, expected, "{context}: one read");
+
+                        for split in 0..=stream.len() {
+                            let (Some(head), Some(tail)) =
+                                (stream.get(..split), stream.get(split..))
+                            else {
+                                panic!("split {split} is inside the stream");
+                            };
+                            let parts = feed(codec(), &[head, tail]);
+                            assert_eq!(parts, whole, "{context}: split at {split}");
+                            checked += 1;
+                        }
+
+                        let bytes: Vec<&[u8]> = stream.chunks(1).collect();
+                        assert_eq!(feed(codec(), &bytes), whole, "{context}: one byte per read");
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "the sweep must cover every split point");
+    }
+
+    #[test]
+    fn test_recovery_seeded_noise_every_split_point_matches_the_single_read_result() {
+        // The same property over deterministic noise (xorshift, fixed seed)
+        // dense in the bytes the framer and the resync judge (`8`, `=`, SOH,
+        // digits, a space, a `|`), interleaved with frames of the session's
+        // version, of another version, and with a wrong checksum.
+        let good = make_fix_message("35=0\x0149=A\x0156=B\x01");
+        let foreign = make_message_with("FIX.4.2", "35=0\x0149=X\x0156=Y\x01");
+        let bad = make_bad_checksum_message("35=0\x0149=Z\x01");
+        let alphabet: &[u8] = b"8=FIX.4\x019\x0110=35 2|";
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let mut stream = Vec::new();
+        for _ in 0..24 {
+            for _ in 0..next() % 24 {
+                let pick = usize::try_from(next() % 18).unwrap_or(0);
+                stream.push(alphabet.get(pick).copied().unwrap_or(b'X'));
+            }
+            let frame = match next() % 3 {
+                0 => &good,
+                1 => &foreign,
+                _ => &bad,
+            };
+            stream.extend_from_slice(frame);
+        }
+
+        for restricted in [true, false] {
+            let codec = || {
+                if restricted {
+                    recovering().with_begin_string("FIX.4.4")
+                } else {
+                    recovering()
+                }
+                .with_max_message_size(4096)
+            };
+            let whole = feed(codec(), &[&stream]);
+            assert!(
+                whole.0.len() >= 4 && whole.1 >= 4,
+                "restricted={restricted}: the seed must leave frames and skips to compare"
+            );
+            assert!(
+                whole
+                    .0
+                    .iter()
+                    .all(|frame| *frame == good || (!restricted && *frame == foreign)),
+                "restricted={restricted}: only real frames are handed up"
+            );
+            for split in 0..=stream.len() {
+                let (Some(head), Some(tail)) = (stream.get(..split), stream.get(split..)) else {
+                    panic!("split {split} is inside the stream");
+                };
+                let parts = feed(codec(), &[head, tail]);
+                assert_eq!(parts, whole, "restricted={restricted}: split at {split}");
+            }
+            let bytes: Vec<&[u8]> = stream.chunks(1).collect();
+            assert_eq!(
+                feed(codec(), &bytes),
+                whole,
+                "restricted={restricted}: one byte per read"
+            );
+        }
+    }
+
+    #[test]
+    fn test_recovery_garbage_at_the_start_of_the_next_read_is_the_same_span() {
+        // After a resync empties the buffer, a read that does not open with
+        // an accepted header continues the garbled span: it is resynchronised
+        // past without being counted again, exactly as in one read. A partial
+        // opening at its start waits for the bytes that settle it.
+        let good = make_fix_message("35=1\x0149=A\x01112=PING\x01");
+        let session = || recovering().with_begin_string("FIX.4.4");
+        let garbage: &[u8] = b"garbage that ends on a delimiter\x01";
+        let more: &[u8] = b"and more garbage, then ";
+
+        let split = feed(session(), &[garbage, more, &good]);
+        let whole = feed(session(), &[&[garbage, more, &good[..]].concat()]);
+        assert_eq!(split, whole);
+        assert_eq!(whole, (vec![good.clone()], 1, Vec::new()));
+
+        let mut codec = session();
+        let mut buf = BytesMut::from(garbage);
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        assert!(buf.is_empty());
+        buf.extend_from_slice(b"8=FIX.4.");
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        assert_eq!(&buf[..], b"8=FIX.4.", "a partial opening is kept");
+        buf.extend_from_slice(b"2\x019=5\x0135=0\x0110=000\x01");
+        buf.extend_from_slice(&good);
+        assert_eq!(&decode_frame(&mut codec, &mut buf)[..], &good[..]);
+        assert!(buf.is_empty());
+        assert_eq!(codec.take_garbled_count(), 1, "one garbled span");
+    }
+
+    #[test]
+    fn test_recovery_without_an_anchor_frames_the_next_read_after_a_plausible_boundary() {
+        // The one configuration the read-start judgement cannot apply to: a
+        // codec restricted to a BeginString outside the FIX family has no
+        // anchor to compare with, so a resync never lands inside a buffer and
+        // a read that starts after a plausible boundary is framed as it is.
+        // Pinned as documented on `with_begin_string`.
+        let good = make_fix_message("35=0\x0149=A\x01");
+        let mut codec = recovering().with_begin_string("NOT.FIX");
+        let mut buf = BytesMut::from(&b"garbage that ends on a delimiter\x01"[..]);
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        assert!(buf.is_empty());
+        buf.extend_from_slice(&good);
+        assert_eq!(&decode_frame(&mut codec, &mut buf)[..], &good[..]);
+        assert_eq!(codec.take_garbled_count(), 1);
     }
 
     #[test]

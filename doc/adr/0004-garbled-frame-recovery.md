@@ -119,13 +119,24 @@ So in recovery mode a candidate is accepted only when both hold:
   tag (`448=FIX…`) and an opening at the very start of a field value
   (`96=8=FIX…`, `213=8=FIX…`), and nothing else.
 
-The boundary is judged across reads too. When a resync empties the buffer, the
-codec remembers the last byte it discarded; if the next read opens an accepted
-header at offset 0 and that byte fails the boundary rule (a resync that
-stopped right after `96=`), the opening belongs to the same garbled span and is
-resynchronised past without being counted again. Without this, the embedded
-frame would reach offset 0, where the current buffer alone shows nothing before
-it.
+Both checks are judged across reads too, so the outcome never depends on where
+TCP splits the bytes (issue #116). The resync scan only sees the current
+buffer, and offset 0 of the next read is never one of its candidates. Left to
+ordinary framing, whatever opens there would be framed, an embedded frame of
+another version included, where the same bytes in one read would have been
+resynchronised past. So when a resync empties the buffer, the codec remembers
+the last byte it discarded, and when it stops on a partial opening at the end
+of the buffer, it remembers that too. The start of the next read is then judged
+exactly as the scan judges a candidate: the byte before it must pass the
+boundary rule (a resync that stopped right after `96=` fails it), and the bytes
+must open an accepted header; a partial opening waits for the bytes that
+settle it. A start that fails either check belongs to the same garbled span and
+is resynchronised past without being counted again, so the skip count does not
+depend on the split either. A codec with no anchor at all (`with_begin_string`
+given a BeginString outside the FIX family) has nothing to compare a read's
+start with, and frames one that follows a plausible boundary as it is. That
+fallback is the one configuration where the split matters; neither engine
+builds one.
 
 The shape is checked inside the resync scan before a candidate is returned, so
 a false start costs about a dozen byte comparisons and is not counted as a
@@ -141,11 +152,13 @@ resync through it, a data-field value that contains a complete header opening
 of the session's own BeginString preceded by any byte other than an ASCII
 digit or `=` (a `|`, a space, `MSG:`, `<![CDATA[`, an SOH) is a candidate, and
 a well-formed frame there is handed up. Only an opening at the very start of
-the value or after a digit is excluded. A codec test pins this behaviour. A
-frame whose opening follows an ASCII digit or `=` (for example after garbage
-that ends in a digit) is passed over by design, and its gap is recovered by
-`ResendRequest`. A stream whose BeginString is not accepted still frames, but a
-resync does not land on it.
+the value or after a digit is excluded. The verdict is the same however the
+bytes are split across reads, and codec tests pin it both in one read and at
+every split point. A frame whose opening follows an ASCII digit or `=` (for
+example after garbage that ends in a digit) is passed over by design, and its
+gap is recovered by `ResendRequest`. A stream whose BeginString is not accepted
+still frames while it stays aligned, but a resync does not land on it, in the
+same read or at the start of the next.
 
 ### Known limits
 
