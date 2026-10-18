@@ -1,9 +1,7 @@
-# ADR-0006 — A message store on the Acceptor, touched only after authentication
+# ADR-0017 — A message store on the Acceptor, and who a refused Logon is answered for
 
-- **Status:** Proposed (issue #60). The store attachment, the shared seeding
-  and the authentication-first rule follow the plan the owner approved; the
-  "no reply to an unauthenticated Logon when a store is attached" rule is new
-  here and awaits review.
+- **Status:** Accepted (issue #60, in the plan the owner approved; the refusal
+  policy and the reset rule as revised in the #60 review)
 - **Date:** 2026-10-18
 
 ## Context
@@ -16,16 +14,21 @@ messages with `PossDupFlag` and `OrigSendingTime` from its outbound journal.
 The initiator already had all of this, with the write order and failure policy
 of ADR-0005.
 
-Two things are specific to the acceptor:
+Three things are specific to the acceptor:
 
 - **The peer is not known when the Logon arrives.** The initiator dials a
   counterparty it chose; the acceptor answers whoever connects. A Logon with
   `ResetSeqNumFlag` (141) = Y resets the outbound journal, so the moment the
-  acceptor touches its store decides whether an unauthenticated peer can wipe
-  it.
-- **Refusals before authentication.** The acceptor answers a refused Logon
-  with a Reject and/or a Logout. With a store, a frame has to be filed under a
-  number before it is written (ADR-0005).
+  acceptor touches its store decides whether an unknown or unauthenticated
+  peer can wipe it.
+- **Refusals.** The acceptor answers a refused Logon with a Reject and/or a
+  Logout. With a store, a frame has to be filed under a number before it is
+  written (ADR-0005), and a number sent without being filed may reuse, with
+  different content, one the session's stream already holds, which #89
+  forbids in every scenario.
+- **A reset the acceptor drives.** With `reset_on_logon`, or a reset owed by an
+  earlier session, the acceptor resets although the peer's Logon may be
+  numbered N > 1 without 141.
 
 ## Decision
 
@@ -33,58 +36,88 @@ Two things are specific to the acceptor:
 
 `Acceptor::with_store`, `with_store_failure_policy`, `with_store_timeout`,
 `with_write_timeout` and `with_app_queue_capacity` mirror the initiator's
-knobs, and `EngineBuilder::with_store` attaches a store in both terminal
-methods. Every frame the acceptor sends once the Logon is authenticated (a
-refusing Logout, the acknowledgement) goes through the shared outbound step of
-ADR-0005; the Logon's number is persisted before the session goes Active; the
-reactor, which both roles share, does the rest unchanged.
+settings, and `EngineBuilder::with_store` attaches a store in both terminal
+methods. Both engines hold the store settings in one `persistence::StoreAttachment`
+(store, policy, call timeout, owed-reset record), so they cannot drift. Every
+frame the acceptor sends to its counterparty goes through the shared outbound
+step of ADR-0005; the Logon's number is persisted before the session goes
+Active; the reactor, which both roles share, does the rest unchanged.
+
+A store belongs to exactly one engine instance: two engines or processes
+writing to one store would interleave two sequence streams. The owed-reset
+record lives in memory in the engine (#78, #89).
 
 ### One seeding helper for both roles
 
 `persistence::seed_session` decides a session's counters for either role, by
 priority: a reset (store reset to 1/1 with one `reset_to` call), an explicit
-initial seed (checked against the store under `CloseSession`), the store's
-refreshed counters, or 1/1. Each role decides only whether the session resets:
-the initiator for `reset_on_logon` or an owed reset; the acceptor for an
-inbound `141=Y`, `reset_on_logon`, or an owed reset. Every reset and refresh
-fails closed whatever the policy.
+initial seed (a zero seed is refused with `EngineError::InvalidInitialSequence`
+in both roles, and under `CloseSession` a sender seed below the store's next
+sender number is refused), the store's refreshed counters, or 1/1. Each role
+decides only whether the session resets: the initiator for `reset_on_logon` or
+an owed reset; the acceptor for an inbound `141=Y`, `reset_on_logon`, or an
+owed reset. Every reset and refresh fails closed whatever the policy.
 
-### The store is touched only after authentication
+### The order of the acceptor's checks
 
-The acceptor checks, in order, the version, the encryption method, identity,
-admission (one live session), `SendingTime`, and `from_admin`, then that a
-`141=Y` Logon carries `MsgSeqNum` 1. Only then does it seed from the store,
-resetting it if the session resets. So a Logon that fails any of those checks,
-`141=Y` or not, can neither clear the journal nor write to it, and a refresh
-cannot be triggered by an unauthenticated peer.
+Version, encryption method, `MsgSeqNum` placement, identity, admission (one
+live session), `SendingTime`, `from_admin`, `141=Y` carrying `MsgSeqNum` 1,
+`HeartBtInt`; then the store is reset (if the session resets) or refreshed;
+then `MsgSeqNum` is validated and the acknowledgement sent. Only a Logon that
+passes every check can reset the store.
 
-### No reply to an unauthenticated Logon when a store is attached
+### Who a refused Logon is answered for
 
-A refusal frame sent before authentication would either be filed, letting an
-unauthenticated peer write to the journal and move its counters (and, for a
-duplicate Logon, race the writes of the live session that owns the store), or
-be numbered without being filed, reusing with different content a number the
-session's stream already holds, which #89 forbids in every scenario. With a
-store attached the acceptor therefore closes the connection without a Reject or
-Logout at that stage, logs the reason, and returns the typed error. Without a
-store nothing changes: those refusals are sent as before, numbered from the
-seed or 1. Refusals after authentication (an invalid `HeartBtInt`, a
-`MsgSeqNum` too low) are filed like any other frame.
+1. **An unknown peer** (version, encryption, missing `MsgSeqNum`, CompIDs). It
+   is not known to be the counterparty. With a store attached it gets no reply:
+   a frame could neither be filed (that would let it write to the journal and
+   move the counters) nor numbered without reusing a number of the stream.
+   Without a store the Reject and/or Logout are sent as before, numbered from
+   the seed or 1, except for a missing `MsgSeqNum`, which never had a reply.
+2. **A duplicate Logon** for a session already live. It gets no reply with or
+   without a store: the live session owns the sequence stream, and nothing the
+   newcomer could be sent belongs to it. This changes the store-less behaviour,
+   which used to send a Logout (FIX session test case 1S(b)).
+3. **The configured counterparty, holding the admission slot**, refused by the
+   `SendingTime` check (Reject 373 = 10, then Logout), by `from_admin` (Logout
+   with its text), by a `141=Y` Logon not numbered 1, or by its `HeartBtInt`.
+   It gets the Reject and Logout, so it learns why, sent like every session
+   frame: numbered from a seed that never resets (the store's refreshed
+   counters, or the configured seed) and filed when a store is attached. A
+   `MsgSeqNum` below the expected one is refused the same way from the
+   session's own seed. None of these refusals resets the store.
+
+### The reset rule both roles share
+
+In a Logon exchange that resets the sequence, each side's Logon or
+acknowledgement is message 1 of its new stream: its next sender number is 2,
+and the next number it expects from the other side is 2.
+
+- The acceptor, after a reset of any origin, acks at 1 with `141=Y` and takes
+  the peer's Logon as its message 1 whatever `MsgSeqNum` it carries. A peer that
+  did not ask for the reset is told to make it by the ack, and no gap (and no
+  `ResendRequest`) is opened for the numbers of its old stream.
+- The initiator, after a reset it declared, takes the acknowledgement as the
+  acceptor's message 1 whatever its `MsgSeqNum`; an ack that declares `141=Y`
+  itself must carry 1. After a reset the acceptor declares on the ack, the
+  initiator sets its next sender number to 2, treating its Logon as message 1.
 
 ### Owed resets and admission
 
 The acceptor keeps the same owed-reset record as the initiator (ADR-0005): a
-failed close-time reset, or a failed reset for a `141=Y` Logon, is owed to the
-next authenticated Logon, whose acknowledgement then declares `141=Y` at 1;
-the record clears once that acknowledgement is sent. The admission slot is
-released only after a session's close path, its store writes included, has
-run, so two sessions of one acceptor never write to the store at once.
+failed close-time reset, or a failed reset for a session that resets, is owed
+to the next accepted Logon, whose acknowledgement then declares `141=Y` at 1;
+the record clears once that acknowledgement is sent. The admission slot is held
+until a session's task ends: past its close-time store writes, the drain of its
+application queue (up to 5 s) and `on_logout`. So two sessions never write to
+the store at once, and a Logon that arrives while the previous session is still
+closing is refused as a duplicate, without a reply.
 
 ### Configuration check
 
-`Acceptor::new` validates the configuration and `serve` refuses an unusable one
-with `EngineError::Config` before the handshake, as `Initiator::connect` does
-before dialling.
+`Acceptor::new` validates the configuration. `accept` and `serve` check it, and
+the FIX version, before anything else: `accept` before it takes a connection
+off the listener, as `Initiator::connect` does before dialling.
 
 ## Consequences
 
@@ -95,19 +128,25 @@ before dialling.
   on `Acceptor` and `EngineBuilder` is replaced by hand-written ones, which
   drop the `A: Debug` bound.
 - **Semver (breaking, auto traits):** `Acceptor` and `EngineBuilder` now hold
-  an `Option<Arc<dyn MessageStore>>`, so they are no longer `UnwindSafe` or
+  an optional `Arc<dyn MessageStore>`, so they are no longer `UnwindSafe` or
   `RefUnwindSafe`; `cargo-semver-checks` reports `auto_trait_impl_removed` on
   both. `Initiator` already held one and already lacked both traits, so the
   two engines now agree. The alternative, wrapping the store in
   `AssertUnwindSafe`, would assert for every store implementation something
   the engine cannot vouch for (`MemoryStore`'s lock does not poison), so it was
   not taken.
-- **Behaviour without a store:** unchanged, except that an acceptor built with
-  an unusable configuration now refuses to serve (`EngineError::Config`)
-  instead of running a handshake whose messages that configuration corrupts.
-- **Behaviour with a store:** an unauthenticated Logon gets no reply. A
-  misconfigured counterparty sees the connection close; the reason is in the
-  acceptor's log and in the error `serve` returns.
+- **Behaviour changes, with or without a store:** a duplicate Logon gets no
+  reply; an acceptor with an unusable configuration refuses to serve, and
+  `accept` refuses before taking a connection; a zero initial seed that would
+  be used is refused instead of raised to 1; the counterparty refused by
+  `SendingTime` or `from_admin` gets frames numbered from the session's
+  counters (the store's, or the seed) rather than provisional ones; and after
+  a reset the acceptor drives, a peer Logon numbered N > 1 no longer draws a
+  `ResendRequest`. The initiator, after a reset it declared, no longer opens
+  a gap for an ack that does not echo the reset.
+- **Behaviour with a store:** an unknown peer gets no reply. A misconfigured
+  counterparty sees the connection close; the reason is in the acceptor's log
+  and in the error `serve` returns.
 - The crate DAG is unchanged. The decisions are synchronous and read no clock
   (ADR-0002); only the store calls are async, bounded by the store timeout.
 - No performance claim (ADR-0001).
