@@ -117,11 +117,13 @@ exists yet.
   `Dictionary` (a golden sample and the full FIX 4.2 and FIXT 1.1 outputs are
   compile-tested in `ironfix-codegen/tests/`). Opt-in,
   `CodeGenerator::generate_views` emits borrowed message views with typed
-  accessors (`rust_decimal::Decimal` for prices and quantities), an
-  enumeration per field with declared values (an undeclared value reads as
-  `Other`), `const` group layouts for the group reader, and writers that send
-  a body, groups in dictionary order, to a `FnMut(u32, &[u8])` closure or a
-  generated `Sink`. The output carries no `#[allow]`; its golden files (a
+  accessors (`rust_decimal::Decimal` for prices and quantities, each value
+  checked against the validator's grammar), an enumeration per field with
+  declared values (an undeclared value reads as `Other`), `const` group
+  layouts for the group reader, and writers that check every value and send a
+  body, groups in dictionary order, to a generated `Sink` (any
+  `FnMut(u32, &[u8])` closure, or the tag=value `Encoder` through a
+  LENGTH/DATA-aware impl). The output carries no `#[allow]`; its golden files (a
   sample, FIXT 1.1, and FIX 4.4 Heartbeat, Logon and NewOrderSingle) are
   compiled and exercised against real frames in
   `ironfix-codegen/tests/generated_views.rs`; the full FIX 4.4, 4.2 and
