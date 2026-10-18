@@ -1076,6 +1076,57 @@ async fn test_registry_failed_authentication_evicts_lookup_sessions() {
     assert!(stores.iter().all(|store| Arc::strong_count(store) == 2));
 }
 
+/// Concurrent failed handshakes for one lookup-admitted session, ending on
+/// different worker threads, never leave it behind: each round's four Logons
+/// are looked up together (a barrier holds every lookup until all four are in
+/// flight), so all four connections claim one provisional session, then all
+/// fail before authentication and release their claims concurrently. With a
+/// cap of one lookup-admitted session, a session leaked by any round would
+/// make every later round's admission fail with `SessionLimit`.
+///
+/// This checks that claims stay balanced end to end; it cannot force the
+/// one interleaving a reference count got wrong (a release landing between
+/// another release and that guard's drop). That interleaving is pinned
+/// deterministically by the registry's unit test
+/// `test_release_evicts_when_the_last_claim_goes_whatever_references_remain`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_registry_concurrent_failed_handshakes_never_leak_a_session() {
+    const ROUNDS: usize = 25;
+    const CONCURRENT: usize = 4;
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    venue_app.refuse_logons.store(true, Ordering::SeqCst);
+    let directory = Arc::new(Directory {
+        barrier: Some(Barrier::new(CONCURRENT)),
+        ..Directory::admitting(&venue_app)
+    });
+    let registry = Arc::new(looked_up(&directory).with_max_sessions(1));
+    let mut served = serve_connections(&registry, listener, ROUNDS * CONCURRENT);
+
+    for round in 0..ROUNDS {
+        let identity = format!("RACE_{round}");
+        let mut peers = Vec::with_capacity(CONCURRENT);
+        for _ in 0..CONCURRENT {
+            let mut peer = connect_peer(addr).await;
+            ok(peer.send(logon(&identity, "VENUE")).await, "a peer logs on");
+            peers.push(peer);
+        }
+        for _ in 0..CONCURRENT {
+            // `serve` returns only once the connection's claim is released.
+            match next_result(&mut served).await {
+                Err(EngineError::LogonRejected { .. }) => {}
+                other => panic!("round {round}: expected a refused Logon, got {other:?}"),
+            }
+        }
+        assert!(
+            registry.session_ids().is_empty(),
+            "round {round} left {:?}",
+            registry.session_ids()
+        );
+    }
+    assert_eq!(directory.asked().len(), ROUNDS * CONCURRENT);
+}
+
 /// A Logon refused after `from_admin` accepted it (here for its HeartBtInt)
 /// confirms the lookup-admitted session: the peer was authenticated, so the
 /// session stays and the lookup is not asked about it again.

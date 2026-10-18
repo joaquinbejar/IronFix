@@ -550,8 +550,8 @@ enum RouteState {
     /// registry's lifetime.
     Registered,
     /// Admitted by the lookup, and no handshake has got past `from_admin`
-    /// yet: evicted when a handshake ends before that while no other
-    /// connection is routed to it.
+    /// yet: evicted when the last claim on it is released while it is still
+    /// in this state.
     Provisional,
     /// Admitted by the lookup, and a handshake got past `from_admin`: kept
     /// for the registry's lifetime.
@@ -568,6 +568,12 @@ struct Route<A: Application> {
     acceptor: Arc<Acceptor<A>>,
     /// Whether the route is kept or still provisional.
     state: RouteState,
+    /// Connections routed to the session while it was provisional whose
+    /// handshake has not ended yet: one [`ProvisionalClaim`] each. Read and
+    /// written only under the write lock, so a release and a new claim never
+    /// interleave; a reference count would not do, because a releasing claim
+    /// still holds its reference while it decides.
+    claims: usize,
 }
 
 /// Every session in the registry, and how many the lookup admitted.
@@ -607,30 +613,69 @@ enum Origin {
 }
 
 /// The session a Logon was routed to.
-struct Routed<A: Application> {
-    /// The session's acceptor.
-    acceptor: Arc<Acceptor<A>>,
-    /// Whether the session was provisional when the Logon was routed, so the
-    /// end of this handshake has to settle it.
-    provisional: bool,
+enum Routed<'r, A: Application + 'static> {
+    /// A registered or confirmed session: kept whatever this handshake does.
+    Kept(Arc<Acceptor<A>>),
+    /// A provisional session, with this connection's claim on it.
+    Provisional(ProvisionalClaim<'r, A>),
 }
 
-/// A connection's claim on a provisional, lookup-admitted session, settled
-/// when it drops: when the handshake ends, however it ends, a `serve` future
-/// dropped mid-handshake included.
-struct ProvisionalAdmission<'r, A: Application + 'static> {
+impl<A: Application + 'static> Routed<'_, A> {
+    /// The routed session's acceptor.
+    fn acceptor(&self) -> &Arc<Acceptor<A>> {
+        match self {
+            Self::Kept(acceptor) => acceptor,
+            Self::Provisional(claim) => &claim.acceptor,
+        }
+    }
+
+    /// Whether this connection holds a claim on a provisional session.
+    const fn is_provisional(&self) -> bool {
+        matches!(self, Self::Provisional(_))
+    }
+}
+
+/// A connection's claim on a provisional, lookup-admitted session.
+///
+/// Taken under the write lock by the step that routed the Logon (the lookup
+/// admission, a raced admission, or a later Logon finding the session), and
+/// released exactly once when it drops: when the handshake ends, however it
+/// ends, a `serve` future dropped mid-handshake included.
+struct ProvisionalClaim<'r, A: Application + 'static> {
     /// The registry that holds the session.
     registry: &'r AcceptorRegistry<A>,
-    /// The session's acceptor; this connection's reference to it.
+    /// The session's acceptor.
     acceptor: Arc<Acceptor<A>>,
     /// Set by the handshake once `from_admin` has accepted the Logon.
     authenticated: AtomicBool,
+    /// Whether the claim has been released, so a second release is a no-op.
+    released: bool,
 }
 
-impl<A: Application + 'static> Drop for ProvisionalAdmission<'_, A> {
-    fn drop(&mut self) {
+impl<'r, A: Application + 'static> ProvisionalClaim<'r, A> {
+    /// A claim the caller has just counted on the session's route.
+    const fn new(registry: &'r AcceptorRegistry<A>, acceptor: Arc<Acceptor<A>>) -> Self {
+        Self {
+            registry,
+            acceptor,
+            authenticated: AtomicBool::new(false),
+            released: false,
+        }
+    }
+
+    /// Releases the claim, once: later calls do nothing.
+    fn release(&mut self) {
+        if std::mem::replace(&mut self.released, true) {
+            return;
+        }
         self.registry
-            .settle(&self.acceptor, self.authenticated.load(Ordering::Acquire));
+            .release(&self.acceptor, self.authenticated.load(Ordering::Acquire));
+    }
+}
+
+impl<A: Application + 'static> Drop for ProvisionalClaim<'_, A> {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -754,9 +799,10 @@ pub struct AcceptorRegistry<A: Application = NoOpApplication> {
     /// Every session in the registry.
     ///
     /// A `std::sync::RwLock`, not `tokio::sync` or `DashMap`: every critical
-    /// section is synchronous and short (a lookup, a push, a retain), no guard
-    /// is ever held across an `.await`, and `register`, `Debug` and the drop
-    /// of a provisional admission need the lock outside any async context.
+    /// section is synchronous and short (a lookup, a push, a retain, a claim
+    /// counted), no guard is ever held across an `.await`, and `register`,
+    /// `Debug` and the drop of a [`ProvisionalClaim`] need the lock outside
+    /// any async context.
     routes: RwLock<RouteTable<A>>,
     /// Resolves an identity no session in the registry matches.
     lookup: Option<Arc<dyn SessionLookup<A>>>,
@@ -914,8 +960,7 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     pub fn register(&self, acceptor: Acceptor<A>) -> Result<(), EngineError> {
         acceptor.preflight()?;
         let pattern = RoutePattern::for_session(acceptor.config());
-        self.insert(pattern, acceptor, Origin::Registered)
-            .map(|_| ())
+        self.insert(pattern, acceptor, Origin::Registered).map(drop)
     }
 
     /// Returns the identifiers of every session in the registry, provisional
@@ -1008,26 +1053,19 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
             HandshakeRead::Codec(err) => return Err(err.into()),
         };
 
-        let Routed {
-            acceptor,
-            provisional,
-        } = self.route(&logon_frame, deadline).await?;
-        if !provisional {
-            return acceptor.serve_logon(framed, logon_frame, None).await;
+        match self.route(&logon_frame, deadline).await? {
+            Routed::Kept(acceptor) => acceptor.serve_logon(framed, logon_frame, None).await,
+            // A lookup-admitted session not yet authenticated: whatever ends
+            // this handshake, the claim is released when this arm ends (the
+            // session kept once `from_admin` accepted a Logon for it, evicted
+            // with the last claim otherwise).
+            Routed::Provisional(claim) => {
+                claim
+                    .acceptor
+                    .serve_logon(framed, logon_frame, Some(&claim.authenticated))
+                    .await
+            }
         }
-        // A lookup-admitted session not yet authenticated: whatever ends this
-        // handshake, dropping the claim settles the session (kept once
-        // `from_admin` accepted, evicted otherwise if no other connection is
-        // routed to it).
-        let admission = ProvisionalAdmission {
-            registry: self,
-            acceptor,
-            authenticated: AtomicBool::new(false),
-        };
-        admission
-            .acceptor
-            .serve_logon(framed, logon_frame, Some(&admission.authenticated))
-            .await
     }
 
     /// Resolves the session a Logon frame is routed to: one in the registry,
@@ -1035,7 +1073,7 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     ///
     /// # Errors
     /// The routing refusals [`AcceptorRegistry::serve`] documents.
-    async fn route(&self, frame: &[u8], deadline: Instant) -> Result<Routed<A>, EngineError> {
+    async fn route(&self, frame: &[u8], deadline: Instant) -> Result<Routed<'_, A>, EngineError> {
         let identity = {
             // Decoded once already by the read, which skips what does not
             // decode; the error is kept typed rather than unwrapped.
@@ -1119,7 +1157,7 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
         &self,
         identity: &LogonIdentity,
         acceptor: Acceptor<A>,
-    ) -> Result<Routed<A>, EngineError> {
+    ) -> Result<Routed<'_, A>, EngineError> {
         let pattern = RoutePattern::for_session(acceptor.config());
         if !pattern.admits(identity) {
             return Err(EngineError::Configuration(format!(
@@ -1131,29 +1169,50 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
         acceptor.preflight()?;
         let routed = self.insert(pattern, acceptor, Origin::Lookup)?;
         tracing::debug!(
-            session = %routed.acceptor.session_id(),
-            provisional = routed.provisional,
+            session = %routed.acceptor().session_id(),
+            provisional = routed.is_provisional(),
             "session admitted by the session lookup"
         );
         Ok(routed)
     }
 
     /// The session in the registry a Logon claiming `identity` is routed to.
-    fn find(&self, identity: &LogonIdentity) -> Option<Routed<A>> {
+    ///
+    /// A registered or confirmed session is found under the read lock. A
+    /// provisional one is claimed under the write lock, after finding it
+    /// again there: a release that would evict it either runs first (the
+    /// session is gone and the Logon goes to the lookup) or counts this claim.
+    fn find(&self, identity: &LogonIdentity) -> Option<Routed<'_, A>> {
         let key = (
             identity.sender_comp_id.clone(),
             identity.target_comp_id.clone(),
         );
-        // The reference is cloned under the read lock, so a settle (which
-        // takes the write lock) never sees a count that is about to grow.
-        self.read_routes()
+        {
+            let routes = self.read_routes();
+            let route = routes
+                .buckets
+                .get(&key)?
+                .iter()
+                .find(|route| route.pattern.admits(identity))?;
+            if route.state != RouteState::Provisional {
+                return Some(Routed::Kept(Arc::clone(&route.acceptor)));
+            }
+        }
+        let mut routes = self.write_routes();
+        let route = routes
             .buckets
-            .get(&key)
-            .and_then(|routes| routes.iter().find(|route| route.pattern.admits(identity)))
-            .map(|route| Routed {
-                acceptor: Arc::clone(&route.acceptor),
-                provisional: route.state == RouteState::Provisional,
-            })
+            .get_mut(&key)?
+            .iter_mut()
+            .find(|route| route.pattern.admits(identity))?;
+        if route.state != RouteState::Provisional {
+            return Some(Routed::Kept(Arc::clone(&route.acceptor)));
+        }
+        // Bounded by the connections in flight; cannot overflow, and is still
+        // added with a checked call.
+        route.claims = route.claims.checked_add(1)?;
+        let acceptor = Arc::clone(&route.acceptor);
+        drop(routes);
+        Some(Routed::Provisional(ProvisionalClaim::new(self, acceptor)))
     }
 
     /// Adds a session under `pattern`, keeping every bucket free of overlaps
@@ -1170,19 +1229,30 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
         pattern: RoutePattern,
         acceptor: Acceptor<A>,
         origin: Origin,
-    ) -> Result<Routed<A>, EngineError> {
+    ) -> Result<Routed<'_, A>, EngineError> {
         let key = pattern.comp_ids();
         let store = acceptor.store_address();
         let mut routes = self.write_routes();
-        if let Some(bucket) = routes.buckets.get(&key) {
-            if origin == Origin::Lookup
-                && let Some(route) = bucket.iter().find(|route| route.pattern == pattern)
-            {
-                return Ok(Routed {
-                    acceptor: Arc::clone(&route.acceptor),
-                    provisional: route.state == RouteState::Provisional,
-                });
+        if origin == Origin::Lookup
+            && let Some(route) = routes
+                .buckets
+                .get_mut(&key)
+                .and_then(|bucket| bucket.iter_mut().find(|route| route.pattern == pattern))
+        {
+            // A lookup that raced this one admitted the same session: keep
+            // it, and claim it if it is still provisional.
+            if route.state != RouteState::Provisional {
+                return Ok(Routed::Kept(Arc::clone(&route.acceptor)));
             }
+            route.claims = route
+                .claims
+                .checked_add(1)
+                .ok_or(EngineError::SessionLimit { max: usize::MAX })?;
+            let acceptor = Arc::clone(&route.acceptor);
+            drop(routes);
+            return Ok(Routed::Provisional(ProvisionalClaim::new(self, acceptor)));
+        }
+        if let Some(bucket) = routes.buckets.get(&key) {
             for route in bucket {
                 if route.pattern.overlaps(&pattern) {
                     return Err(EngineError::Configuration(format!(
@@ -1236,27 +1306,32 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
             }
         };
         let acceptor = Arc::new(acceptor);
+        let provisional = state == RouteState::Provisional;
         routes.buckets.entry(key).or_default().push(Route {
             pattern,
             acceptor: Arc::clone(&acceptor),
             state,
+            // The admitting connection's claim.
+            claims: usize::from(provisional),
         });
-        Ok(Routed {
-            acceptor,
-            provisional: state == RouteState::Provisional,
+        drop(routes);
+        Ok(if provisional {
+            Routed::Provisional(ProvisionalClaim::new(self, acceptor))
+        } else {
+            Routed::Kept(acceptor)
         })
     }
 
-    /// Settles a provisional session when one of its handshakes ends.
+    /// Releases one claim on a provisional session when its handshake ends.
     ///
-    /// Confirms the session if this handshake got past `from_admin`.
-    /// Otherwise evicts it if it is still provisional and no other connection
-    /// is routed to it: the table's reference and the caller's are the only
-    /// ones. References are cloned only under the read lock, which this write
-    /// lock excludes, so the count cannot grow while it is read. Before
-    /// authentication the session's store was never touched, so eviction
-    /// loses nothing.
-    fn settle(&self, acceptor: &Arc<Acceptor<A>>, authenticated: bool) {
+    /// Under the write lock: the claim is uncounted; the session is confirmed
+    /// if this handshake got past `from_admin`; otherwise it is evicted if it
+    /// is still provisional and no claim on it remains. Every claim is taken
+    /// and released under this lock, so two releases cannot both see the
+    /// other's claim and both keep the session. Before authentication the
+    /// session's store was never touched, so eviction loses nothing. Called
+    /// once per claim, by [`ProvisionalClaim::release`].
+    fn release(&self, acceptor: &Arc<Acceptor<A>>, authenticated: bool) {
         let config = acceptor.config();
         let key = (config.target_comp_id.clone(), config.sender_comp_id.clone());
         let mut routes = self.write_routes();
@@ -1270,6 +1345,10 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
         else {
             return;
         };
+        debug_assert!(route.claims > 0, "a claim is released once per claim taken");
+        if let Some(remaining) = route.claims.checked_sub(1) {
+            route.claims = remaining;
+        }
         if route.state != RouteState::Provisional {
             return;
         }
@@ -1281,7 +1360,7 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
             );
             return;
         }
-        if Arc::strong_count(acceptor) > 2 {
+        if route.claims > 0 {
             return;
         }
         bucket.retain(|route| !Arc::ptr_eq(&route.acceptor, acceptor));
@@ -1293,7 +1372,7 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
         }
         tracing::debug!(
             session = %acceptor.session_id(),
-            "evicted a lookup-admitted session whose handshake ended before authentication"
+            "evicted a lookup-admitted session whose handshakes all ended before authentication"
         );
     }
 
@@ -1423,15 +1502,43 @@ mod tests {
     /// Admits `config` as the lookup would for `identity`, failing the test
     /// otherwise.
     #[track_caller]
-    fn admitted(
-        registry: &AcceptorRegistry<NoOpApplication>,
+    fn admitted<'r>(
+        registry: &'r AcceptorRegistry<NoOpApplication>,
         identity: &LogonIdentity,
         config: SessionConfig,
-    ) -> Routed<NoOpApplication> {
+    ) -> ProvisionalClaim<'r, NoOpApplication> {
         match registry.admit_resolved(identity, acceptor(config)) {
-            Ok(routed) => routed,
+            Ok(Routed::Provisional(claim)) => claim,
+            Ok(Routed::Kept(_)) => panic!("a lookup admission must be provisional"),
             Err(err) => panic!("the lookup admission must succeed: {err}"),
         }
+    }
+
+    /// Claims the provisional session a Logon claiming `identity` is routed
+    /// to, failing the test otherwise.
+    #[track_caller]
+    fn claimed_again<'r>(
+        registry: &'r AcceptorRegistry<NoOpApplication>,
+        identity: &LogonIdentity,
+    ) -> ProvisionalClaim<'r, NoOpApplication> {
+        match registry.find(identity) {
+            Some(Routed::Provisional(claim)) => claim,
+            Some(Routed::Kept(_)) => panic!("the session must still be provisional"),
+            None => panic!("the provisional session must be found"),
+        }
+    }
+
+    /// The claims counted on the session a Logon claiming `identity` is
+    /// routed to, or `None` when there is no such session.
+    fn claims_of(
+        registry: &AcceptorRegistry<NoOpApplication>,
+        identity: &LogonIdentity,
+    ) -> Option<usize> {
+        registry
+            .read_routes()
+            .routes()
+            .find(|route| route.pattern.admits(identity))
+            .map(|route| route.claims)
     }
 
     #[test]
@@ -1719,13 +1826,10 @@ mod tests {
         assert_eq!(registry.session_ids().len(), 4);
         let found = registry.find(&routed(&logon(b"MEMBER_C", b"VENUE", &[(50, b"DESK2")])));
         match found {
-            Some(routed) => {
-                assert_eq!(
-                    routed.acceptor.config().target_sub_id.as_deref(),
-                    Some("DESK2")
-                );
-                assert!(!routed.provisional);
+            Some(Routed::Kept(acceptor)) => {
+                assert_eq!(acceptor.config().target_sub_id.as_deref(), Some("DESK2"));
             }
+            Some(Routed::Provisional(_)) => panic!("a registered session is never provisional"),
             None => panic!("the DESK2 session must be found"),
         }
         assert!(
@@ -1780,10 +1884,10 @@ mod tests {
         let first = admitted(&registry, &claimed, session("MEMBER"));
         let second = admitted(&registry, &claimed, session("MEMBER"));
 
-        // One acceptor, so one admission slot for the session.
-        assert!(first.provisional);
-        assert!(second.provisional);
+        // One acceptor, so one admission slot for the session, and one claim
+        // per connection on it.
         assert!(Arc::ptr_eq(&first.acceptor, &second.acceptor));
+        assert_eq!(claims_of(&registry, &claimed), Some(2));
         assert_eq!(registry.session_ids().len(), 1);
         assert_eq!(registry.read_routes().from_lookup, 1);
     }
@@ -1809,66 +1913,111 @@ mod tests {
     }
 
     #[test]
-    fn test_settle_evicts_an_unauthenticated_provisional_session() {
+    fn test_release_evicts_an_unauthenticated_provisional_session() {
         let registry = AcceptorRegistry::new();
         let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
-        let routed = admitted(&registry, &claimed, session("MEMBER"));
+        let claim = admitted(&registry, &claimed, session("MEMBER"));
+        assert_eq!(claims_of(&registry, &claimed), Some(1));
 
-        registry.settle(&routed.acceptor, false);
+        drop(claim);
 
         assert!(registry.session_ids().is_empty());
         assert_eq!(registry.read_routes().from_lookup, 0);
     }
 
     #[test]
-    fn test_settle_keeps_a_provisional_session_another_connection_uses() {
+    fn test_release_keeps_a_provisional_session_another_connection_claims() {
         let registry = AcceptorRegistry::new();
         let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
         let first = admitted(&registry, &claimed, session("MEMBER"));
-        let Some(second) = registry.find(&claimed) else {
-            panic!("the provisional session must be found");
-        };
-        assert!(second.provisional);
+        let second = claimed_again(&registry, &claimed);
+        assert_eq!(claims_of(&registry, &claimed), Some(2));
 
         // The first connection fails while the second is still routed here.
-        registry.settle(&first.acceptor, false);
-        assert_eq!(registry.session_ids().len(), 1);
+        drop(first);
+        assert_eq!(claims_of(&registry, &claimed), Some(1));
 
         // Then the second fails too, and nobody is left.
+        drop(second);
+        assert!(registry.session_ids().is_empty());
+    }
+
+    /// The race a reference count could not see: two handshakes end, each
+    /// releasing its claim while both still hold a reference to the acceptor
+    /// (as a guard does while it releases, and as any other holder might).
+    /// Each release sees three references, yet the second one evicts, because
+    /// the decision reads the claims counted under the lock.
+    #[test]
+    fn test_release_evicts_when_the_last_claim_goes_whatever_references_remain() {
+        let registry = AcceptorRegistry::new().with_max_sessions(1);
+        let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
+        let mut first = admitted(&registry, &claimed, session("MEMBER"));
+        let mut second = claimed_again(&registry, &claimed);
+        let held = Arc::clone(&first.acceptor);
+        assert_eq!(Arc::strong_count(&held), 4);
+
+        first.release();
+        assert_eq!(registry.session_ids().len(), 1);
+        second.release();
+
+        assert!(registry.session_ids().is_empty());
+        assert_eq!(registry.read_routes().from_lookup, 0);
+        // The cap is not exhausted: a new session is admitted.
+        let other = routed(&logon(b"OTHER", b"VENUE", &[]));
+        let _admitted = admitted(&registry, &other, session("OTHER"));
+        assert_eq!(registry.session_ids().len(), 1);
+        drop(held);
+    }
+
+    #[test]
+    fn test_release_is_idempotent_per_claim() {
+        let registry = AcceptorRegistry::new();
+        let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
+        let mut first = admitted(&registry, &claimed, session("MEMBER"));
+        let second = claimed_again(&registry, &claimed);
+
+        first.release();
+        first.release();
         drop(first);
-        registry.settle(&second.acceptor, false);
+
+        // Released once: the second claim still keeps the session.
+        assert_eq!(claims_of(&registry, &claimed), Some(1));
+        assert_eq!(registry.session_ids().len(), 1);
+        drop(second);
         assert!(registry.session_ids().is_empty());
     }
 
     #[test]
-    fn test_settle_confirms_an_authenticated_session_for_good() {
+    fn test_release_confirms_an_authenticated_session_for_good() {
         let registry = AcceptorRegistry::new();
         let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
-        let routed = admitted(&registry, &claimed, session("MEMBER"));
+        let first = admitted(&registry, &claimed, session("MEMBER"));
+        let second = claimed_again(&registry, &claimed);
 
-        registry.settle(&routed.acceptor, true);
-        // A later unauthenticated handshake no longer evicts it.
-        registry.settle(&routed.acceptor, false);
+        // The second handshake is authenticated and ends; the first one then
+        // fails, the last claim to go, and the session stays.
+        second.authenticated.store(true, Ordering::Release);
+        drop(second);
+        drop(first);
 
         assert_eq!(registry.session_ids().len(), 1);
+        assert_eq!(claims_of(&registry, &claimed), Some(0));
         match registry.find(&claimed) {
-            Some(found) => assert!(!found.provisional),
+            Some(Routed::Kept(_)) => {}
+            Some(Routed::Provisional(_)) => panic!("a confirmed session is kept"),
             None => panic!("the confirmed session must stay"),
         }
         assert_eq!(registry.read_routes().from_lookup, 1);
     }
 
     #[test]
-    fn test_settle_never_evicts_a_registered_session() {
+    fn test_registered_session_is_never_claimed() {
         let registry = AcceptorRegistry::new();
         assert!(registry.register(acceptor(session("MEMBER"))).is_ok());
         let claimed = routed(&logon(b"MEMBER", b"VENUE", &[]));
-        let Some(found) = registry.find(&claimed) else {
-            panic!("the registered session must be found");
-        };
 
-        registry.settle(&found.acceptor, false);
-
+        assert!(matches!(registry.find(&claimed), Some(Routed::Kept(_))));
+        assert_eq!(claims_of(&registry, &claimed), Some(0));
         assert_eq!(registry.session_ids().len(), 1);
     }
 
@@ -1894,9 +2043,8 @@ mod tests {
         );
 
         // An eviction frees the place.
-        registry.settle(&held.acceptor, false);
         drop(held);
-        let _ = admitted(&registry, &second, session("MEMBER_B"));
+        let _admitted = admitted(&registry, &second, session("MEMBER_B"));
         assert_eq!(registry.session_ids().len(), 2);
     }
 
