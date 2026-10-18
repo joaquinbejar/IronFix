@@ -63,7 +63,12 @@ exists yet.
   `Initiator::with_store` and an inbound `ResendRequest` replays the stored
   application messages with `PossDupFlag = Y` and the original `SendingTime`
   in `OrigSendingTime`; administrative messages, and anything the store cannot
-  produce, are covered by gap fill.
+  produce, are covered by gap fill. Store writes are fallible and ordered: a
+  frame is filed and the next sender number persisted before its bytes are
+  written, and the next target number is persisted before an inbound message
+  is acted on. `Initiator::with_store_failure_policy` chooses between warning
+  and continuing (the default) or failing closed, writing nothing the store
+  has not accepted.
 - **A typestate session FSM** and checked sequence arithmetic in
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in
@@ -99,7 +104,9 @@ around it.
   no `FileStore` and no memory-mapped store, so stored messages and sequence
   numbers do not survive a restart (`ironfix-store/src/lib.rs`). The store is
   opt-in on `Initiator` only: `Acceptor` attaches none, so every resend it
-  answers is a gap fill (`ironfix-engine/src/acceptor.rs`).
+  answers is a gap fill (`ironfix-engine/src/acceptor.rs`). Inbound
+  application messages are delivered at most once across a crash, and inbound
+  frames are not filed.
 - **One session per engine.** `EngineBuilder` takes exactly one
   `SessionConfig`; `into_initiator()` and `into_acceptor()` return
   `EngineError::Configuration` for zero or several

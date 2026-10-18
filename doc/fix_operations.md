@@ -404,6 +404,58 @@ is not persistent: it holds messages and sequence numbers in process memory
 only. Replay therefore works within a live process, but no message and no
 sequence number survives a restart. A durable store is separate, tracked work.
 
+**Store write order.** Every store write (`store`, `set_next_sender_seq`,
+`set_next_target_seq`) is asynchronous and can fail. With a store attached the
+engine writes in this order, in the Logon handshake and in the session reactor
+alike (`doc/adr/0005-fallible-store-writes.md`):
+
+1. *Outbound:* the frame is filed under its `MsgSeqNum` N, then N+1 is
+   persisted as the next sender number, then N is spent in memory, and only
+   then are the frame's bytes written to the socket. Filing comes first, so a
+   crash between the two writes leaves frame N and counter N: N is reused for
+   a message the peer never saw, and the filed frame is overwritten. A crash
+   after both writes leaves frame N and counter N+1: N is never reused, and a
+   resend of N replays the filed frame, whether or not its bytes reached the
+   peer.
+2. *Inbound:* when a message M is accepted in sequence, M+1 is persisted as the
+   next target number before M is acted on: before an administrative message
+   is processed, and before an application message is handed to the
+   application. In the initiator handshake the Logon ack's number is persisted
+   before the session goes Active on it (the ack is validated, including
+   `from_admin`, before its number is consumed).
+3. Any other change to a counter (a `SequenceReset`, a gap fill, a gapped
+   message) is persisted at the end of the event that made it, before the next
+   event is handled.
+4. A counter is written only when its value changed.
+
+*Inbound delivery is at most once across a crash.* Because M+1 is durable
+before M is handed over, a crash after that write and before `from_app` has
+finished with M loses M to the application: on restart the engine expects M+1
+and never asks the counterparty for M again. The window covers the messages
+waiting in the application queue (up to its capacity) and the one `from_app`
+is handling. The engine does not detect or report such a loss after a
+restart. While the process runs, a message whose target write did not succeed
+is never handed over, so nothing is skipped silently in that case.
+
+**Store failure policy.** `Initiator::with_store_failure_policy` chooses what a
+failed write means:
+
+- `StoreFailurePolicy::Continue` (the default, and the behaviour before writes
+  were fallible): log a warning without frame bytes and carry on. The frame is
+  written anyway; a frame that could not be filed is gap-filled if it is ever
+  requested again.
+- `StoreFailurePolicy::CloseSession`: fail closed. A frame whose filing or
+  sender-counter write fails is not written (the counterparty reads no bytes
+  for it), an inbound message whose target write fails is not acted on (it
+  never reaches `from_app`), and the session closes without a Logout, which
+  could not be filed either. During the handshake, `Initiator::connect`
+  returns `EngineError::Store` and the frame concerned is never written.
+
+The `Acceptor` attaches no store yet, so the policy has nothing to act on
+there. Not done: inbound frames are not filed (only the target counter is
+kept), and a failed `reset` of the store when a session closes is still logged
+and ignored.
+
 **Outbound `EndSeqNo` sentinel — a version caveat.** When the engine detects an
 inbound gap it requests retransmission with `EndSeqNo` (16) = 0, the open-ended
 "to infinity" sentinel. That `16=0` convention was introduced in FIX 4.2; FIX
@@ -1184,7 +1236,11 @@ ends a `Framed` stream.
   answered with a single gap fill; the store can be attached to the
   **initiator only**, since the `Acceptor` attaches none and so answers every
   resend with gap fill; and `MemoryStore` is not persistent, so nothing is
-  replayable after a restart. An *outbound* request the peer never
+  replayable after a restart. Store writes are ordered (frame and next sender
+  number before the bytes, next target number before an inbound message is
+  acted on) and fallible, under a `StoreFailurePolicy` that either warns and
+  continues or fails closed; inbound delivery is at most once across a crash.
+  An *outbound* request the peer never
   satisfies is also bounded — retried every `SessionConfig::resend_timeout` and
   then escalated to Logout after `SessionConfig::max_resend_requests` attempts,
   rather than stalling the session forever. See "Resend Request" above.

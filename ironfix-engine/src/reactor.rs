@@ -1006,7 +1006,7 @@ impl<A: Application> Reactor<A> {
     /// with no legal wire form is therefore dropped with a warning and
     /// [`Sent::Dropped`] is returned: the session is intact and there is no
     /// hole for the counterparty to resend over. A caller that arms follow-on
-    /// state — the logout deadline, a pending TestRequest, a pending resend —
+    /// state (the logout deadline, a pending TestRequest, a pending resend)
     /// must act only on [`Sent::Yes`], or it advances the session on a frame
     /// the peer never saw.
     ///
@@ -2368,7 +2368,7 @@ pub(crate) struct SessionParams<A: Application> {
 ///
 /// This is the single place the reactor is launched, so both engines get the
 /// same dispatcher hand-off, the same store persistence order and policy, and
-/// the same shutdown path — a spawned task that always reaches a close, fires
+/// the same shutdown path: a spawned task that always reaches a close, fires
 /// `on_logout`, and signals the `watch` channel. The counters are first
 /// persisted inside the task, before the first inbound message is acted on.
 pub(crate) fn spawn_session<A, G>(
