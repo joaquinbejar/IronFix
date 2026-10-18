@@ -1,0 +1,24 @@
+[package]
+name = "ironfix-fixp"
+description = "FIX Performance Session Layer (FIXP) session core for IronFix: sans-IO, with the SBE session messages"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# The FIXP SBE schema in spec/ is vendored verbatim from FIX Trading Community
+# under CC BY-ND 4.0 (see spec/README.md), not under this crate's MIT license.
+# It is a test input only: keep it, and the test that reads it, out of the
+# published package so everything that ships is MIT.
+exclude = ["spec", "tests/schema_conformance.rs"]
+
+# ADR-0003: `fixp -> core + ironsbe-core`. No ironfix-sofh (framing is the
+# driver's concern) and no tag=value crate.
+[dependencies]
+ironfix-core.workspace = true
+ironsbe-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

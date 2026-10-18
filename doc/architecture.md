@@ -55,10 +55,11 @@ The architecture prioritizes three often-competing goals through careful design 
 
 ## Crate organization and module structure
 
-> **Target tree, not the current one.** The workspace has 13 member crates (11
-> published, `ironfix-sofh` not yet published, plus the unpublished
-> `ironfix-codegen-check`); the tree below names files and directories that do
-> not exist. For the real layout, run `make tree`. Notable differences: there
+> **Target tree, not the current one.** The workspace has 14 member crates (11
+> published, `ironfix-sofh` and `ironfix-fixp` not yet published, plus the
+> unpublished `ironfix-codegen-check`); the tree below names files and
+> directories that do not exist. For the real layout, run `make tree`.
+> Notable differences: there
 > is no `ironfix/` facade crate (the umbrella re-exports live in
 > `ironfix-example`); `ironfix-transport` contains only `codec.rs`;
 > `ironfix-store` contains only `traits.rs` and `memory.rs`; `ironfix-engine`

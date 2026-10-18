@@ -77,5 +77,33 @@ decision and pinned to a compatible 0.7 range when `ironfix-fixp` lands.
   fatal for the stream, since SOFH has no resynchronisation anchor. It
   depends on `ironfix-core` only, joins the lockstep version, and is
   published right after `ironfix-core`; it enters the `semver.yml` matrix
-  after its first publish. Nothing composes it yet: `ironfix-fixp` (#95) and
-  the engine wiring (#96) do not exist.
+  after its first publish. Nothing composes it yet: the engine wiring (#96)
+  does not exist.
+- **`ironfix-fixp` exists** (#95). It implements FIXP v1.1, the Draft
+  Standard of April 18, 2019 (the highest version published; v1.0 is the
+  April 2021 Technical Standard, with the same point-to-point protocol), as a
+  sans-IO core in both roles, per ADR-0002: decoded messages and an explicit
+  `Instant` in, messages, transport closes and events out, no clock read. It
+  depends on `ironfix-core` and `ironsbe-core` only, the latter at `0.7.1`
+  (compatible range `^0.7.1`), which brings `crossbeam-queue` into the lock
+  file; no `ironsbe-core` type appears in its public API, so a breaking
+  `ironsbe-core` release does not force one here. The 19 session messages of
+  the FIXP SBE schema (id 2748, version 0) are encoded by hand on
+  `ironsbe-core`'s header and buffer primitives. That schema is © FIX
+  Protocol Ltd. under CC BY-ND 4.0, so it is vendored byte for byte under
+  `ironfix-fixp/spec/` with its license and provenance as the input of a
+  conformance test, and excluded with that test from the published package,
+  which stays MIT; no description from it is reused in the crate's
+  documentation. Recoverable, Idempotent, Unsequenced and None flows run on
+  one state machine. What happens when a RetransmitRequest stalls is a typed
+  policy (`RetransmitStallPolicy`), because FIXP both forbids a second
+  request while a retransmission is in progress and makes asking again the
+  requester's duty; the default only asks again once a context switch has cut
+  a batch short. A counterparty's finalization is answered; sending one,
+  multiplexing, datagram transports, multicast and persistence are not
+  implemented (`doc/fixp_operations.md`). The engine driver (#96) owns the
+  transports: the crate states which transport each output belongs to, and a
+  server session left negotiated without a transport needs an eviction
+  policy there. The crate joins the lockstep version and `make publish-all`
+  right after `ironfix-sofh`, and enters the `semver.yml` matrix after its
+  first publish.
