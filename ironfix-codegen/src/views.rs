@@ -45,9 +45,8 @@
 //! prefix clippy ties to another receiver (`from_`, `into_`, `to_`).
 
 use crate::generator::{
-    GeneratorError, MAX_NESTING_DEPTH, is_keyword, is_valid_ident, line, to_field_ident,
-    to_pascal_case, to_screaming_snake_case, to_snake_case, to_type_ident, unique_name,
-    unique_type_name,
+    GeneratorError, MAX_NESTING_DEPTH, claim_ident, is_keyword, is_valid_ident, line,
+    to_pascal_case, to_screaming_snake_case, to_snake_case, to_type_ident, unique_type_name,
 };
 use ironfix_dictionary::schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldType, GroupDef, MemberRef, MessageDef,
@@ -706,7 +705,9 @@ impl<'d> Builder<'d> {
                 name: group.name.clone(),
             });
         }
-        let base = unique_type_name(&mut self.bases, &to_type_ident(&candidate));
+        // A base is only ever emitted with a suffix (`View`, `Fields`), so
+        // it is not escaped: `Self` gives `SelfView`, not `Self_View`.
+        let base = unique_type_name(&mut self.bases, &candidate);
         let index = self.sites.len();
         self.sites.push(Site {
             base: base.clone(),
@@ -998,7 +999,8 @@ fn build(dict: &Dictionary) -> Result<Model, GeneratorError> {
     let mut bases = Vec::with_capacity(defs.len());
     for def in &defs {
         let base = type_base(&def.name, "message")?;
-        bases.push(unique_type_name(&mut builder.bases, &to_type_ident(&base)));
+        // Not escaped: a base is only ever emitted with a suffix.
+        bases.push(unique_type_name(&mut builder.bases, &base));
     }
     let envelope = builder.envelope()?;
     let mut messages = Vec::with_capacity(defs.len());
@@ -1136,7 +1138,15 @@ fn name_members(level: &mut Level) -> Result<(), GeneratorError> {
         {
             base = format!("field_{base}");
         }
-        idents.push(to_field_ident(&unique_name(&mut used, &base, tag)));
+        // Checked and reserved once escaped, so `Crate` (`crate_`) and
+        // `Crate_` get distinct accessors.
+        let ident = claim_ident(&mut used, &base, &tag.to_string()).ok_or_else(|| {
+            GeneratorError::UnnameableItem {
+                what,
+                name: name.to_string(),
+            }
+        })?;
+        idents.push(ident);
     }
     level.idents = idents;
     Ok(())
@@ -3166,8 +3176,10 @@ mod tests {
 
     #[test]
     fn test_generate_views_for_every_embedded_dictionary() {
-        // FIX 4.4 views are about 4.2 MB and FIX 5.0 SP2 views about 26 MB:
-        // generated and inspected here, compiled out of tree (see ADR-0012).
+        // FIX 4.4 views are about 5.2 MB and FIX 5.0 SP2 views about 31 MB:
+        // generated and inspected here. ironfix-codegen-check compiles the
+        // FIX 4.4 views; the FIX 5.0 SP2 views are compiled out of tree only
+        // (see ADR-0012 and ADR-0019).
         for dict in [
             embedded(Dictionary::fix44()),
             embedded(Dictionary::fix42()),

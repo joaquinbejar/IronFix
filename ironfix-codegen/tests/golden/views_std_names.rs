@@ -208,14 +208,14 @@ pub mod layouts {
 
     /// Groups that may open at the top level of Vec (MsgType=U2), header and trailer groups included,
     /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
-    pub const VEC: GroupSet<'static> = match GroupSet::with_level_tags(&[], &[5006]) {
+    pub const VEC: GroupSet<'static> = match GroupSet::with_level_tags(&[], &[5006, 5011]) {
         Ok(set) => set,
         Err(_) => panic!("invalid Vec group table"),
     };
 
     /// Groups that may open at the top level of String (MsgType=U3), header and trailer groups included,
     /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
-    pub const STRING: GroupSet<'static> = match GroupSet::with_level_tags(&[], &[5006]) {
+    pub const STRING: GroupSet<'static> = match GroupSet::with_level_tags(&[], &[5006, 5011]) {
         Ok(set) => set,
         Err(_) => panic!("invalid String group table"),
     };
@@ -403,6 +403,11 @@ pub mod views {
         pub fn text(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(5006).map(|field| text(field, FieldType::String)).transpose()
         }
+
+        /// Note (tag 5011).
+        pub fn note(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.get(5011).map(|field| text(field, FieldType::String)).transpose()
+        }
     }
 
     /// String message (MsgType=U3), read in place from a decoded message.
@@ -444,6 +449,11 @@ pub mod views {
         /// Text (tag 5006).
         pub fn text(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(5006).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// Note (tag 5011).
+        pub fn note(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.get(5011).map(|field| text(field, FieldType::String)).transpose()
         }
     }
 
@@ -791,6 +801,8 @@ pub mod writers {
     pub struct VecFields<'v> {
         /// Text (tag 5006).
         pub text: ::core::option::Option<&'v str>,
+        /// Note (tag 5011).
+        pub note: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for VecFields<'_> {
@@ -819,12 +831,15 @@ pub mod writers {
         fn check(&self) -> ::core::result::Result<(), EncodeError> {
             check_text(self.text.map(str::as_bytes), 5006)?;
             check_grammar(self.text.map(str::as_bytes), FieldType::String, 5006)?;
+            check_text(self.note.map(str::as_bytes), 5011)?;
+            check_grammar(self.note.map(str::as_bytes), FieldType::String, 5011)?;
             Ok(())
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.text { sink.field(5006, value.as_bytes()); }
+            if let Some(value) = self.note { sink.field(5011, value.as_bytes()); }
             Ok(())
         }
     }
@@ -834,6 +849,8 @@ pub mod writers {
     pub struct StringFields<'v> {
         /// Text (tag 5006).
         pub text: ::core::option::Option<&'v str>,
+        /// Note (tag 5011).
+        pub note: ::core::option::Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for StringFields<'_> {
@@ -862,12 +879,15 @@ pub mod writers {
         fn check(&self) -> ::core::result::Result<(), EncodeError> {
             check_text(self.text.map(str::as_bytes), 5006)?;
             check_grammar(self.text.map(str::as_bytes), FieldType::String, 5006)?;
+            check_text(self.note.map(str::as_bytes), 5011)?;
+            check_grammar(self.note.map(str::as_bytes), FieldType::String, 5011)?;
             Ok(())
         }
 
         /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.text { sink.field(5006, value.as_bytes()); }
+            if let Some(value) = self.note { sink.field(5011, value.as_bytes()); }
             Ok(())
         }
     }

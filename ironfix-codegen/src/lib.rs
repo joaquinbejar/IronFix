@@ -12,10 +12,14 @@
 //! source, in two independent outputs:
 //!
 //! - **Data definitions** ([`CodeGenerator::generate`], the default): one
-//!   `u32` constant per field tag, and one owned struct per message
-//!   (including the fields its components contribute and a struct per
-//!   repeating group entry). These structs carry no `FixMessage` or
-//!   `FixField` implementation.
+//!   `u32` constant per field tag, one owned struct per message (module
+//!   `messages`), one per component a message reaches (module
+//!   `components`), and one entry struct per repeating-group definition,
+//!   named `<DeclaringOwner><GroupName>Entry`. Each is generated once and
+//!   referenced by name wherever it is used, with its members in XML order,
+//!   so the output grows with the number of definitions rather than with
+//!   their reuse. These structs carry no `FixMessage` or `FixField`
+//!   implementation.
 //! - **Views, enumerations and writers** ([`CodeGenerator::generate_views`],
 //!   opt-in): an enumeration per field with declared values (an undeclared
 //!   wire value reads as `Other(&[u8])`), static repeating-group layouts for
@@ -35,10 +39,11 @@
 //!
 //! Nothing in the IronFix workspace consumes either output at run time: the
 //! engine and the codec read fields by tag. The outputs are compile-tested
-//! from golden files in this crate's tests, and the full views of the
-//! embedded FIX 4.4, FIX 4.2 and FIXT 1.1 dictionaries by the unpublished
+//! from golden files in this crate's tests, and in full by the unpublished
 //! `ironfix-codegen-check` workspace crate, whose build script generates them
-//! for the workspace lints.
+//! for the workspace lints: the data definitions of the embedded FIX 4.2,
+//! FIX 4.4, FIXT 1.1 and FIX 5.0 SP2 dictionaries, and the views of the
+//! first three.
 //!
 //! ## Usage
 //!
@@ -75,10 +80,11 @@
 //!   header group.
 //! - **Members follow the XML order** the dictionary records (`members()`),
 //!   a component's members in its place; within a group entry the delimiter
-//!   is always written first. The default output keeps its own order
-//!   (direct fields, component fields, groups), unchanged.
+//!   is always written first. The data definitions follow the XML order too,
+//!   with a component as one field of its own type in its place.
 
 pub mod generator;
+mod structs;
 mod views;
 
 pub use generator::{CodeGenerator, GeneratorConfig, GeneratorError};

@@ -140,8 +140,14 @@ exists yet.
   `ironfix-derive` implement the `ironfix-core` traits with typed
   `DecodeError` / `EncodeError` paths (compile-tested in
   `ironfix-derive/tests/`), and `ironfix-codegen` emits Rust from a loaded
-  `Dictionary` (a golden sample and the full FIX 4.2 and FIXT 1.1 outputs are
-  compile-tested in `ironfix-codegen/tests/`). Opt-in,
+  `Dictionary`: tag constants and data-only structs, one per message, per
+  component a message reaches and per repeating-group definition, each
+  referenced by name wherever it is used, members in XML order
+  (`doc/adr/0019-shared-component-and-group-types-in-the-default-output.md`).
+  A golden sample and the full FIX 4.2 and FIXT 1.1 outputs are
+  compile-tested in `ironfix-codegen/tests/`, and the full data structs of
+  all four embedded dictionaries, FIX 5.0 SP2 included, by the unpublished
+  `ironfix-codegen-check` crate under `make lint` and `make doc`. Opt-in,
   `CodeGenerator::generate_views` emits borrowed message views with typed
   accessors (`rust_decimal::Decimal` for prices and quantities, each value
   checked against the validator's grammar), an enumeration per field with
@@ -155,8 +161,9 @@ exists yet.
   `make lint` and `make doc`; golden files (a sample, FIXT 1.1, and FIX 4.4
   Heartbeat, Logon and NewOrderSingle) are exercised against real frames in
   `ironfix-codegen/tests/generated_views.rs`. The FIX 5.0 SP2 views (about
-  26 MB) were checked with clippy out of tree only
-  (`doc/adr/0012-generated-views-enums-and-writers.md`).
+  31 MB) were checked with clippy out of tree only
+  (`doc/adr/0012-generated-views-enums-and-writers.md`; why they stay out of
+  CI: `doc/adr/0019-shared-component-and-group-types-in-the-default-output.md`).
 - **FAST primitives** in `ironfix-fast`: stop-bit encode/decode of unsigned
   and signed integers, ASCII strings and byte vectors, each in nullable and
   non-nullable form, plus presence maps, all round-trip tested. The `Operator`
@@ -230,9 +237,10 @@ around it.
   loaded.
 - **Generated code has no consumer.** Nothing in the workspace uses the
   derives or `ironfix-codegen` output (data structs or views) at run time
-  (`ironfix-codegen-check` only compiles generated code: the views of the
-  embedded FIX 4.4, FIX 4.2 and FIXT 1.1 dictionaries, and both outputs for
-  the FIX 4.4 Orchestra repository), so field
+  (`ironfix-codegen-check` only compiles generated code: the data structs
+  of the four embedded dictionaries, the views of the embedded FIX 4.4,
+  FIX 4.2 and FIXT 1.1 dictionaries, and both outputs for the FIX 4.4
+  Orchestra repository), so field
   access on the session path is untyped tag lookup
   (`ironfix-codegen/src/lib.rs`). Generated views cover the message body
   only, and are generated from one dictionary: a FIXT.1.1 + FIX 5.0

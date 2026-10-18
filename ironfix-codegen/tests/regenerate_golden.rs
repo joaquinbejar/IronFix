@@ -10,6 +10,7 @@
 //! empty — which is exactly when it is needed.
 
 mod common;
+mod keyword_names_common;
 mod std_names_common;
 mod views_common;
 
@@ -26,9 +27,10 @@ fn write_golden(file: &str, code: &str) {
 }
 
 /// Rewrites every golden file from the current generator: the default
-/// output (`sample.rs`, `fix42.rs`, `fixt11.rs`, `std_names.rs`) and the
-/// views (`views_sample.rs`, `views_fix44_order.rs`, `views_fixt11.rs`,
-/// `views_std_names.rs`).
+/// output (`sample.rs`, `fix42.rs`, `fixt11.rs`, `std_names.rs`,
+/// `keyword_names.rs`) and the views (`views_sample.rs`,
+/// `views_fix44_order.rs`, `views_fixt11.rs`, `views_std_names.rs`,
+/// `views_keyword_names.rs`).
 ///
 /// Ignored by default: it is a maintenance action, not a check.
 #[test]
@@ -47,5 +49,13 @@ fn test_regenerate_golden_file() {
     write_golden(
         "views_std_names.rs",
         &std_names_common::generate_views_std_names(),
+    );
+    write_golden(
+        "keyword_names.rs",
+        &keyword_names_common::generate_keyword_names(),
+    );
+    write_golden(
+        "views_keyword_names.rs",
+        &keyword_names_common::generate_views_keyword_names(),
     );
 }

@@ -24,6 +24,10 @@ The constraints:
 - **Size.** The data-struct output repeats every component's fields, and
   every group's entry struct, in each message that uses them: about 1.4 MB for
   FIX 4.4 and about 50 MB for FIX 5.0 SP2 (#98 tracks that output).
+
+  > **Amended by ADR-0019 (#98), 2026-10-18.** The data structs now have one
+  > type per component and per group definition: about 0.45 MB for FIX 4.4
+  > and about 2.4 MB for FIX 5.0 SP2.
 - **Group structure lives in the dictionary.** Decoding is dictionary-free;
   ADR-0011 added a reader whose `GroupSpec` / `GroupSet` tables are `const`
   constructible precisely so generated code can carry them.
@@ -118,6 +122,12 @@ each message's view and writer: a message lists every field its components
 contribute. That keeps the full FIX 5.0 SP2 views at about 26 MB, about half
 the data structs. #98, which tracks the data structs' size, should reuse the
 same per-definition naming so both outputs name a group alike.
+
+> **Amended by ADR-0019 (#98), 2026-10-18.** Measured again for #98, the
+> full views are about 5.2 MB for FIX 4.4 and about 31 MB for FIX 5.0 SP2;
+> the FIX 5.0 SP2 data structs, which no longer copy components, are about
+> 2.4 MB. #98 reuses this naming: the entry struct of a group is its base
+> followed by `Entry` (`PartiesNoPartyIDsEntry`).
 
 **Requiredness follows the validator.** A field reached through components
 is required only when every component reference on the way is required and
@@ -278,6 +288,12 @@ carries them; the bounded requirement leaves out a later breaking release.
   and 2021 from a scratch crate. The generator's unit tests generate all four
   outputs, check determinism and that they carry no `#[allow]` and no binary
   float.
+
+  > **Amended by ADR-0019 (#98), 2026-10-18.** The FIX 5.0 SP2 views are
+  > about 31 MB and still out of CI (ADR-0019 records their build time and
+  > memory on one machine). The data structs of all four embedded
+  > dictionaries, FIX 5.0 SP2 included (about 2.4 MB), are now compiled by
+  > `ironfix-codegen-check`.
 - **No performance or allocation claim.** Views delegate to the group
   reader (whose read path is proved allocation-free, `GroupSet::field`
   included) and to `ironfix_core`'s conversions and the grammar check, which

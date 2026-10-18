@@ -148,7 +148,7 @@ pub mod fields {
     pub const SESSION_STATUS: u32 = 1409;
 }
 
-/// Message type definitions.
+/// Message type definitions, and the entries of the repeating groups messages declare.
 pub mod messages {
     /// Heartbeat message (MsgType=0).
     #[derive(Debug, Clone)]
@@ -237,6 +237,8 @@ pub mod messages {
         pub next_expected_msg_seq_num: ::core::option::Option<i64>,
         /// MaxMessageSize (tag 383).
         pub max_message_size: ::core::option::Option<i64>,
+        /// MsgTypeGrp component.
+        pub msg_type_grp: ::core::option::Option<super::components::MsgTypeGrp>,
         /// TestMessageIndicator (tag 464).
         pub test_message_indicator: ::core::option::Option<bool>,
         /// Username (tag 553).
@@ -274,5 +276,13 @@ pub mod messages {
     /// XMLnonFIX message (MsgType=n).
     #[derive(Debug, Clone)]
     pub struct XMLnonFIX {}
+
+}
+
+/// Component type definitions, one per component a message reaches, and the entries of the repeating groups components declare.
+pub mod components {
+    /// MsgTypeGrp component, one type shared by every message, component and group entry that lists it.
+    #[derive(Debug, Clone)]
+    pub struct MsgTypeGrp {}
 
 }

@@ -11,15 +11,17 @@
 //!
 //! A field with declared values becomes an enumeration of its name in the
 //! generated `enums` module, and a message a struct of its name in the
-//! default output's `messages` module. Generated code that named a standard
-//! item by its bare name there (a multi-value field's `join` returning
-//! `Vec<u8>`, an optional `String` field) would resolve to the generated
-//! type and not compile.
+//! default output's `messages` module, and a component a struct of its name
+//! in its `components` module. Generated code that named a standard item by
+//! its bare name there (a multi-value field's `join` returning `Vec<u8>`, an
+//! optional `String` field) would resolve to the generated type and not
+//! compile. The components `Vec` and `String` also share their names with
+//! messages, which the default output keeps apart in its two modules.
 
 use ironfix_codegen::CodeGenerator;
 use ironfix_dictionary::schema::{
-    Dictionary, FieldDef, FieldRef as SchemaFieldRef, FieldType, GroupDef, Member, MessageCategory,
-    MessageDef, Version,
+    ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef as SchemaFieldRef, FieldType,
+    GroupDef, Member, MessageCategory, MessageDef, Version,
 };
 use std::collections::HashMap;
 
@@ -43,7 +45,10 @@ fn values(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 /// The dictionary: four enumerations and four messages named after
 /// standard library items, a multi-value enumeration (whose `join` builds a
 /// `Vec`), a `String` field, a LENGTH/DATA pair (a `Vec<u8>` in the default
-/// output) and a repeating group (a `Vec` of entries).
+/// output), a repeating group (a `Vec` of entries), and two components
+/// named `Vec` and `String`, like two of the messages: `String` holds
+/// `Vec`, the message `Vec` lists the component `Vec` (optional) and the
+/// message `String` the component `String` (required).
 #[must_use]
 pub fn std_names_dictionary() -> Dictionary {
     let mut dict = Dictionary::new(Version::Fix44);
@@ -92,12 +97,26 @@ pub fn std_names_dictionary() -> Dictionary {
             )),
         ],
     ));
-    for (msg_type, name) in [("U2", "Vec"), ("U3", "String"), ("U4", "Result")] {
+    dict.add_field(FieldDef::new(5011, "Note", FieldType::String));
+    dict.add_component(ComponentDef::new(
+        "Vec",
+        vec![Member::Field(field_ref(5011, "Note", true))],
+    ));
+    dict.add_component(ComponentDef::new(
+        "String",
+        vec![Member::Component(ComponentRef::new("Vec", false))],
+    ));
+    for (msg_type, name, component) in [
+        ("U2", "Vec", Some(ComponentRef::new("Vec", false))),
+        ("U3", "String", Some(ComponentRef::new("String", true))),
+        ("U4", "Result", None),
+    ] {
+        let text = Member::Field(field_ref(5006, "Text", false));
         dict.add_message(MessageDef::new(
             msg_type,
             name,
             MessageCategory::App,
-            vec![Member::Field(field_ref(5006, "Text", false))],
+            std::iter::once(text).chain(component.map(Member::Component)),
         ));
     }
     dict
