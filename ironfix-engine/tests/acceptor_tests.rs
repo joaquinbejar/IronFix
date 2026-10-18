@@ -1330,6 +1330,7 @@ struct ProbeStore {
     fail_refresh: AtomicBool,
     fail_store: AtomicBool,
     fail_reset: AtomicBool,
+    hold_reset: AtomicBool,
     stall_target: AtomicBool,
 }
 
@@ -1341,6 +1342,7 @@ impl ProbeStore {
             fail_refresh: AtomicBool::new(false),
             fail_store: AtomicBool::new(false),
             fail_reset: AtomicBool::new(false),
+            hold_reset: AtomicBool::new(false),
             stall_target: AtomicBool::new(false),
         }
     }
@@ -1401,6 +1403,9 @@ impl MessageStore for ProbeStore {
 
     async fn reset(&self) -> Result<(), StoreError> {
         self.count();
+        if self.hold_reset.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.fail_reset.load(Ordering::SeqCst) {
             return Err(StoreError::Io(
                 "reset refused by the test store".to_string(),
@@ -2303,4 +2308,88 @@ async fn test_acceptor_failed_close_time_reset_is_owed_to_the_next_logon() {
     let (_framed, _connection, ack) = establish_shared(&acceptor, 2, &[]).await;
     assert_eq!(field(&ack, 34).as_deref(), Some("1"));
     assert_eq!(field(&ack, 141).as_deref(), Some("Y"));
+}
+
+/// A `serve` dropped while the reset for a `ResetSeqNumFlag` (141) Logon is
+/// still pending leaves the reset owed: the next accepted Logon, which does not
+/// ask for one, still gets the store reset and an acknowledgement at 1 that
+/// declares it.
+#[tokio::test]
+async fn test_acceptor_serve_dropped_during_the_reset_leaves_it_owed() {
+    let store = Arc::new(ProbeStore::new());
+    seed_history(&store.inner).await;
+    store.hold_reset.store(true, Ordering::SeqCst);
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)),
+            Arc::clone(&venue_app),
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+
+    // First Logon asks for a reset; the caller drops `accept` while the store
+    // reset hangs.
+    let (listener, addr) = bind_listener().await;
+    let stream = ok(TcpStream::connect(addr).await, "client connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    ok(
+        framed
+            .send(client_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]))
+            .await,
+        "client sends a resetting logon",
+    );
+    assert!(
+        timeout(Duration::from_millis(500), acceptor.accept(&listener))
+            .await
+            .is_err(),
+        "accept must still be inside the store reset"
+    );
+    drop(framed);
+    assert!(store.inner.contains(1), "the held reset changed nothing");
+    store.hold_reset.store(false, Ordering::SeqCst);
+
+    // Second Logon continues the peer's old stream without asking for a reset:
+    // the reset is still owed, so it is made and declared.
+    let (_framed, _connection, ack) = establish_shared(&acceptor, 3, &[]).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("1"));
+    assert_eq!(field(&ack, 141).as_deref(), Some("Y"));
+    assert!(!store.inner.contains(3), "the previous stream is gone");
+}
+
+/// A store write that overruns the acceptor's store timeout may still land
+/// later, so it leaves a reset owed: the next accepted Logon gets the store
+/// reset and an acknowledgement at 1 that declares it.
+#[tokio::test]
+async fn test_acceptor_timed_out_store_write_leaves_a_reset_owed() {
+    let store = Arc::new(ProbeStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)),
+            Arc::clone(&venue_app),
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+        .with_store_timeout(Duration::from_millis(200)),
+    );
+
+    let (mut framed, connection, _ack) = establish_shared(&acceptor, 1, &[]).await;
+    store.stall_target.store(true, Ordering::SeqCst);
+    ok(
+        framed.send(client_msg("1", 2, &[(112, "PING")])).await,
+        "send TestRequest",
+    );
+    // Continue: answered once the overrun has been logged.
+    let heartbeat = next_frame(&mut framed).await;
+    assert_eq!(field(&heartbeat, 112).as_deref(), Some("PING"));
+    drop(framed);
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+    store.stall_target.store(false, Ordering::SeqCst);
+
+    let (_framed, _connection, ack) = establish_shared(&acceptor, 3, &[]).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("1"), "a new stream starts");
+    assert_eq!(field(&ack, 141).as_deref(), Some("Y"), "and is declared");
 }

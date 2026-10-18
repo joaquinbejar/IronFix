@@ -402,6 +402,12 @@ impl<A: Application + 'static> Acceptor<A> {
     /// resend read that overruns is answered with a gap fill. Without a store
     /// this has no effect.
     ///
+    /// A write that overruns may still land later, so it also leaves a reset
+    /// owed: the next accepted Logon gets the store reset and an
+    /// acknowledgement at 1 declaring `ResetSeqNumFlag` (141) = Y. Reusing the
+    /// store is safe only if it applies its mutations in call order even when a
+    /// call is dropped (see the [`persistence`](crate::persistence) module).
+    ///
     /// A zero timeout is raised to one tick, as for the write timeout: a call
     /// given no time at all can never succeed.
     ///

@@ -107,7 +107,12 @@ and the next number it expects from the other side is 2.
 The acceptor keeps the same owed-reset record as the initiator (ADR-0005): a
 failed close-time reset, or a failed reset for a session that resets, is owed
 to the next accepted Logon, whose acknowledgement then declares `141=Y` at 1;
-the record clears once that acknowledgement is sent. The admission slot is held
+the record clears once that acknowledgement is sent. As in ADR-0005
+("Cancellation and timeouts"), the reset is recorded as owed before it is
+awaited, so a `serve` dropped while it is pending still leaves it owed, and a
+store mutation that overruns the store timeout leaves a reset owed too; both
+engines get this from the same `StoreAttachment` and `SessionStore` code. The
+admission slot is held
 until a session's task ends: past its close-time store writes, the drain of its
 application queue (up to 5 s) and `on_logout`. So two sessions never write to
 the store at once, and a Logon that arrives while the previous session is still
