@@ -19,3 +19,8 @@ parking_lot.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "file_store"
+harness = false

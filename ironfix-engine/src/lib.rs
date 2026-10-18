@@ -55,19 +55,25 @@
 //!
 //! - **There is no TLS**, and no dictionary validation: `ironfix-dictionary`'s
 //!   `Validator` is never invoked on the session path.
-//! - **The store is opt-in and in-memory.** Attaching an
-//!   [`ironfix_store::MemoryStore`] with [`Initiator::with_store`],
+//! - **The store is opt-in.** Attaching one with [`Initiator::with_store`],
 //!   [`Acceptor::with_store`] or [`EngineBuilder::with_store`] enables
-//!   resend-from-store replay and seeds each session's counters in both roles,
-//!   but there is no persistent implementation yet. A store belongs to
-//!   exactly one engine. The acceptor touches its store only once the peer is
+//!   resend-from-store replay and seeds each session's counters in both roles.
+//!   [`ironfix_store::MemoryStore`] keeps them in memory only;
+//!   [`ironfix_store::FileStore`] keeps them in a journal file, so they
+//!   survive a restart as durably as its sync policy promises (only
+//!   `SyncPolicy::EveryWrite` covers an OS crash or power loss for every
+//!   write, and only under [`StoreFailurePolicy::CloseSession`] does a failed
+//!   write keep its frame off the wire). A store belongs to exactly one
+//!   engine. The acceptor touches its store only once the peer is
 //!   authenticated (`from_admin` accepted it), and resets it only for a Logon
 //!   that passes every check. Store writes are ordered and fallible, and
-//!   [`StoreFailurePolicy`] decides
-//!   whether a failed one is tolerated or closes the session (see
-//!   [`persistence`]). Inbound application messages are delivered at most
-//!   once: a crash, or a close whose application queue does not drain in
-//!   time, loses the messages still queued.
+//!   [`StoreFailurePolicy`] decides whether a failed one is tolerated or
+//!   closes the session (see [`persistence`]); either way a failed write owes
+//!   the next session a sequence reset. A store that reports itself corrupted
+//!   while a resend is read closes the session instead of gap-filling the
+//!   request. Inbound application messages are delivered at most once: a
+//!   crash, or a close whose application queue does not drain in time, loses
+//!   the messages still queued.
 
 pub mod acceptor;
 pub mod application;

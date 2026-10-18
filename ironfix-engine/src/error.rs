@@ -225,7 +225,8 @@ pub enum EngineError {
     /// through `on_logout`.
     ///
     /// A store call that overruns the store timeout fails with
-    /// [`StoreError::Timeout`].
+    /// [`StoreError::Timeout`]. A failed store mutation, whatever the error,
+    /// also owes the next session a sequence reset.
     #[error("store error: {0}")]
     Store(#[from] StoreError),
 

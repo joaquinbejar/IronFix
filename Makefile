@@ -325,7 +325,7 @@ BENCH_BASELINE ?= v$(WORKSPACE_VERSION)
 # would also select every crate's implicit libtest bench target, and libtest
 # rejects criterion's arguments ("error: Unrecognized option: 'quick'"), so any
 # target that forwards flags would fail on an unrelated crate.
-CRITERION_BENCHES := ironfix-tagvalue:tagvalue ironfix-fast:fast ironfix-transport:framing
+CRITERION_BENCHES := ironfix-tagvalue:tagvalue ironfix-fast:fast ironfix-transport:framing ironfix-store:file_store
 
 # Arguments forwarded to the criterion harness. Set by the wrapper targets
 # below; override directly for anything criterion accepts, for example:

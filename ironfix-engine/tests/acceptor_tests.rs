@@ -2432,3 +2432,56 @@ async fn test_acceptor_refuses_a_logon_numbered_zero_before_any_reset() {
     assert_history_kept(&store);
     assert!(!venue_app.events().contains(&"logon".to_string()));
 }
+
+/// Three sessions on one store. The first leaves a reset owed (a store write
+/// fails under `Continue`). The second pays it (the store is reset and the
+/// acknowledgement declares `ResetSeqNumFlag` (141) at 1), but filing that
+/// acknowledgement fails. Paying the reset must not settle the later failure,
+/// so the third acknowledgement must again start at 1 and declare a reset.
+#[tokio::test]
+async fn test_acceptor_ack_filing_failure_still_owes_a_reset_after_one_is_paid() {
+    let store = Arc::new(ProbeStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config(Duration::from_secs(30)),
+            Arc::clone(&venue_app),
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+
+    let (mut framed, connection, _ack) = establish_shared(&acceptor, 1, &[]).await;
+    store.fail_store.store(true, Ordering::SeqCst);
+    send_reports(&connection, 1, 1).await;
+    let _report = next_frame(&mut framed).await;
+    drop(framed);
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+    store.fail_store.store(false, Ordering::SeqCst);
+
+    store.fail_store.store(true, Ordering::SeqCst);
+    let (framed, connection, ack) = establish_shared(&acceptor, 2, &[]).await;
+    // Off before anything else is written: only the ack's filing failed.
+    store.fail_store.store(false, Ordering::SeqCst);
+    assert_eq!(
+        field(&ack, 34).as_deref(),
+        Some("1"),
+        "the owed reset is paid"
+    );
+    assert_eq!(field(&ack, 141).as_deref(), Some("Y"));
+    drop(framed);
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the second session closes within 5s",
+    );
+
+    let (_framed, _connection, ack) = establish_shared(&acceptor, 2, &[]).await;
+    assert_eq!(
+        field(&ack, 34).as_deref(),
+        Some("1"),
+        "the reset paid in the second session does not settle the filing that failed during it"
+    );
+    assert_eq!(field(&ack, 141).as_deref(), Some("Y"), "and is declared");
+}

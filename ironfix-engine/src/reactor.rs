@@ -107,7 +107,8 @@ use crate::error::EngineError;
 use crate::garbled::{GarbledFrameWindow, GarbledVerdict};
 use crate::outbound;
 use crate::persistence::{
-    HandshakeStore, PersistedCounters, SessionStore, StoreFailurePolicy, file_and_spend, timed,
+    HandshakeStore, OwedReset, PersistedCounters, SessionStore, StoreFailurePolicy, file_and_spend,
+    timed,
 };
 use crate::wire::{
     self, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard, SendingTimeProblem,
@@ -126,7 +127,7 @@ use ironfix_session::{
 use ironfix_store::MessageStore;
 use ironfix_transport::{CodecError, FixCodec};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -717,7 +718,7 @@ struct Reactor<A: Application> {
     persisted: PersistedCounters,
     /// Set when the close-time store reset fails, for the engine that owns
     /// the store to perform on its next session.
-    reset_owed: Arc<AtomicBool>,
+    reset_owed: Arc<OwedReset>,
     /// The first and last `MsgSeqNum` handed to the application dispatcher.
     app_handed: Option<(u64, u64)>,
     /// The outstanding ResendRequest, if a gap is being recovered.
@@ -884,13 +885,13 @@ async fn run_reactor<A: Application + 'static>(
         // file the next session's messages on top of this one's, and a resend
         // request in that session could answer with traffic from this one.
         if let Some(store) = ctx.store.as_deref() {
-            // Owed from before the call and cleared only once it has
+            // Owed from before the call and paid only once it has
             // succeeded: a reactor dropped while the reset is pending (a
             // runtime shutting down) runs no error branch, and the next
             // session must still make the reset.
-            ctx.reset_owed.store(true, Ordering::Release);
+            let ticket = ctx.reset_owed.owe();
             match timed(ctx.store_timeout, store.reset()).await {
-                Ok(()) => ctx.reset_owed.store(false, Ordering::Release),
+                Ok(()) => ctx.reset_owed.pay(ticket),
                 Err(err) => {
                     // The reset counters written over a store that still
                     // holds this session's stream would describe neither, so
@@ -971,7 +972,7 @@ fn bind_store<'s>(
     store: Option<&'s Arc<dyn MessageStore>>,
     policy: StoreFailurePolicy,
     timeout: Duration,
-    owed: &'s AtomicBool,
+    owed: &'s OwedReset,
 ) -> Option<SessionStore<'s>> {
     store.map(|store| SessionStore::new(store.as_ref(), policy, timeout, owed))
 }
@@ -2110,10 +2111,12 @@ impl<A: Application> Reactor<A> {
     /// and this session's own inbound traffic keep making progress.
     ///
     /// # Errors
-    /// Returns [`EngineError`] only if writing to the socket fails; the session
-    /// is then closed by the caller. Every other failure — an unreadable store,
-    /// a read that overruns the store timeout, an unrebuildable frame —
-    /// degrades to a gap fill.
+    /// Returns [`EngineError`] if writing to the socket fails, or
+    /// [`EngineError::Store`] if the store reports itself corrupted
+    /// ([`StoreError::Corrupted`]); the session is then closed by the caller.
+    /// Every other failure (a store that cannot be read, a read that overruns
+    /// the store timeout, a frame that does not rebuild) degrades to a gap
+    /// fill.
     async fn replay_range(
         &mut self,
         framed: &mut FixFramed,
@@ -2149,6 +2152,23 @@ impl<A: Application> Reactor<A> {
             let read = store.get_page(read_from, end_seq, RESEND_PAGE_LIMIT);
             let page = match timed(self.store_timeout, read).await {
                 Ok(page) => page,
+                // A store that finds its own records damaged cannot say which
+                // of the messages it holds are intact. Gap-filling the rest of
+                // the range would tell the counterparty that application
+                // messages it may never have received do not exist, so the
+                // session is closed instead and the request is left for the
+                // next session to make again.
+                Err(err @ StoreError::Corrupted { .. }) => {
+                    tracing::error!(
+                        session = %self.session_id,
+                        read_from,
+                        end_seq,
+                        error = %err,
+                        "the store holding the resend range is corrupted: closing the session \
+                         rather than gap-filling messages it may still hold"
+                    );
+                    return Err(EngineError::Store(err));
+                }
                 Err(err) => {
                     tracing::warn!(
                         session = %self.session_id,
@@ -2580,7 +2600,7 @@ pub(crate) struct SessionParams<A: Application> {
     pub(crate) persisted: PersistedCounters,
     /// Set by the reactor when its close-time store reset fails; the engine
     /// that owns the store performs the reset on its next session.
-    pub(crate) reset_owed: Arc<AtomicBool>,
+    pub(crate) reset_owed: Arc<OwedReset>,
     /// A gap detected in the Logon exchange, as (first missing number, highest
     /// number seen). The reactor's first act is to request it, so a failure to
     /// send that request closes the session through the normal close path.

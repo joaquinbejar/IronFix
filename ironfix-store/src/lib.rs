@@ -22,19 +22,41 @@
 //! - **[`StoredMessage`]**: one message as it was filed — verbatim frame bytes,
 //!   its sequence number, and its recorded `MsgType`
 //! - **[`MemoryStore`]**: an in-memory implementation, backed by a
-//!   `parking_lot::RwLock<BTreeMap<..>>` and two atomics
+//!   `parking_lot::RwLock<BTreeMap<..>>` and two atomics. Nothing in it
+//!   survives the process.
+//! - **[`FileStore`]**: a persistent implementation, one append-only journal
+//!   file per store holding the filed frames and both sequence counters, so a
+//!   session resumes from its counters after a restart and a `ResendRequest`
+//!   is answered with the original frames. Configured by [`FileStoreConfig`].
 //!
-//! ## Not persistent
+//! ## What survives what
 //!
-//! [`MemoryStore`] is the **only** implementation — there is no file-based or
-//! memory-mapped store, so nothing here survives a process restart. A durable
-//! implementation is separate, tracked work; until it lands, restart recovery
-//! is a gap, not a feature.
+//! | Store | Process crash | OS crash or power loss |
+//! |---|---|---|
+//! | [`MemoryStore`] | nothing | nothing |
+//! | [`FileStore`], [`SyncPolicy::EveryWrite`] (default) | every write that returned `Ok` | every write that returned `Ok` |
+//! | [`FileStore`], [`SyncPolicy::EveryN`] | every write that returned `Ok` | all but at most the last `n - 1` |
+//! | [`FileStore`], [`SyncPolicy::Never`] | every write that returned `Ok` | nothing is promised |
+//!
+//! Only [`SyncPolicy::EveryWrite`] makes the engine's write order a guarantee
+//! against an OS crash or a power loss, and only under the engine's
+//! `StoreFailurePolicy::CloseSession` does a failed write keep its frame off
+//! the wire. These guarantees are stated for Unix. When a [`FileStore`]
+//! opens, it cuts only what an interrupted write can leave at the end of its
+//! journal; damage anywhere else makes it refuse to open
+//! (`StoreError::Corrupted`) until an operator runs [`FileStore::repair`],
+//! after which the session must reset its sequence. It never returns a record
+//! it cannot vouch for (see the [`file`](mod@file) module and
+//! `doc/adr/0006-file-store.md`). There is no memory-mapped store.
 
+pub mod file;
 pub mod memory;
 pub mod stored;
 pub mod traits;
 
+pub use file::{
+    FileStore, FileStoreConfig, FileStoreConfigError, SyncPolicy, Truncation, TruncationCause,
+};
 pub use memory::MemoryStore;
 pub use stored::StoredMessage;
 pub use traits::MessageStore;

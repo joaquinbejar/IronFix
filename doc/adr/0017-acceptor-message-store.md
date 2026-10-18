@@ -45,7 +45,7 @@ Active; the reactor, which both roles share, does the rest unchanged.
 
 A store belongs to exactly one engine instance: two engines or processes
 writing to one store would interleave two sequence streams. The owed-reset
-record lives in memory in the engine (#78, #89).
+record lives in memory in the engine (#111).
 
 ### One seeding helper for both roles
 
@@ -118,7 +118,8 @@ and the next number it expects from the other side is 2.
 The acceptor keeps the same owed-reset record as the initiator (ADR-0005): a
 failed close-time reset, or a failed reset for a session that resets, is owed
 to the next accepted Logon, whose acknowledgement then declares `141=Y` at 1;
-the record clears once that acknowledgement is sent. As in ADR-0005
+that reset is paid once that acknowledgement is sent, and a store write that
+fails while the acknowledgement is filed stays owed (ADR-0006). As in ADR-0005
 ("Cancellation and timeouts"), the reset is recorded as owed before it is
 awaited, so a `serve` dropped while it is pending still leaves it owed, and a
 store mutation that overruns the store timeout leaves a reset owed too; both

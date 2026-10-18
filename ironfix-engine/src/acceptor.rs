@@ -339,16 +339,17 @@ impl<A: Application + 'static> Acceptor<A> {
     /// is set, or a reset is owed) or [`Acceptor::with_initial_sequences`] is
     /// called, each session starts from the counters the store reports, and
     /// both counters are persisted back into it as the session runs, in the
-    /// order described in the [`persistence`](crate::persistence) module. Note
-    /// that [`MemoryStore`](ironfix_store::MemoryStore) is the only
-    /// implementation today and is **not** persistent, so this does not yet
-    /// survive a restart.
+    /// order described in the [`persistence`](crate::persistence) module. With
+    /// a [`FileStore`](ironfix_store::FileStore) the counters and the filed
+    /// frames survive a restart, as durably as its
+    /// [`SyncPolicy`](ironfix_store::SyncPolicy) promises; a
+    /// [`MemoryStore`](ironfix_store::MemoryStore) holds them in memory only.
     ///
     /// **One store, one engine.** The store must belong to this acceptor alone:
     /// two engines, or two processes, writing to one store would interleave two
     /// sequence streams in it. The record of a reset owed to the next session
     /// is held in memory by the acceptor, not in the store, so a restart
-    /// forgets it (#78, #89).
+    /// forgets it (#111).
     ///
     /// **Nothing reaches the store before the Logon is authenticated.** A Logon
     /// refused before `from_admin` has accepted it (wrong version, encryption,
@@ -779,6 +780,7 @@ impl<A: Application + 'static> Acceptor<A> {
         let runtime;
         let mut store;
         let reset;
+        let reset_ticket;
         {
             let raw = match wire::decode_frame(&logon_frame) {
                 Ok(raw) => raw,
@@ -1002,9 +1004,9 @@ impl<A: Application + 'static> Acceptor<A> {
             // is awaited until the acknowledgement declaring it is sent, so a
             // serve dropped or failed in between leaves it owed.
             reset = inbound_reset || self.config.reset_on_logon || self.store.reset_is_owed();
-            if reset && self.store.store().is_some() {
-                self.store.owe_reset();
-            }
+            // The ticket pays only this reset: a store write that fails while
+            // the acknowledgement is filed owes another.
+            reset_ticket = (reset && self.store.store().is_some()).then(|| self.store.owe_reset());
             let Seeded {
                 sequences,
                 persisted,
@@ -1132,10 +1134,11 @@ impl<A: Application + 'static> Acceptor<A> {
             lock_heartbeat(&runtime).on_message_sent();
         }
 
-        // The acknowledgement that declared the reset is on the wire: no reset
-        // is owed any more.
-        if reset {
-            self.store.reset_paid();
+        // The acknowledgement that declared the reset is on the wire: that
+        // reset is paid. A store write that failed during this handshake was
+        // owed after the ticket was taken, and stays owed.
+        if let Some(ticket) = reset_ticket {
+            self.store.reset_paid(ticket);
         }
 
         // Typestate: LogonReceived -> Active.

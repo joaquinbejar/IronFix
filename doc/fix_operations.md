@@ -430,7 +430,11 @@ each carrying `MsgSeqNum` = the first number it covers, `GapFillFlag` (123) = Y,
 - **stored frames that cannot be rebuilt** — a frame that does not decode, or
   that carries no `SendingTime` (52) to copy into `OrigSendingTime` and so
   cannot be resent conformantly;
-- **the whole range**, if the store itself returns an error.
+- **the rest of the range**, if the store returns an error reading it, except
+  `StoreError::Corrupted`: a store that finds its own records damaged cannot
+  say which messages it still holds intact, so the engine closes the session
+  instead of gap-filling them, and the counterparty asks again in the next
+  session.
 
 A gap fill allocates no sender sequence number either: it occupies the range it
 replaces. So answering a resend never moves the session's own outbound
@@ -448,10 +452,22 @@ single `SequenceReset`-GapFill with `MsgSeqNum` = BeginSeqNo and `NewSeqNo` as
 above. A counterparty asking for business traffic then receives a gap fill
 rather than the traffic.
 
-**Restart caveat.** `MemoryStore` is the only `MessageStore` implementation and
-is not persistent: it holds messages and sequence numbers in process memory
-only. Replay therefore works within a live process, but no message and no
-sequence number survives a restart. A durable store is separate, tracked work.
+**Across a restart.** `MemoryStore` holds messages and sequence numbers in
+process memory only, so with it replay works within a live process and
+nothing survives a restart. `FileStore` keeps the filed frames and both
+counters in a journal file: a session started on a reopened `FileStore`
+resumes from its counters, and a `ResendRequest` after the restart replays the
+original frames. What survives depends on its `SyncPolicy`: every write that
+returned `Ok` survives a process crash under every policy, and an OS crash or
+power loss only under `SyncPolicy::EveryWrite` (the default), and only under
+`StoreFailurePolicy::CloseSession` does a failed write keep its frame off the
+wire. When it opens, `FileStore` cuts only what an interrupted write can leave
+at the end of its journal (a cut record is never replayed); damage anywhere
+else makes it refuse to open with `StoreError::Corrupted` until an operator
+runs `FileStore::repair`, after which the session must reset its sequence
+(`ResetSeqNumFlag` (141) = Y). A missing journal is an error unless the store
+is configured to create it. These guarantees are stated for Unix
+(`doc/adr/0006-file-store.md`).
 
 **Store write order.** Every store call (`store`, `file_outbound`,
 `set_next_sender_seq`, `set_next_target_seq`, `reset`, `reset_to`, `refresh`,
@@ -550,13 +566,18 @@ close-time reset of `reset_on_logout` / `reset_on_disconnect` fails (no
 counter is then written) or when the reset for the counterparty's
 `ResetSeqNumFlag` fails. The `Initiator`'s next `connect` then resets the
 store before anything else, and its Logon declares `ResetSeqNumFlag` (141) = Y
-at `MsgSeqNum` 1, so the counterparty restarts the sequence with it; the
-record is cleared once that Logon is acknowledged. On the `Acceptor` (whose
+at `MsgSeqNum` 1, so the counterparty restarts the sequence with it; that
+reset is paid once that Logon is acknowledged. On the `Acceptor` (whose
 reset fails closed the same way for a session that resets), the next accepted
-Logon resets the store and its acknowledgement declares `141=Y` at 1; the
-record is cleared once that acknowledgement is sent. The record lives in the
-engine, in memory, so a process restart forgets it (#78, #89). For the same
-reason a store must belong to exactly one engine instance.
+Logon resets the store and its acknowledgement declares `141=Y` at 1; that
+reset is paid once that acknowledgement is sent. The record lives in the
+engine, in memory, so a process restart forgets it whichever store is
+attached; `FileStore` does not persist it. A crash after the counterparty
+acknowledged a `ResetSeqNumFlag` reset and before the store made it durable
+therefore restarts from the previous stream's counters; making the intent
+durable is #111. For the same reason a store
+must belong to exactly one engine instance; `FileStore` enforces this with a
+lock file.
 
 With a store attached, call `Initiator::connect` again only once the previous
 session's `Connection::wait_closed` has returned: until then the closing
@@ -568,19 +589,28 @@ with a closing session; one that arrives before then is refused as a duplicate,
 without a reply.
 
 *Cancellation and timeouts.* Every reset is recorded as owed before it is
-awaited and cleared only once it has succeeded, so a connect dropped while a
-reset is pending still leaves it owed. A store write that overruns the store
-timeout may still land later, so it too leaves a reset owed, and the next
-session starts with a reset and `ResetSeqNumFlag` (141) = Y. This relies on
+awaited and paid only once it has succeeded, so a connect dropped while a
+reset is pending still leaves it owed. The record is kept by generation:
+paying a reset settles what was owed before it started, never what was owed
+after, so a store write that fails during the handshake paying an owed reset
+(before or after the acknowledgement) still owes the next session a reset. A store write that overruns the store
+timeout may still land later, and one that fails may have changed the store
+before failing (the `MessageStore` contract cannot say otherwise), so either
+leaves a reset owed, under both policies, and the next session starts with a
+reset and `ResetSeqNumFlag` (141) = Y. This relies on
 the store applying its mutations in call order even when a call is dropped,
-which `MessageStore` now requires and `MemoryStore` satisfies; a store that
+which `MessageStore` now requires and `MemoryStore` and `FileStore` satisfy
+(`FileStore` runs each call behind a first-in, first-out lock held until its
+file I/O is done); a store that
 does not must not be reused after a timed-out write
 (`doc/adr/0005-fallible-store-writes.md`, "Cancellation and timeouts").
 
 The default `MessageStore::reset_to` is three calls, not one atomic write: a
 crash between them leaves the store cleared with its initial counters, and the
 next Logon goes out at 1 without `ResetSeqNumFlag`. A durable store should
-override it.
+override it. `FileStore` does: its `reset_to` writes a new journal and renames
+it into place, and its `file_outbound` writes the frame and the next sender
+number as one record.
 
 Not done: inbound frames are not filed (only the target counter is kept).
 
@@ -1489,15 +1519,14 @@ ADR-0011.
 - [x] Reject
 - [x] Sequence Reset
 - [x] Resend Request — inbound requests are validated, and with a
-  `MessageStore` attached (`Initiator::with_store`) the stored application
-  messages in the range are replayed with `PossDupFlag` (43) = Y and the
-  original `SendingTime` in `OrigSendingTime` (122), with administrative
-  messages and unavailable sequence numbers gap-filled. Three limits are worth
-  stating: the store is **opt-in**, and without one the whole range is still
-  answered with a single gap fill; the store can be attached to the
-  **initiator only**, since the `Acceptor` attaches none and so answers every
-  resend with gap fill; and `MemoryStore` is not persistent, so nothing is
-  replayable after a restart. Store writes are ordered (frame and next sender
+  `MessageStore` attached (`Initiator::with_store`, `Acceptor::with_store`)
+  the stored application messages in the range are replayed with
+  `PossDupFlag` (43) = Y and the original `SendingTime` in `OrigSendingTime`
+  (122), with administrative messages and unavailable sequence numbers
+  gap-filled. Two limits are worth stating: the store is **opt-in**, and
+  without one the whole range is still answered with a single gap fill; and
+  only `FileStore` replays after a restart (`MemoryStore` is not persistent),
+  as durably as its `SyncPolicy` promises. Store writes are ordered (frame and next sender
   number before the bytes, next target number before an inbound message is
   acted on) and fallible, under a `StoreFailurePolicy` that either warns and
   continues or fails closed; inbound delivery is at most once across a crash.

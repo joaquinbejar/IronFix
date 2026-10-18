@@ -60,7 +60,8 @@ A new defaulted method, `file_outbound(seq, msg_type, frame, next_sender)`,
 files an outbound frame and then persists the next sender number. The default
 calls `store()` and then `set_next_sender_seq()`, stopping at the first error.
 A durable store can override it to make both changes in one atomic write, and
-the engine then pays one call per outbound message instead of two.
+the engine then pays one call per outbound message instead of two. `FileStore`
+does, with one journal record (ADR-0006).
 
 A second defaulted method, `reset_to(next_sender, next_target)`, resets the
 store and then sets both counters, for the counterparty's reset on its Logon
@@ -69,7 +70,8 @@ stopping at the first error, and is **not atomic**: a crash between the calls
 leaves the store cleared with its initial counters, and the next session's
 Logon goes out at `MsgSeqNum` 1 without `ResetSeqNumFlag`, which the
 counterparty reads as too low. A durable store (#78) should override it with
-one atomic write.
+one atomic write; `FileStore` does, by renaming a new journal into place
+(ADR-0006).
 
 `store()` has **replace** semantics: filing under a number that is already
 filed replaces the frame there. The engine relies on it, because a crash after
@@ -225,7 +227,7 @@ then declares `ResetSeqNumFlag` = Y and starts at 1. Without the flag the
 retry would be stuck: after a failed ack reset the store still holds the old
 counters (Logon at 7 against a counterparty expecting 2, and a `ResendRequest`
 replaying old orders), and after a successful owed reset our Logon at 1 is
-too low for a counterparty that did not reset. The record is cleared once that
+too low for a counterparty that did not reset. That reset is paid once that
 Logon is acknowledged, so a connect that fails before then still owes it. It
 lives in the `Initiator`, not in the store: a process restart forgets it, and
 the next session starts from the counters the store still holds.
@@ -238,17 +240,22 @@ the store having finished:
 - **A dropped future.** A caller that drops a connect while a reset is
   pending, or a runtime that drops a closing session, runs no error branch.
   Every reset is therefore recorded as owed **before** the engine awaits it,
-  and the record is cleared only once the reset has succeeded (for a reset
-  declared on a Logon, once that Logon is acknowledged). This covers the
-  reset for a counterparty's `ResetSeqNumFlag` on the ack, the close-time
-  reset, and the reset at the start of a session that declares one.
+  and paid only once the reset has succeeded (for a reset declared on a
+  Logon, once that Logon is acknowledged). This covers the reset for a
+  counterparty's `ResetSeqNumFlag` on the ack, the close-time reset, and the
+  reset at the start of a session that declares one. Since #78 (ADR-0006)
+  the record is kept by generation: paying a reset settles what was owed
+  before it started and never what was owed after, so a store write that
+  fails during the handshake paying a reset stays owed.
 - **A timeout.** A timeout drops the call's future, not necessarily the work
   the store has already submitted: a disk or replication write can land
   later. After any **mutation** overruns the store timeout, the engine treats
   the store as possibly holding an outstanding write and records a reset as
   owed, so the next session starts a new stream (a reset, and
   `ResetSeqNumFlag` = Y) rather than building on counters a late write may
-  still move.
+  still move. Since #78 (ADR-0006) this applies to **every failed
+  mutation**, not only one that overruns: the contract gives a store no way
+  to say a failed write changed nothing, so its state after one is unknown.
 
 That second rule is sound only with a contract on the store, now stated in
 the `MessageStore` documentation: **mutations take effect in call order, even
