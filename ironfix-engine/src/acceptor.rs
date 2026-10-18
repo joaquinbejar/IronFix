@@ -21,8 +21,11 @@
 //! reconnection is the consumer's for the initiator: an `Acceptor` is a single
 //! configured session (one expected counterparty), and each accepted
 //! connection becomes its own live session with its own sequence state. A
-//! server that fronts several counterparties runs one accept loop and matches
-//! each inbound connection to the `Acceptor` configured for it.
+//! server that fronts several counterparties on one listener registers one
+//! `Acceptor` per counterparty in an
+//! [`AcceptorRegistry`](crate::AcceptorRegistry), which reads each inbound
+//! Logon once, routes it by the CompIDs it claims, and runs the routed
+//! `Acceptor`'s handshake on it, the same handshake `serve` runs.
 //!
 //! # Handshake conformance
 //!
@@ -175,6 +178,7 @@ use ironfix_session::{
     Connecting, Disconnected, HeartbeatManager, SequenceManager, Session, SessionConfig,
 };
 use ironfix_store::MessageStore;
+use ironfix_transport::CodecError;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -524,7 +528,7 @@ impl<A: Application + 'static> Acceptor<A> {
     /// [`EngineError::Config`] for an unusable configuration, and
     /// [`EngineError::UnsupportedVersion`] for a `BeginString` this engine
     /// cannot frame conformantly.
-    fn preflight(&self) -> Result<FixVersion, EngineError> {
+    pub(crate) fn preflight(&self) -> Result<FixVersion, EngineError> {
         if let Err(err) = &self.config_check {
             return Err(EngineError::Config(err.clone()));
         }
@@ -767,13 +771,63 @@ impl<A: Application + 'static> Acceptor<A> {
             .await
     }
 
+    /// Runs this session's handshake on a Logon that was read, and routed to
+    /// this acceptor, by an [`AcceptorRegistry`](crate::AcceptorRegistry).
+    ///
+    /// Everything [`Acceptor::serve`] does after the Logon has arrived is done
+    /// here unchanged: the same checks in the same order, the same refusal
+    /// policy, the same store order and the same reactor. What differs is only
+    /// what came before. The configuration check and `on_create` run now, once
+    /// the session is known, rather than before the read; the socket's codec
+    /// is replaced by this session's own (its message-size ceiling, checksum
+    /// setting and resync anchor), which governs every frame after the Logon;
+    /// and the Logon, framed under the registry's ceiling, is held to this
+    /// session's `max_message_size` too, so a frame this session's codec would
+    /// have refused is refused here, without a reply.
+    ///
+    /// # Errors
+    /// [`EngineError::Codec`] for a Logon above this session's
+    /// `max_message_size`; otherwise any error [`Acceptor::serve`] can produce
+    /// once the Logon has been read.
+    pub(crate) async fn serve_logon(
+        &self,
+        mut framed: FixFramed,
+        logon_frame: BytesMut,
+    ) -> Result<Connection, EngineError> {
+        let version = self.preflight()?;
+
+        let session_id = self.session_id.clone();
+        self.application.on_create(&session_id).await;
+
+        // Typestate: Disconnected -> Connecting (acceptor side).
+        let session = Session::<Disconnected>::new(session_id.to_string()).accept();
+
+        // From here on the socket is this session's: frames after the Logon
+        // are framed under its own settings, exactly as on `serve`. The codec
+        // holds no partial frame (it settles whenever it returns one), and any
+        // bytes already read stay in the `Framed` buffer for the new codec.
+        *framed.codec_mut() = session_codec(&self.config, version);
+        let max_size = self.config.max_message_size;
+        if logon_frame.len() > max_size {
+            let _ = session.disconnect();
+            return Err(CodecError::MessageTooLarge {
+                size: logon_frame.len(),
+                max_size,
+            }
+            .into());
+        }
+
+        self.complete_handshake(version, session, framed, logon_frame)
+            .await
+    }
+
     /// The acceptor half of the Logon handshake, from a Logon frame that has
     /// already been read (and decoded once) on `framed`, up to the spawned
     /// reactor.
     ///
-    /// Kept apart from the read in [`Acceptor::serve`], so a caller that has
-    /// already read the Logon can run exactly the same checks, refusals,
-    /// store order and reactor on it.
+    /// Shared by [`Acceptor::serve`] and the registry path
+    /// ([`Acceptor::serve_logon`]), so a routed session is checked, refused,
+    /// persisted and run exactly as a session served directly.
     ///
     /// # Errors
     /// Every handshake error [`Acceptor::serve`] documents after the read.

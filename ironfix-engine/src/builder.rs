@@ -6,9 +6,12 @@
 
 //! Engine builder for fluent configuration.
 //!
-//! [`EngineBuilder`] collects an [`Application`] and a session configuration
+//! [`EngineBuilder`] collects an [`Application`] and session configurations
 //! and terminates in a ready-to-run engine: [`EngineBuilder::into_initiator`]
-//! for the client side, [`EngineBuilder::into_acceptor`] for the server side.
+//! for the client side, [`EngineBuilder::into_acceptor`] for one server-side
+//! session, and [`EngineBuilder::into_acceptor_registry`] for several
+//! server-side sessions on one listener, each inbound Logon routed to its
+//! session by CompID.
 //!
 //! Every setter on this builder configures something an engine actually honors.
 //! The builder does **not** carry TLS or reconnection knobs: there is no TLS in
@@ -17,12 +20,15 @@
 //! calls it again). The connect timeout applies to the initiator only; an
 //! acceptor waits for inbound connections and bounds the Logon handshake with
 //! [`SessionConfig::logon_timeout`] instead. A [`MessageStore`] set with
-//! [`EngineBuilder::with_store`] is attached by both terminal methods.
+//! [`EngineBuilder::with_store`] is attached by every terminal method; since a
+//! store belongs to exactly one session, a registry of several sessions takes
+//! its stores per session through [`AcceptorRegistry::register`] instead.
 
 use crate::acceptor::Acceptor;
 use crate::application::{Application, NoOpApplication};
 use crate::error::EngineError;
 use crate::initiator::Initiator;
+use crate::registry::AcceptorRegistry;
 use ironfix_session::config::SessionConfig;
 use ironfix_store::MessageStore;
 use std::sync::Arc;
@@ -32,7 +38,9 @@ use std::time::Duration;
 ///
 /// Set the [`Application`] and add exactly one [`SessionConfig`], then call
 /// [`EngineBuilder::into_initiator`] or [`EngineBuilder::into_acceptor`] to
-/// obtain a runnable engine.
+/// obtain a runnable engine; or add one per counterparty and call
+/// [`EngineBuilder::into_acceptor_registry`] to serve them all on one
+/// listener.
 pub struct EngineBuilder<A: Application = NoOpApplication> {
     /// Application callback handler.
     application: Arc<A>,
@@ -89,9 +97,10 @@ impl<A: Application + 'static> EngineBuilder<A> {
 
     /// Adds a session configuration.
     ///
-    /// The terminal methods build a single-session engine, so exactly one
-    /// session must be added before [`EngineBuilder::into_initiator`] or
-    /// [`EngineBuilder::into_acceptor`] is called.
+    /// [`EngineBuilder::into_initiator`] and [`EngineBuilder::into_acceptor`]
+    /// build a single-session engine, so exactly one session must be added
+    /// before either is called. [`EngineBuilder::into_acceptor_registry`]
+    /// takes any number.
     #[must_use]
     pub fn add_session(mut self, config: SessionConfig) -> Self {
         self.sessions.push(config);
@@ -106,13 +115,14 @@ impl<A: Application + 'static> EngineBuilder<A> {
         self
     }
 
-    /// Attaches a message store to the engine either terminal method
-    /// produces.
+    /// Attaches a message store to the engine a terminal method produces.
     ///
     /// [`EngineBuilder::into_initiator`] passes it to
     /// [`Initiator::with_store`] and [`EngineBuilder::into_acceptor`] to
     /// [`Acceptor::with_store`]; see those for what a store changes. The store
     /// failure policy and the store timeout are set on the engine itself.
+    /// [`EngineBuilder::into_acceptor_registry`] attaches it only to a
+    /// registry of exactly one session: a store belongs to one session.
     #[must_use]
     pub fn with_store(mut self, store: Arc<dyn MessageStore>) -> Self {
         self.store = Some(store);
@@ -176,6 +186,45 @@ impl<A: Application + 'static> EngineBuilder<A> {
         })
     }
 
+    /// Consumes the builder and produces an [`AcceptorRegistry`] with one
+    /// [`Acceptor`] per configured session, all sharing the application, so
+    /// several counterparties can be served on one listener with each inbound
+    /// Logon routed to its session by CompID.
+    ///
+    /// Any number of sessions may be added, none included (sessions can also
+    /// be registered later with [`AcceptorRegistry::register`]). A store set
+    /// with [`EngineBuilder::with_store`] is attached when exactly one session
+    /// is configured. For several sessions with stores, or with per-session
+    /// settings (failure policy, timeouts, initial sequences), build each
+    /// [`Acceptor`] and register it on the registry directly.
+    ///
+    /// # Errors
+    /// [`EngineError::Configuration`] when a store has been set and more than
+    /// one session is configured: a store belongs to exactly one session, and
+    /// two sessions writing to one store would interleave their sequence
+    /// streams. Otherwise any error [`AcceptorRegistry::register`] returns for
+    /// a session: an unusable configuration or version, two sessions whose
+    /// identities overlap, or the same session twice.
+    pub fn into_acceptor_registry(self) -> Result<AcceptorRegistry<A>, EngineError> {
+        if self.store.is_some() && self.sessions.len() > 1 {
+            return Err(EngineError::Configuration(format!(
+                "a store was set for {} sessions, but a store belongs to exactly one session: \
+                 attach one store per session with AcceptorRegistry::register",
+                self.sessions.len()
+            )));
+        }
+        let registry = AcceptorRegistry::new();
+        for config in self.sessions {
+            let acceptor = Acceptor::new(config, Arc::clone(&self.application));
+            let acceptor = match &self.store {
+                Some(store) => acceptor.with_store(Arc::clone(store)),
+                None => acceptor,
+            };
+            registry.register(acceptor)?;
+        }
+        Ok(registry)
+    }
+
     /// Extracts the single configured session, or explains why there is not
     /// exactly one.
     fn single_session(&self) -> Result<SessionConfig, EngineError> {
@@ -185,7 +234,8 @@ impl<A: Application + 'static> EngineBuilder<A> {
                 "no session configured: add exactly one with add_session".to_string(),
             )),
             many => Err(EngineError::Configuration(format!(
-                "{} sessions configured, but a single-session engine requires exactly one",
+                "{} sessions configured, but a single-session engine requires exactly one \
+                 (into_acceptor_registry serves several acceptor sessions)",
                 many.len()
             ))),
         }
@@ -270,6 +320,82 @@ mod tests {
         match EngineBuilder::new().into_initiator() {
             Err(EngineError::Configuration(detail)) => assert!(detail.contains("no session")),
             other => panic!("an empty builder must fail with Configuration, got {other:?}"),
+        }
+    }
+
+    fn member_session(member: &str) -> SessionConfig {
+        SessionConfig::new(comp_id("VENUE"), comp_id(member), "FIX.4.4")
+    }
+
+    #[test]
+    fn test_into_acceptor_registry_registers_every_session() {
+        let registry = EngineBuilder::new()
+            .add_session(member_session("MEMBER_A"))
+            .add_session(member_session("MEMBER_B"))
+            .into_acceptor_registry();
+
+        match registry {
+            Ok(registry) => {
+                let mut ids: Vec<String> = registry
+                    .session_ids()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                ids.sort();
+                assert_eq!(ids, ["FIX.4.4:VENUE->MEMBER_A", "FIX.4.4:VENUE->MEMBER_B"]);
+            }
+            Err(err) => panic!("two disjoint sessions must build a registry: {err}"),
+        }
+    }
+
+    #[test]
+    fn test_into_acceptor_registry_without_session_is_empty() {
+        match EngineBuilder::new().into_acceptor_registry() {
+            Ok(registry) => assert!(registry.session_ids().is_empty()),
+            Err(err) => panic!("an empty registry must build: {err}"),
+        }
+    }
+
+    #[test]
+    fn test_into_acceptor_registry_refuses_one_store_for_several_sessions() {
+        let store: Arc<dyn MessageStore> = Arc::new(ironfix_store::MemoryStore::new());
+        match EngineBuilder::new()
+            .add_session(member_session("MEMBER_A"))
+            .add_session(member_session("MEMBER_B"))
+            .with_store(store)
+            .into_acceptor_registry()
+        {
+            Err(EngineError::Configuration(detail)) => {
+                assert!(detail.contains("exactly one session"), "got {detail}");
+            }
+            other => panic!("one store for two sessions must be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_into_acceptor_registry_accepts_a_store_for_one_session() {
+        let store: Arc<dyn MessageStore> = Arc::new(ironfix_store::MemoryStore::new());
+        let registry = EngineBuilder::new()
+            .add_session(member_session("MEMBER_A"))
+            .with_store(store)
+            .into_acceptor_registry();
+        match registry {
+            Ok(registry) => assert_eq!(registry.session_ids().len(), 1),
+            Err(err) => panic!("one store for one session must build: {err}"),
+        }
+    }
+
+    #[test]
+    fn test_into_acceptor_registry_refuses_overlapping_sessions() {
+        match EngineBuilder::new()
+            .add_session(member_session("MEMBER_A"))
+            .add_session(member_session("MEMBER_A"))
+            .into_acceptor_registry()
+        {
+            Err(EngineError::Configuration(detail)) => {
+                assert!(detail.contains("overlaps"), "got {detail}");
+            }
+            other => panic!("the same session twice must be refused: {other:?}"),
         }
     }
 

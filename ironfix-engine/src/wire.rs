@@ -222,6 +222,26 @@ fn in_standard_header(raw: &RawMessage<'_>, tag: u32) -> bool {
     false
 }
 
+/// Returns the value of the first `tag` in the standard header of `raw`, or
+/// `None` when the header carries no `tag`.
+///
+/// The header is the leading run of standard-header tags, as for
+/// [`in_standard_header`]: a `tag` that occurs only in the body is not found.
+/// One scan, no allocation, and the value is returned as raw bytes, so a
+/// caller bounding an untrusted value sees every byte before deciding whether
+/// it is text at all.
+pub(crate) fn header_field<'a>(raw: &RawMessage<'a>, tag: u32) -> Option<&'a [u8]> {
+    for field in raw.fields() {
+        if field.tag == tag {
+            return Some(field.value);
+        }
+        if !is_standard_header_tag(field.tag) {
+            return None;
+        }
+    }
+    None
+}
+
 /// Reads `MsgSeqNum` (34) from the standard header of `raw`.
 ///
 /// A tag 34 that appears only in the message body is treated as **absent**: it
@@ -1854,6 +1874,29 @@ mod tests {
         ]);
 
         assert_eq!(identity.validate(&decode(&frame)), Ok(()));
+    }
+
+    #[test]
+    fn test_header_field_reads_the_header_only_and_returns_raw_bytes() {
+        let frame = frame_with_raw_fields(&[
+            (35, b"A"),
+            (49, b"CLIENT"),
+            (56, b"VENUE"),
+            (34, b"1"),
+            (142, b"LON\x80"),
+            (52, b"20260721-10:00:00.000"),
+            (98, b"0"),
+            // Body: a 57 here is not the header's.
+            (57, b"DESK"),
+        ]);
+        let raw = decode(&frame);
+
+        assert_eq!(header_field(&raw, 49), Some(&b"CLIENT"[..]));
+        assert_eq!(header_field(&raw, 56), Some(&b"VENUE"[..]));
+        // Not UTF-8, returned as bytes for the caller to bound.
+        assert_eq!(header_field(&raw, 142), Some(&b"LON\x80"[..]));
+        assert_eq!(header_field(&raw, 57), None);
+        assert_eq!(header_field(&raw, 50), None);
     }
 
     #[test]

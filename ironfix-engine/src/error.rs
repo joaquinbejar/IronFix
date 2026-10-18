@@ -161,6 +161,39 @@ pub enum EngineError {
         detail: String,
     },
 
+    /// An inbound Logon cannot be routed to a session by an
+    /// [`AcceptorRegistry`](crate::AcceptorRegistry): one of its identity
+    /// fields is absent from the standard header (`SenderCompID` (49),
+    /// `TargetCompID` (56)), empty, longer than
+    /// [`MAX_ID_LEN`](ironfix_session::config::MAX_ID_LEN) bytes, or carries
+    /// a byte outside printable ASCII.
+    ///
+    /// Checked before any registered session or the lookup is consulted. The
+    /// connection is closed without a reply; no store is touched and no
+    /// [`Application`](crate::Application) callback runs.
+    #[error("unroutable logon: tag {tag} {detail}")]
+    UnroutableLogon {
+        /// The identity field that failed: 49, 56, 50, 57, 142 or 143.
+        tag: u32,
+        /// What is wrong with it. It never quotes the value.
+        detail: String,
+    },
+
+    /// No session is registered in an
+    /// [`AcceptorRegistry`](crate::AcceptorRegistry) for the identity an
+    /// inbound Logon claims, and no
+    /// [`SessionLookup`](crate::SessionLookup) admitted one.
+    ///
+    /// The connection is closed without a reply; no store is touched and no
+    /// [`Application`](crate::Application) callback runs.
+    #[error("no session for the logon identity {identity}")]
+    UnknownSession {
+        /// The identity the Logon claimed, in its own orientation (its
+        /// `SenderCompID` (49) first). Every value in it has passed the
+        /// routing bounds, so it is at most a few hundred printable bytes.
+        identity: String,
+    },
+
     /// The Logon acknowledgement carried a `BeginString` (8) that does not
     /// match the configured session version.
     ///

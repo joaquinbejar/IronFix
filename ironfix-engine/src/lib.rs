@@ -18,9 +18,17 @@
 //!   CompID validation, sequence-gap detection, `ResendRequest` /
 //!   `SequenceReset` / gap fill, `PossDupFlag` and `OrigSendingTime`,
 //!   `ResetSeqNumFlag`, resend-from-store replay, and session-level `Reject`.
-//! - **[`Acceptor`]**: the server-side engine. [`Acceptor::serve`] runs the
-//!   acceptor half of the Logon handshake on an inbound connection and hands the
-//!   socket to the same reactor.
+//! - **[`Acceptor`]**: the server-side engine for one configured session.
+//!   [`Acceptor::serve`] runs the acceptor half of the Logon handshake on an
+//!   inbound connection and hands the socket to the same reactor.
+//! - **[`AcceptorRegistry`]**: many acceptor sessions on one listener.
+//!   [`AcceptorRegistry::serve`] reads the inbound Logon once, routes it by
+//!   the CompIDs (and configured sub and location IDs) it claims, read from
+//!   the standard header and bounded before anything is looked up, to a
+//!   registered [`Acceptor`] or one a [`SessionLookup`] admits, and runs that
+//!   session's handshake on it. A Logon that cannot be routed is closed
+//!   without a reply, touching no store and running no callback. Each session
+//!   keeps its own sequence numbers, store and heartbeat.
 //! - **[`Connection`]**: a cheap-clone handle returned by both engines — send,
 //!   logout, await close, read sequence numbers.
 //! - **[`OutboundMessage`]**: the body you hand to [`Connection::send`]; the
@@ -29,7 +37,7 @@
 //!   (`on_create` / `on_logon` / `on_logout` / `to_admin` / `from_admin` /
 //!   `to_app` / `from_app`), plus [`NoOpApplication`].
 //! - **[`EngineBuilder`]**: fluent configuration that terminates in a
-//!   ready-to-run [`Initiator`] or [`Acceptor`].
+//!   ready-to-run [`Initiator`], [`Acceptor`] or [`AcceptorRegistry`].
 //!
 //! Both engines share the same internal session reactor (`reactor`): once
 //! a Logon handshake completes, the inbound-frame contract — sequence
@@ -85,6 +93,7 @@ pub mod initiator;
 pub mod outbound;
 pub mod persistence;
 mod reactor;
+pub mod registry;
 mod wire;
 
 pub use acceptor::Acceptor;
@@ -95,6 +104,7 @@ pub use error::EngineError;
 pub use initiator::Initiator;
 pub use outbound::{OutboundField, OutboundMessage};
 pub use persistence::StoreFailurePolicy;
+pub use registry::{AcceptorRegistry, LogonIdentity, SessionLookup};
 
 // Re-exported for convenience: the per-session configuration consumed by
 // [`Initiator`].

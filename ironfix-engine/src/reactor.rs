@@ -373,11 +373,18 @@ pub(crate) enum HandshakeRead {
 /// only, never frame bytes. The codec's count is drained here, so nothing
 /// skipped during the handshake counts toward
 /// [`SessionConfig::garbled_frame_limit`], which governs the Active session.
-pub(crate) async fn read_handshake_frame(
+///
+/// `session_id` labels the report: the session's identifier, or, before an
+/// [`AcceptorRegistry`](crate::AcceptorRegistry) has routed the Logon to a
+/// session, a fixed label that names no counterparty.
+pub(crate) async fn read_handshake_frame<S>(
     framed: &mut FixFramed,
     logon_timeout: Duration,
-    session_id: &SessionId,
-) -> HandshakeRead {
+    session_id: &S,
+) -> HandshakeRead
+where
+    S: std::fmt::Display + Sync + ?Sized,
+{
     let mut skips = HandshakeSkips::default();
     let outcome = match timeout(logon_timeout, next_decodable_frame(framed, &mut skips)).await {
         Err(_) => HandshakeRead::TimedOut,
