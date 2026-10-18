@@ -327,8 +327,11 @@ impl Dictionary {
 
 /// Intermediate representation of a member of a message, component,
 /// group, header, or trailer, preserving document order.
+///
+/// Crate-internal so that another loader can resolve its own references into
+/// these name references and hand them to the same [`assemble`] step.
 #[derive(Debug)]
-enum Item {
+pub(crate) enum Item {
     /// Field reference.
     Field {
         /// Field name.
@@ -355,11 +358,15 @@ enum Item {
 }
 
 /// Intermediate representation of a `<message>` element.
-struct MessageIr {
-    name: String,
-    msg_type: String,
-    category: MessageCategory,
-    items: Vec<Item>,
+pub(crate) struct MessageIr {
+    /// Message name.
+    pub(crate) name: String,
+    /// Message type (tag 35).
+    pub(crate) msg_type: String,
+    /// Admin or application message.
+    pub(crate) category: MessageCategory,
+    /// Members, in document order.
+    pub(crate) items: Vec<Item>,
 }
 
 impl MessageIr {
@@ -382,7 +389,7 @@ impl MessageIr {
 /// Component definitions collected from the `<components>` section, in
 /// declaration order.
 #[derive(Default)]
-struct ComponentIrs {
+pub(crate) struct ComponentIrs {
     /// Members of each component, keyed by name.
     items: HashMap<String, Vec<Item>>,
     /// Component names in declaration order.
@@ -391,7 +398,7 @@ struct ComponentIrs {
 
 impl ComponentIrs {
     /// Registers one component definition, rejecting a duplicate name.
-    fn define(&mut self, name: String, items: Vec<Item>) -> Result<(), DictionaryError> {
+    pub(crate) fn define(&mut self, name: String, items: Vec<Item>) -> Result<(), DictionaryError> {
         if self.items.contains_key(&name) {
             return Err(DictionaryError::DuplicateDefinition {
                 kind: DefinitionKind::Component,
@@ -896,6 +903,54 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
     let version =
         version.ok_or_else(|| DictionaryError::Xml("missing root <fix> element".to_string()))?;
 
+    assemble(Assembly {
+        version,
+        fields: field_defs,
+        header: header_items,
+        trailer: trailer_items,
+        components: component_defs,
+        messages: message_irs,
+    })
+}
+
+/// A parsed dictionary document, its references still by name, ready for
+/// [`assemble`].
+pub(crate) struct Assembly {
+    /// The version the document declares.
+    pub(crate) version: Version,
+    /// Field definitions, in document order.
+    pub(crate) fields: Vec<FieldDef>,
+    /// Header members.
+    pub(crate) header: Vec<Item>,
+    /// Trailer members.
+    pub(crate) trailer: Vec<Item>,
+    /// Component definitions.
+    pub(crate) components: ComponentIrs,
+    /// Message definitions, in document order.
+    pub(crate) messages: Vec<MessageIr>,
+}
+
+/// Builds a [`Dictionary`] from a parsed document: the step the QuickFIX and
+/// the Orchestra loaders share.
+///
+/// Checks the component graph ([`check_component_graph`]) before resolving
+/// anything, rejects duplicate field names and tags and duplicate message
+/// types, resolves every name reference, and builds each definition with its
+/// members in document order.
+///
+/// # Errors
+/// Returns [`DictionaryError`] for a component cycle, a dangling or over-deep
+/// component reference, a duplicate definition, an unknown field name, or an
+/// empty group.
+pub(crate) fn assemble(assembly: Assembly) -> Result<Dictionary, DictionaryError> {
+    let Assembly {
+        version,
+        fields: field_defs,
+        header: header_items,
+        trailer: trailer_items,
+        components: component_defs,
+        messages: message_irs,
+    } = assembly;
     let ComponentIrs {
         items: component_irs,
         order: component_order,
