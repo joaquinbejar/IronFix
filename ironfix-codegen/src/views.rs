@@ -2199,6 +2199,10 @@ struct WriterUses {
     character: bool,
     /// Multi-value tokens: not empty, no space, no SOH.
     token: bool,
+    /// Text, enumeration and token values checked against their FIX type.
+    grammar: bool,
+    /// Non-negative integers checked against their FIX type.
+    number: bool,
     display: bool,
     decimal: bool,
     enums: bool,
@@ -2216,6 +2220,9 @@ impl WriterUses {
                         uses.data |= field.kind == Kind::Bytes;
                         uses.character |= field.kind == Kind::Char;
                         uses.token |= matches!(field.kind, Kind::Tokens(_));
+                        uses.grammar |=
+                            matches!(field.kind, Kind::Str | Kind::Enum(_) | Kind::Tokens(_));
+                        uses.number |= field.kind == Kind::UInt;
                         uses.display |=
                             matches!(field.kind, Kind::Int | Kind::UInt | Kind::Decimal);
                         uses.decimal |= field.kind == Kind::Decimal;
@@ -2313,6 +2320,9 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
     if uses.decimal {
         line(code, "    use ::rust_decimal::Decimal;");
     }
+    if uses.grammar || uses.number {
+        line(code, "    use ::ironfix_dictionary::FieldType;");
+    }
     if uses.enums {
         line(code, "    use super::enums;");
     }
@@ -2333,7 +2343,7 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
         }
     }
     let emitted = [uses.text, uses.data, uses.character, uses.token];
-    if emitted.contains(&true) {
+    if emitted.contains(&true) || uses.grammar || uses.number {
         for text in [
             "",
             "    /// Builds the invalid-value error of `tag`.",
@@ -2362,8 +2372,51 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
         line(code, "        }");
         line(code, "    }");
     }
+    if uses.grammar {
+        for text in [
+            "",
+            "    /// Refuses a value that does not match the grammar of `field_type`, the rule the validator",
+            "    /// applies.",
+            "    fn check_grammar(value: Option<&[u8]>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {",
+            "        let Some(bytes) = value else {",
+            "            return Ok(());",
+            "        };",
+            "        match ::core::str::from_utf8(bytes) {",
+            "            Ok(text) if field_type.is_valid_value(text) => Ok(()),",
+            "            _ => Err(invalid(tag, format!(\"the value is not a valid {field_type:?} value\"))),",
+            "        }",
+            "    }",
+        ] {
+            line(code, text);
+        }
+    }
     if uses.display {
         emit_display_helper(code);
+    }
+    if uses.number {
+        // `check_number` formats with the display helper's buffer, which is
+        // emitted whenever a number is written, so whenever it is checked.
+        for text in [
+            "",
+            "    /// Refuses a number whose decimal form does not match the grammar of `field_type` (a",
+            "    /// `DayOfMonth` outside 1 to 31).",
+            "    fn check_number<T: ::core::fmt::Display>(value: Option<T>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {",
+            "        let Some(value) = value else {",
+            "            return Ok(());",
+            "        };",
+            &format!(
+                "        let mut buffer = Buffer {{ bytes: [0; {FORMAT_BUFFER_BYTES}], len: 0 }};"
+            ),
+            "        let written = ::core::fmt::Write::write_fmt(&mut buffer, format_args!(\"{value}\"));",
+            "        let text = buffer.bytes.get(..buffer.len).and_then(|bytes| ::core::str::from_utf8(bytes).ok());",
+            "        match (written, text) {",
+            "            (Ok(()), Some(text)) if field_type.is_valid_value(text) => Ok(()),",
+            "            _ => Err(invalid(tag, format!(\"{value} is not a valid {field_type:?} value\"))),",
+            "        }",
+            "    }",
+        ] {
+            line(code, text);
+        }
     }
     for message in &model.messages {
         let name = format!("{}Fields", message.base);
@@ -2422,8 +2475,8 @@ fn emit_sink(code: &mut String) {
         "        /// Writes field `tag` with `value`.",
         "        ///",
         "        /// The writers have checked, before writing anything, that `value` is not empty and carries",
-        "        /// no SOH, that a character is printable ASCII, and that every multi-value token is non-empty",
-        "        /// with no space. A number or group count is formatted in decimal.",
+        "        /// no SOH, that it matches its field's FIX type (`FieldType::is_valid_value`), that a character",
+        "        /// is printable ASCII, and that every multi-value token is non-empty with no space. A number or\n        /// group count is formatted in decimal.",
         "        fn field(&mut self, tag: u32, value: &[u8]);",
         "",
         "        /// Writes a LENGTH/DATA pair: the length field, holding the size of `value` in bytes, then",
@@ -2591,21 +2644,34 @@ fn writer_checks(level: &Level) -> Vec<String> {
                     checks.push(format!("present({present}, {})?;", field.tag));
                 }
                 let tag = field.tag;
+                let grammar = format!("FieldType::{:?}", field.field_type);
                 match field.kind {
-                    Kind::Str => checks.push(format!(
-                        "check_text(self.{ident}.map(str::as_bytes), {tag})?;"
-                    )),
-                    Kind::Enum(_) => checks.push(format!(
-                        "check_text(self.{ident}.map(|value| value.as_bytes()), {tag})?;"
-                    )),
+                    Kind::Str => {
+                        let bytes = format!("self.{ident}.map(str::as_bytes)");
+                        checks.push(format!("check_text({bytes}, {tag})?;"));
+                        checks.push(format!("check_grammar({bytes}, {grammar}, {tag})?;"));
+                    }
+                    Kind::Enum(_) => {
+                        let bytes = format!("self.{ident}.map(|value| value.as_bytes())");
+                        checks.push(format!("check_text({bytes}, {tag})?;"));
+                        checks.push(format!("check_grammar({bytes}, {grammar}, {tag})?;"));
+                    }
                     Kind::Bytes => checks.push(format!("check_data(self.{ident}, {tag})?;")),
+                    // A printable ASCII character is always one valid `char`.
                     Kind::Char => checks.push(format!("check_char(self.{ident}, {tag})?;")),
+                    Kind::UInt => {
+                        checks.push(format!("check_number(self.{ident}, {grammar}, {tag})?;"));
+                    }
                     Kind::Tokens(_) => {
                         checks.push(format!("for value in self.{ident} {{"));
                         checks.push(format!("    check_token(value.as_bytes(), {tag})?;"));
+                        checks.push(format!(
+                            "    check_grammar(Some(value.as_bytes()), {grammar}, {tag})?;"
+                        ));
                         checks.push("}".to_string());
                     }
-                    Kind::Bool | Kind::Int | Kind::UInt | Kind::Decimal => {}
+                    // Formatted by the writer itself: always valid.
+                    Kind::Bool | Kind::Int | Kind::Decimal => {}
                 }
             }
             Member::Group(group) => {
@@ -2752,8 +2818,9 @@ fn emit_writer(
             "        /// # Errors",
             "        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry",
             "        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a",
-            "        /// value other than data, a `char` that is not printable ASCII, or a multi-value token",
-            "        /// that is empty or carries a space. All are checked before anything is written.",
+            "        /// value other than data, a value that does not match its field's FIX type, a `char` that",
+            "        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are",
+            "        /// checked before anything is written.",
         ] {
             line(code, text);
         }

@@ -154,8 +154,18 @@ field, required group or entry delimiter is
 `EncodeError::MissingRequiredField`. An empty value, SOH in any value other
 than `data`, a `char` that is not printable ASCII, and a multi-value token
 that is empty or carries a space or SOH are `EncodeError::InvalidFieldValue`.
-`data` may carry SOH (it goes through `Sink::data`) but not be empty. The
-sink is therefore only ever handed a value it can write.
+So is a value that does not match its field's FIX type, checked with the
+validator's own `FieldType::is_valid_value`: a string (a malformed
+`UTCTimestamp`, a two-letter `Currency`), a non-negative integer (a
+`DayOfMonth` outside 1 to 31), an enumeration value (an `Other(b"AB")` on a
+`char` field) and each multi-value token (a `MultipleCharValue` token longer
+than one character). Integers, decimals and booleans are formatted by the
+writer and always match; a printable ASCII `char` is always one valid
+character. `data` may carry SOH (it goes through `Sink::data`) but not be
+empty. The sink is therefore only ever handed a value it can write, in a
+form the validator accepts; an undeclared enumeration value of the right form
+is still written (`Other` exists to carry it), and the validator would report
+it as an undeclared value.
 
 **Lint-clean by construction.** The generated text has no `#[allow]`, and
 must pass `-D warnings` and the default clippy lints for any dictionary:

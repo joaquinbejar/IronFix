@@ -1577,3 +1577,132 @@ fn test_generated_view_reads_an_empty_top_level_group_like_the_layout() {
     );
     assert_eq!(ok(view.text(), "message-level Text"), Some("top"));
 }
+
+#[test]
+fn test_writer_refuses_values_that_do_not_match_their_fix_type() {
+    use sample::enums::{Flags, Side};
+    use sample::writers::{NewOrderSingleFields, TypeSamplerFields, TypeSamplerNoDocsFields};
+
+    let calls = Cell::new(0usize);
+    let docs = [TypeSamplerNoDocsFields {
+        encoded_text: Some(&b"x"[..]),
+        doc_name: None,
+    }];
+    let valid = TypeSamplerFields {
+        no_docs: &docs,
+        ..TypeSamplerFields::default()
+    };
+    let refused = |fields: TypeSamplerFields<'_>, tag: u32, what: &str| {
+        let mut sink = |_tag: u32, _value: &[u8]| calls.set(calls.get() + 1);
+        assert!(
+            matches!(
+                fields.write(&mut sink),
+                Err(EncodeError::InvalidFieldValue { tag: found, .. }) if found == tag
+            ),
+            "{what}"
+        );
+    };
+    refused(
+        TypeSamplerFields {
+            transact_time: Some("2026-07-12 10:00"),
+            ..valid
+        },
+        60,
+        "a malformed UTCTimestamp",
+    );
+    refused(
+        TypeSamplerFields {
+            sample_time: Some("10:00"),
+            ..valid
+        },
+        5010,
+        "a malformed UTCTimeOnly",
+    );
+    refused(
+        TypeSamplerFields {
+            maturity_month_year: Some("2026"),
+            ..valid
+        },
+        200,
+        "a malformed MonthYear",
+    );
+    refused(
+        TypeSamplerFields {
+            currency: Some("EU"),
+            ..valid
+        },
+        15,
+        "a two-letter Currency",
+    );
+    refused(
+        TypeSamplerFields {
+            country: Some("USA"),
+            ..valid
+        },
+        421,
+        "a three-letter Country",
+    );
+    for day in [0, 32] {
+        refused(
+            TypeSamplerFields {
+                maturity_day: Some(day),
+                ..valid
+            },
+            205,
+            "a DayOfMonth outside 1 to 31",
+        );
+    }
+    refused(
+        TypeSamplerFields {
+            labels: Some("a  b"),
+            ..valid
+        },
+        5013,
+        "an empty MultipleStringValue token",
+    );
+    refused(
+        TypeSamplerFields {
+            flags: &[Flags::Alpha, Flags::Other(b"AB")],
+            ..valid
+        },
+        5014,
+        "a MultipleCharValue token longer than one character",
+    );
+    let order = NewOrderSingleFields {
+        cl_ord_id: Some("ORDER-1"),
+        side: Some(Side::Other(b"AB")),
+        transact_time: Some("20260712-10:00:01"),
+        symbol: Some("EURUSD"),
+        ..NewOrderSingleFields::default()
+    };
+    let mut sink = |_tag: u32, _value: &[u8]| calls.set(calls.get() + 1);
+    assert!(
+        matches!(
+            order.write(&mut sink),
+            Err(EncodeError::InvalidFieldValue { tag: 54, .. })
+        ),
+        "an undeclared value too long for a char field"
+    );
+    assert_eq!(calls.get(), 0, "nothing is written when a check fails");
+
+    // The same fields with well-formed values write, and validate.
+    let sampler = TypeSamplerFields {
+        transact_time: Some("20260712-10:00:00.123"),
+        sample_time: Some("10:00:00"),
+        sample_date: Some("20260712"),
+        trade_date: Some("20260712"),
+        maturity_month_year: Some("202607w2"),
+        maturity_day: Some(31),
+        country: Some("US"),
+        currency: Some("EUR"),
+        labels: Some("a b"),
+        flags: &[Flags::Alpha, Flags::Bravo],
+        no_docs: &docs,
+        ..TypeSamplerFields::default()
+    };
+    let bytes = encode("U1", |encoder| sampler.write(encoder));
+    let mut decoder = Decoder::new(&bytes);
+    let msg = ok(decoder.decode(), "the written frame decodes");
+    let dict = views_common::views_sample_dictionary();
+    assert_eq!(Validator::new(&dict).validate(&msg), Ok(()));
+}

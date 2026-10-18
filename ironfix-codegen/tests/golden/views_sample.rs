@@ -965,6 +965,7 @@ pub mod views {
 pub mod writers {
     use ::ironfix_core::error::EncodeError;
     use ::rust_decimal::Decimal;
+    use ::ironfix_dictionary::FieldType;
     use super::enums;
 
     /// Where a writer sends a body, one call per field.
@@ -997,8 +998,9 @@ pub mod writers {
         /// Writes field `tag` with `value`.
         ///
         /// The writers have checked, before writing anything, that `value` is not empty and carries
-        /// no SOH, that a character is printable ASCII, and that every multi-value token is non-empty
-        /// with no space. A number or group count is formatted in decimal.
+        /// no SOH, that it matches its field's FIX type (`FieldType::is_valid_value`), that a character
+        /// is printable ASCII, and that every multi-value token is non-empty with no space. A number or
+        /// group count is formatted in decimal.
         fn field(&mut self, tag: u32, value: &[u8]);
 
         /// Writes a LENGTH/DATA pair: the length field, holding the size of `value` in bytes, then
@@ -1084,6 +1086,18 @@ pub mod writers {
         }
     }
 
+    /// Refuses a value that does not match the grammar of `field_type`, the rule the validator
+    /// applies.
+    fn check_grammar(value: Option<&[u8]>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {
+        let Some(bytes) = value else {
+            return Ok(());
+        };
+        match ::core::str::from_utf8(bytes) {
+            Ok(text) if field_type.is_valid_value(text) => Ok(()),
+            _ => Err(invalid(tag, format!("the value is not a valid {field_type:?} value"))),
+        }
+    }
+
     /// A 64-byte stack buffer the writers format numbers into.
     struct Buffer {
         bytes: [u8; 64],
@@ -1116,6 +1130,21 @@ pub mod writers {
         }
     }
 
+    /// Refuses a number whose decimal form does not match the grammar of `field_type` (a
+    /// `DayOfMonth` outside 1 to 31).
+    fn check_number<T: ::core::fmt::Display>(value: Option<T>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let mut buffer = Buffer { bytes: [0; 64], len: 0 };
+        let written = ::core::fmt::Write::write_fmt(&mut buffer, format_args!("{value}"));
+        let text = buffer.bytes.get(..buffer.len).and_then(|bytes| ::core::str::from_utf8(bytes).ok());
+        match (written, text) {
+            (Ok(()), Some(text)) if field_type.is_valid_value(text) => Ok(()),
+            _ => Err(invalid(tag, format!("{value} is not a valid {field_type:?} value"))),
+        }
+    }
+
     /// Body of a Heartbeat message (MsgType=0), to write.
     #[derive(Clone, Copy, Default)]
     pub struct HeartbeatFields {}
@@ -1133,8 +1162,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, _sink: &mut S) -> Result<(), EncodeError> {
             Ok(())
         }
@@ -1170,8 +1200,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
@@ -1181,12 +1212,17 @@ pub mod writers {
         fn check(&self) -> Result<(), EncodeError> {
             present(self.cl_ord_id.is_some(), 11)?;
             check_text(self.cl_ord_id.map(str::as_bytes), 11)?;
+            check_grammar(self.cl_ord_id.map(str::as_bytes), FieldType::String, 11)?;
             present(self.side.is_some(), 54)?;
             check_text(self.side.map(|value| value.as_bytes()), 54)?;
+            check_grammar(self.side.map(|value| value.as_bytes()), FieldType::Char, 54)?;
             check_text(self.text.map(str::as_bytes), 58)?;
+            check_grammar(self.text.map(str::as_bytes), FieldType::String, 58)?;
             present(self.symbol.is_some(), 55)?;
             check_text(self.symbol.map(str::as_bytes), 55)?;
+            check_grammar(self.symbol.map(str::as_bytes), FieldType::String, 55)?;
             check_text(self.security_type.map(|value| value.as_bytes()), 167)?;
+            check_grammar(self.security_type.map(|value| value.as_bytes()), FieldType::String, 167)?;
             for entry in self.no_party_ids {
                 entry.check()?;
             }
@@ -1266,8 +1302,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
@@ -1277,26 +1314,37 @@ pub mod writers {
         fn check(&self) -> Result<(), EncodeError> {
             present(self.cl_ord_id.is_some(), 11)?;
             check_text(self.cl_ord_id.map(str::as_bytes), 11)?;
+            check_grammar(self.cl_ord_id.map(str::as_bytes), FieldType::String, 11)?;
             check_text(self.cl_ord_id_12.map(str::as_bytes), 12)?;
+            check_grammar(self.cl_ord_id_12.map(str::as_bytes), FieldType::String, 12)?;
             check_text(self.account.map(str::as_bytes), 1)?;
+            check_grammar(self.account.map(str::as_bytes), FieldType::String, 1)?;
             present(self.side.is_some(), 54)?;
             check_text(self.side.map(|value| value.as_bytes()), 54)?;
+            check_grammar(self.side.map(|value| value.as_bytes()), FieldType::Char, 54)?;
             present(self.transact_time.is_some(), 60)?;
             check_text(self.transact_time.map(str::as_bytes), 60)?;
+            check_grammar(self.transact_time.map(str::as_bytes), FieldType::UtcTimestamp, 60)?;
             for value in self.exec_inst {
                 check_token(value.as_bytes(), 18)?;
+                check_grammar(Some(value.as_bytes()), FieldType::MultipleStringValue, 18)?;
             }
             check_data(self.raw_data, 96)?;
             check_text(self.text.map(str::as_bytes), 58)?;
+            check_grammar(self.text.map(str::as_bytes), FieldType::String, 58)?;
             check_text(self.field_to_venue.map(str::as_bytes), 5000)?;
+            check_grammar(self.field_to_venue.map(str::as_bytes), FieldType::String, 5000)?;
             check_text(self.get_5001.map(str::as_bytes), 5001)?;
+            check_grammar(self.get_5001.map(str::as_bytes), FieldType::String, 5001)?;
             check_char(self.flag, 5002)?;
             for entry in self.no_allocs {
                 entry.check()?;
             }
             present(self.symbol.is_some(), 55)?;
             check_text(self.symbol.map(str::as_bytes), 55)?;
+            check_grammar(self.symbol.map(str::as_bytes), FieldType::String, 55)?;
             check_text(self.security_type.map(|value| value.as_bytes()), 167)?;
+            check_grammar(self.security_type.map(|value| value.as_bytes()), FieldType::String, 167)?;
             for entry in self.no_party_ids {
                 entry.check()?;
             }
@@ -1384,8 +1432,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
@@ -1394,17 +1443,28 @@ pub mod writers {
         /// Checks required fields, groups and entries before anything is written.
         fn check(&self) -> Result<(), EncodeError> {
             check_text(self.transact_time.map(str::as_bytes), 60)?;
+            check_grammar(self.transact_time.map(str::as_bytes), FieldType::UtcTimestamp, 60)?;
             check_text(self.sample_time.map(str::as_bytes), 5010)?;
+            check_grammar(self.sample_time.map(str::as_bytes), FieldType::UtcTimeOnly, 5010)?;
             check_text(self.sample_date.map(str::as_bytes), 5011)?;
+            check_grammar(self.sample_date.map(str::as_bytes), FieldType::UtcDateOnly, 5011)?;
             check_text(self.trade_date.map(str::as_bytes), 75)?;
+            check_grammar(self.trade_date.map(str::as_bytes), FieldType::LocalMktDate, 75)?;
             check_text(self.maturity_month_year.map(str::as_bytes), 200)?;
+            check_grammar(self.maturity_month_year.map(str::as_bytes), FieldType::MonthYear, 200)?;
+            check_number(self.maturity_day, FieldType::DayOfMonth, 205)?;
             check_text(self.country.map(str::as_bytes), 421)?;
+            check_grammar(self.country.map(str::as_bytes), FieldType::Country, 421)?;
             check_text(self.currency.map(str::as_bytes), 15)?;
+            check_grammar(self.currency.map(str::as_bytes), FieldType::Currency, 15)?;
             check_text(self.labels.map(str::as_bytes), 5013)?;
+            check_grammar(self.labels.map(str::as_bytes), FieldType::MultipleStringValue, 5013)?;
             for value in self.flags {
                 check_token(value.as_bytes(), 5014)?;
+                check_grammar(Some(value.as_bytes()), FieldType::MultipleCharValue, 5014)?;
             }
             check_text(self.mode.map(|value| value.as_bytes()), 5015)?;
+            check_grammar(self.mode.map(|value| value.as_bytes()), FieldType::Char, 5015)?;
             present(!self.no_docs.is_empty(), 5020)?;
             for entry in self.no_docs {
                 entry.check()?;
@@ -1463,9 +1523,12 @@ pub mod writers {
         fn check(&self) -> Result<(), EncodeError> {
             present(self.party_id.is_some(), 448)?;
             check_text(self.party_id.map(str::as_bytes), 448)?;
+            check_grammar(self.party_id.map(str::as_bytes), FieldType::String, 448)?;
             check_text(self.party_idsource.map(|value| value.as_bytes()), 447)?;
+            check_grammar(self.party_idsource.map(|value| value.as_bytes()), FieldType::Char, 447)?;
             present(self.party_role.is_some(), 452)?;
             check_text(self.text.map(str::as_bytes), 58)?;
+            check_grammar(self.text.map(str::as_bytes), FieldType::String, 58)?;
             for entry in self.no_party_sub_ids {
                 entry.check()?;
             }
@@ -1508,6 +1571,7 @@ pub mod writers {
         fn check(&self) -> Result<(), EncodeError> {
             present(self.party_sub_id.is_some(), 523)?;
             check_text(self.party_sub_id.map(str::as_bytes), 523)?;
+            check_grammar(self.party_sub_id.map(str::as_bytes), FieldType::String, 523)?;
             Ok(())
         }
 
@@ -1539,6 +1603,7 @@ pub mod writers {
         fn check(&self) -> Result<(), EncodeError> {
             present(self.alloc_account.is_some(), 79)?;
             check_text(self.alloc_account.map(str::as_bytes), 79)?;
+            check_grammar(self.alloc_account.map(str::as_bytes), FieldType::String, 79)?;
             Ok(())
         }
 
@@ -1571,6 +1636,7 @@ pub mod writers {
             present(self.encoded_text.is_some(), 355)?;
             check_data(self.encoded_text, 355)?;
             check_text(self.doc_name.map(str::as_bytes), 5023)?;
+            check_grammar(self.doc_name.map(str::as_bytes), FieldType::String, 5023)?;
             Ok(())
         }
 

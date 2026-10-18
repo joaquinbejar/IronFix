@@ -880,6 +880,7 @@ pub mod views {
 /// multi-value field allocates, to join its values.
 pub mod writers {
     use ::ironfix_core::error::EncodeError;
+    use ::ironfix_dictionary::FieldType;
     use super::enums;
 
     /// Where a writer sends a body, one call per field.
@@ -912,8 +913,9 @@ pub mod writers {
         /// Writes field `tag` with `value`.
         ///
         /// The writers have checked, before writing anything, that `value` is not empty and carries
-        /// no SOH, that a character is printable ASCII, and that every multi-value token is non-empty
-        /// with no space. A number or group count is formatted in decimal.
+        /// no SOH, that it matches its field's FIX type (`FieldType::is_valid_value`), that a character
+        /// is printable ASCII, and that every multi-value token is non-empty with no space. A number or
+        /// group count is formatted in decimal.
         fn field(&mut self, tag: u32, value: &[u8]);
 
         /// Writes a LENGTH/DATA pair: the length field, holding the size of `value` in bytes, then
@@ -981,6 +983,18 @@ pub mod writers {
         }
     }
 
+    /// Refuses a value that does not match the grammar of `field_type`, the rule the validator
+    /// applies.
+    fn check_grammar(value: Option<&[u8]>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {
+        let Some(bytes) = value else {
+            return Ok(());
+        };
+        match ::core::str::from_utf8(bytes) {
+            Ok(text) if field_type.is_valid_value(text) => Ok(()),
+            _ => Err(invalid(tag, format!("the value is not a valid {field_type:?} value"))),
+        }
+    }
+
     /// A 64-byte stack buffer the writers format numbers into.
     struct Buffer {
         bytes: [u8; 64],
@@ -1013,6 +1027,21 @@ pub mod writers {
         }
     }
 
+    /// Refuses a number whose decimal form does not match the grammar of `field_type` (a
+    /// `DayOfMonth` outside 1 to 31).
+    fn check_number<T: ::core::fmt::Display>(value: Option<T>, field_type: FieldType, tag: u32) -> Result<(), EncodeError> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        let mut buffer = Buffer { bytes: [0; 64], len: 0 };
+        let written = ::core::fmt::Write::write_fmt(&mut buffer, format_args!("{value}"));
+        let text = buffer.bytes.get(..buffer.len).and_then(|bytes| ::core::str::from_utf8(bytes).ok());
+        match (written, text) {
+            (Ok(()), Some(text)) if field_type.is_valid_value(text) => Ok(()),
+            _ => Err(invalid(tag, format!("{value} is not a valid {field_type:?} value"))),
+        }
+    }
+
     /// Body of a Heartbeat message (MsgType=0), to write.
     #[derive(Clone, Copy, Default)]
     pub struct HeartbeatFields<'v> {
@@ -1033,8 +1062,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
@@ -1043,6 +1073,7 @@ pub mod writers {
         /// Checks required fields, groups and entries before anything is written.
         fn check(&self) -> Result<(), EncodeError> {
             check_text(self.test_req_id.map(str::as_bytes), 112)?;
+            check_grammar(self.test_req_id.map(str::as_bytes), FieldType::String, 112)?;
             Ok(())
         }
 
@@ -1073,8 +1104,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
@@ -1084,6 +1116,7 @@ pub mod writers {
         fn check(&self) -> Result<(), EncodeError> {
             present(self.test_req_id.is_some(), 112)?;
             check_text(self.test_req_id.map(str::as_bytes), 112)?;
+            check_grammar(self.test_req_id.map(str::as_bytes), FieldType::String, 112)?;
             Ok(())
         }
 
@@ -1116,8 +1149,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
@@ -1126,7 +1160,9 @@ pub mod writers {
         /// Checks required fields, groups and entries before anything is written.
         fn check(&self) -> Result<(), EncodeError> {
             present(self.begin_seq_no.is_some(), 7)?;
+            check_number(self.begin_seq_no, FieldType::SeqNum, 7)?;
             present(self.end_seq_no.is_some(), 16)?;
+            check_number(self.end_seq_no, FieldType::SeqNum, 16)?;
             Ok(())
         }
 
@@ -1174,8 +1210,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
@@ -1184,11 +1221,17 @@ pub mod writers {
         /// Checks required fields, groups and entries before anything is written.
         fn check(&self) -> Result<(), EncodeError> {
             present(self.ref_seq_num.is_some(), 45)?;
+            check_number(self.ref_seq_num, FieldType::SeqNum, 45)?;
             check_text(self.ref_msg_type.map(str::as_bytes), 372)?;
+            check_grammar(self.ref_msg_type.map(str::as_bytes), FieldType::String, 372)?;
             check_text(self.ref_appl_ver_id.map(str::as_bytes), 1130)?;
+            check_grammar(self.ref_appl_ver_id.map(str::as_bytes), FieldType::String, 1130)?;
             check_text(self.ref_cstm_appl_ver_id.map(str::as_bytes), 1131)?;
+            check_grammar(self.ref_cstm_appl_ver_id.map(str::as_bytes), FieldType::String, 1131)?;
             check_text(self.session_reject_reason.map(|value| value.as_bytes()), 373)?;
+            check_grammar(self.session_reject_reason.map(|value| value.as_bytes()), FieldType::Int, 373)?;
             check_text(self.text.map(str::as_bytes), 58)?;
+            check_grammar(self.text.map(str::as_bytes), FieldType::String, 58)?;
             check_data(self.encoded_text, 355)?;
             Ok(())
         }
@@ -1230,8 +1273,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
@@ -1240,6 +1284,7 @@ pub mod writers {
         /// Checks required fields, groups and entries before anything is written.
         fn check(&self) -> Result<(), EncodeError> {
             present(self.new_seq_no.is_some(), 36)?;
+            check_number(self.new_seq_no, FieldType::SeqNum, 36)?;
             Ok(())
         }
 
@@ -1275,8 +1320,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
@@ -1285,7 +1331,9 @@ pub mod writers {
         /// Checks required fields, groups and entries before anything is written.
         fn check(&self) -> Result<(), EncodeError> {
             check_text(self.session_status.map(|value| value.as_bytes()), 1409)?;
+            check_grammar(self.session_status.map(|value| value.as_bytes()), FieldType::Int, 1409)?;
             check_text(self.text.map(str::as_bytes), 58)?;
+            check_grammar(self.text.map(str::as_bytes), FieldType::String, 58)?;
             check_data(self.encoded_text, 355)?;
             Ok(())
         }
@@ -1355,8 +1403,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             self.check()?;
             self.emit(sink)
@@ -1366,18 +1415,28 @@ pub mod writers {
         fn check(&self) -> Result<(), EncodeError> {
             present(self.encrypt_method.is_some(), 98)?;
             check_text(self.encrypt_method.map(|value| value.as_bytes()), 98)?;
+            check_grammar(self.encrypt_method.map(|value| value.as_bytes()), FieldType::Int, 98)?;
             present(self.heart_bt_int.is_some(), 108)?;
             check_data(self.raw_data, 96)?;
+            check_number(self.next_expected_msg_seq_num, FieldType::SeqNum, 789)?;
+            check_number(self.max_message_size, FieldType::Length, 383)?;
             check_text(self.username.map(str::as_bytes), 553)?;
+            check_grammar(self.username.map(str::as_bytes), FieldType::String, 553)?;
             check_text(self.password.map(str::as_bytes), 554)?;
+            check_grammar(self.password.map(str::as_bytes), FieldType::String, 554)?;
             check_text(self.new_password.map(str::as_bytes), 925)?;
+            check_grammar(self.new_password.map(str::as_bytes), FieldType::String, 925)?;
             check_data(self.encrypted_password, 1402)?;
             check_data(self.encrypted_new_password, 1404)?;
             check_text(self.session_status.map(|value| value.as_bytes()), 1409)?;
+            check_grammar(self.session_status.map(|value| value.as_bytes()), FieldType::Int, 1409)?;
             present(self.default_appl_ver_id.is_some(), 1137)?;
             check_text(self.default_appl_ver_id.map(str::as_bytes), 1137)?;
+            check_grammar(self.default_appl_ver_id.map(str::as_bytes), FieldType::String, 1137)?;
             check_text(self.default_cstm_appl_ver_id.map(str::as_bytes), 1408)?;
+            check_grammar(self.default_cstm_appl_ver_id.map(str::as_bytes), FieldType::String, 1408)?;
             check_text(self.text.map(str::as_bytes), 58)?;
+            check_grammar(self.text.map(str::as_bytes), FieldType::String, 58)?;
             check_data(self.encoded_text, 355)?;
             Ok(())
         }
@@ -1424,8 +1483,9 @@ pub mod writers {
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
         /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
-        /// value other than data, a `char` that is not printable ASCII, or a multi-value token
-        /// that is empty or carries a space. All are checked before anything is written.
+        /// value other than data, a value that does not match its field's FIX type, a `char` that
+        /// is not printable ASCII, or a multi-value token that is empty or carries a space. All are
+        /// checked before anything is written.
         pub fn write<S: Sink + ?Sized>(&self, _sink: &mut S) -> Result<(), EncodeError> {
             Ok(())
         }
