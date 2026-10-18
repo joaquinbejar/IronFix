@@ -1013,7 +1013,7 @@ impl<'m, 'a, 's> GroupEntry<'m, 'a, 's> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ComponentDef, ComponentRef, MessageCategory, MessageDef, Version};
+    use crate::schema::{ComponentDef, ComponentRef, Member, MessageCategory, MessageDef, Version};
     use ironfix_tagvalue::Decoder;
     use std::fmt::Debug;
 
@@ -1697,21 +1697,20 @@ mod tests {
         let mut dict = Dictionary::new(Version::Fix44);
         let links = MAX_SCOPE_DEPTH + 5;
         for index in 0..links {
-            dict.add_component(ComponentDef {
-                name: format!("C{index}"),
-                fields: Vec::new(),
-                groups: Vec::new(),
-                components: vec![ComponentRef::new(format!("C{}", index + 1), true)],
-            });
+            dict.add_component(ComponentDef::new(
+                format!("C{index}"),
+                vec![Member::Component(ComponentRef::new(
+                    format!("C{}", index + 1),
+                    true,
+                ))],
+            ));
         }
-        dict.add_message(MessageDef {
-            msg_type: "U1".to_string(),
-            name: "Deep".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("C0", true)],
-        });
+        dict.add_message(MessageDef::new(
+            "U1",
+            "Deep",
+            MessageCategory::App,
+            vec![Member::Component(ComponentRef::new("C0", true))],
+        ));
         assert!(matches!(
             MessageLayout::new(&dict, "U1").err(),
             Some(GroupError::InvalidSchema(

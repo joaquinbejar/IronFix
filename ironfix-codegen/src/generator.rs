@@ -381,9 +381,9 @@ impl CodeGenerator {
             self.collect(
                 dict,
                 &scope,
-                &message.fields,
-                &message.groups,
-                &message.components,
+                message.fields(),
+                message.groups(),
+                message.components(),
                 false,
                 0,
                 &mut stack,
@@ -472,9 +472,9 @@ impl CodeGenerator {
                 self.collect(
                     dict,
                     &nested_scope,
-                    &component.fields,
-                    &component.groups,
-                    &component.components,
+                    component.fields(),
+                    component.groups(),
+                    component.components(),
                     true,
                     depth + 1,
                     stack,
@@ -582,9 +582,9 @@ impl CodeGenerator {
                     self.collect(
                         dict,
                         &group_scope,
-                        &def.fields,
-                        &def.groups,
-                        &def.components,
+                        def.fields(),
+                        def.groups(),
+                        def.components(),
                         false,
                         depth + 1,
                         &mut stack,
@@ -902,6 +902,7 @@ fn field_type_to_rust(field_type: FieldType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironfix_dictionary::schema::Member as SchemaMember;
     use ironfix_dictionary::schema::{ComponentDef, ComponentRef, MessageCategory, Version};
 
     /// The vendored FIX 4.4 dictionary.
@@ -1234,29 +1235,28 @@ mod tests {
         let mut dict = Dictionary::new(Version::Fix44);
         dict.add_field(FieldDef::new(11, "ClOrdID", FieldType::String));
         dict.add_component(component);
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "NewOrderSingle".to_string(),
-            category: MessageCategory::App,
-            fields: vec![SchemaFieldRef {
-                tag: 11,
-                name: "ClOrdID".to_string(),
-                required: true,
-            }],
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("Looper", false)],
-        });
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![
+                SchemaMember::Field(SchemaFieldRef {
+                    tag: 11,
+                    name: "ClOrdID".to_string(),
+                    required: true,
+                }),
+                SchemaMember::Component(ComponentRef::new("Looper", false)),
+            ],
+        ));
         dict
     }
 
     #[test]
     fn test_generate_self_referencing_component_is_a_typed_error() {
-        let dict = dict_with_component(ComponentDef {
-            name: "Looper".to_string(),
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("Looper", false)],
-        });
+        let dict = dict_with_component(ComponentDef::new(
+            "Looper",
+            vec![SchemaMember::Component(ComponentRef::new("Looper", false))],
+        ));
         assert_eq!(
             CodeGenerator::new().generate(&dict),
             Err(GeneratorError::ComponentCycle {
@@ -1270,14 +1270,12 @@ mod tests {
     fn test_generate_unknown_component_is_a_typed_error() {
         let mut dict = Dictionary::new(Version::Fix44);
         dict.add_field(FieldDef::new(11, "ClOrdID", FieldType::String));
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "NewOrderSingle".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("Nowhere", false)],
-        });
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![SchemaMember::Component(ComponentRef::new("Nowhere", false))],
+        ));
         assert_eq!(
             CodeGenerator::new().generate(&dict),
             Err(GeneratorError::UnknownComponent {
@@ -1290,18 +1288,16 @@ mod tests {
     #[test]
     fn test_generate_unknown_field_tag_is_a_typed_error() {
         let mut dict = Dictionary::new(Version::Fix44);
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "NewOrderSingle".to_string(),
-            category: MessageCategory::App,
-            fields: vec![SchemaFieldRef {
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![SchemaMember::Field(SchemaFieldRef {
                 tag: 9999,
                 name: "Mystery".to_string(),
                 required: true,
-            }],
-            groups: Vec::new(),
-            components: Vec::new(),
-        });
+            })],
+        ));
         assert_eq!(
             CodeGenerator::new().generate(&dict),
             Err(GeneratorError::UnknownField {
@@ -1315,24 +1311,23 @@ mod tests {
     fn test_generate_component_field_is_optional_even_when_required_inside() {
         let mut dict = Dictionary::new(Version::Fix44);
         dict.add_field(FieldDef::new(55, "Symbol", FieldType::String));
-        dict.add_component(ComponentDef {
-            name: "Instrument".to_string(),
-            fields: vec![SchemaFieldRef {
+        dict.add_component(ComponentDef::new(
+            "Instrument",
+            vec![SchemaMember::Field(SchemaFieldRef {
                 tag: 55,
                 name: "Symbol".to_string(),
                 required: true,
-            }],
-            groups: Vec::new(),
-            components: Vec::new(),
-        });
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "NewOrderSingle".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("Instrument", false)],
-        });
+            })],
+        ));
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![SchemaMember::Component(ComponentRef::new(
+                "Instrument",
+                false,
+            ))],
+        ));
         let code = generate(&CodeGenerator::new(), &dict);
         // The dictionary does not record whether the component reference is
         // required, so the safe representation is Option.
@@ -1344,32 +1339,31 @@ mod tests {
         let mut dict = Dictionary::new(Version::Fix44);
         dict.add_field(FieldDef::new(453, "NoPartyIDs", FieldType::NumInGroup));
         dict.add_field(FieldDef::new(448, "PartyID", FieldType::String));
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "NewOrderSingle".to_string(),
-            category: MessageCategory::App,
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
             // A dictionary that lists the count field directly as well as the
             // group it counts. Dropping either would lose information.
-            fields: vec![SchemaFieldRef {
-                tag: 453,
-                name: "NoPartyIDs".to_string(),
-                required: false,
-            }],
-            groups: vec![GroupDef {
-                count_tag: 453,
-                name: "NoPartyIDs".to_string(),
-                delimiter_tag: 448,
-                fields: vec![SchemaFieldRef {
-                    tag: 448,
-                    name: "PartyID".to_string(),
-                    required: true,
-                }],
-                groups: Vec::new(),
-                components: Vec::new(),
-                required: false,
-            }],
-            components: Vec::new(),
-        });
+            vec![
+                SchemaMember::Field(SchemaFieldRef {
+                    tag: 453,
+                    name: "NoPartyIDs".to_string(),
+                    required: false,
+                }),
+                SchemaMember::Group(GroupDef::new(
+                    453,
+                    "NoPartyIDs",
+                    448,
+                    false,
+                    vec![SchemaMember::Field(SchemaFieldRef {
+                        tag: 448,
+                        name: "PartyID".to_string(),
+                        required: true,
+                    })],
+                )),
+            ],
+        ));
         let code = generate(&CodeGenerator::new(), &dict);
         assert!(code.contains("pub no_party_ids: Option<i64>,"), "{code}");
         assert!(
@@ -1382,28 +1376,27 @@ mod tests {
     fn test_generate_field_reached_twice_appears_once() {
         let mut dict = Dictionary::new(Version::Fix44);
         dict.add_field(FieldDef::new(55, "Symbol", FieldType::String));
-        dict.add_component(ComponentDef {
-            name: "Instrument".to_string(),
-            fields: vec![SchemaFieldRef {
+        dict.add_component(ComponentDef::new(
+            "Instrument",
+            vec![SchemaMember::Field(SchemaFieldRef {
                 tag: 55,
                 name: "Symbol".to_string(),
                 required: true,
-            }],
-            groups: Vec::new(),
-            components: Vec::new(),
-        });
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "NewOrderSingle".to_string(),
-            category: MessageCategory::App,
-            fields: vec![SchemaFieldRef {
-                tag: 55,
-                name: "Symbol".to_string(),
-                required: true,
-            }],
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("Instrument", false)],
-        });
+            })],
+        ));
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![
+                SchemaMember::Field(SchemaFieldRef {
+                    tag: 55,
+                    name: "Symbol".to_string(),
+                    required: true,
+                }),
+                SchemaMember::Component(ComponentRef::new("Instrument", false)),
+            ],
+        ));
         let code = generate(&CodeGenerator::new(), &dict);
         assert_eq!(code.matches("pub symbol:").count(), 1);
         // The direct reference wins, so it keeps its required-ness.
@@ -1419,32 +1412,29 @@ mod tests {
         let mut dict = Dictionary::new(Version::Fix44);
         dict.add_field(FieldDef::new(453, "NoPartyIDs", FieldType::NumInGroup));
         dict.add_field(FieldDef::new(448, "PartyID", FieldType::String));
-        dict.add_component(ComponentDef {
-            name: "Parties".to_string(),
-            fields: Vec::new(),
-            groups: vec![GroupDef {
-                count_tag: 453,
-                name: "NoPartyIDs".to_string(),
-                delimiter_tag: 448,
-                fields: vec![SchemaFieldRef {
-                    tag: 448,
-                    name: "PartyID".to_string(),
-                    required: true,
-                }],
-                groups: Vec::new(),
-                components: vec![ComponentRef::new("Parties", false)],
-                required: false,
-            }],
-            components: Vec::new(),
-        });
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "NewOrderSingle".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("Parties", false)],
-        });
+        dict.add_component(ComponentDef::new(
+            "Parties",
+            vec![SchemaMember::Group(GroupDef::new(
+                453,
+                "NoPartyIDs",
+                448,
+                false,
+                vec![
+                    SchemaMember::Field(SchemaFieldRef {
+                        tag: 448,
+                        name: "PartyID".to_string(),
+                        required: true,
+                    }),
+                    SchemaMember::Component(ComponentRef::new("Parties", false)),
+                ],
+            ))],
+        ));
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![SchemaMember::Component(ComponentRef::new("Parties", false))],
+        ));
         assert_eq!(
             CodeGenerator::new().generate(&dict),
             Err(GeneratorError::ComponentCycle {
@@ -1468,25 +1458,24 @@ mod tests {
             } else {
                 Vec::new()
             };
-            dict.add_component(ComponentDef {
-                name: format!("Comp{index}"),
-                fields: Vec::new(),
-                groups: Vec::new(),
-                components: next,
-            });
+            dict.add_component(ComponentDef::new(
+                format!("Comp{index}"),
+                next.into_iter().map(SchemaMember::Component),
+            ));
         }
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "NewOrderSingle".to_string(),
-            category: MessageCategory::App,
-            fields: vec![SchemaFieldRef {
-                tag: 11,
-                name: "ClOrdID".to_string(),
-                required: true,
-            }],
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("Comp0", false)],
-        });
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![
+                SchemaMember::Field(SchemaFieldRef {
+                    tag: 11,
+                    name: "ClOrdID".to_string(),
+                    required: true,
+                }),
+                SchemaMember::Component(ComponentRef::new("Comp0", false)),
+            ],
+        ));
         assert!(matches!(
             CodeGenerator::new().generate(&dict),
             Err(GeneratorError::MaxDepthExceeded {
@@ -1517,18 +1506,16 @@ mod tests {
         // will not compile.
         let mut dict = Dictionary::new(Version::Fix44);
         dict.add_field(FieldDef::new(11, "Foo-Bar", FieldType::String));
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "NewOrderSingle".to_string(),
-            category: MessageCategory::App,
-            fields: vec![SchemaFieldRef {
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![SchemaMember::Field(SchemaFieldRef {
                 tag: 11,
                 name: "Foo-Bar".to_string(),
                 required: true,
-            }],
-            groups: Vec::new(),
-            components: Vec::new(),
-        });
+            })],
+        ));
         assert_eq!(
             CodeGenerator::new().generate(&dict),
             Err(GeneratorError::UnnameableItem {
@@ -1556,14 +1543,12 @@ mod tests {
     #[test]
     fn test_generate_message_name_with_a_hyphen_is_a_typed_error() {
         let mut dict = Dictionary::new(Version::Fix44);
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "New-Order".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: Vec::new(),
-        });
+        dict.add_message(MessageDef::new(
+            "D",
+            "New-Order",
+            MessageCategory::App,
+            Vec::new(),
+        ));
         assert_eq!(
             CodeGenerator::new().generate(&dict),
             Err(GeneratorError::UnnameableItem {
@@ -1580,26 +1565,22 @@ mod tests {
         let mut dict = Dictionary::new(Version::Fix44);
         dict.add_field(FieldDef::new(453, "NoParties", FieldType::NumInGroup));
         dict.add_field(FieldDef::new(448, "PartyID", FieldType::String));
-        dict.add_message(MessageDef {
-            msg_type: "D".to_string(),
-            name: "NewOrderSingle".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: vec![GroupDef {
-                count_tag: 453,
-                name: "No-Parties".to_string(),
-                delimiter_tag: 448,
-                fields: vec![SchemaFieldRef {
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![SchemaMember::Group(GroupDef::new(
+                453,
+                "No-Parties",
+                448,
+                false,
+                vec![SchemaMember::Field(SchemaFieldRef {
                     tag: 448,
                     name: "PartyID".to_string(),
                     required: true,
-                }],
-                groups: Vec::new(),
-                components: Vec::new(),
-                required: false,
-            }],
-            components: Vec::new(),
-        });
+                })],
+            ))],
+        ));
         assert_eq!(
             CodeGenerator::new().generate(&dict),
             Err(GeneratorError::UnnameableItem {

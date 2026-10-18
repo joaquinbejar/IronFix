@@ -22,7 +22,7 @@ use ironfix_codegen::{CodeGenerator, GeneratorConfig};
 use ironfix_dictionary::DictionaryError;
 use ironfix_dictionary::schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef as SchemaFieldRef, FieldType,
-    GroupDef, MessageCategory, MessageDef, Version,
+    GroupDef, Member, MessageCategory, MessageDef, Version,
 };
 
 /// Builds a field reference for the fixture dictionary.
@@ -58,57 +58,52 @@ fn sample_dictionary() -> Dictionary {
         dict.add_field(FieldDef::new(tag, name, field_type));
     }
 
-    dict.add_component(ComponentDef {
-        name: "Instrument".to_string(),
-        fields: vec![field_ref(55, "Symbol", true)],
-        groups: Vec::new(),
-        components: Vec::new(),
-    });
+    dict.add_component(ComponentDef::new(
+        "Instrument",
+        vec![Member::Field(field_ref(55, "Symbol", true))],
+    ));
 
-    dict.add_message(MessageDef {
-        msg_type: "D".to_string(),
-        name: "NewOrderSingle".to_string(),
-        category: MessageCategory::App,
-        fields: vec![
-            field_ref(11, "ClOrdID", true),
-            field_ref(12, "ClOrdId", false),
-            field_ref(34, "MsgSeqNum", false),
-            field_ref(43, "PossDupFlag", false),
-            field_ref(44, "Price", false),
-            field_ref(54, "Side", true),
-            field_ref(96, "RawData", false),
-            field_ref(236, "Yield", false),
+    dict.add_message(MessageDef::new(
+        "D",
+        "NewOrderSingle",
+        MessageCategory::App,
+        vec![
+            Member::Field(field_ref(11, "ClOrdID", true)),
+            Member::Field(field_ref(12, "ClOrdId", false)),
+            Member::Field(field_ref(34, "MsgSeqNum", false)),
+            Member::Field(field_ref(43, "PossDupFlag", false)),
+            Member::Field(field_ref(44, "Price", false)),
+            Member::Field(field_ref(54, "Side", true)),
+            Member::Field(field_ref(96, "RawData", false)),
+            Member::Field(field_ref(236, "Yield", false)),
+            Member::Group(GroupDef::new(
+                453,
+                "NoPartyIDs",
+                448,
+                false,
+                vec![
+                    Member::Field(field_ref(448, "PartyID", true)),
+                    Member::Group(GroupDef::new(
+                        802,
+                        "NoPartySubIDs",
+                        523,
+                        false,
+                        vec![Member::Field(field_ref(523, "PartySubID", true))],
+                    )),
+                ],
+            )),
+            Member::Component(ComponentRef::new("Instrument", false)),
         ],
-        groups: vec![GroupDef {
-            count_tag: 453,
-            name: "NoPartyIDs".to_string(),
-            delimiter_tag: 448,
-            fields: vec![field_ref(448, "PartyID", true)],
-            groups: vec![GroupDef {
-                count_tag: 802,
-                name: "NoPartySubIDs".to_string(),
-                delimiter_tag: 523,
-                fields: vec![field_ref(523, "PartySubID", true)],
-                groups: Vec::new(),
-                components: Vec::new(),
-                required: false,
-            }],
-            components: Vec::new(),
-            required: false,
-        }],
-        components: vec![ComponentRef::new("Instrument", false)],
-    });
+    ));
 
     // A message with no fields at all: the generated struct must still be
     // valid Rust.
-    dict.add_message(MessageDef {
-        msg_type: "0".to_string(),
-        name: "Heartbeat".to_string(),
-        category: MessageCategory::Admin,
-        fields: Vec::new(),
-        groups: Vec::new(),
-        components: Vec::new(),
-    });
+    dict.add_message(MessageDef::new(
+        "0",
+        "Heartbeat",
+        MessageCategory::Admin,
+        Vec::new(),
+    ));
 
     dict
 }

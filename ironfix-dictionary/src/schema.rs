@@ -12,7 +12,17 @@
 //! - [`ComponentDef`]: Reusable component definitions
 //! - [`ComponentRef`]: A reference to a component, with its own required flag
 //! - [`GroupDef`]: Repeating group definitions
+//! - [`Member`] / [`MemberRef`]: A member of a message, component or group
+//!   entry, owned (to build a definition) or borrowed (to read one in order)
 //! - [`Dictionary`]: Complete FIX version dictionary
+//!
+//! [`MessageDef`], [`ComponentDef`] and [`GroupDef`] keep their members
+//! private, read in the order the dictionary lists them with `members()`
+//! (inside a repeating group FIX requires that order) or per kind with
+//! `fields()`, `groups()` and `components()`. The three are
+//! `#[non_exhaustive]`, built with their `new` constructors, which take the
+//! members in dictionary order, and extended with `push`, so the order and the
+//! per-kind lists cannot disagree.
 //!
 //! [`FieldType`] carries both the QuickFIX XML spelling of a FIX data type
 //! (via [`FromStr`](std::str::FromStr)) and the on-the-wire form that type
@@ -21,6 +31,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::iter::FusedIterator;
 
 /// FIX protocol version.
 ///
@@ -486,7 +497,15 @@ impl ComponentRef {
 }
 
 /// Definition of a repeating group.
+///
+/// The members of an entry are private, so their two views cannot disagree:
+/// [`GroupDef::members`] gives them in the order the dictionary lists them,
+/// the order FIX requires inside a group entry (session reject reason 15,
+/// "repeating group fields out of order"); [`GroupDef::fields`],
+/// [`GroupDef::groups`] and [`GroupDef::components`] give them per kind.
+/// Build one with [`GroupDef::new`] and extend it with [`GroupDef::push`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct GroupDef {
     /// Tag of the count field (NumInGroup).
     pub count_tag: u32,
@@ -494,32 +513,169 @@ pub struct GroupDef {
     pub name: String,
     /// Tag of the first field in each group entry (delimiter).
     pub delimiter_tag: u32,
-    /// Fields within each group entry.
-    pub fields: Vec<FieldRef>,
-    /// Nested groups within this group.
-    pub groups: Vec<GroupDef>,
-    /// Components used within each group entry.
-    #[serde(default)]
-    pub components: Vec<ComponentRef>,
+    /// The members of an entry.
+    #[serde(flatten)]
+    members: Members,
     /// Whether the group is required.
     pub required: bool,
 }
 
+impl GroupDef {
+    /// Creates a group definition from its members, in dictionary order.
+    ///
+    /// # Arguments
+    /// * `count_tag` - Tag of the count field (NumInGroup)
+    /// * `name` - Name of the group
+    /// * `delimiter_tag` - Tag every entry starts with
+    /// * `required` - Whether the group must appear where it is listed
+    /// * `members` - The members of an entry, in the order the dictionary
+    ///   lists them
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironfix_dictionary::{FieldRef, GroupDef, Member, MemberRef};
+    ///
+    /// let field = |tag, name: &str| FieldRef {
+    ///     tag,
+    ///     name: name.to_string(),
+    ///     required: false,
+    /// };
+    /// let group = GroupDef::new(
+    ///     453,
+    ///     "NoPartyIDs",
+    ///     448,
+    ///     false,
+    ///     [
+    ///         Member::Field(field(448, "PartyID")),
+    ///         Member::Field(field(452, "PartyRole")),
+    ///     ],
+    /// );
+    /// let tags: Vec<u32> = group
+    ///     .members()
+    ///     .filter_map(|member| match member {
+    ///         MemberRef::Field(field) => Some(field.tag),
+    ///         MemberRef::Group(_) | MemberRef::Component(_) => None,
+    ///     })
+    ///     .collect();
+    /// assert_eq!(tags, [448, 452]);
+    /// assert_eq!(group.fields().len(), 2);
+    /// ```
+    #[must_use]
+    pub fn new(
+        count_tag: u32,
+        name: impl Into<String>,
+        delimiter_tag: u32,
+        required: bool,
+        members: impl IntoIterator<Item = Member>,
+    ) -> Self {
+        Self {
+            count_tag,
+            name: name.into(),
+            delimiter_tag,
+            members: Members::from_members(members),
+            required,
+        }
+    }
+
+    /// Returns the members of an entry in dictionary order, without
+    /// allocating. The iterator knows its exact length and is fused.
+    pub fn members(&self) -> impl ExactSizeIterator<Item = MemberRef<'_>> + FusedIterator {
+        self.members.iter()
+    }
+
+    /// Returns the fields of an entry, in dictionary order.
+    #[must_use]
+    pub fn fields(&self) -> &[FieldRef] {
+        &self.members.fields
+    }
+
+    /// Returns the groups nested in an entry, in dictionary order.
+    #[must_use]
+    pub fn groups(&self) -> &[GroupDef] {
+        &self.members.groups
+    }
+
+    /// Returns the components an entry references, in dictionary order.
+    #[must_use]
+    pub fn components(&self) -> &[ComponentRef] {
+        &self.members.components
+    }
+
+    /// Appends a member after the existing ones.
+    pub fn push(&mut self, member: Member) {
+        self.members.push(member);
+    }
+}
+
 /// Definition of a reusable component.
+///
+/// Its members are private and read in dictionary order with
+/// [`ComponentDef::members`] or per kind with [`ComponentDef::fields`],
+/// [`ComponentDef::groups`] and [`ComponentDef::components`]. Build one with
+/// [`ComponentDef::new`] and extend it with [`ComponentDef::push`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ComponentDef {
     /// Component name.
     pub name: String,
-    /// Fields in this component.
-    pub fields: Vec<FieldRef>,
-    /// Groups in this component.
-    pub groups: Vec<GroupDef>,
-    /// Nested components.
-    pub components: Vec<ComponentRef>,
+    /// Its members.
+    #[serde(flatten)]
+    members: Members,
+}
+
+impl ComponentDef {
+    /// Creates a component definition from its members, in dictionary order.
+    ///
+    /// # Arguments
+    /// * `name` - Component name
+    /// * `members` - Its members, in the order the dictionary lists them
+    #[must_use]
+    pub fn new(name: impl Into<String>, members: impl IntoIterator<Item = Member>) -> Self {
+        Self {
+            name: name.into(),
+            members: Members::from_members(members),
+        }
+    }
+
+    /// Returns the members in dictionary order, without allocating. The
+    /// iterator knows its exact length and is fused.
+    pub fn members(&self) -> impl ExactSizeIterator<Item = MemberRef<'_>> + FusedIterator {
+        self.members.iter()
+    }
+
+    /// Returns the fields, in dictionary order.
+    #[must_use]
+    pub fn fields(&self) -> &[FieldRef] {
+        &self.members.fields
+    }
+
+    /// Returns the groups, in dictionary order.
+    #[must_use]
+    pub fn groups(&self) -> &[GroupDef] {
+        &self.members.groups
+    }
+
+    /// Returns the nested component references, in dictionary order.
+    #[must_use]
+    pub fn components(&self) -> &[ComponentRef] {
+        &self.members.components
+    }
+
+    /// Appends a member after the existing ones.
+    pub fn push(&mut self, member: Member) {
+        self.members.push(member);
+    }
 }
 
 /// Definition of a FIX message.
+///
+/// The members of its body are private and read in dictionary order with
+/// [`MessageDef::members`] or per kind with [`MessageDef::fields`],
+/// [`MessageDef::groups`] and [`MessageDef::components`]. Build one with
+/// [`MessageDef::new`] and extend it with [`MessageDef::push`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageDef {
     /// Message type value (tag 35).
     pub msg_type: String,
@@ -527,13 +683,241 @@ pub struct MessageDef {
     pub name: String,
     /// Message category (admin or app).
     pub category: MessageCategory,
-    /// Fields in this message.
-    pub fields: Vec<FieldRef>,
-    /// Groups in this message.
-    pub groups: Vec<GroupDef>,
-    /// Components used in this message.
-    pub components: Vec<ComponentRef>,
+    /// The members of the body.
+    #[serde(flatten)]
+    members: Members,
 }
+
+impl MessageDef {
+    /// Creates a message definition from the members of its body, in
+    /// dictionary order.
+    ///
+    /// # Arguments
+    /// * `msg_type` - Message type value (tag 35)
+    /// * `name` - Message name
+    /// * `category` - Admin or application
+    /// * `members` - The body's members, in the order the dictionary lists
+    ///   them
+    #[must_use]
+    pub fn new(
+        msg_type: impl Into<String>,
+        name: impl Into<String>,
+        category: MessageCategory,
+        members: impl IntoIterator<Item = Member>,
+    ) -> Self {
+        Self {
+            msg_type: msg_type.into(),
+            name: name.into(),
+            category,
+            members: Members::from_members(members),
+        }
+    }
+
+    /// Returns the members of the body in dictionary order, without
+    /// allocating. The iterator knows its exact length and is fused.
+    pub fn members(&self) -> impl ExactSizeIterator<Item = MemberRef<'_>> + FusedIterator {
+        self.members.iter()
+    }
+
+    /// Returns the fields of the body, in dictionary order.
+    #[must_use]
+    pub fn fields(&self) -> &[FieldRef] {
+        &self.members.fields
+    }
+
+    /// Returns the groups of the body, in dictionary order.
+    #[must_use]
+    pub fn groups(&self) -> &[GroupDef] {
+        &self.members.groups
+    }
+
+    /// Returns the components the body references, in dictionary order.
+    #[must_use]
+    pub fn components(&self) -> &[ComponentRef] {
+        &self.members.components
+    }
+
+    /// Appends a member after the existing ones.
+    pub fn push(&mut self, member: Member) {
+        self.members.push(member);
+    }
+}
+
+/// A member of a message, component, or repeating-group entry, to build a
+/// definition from.
+///
+/// Not `#[non_exhaustive]`: the kinds are those of the QuickFIX XML format
+/// (`field`, `group`, `component`), so a new kind is a breaking change
+/// anyway, and an exhaustive `match` lets the compiler find every consumer.
+#[derive(Debug, Clone)]
+pub enum Member {
+    /// A field reference.
+    Field(FieldRef),
+    /// A repeating group.
+    Group(GroupDef),
+    /// A component reference.
+    Component(ComponentRef),
+}
+
+/// A member of a message, component, or repeating-group entry, borrowed from
+/// its definition in dictionary order. Not `#[non_exhaustive]`, like
+/// [`Member`].
+#[derive(Debug, Clone, Copy)]
+pub enum MemberRef<'a> {
+    /// A field reference.
+    Field(&'a FieldRef),
+    /// A repeating group.
+    Group(&'a GroupDef),
+    /// A component reference.
+    Component(&'a ComponentRef),
+}
+
+/// The kind of a member, recorded in dictionary order next to the per-kind
+/// lists: within one kind the lists keep their relative order, so the
+/// sequence of kinds is enough to interleave them again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum MemberKind {
+    Field,
+    Group,
+    Component,
+}
+
+/// The members of a definition, per kind and in dictionary order.
+///
+/// Invariant: `order` holds exactly as many entries of each kind as its list
+/// has members. Every way to build or change it keeps that, deserialization
+/// included (see [`MembersData`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "MembersData")]
+struct Members {
+    fields: Vec<FieldRef>,
+    groups: Vec<GroupDef>,
+    components: Vec<ComponentRef>,
+    order: Vec<MemberKind>,
+}
+
+impl Members {
+    fn from_members(members: impl IntoIterator<Item = Member>) -> Self {
+        let mut built = Self::default();
+        for member in members {
+            built.push(member);
+        }
+        built
+    }
+
+    fn push(&mut self, member: Member) {
+        match member {
+            Member::Field(field) => {
+                self.fields.push(field);
+                self.order.push(MemberKind::Field);
+            }
+            Member::Group(group) => {
+                self.groups.push(group);
+                self.order.push(MemberKind::Group);
+            }
+            Member::Component(component) => {
+                self.components.push(component);
+                self.order.push(MemberKind::Component);
+            }
+        }
+    }
+
+    fn iter(&self) -> Interleave<'_> {
+        Interleave {
+            order: self.order.iter(),
+            fields: self.fields.iter(),
+            groups: self.groups.iter(),
+            components: self.components.iter(),
+        }
+    }
+}
+
+/// The serialized form of [`Members`], repaired into the invariant when it is
+/// loaded: a missing list is empty, and an `order` that is missing or does not
+/// count the members of each kind (data written before the order was
+/// recorded, or edited by hand) is rebuilt as the fields, then the groups,
+/// then the components, which is what the per-kind lists meant before.
+#[derive(Deserialize)]
+struct MembersData {
+    #[serde(default)]
+    fields: Vec<FieldRef>,
+    #[serde(default)]
+    groups: Vec<GroupDef>,
+    #[serde(default)]
+    components: Vec<ComponentRef>,
+    #[serde(default)]
+    order: Vec<MemberKind>,
+}
+
+impl From<MembersData> for Members {
+    fn from(data: MembersData) -> Self {
+        let count = |kind: MemberKind| {
+            data.order
+                .iter()
+                .filter(|recorded| **recorded == kind)
+                .count()
+        };
+        let consistent = count(MemberKind::Field) == data.fields.len()
+            && count(MemberKind::Group) == data.groups.len()
+            && count(MemberKind::Component) == data.components.len();
+        let order = if consistent {
+            data.order
+        } else {
+            std::iter::repeat_n(MemberKind::Field, data.fields.len())
+                .chain(std::iter::repeat_n(MemberKind::Group, data.groups.len()))
+                .chain(std::iter::repeat_n(
+                    MemberKind::Component,
+                    data.components.len(),
+                ))
+                .collect()
+        };
+        Self {
+            fields: data.fields,
+            groups: data.groups,
+            components: data.components,
+            order,
+        }
+    }
+}
+
+/// Interleaves the per-kind lists by the recorded order of kinds, without
+/// allocating: each recorded kind takes the next member of that kind.
+#[derive(Debug, Clone)]
+struct Interleave<'a> {
+    order: std::slice::Iter<'a, MemberKind>,
+    fields: std::slice::Iter<'a, FieldRef>,
+    groups: std::slice::Iter<'a, GroupDef>,
+    components: std::slice::Iter<'a, ComponentRef>,
+}
+
+impl<'a> Iterator for Interleave<'a> {
+    type Item = MemberRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // The invariant of `Members` makes every recorded kind find its
+        // member; one that would not is skipped rather than panicking.
+        for kind in self.order.by_ref() {
+            let member = match kind {
+                MemberKind::Field => self.fields.next().map(MemberRef::Field),
+                MemberKind::Group => self.groups.next().map(MemberRef::Group),
+                MemberKind::Component => self.components.next().map(MemberRef::Component),
+            };
+            if member.is_some() {
+                return member;
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.order.len();
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for Interleave<'_> {}
+
+impl FusedIterator for Interleave<'_> {}
 
 /// Message category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -821,5 +1205,88 @@ mod tests {
         assert!(dict.get_field(35).is_some());
         assert!(dict.get_field_by_name("MsgType").is_some());
         assert!(dict.get_field(999).is_none());
+    }
+
+    /// The kinds of `members`, in order.
+    fn kinds(members: &Members) -> Vec<MemberKind> {
+        members
+            .iter()
+            .map(|member| match member {
+                MemberRef::Field(_) => MemberKind::Field,
+                MemberRef::Group(_) => MemberKind::Group,
+                MemberRef::Component(_) => MemberKind::Component,
+            })
+            .collect()
+    }
+
+    /// Serialized members with two fields and a component.
+    fn data(order: Vec<MemberKind>) -> MembersData {
+        let field = |tag: u32| FieldRef {
+            tag,
+            name: tag.to_string(),
+            required: false,
+        };
+        MembersData {
+            fields: vec![field(1), field(2)],
+            groups: Vec::new(),
+            components: vec![ComponentRef::new("C", false)],
+            order,
+        }
+    }
+
+    #[test]
+    fn test_loaded_members_keep_a_consistent_order() {
+        use MemberKind::{Component, Field};
+        let members = Members::from(data(vec![Field, Component, Field]));
+        assert_eq!(kinds(&members), [Field, Component, Field]);
+        assert_eq!(members.iter().len(), 3);
+    }
+
+    #[test]
+    fn test_loaded_members_rebuild_a_missing_or_inconsistent_order() {
+        use MemberKind::{Component, Field, Group};
+        // Written before the order was recorded: fields, groups, components.
+        let members = Members::from(data(Vec::new()));
+        assert_eq!(kinds(&members), [Field, Field, Component]);
+        // An order that does not count the members of each kind is rebuilt
+        // the same way rather than trusted.
+        for order in [vec![Field], vec![Field, Field, Group], vec![Component; 3]] {
+            let members = Members::from(data(order));
+            assert_eq!(kinds(&members), [Field, Field, Component]);
+            assert_eq!(members.iter().len(), 3);
+        }
+    }
+
+    /// Accepts only an exact-size, fused iterator: the bounds `members()`
+    /// promises.
+    fn exact_and_fused<I: ExactSizeIterator + FusedIterator>(members: I) -> usize {
+        members.len()
+    }
+
+    #[test]
+    fn test_members_are_exact_size_and_fused() {
+        let field = || {
+            Member::Field(FieldRef {
+                tag: 11,
+                name: "ClOrdID".to_owned(),
+                required: true,
+            })
+        };
+        let group = GroupDef::new(453, "NoPartyIDs", 448, false, vec![field()]);
+        let component = ComponentDef::new("Instrument", vec![field(), field()]);
+        let message = MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![field(), Member::Group(group.clone())],
+        );
+        assert_eq!(exact_and_fused(group.members()), 1);
+        assert_eq!(exact_and_fused(component.members()), 2);
+        assert_eq!(exact_and_fused(message.members()), 2);
+        // Fused: once exhausted, it stays exhausted.
+        let mut members = message.members();
+        assert!(members.by_ref().nth(1).is_some());
+        assert!(members.next().is_none());
+        assert!(members.next().is_none());
     }
 }

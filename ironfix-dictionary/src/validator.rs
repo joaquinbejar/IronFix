@@ -1020,7 +1020,7 @@ mod tests {
     // appears in full above.
     use crate::schema::FieldRef as SchemaFieldRef;
     use crate::schema::{
-        ComponentDef, ComponentRef, Dictionary, FieldDef, GroupDef, MessageCategory,
+        ComponentDef, ComponentRef, Dictionary, FieldDef, GroupDef, Member, MessageCategory,
     };
     use ironfix_tagvalue::Decoder;
     use std::fmt::Debug;
@@ -1643,23 +1643,24 @@ mod tests {
             name: "SharedDelimiter".to_string(),
             required: true,
         };
-        let group = |count_tag: u32, name: &str| GroupDef {
-            count_tag,
-            name: name.to_string(),
-            delimiter_tag: 200,
-            fields: vec![member.clone()],
-            groups: Vec::new(),
-            components: Vec::new(),
-            required: false,
+        let group = |count_tag: u32, name: &str| {
+            GroupDef::new(
+                count_tag,
+                name.to_string(),
+                200,
+                false,
+                vec![Member::Field(member.clone())],
+            )
         };
-        dict.add_message(MessageDef {
-            msg_type: "U4".to_string(),
-            name: "TwoGroups".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: vec![group(100, "NoFirst"), group(101, "NoSecond")],
-            components: Vec::new(),
-        });
+        dict.add_message(MessageDef::new(
+            "U4",
+            "TwoGroups",
+            MessageCategory::App,
+            vec![
+                Member::Group(group(100, "NoFirst")),
+                Member::Group(group(101, "NoSecond")),
+            ],
+        ));
         dict
     }
 
@@ -1982,29 +1983,23 @@ mod tests {
             required(34, "MsgSeqNum"),
         ];
         dict.trailer = vec![required(10, "CheckSum")];
-        dict.add_component(ComponentDef {
-            name: "Instrument".to_string(),
-            fields: vec![required(55, "Symbol")],
-            groups: Vec::new(),
-            components: Vec::new(),
-        });
-        dict.add_component(ComponentDef {
-            name: "PriceBlock".to_string(),
-            fields: vec![required(44, "Price")],
-            groups: Vec::new(),
-            components: Vec::new(),
-        });
-        dict.add_message(MessageDef {
-            msg_type: "U1".to_string(),
-            name: "Ping".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: vec![
-                ComponentRef::new("Instrument", true),
-                ComponentRef::new("PriceBlock", false),
+        dict.add_component(ComponentDef::new(
+            "Instrument",
+            vec![Member::Field(required(55, "Symbol"))],
+        ));
+        dict.add_component(ComponentDef::new(
+            "PriceBlock",
+            vec![Member::Field(required(44, "Price"))],
+        ));
+        dict.add_message(MessageDef::new(
+            "U1",
+            "Ping",
+            MessageCategory::App,
+            vec![
+                Member::Component(ComponentRef::new("Instrument", true)),
+                Member::Component(ComponentRef::new("PriceBlock", false)),
             ],
-        });
+        ));
         dict
     }
 
@@ -2054,14 +2049,12 @@ mod tests {
     #[test]
     fn test_validate_undefined_component_reference_is_reported() {
         let mut dict = dialect_with_optional_component();
-        dict.add_message(MessageDef {
-            msg_type: "U2".to_string(),
-            name: "Pong".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("Nope", true)],
-        });
+        dict.add_message(MessageDef::new(
+            "U2",
+            "Pong",
+            MessageCategory::App,
+            vec![Member::Component(ComponentRef::new("Nope", true))],
+        ));
         let found = errors(validate_with(
             &dict,
             &[
@@ -2104,27 +2097,21 @@ mod tests {
         let mut dict = dialect_with_optional_component();
         let links = MAX_SCOPE_DEPTH + 10;
         for index in 0..links {
-            dict.add_component(ComponentDef {
-                name: format!("C{index}"),
-                fields: Vec::new(),
-                groups: Vec::new(),
-                components: vec![ComponentRef::new(format!("C{}", index + 1), true)],
-            });
+            dict.add_component(ComponentDef::new(
+                format!("C{index}"),
+                vec![Member::Component(ComponentRef::new(
+                    format!("C{}", index + 1),
+                    true,
+                ))],
+            ));
         }
-        dict.add_component(ComponentDef {
-            name: format!("C{links}"),
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: Vec::new(),
-        });
-        dict.add_message(MessageDef {
-            msg_type: "U3".to_string(),
-            name: "Deep".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("C0", true)],
-        });
+        dict.add_component(ComponentDef::new(format!("C{links}"), Vec::new()));
+        dict.add_message(MessageDef::new(
+            "U3",
+            "Deep",
+            MessageCategory::App,
+            vec![Member::Component(ComponentRef::new("C0", true))],
+        ));
 
         let found = errors(validate_u3(&dict));
         assert!(
@@ -2142,16 +2129,13 @@ mod tests {
     #[test]
     fn test_validate_schema_past_the_node_budget_is_reported() {
         let mut dict = dialect_with_optional_component();
-        dict.add_message(MessageDef {
-            msg_type: "U3".to_string(),
-            name: "Wide".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: (0..=MAX_SCOPE_NODES)
-                .map(|_| ComponentRef::new("Instrument", false))
-                .collect(),
-        });
+        dict.add_message(MessageDef::new(
+            "U3",
+            "Wide",
+            MessageCategory::App,
+            (0..=MAX_SCOPE_NODES)
+                .map(|_| Member::Component(ComponentRef::new("Instrument", false))),
+        ));
 
         let found = errors(validate_u3(&dict));
         assert!(
@@ -2168,20 +2152,16 @@ mod tests {
         // still hold one: expansion must terminate rather than recurse
         // forever.
         let mut dict = dialect_with_optional_component();
-        dict.add_component(ComponentDef {
-            name: "Loop".to_string(),
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("Loop", true)],
-        });
-        dict.add_message(MessageDef {
-            msg_type: "U3".to_string(),
-            name: "Looping".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: Vec::new(),
-            components: vec![ComponentRef::new("Loop", true)],
-        });
+        dict.add_component(ComponentDef::new(
+            "Loop",
+            vec![Member::Component(ComponentRef::new("Loop", true))],
+        ));
+        dict.add_message(MessageDef::new(
+            "U3",
+            "Looping",
+            MessageCategory::App,
+            vec![Member::Component(ComponentRef::new("Loop", true))],
+        ));
         let result = validate_with(
             &dict,
             &[
@@ -2495,14 +2475,12 @@ mod tests {
         ] {
             application.add_field(FieldDef::new(tag, name, field_type));
         }
-        application.add_message(MessageDef {
-            msg_type: "U1".to_string(),
-            name: "Probe".to_string(),
-            category: MessageCategory::App,
-            fields: vec![field_ref(9001, "BodyTag", false)],
-            groups: Vec::new(),
-            components: Vec::new(),
-        });
+        application.add_message(MessageDef::new(
+            "U1",
+            "Probe",
+            MessageCategory::App,
+            vec![Member::Field(field_ref(9001, "BodyTag", false))],
+        ));
         (transport, application)
     }
 
@@ -2802,14 +2780,14 @@ mod tests {
             Some(message) => message,
             None => panic!("StreamAssignmentRequest is defined"),
         };
-        let component = match message.components.first() {
+        let component = match message.components().first() {
             Some(reference) => reference.name.as_str(),
             None => panic!("StreamAssignmentRequest references StrmAsgnReqGrp"),
         };
         let group = session
             .application()
             .get_component(component)
-            .and_then(|def| def.groups.iter().find(|group| group.count_tag == 1499));
+            .and_then(|def| def.groups().iter().find(|group| group.count_tag == 1499));
         match group {
             Some(group) => assert_eq!(group.delimiter_tag, 453),
             None => panic!("NoAsgnReqs(1499) is defined in {component}"),
@@ -2937,7 +2915,7 @@ mod tests {
         for (msg_type, count_tag) in [("U6", 100), ("U7", 120)] {
             let group = dict
                 .get_message(msg_type)
-                .and_then(|message| message.groups.iter().find(|g| g.count_tag == count_tag));
+                .and_then(|message| message.groups().iter().find(|g| g.count_tag == count_tag));
             match group {
                 Some(group) => assert_eq!(group.delimiter_tag, 110, "{msg_type}"),
                 None => panic!("{msg_type} carries group {count_tag}"),
@@ -3280,76 +3258,64 @@ mod tests {
             name: name.to_string(),
             required,
         };
-        dict.add_component(ComponentDef {
-            name: "ReqBlock".to_string(),
-            fields: vec![
-                field_ref(300, "ReqField", true),
-                field_ref(201, "OuterReq", true),
+        dict.add_component(ComponentDef::new(
+            "ReqBlock",
+            vec![
+                Member::Field(field_ref(300, "ReqField", true)),
+                Member::Field(field_ref(201, "OuterReq", true)),
             ],
-            groups: Vec::new(),
-            components: Vec::new(),
-        });
-        dict.add_component(ComponentDef {
-            name: "OptBlock".to_string(),
-            fields: vec![
-                field_ref(301, "OptReq", true),
-                field_ref(302, "OptOther", false),
+        ));
+        dict.add_component(ComponentDef::new(
+            "OptBlock",
+            vec![
+                Member::Field(field_ref(301, "OptReq", true)),
+                Member::Field(field_ref(302, "OptOther", false)),
+                Member::Group(GroupDef::new(
+                    130,
+                    "NoOptNested",
+                    230,
+                    true,
+                    vec![Member::Field(field_ref(230, "OptNestedKey", true))],
+                )),
             ],
-            groups: vec![GroupDef {
-                count_tag: 130,
-                name: "NoOptNested".to_string(),
-                delimiter_tag: 230,
-                fields: vec![field_ref(230, "OptNestedKey", true)],
-                groups: Vec::new(),
-                components: Vec::new(),
-                required: true,
-            }],
-            components: Vec::new(),
-        });
-        let inner = GroupDef {
-            count_tag: 110,
-            name: "NoInner".to_string(),
-            delimiter_tag: 210,
-            fields: vec![
-                field_ref(210, "InnerKey", true),
-                field_ref(211, "InnerReq", true),
+        ));
+        let inner = GroupDef::new(
+            110,
+            "NoInner",
+            210,
+            false,
+            vec![
+                Member::Field(field_ref(210, "InnerKey", true)),
+                Member::Field(field_ref(211, "InnerReq", true)),
             ],
-            groups: Vec::new(),
-            components: Vec::new(),
-            required: false,
-        };
-        let req_nested = GroupDef {
-            count_tag: 120,
-            name: "NoReqNested".to_string(),
-            delimiter_tag: 220,
-            fields: vec![field_ref(220, "NestedKey", true)],
-            groups: Vec::new(),
-            components: Vec::new(),
-            required: true,
-        };
-        let outer = GroupDef {
-            count_tag: 100,
-            name: "NoOuter".to_string(),
-            delimiter_tag: 200,
-            fields: vec![
-                field_ref(200, "OuterKey", true),
-                field_ref(201, "OuterReq", true),
+        );
+        let req_nested = GroupDef::new(
+            120,
+            "NoReqNested",
+            220,
+            true,
+            vec![Member::Field(field_ref(220, "NestedKey", true))],
+        );
+        let outer = GroupDef::new(
+            100,
+            "NoOuter",
+            200,
+            false,
+            vec![
+                Member::Field(field_ref(200, "OuterKey", true)),
+                Member::Field(field_ref(201, "OuterReq", true)),
+                Member::Group(inner),
+                Member::Group(req_nested),
+                Member::Component(ComponentRef::new("ReqBlock", true)),
+                Member::Component(ComponentRef::new("OptBlock", false)),
             ],
-            groups: vec![inner, req_nested],
-            components: vec![
-                ComponentRef::new("ReqBlock", true),
-                ComponentRef::new("OptBlock", false),
-            ],
-            required: false,
-        };
-        dict.add_message(MessageDef {
-            msg_type: "U5".to_string(),
-            name: "Groups".to_string(),
-            category: MessageCategory::App,
-            fields: Vec::new(),
-            groups: vec![outer],
-            components: Vec::new(),
-        });
+        );
+        dict.add_message(MessageDef::new(
+            "U5",
+            "Groups",
+            MessageCategory::App,
+            vec![Member::Group(outer)],
+        ));
         dict
     }
 
