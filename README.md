@@ -82,6 +82,16 @@ exists yet.
   against the pair with QuickFIX-like semantics: `BeginString` must be
   `FIXT.1.1`, header and trailer come from the transport, the body from the
   application, and admin messages entirely from the transport.
+- **A zero-copy repeating-group reader** in `ironfix-dictionary`. Build a
+  `MessageLayout` once per message type from a dictionary (or describe the
+  groups at compile time with `GroupSpec` / `GroupSet`), then read a decoded
+  message's groups as borrowed views: `layout.read(&msg, 453)` checks the
+  whole group with the validator's own walk and yields one `GroupEntry` per
+  entry, with own-level field lookup and nested groups. A malformed group is
+  a typed `GroupError`, never a partial view, and the read path allocates
+  nothing (proved with a counting allocator in
+  `ironfix-dictionary/tests/group_reader_allocations.rs`). It is opt-in: the
+  engine does not call it.
 - **Code generation.** `#[derive(FixMessage)]` and `#[derive(FixField)]` in
   `ironfix-derive` implement the `ironfix-core` traits with typed
   `DecodeError` / `EncodeError` paths (compile-tested in

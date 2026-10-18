@@ -1334,6 +1334,21 @@ validation is stricter than it was, and stricter than QuickFIX: messages whose
 entries lacked required members used to pass, and some still pass at a
 QuickFIX counterparty.
 
+**Reading groups.** `ironfix-dictionary::group` reads a decoded message's
+repeating groups with the same positional walk, so the reader and the
+validator agree on entry boundaries and on which instances are malformed (a
+test sweeps every validator fixture to keep it so). A `MessageLayout` is built
+once per message type from the dictionary; `layout.read(&msg, count_tag)`
+finds the count field at the message level only (the same tag inside another
+group's entries is skipped), checks the whole instance, nested groups
+included, and returns `Ok(None)` when the group is absent or a typed
+`GroupError` for a count mismatch, a delimiter mismatch, a tag repeated in an
+entry, a count that is not one or more ASCII digits (`+1` included), a count
+field present twice, or nesting deeper than 32. Entries are borrowed ranges of
+the message's field list: reading and iterating allocate nothing. Required
+members are the validator's concern; the reader does not check them. See
+ADR-0011.
+
 ---
 
 ### Business Message Reject (MsgType = j)
