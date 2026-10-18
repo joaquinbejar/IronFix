@@ -608,6 +608,12 @@ impl<'s> GroupSet<'s> {
     /// other field. No allocation, for groups of up to 512 entry-level
     /// members.
     ///
+    /// A tag repeated at the message level is not reported here: the first
+    /// occurrence is returned and the others are ignored. A repeated tag is a
+    /// malformed message (session reject reason 13, "tag appears more than
+    /// once"); [`Validator`](crate::Validator) reports it as
+    /// [`ValidationError::DuplicateTag`].
+    ///
     /// # Examples
     ///
     /// ```
