@@ -102,6 +102,7 @@
 //! buffer. Both names exist in the workspace; always qualify them.
 
 pub mod composition;
+mod document;
 pub mod group;
 pub mod loader;
 pub mod orchestra;

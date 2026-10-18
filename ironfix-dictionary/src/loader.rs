@@ -51,7 +51,18 @@
 //! rejected ([`DictionaryError::UnknownComponent`]), and duplicate
 //! definitions are rejected rather than silently overwriting each other
 //! ([`DictionaryError::DuplicateDefinition`]).
+//!
+//! The document is one `<fix>` root element. Outside it the loader accepts
+//! only what XML allows there: whitespace, comments, processing
+//! instructions, the XML declaration (first in the document) and one
+//! document type declaration (before the root; quick-xml does not process
+//! it, so it declares no entity the loader expands). Text, a CDATA section,
+//! a reference or a second element before or after the root, a root other
+//! than `<fix>`, and a `<fix>` the document never closes are each a
+//! [`DictionaryError::Xml`], so a truncated, concatenated or corrupted file
+//! is an error rather than a dictionary read from part of it.
 
+use crate::document::{Prolog, epilog, excerpt};
 use crate::orchestra::OrchestraKind;
 use crate::schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, Member,
@@ -435,8 +446,11 @@ impl Dictionary {
     /// * `xml` - The XML document contents
     ///
     /// # Errors
-    /// Returns [`DictionaryError`] if the XML is malformed, describes an
-    /// unsupported version, or contains dangling field/component references.
+    /// Returns [`DictionaryError`] if the XML is malformed (content outside
+    /// the `<fix>` root other than whitespace, comments, processing
+    /// instructions and declarations included; see the [module
+    /// docs](crate::loader)), describes an unsupported version, or contains
+    /// dangling field/component references.
     pub fn from_quickfix_xml(xml: &str) -> Result<Self, DictionaryError> {
         load(xml)
     }
@@ -987,61 +1001,118 @@ fn visit_items(
     Ok(height)
 }
 
+/// Reads the prolog and the root element's start tag, which must be `<fix>`;
+/// returns it and whether it is self-closing.
+///
+/// The prolog may hold only what XML allows there ([`Prolog`]): whitespace,
+/// comments, processing instructions, the XML declaration first and one
+/// document type declaration.
+fn root<'i>(reader: &mut Reader<&'i [u8]>) -> Result<(BytesStart<'i>, bool), DictionaryError> {
+    let mut prolog = Prolog::default();
+    loop {
+        let (start, empty) = match reader.read_event().map_err(xml_err)? {
+            Event::Start(start) => (start, false),
+            Event::Empty(start) => (start, true),
+            Event::Eof => {
+                return Err(DictionaryError::Xml(
+                    "missing root <fix> element".to_string(),
+                ));
+            }
+            event => {
+                prolog.accept(&event)?;
+                continue;
+            }
+        };
+        if start.name().as_ref() != "fix" {
+            return Err(DictionaryError::Xml(format!(
+                "root element <{}> is not <fix>",
+                excerpt(start.name().0)
+            )));
+        }
+        return Ok((start, empty));
+    }
+}
+
 fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
     let mut reader = Reader::from_str(xml);
 
-    let mut version: Option<Version> = None;
+    let (fix, empty) = root(&mut reader)?;
+    let version = parse_version(&attr_map(&fix)?)?;
     let mut header_items: Vec<Item> = Vec::new();
     let mut trailer_items: Vec<Item> = Vec::new();
     let mut message_irs: Vec<MessageIr> = Vec::new();
     let mut component_defs = ComponentIrs::default();
     let mut field_defs: Vec<FieldDef> = Vec::new();
 
-    loop {
-        match reader.read_event().map_err(xml_err)? {
-            Event::Start(e) => match e.name().as_ref() {
-                "fix" => version = Some(parse_version(&attr_map(&e)?)?),
-                "header" => header_items = parse_items(&mut reader, "header", 1)?,
-                "trailer" => trailer_items = parse_items(&mut reader, "trailer", 1)?,
-                "message" => {
-                    let attrs = attr_map(&e)?;
-                    let items = parse_items(&mut reader, "message", 1)?;
-                    message_irs.push(MessageIr::new(&attrs, items)?);
+    if !empty {
+        // Elements open inside `<fix>` that no section parser consumes
+        // (`<messages>`, `<components>`, unknown ones); the end tag read
+        // with none open is `</fix>` itself (quick-xml checks the name).
+        let mut open: usize = 0;
+        loop {
+            match reader.read_event().map_err(xml_err)? {
+                Event::Start(e) => match e.name().as_ref() {
+                    "header" => header_items = parse_items(&mut reader, "header", 1)?,
+                    "trailer" => trailer_items = parse_items(&mut reader, "trailer", 1)?,
+                    "message" => {
+                        let attrs = attr_map(&e)?;
+                        let items = parse_items(&mut reader, "message", 1)?;
+                        message_irs.push(MessageIr::new(&attrs, items)?);
+                    }
+                    "component" => {
+                        let attrs = attr_map(&e)?;
+                        let name = required_attr(&attrs, "component", "name")?;
+                        let items = parse_items(&mut reader, "component", 1)?;
+                        component_defs.define(name, items)?;
+                    }
+                    "fields" => field_defs = parse_field_defs(&mut reader)?,
+                    _ => {
+                        open = open.checked_add(1).ok_or_else(|| {
+                            DictionaryError::Xml("element nesting overflows".to_string())
+                        })?;
+                    }
+                },
+                // A self-closing definition is a definition with no members, not
+                // an element to skip. QuickFIX writes them: `FIXT11.xml` defines
+                // `<component name='MsgTypeGrp' />` (referenced by Logon), and
+                // `FIXT11.xml` / `FIX44.xml` define
+                // `<message name='XMLnonFIX' msgtype='n' msgcat='admin' />`.
+                // Skipping the first made every reference to it a dangling
+                // `UnknownComponent`; skipping the second dropped a message the
+                // dictionary defines. Member references never reach this loop:
+                // `parse_items` consumes everything inside a message, component,
+                // group, header, or trailer.
+                Event::Empty(e) => match e.name().as_ref() {
+                    "message" => message_irs.push(MessageIr::new(&attr_map(&e)?, Vec::new())?),
+                    "component" => {
+                        let name = required_attr(&attr_map(&e)?, "component", "name")?;
+                        component_defs.define(name, Vec::new())?;
+                    }
+                    _ => {}
+                },
+                Event::End(_) => match open.checked_sub(1) {
+                    Some(still_open) => open = still_open,
+                    None => break,
+                },
+                Event::Eof => {
+                    return Err(DictionaryError::Xml(
+                        "unexpected end of file inside <fix>".to_string(),
+                    ));
                 }
-                "component" => {
-                    let attrs = attr_map(&e)?;
-                    let name = required_attr(&attrs, "component", "name")?;
-                    let items = parse_items(&mut reader, "component", 1)?;
-                    component_defs.define(name, items)?;
-                }
-                "fields" => field_defs = parse_field_defs(&mut reader)?,
                 _ => {}
-            },
-            // A self-closing definition is a definition with no members, not
-            // an element to skip. QuickFIX writes them: `FIXT11.xml` defines
-            // `<component name='MsgTypeGrp' />` (referenced by Logon), and
-            // `FIXT11.xml` / `FIX44.xml` define
-            // `<message name='XMLnonFIX' msgtype='n' msgcat='admin' />`.
-            // Skipping the first made every reference to it a dangling
-            // `UnknownComponent`; skipping the second dropped a message the
-            // dictionary defines. Member references never reach this loop:
-            // `parse_items` consumes everything inside a message, component,
-            // group, header, or trailer.
-            Event::Empty(e) => match e.name().as_ref() {
-                "message" => message_irs.push(MessageIr::new(&attr_map(&e)?, Vec::new())?),
-                "component" => {
-                    let name = required_attr(&attr_map(&e)?, "component", "name")?;
-                    component_defs.define(name, Vec::new())?;
-                }
-                _ => {}
-            },
-            Event::Eof => break,
-            _ => {}
+            }
         }
     }
 
-    let version =
-        version.ok_or_else(|| DictionaryError::Xml("missing root <fix> element".to_string()))?;
+    // Only whitespace, comments and processing instructions may follow
+    // `</fix>`: text or a second root there is a corrupted or concatenated
+    // file, not one to read part of.
+    loop {
+        match reader.read_event().map_err(xml_err)? {
+            Event::Eof => break,
+            event => epilog(&event)?,
+        }
+    }
 
     assemble(Assembly {
         version,
@@ -2282,5 +2353,124 @@ mod tests {
         let ping = some(dict.get_message("U1"), "custom message defined");
         assert_eq!(ping.name, "Ping");
         assert_eq!(some(ping.fields().first(), "Ping has a field").tag, 112);
+    }
+
+    /// A small, complete QuickFIX document.
+    const MINIMAL_XML: &str = "<fix type='FIX' major='4' minor='4'>\
+        <header><field name='BeginString' required='Y'/></header>\
+        <trailer/><messages/>\
+        <fields><field number='8' name='BeginString' type='STRING'/></fields>\
+        </fix>";
+
+    #[test]
+    fn test_content_outside_the_root_element_is_rejected() {
+        let xml_error = |message: &str| DictionaryError::Xml(message.to_string());
+        // Issue #117: text after `</fix>` was read past, and the dictionary
+        // loaded from the document's first part.
+        assert_eq!(
+            load_err(&format!("{FIX44_XML}TRAILING_CORRUPTION")),
+            xml_error("text `TRAILING_CORRUPTION` after the root element")
+        );
+        assert_eq!(
+            load_err(&format!("{MINIMAL_XML}\n  junk\n")),
+            xml_error("text `junk` after the root element")
+        );
+        // A second root used to replace the first one's version: this loaded
+        // as FIX 4.2.
+        assert_eq!(
+            load_err(&format!(
+                "{MINIMAL_XML}<fix type='FIX' major='4' minor='2'></fix>"
+            )),
+            xml_error("an element <fix> after the root element")
+        );
+        assert_eq!(
+            load_err(&format!("{MINIMAL_XML}<![CDATA[x]]>")),
+            xml_error("a CDATA section after the root element")
+        );
+        assert_eq!(
+            load_err(&format!("{MINIMAL_XML}<?xml version='1.0'?>")),
+            xml_error("an XML declaration after the root element")
+        );
+        assert_eq!(
+            load_err(&format!("JUNK{MINIMAL_XML}")),
+            xml_error("text `JUNK` before the root element")
+        );
+        assert_eq!(
+            load_err(&format!("<?xml version='1.0'?>JUNK{MINIMAL_XML}")),
+            xml_error("text `JUNK` before the root element")
+        );
+        assert_eq!(
+            load_err(&format!("\n<?xml version='1.0'?>{MINIMAL_XML}")),
+            xml_error("an XML declaration that does not start the document")
+        );
+        assert_eq!(
+            load_err("<!-- no root -->"),
+            xml_error("missing root <fix> element")
+        );
+    }
+
+    #[test]
+    fn test_root_element_other_than_fix_is_rejected() {
+        // Used to load: the loader read a `<fix>` start tag at any depth.
+        assert_eq!(
+            load_err(&format!("<wrapper>{MINIMAL_XML}</wrapper>")),
+            DictionaryError::Xml("root element <wrapper> is not <fix>".to_string())
+        );
+    }
+
+    #[test]
+    fn test_unclosed_root_element_is_rejected() {
+        // Used to load: the end of the document ended the dictionary.
+        let unclosed = some(MINIMAL_XML.strip_suffix("</fix>"), "ends with </fix>");
+        assert_eq!(
+            load_err(unclosed),
+            DictionaryError::Xml("unexpected end of file inside <fix>".to_string())
+        );
+        let unclosed = some(FIX44_XML.strip_suffix("</fix>"), "ends with </fix>");
+        assert!(matches!(load_err(unclosed), DictionaryError::Xml(_)));
+    }
+
+    #[test]
+    fn test_misc_outside_the_root_element_is_accepted() {
+        let padded = format!(
+            "<?xml version='1.0' encoding='UTF-8'?>\n<!-- before -->\n<?pi before?>\n\
+             <!DOCTYPE fix>\n{MINIMAL_XML}\n<!-- after -->\n<?pi after?>\n \t\r\n"
+        );
+        let dict = ok(Dictionary::from_quickfix_xml(&padded), "padded loads");
+        assert_eq!(dict.version, Version::Fix44);
+        assert_eq!(dict.header.len(), 1);
+        assert_eq!(dict.fields.len(), 1);
+
+        let embedded: [(&str, Version); 4] = [
+            (FIX42_XML, Version::Fix42),
+            (FIX44_XML, Version::Fix44),
+            (FIXT11_XML, Version::Fixt11),
+            (FIX50SP2_XML, Version::Fix50Sp2),
+        ];
+        for (xml, version) in embedded {
+            let padded = format!("\n{xml}\n<!-- trailing comment -->\n");
+            let dict = ok(
+                Dictionary::from_quickfix_xml(&padded),
+                "padded embedded loads",
+            );
+            assert_eq!(dict.version, version);
+        }
+    }
+
+    #[test]
+    fn test_self_closing_root_element_loads_as_an_empty_dictionary() {
+        // `<fix .../>` and `<fix ...></fix>` are the same element.
+        for xml in [
+            "<fix type='FIX' major='4' minor='4'/>",
+            "<fix type='FIX' major='4' minor='4'></fix>",
+        ] {
+            let dict = ok(Dictionary::from_quickfix_xml(xml), "empty dictionary loads");
+            assert_eq!(dict.version, Version::Fix44);
+            assert!(dict.fields.is_empty() && dict.messages.is_empty());
+        }
+        assert!(matches!(
+            load_err("<fix type='FIX' major='9' minor='9'/>"),
+            DictionaryError::UnsupportedVersion(_)
+        ));
     }
 }
