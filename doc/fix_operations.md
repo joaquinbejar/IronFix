@@ -813,7 +813,8 @@ FIX 4.x session (which carries no `ApplVerID` to reject).
 | 6 | `SequenceReset` with a malformed `GapFillFlag` (123) that is present but neither `Y` nor `N`; inbound `SendingTime` (52) present but not a `UTCTimestamp` |
 | 9 | Inbound `SenderCompID`/`TargetCompID` (and `SenderSubID`/`TargetSubID` when configured) do not match the session configuration, **or** appear outside the standard header |
 | 10 | Inbound `SendingTime` (52) differs from the local clock by more than the configured tolerance |
-| 13 | FIX 5.0 only: `ApplVerID` (1128) more than once in an inbound application message, or `DefaultApplVerID` (1137) more than once on the Logon acknowledgement (initiator); `RefTagID` = the repeated tag |
+| 13 | FIX 5.0 only: `ApplVerID` (1128) more than once in the standard header of an inbound application message, or `DefaultApplVerID` (1137) more than once on the Logon acknowledgement (initiator); `RefTagID` = the repeated tag |
+| 14 | FIX 5.0 only: `ApplVerID` (1128), a standard-header field, after the header of an inbound application message has ended; `RefTagID` = 1128, the number is consumed and the message never reaches `from_app` |
 | 18 | FIX 5.0 only: an inbound application message whose `ApplVerID` (1128) names no version or a version the session does not accept (`RefTagID` = 1128; the message's number is consumed and it never reaches `from_app`), or a Logon acknowledgement whose `DefaultApplVerID` (1137) fails the same rule (`RefTagID` = 1137, followed by a Logout; initiator) |
 | any | Whatever an `Application::from_admin` / `from_app` implementation returns in its `RejectReason` |
 
@@ -1758,13 +1759,17 @@ and are refused as unknown. Both are reason 18.
 |---|---|---|
 | Acceptor, inbound Logon | 1137 required, once, naming an accepted version | Logout with the reason and the accepted versions, after `from_admin` (filed when a store is attached; never resets it); `EngineError::ApplVersion` |
 | Initiator, Logon ack | 1137, when present, once and naming an accepted version | Reject (18, or 13 when repeated; `RefTagID` 1137) and Logout; `EngineError::ApplVersion` |
-| Both roles, in session | 1128 on an application message, when present, once and naming an accepted version | Reject (18, or 13 when repeated; `RefTagID` 1128); the number is consumed and persisted, `from_app` is not called, the session stays up |
+| Both roles, in session | 1128 on an application message, when present, in the standard header, once, naming an accepted version | Reject (18; 13 when repeated in the header; 14 when outside it; `RefTagID` 1128); the number is consumed and persisted, `from_app` is not called, the session stays up |
 
-Every occurrence of 1128 in the message counts, header or not: the value the
-session checks is the value `RawMessage::get_field_str(1128)` hands the
-application. A message without 1128 is in the counterparty's default version,
-which the Logon exchange checked. FIX 4.x sessions carry neither field and are
-not checked.
+1128 is a standard-header field (`FIXT11.xml`), so it is read positionally,
+as the CompIDs are: one in the header (the leading run of standard-header
+tags) is the message's version, and one after the header has ended is out of
+order (reason 14) whatever its value, so no 1128 that
+`RawMessage::get_field_str(1128)` could hand the application escapes the
+check. 1137 is a body field of the Logon and is read across the whole message.
+A message without 1128 is in the counterparty's default version, which the
+Logon exchange checked. FIX 4.x sessions carry neither field and are not
+checked.
 
 **Not implemented for 5.0:**
 

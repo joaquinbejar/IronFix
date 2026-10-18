@@ -86,18 +86,24 @@ no session state:
   `required`), repeated, not a code (`Unknown`), or not accepted
   (`NotAccepted`);
 - `check_application(raw)` for 1128: absent passes (the message is in the
-  counterparty's default version, which the handshake checked); repeated, not
-  a code, or not accepted fail.
+  counterparty's default version, which the handshake checked); outside the
+  standard header, repeated in it, not a code, or not accepted fail.
 
-Each tag is looked up across the whole message, not the header alone: the
-application reads 1128 with `RawMessage::get_field_str`, which returns the
-first occurrence wherever it is, so the value the session checks must be the
-value the application can read. A repeated tag fails because no occurrence
-can be trusted over the other.
+The two tags are read differently because they live in different places.
+1137 is a body field of the Logon, so it is read across the whole message and
+must occur once. 1128 is a standard-header field (`FIXT11.xml`, `<header>`),
+so it is read positionally, as the CompIDs are: one in the header (the leading
+run of standard-header tags) is the message's version, more than one there is
+repeated, and one after the header has ended is out of order, whatever its
+value and whatever else the message carries. Every occurrence is looked at, so
+no 1128 the application could read with `RawMessage::get_field_str` escapes
+the check. (An earlier revision read 1128 across the whole message as well;
+review asked for the positional read.)
 
 `ApplVersionProblem::reject_reason` maps a failure to a Reject:
 `SessionRejectReason` 18 for an unknown or unaccepted value, 13 for a
-repeated tag, 1 for a missing required tag, `RefTagID` the tag. The refusal
+repeated tag, 14 ("tag specified out of required order") for a 1128 outside
+the header, 1 for a missing required tag, `RefTagID` the tag. The refusal
 text echoes at most 16 bytes of the value, escaped, and names the accepted
 versions; neither tag can carry a credential.
 

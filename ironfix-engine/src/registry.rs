@@ -148,7 +148,7 @@ use crate::application::{Application, NoOpApplication, SessionId};
 use crate::connection::Connection;
 use crate::error::EngineError;
 use crate::reactor::{HandshakeRead, read_handshake_frame_until};
-use crate::wire::{self, HeaderField};
+use crate::wire::{self, FieldOccurrence};
 use async_trait::async_trait;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::CompId;
@@ -407,13 +407,13 @@ fn bounded_value(value: &[u8]) -> Result<&str, String> {
 /// that fails [`bounded_value`].
 fn header_value<'a>(raw: &RawMessage<'a>, tag: u32) -> Result<Option<&'a str>, RoutingRefusal<'a>> {
     match wire::header_field(raw, tag) {
-        HeaderField::Absent => Ok(None),
-        HeaderField::Repeated => Err(RoutingRefusal {
+        FieldOccurrence::Absent => Ok(None),
+        FieldOccurrence::Repeated => Err(RoutingRefusal {
             tag,
             detail: "occurs more than once in the standard header".to_string(),
             value: None,
         }),
-        HeaderField::Once(value) => {
+        FieldOccurrence::Once(value) => {
             bounded_value(value)
                 .map(Some)
                 .map_err(|detail| RoutingRefusal {

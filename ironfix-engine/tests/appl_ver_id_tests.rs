@@ -836,6 +836,47 @@ async fn test_fix4_or_repeated_appl_ver_id_is_rejected() {
     assert_eq!(connection.next_target_seq(), 4);
 }
 
+/// `ApplVerID` (1128) is a standard-header field: one placed after the body
+/// has opened is out of order, so even an accepted value there draws a
+/// Reject (373 = 14, 371 = 1128). Its number is consumed and it never reaches
+/// `from_app`; the next message is in sequence.
+#[tokio::test]
+async fn test_appl_ver_id_outside_the_header_is_rejected_with_reason_14() {
+    let (venue_app, mut venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(Acceptor::new(
+        venue_config("FIX.5.0SP2"),
+        Arc::clone(&venue_app),
+    ));
+    let (mut framed, connection, _ack) =
+        establish(acceptor, client_fixt_logon(1, &[(1137, "9")])).await;
+
+    let mut body = ORDER_BODY.to_vec();
+    body.push((1128, "9"));
+    ok(
+        framed.send(client_fixt("D", 2, &[], &body)).await,
+        "client sends an order with 1128 in the body",
+    );
+    let reject = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&reject), "3");
+    assert_eq!(field(&reject, 45).as_deref(), Some("2"));
+    assert_eq!(field(&reject, 373).as_deref(), Some("14"));
+    assert_eq!(field(&reject, 371).as_deref(), Some("1128"));
+    assert_no_app_message(&mut venue_rx, "the misplaced order").await;
+    assert_eq!(connection.next_target_seq(), 3, "its number is consumed");
+
+    ok(
+        framed
+            .send(client_fixt("D", 3, &[(1128, "9")], &ORDER_BODY))
+            .await,
+        "client sends an order with 1128 in the header",
+    );
+    assert_eq!(
+        next_app_message(&mut venue_rx).await,
+        ("D".to_string(), "3".to_string(), Some("9".to_string()))
+    );
+    assert_silent(&mut framed, "no ResendRequest for the rejected number").await;
+}
+
 /// The initiator runs the same reactor: an inbound report with a disallowed
 /// `ApplVerID` is rejected there too and never reaches `from_app`.
 #[tokio::test]

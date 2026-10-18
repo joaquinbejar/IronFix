@@ -223,16 +223,18 @@ fn in_standard_header(raw: &RawMessage<'_>, tag: u32) -> bool {
     false
 }
 
-/// How often a tag occurs in the standard header of a message.
+/// How often a tag occurs in the part of a message a read covers: the
+/// standard header for [`header_field`], the whole message for the
+/// message-wide read of a body field such as `DefaultApplVerID` (1137).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HeaderField<'a> {
-    /// The header does not carry the tag.
+pub(crate) enum FieldOccurrence<'a> {
+    /// The part read does not carry the tag.
     Absent,
-    /// The header carries the tag once, with this raw value.
+    /// The part read carries the tag once, with this raw value.
     Once(&'a [u8]),
-    /// The header carries the tag more than once (`SessionRejectReason` 13,
-    /// "tag appears more than once"): no occurrence can be trusted over the
-    /// others.
+    /// The part read carries the tag more than once (`SessionRejectReason`
+    /// 13, "tag appears more than once"): no occurrence can be trusted over
+    /// the others.
     Repeated,
 }
 
@@ -240,22 +242,22 @@ pub(crate) enum HeaderField<'a> {
 ///
 /// The header is the leading run of standard-header tags, as for
 /// [`in_standard_header`]: a `tag` that occurs only in the body is
-/// [`HeaderField::Absent`], and a tag outside the standard header set is never
+/// [`FieldOccurrence::Absent`], and a tag outside the standard header set is never
 /// found. The whole header is scanned, so a tag repeated in it is
-/// [`HeaderField::Repeated`] rather than its first value. One scan, no
+/// [`FieldOccurrence::Repeated`] rather than its first value. One scan, no
 /// allocation, and the value is returned as raw bytes, so a caller bounding an
 /// untrusted value sees every byte before deciding whether it is text at all.
-pub(crate) fn header_field<'a>(raw: &RawMessage<'a>, tag: u32) -> HeaderField<'a> {
-    let mut found = HeaderField::Absent;
+pub(crate) fn header_field<'a>(raw: &RawMessage<'a>, tag: u32) -> FieldOccurrence<'a> {
+    let mut found = FieldOccurrence::Absent;
     for field in raw.fields() {
         if !is_standard_header_tag(field.tag) {
             break;
         }
         if field.tag == tag {
-            if found != HeaderField::Absent {
-                return HeaderField::Repeated;
+            if found != FieldOccurrence::Absent {
+                return FieldOccurrence::Repeated;
             }
-            found = HeaderField::Once(field.value);
+            found = FieldOccurrence::Once(field.value);
         }
     }
     found
@@ -612,7 +614,7 @@ impl SendingTimeGuard {
 pub(crate) const DEFAULT_APPL_VER_ID: u32 = 1137;
 
 /// `ApplVerID` (1128): the application version of one FIXT.1.1 application
-/// message, in its standard header.
+/// message. A standard-header field (`FIXT11.xml`, `<header>`), and only that.
 pub(crate) const APPL_VER_ID: u32 = 1128;
 
 /// Longest application-version value echoed in a log line, a Reject or a
@@ -633,6 +635,13 @@ pub(crate) enum ApplVersionProblem {
     /// others (`SessionRejectReason` 13).
     Repeated {
         /// The repeated tag.
+        tag: u32,
+    },
+    /// A header-only tag (`ApplVerID` (1128)) occurs after the standard
+    /// header has ended (`SessionRejectReason` 14, "tag specified out of
+    /// required order").
+    OutsideHeader {
+        /// The misplaced tag.
         tag: u32,
     },
     /// The value names no version: it is not one of the `ApplVerID` codes
@@ -668,6 +677,7 @@ impl ApplVersionProblem {
         match self {
             Self::Missing { tag }
             | Self::Repeated { tag }
+            | Self::OutsideHeader { tag }
             | Self::Unknown { tag, .. }
             | Self::NotAccepted { tag, .. } => *tag,
         }
@@ -680,13 +690,15 @@ impl ApplVersionProblem {
     /// in the FIXT.1.1 session dictionary (QuickFIX `FIXT11.xml`,
     /// `INVALID_UNSUPPORTED_APPLICATION_VERSION`), which governs the Reject
     /// message on every FIXT.1.1 session; this check runs on no other kind. A
-    /// missing required tag is reason 1 and a repeated one reason 13
-    /// (`doc/fix_operations.md`, "Session Reject Reasons").
+    /// missing required tag is reason 1, a repeated one reason 13 and a
+    /// header tag outside the header reason 14 (`doc/fix_operations.md`,
+    /// "Session Reject Reasons").
     #[must_use]
     pub(crate) fn reject_reason(&self) -> RejectReason {
         let code = match self {
             Self::Missing { .. } => 1,
             Self::Repeated { .. } => 13,
+            Self::OutsideHeader { .. } => 14,
             Self::Unknown { .. } | Self::NotAccepted { .. } => 18,
         };
         RejectReason::new(code, self.to_string()).with_ref_tag(self.tag())
@@ -712,6 +724,10 @@ impl std::fmt::Display for ApplVersionProblem {
                  application version"
             ),
             Self::Repeated { tag } => write!(f, "{name} ({tag}) appears more than once"),
+            Self::OutsideHeader { tag } => write!(
+                f,
+                "{name} ({tag}) appears outside the standard header, where it belongs"
+            ),
             Self::Unknown {
                 tag,
                 value,
@@ -737,18 +753,18 @@ impl std::fmt::Display for ApplVersionProblem {
 
 /// Where a tag occurs anywhere in a message, header, body or trailer.
 ///
-/// Used for the application-version tags: an application reads them with
-/// [`RawMessage::get_field_str`], which finds the first occurrence wherever it
-/// is, so a value the session checks has to be the value the application can
-/// read, wherever the counterparty put it.
-fn message_field<'a>(raw: &RawMessage<'a>, tag: u32) -> HeaderField<'a> {
-    let mut found = HeaderField::Absent;
+/// Used for `DefaultApplVerID` (1137), a body field of the Logon: an
+/// application reads it with [`RawMessage::get_field_str`], which finds the
+/// first occurrence wherever it is, so the value the session checks has to be
+/// the only one the message carries.
+fn message_field<'a>(raw: &RawMessage<'a>, tag: u32) -> FieldOccurrence<'a> {
+    let mut found = FieldOccurrence::Absent;
     for field in raw.fields() {
         if field.tag == tag {
-            if found != HeaderField::Absent {
-                return HeaderField::Repeated;
+            if found != FieldOccurrence::Absent {
+                return FieldOccurrence::Repeated;
             }
-            found = HeaderField::Once(field.value);
+            found = FieldOccurrence::Once(field.value);
         }
     }
     found
@@ -854,14 +870,14 @@ impl ApplVersionGuard {
             return Ok(None);
         }
         match message_field(raw, DEFAULT_APPL_VER_ID) {
-            HeaderField::Absent if required => Err(ApplVersionProblem::Missing {
+            FieldOccurrence::Absent if required => Err(ApplVersionProblem::Missing {
                 tag: DEFAULT_APPL_VER_ID,
             }),
-            HeaderField::Absent => Ok(None),
-            HeaderField::Repeated => Err(ApplVersionProblem::Repeated {
+            FieldOccurrence::Absent => Ok(None),
+            FieldOccurrence::Repeated => Err(ApplVersionProblem::Repeated {
                 tag: DEFAULT_APPL_VER_ID,
             }),
-            HeaderField::Once(value) => self.check_value(DEFAULT_APPL_VER_ID, value).map(Some),
+            FieldOccurrence::Once(value) => self.check_value(DEFAULT_APPL_VER_ID, value).map(Some),
         }
     }
 
@@ -869,12 +885,19 @@ impl ApplVersionGuard {
     ///
     /// A message without 1128 is in the counterparty's default application
     /// version, which its Logon declared and the handshake already checked,
-    /// so it passes. Every occurrence of 1128 counts, header or not: the
-    /// value checked is the value the application can read. On a FIX 4.x
-    /// session nothing is checked.
+    /// so it passes. 1128 is a standard-header field (`FIXT11.xml`), so it is
+    /// read positionally, as [`header_field`] reads the CompIDs: one in the
+    /// header is the message's version, and one after the header has ended is
+    /// out of order, wherever else 1128 occurs. Every occurrence is looked at,
+    /// so no 1128 the application could read with
+    /// [`RawMessage::get_field_str`] escapes the check. On a FIX 4.x session
+    /// nothing is checked.
     ///
     /// # Errors
-    /// [`ApplVersionProblem::Repeated`] when 1128 occurs more than once,
+    /// [`ApplVersionProblem::OutsideHeader`] when any 1128 occurs after the
+    /// standard header (this outranks a repetition),
+    /// [`ApplVersionProblem::Repeated`] when the header carries it more than
+    /// once,
     /// [`ApplVersionProblem::Unknown`] when its value names no version, and
     /// [`ApplVersionProblem::NotAccepted`] when it names one the session does
     /// not accept.
@@ -882,10 +905,27 @@ impl ApplVersionGuard {
         if !self.fixt {
             return Ok(());
         }
-        match message_field(raw, APPL_VER_ID) {
-            HeaderField::Absent => Ok(()),
-            HeaderField::Repeated => Err(ApplVersionProblem::Repeated { tag: APPL_VER_ID }),
-            HeaderField::Once(value) => self.check_value(APPL_VER_ID, value).map(|_| ()),
+        // One scan: the header is the leading run of standard-header tags,
+        // and any 1128 after it is out of order.
+        let mut in_header = true;
+        let mut found = FieldOccurrence::Absent;
+        for field in raw.fields() {
+            in_header = in_header && is_standard_header_tag(field.tag);
+            if field.tag != APPL_VER_ID {
+                continue;
+            }
+            if !in_header {
+                return Err(ApplVersionProblem::OutsideHeader { tag: APPL_VER_ID });
+            }
+            found = match found {
+                FieldOccurrence::Absent => FieldOccurrence::Once(field.value),
+                FieldOccurrence::Once(_) | FieldOccurrence::Repeated => FieldOccurrence::Repeated,
+            };
+        }
+        match found {
+            FieldOccurrence::Absent => Ok(()),
+            FieldOccurrence::Repeated => Err(ApplVersionProblem::Repeated { tag: APPL_VER_ID }),
+            FieldOccurrence::Once(value) => self.check_value(APPL_VER_ID, value).map(|_| ()),
         }
     }
 }
@@ -2209,14 +2249,14 @@ mod tests {
         ]);
         let raw = decode(&frame);
 
-        assert_eq!(header_field(&raw, 49), HeaderField::Once(b"CLIENT"));
-        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"VENUE"));
+        assert_eq!(header_field(&raw, 49), FieldOccurrence::Once(b"CLIENT"));
+        assert_eq!(header_field(&raw, 56), FieldOccurrence::Once(b"VENUE"));
         // Not UTF-8, returned as bytes for the caller to bound.
-        assert_eq!(header_field(&raw, 142), HeaderField::Once(b"LON\x80"));
-        assert_eq!(header_field(&raw, 57), HeaderField::Absent);
-        assert_eq!(header_field(&raw, 50), HeaderField::Absent);
+        assert_eq!(header_field(&raw, 142), FieldOccurrence::Once(b"LON\x80"));
+        assert_eq!(header_field(&raw, 57), FieldOccurrence::Absent);
+        assert_eq!(header_field(&raw, 50), FieldOccurrence::Absent);
         // A body tag is never a header field, even as the first body field.
-        assert_eq!(header_field(&raw, 98), HeaderField::Absent);
+        assert_eq!(header_field(&raw, 98), FieldOccurrence::Absent);
     }
 
     #[test]
@@ -2234,8 +2274,8 @@ mod tests {
         ]);
         let raw = decode(&frame);
 
-        assert_eq!(header_field(&raw, 49), HeaderField::Repeated);
-        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"VENUE"));
+        assert_eq!(header_field(&raw, 49), FieldOccurrence::Repeated);
+        assert_eq!(header_field(&raw, 56), FieldOccurrence::Once(b"VENUE"));
     }
 
     #[test]
@@ -2253,7 +2293,7 @@ mod tests {
         let raw = decode(&frame);
 
         assert!(is_standard_header_tag(370));
-        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"CLIENT"));
+        assert_eq!(header_field(&raw, 56), FieldOccurrence::Once(b"CLIENT"));
         assert_eq!(
             PeerIdentity::new(&config_for("FIX.4.4")).validate(&raw),
             Ok(())
@@ -2895,28 +2935,82 @@ mod tests {
     }
 
     #[test]
-    fn test_appl_guard_checks_an_appl_ver_id_outside_the_header() {
-        // A 1128 after the body opens is still what `get_field_str(1128)`
-        // hands the application, so it is checked like a header one.
+    fn test_appl_guard_refuses_an_appl_ver_id_outside_the_header() {
+        // 1128 is header-only: one after the body opens is out of order
+        // (reason 14), whatever its value, accepted or not.
         let guard = appl_guard("FIX.5.0SP2", &[]);
-        let mut fields = vec![
+        for value in ["7", "9"] {
+            let frame = frame_with_fields(&[
+                (35, "8"),
+                (49, "VENUE"),
+                (56, "CLIENT"),
+                (34, "2"),
+                (37, "EX-1"),
+                (1128, value),
+            ]);
+            let refused = guard.check_application(&decode(&frame));
+            assert_eq!(
+                refused,
+                Err(ApplVersionProblem::OutsideHeader { tag: 1128 })
+            );
+            if let Err(problem) = refused {
+                let reason = problem.reject_reason();
+                assert_eq!(reason.code, 14);
+                assert_eq!(reason.ref_tag, Some(1128));
+            }
+        }
+        // A header copy and a body copy: the body one is out of order, which
+        // outranks the repetition.
+        let both = frame_with_fields(&[
             (35, "8"),
+            (1128, "9"),
             (49, "VENUE"),
             (56, "CLIENT"),
             (34, "2"),
             (37, "EX-1"),
-        ];
-        fields.push((1128, "7"));
-        let frame = frame_with_fields(&fields);
+            (1128, "9"),
+        ]);
+        assert_eq!(
+            guard.check_application(&decode(&both)),
+            Err(ApplVersionProblem::OutsideHeader { tag: 1128 })
+        );
+    }
+
+    #[test]
+    fn test_appl_guard_refuses_an_appl_ver_id_repeated_in_the_header() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        let frame = frame_with_fields(&[
+            (35, "8"),
+            (1128, "9"),
+            (1128, "9"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "2"),
+            (37, "EX-1"),
+        ]);
+        let refused = guard.check_application(&decode(&frame));
+        assert_eq!(refused, Err(ApplVersionProblem::Repeated { tag: 1128 }));
+        if let Err(problem) = refused {
+            assert_eq!(problem.reject_reason().code, 13);
+        }
+    }
+
+    #[test]
+    fn test_appl_guard_reads_appl_ver_id_anywhere_in_the_header() {
+        // After the CompIDs and MsgSeqNum is still the header.
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        let frame = frame_with_fields(&[
+            (35, "8"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "2"),
+            (1128, "7"),
+            (37, "EX-1"),
+        ]);
         assert!(matches!(
             guard.check_application(&decode(&frame)),
             Err(ApplVersionProblem::NotAccepted { tag: 1128, .. })
         ));
-        let repeated = report_with(&[(1128, "9"), (1128, "9")]);
-        assert_eq!(
-            guard.check_application(&decode(&repeated)),
-            Err(ApplVersionProblem::Repeated { tag: 1128 })
-        );
     }
 
     #[test]

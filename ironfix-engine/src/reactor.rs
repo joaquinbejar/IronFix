@@ -2472,7 +2472,8 @@ impl<A: Application> Reactor<A> {
     /// session does not accept ([`ApplVersionGuard::check_application`], a
     /// synchronous decision over the message alone) is answered with a
     /// session-level Reject, `SessionRejectReason` 18 and `RefTagID` 1128 (13
-    /// for a repeated 1128); see [`Reactor::reject_appl_version`]. A message
+    /// for a 1128 repeated in the header, 14 for one outside it); see
+    /// [`Reactor::reject_appl_version`]. A message
     /// without 1128 is in the counterparty's default application version,
     /// which the handshake checked, and passes.
     async fn on_app_in_sequence(
