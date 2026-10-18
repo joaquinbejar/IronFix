@@ -91,6 +91,33 @@ fn test_default_output_structs_named_after_std_items_compile() {
 }
 
 #[test]
+fn test_default_output_components_named_like_std_items_and_messages_compile() {
+    use generated::{components, messages};
+
+    // The components `Vec` and `String` share their names with standard
+    // items and with two messages; each module keeps its own.
+    let note = components::Vec {
+        note: "note".to_owned(),
+    };
+    let listed = messages::Vec {
+        text: None,
+        vec: Some(note.clone()),
+    };
+    let required = messages::String {
+        text: Some("text".to_owned()),
+        string: components::String { vec: Some(note) },
+    };
+    assert_eq!(
+        listed.vec.as_ref().map(|vec| vec.note.as_str()),
+        Some("note")
+    );
+    assert_eq!(
+        required.string.vec.map(|vec| vec.note),
+        Some("note".to_owned())
+    );
+}
+
+#[test]
 fn test_enumerations_named_after_std_items_read_and_write() {
     use std_views::enums;
     use std_views::writers::{OptionFields, OptionNoItemsFields};

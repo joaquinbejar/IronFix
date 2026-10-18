@@ -24,6 +24,8 @@ pub mod fields {
     pub const NO_ITEMS: u32 = 5009;
     /// ItemName (tag 5010).
     pub const ITEM_NAME: u32 = 5010;
+    /// Note (tag 5011).
+    pub const NOTE: u32 = 5011;
 }
 
 /// Message type definitions, and the entries of the repeating groups messages declare.
@@ -63,6 +65,8 @@ pub mod messages {
     pub struct Vec {
         /// Text (tag 5006).
         pub text: ::core::option::Option<::std::string::String>,
+        /// Vec component.
+        pub vec: ::core::option::Option<super::components::Vec>,
     }
 
     /// String message (MsgType=U3).
@@ -70,6 +74,8 @@ pub mod messages {
     pub struct String {
         /// Text (tag 5006).
         pub text: ::core::option::Option<::std::string::String>,
+        /// String component.
+        pub string: super::components::String,
     }
 
     /// Result message (MsgType=U4).
@@ -77,6 +83,24 @@ pub mod messages {
     pub struct Result {
         /// Text (tag 5006).
         pub text: ::core::option::Option<::std::string::String>,
+    }
+
+}
+
+/// Component type definitions, one per component a message reaches, and the entries of the repeating groups components declare.
+pub mod components {
+    /// String component, one type shared by every message, component and group entry that lists it.
+    #[derive(Debug, Clone)]
+    pub struct String {
+        /// Vec component.
+        pub vec: ::core::option::Option<Vec>,
+    }
+
+    /// Vec component, one type shared by every message, component and group entry that lists it.
+    #[derive(Debug, Clone)]
+    pub struct Vec {
+        /// Note (tag 5011).
+        pub note: ::std::string::String,
     }
 
 }
