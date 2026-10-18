@@ -2661,14 +2661,14 @@ async fn bilateral_recovery(with_789: bool) {
     );
 
     ok(
-        timeout(Duration::from_secs(60), async {
+        timeout(Duration::from_secs(30), async {
             tokio::join!(
                 receive_backlog(&mut client_rx),
                 receive_backlog(&mut venue_rx)
             )
         })
         .await,
-        "both backlogs are resent within 60s",
+        "both backlogs are resent within 30s",
     );
 
     let live_seq = (BACKLOG_MESSAGES + 4).to_string();
@@ -2787,6 +2787,468 @@ async fn test_resend_stays_ahead_of_live_application_messages() {
     assert_eq!(field(&live, 37).as_deref(), Some("EX-LIVE"));
     assert_eq!(field(&live, 34).as_deref(), Some("303"));
     assert_eq!(field(&live, 43), None, "an original send");
+}
+
+// ---------------------------------------------------------------------------
+// A resend under way: what waits behind it, and what does not cut it short
+// ---------------------------------------------------------------------------
+
+/// A resend from the scripted acceptor: `body` with `PossDupFlag` (43) = Y
+/// and an `OrigSendingTime` (122).
+#[track_caller]
+fn venue_resend(msg_type: &str, seq: u64, body: &[(u32, &str)]) -> BytesMut {
+    let mut fields = vec![(43, "Y"), (122, "20261018-12:00:00.000")];
+    fields.extend_from_slice(body);
+    venue_msg(msg_type, seq, &fields)
+}
+
+/// The acceptor's previous stream: its Logon ack (1) and 300 reports (2 to
+/// 301); next sender 302, next target 3.
+async fn venue_report_backlog() -> Arc<MemoryStore> {
+    let store = Arc::new(MemoryStore::new());
+    ok(
+        store.store(1, &MsgType::Logon, &venue_ack(1, &[])).await,
+        "seed the Logon",
+    );
+    for seq in 2..=301u64 {
+        ok(
+            store
+                .store(
+                    seq,
+                    &MsgType::ExecutionReport,
+                    &venue_msg("8", seq, &REPORT_BODY),
+                )
+                .await,
+            "seed a report",
+        );
+    }
+    ok(
+        store.set_next_sender_seq(302).await,
+        "seed the sender counter",
+    );
+    ok(
+        store.set_next_target_seq(3).await,
+        "seed the target counter",
+    );
+    store
+}
+
+/// Reads every frame until the engine stops sending for 2 s or hangs up, as
+/// `(MsgType, MsgSeqNum, PossDupFlag)`.
+async fn drain_frames(
+    framed: &mut Framed<TcpStream, FixCodec>,
+) -> Vec<(String, u64, Option<String>)> {
+    let mut frames = Vec::new();
+    while let Ok(Some(Ok(frame))) = timeout(Duration::from_secs(2), framed.next()).await {
+        frames.push((
+            msg_type_of(&frame),
+            field(&frame, 34)
+                .and_then(|seq| seq.parse::<u64>().ok())
+                .unwrap_or(0),
+            field(&frame, 43),
+        ));
+    }
+    frames
+}
+
+/// A counterparty that asks for a resend and logs out right behind it gets
+/// the whole resend before the Logout reply: FIX gives the remote end the
+/// chance to fill the gap first. 300 reports are replayed and the
+/// acknowledgement gap-filled, then the Logout goes out and the session ends
+/// gracefully.
+#[tokio::test]
+async fn test_acceptor_finishes_a_resend_before_replying_to_a_logout() {
+    let store = venue_report_backlog().await;
+    let (venue_app, _rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(venue_config("FIX.4.4"), Arc::clone(&venue_app))
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    let (mut framed, connection, ack) = establish(acceptor, client_logon(3, &[])).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("302"));
+    ok(
+        framed
+            .send(client_msg("2", 4, &[(7, "2"), (16, "0")]))
+            .await,
+        "the client asks for everything",
+    );
+    ok(
+        framed.send(client_msg("5", 5, &[])).await,
+        "and logs out right behind it",
+    );
+    let frames = drain_frames(&mut framed).await;
+    let Some((last_type, last_seq, _)) = frames.last() else {
+        panic!("the venue answered nothing")
+    };
+    assert_eq!(
+        (last_type.as_str(), *last_seq),
+        ("5", 303),
+        "the Logout reply comes last"
+    );
+    let resent: Vec<u64> = frames
+        .iter()
+        .filter(|(_, _, poss_dup)| poss_dup.as_deref() == Some("Y"))
+        .map(|(_, seq, _)| *seq)
+        .collect();
+    let expected: Vec<u64> = (2..=302).collect();
+    assert_eq!(
+        resent, expected,
+        "300 replays and the gap fill for the ack, in order"
+    );
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the session closes within 5s",
+    );
+    assert!(venue_app.events().contains(&"logout".to_string()));
+}
+
+/// A store whose page reads are slow, standing in for a resend that takes
+/// longer than the logout timeout.
+#[derive(Debug)]
+struct SlowPageStore {
+    inner: Arc<MemoryStore>,
+    delay: Duration,
+}
+
+#[async_trait]
+impl MessageStore for SlowPageStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), StoreError> {
+        self.inner.store(seq_num, msg_type, message).await
+    }
+
+    async fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        tokio::time::sleep(self.delay).await;
+        self.inner.get_range(begin, end).await
+    }
+
+    fn next_sender_seq(&self) -> u64 {
+        self.inner.next_sender_seq()
+    }
+
+    fn next_target_seq(&self) -> u64 {
+        self.inner.next_target_seq()
+    }
+
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.inner.set_next_sender_seq(seq).await
+    }
+
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.inner.set_next_target_seq(seq).await
+    }
+
+    async fn reset(&self) -> Result<(), StoreError> {
+        self.inner.reset().await
+    }
+
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.inner.creation_time()
+    }
+}
+
+/// The wait for an owed resend is bounded by the logout timeout: when the
+/// resend takes longer, the Logout reply goes out without the rest of it.
+#[tokio::test]
+async fn test_owed_logout_reply_is_bounded_by_the_logout_timeout() {
+    let store = Arc::new(SlowPageStore {
+        inner: venue_report_backlog().await,
+        delay: Duration::from_millis(500),
+    });
+    let (venue_app, _rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_config("FIX.4.4").with_logout_timeout(Duration::from_millis(200)),
+            Arc::clone(&venue_app),
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    let (mut framed, connection, _ack) = establish(acceptor, client_logon(3, &[])).await;
+    ok(
+        framed
+            .send(client_msg("2", 4, &[(7, "2"), (16, "0")]))
+            .await,
+        "the client asks for everything",
+    );
+    ok(
+        framed.send(client_msg("5", 5, &[])).await,
+        "and logs out right behind it",
+    );
+    let frames = drain_frames(&mut framed).await;
+    let Some((last_type, _, _)) = frames.last() else {
+        panic!("the venue answered nothing")
+    };
+    assert_eq!(last_type, "5", "the Logout reply still goes out");
+    let resent = frames
+        .iter()
+        .filter(|(_, _, poss_dup)| poss_dup.as_deref() == Some("Y"))
+        .count();
+    assert!(resent < 301, "the resend was cut short: {resent} frames");
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the session closes within 5s",
+    );
+}
+
+/// A Logout the consumer asks for while a resend is under way waits behind
+/// it: the 789 resend of 300 reports goes out whole, then the Logout.
+#[tokio::test]
+async fn test_consumer_logout_waits_behind_a_resend() {
+    let store = venue_report_backlog().await;
+    let (venue_app, _rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(venue_789(), Arc::clone(&venue_app))
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    let (mut framed, connection, ack) = establish(acceptor, client_logon(3, &[(789, "2")])).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("302"));
+    ok(connection.logout().await, "the venue logs out at once");
+    for seq in 2..=301u64 {
+        let frame = next_frame(&mut framed).await;
+        assert_eq!(field(&frame, 34), Some(seq.to_string()), "resent in order");
+        assert_eq!(field(&frame, 43).as_deref(), Some("Y"));
+    }
+    let logout = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&logout), "5", "the Logout follows the resend");
+    assert_eq!(field(&logout, 34).as_deref(), Some("303"));
+    ok(
+        framed.send(client_msg("5", 4, &[])).await,
+        "the client acknowledges",
+    );
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the session closes within 5s",
+    );
+}
+
+/// Every message that takes a new number waits behind a resend: a TestRequest
+/// (4) and a gapped Heartbeat (9) arrive while the 789 resend of 300 reports
+/// is being written, and the application sends a live report. The resend
+/// goes out whole and in order; then the Heartbeat answering the
+/// TestRequest, the ResendRequest for the gap (from 5) and the live report,
+/// in that order, under 303, 304 and 305. No number is used twice.
+#[tokio::test]
+async fn test_new_numbers_wait_behind_a_resend() {
+    let store = venue_report_backlog().await;
+    let (venue_app, _rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(venue_789(), Arc::clone(&venue_app))
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    let (mut framed, connection, ack) = establish(acceptor, client_logon(3, &[(789, "2")])).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("302"));
+    ok(
+        framed.send(client_msg("1", 4, &[(112, "PING")])).await,
+        "a TestRequest",
+    );
+    ok(
+        framed.send(client_msg("0", 9, &[])).await,
+        "a gapped Heartbeat",
+    );
+    let mut report = OutboundMessage::new(MsgType::ExecutionReport);
+    report
+        .push_str(37, "EX-LIVE")
+        .push_str(17, "E-LIVE")
+        .push_char(150, '0')
+        .push_char(39, '0');
+    ok(connection.send(report).await, "a live report");
+
+    for seq in 2..=301u64 {
+        let frame = next_frame(&mut framed).await;
+        assert_eq!(field(&frame, 34), Some(seq.to_string()), "resent in order");
+        assert_eq!(
+            field(&frame, 43).as_deref(),
+            Some("Y"),
+            "nothing new in between"
+        );
+    }
+    let heartbeat = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&heartbeat), "0");
+    assert_eq!(field(&heartbeat, 34).as_deref(), Some("303"));
+    assert_eq!(field(&heartbeat, 112).as_deref(), Some("PING"));
+    let request = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&request), "2");
+    assert_eq!(field(&request, 34).as_deref(), Some("304"));
+    assert_eq!(field(&request, 7).as_deref(), Some("5"));
+    let live = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&live), "8");
+    assert_eq!(field(&live, 34).as_deref(), Some("305"));
+    assert_eq!(field(&live, 43), None);
+}
+
+/// After the fallback request, a late 789 resend from the initiator stops
+/// below its Logon (6) with an administrative message (5, gap-filled), so
+/// the expectation is 6. The answer to the request then gap-fills 5 and 6
+/// with one fill numbered 5: a possible duplicate below the expectation,
+/// ignored as FIX requires. Its NewSeqNo (7) spans 6, which is still missing,
+/// so 6 is re-requested at once, not charged against the one request
+/// allowed; the answer fills 6 in sequence and the recovery completes with
+/// no Logout.
+#[tokio::test]
+async fn test_acceptor_re_requests_what_a_spanning_possible_duplicate_fill_skips() {
+    let resend_timeout = Duration::from_millis(400);
+    let (venue_app, mut venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_789()
+                .with_resend_timeout(resend_timeout)
+                .with_max_resend_requests(1),
+            Arc::clone(&venue_app),
+        )
+        .with_initial_sequences(1, 3),
+    );
+    let (mut framed, connection, _ack) = establish(acceptor, client_logon(6, &[(789, "1")])).await;
+    let request = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&request), "2", "the fallback fires");
+    assert_eq!(field(&request, 7).as_deref(), Some("3"));
+    for seq in [3u64, 4] {
+        ok(
+            framed.send(client_resend("D", seq, &ORDER_BODY)).await,
+            "the late 789 resend",
+        );
+    }
+    ok(
+        framed
+            .send(client_resend("4", 5, &[(123, "Y"), (36, "6")]))
+            .await,
+        "the 789 resend fills 5 and stops before the Logon",
+    );
+    for seq in [3u64, 4] {
+        ok(
+            framed.send(client_resend("D", seq, &ORDER_BODY)).await,
+            "the answer",
+        );
+    }
+    ok(
+        framed
+            .send(client_resend("4", 5, &[(123, "Y"), (36, "7")]))
+            .await,
+        "the answer fills 5..=6",
+    );
+    for expected in ["3", "4"] {
+        assert_eq!(next_app_message(&mut venue_rx).await.1, expected);
+    }
+    let rerequest = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&rerequest), "2", "6 is re-requested at once");
+    assert_eq!(field(&rerequest, 7).as_deref(), Some("6"));
+    assert_eq!(field(&rerequest, 16).as_deref(), Some("0"));
+    ok(
+        framed
+            .send(client_resend("4", 6, &[(123, "Y"), (36, "7")]))
+            .await,
+        "the answer fills 6",
+    );
+    if let Ok(Some(Ok(frame))) = timeout(resend_timeout * 3, framed.next()).await {
+        panic!(
+            "the recovery is complete: unexpected MsgType {}",
+            msg_type_of(&frame)
+        );
+    }
+    assert_eq!(connection.next_target_seq(), 7);
+}
+
+/// What a resend with a new number written in the middle does to an IronFix
+/// receiver, which does not queue gapped messages (#71), and so why IronFix
+/// writes nothing new while it resends. The scripted acceptor answers the
+/// initiator's ResendRequest (2 to 4, and a fill for its ack at 5).
+///
+/// - Written whole, then a Heartbeat at 6: the initiator recovers to 7.
+/// - With the Heartbeat at 6 written in the middle: the initiator reads 6 as
+///   gapped (processed, not consumed), fills 2..=5, and is left expecting 6,
+///   which nothing will send again until it asks; with a limit of one
+///   request that ends in a Logout.
+#[tokio::test]
+async fn test_a_new_number_inside_an_answer_strands_an_ironfix_receiver() {
+    async fn run(interleave: bool) -> (u64, Vec<String>) {
+        let resend_timeout = Duration::from_millis(400);
+        let (listener, addr) = bind_listener().await;
+        let venue = tokio::spawn(async move {
+            let (mut framed, _logon) = read_client_logon(listener).await;
+            ok(framed.send(venue_ack(5, &[])).await, "ack at 5");
+            let request = next_frame(&mut framed).await;
+            assert_eq!(msg_type_of(&request), "2");
+            assert_eq!(field(&request, 7).as_deref(), Some("2"));
+            ok(
+                framed.send(venue_resend("8", 2, &REPORT_BODY)).await,
+                "replay 2",
+            );
+            if interleave {
+                ok(
+                    framed.send(venue_msg("0", 6, &[])).await,
+                    "a new Heartbeat inside the answer",
+                );
+            }
+            for seq in [3u64, 4] {
+                ok(
+                    framed.send(venue_resend("8", seq, &REPORT_BODY)).await,
+                    "replay 3 and 4",
+                );
+            }
+            ok(
+                framed
+                    .send(venue_resend("4", 5, &[(123, "Y"), (36, "6")]))
+                    .await,
+                "fill the ack",
+            );
+            if !interleave {
+                ok(
+                    framed.send(venue_msg("0", 6, &[])).await,
+                    "a new Heartbeat after the answer",
+                );
+            }
+            let mut after = Vec::new();
+            while let Ok(Some(Ok(frame))) = timeout(resend_timeout * 3, framed.next()).await {
+                after.push(msg_type_of(&frame));
+            }
+            after
+        });
+        let (client_app, mut client_rx) = RecordingApp::new();
+        let connection = ok(
+            Initiator::new(
+                client_config("FIX.4.4")
+                    .with_resend_timeout(resend_timeout)
+                    .with_max_resend_requests(1),
+                Arc::clone(&client_app),
+            )
+            .with_initial_sequences(1, 2)
+            .connect(addr)
+            .await,
+            "connect",
+        );
+        for expected in ["2", "3", "4"] {
+            assert_eq!(next_app_message(&mut client_rx).await.1, expected);
+        }
+        let after = ok(
+            ok(
+                timeout(Duration::from_secs(5), venue).await,
+                "venue done within 5s",
+            ),
+            "venue task",
+        );
+        (connection.next_target_seq(), after)
+    }
+
+    let (target, after) = run(false).await;
+    assert_eq!(
+        target, 7,
+        "written whole, the answer completes the recovery"
+    );
+    assert!(after.is_empty(), "nothing more was asked: {after:?}");
+
+    let (target, after) = run(true).await;
+    assert_eq!(
+        target, 6,
+        "6 arrived inside the answer and is still missing"
+    );
+    assert_eq!(
+        after.last().map(String::as_str),
+        Some("5"),
+        "a Logout: {after:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
