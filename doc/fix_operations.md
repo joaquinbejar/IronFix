@@ -65,7 +65,9 @@ and stops at the first failure:
 2. **Identity.** Inbound `SenderCompID` (49) must equal the configured
    `target_comp_id` and inbound `TargetCompID` (56) the configured
    `sender_comp_id`; when `sender_sub_id` / `target_sub_id` are configured,
-   inbound `TargetSubID` (57) and `SenderSubID` (50) are checked the same way.
+   inbound `TargetSubID` (57) and `SenderSubID` (50) are checked the same way,
+   and so, when `sender_location_id` / `target_location_id` are configured,
+   are inbound `TargetLocationID` (143) and `SenderLocationID` (142).
    Each must both carry the expected value **and** occur in the standard header:
    a CompID that appears only after the message body identifies nothing and is
    treated as missing. A mismatch or a misplacement produces a session Reject
@@ -138,8 +140,9 @@ Logon (bounded by `SessionConfig::logon_timeout`) and validates it in this
 order — it must decode and be a Logon; its `BeginString` (8) must match this
 session's version and its `EncryptMethod` (98) must be 0 (None); it must carry
 `MsgSeqNum` (34) **in the standard header** (a body-only 34 is treated as
-missing, exactly as for the CompIDs); then identity (49/56, plus 50/57 when
-configured), after which the acceptor claims its single admission slot;
+missing, exactly as for the CompIDs); then identity (49/56, plus 50/57 and
+142/143 when configured), after which the acceptor claims its single admission
+slot;
 then `SendingTime` (52), and the `from_admin` authentication hook (where
 `Username` (553) / `Password` (554) are inspected); then a `ResetSeqNumFlag`
 (141) Logon must carry `MsgSeqNum = 1`; then `HeartBtInt` (108); only then is
@@ -171,7 +174,10 @@ acknowledgement sent. The differences from the initiator are role-symmetric:
   the newcomer could be sent belongs to it. The slot is held until the live
   session's task has ended, past its close-time store writes, the drain of its
   application queue (up to 5 s) and `on_logout`; a Logon arriving before then
-  is refused the same way.
+  is refused the same way. While the session is live, a Logon refused before
+  the slot is reached (wrong `BeginString`, `EncryptMethod` or CompIDs) gets no
+  reply either, with or without a store: a refusal would be numbered from the
+  provisional counters, a stream the live session owns.
 - **The message store.** With `Acceptor::with_store`, the store is touched only
   once the peer is authenticated (after identity, admission, `SendingTime` and
   `from_admin`), and reset only for a Logon that passes every check (for `141=Y`,
@@ -195,7 +201,8 @@ the Logon:
    counters) nor be numbered without reusing, with different content, a number
    the session's stream already holds. Without a store, a Reject (reason 9 for
    identity, 10 for the clock) and/or a Logout, numbered from the seed or 1, as
-   before.
+   before, unless the session is live on another connection: then a refusal
+   for the version, encryption or CompIDs gets nothing either.
 2. **A Logon without a valid `MsgSeqNum`** — absent, outside the header, or 0
    (which names no message): nothing, in either mode.
 3. **A duplicate Logon** — nothing, in either mode (above).
@@ -219,34 +226,51 @@ once and routes it before any session's handshake runs
 
 1. **Read.** The Logon is framed under the registry's own ceiling
    (`AcceptorRegistry::with_max_message_size`, default 64 KiB) with checksum
-   validation and garbled-frame recovery on (garbled frames are skipped, as on
-   `Acceptor::serve`). Reading it and resolving its session are bounded
-   together by the registry's logon timeout (`with_logon_timeout`, default
+   validation always on (whatever the session's own setting) and
+   garbled-frame recovery on (garbled frames are skipped, as on
+   `Acceptor::serve`). Reading it and resolving its session share one
+   deadline, the registry's logon timeout (`with_logon_timeout`, default
    10 s); expiry is `EngineError::LogonTimeout`. The first frame must be a
    Logon.
 2. **Bound the identity.** `SenderCompID` (49) and `TargetCompID` (56), and
    `SenderSubID` (50), `TargetSubID` (57), `SenderLocationID` (142) and
    `TargetLocationID` (143) when present, are read from the **standard header**
-   only (a body-only 49 or 56 is absent) and must each be 1 to 32 bytes of
-   printable ASCII, the bound a configured CompID, sub ID or location ID
-   obeys. Anything else is `EngineError::UnroutableLogon`, decided before any
-   session or the lookup is consulted. Only these fields are ever logged, so
-   `Password` (554), `NewPassword` (925) and `RawData` (96) never are.
+   only (a body-only 49 or 56 is absent), must each occur there at most once
+   (a repeated one is the "tag appears more than once" case,
+   `SessionRejectReason` 13), and must each be 1 to 32 bytes of printable
+   ASCII, the bound a configured CompID, sub ID or location ID obeys. Anything
+   else is `EngineError::UnroutableLogon`, decided before any session or the
+   lookup is consulted. Only these fields are ever logged, so `Password`
+   (554), `NewPassword` (925) and `RawData` (96) never are.
 3. **Match.** The key is the session's configured identity, reversed: the
    Logon's 49 is the session's `target_comp_id`, its 56 the session's
    `sender_comp_id`, and a sub or location ID the session configures must be
    carried with the reversed value; one it does not configure places no
-   requirement. `BeginString` (8) is not part of the key; the routed session
-   checks it. Registration refuses a session whose key overlaps one already
-   registered (a Logon could match both) or whose `SessionId` is already
-   registered, so a Logon matches at most one session.
+   requirement. The routed session then checks the same fields on every
+   inbound message (see the identity checks above), so a peer cannot be routed
+   on one identity and send under another. `BeginString` (8) is not part of
+   the key; the routed session checks it, and two sessions that differ only by
+   version cannot share a registry. Registration refuses a session whose key
+   overlaps one already registered (a Logon could match both), whose
+   `SessionId` is already registered, or whose store another session uses, so
+   a Logon matches at most one session and a store belongs to one session.
 4. **Look up.** With no match, an optional `SessionLookup` is asked about the
-   identity (never the Logon, so it never sees credentials). It may return the
-   `Acceptor` that serves it, which must route that identity and not overlap a
-   registered session, or refuse. An admitted session stays registered for the
-   registry's lifetime, so its single admission slot and owed-reset record
-   persist; two lookups racing for one identity end with one `Acceptor`, and
-   the second Logon is then refused as a duplicate.
+   identity (never the Logon, so it never sees credentials). It returns the
+   `Acceptor` that serves it (which must route that identity, overlap no
+   session and share no store), refuses (`EngineError::UnknownSession`), or
+   reports that it cannot decide (`LookupError`, surfaced as
+   `EngineError::Lookup`). It is asked once per Logon whose identity matches
+   no session, so an unauthenticated peer can make it run once per connection.
+   An admitted session is **provisional** while its first handshake runs,
+   because the lookup admits before `from_admin` authenticates anyone: if that
+   handshake ends before `from_admin` accepts the Logon (a dropped `serve`
+   included) and no other connection is routed to the session, it is evicted,
+   losing nothing since its store was never touched. Once a handshake gets
+   past `from_admin`, the session stays for the registry's lifetime, so its
+   single admission slot and owed-reset record persist. `with_max_sessions`
+   caps the lookup-admitted sessions held at once (`EngineError::SessionLimit`
+   beyond it). Two lookups racing for one identity end with one `Acceptor`,
+   and the second Logon is then refused as a duplicate.
 5. **Hand over.** The routed `Acceptor` runs its handshake on the Logon
    exactly as `Acceptor::serve` does once a Logon has arrived: the checks
    above in the same order, with the same refusal groups. `on_create` fires
@@ -255,13 +279,17 @@ once and routes it before any session's handshake runs
    session's `max_message_size` is refused as its codec would have refused it.
 
 A Logon that cannot be routed (unroutable identity, unknown session, a lookup
-that refuses or does not answer in time, a first frame that is not a Logon) is
-closed **without a reply**, touches no store and runs no `Application`
-callback: before routing there is no session whose stream could number a
-reply, no store to file it in, and no configured identity to stamp on it. A
-second Logon for a session that is live is refused without a reply by that
-session's admission slot while the live session continues. Every session keeps
-its own sequence numbers, store and heartbeat.
+that refuses, fails or does not answer in time, the session cap, a first frame
+that is not a Logon) is closed **without a reply**, touches no store and runs no
+`Application` callback: before routing there is no session whose stream could
+number a reply, no store to file it in, and no configured identity to stamp on
+it. These refusals are logged at debug level, since any peer can provoke them
+at will; a lookup that fails or overruns, returns a session the registry
+cannot hold, or meets the session cap is logged as a warning. A second Logon
+for a session that is live gets no reply, even with a wrong `BeginString` or
+`EncryptMethod`, while the live session continues. Capping the connections
+whose Logon is still being read or routed is the consumer's job, in its accept
+loop. Every session keeps its own sequence numbers, store and heartbeat.
 
 ---
 

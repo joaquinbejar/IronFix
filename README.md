@@ -53,9 +53,13 @@ exists yet.
   location IDs) in its standard header, bounded before anything is looked
   up, to a registered `Acceptor` or one an optional `SessionLookup` admits,
   and runs that session's handshake; a Logon it cannot route is closed
-  without a reply, touching no store. Each session keeps its own sequence
-  numbers, store and heartbeat. `EngineBuilder` terminates in any of them
-  via `into_initiator()`, `into_acceptor()` or `into_acceptor_registry()`.
+  without a reply, touching no store. A session the lookup admits stays
+  only once a Logon for it gets past `from_admin` (it is evicted otherwise),
+  and `with_max_sessions` caps how many it holds. Each session keeps its own
+  sequence numbers, store and heartbeat, and checks its configured sub and
+  location IDs on every inbound message. `EngineBuilder` terminates in any
+  of them via `into_initiator()`, `into_acceptor()` or
+  `into_acceptor_registry()`.
 - **One session reactor shared by both roles.** Once Logon completes, the
   engine owns the socket: heartbeats and TestRequests at the negotiated
   interval, CompID and `SendingTime` validation, sequence-gap detection with
@@ -170,8 +174,11 @@ around it.
   (`into_acceptor_registry()`); there is no multi-session initiator. The
   registry's routing key does not include `BeginString`, so two sessions
   that differ only by FIX version cannot share a registry, and
-  `into_acceptor_registry()` attaches a builder store only to a single
-  session (register each `Acceptor` with its own store instead).
+  `into_acceptor_registry()` accepts a builder store only for exactly one
+  session (register each `Acceptor` with its own store instead). The
+  registry bounds each connection, not how many there are: capping the
+  connections still in their Logon handshake is the consumer's job, in its
+  accept loop.
 - **No TLS.** There is no `rustls` dependency anywhere. `ironfix-transport`
   contains `FixCodec` only; the engines open plain TCP themselves (`Initiator`
   calls `TcpStream::connect`, `Acceptor` serves a `TcpStream`). See "Current
