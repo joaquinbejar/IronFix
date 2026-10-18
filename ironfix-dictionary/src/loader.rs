@@ -59,6 +59,7 @@ use crate::schema::{
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::OnceLock;
@@ -700,6 +701,10 @@ fn field_def(
 struct Resolver<'a> {
     fields_by_name: &'a HashMap<String, u32>,
     components: &'a HashMap<String, Vec<Item>>,
+    /// The first tag of each component already walked, so a component
+    /// reached many times (every group whose first member it is, every path
+    /// through a chain of components) is walked once.
+    first_tags: RefCell<HashMap<String, Option<u32>>>,
 }
 
 impl Resolver<'_> {
@@ -723,7 +728,10 @@ impl Resolver<'_> {
     ///
     /// Reference cycles are already rejected by [`check_component_graph`]
     /// before any resolution starts; the depth ceiling here is a second,
-    /// independent bound on the recursion.
+    /// independent bound on the recursion. Each component's first tag is
+    /// computed once ([`Self::component_first_tag`]), so the walk is linear
+    /// in the number of component references even where a component without
+    /// fields leads to the same component along many paths.
     fn first_tag(&self, items: &[Item], depth: usize) -> Result<Option<u32>, DictionaryError> {
         for item in items {
             match item {
@@ -731,23 +739,38 @@ impl Resolver<'_> {
                     return self.tag(name).map(Some);
                 }
                 Item::Component { name, .. } => {
-                    if depth >= MAX_COMPONENT_DEPTH {
-                        return Err(DictionaryError::NestingTooDeep {
-                            element: name.clone(),
-                            limit: MAX_COMPONENT_DEPTH,
-                        });
-                    }
-                    let inner = self
-                        .components
-                        .get(name)
-                        .ok_or_else(|| DictionaryError::UnknownComponent(name.clone()))?;
-                    if let Some(tag) = self.first_tag(inner, depth + 1)? {
+                    if let Some(tag) = self.component_first_tag(name, depth)? {
                         return Ok(Some(tag));
                     }
                 }
             }
         }
         Ok(None)
+    }
+
+    /// Returns the first tag of component `name`, computing it once.
+    fn component_first_tag(
+        &self,
+        name: &str,
+        depth: usize,
+    ) -> Result<Option<u32>, DictionaryError> {
+        let cached = self.first_tags.borrow().get(name).copied();
+        if let Some(tag) = cached {
+            return Ok(tag);
+        }
+        if depth >= MAX_COMPONENT_DEPTH {
+            return Err(DictionaryError::NestingTooDeep {
+                element: name.to_owned(),
+                limit: MAX_COMPONENT_DEPTH,
+            });
+        }
+        let inner = self
+            .components
+            .get(name)
+            .ok_or_else(|| DictionaryError::UnknownComponent(name.to_owned()))?;
+        let tag = self.first_tag(inner, depth + 1)?;
+        self.first_tags.borrow_mut().insert(name.to_owned(), tag);
+        Ok(tag)
     }
 
     fn group(
@@ -1068,6 +1091,7 @@ pub(crate) fn assemble(assembly: Assembly) -> Result<Dictionary, DictionaryError
     let resolver = Resolver {
         fields_by_name: &dict.fields_by_name,
         components: &component_irs,
+        first_tags: RefCell::new(HashMap::new()),
     };
 
     let (header_fields, header_groups) = resolver.envelope(&header_items)?;
@@ -2087,6 +2111,37 @@ mod tests {
         );
 
         assert!(load(&xml).is_ok());
+    }
+
+    #[test]
+    fn test_component_chain_without_fields_is_walked_once() {
+        // MAX_COMPONENT_DEPTH components, each holding the next twice and
+        // the last nothing, ahead of a group's first field. Finding the
+        // group's delimiter walks every component once: without the cache it
+        // walks 2^31 paths.
+        let mut xml = String::from(
+            "<fix type='FIX' major='4' minor='4'><header></header><trailer></trailer>\
+             <messages><message name='Heartbeat' msgtype='0' msgcat='admin'>\
+             <group name='NoHops' required='N'><component name='C0' required='N'/>\
+             <field name='HopCompID' required='N'/></group></message></messages><components>",
+        );
+        let last = MAX_COMPONENT_DEPTH - 1;
+        for index in 0..last {
+            xml.push_str(&format!("<component name='C{index}'>"));
+            for _ in 0..2 {
+                xml.push_str(&format!("<component name='C{}' required='N'/>", index + 1));
+            }
+            xml.push_str("</component>");
+        }
+        xml.push_str(&format!("<component name='C{last}'/>"));
+        xml.push_str(
+            "</components><fields><field number='627' name='NoHops' type='NUMINGROUP'/>\
+             <field number='628' name='HopCompID' type='STRING'/></fields></fix>",
+        );
+
+        let dict = ok(load(&xml), "the chain loads");
+        let heartbeat = some(dict.get_message("0"), "Heartbeat");
+        assert_eq!(heartbeat.groups()[0].delimiter_tag, 628);
     }
 
     #[test]
