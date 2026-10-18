@@ -13,11 +13,17 @@
 //! `make doc` (`-D missing_docs`) check the generated text, which carries no
 //! `#[allow]`, and so does this crate.
 //!
+//! It also compiles both outputs, `CodeGenerator::generate` and
+//! `CodeGenerator::generate_views`, for the dictionary that
+//! `Dictionary::from_orchestra_xml` loads from the FIX Trading Community's
+//! FIX 4.4 Orchestra repository (the `ironfix-dictionary` test fixture).
+//!
 //! `build.rs` generates the sources into `OUT_DIR`; Cargo reruns it when
-//! `build.rs` or one of its build dependencies (`ironfix-codegen`,
-//! `ironfix-dictionary`, the embedded XML they include) changes, so there is
-//! no golden file to keep in step. Not published: it is a check, left out of
-//! `make publish-all`, the semver matrix and the coverage report.
+//! `build.rs`, the Orchestra fixture, or one of its build dependencies
+//! (`ironfix-codegen`, `ironfix-dictionary`, the embedded XML they include)
+//! changes, so there is no golden file to keep in step. Not published: it is
+//! a check, left out of `make publish-all`, the semver matrix and the
+//! coverage report.
 #![deny(missing_docs)]
 
 /// The full views of the embedded FIX 4.4 dictionary.
@@ -33,6 +39,16 @@ pub mod fix42 {
 /// The full views of the embedded FIXT 1.1 dictionary.
 pub mod fixt11 {
     include!(concat!(env!("OUT_DIR"), "/fixt11_views.rs"));
+}
+
+/// The default output for the FIX 4.4 Orchestra repository.
+pub mod orchestra_fix44 {
+    include!(concat!(env!("OUT_DIR"), "/orchestra_fix44.rs"));
+}
+
+/// The full views of the FIX 4.4 Orchestra repository.
+pub mod orchestra_fix44_views {
+    include!(concat!(env!("OUT_DIR"), "/orchestra_fix44_views.rs"));
 }
 
 #[cfg(test)]
@@ -82,5 +98,81 @@ mod tests {
         assert_eq!(ok(report.cum_qty(), "CumQty"), Decimal::new(100, 0));
         assert_eq!(ok(report.avg_px(), "AvgPx"), Decimal::new(12345, 4));
         assert_eq!(ok(report.symbol(), "Symbol"), Some("EURUSD"));
+    }
+
+    /// The FIX 4.4 Orchestra repository build.rs generated from.
+    const ORCHESTRA_FIX44: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../ironfix-dictionary/tests/fixtures/orchestra/OrchestraFIX44.xml"
+    ));
+
+    #[test]
+    fn test_orchestra_fix44_generates_the_compiled_output() {
+        let import = ok(
+            ironfix_dictionary::Dictionary::from_orchestra_xml(ORCHESTRA_FIX44),
+            "the FIX 4.4 Orchestra repository loads",
+        );
+        let generator = ironfix_codegen::CodeGenerator::new();
+        let code = ok(generator.generate(import.dictionary()), "generate");
+        let views = ok(
+            generator.generate_views(import.dictionary()),
+            "generate_views",
+        );
+        // What this crate compiled, as `orchestra_fix44` and
+        // `orchestra_fix44_views`.
+        assert!(code == include_str!(concat!(env!("OUT_DIR"), "/orchestra_fix44.rs")));
+        assert!(views == include_str!(concat!(env!("OUT_DIR"), "/orchestra_fix44_views.rs")));
+    }
+
+    #[test]
+    fn test_orchestra_fix44_default_output_types_prices_as_decimals() {
+        use super::orchestra_fix44::{fields, messages};
+        assert_eq!(fields::CL_ORD_ID, 11);
+        assert_eq!(fields::AVG_PX, 6);
+        // Compiles only if AvgPx(6) and Price(44) are rust_decimal::Decimal.
+        let avg_px = |report: &messages::ExecutionReport| -> Decimal { report.avg_px };
+        let price = |report: &messages::ExecutionReport| -> Option<Decimal> { report.price };
+        let _ = (avg_px, price);
+    }
+
+    #[test]
+    fn test_orchestra_fix44_views_read_like_the_quickfix_views() {
+        use super::orchestra_fix44_views as orchestra;
+        let body = "35=8\x0149=S\x0156=T\x0134=1\x0152=20260712-10:00:00\x01\
+                    37=ORDER-1\x0117=EXEC-1\x01150=F\x0139=2\x0155=EURUSD\x0154=1\x01\
+                    453=1\x01448=TRADER\x01447=D\x01452=11\x01\
+                    151=0\x0114=100\x016=1.2345\x01";
+        let text = format!("8=FIX.4.4\x019={}\x01{body}10=000\x01", body.len());
+        let msg = decode(&text);
+        let Some(from_orchestra) = orchestra::views::ExecutionReportView::from_message(&msg) else {
+            panic!("an Orchestra ExecutionReport view");
+        };
+        let Some(from_quickfix) = fix44::views::ExecutionReportView::from_message(&msg) else {
+            panic!("a QuickFIX ExecutionReport view");
+        };
+        assert_eq!(
+            ok(from_orchestra.order_id(), "OrderID"),
+            ok(from_quickfix.order_id(), "OrderID")
+        );
+        assert_eq!(
+            ok(from_orchestra.exec_type(), "ExecType"),
+            orchestra::enums::ExecType::Trade
+        );
+        assert_eq!(
+            ok(from_orchestra.avg_px(), "AvgPx"),
+            ok(from_quickfix.avg_px(), "AvgPx")
+        );
+        assert_eq!(
+            ok(from_orchestra.symbol(), "Symbol"),
+            ok(from_quickfix.symbol(), "Symbol")
+        );
+        // The Parties group, named after its count field in both.
+        let Some(parties) = ok(from_orchestra.no_party_ids(), "NoPartyIDs") else {
+            panic!("the Parties group is present");
+        };
+        let ids: Vec<&str> = parties
+            .map(|party| ok(party.party_id(), "PartyID"))
+            .collect();
+        assert_eq!(ids, ["TRADER"]);
     }
 }
