@@ -31,10 +31,14 @@
 //! implementation is separate, tracked work; until it lands, restart recovery
 //! is a gap, not a feature.
 
+pub mod file;
 pub mod memory;
 pub mod stored;
 pub mod traits;
 
+pub use file::{
+    FileStore, FileStoreConfig, FileStoreConfigError, SyncPolicy, Truncation, TruncationCause,
+};
 pub use memory::MemoryStore;
 pub use stored::StoredMessage;
 pub use traits::MessageStore;
