@@ -37,6 +37,7 @@
 //! | `garbled_frame_limit` | frames within a duration | unset, or 1..=[`MAX_GARBLED_FRAME_LIMIT`] frames within a non-zero window of at most [`MAX_GARBLED_FRAME_WINDOW`] | unset |
 //! | `sender_sub_id` / `target_sub_id` | ASCII | unset, or 1..=[`MAX_ID_LEN`] bytes, printable ASCII except `=` | unset |
 //! | `sender_location_id` / `target_location_id` | ASCII | as above | unset |
+//! | `allowed_appl_versions` | [`FixVersion`] set | empty, or FIX.5.0 / FIX.5.0SP1 / FIX.5.0SP2 on a FIX 5.0 session | empty: the configured version only |
 //! | `reset_on_*`, `validate_*` | flag | any | see [`SessionConfig::new`] |
 //!
 //! # `HeartBtInt` (108) is whole seconds
@@ -48,9 +49,22 @@
 //! sub-second. Fractional intervals are rejected rather than truncated, and
 //! `HeartBtInt = 0` must be asked for explicitly through
 //! [`SessionConfigBuilder::disable_heartbeats`].
+//!
+//! # Application versions on a FIX 5.0 session
+//!
+//! A FIX 5.0 session is framed as FIXT.1.1: its counterparty declares its
+//! default application version in `DefaultApplVerID` (1137) on the Logon, and
+//! may name another per message in `ApplVerID` (1128). The session accepts
+//! its own configured version (the one `begin_string` names, and the one it
+//! stamps in its own 1137 and 1128) and any version in
+//! [`SessionConfig::allowed_appl_versions`];
+//! [`SessionConfig::accepts_appl_version`] is that rule. `ironfix-engine`
+//! enforces it. A FIX 4.x session carries neither field, so the set must be
+//! empty there.
 
 use crate::heartbeat::MAX_HEARTBEAT_INTERVAL_SECS;
 use ironfix_core::types::{COMP_ID_MAX_LEN, CompId};
+use ironfix_core::version::FixVersion;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -234,6 +248,24 @@ pub enum SessionConfigError {
         /// The longest window accepted, [`MAX_GARBLED_FRAME_WINDOW`].
         max_window: Duration,
     },
+
+    /// [`SessionConfig::allowed_appl_versions`] names a version this session
+    /// cannot accept.
+    ///
+    /// Only a FIX 5.0 session (`begin_string` FIX.5.0, FIX.5.0SP1 or
+    /// FIX.5.0SP2, framed as FIXT.1.1) carries `DefaultApplVerID` (1137) and
+    /// `ApplVerID` (1128), and only those three versions have a code there.
+    /// A set on any other session, or a set naming any other version, would
+    /// promise a check the session cannot make.
+    #[error(
+        "allowed_appl_versions names {version}, which a {begin_string} session cannot accept: only a FIX.5.0, FIX.5.0SP1 or FIX.5.0SP2 session (framed as FIXT.1.1) carries DefaultApplVerID (1137) and ApplVerID (1128), and only those versions have a code there"
+    )]
+    UnusableApplVersion {
+        /// The version that cannot be accepted.
+        version: FixVersion,
+        /// The session's configured `begin_string`.
+        begin_string: String,
+    },
 }
 
 /// Bound on garbled inbound frames: the session is closed once
@@ -359,6 +391,35 @@ fn validate_timeout(field: &'static str, timeout: Duration) -> Result<(), Sessio
         });
     }
     Ok(())
+}
+
+/// The FIX 5.0 application version `begin_string` names, or `None` when it
+/// names no version with an `ApplVerID` code (a FIX 4.x version, bare
+/// FIXT.1.1, or no version at all).
+fn configured_appl_version(begin_string: &str) -> Option<FixVersion> {
+    begin_string
+        .parse::<FixVersion>()
+        .ok()
+        .filter(|version| version.appl_ver_id().is_some())
+}
+
+/// Validates [`SessionConfig::allowed_appl_versions`]: empty, or only
+/// versions with an `ApplVerID` code on a session whose own version has one.
+fn validate_appl_versions(
+    begin_string: &str,
+    allowed: &[FixVersion],
+) -> Result<(), SessionConfigError> {
+    let fixt_session = configured_appl_version(begin_string).is_some();
+    match allowed
+        .iter()
+        .find(|version| !fixt_session || version.appl_ver_id().is_none())
+    {
+        Some(&version) => Err(SessionConfigError::UnusableApplVersion {
+            version,
+            begin_string: begin_string.to_owned(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// Validates the heartbeat interval against what tag 108 can carry.
@@ -522,6 +583,24 @@ pub struct SessionConfig {
     pub sender_location_id: Option<String>,
     /// Optional target location ID (tag 143), 1..=[`MAX_ID_LEN`] bytes when set.
     pub target_location_id: Option<String>,
+    /// Application versions accepted from the counterparty besides the
+    /// session's own, on a FIX 5.0 session.
+    ///
+    /// The counterparty declares its default application version in
+    /// `DefaultApplVerID` (1137) on the Logon and may name another per
+    /// application message in `ApplVerID` (1128). The version `begin_string`
+    /// names is always accepted: it is the one this session declares and
+    /// stamps itself. This set adds others. Default: empty, which accepts the
+    /// configured version only. Read the rule through
+    /// [`SessionConfig::accepts_appl_version`].
+    ///
+    /// Range: empty, or FIX.5.0, FIX.5.0SP1 and FIX.5.0SP2 on a session whose
+    /// `begin_string` is one of them. A FIX 4.x session carries neither field,
+    /// so a set there, or a set naming a version without an `ApplVerID` code
+    /// (FIX 4.x, bare FIXT.1.1), is refused by [`SessionConfig::validate`]
+    /// with [`SessionConfigError::UnusableApplVersion`]. Duplicates are
+    /// harmless.
+    pub allowed_appl_versions: Vec<FixVersion>,
 }
 
 impl SessionConfig {
@@ -565,6 +644,7 @@ impl SessionConfig {
             target_sub_id: None,
             sender_location_id: None,
             target_location_id: None,
+            allowed_appl_versions: Vec::new(),
         }
     }
 
@@ -582,8 +662,10 @@ impl SessionConfig {
     /// # Errors
     /// Returns the first [`SessionConfigError`] found: an empty, oversized or
     /// non-encodable identity string, a fractional or out-of-range heartbeat
-    /// interval, a zero or excessive handshake timeout, or a message-size
-    /// limit outside [`MIN_MESSAGE_SIZE_LIMIT`]..=[`MAX_MESSAGE_SIZE_LIMIT`].
+    /// interval, a zero or excessive handshake timeout, a message-size
+    /// limit outside [`MIN_MESSAGE_SIZE_LIMIT`]..=[`MAX_MESSAGE_SIZE_LIMIT`],
+    /// or an [`SessionConfig::allowed_appl_versions`] set the session cannot
+    /// honour.
     pub fn validate(&self) -> Result<(), SessionConfigError> {
         validate_id("begin_string", &self.begin_string)?;
         validate_heartbeat_interval(self.heartbeat_interval)?;
@@ -609,7 +691,64 @@ impl SessionConfig {
                 validate_id(field, value)?;
             }
         }
-        Ok(())
+        validate_appl_versions(&self.begin_string, &self.allowed_appl_versions)
+    }
+
+    /// Whether `version` is an application version this session accepts from
+    /// its counterparty, in `DefaultApplVerID` (1137) on the Logon or
+    /// `ApplVerID` (1128) on an application message.
+    ///
+    /// True for the version `begin_string` names, which the session declares
+    /// and stamps itself, and for every version in
+    /// [`SessionConfig::allowed_appl_versions`]; false for anything else, and
+    /// always false on a session that is not a FIX 5.0 session (FIX 4.x
+    /// carries neither field) or for a version without an `ApplVerID` code.
+    /// The rule is pure: it reads no clock and no counterparty state, so the
+    /// engine can apply it to each message on its own.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironfix_core::FixVersion;
+    /// use ironfix_core::types::CompId;
+    /// use ironfix_session::SessionConfig;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let config = SessionConfig::new(CompId::new("VENUE")?, CompId::new("CLIENT")?, "FIX.5.0SP2")
+    ///     .with_allowed_appl_versions([FixVersion::Fix50Sp1]);
+    /// assert_eq!(config.validate(), Ok(()));
+    /// assert!(config.accepts_appl_version(FixVersion::Fix50Sp2));
+    /// assert!(config.accepts_appl_version(FixVersion::Fix50Sp1));
+    /// assert!(!config.accepts_appl_version(FixVersion::Fix50));
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn accepts_appl_version(&self, version: FixVersion) -> bool {
+        if version.appl_ver_id().is_none() {
+            return false;
+        }
+        match configured_appl_version(&self.begin_string) {
+            Some(configured) => {
+                version == configured || self.allowed_appl_versions.contains(&version)
+            }
+            None => false,
+        }
+    }
+
+    /// Sets the application versions accepted from the counterparty besides
+    /// the session's own; an empty set accepts the configured version only.
+    ///
+    /// FIX.5.0, FIX.5.0SP1 or FIX.5.0SP2, on a FIX 5.0 session. Checked by
+    /// [`SessionConfig::validate`], not here. See
+    /// [`SessionConfig::allowed_appl_versions`].
+    #[must_use]
+    pub fn with_allowed_appl_versions(
+        mut self,
+        versions: impl IntoIterator<Item = FixVersion>,
+    ) -> Self {
+        self.allowed_appl_versions = versions.into_iter().collect();
+        self
     }
 
     /// Sets the heartbeat interval, `HeartBtInt` (108).
@@ -811,6 +950,8 @@ pub struct SessionConfigBuilder {
     sender_location_id: Option<String>,
     /// Target location ID (tag 143).
     target_location_id: Option<String>,
+    /// Application versions accepted besides the configured one.
+    allowed_appl_versions: Vec<FixVersion>,
 }
 
 impl Default for SessionConfigBuilder {
@@ -832,6 +973,7 @@ impl Default for SessionConfigBuilder {
             target_sub_id: None,
             sender_location_id: None,
             target_location_id: None,
+            allowed_appl_versions: Vec::new(),
         }
     }
 }
@@ -997,6 +1139,20 @@ impl SessionConfigBuilder {
         self
     }
 
+    /// Sets the application versions accepted from the counterparty in
+    /// `DefaultApplVerID` (1137) and `ApplVerID` (1128) besides the session's
+    /// own; without this call, the configured version only.
+    ///
+    /// FIX.5.0, FIX.5.0SP1 or FIX.5.0SP2, on a FIX 5.0 session. Anything else
+    /// is refused by [`SessionConfigBuilder::build`] with
+    /// [`SessionConfigError::UnusableApplVersion`]. See
+    /// [`SessionConfig::allowed_appl_versions`].
+    #[must_use = "builders do nothing unless .build() is called"]
+    pub fn allowed_appl_versions(mut self, versions: impl IntoIterator<Item = FixVersion>) -> Self {
+        self.allowed_appl_versions = versions.into_iter().collect();
+        self
+    }
+
     /// Builds the configuration, validating every knob.
     ///
     /// # Errors
@@ -1057,6 +1213,7 @@ impl SessionConfigBuilder {
             target_sub_id: self.target_sub_id,
             sender_location_id: self.sender_location_id,
             target_location_id: self.target_location_id,
+            allowed_appl_versions: self.allowed_appl_versions,
         };
         config.validate()?;
         Ok(config)
@@ -1654,6 +1811,137 @@ mod tests {
             GarbledFrameLimit::try_new(frames(1), Duration::ZERO),
             Err(garbled_out_of_range(frames(1), Duration::ZERO))
         );
+    }
+
+    // --- Application versions (FIXT.1.1) ------------------------------------
+
+    /// A FIX.5.0SP2 configuration, built through the builder.
+    fn fixt_required() -> SessionConfigBuilder {
+        required().begin_string("FIX.5.0SP2")
+    }
+
+    #[test]
+    fn test_allowed_appl_versions_default_to_empty() {
+        assert!(config().allowed_appl_versions.is_empty());
+        assert!(built(fixt_required()).allowed_appl_versions.is_empty());
+    }
+
+    #[test]
+    fn test_default_accepts_only_the_configured_appl_version() {
+        let config = built(fixt_required());
+        assert!(config.accepts_appl_version(FixVersion::Fix50Sp2));
+        for other in [
+            FixVersion::Fix50,
+            FixVersion::Fix50Sp1,
+            FixVersion::Fix44,
+            FixVersion::Fixt11,
+        ] {
+            assert!(
+                !config.accepts_appl_version(other),
+                "{other} must not be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_builder_allowed_appl_versions_lands_and_extends_the_configured_one() {
+        let config = built(fixt_required().allowed_appl_versions([FixVersion::Fix50Sp1]));
+        assert_eq!(config.allowed_appl_versions, vec![FixVersion::Fix50Sp1]);
+        assert!(config.accepts_appl_version(FixVersion::Fix50Sp2));
+        assert!(config.accepts_appl_version(FixVersion::Fix50Sp1));
+        assert!(!config.accepts_appl_version(FixVersion::Fix50));
+    }
+
+    #[test]
+    fn test_build_with_allowed_appl_versions_on_a_fix44_session_is_rejected() {
+        assert_eq!(
+            build_error(
+                required()
+                    .begin_string("FIX.4.4")
+                    .allowed_appl_versions([FixVersion::Fix50Sp2])
+            ),
+            SessionConfigError::UnusableApplVersion {
+                version: FixVersion::Fix50Sp2,
+                begin_string: "FIX.4.4".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_build_with_allowed_appl_versions_on_a_fix42_session_is_rejected() {
+        assert!(matches!(
+            build_error(
+                required()
+                    .begin_string("FIX.4.2")
+                    .allowed_appl_versions([FixVersion::Fix50])
+            ),
+            SessionConfigError::UnusableApplVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn test_build_with_a_version_without_an_appl_ver_id_code_is_rejected() {
+        for version in [FixVersion::Fix44, FixVersion::Fixt11] {
+            assert_eq!(
+                build_error(fixt_required().allowed_appl_versions([version])),
+                SessionConfigError::UnusableApplVersion {
+                    version,
+                    begin_string: "FIX.5.0SP2".to_string(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_with_allowed_appl_versions_on_bare_fixt_is_rejected() {
+        // FIXT.1.1 alone names no application version, so the session has no
+        // own version for the set to extend.
+        assert!(matches!(
+            build_error(
+                required()
+                    .begin_string("FIXT.1.1")
+                    .allowed_appl_versions([FixVersion::Fix50Sp2])
+            ),
+            SessionConfigError::UnusableApplVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_a_hand_assembled_appl_version_set_on_fix44() {
+        let config = config().with_allowed_appl_versions([FixVersion::Fix50Sp1]);
+        assert_eq!(
+            config.validate(),
+            Err(SessionConfigError::UnusableApplVersion {
+                version: FixVersion::Fix50Sp1,
+                begin_string: "FIX.4.4".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_with_allowed_appl_versions_sets_and_clears_the_set() {
+        let base = SessionConfig::new(comp_id("SENDER"), comp_id("TARGET"), "FIX.5.0");
+        let set = base.with_allowed_appl_versions([FixVersion::Fix50Sp1, FixVersion::Fix50Sp2]);
+        assert_eq!(set.validate(), Ok(()));
+        assert!(set.accepts_appl_version(FixVersion::Fix50));
+        assert!(set.accepts_appl_version(FixVersion::Fix50Sp1));
+        assert!(set.accepts_appl_version(FixVersion::Fix50Sp2));
+        let cleared = set.with_allowed_appl_versions([]);
+        assert!(cleared.allowed_appl_versions.is_empty());
+        assert!(!cleared.accepts_appl_version(FixVersion::Fix50Sp2));
+    }
+
+    #[test]
+    fn test_fix4_session_accepts_no_appl_version() {
+        for begin_string in ["FIX.4.2", "FIX.4.4"] {
+            let config = SessionConfig::new(comp_id("SENDER"), comp_id("TARGET"), begin_string);
+            for version in FixVersion::ALL {
+                assert!(
+                    !config.accepts_appl_version(version),
+                    "a {begin_string} session must accept no application version, accepted {version}"
+                );
+            }
+        }
     }
 
     #[test]

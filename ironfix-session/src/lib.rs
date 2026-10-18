@@ -24,8 +24,10 @@
 //!   heartbeat and TestRequest deadlines and `HeartBtInt` negotiation
 //! - **Configuration**: [`SessionConfig`] and its validating
 //!   [`config::SessionConfigBuilder`], including the opt-in
-//!   [`GarbledFrameLimit`] on garbled inbound frames (enforced by
-//!   `ironfix-engine`)
+//!   [`GarbledFrameLimit`] on garbled inbound frames and, on a FIX 5.0
+//!   session, the application versions accepted from the counterparty
+//!   ([`SessionConfig::accepts_appl_version`]); both enforced by
+//!   `ironfix-engine`
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
 //! progress". The actual `ResendRequest` / `SequenceReset` / gap-fill message
