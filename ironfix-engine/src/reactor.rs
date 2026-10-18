@@ -95,27 +95,50 @@
 //!
 //! # What blocks the reactor, and what does not
 //!
-//! The reactor is a single task owning the socket. A stalled peer cannot park it
-//! forever: every write is bounded by the caller's write timeout, and its expiry
-//! closes the session. A slow `from_app` cannot delay it either: inbound
-//! application messages are handed to a separate dispatcher task over a bounded
-//! queue, so an application handler never delays a socket read, a heartbeat, or
+//! The reactor is a single task owning the socket, and it never waits inside
+//! a write. Every frame it sends, resends or answers with is appended to the
+//! session's write buffer; the buffer is written out by one branch of the
+//! loop that polls the flush and the next inbound read together, on the same
+//! socket, so a flush the counterparty is not taking never stops the reading.
+//! Two sides writing to each other at once (two resends larger than the
+//! socket buffers, or live traffic both ways) therefore keep draining each
+//! other. A side that waited inside one write would wait for a reader that
+//! may be waiting the same way, until the write timeout closed both.
+//!
+//! The write timeout is how long waiting output may make **no progress** at
+//! all, checked on the 100 ms tick: a counterparty that stops reading is
+//! detected at most two ticks after the timeout, and a long resend to a slow
+//! but reading counterparty is never cut short. Output waits for the socket in
+//! the write buffer up to a high-water mark (64 KiB); past it, neither a
+//! resend nor the command queue adds more, which is what holds
+//! [`Connection::send`](crate::Connection::send) back while the counterparty
+//! reads slowly. Reading pauses only while the replies to inbound frames have
+//! piled up past one `max_message_size` above that mark, so a counterparty
+//! that sends faster than it reads cannot grow the buffer without bound.
+//!
+//! A slow `from_app` cannot delay the reactor either: inbound application
+//! messages are handed to a separate dispatcher task over a bounded queue, so
+//! an application handler never delays a socket read, a heartbeat, or
 //! timeout detection.
 //!
 //! A resend (the answer to a `ResendRequest`, or the resend a counterparty's
-//! `NextExpectedMsgSeqNum` (789) asks for) does not park it either. It is
-//! queued and written one frame per pass of the loop, and a frame the
-//! counterparty has already sent is read before the next resend frame is
-//! written. Two sides resending large backlogs to each other at once
-//! therefore keep draining each other instead of both blocking on full socket
-//! buffers until the write timeout. Nothing that takes a new number is
+//! `NextExpectedMsgSeqNum` (789) asks for) is queued and fed to the write
+//! buffer a few frames per step of the loop, up to the high-water mark, so
+//! one flush carries many frames. Steps and inbound reads alternate in a
+//! bounded ratio: a frame the counterparty has already sent is handled before
+//! the next step, and at most 16 in a row, so a counterparty that sends
+//! without pause cannot hold a resend back, and a resend cannot hold reading
+//! back. The owed Logout's deadline is checked before every step as well as
+//! on the tick. Nothing that takes a new number is
 //! written in the middle of a resend: live outbound application messages (and
 //! a Logout the consumer asks for) wait in the command queue, Heartbeat
 //! replies, session Rejects and this session's own `ResendRequest` are held
 //! back and written right after it, and no idle Heartbeat or TestRequest is
 //! sent meanwhile. A Logout from the counterparty is answered once the resend
 //! it is owed is done, within the logout timeout. Only messages that end the
-//! session are written at once.
+//! session are written at once. Whatever a closing session left in the write
+//! buffer (its last Logout, typically) is written out before the socket is
+//! dropped, within what is left of the write timeout.
 //!
 //! The attached [`MessageStore`] **does** run on the reactor: every store call
 //! is awaited inline, because its result decides whether a frame may be written
@@ -145,7 +168,7 @@ use crate::wire::{
     SendingTimeGuard, SendingTimeProblem,
 };
 use bytes::{Bytes, BytesMut};
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
 use ironfix_core::error::{DecodeError, EncodeError, StoreError};
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::version::FixVersion;
@@ -158,13 +181,15 @@ use ironfix_session::{
 use ironfix_store::{MessageStore, StoredMessage};
 use ironfix_transport::{CodecError, FixCodec};
 use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
-use tokio_util::codec::Framed;
+use tokio_util::codec::{Encoder, Framed};
 
 /// The session's byte stream, a TCP socket or any stream a caller provided
 /// (see [`crate::stream`]), framed as FIX messages.
@@ -212,8 +237,35 @@ pub(crate) const DEFAULT_OUTBOUND_CAPACITY: usize = 1024;
 /// its ceiling.
 pub(crate) const DEFAULT_APP_QUEUE_CAPACITY: usize = 1024;
 
-/// Default bound on a single socket write.
+/// Default write timeout: how long a handshake write may take, and how long
+/// an established session's output may wait without any of it reaching the
+/// socket.
 pub(crate) const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Output, in bytes, the reactor lets wait in the write buffer before it
+/// stops taking more from a resend or from the command queue.
+///
+/// The bound is checked before a frame is added, so the buffer can exceed it
+/// by one frame. It is what lets one flush carry many frames, and what holds a
+/// [`Connection::send`](crate::Connection::send) back while the counterparty
+/// is reading more slowly than the session writes.
+const WRITE_BUFFER_HIGH_WATER: usize = 64 * 1024;
+
+/// Most inbound frames the reactor handles in a row while a resend has room
+/// to write, before it gives the resend a step.
+///
+/// Before each resend step the reactor handles a frame the counterparty has
+/// already sent, if there is one, so a resend never holds reading back (a
+/// Logout that arrived is seen before the resend runs on). This bound is the
+/// other half of the ratio: a counterparty that sends without pause (market
+/// data, or a TestRequest storm) cannot hold a resend back, and nothing that
+/// waits behind the resend is held with it.
+const MAX_READS_PER_RESEND_STEP: u32 = 16;
+
+/// Most inbound frames dropped per poll while a closing session writes out
+/// its last output, so a counterparty that keeps sending cannot keep that
+/// poll from returning.
+const CLOSE_DRAIN_FRAMES_PER_POLL: usize = 64;
 
 /// How long the reactor waits for the application dispatcher to finish the
 /// messages already queued before it reports the session closed.
@@ -239,13 +291,13 @@ const RESEND_PAGE_LIMIT: usize = 256;
 /// Most resends a session queues for its counterparty, the one under way
 /// included.
 ///
-/// Resends are answered one frame per pass of the reactor loop, so requests
-/// that keep arriving faster than they are answered would otherwise grow the
-/// queue without bound. Past this many, a new request is merged into the last
-/// queued one, which is not under way yet: its range widens to cover both, so
-/// every number either request asked for is still answered (a number asked
-/// for by neither reaches the counterparty as a possible duplicate, which it
-/// drops).
+/// Resends are answered by steps of the reactor loop, between inbound reads,
+/// so requests that keep arriving faster than they are answered would
+/// otherwise grow the queue without bound. Past this many, a new request is
+/// merged into the last queued one, which is not under way yet: its range
+/// widens to cover both, so every number either request asked for is still
+/// answered (a number asked for by neither reaches the counterparty as a
+/// possible duplicate, which it drops).
 const MAX_QUEUED_RESENDS: usize = 64;
 
 // The merge widens the last queued resend, which must not be the one under way.
@@ -811,7 +863,7 @@ impl ResendState {
 }
 
 /// One resend this session owes the counterparty: what is left of
-/// `begin_seq..new_seq`, written one frame at a time.
+/// `begin_seq..new_seq`, written a few frames per step of the reactor loop.
 #[derive(Debug)]
 struct ResendJob {
     /// The first number not covered by the reply (exclusive end).
@@ -877,13 +929,252 @@ fn push_resend(queue: &mut VecDeque<ResendJob>, job: ResendJob) {
     queue.push_back(job);
 }
 
-/// What one step of a resend did.
+/// What one call of [`Reactor::advance_resend`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResendProgress {
-    /// It wrote one frame or read one page; there may be more.
-    More,
+    /// It added one frame to the write buffer (or dropped a gap fill the
+    /// callback left unsendable); there may be more.
+    Wrote,
+    /// It read one page from the store; there may be more. A page read ends
+    /// the step, so the loop reads inbound and yields between pages.
+    ReadPage,
     /// The resend is complete.
     Done,
+}
+
+/// The reactor's side of the session's write buffer (the one inside
+/// [`FixFramed`]), and the clock of the write timeout.
+///
+/// Every frame the reactor sends, resends or answers with is appended to the
+/// write buffer here ([`Writer::feed`]) and nothing else happens: no socket
+/// call is made. The buffer is written to the socket by the flush half of
+/// [`poll_socket`], which the reactor loop polls together with the next
+/// inbound read, so a socket that is not taking bytes never stops the reactor
+/// from reading. Two sides writing to each other at once therefore keep
+/// draining each other, whatever the socket buffers hold; a side that waited
+/// inside one write would wait for a reader that may be waiting the same way.
+///
+/// The order on the wire is the order frames are fed, because the buffer is
+/// written front to back.
+#[derive(Debug)]
+struct Writer {
+    /// Frames outbound bytes into the write buffer under the session's
+    /// `max_message_size`, the check the framed socket's codec makes, so a
+    /// frame the counterparty would refuse is never sent. Only its encoder
+    /// half is used; the framed socket's own codec reads.
+    codec: FixCodec,
+    /// Whether output is waiting: set when a frame is fed, cleared when a
+    /// flush completes (the buffer written and the stream flushed).
+    pending: bool,
+    /// Whether a flush moved bytes to the socket since the last tick.
+    progressed: bool,
+    /// Since when the waiting output has made no progress, as the ticks see
+    /// it: started by the first tick that finds output waiting, restarted by
+    /// every tick that finds progress, and cleared by a completed flush.
+    stalled_since: Option<Instant>,
+    /// Set when a write failed or the write timeout ran out: the closing
+    /// session does not try to flush again.
+    failed: bool,
+}
+
+/// What a tick found on the write side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteCheck {
+    /// No output is waiting, or it has waited less than the write timeout.
+    Fine,
+    /// Output reached the socket since the last tick.
+    Progressed,
+    /// Output has waited the whole write timeout without any of it reaching
+    /// the socket.
+    Stalled,
+}
+
+impl Writer {
+    /// A writer framing outbound bytes under `max_message_size`, with no
+    /// output waiting.
+    #[must_use]
+    fn new(max_message_size: usize) -> Self {
+        Self {
+            codec: FixCodec::new().with_max_message_size(max_message_size),
+            pending: false,
+            progressed: false,
+            stalled_since: None,
+            failed: false,
+        }
+    }
+
+    /// Appends `frame` to the write buffer of `framed`. No byte reaches the
+    /// socket here, and nothing here can wait: the reactor loop's flush
+    /// writes the buffer out.
+    ///
+    /// The buffer keeps its capacity across flushes, so a frame costs a copy
+    /// and, in steady state, no allocation.
+    ///
+    /// # Errors
+    /// [`CodecError::MessageTooLarge`] when `frame` exceeds the session's
+    /// `max_message_size`; nothing is appended.
+    fn feed(&mut self, framed: &mut FixFramed, frame: &[u8]) -> Result<(), CodecError> {
+        self.codec.encode(frame, framed.write_buffer_mut())?;
+        self.pending = true;
+        Ok(())
+    }
+
+    /// Records a completed flush: nothing is waiting any more.
+    const fn flushed(&mut self) {
+        self.pending = false;
+        self.progressed = false;
+        self.stalled_since = None;
+    }
+
+    /// Moves the write timeout's clock on a tick at `now`.
+    ///
+    /// The timeout measures how long waiting output has made **no
+    /// progress**, not how long one write takes: a resend of many megabytes
+    /// to a slow but reading counterparty is never cut short, and a
+    /// counterparty that stops reading is detected at most two ticks after
+    /// the timeout: the clock starts at the first tick that finds output
+    /// waiting, and is read again on every tick after it.
+    fn on_tick(&mut self, now: Instant, write_timeout: Duration) -> WriteCheck {
+        if !self.pending {
+            self.stalled_since = None;
+            return WriteCheck::Fine;
+        }
+        if std::mem::take(&mut self.progressed) {
+            self.stalled_since = Some(now);
+            return WriteCheck::Progressed;
+        }
+        match self.stalled_since {
+            Some(since)
+                if now
+                    .checked_duration_since(since)
+                    .is_some_and(|waited| waited >= write_timeout) =>
+            {
+                WriteCheck::Stalled
+            }
+            Some(_) => WriteCheck::Fine,
+            None => {
+                self.stalled_since = Some(now);
+                WriteCheck::Fine
+            }
+        }
+    }
+
+    /// How long a closing session at `now` may still spend writing its last
+    /// output: what is left of one write timeout since the output last made
+    /// progress, so the close never extends the wait the timeout allows.
+    #[must_use]
+    fn close_budget(&self, now: Instant, write_timeout: Duration) -> Duration {
+        let waited = self
+            .stalled_since
+            .and_then(|since| now.checked_duration_since(since))
+            .unwrap_or_default();
+        write_timeout.checked_sub(waited).unwrap_or_default()
+    }
+}
+
+/// What one poll of the socket came to.
+#[derive(Debug)]
+enum SocketEvent {
+    /// The waiting output is written and the stream flushed, or the write
+    /// failed.
+    Flushed(Result<(), CodecError>),
+    /// What one read produced: a frame, a fatal codec error, or the end of
+    /// the stream.
+    Inbound(Option<Result<BytesMut, CodecError>>),
+}
+
+/// Polls the socket in both directions at once, on the same `framed`.
+///
+/// The flush of the waiting output is polled first, so a steady inbound
+/// stream can never keep the output waiting; then, with `read` set, the next
+/// inbound frame, so a flush the socket is not taking never keeps the reactor
+/// from reading. A flush that moved bytes is recorded for the write timeout
+/// even when it has not completed.
+fn poll_socket(
+    framed: &mut FixFramed,
+    writer: &mut Writer,
+    read: bool,
+    cx: &mut Context<'_>,
+) -> Poll<SocketEvent> {
+    if writer.pending {
+        let waiting = framed.write_buffer().len();
+        let flush = <FixFramed as Sink<BytesMut>>::poll_flush(Pin::new(&mut *framed), cx);
+        if framed.write_buffer().len() < waiting {
+            writer.progressed = true;
+        }
+        if let Poll::Ready(result) = flush {
+            return Poll::Ready(SocketEvent::Flushed(result));
+        }
+    }
+    if read && let Poll::Ready(inbound) = framed.poll_next_unpin(cx) {
+        return Poll::Ready(SocketEvent::Inbound(inbound));
+    }
+    Poll::Pending
+}
+
+/// [`poll_socket`] once, without waiting: what the socket has ready now, or
+/// `None`. A direction that is not ready is polled again, with the reactor's
+/// waker, by the socket branch of the next pass.
+fn poll_socket_now(framed: &mut FixFramed, writer: &mut Writer, read: bool) -> Option<SocketEvent> {
+    std::future::poll_fn(|cx| poll_socket(framed, writer, read, cx)).now_or_never()
+}
+
+/// How dropping inbound frames during a close went for one poll.
+enum Drain {
+    /// Nothing more to read for now; the read waker is registered.
+    Waiting,
+    /// The stream ended or failed: nothing more will be read.
+    Ended,
+    /// [`CLOSE_DRAIN_FRAMES_PER_POLL`] frames were dropped and there may be
+    /// more; the task is woken to poll again.
+    Busy,
+}
+
+/// Reads and drops up to [`CLOSE_DRAIN_FRAMES_PER_POLL`] inbound frames.
+fn drain_inbound(framed: &mut FixFramed, cx: &mut Context<'_>) -> Drain {
+    for _ in 0..CLOSE_DRAIN_FRAMES_PER_POLL {
+        match framed.poll_next_unpin(cx) {
+            Poll::Pending => return Drain::Waiting,
+            Poll::Ready(Some(Ok(_dropped))) => {}
+            Poll::Ready(Some(Err(_)) | None) => return Drain::Ended,
+        }
+    }
+    cx.waker().wake_by_ref();
+    Drain::Busy
+}
+
+/// Writes out what a closing session left in the write buffer (its last
+/// Logout, typically) before the socket is dropped, for at most `budget`.
+///
+/// Inbound frames that arrive meanwhile are read and dropped: the session is
+/// over, and a counterparty flushing its own last output must not be left
+/// waiting on a reader that stopped. Nothing here is logged but the outcome,
+/// never a frame.
+async fn flush_on_close(framed: &mut FixFramed, budget: Duration, session_id: &SessionId) {
+    let mut reading = true;
+    let flush = std::future::poll_fn(|cx| {
+        if let Poll::Ready(result) =
+            <FixFramed as Sink<BytesMut>>::poll_flush(Pin::new(&mut *framed), cx)
+        {
+            return Poll::Ready(result);
+        }
+        if reading && matches!(drain_inbound(framed, cx), Drain::Ended) {
+            reading = false;
+        }
+        Poll::Pending
+    });
+    match timeout(budget, flush).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!(
+            session = %session_id,
+            error = %err,
+            "cannot write the closing session's last output"
+        ),
+        Err(_) => tracing::warn!(
+            session = %session_id,
+            "the closing session's last output was not written within the write timeout"
+        ),
+    }
 }
 
 /// Reactor state shared across event handlers.
@@ -928,9 +1219,13 @@ struct Reactor<A: Application> {
     /// `NextExpectedMsgSeqNum` (789) resend fills the gap below it, then
     /// consumed ([`Reactor::release_held_logon`]).
     held_logon: Option<u64>,
-    /// Resends this session owes the counterparty, answered in order, one
-    /// frame per pass of the reactor loop ([`Reactor::resend_step`]).
+    /// Resends this session owes the counterparty, answered in order, by
+    /// steps of the reactor loop ([`Reactor::resend_step`]).
     resends: VecDeque<ResendJob>,
+    /// Inbound frames handled since the last resend step, counted only while
+    /// a resend has room to write; at [`MAX_READS_PER_RESEND_STEP`] the next
+    /// pass gives the resend its step before reading again.
+    reads_since_resend_step: u32,
     /// Messages that take a new number, held back while a resend is under
     /// way and written in order once it is done ([`Reactor::finish_resends`]).
     deferred: VecDeque<DeferredSend>,
@@ -941,8 +1236,11 @@ struct Reactor<A: Application> {
     /// this session re-request, so it re-requests at most once per number
     /// ([`Reactor::rerequest_spanned_gap`]).
     spanning_rerequested: Option<u64>,
-    /// Bound on a single socket write.
+    /// How long waiting output may make no progress before the session is
+    /// closed ([`Writer::on_tick`]).
     write_timeout: Duration,
+    /// The write buffer's state and the write timeout's clock.
+    writer: Writer,
     /// Hand-off queue to the application dispatcher.
     app_tx: mpsc::Sender<AppFrame>,
     /// Garbled-frame count against [`SessionConfig::garbled_frame_limit`], or
@@ -1038,26 +1336,42 @@ async fn run_reactor<A: Application + 'static>(
             Ok(()) => current,
             Err(err) => break ctx.close_on_store_failure(current, &err),
         };
-        // A resend in progress (the answer to a ResendRequest, or the 789
-        // resend) is written one frame per pass, between inbound reads; until
-        // it is done, live outbound application messages wait in the command
-        // queue, so they never overtake it.
+        // Nothing below writes to the socket: every handler only appends to
+        // the write buffer, and the socket branch writes it out while it goes
+        // on reading. A resend in progress (the answer to a ResendRequest, or
+        // the 789 resend) is fed a few frames per step, up to the high water;
+        // until it is done, live outbound application messages wait in the
+        // command queue, so they never overtake it. Live messages stop at the
+        // high water too, which is what holds a sender back while the
+        // counterparty reads slowly.
         let resending = ctx.resend_in_progress();
+        let waiting = framed.write_buffer().len();
+        let room = waiting < WRITE_BUFFER_HIGH_WATER;
+        let resend_ready = resending && room;
+        // Reading pauses for one pass once a resend that has room has waited
+        // through MAX_READS_PER_RESEND_STEP inbound frames, and while the
+        // replies to inbound frames have piled up past the read ceiling.
+        let read = !ctx.replies_piled_up(waiting)
+            && !(resend_ready && ctx.reads_since_resend_step >= MAX_READS_PER_RESEND_STEP);
+        let flushing = ctx.writer.pending;
         let result = tokio::select! {
-            // While a resend is under way inbound frames are read only by the
-            // resend branch below, before each resend frame, so a frame the
-            // counterparty has sent is always read before the next resend
-            // frame is written.
-            inbound = framed.next(), if !resending => ctx.on_inbound_event(&mut framed, current, inbound).await,
-            // Always ready while resending. A frame the peer has already sent
-            // is read before the next resend frame is written: each side keeps
-            // draining the other while it resends, so two sides resending at
-            // once never both block writing into full socket buffers.
-            () = std::future::ready(()), if resending => match framed.next().now_or_never() {
-                Some(inbound) => ctx.on_inbound_event(&mut framed, current, inbound).await,
+            // Both directions in one poll on the same socket: the flush of
+            // the waiting output, then the next inbound frame. A flush the
+            // counterparty is not taking never stops the reading, so two sides
+            // writing to each other at once keep draining each other.
+            event = std::future::poll_fn(|cx| poll_socket(&mut framed, &mut ctx.writer, read, cx)), if read || flushing => {
+                ctx.on_socket_event(&mut framed, current, event, resend_ready).await
+            }
+            // Always ready while a resend has room to write. The socket is
+            // polled once first, without waiting: a frame the counterparty
+            // has already sent is handled before the next step, up to
+            // MAX_READS_PER_RESEND_STEP in a row, so neither the resend nor
+            // the reading can hold the other back.
+            () = std::future::ready(()), if resend_ready => match poll_socket_now(&mut framed, &mut ctx.writer, read) {
+                Some(event) => ctx.on_socket_event(&mut framed, current, event, resend_ready).await,
                 None => ctx.resend_step(&mut framed, current).await,
             },
-            command = commands.recv(), if commands_open && !resending => match command {
+            command = commands.recv(), if commands_open && !resending && room => match command {
                 Some(command) => ctx.on_command(&mut framed, current, command).await,
                 None => {
                     // All handles dropped: log out gracefully.
@@ -1065,6 +1379,10 @@ async fn run_reactor<A: Application + 'static>(
                     ctx.on_command(&mut framed, current, Command::Logout).await
                 }
             },
+            // Not held back by the high water: a Reject answers an inbound
+            // message, like a Heartbeat answers a TestRequest, and the read
+            // ceiling bounds those. Holding it would stall the dispatcher and
+            // fill the application queue while inbound is still read.
             rejection = app_rejects.recv(), if rejects_open => match rejection {
                 Some(rejection) => {
                     let ref_msg_type = rejection.ref_msg_type.as_str().to_string();
@@ -1098,6 +1416,15 @@ async fn run_reactor<A: Application + 'static>(
             Err(outcome) => break outcome,
         }
     };
+
+    // What the session queued last (its Logout, the reply to the
+    // counterparty's, the Reject before an identity Logout) is still in the
+    // write buffer: it is written out before anything else closes, within
+    // what is left of the write timeout, unless writing is what failed.
+    if ctx.writer.pending && !ctx.writer.failed {
+        let budget = ctx.writer.close_budget(driver_now(), ctx.write_timeout);
+        flush_on_close(&mut framed, budget, &ctx.session_id).await;
+    }
 
     let mut write_counters = true;
     if ctx.config.reset_on_disconnect || (outcome.graceful && ctx.config.reset_on_logout) {
@@ -1241,7 +1568,9 @@ enum WriteFailure {
 /// saw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sent {
-    /// The frame went out and a sequence number was spent.
+    /// The frame is in the write buffer, behind everything sent before it,
+    /// and a sequence number was spent. The reactor loop writes it out; if
+    /// that fails, the session closes.
     Yes,
     /// The message was dropped before the wire: `to_admin`/`to_app` left it
     /// unframeable or dropped a required field. No sequence number was spent
@@ -1347,16 +1676,82 @@ impl<A: Application> Reactor<A> {
         )
     }
 
-    /// Frames `pending` under `seq` and writes it, bounded by the write
-    /// timeout.
+    /// Whether `waiting` bytes of output have piled up past the read ceiling:
+    /// more than one `max_message_size` above [`WRITE_BUFFER_HIGH_WATER`].
+    /// The reactor then stops reading until the counterparty has taken some
+    /// of it.
+    ///
+    /// Resends and live sends stop at the high water and add at most one
+    /// frame past it, so only the replies to inbound frames (Heartbeats,
+    /// Rejects) can get here, and only from a counterparty that sends faster
+    /// than it reads. Reading is then held back rather than the buffer
+    /// growing without bound. Computed by subtraction, so it cannot overflow.
+    #[must_use]
+    const fn replies_piled_up(&self, waiting: usize) -> bool {
+        match waiting.checked_sub(self.config.max_message_size) {
+            Some(beyond) => beyond > WRITE_BUFFER_HIGH_WATER,
+            None => false,
+        }
+    }
+
+    /// Handles what one poll of the socket came to: a completed or failed
+    /// flush, or an inbound read. `resend_ready` says whether a resend had
+    /// room to write when the socket was polled; an inbound frame handled
+    /// then counts against [`MAX_READS_PER_RESEND_STEP`].
+    async fn on_socket_event(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        event: SocketEvent,
+        resend_ready: bool,
+    ) -> Result<Phase, SessionClosed> {
+        match event {
+            SocketEvent::Flushed(Ok(())) => {
+                self.on_flushed();
+                Ok(phase)
+            }
+            SocketEvent::Flushed(Err(err)) => Err(self.close_on_write_failure(phase, &err)),
+            SocketEvent::Inbound(inbound) => {
+                if resend_ready && let Some(reads) = self.reads_since_resend_step.checked_add(1) {
+                    self.reads_since_resend_step = reads;
+                }
+                self.on_inbound_event(framed, phase, inbound).await
+            }
+        }
+    }
+
+    /// Records a completed flush: the output reached the socket, which is
+    /// what the heartbeat clock counts as sending. Called once per flush, not
+    /// once per frame.
+    fn on_flushed(&mut self) {
+        self.writer.flushed();
+        lock_heartbeat(&self.runtime).on_message_sent();
+    }
+
+    /// Ends the session because writing to the counterparty failed, or made
+    /// no progress for the write timeout. Nothing more is written: the
+    /// closing session does not try to flush what is left.
+    fn close_on_write_failure(
+        &mut self,
+        phase: Phase,
+        err: &dyn std::fmt::Display,
+    ) -> SessionClosed {
+        self.writer.failed = true;
+        teardown(phase);
+        closed(format!("write failed: {err}"), false)
+    }
+
+    /// Frames `pending` under `seq` and feeds it to the write buffer, behind
+    /// everything fed before it.
     ///
     /// With `spend` set, `seq` must be the next sender number and this is the
     /// frame that spends it, in this order: encode; then [`file_and_spend`],
     /// which files the frame under `seq` and persists `seq + 1` as the next
     /// sender number when a store is attached, and spends `seq` in memory (the
-    /// step the Logon handshakes share); then write. The store and the
-    /// in-memory counter therefore agree before any byte reaches the socket,
-    /// and a write that fails afterwards cannot lead to `seq` being reused.
+    /// step the Logon handshakes share); then feed it to the write buffer,
+    /// from which the reactor loop writes it. The store and the in-memory
+    /// counter therefore agree before any byte reaches the socket, and a
+    /// write that fails afterwards cannot lead to `seq` being reused.
     ///
     /// A gap fill passes `false`: it re-occupies a range it does not own, so
     /// filing it would overwrite a message under `seq` that is still
@@ -1365,9 +1760,9 @@ impl<A: Application> Reactor<A> {
     /// # Errors
     /// [`WriteFailure::Encode`] leaves the session untouched — nothing was
     /// written and nothing was spent. [`WriteFailure::Fatal`] does not: a
-    /// stalled or broken transport, an exhausted sender counter, or a store
-    /// write that failed under [`StoreFailurePolicy::CloseSession`] (in which
-    /// case nothing was written and nothing spent) ends the session.
+    /// frame above `max_message_size`, an exhausted sender counter, or a
+    /// store write that failed under [`StoreFailurePolicy::CloseSession`] (in
+    /// which case nothing was written and nothing spent) ends the session.
     async fn write_at(
         &mut self,
         framed: &mut FixFramed,
@@ -1375,7 +1770,6 @@ impl<A: Application> Reactor<A> {
         pending: &PendingMessage,
         spend: bool,
     ) -> Result<(), WriteFailure> {
-        let write_timeout = self.write_timeout;
         let frame = match self.factory.encode(seq, pending) {
             Ok(frame) => frame,
             Err(err) => return Err(WriteFailure::Encode(err)),
@@ -1403,15 +1797,11 @@ impl<A: Application> Reactor<A> {
             .await
             .map_err(WriteFailure::Fatal)?;
         }
-        // A peer that stops reading parks this write forever once its receive
-        // window closes, and the reactor's liveness timers park with it.
-        match timeout(write_timeout, framed.send(frame)).await {
-            Err(_) => Err(WriteFailure::Fatal(EngineError::WriteTimeout(
-                write_timeout,
-            ))),
-            Ok(Err(err)) => Err(WriteFailure::Fatal(err.into())),
-            Ok(Ok(())) => Ok(()),
-        }
+        // Appended, not written: the reactor loop writes it out while it
+        // goes on reading, and the write timeout watches that.
+        self.writer
+            .feed(framed, frame)
+            .map_err(|err| WriteFailure::Fatal(err.into()))
     }
 
     /// Runs the outbound application callback, checks the body, files the
@@ -1456,8 +1846,9 @@ impl<A: Application> Reactor<A> {
         self.send_now(framed, pending).await
     }
 
-    /// Writes `pending` at once, under the next sender sequence number, as
-    /// [`Reactor::send`] does when no resend is under way.
+    /// Feeds `pending` to the write buffer at once, under the next sender
+    /// sequence number, as [`Reactor::send`] does when no resend is under
+    /// way.
     ///
     /// # Errors
     /// As for [`Reactor::send`].
@@ -1471,19 +1862,17 @@ impl<A: Application> Reactor<A> {
         }
         let seq = self.runtime.sequences.next_sender_seq().value();
         match self.write_at(framed, seq, &pending, true).await {
-            Ok(()) => {}
+            Ok(()) => Ok(Sent::Yes),
             Err(WriteFailure::Encode(err)) => {
                 tracing::warn!(
                     session = %self.session_id,
                     error = %err,
                     "dropping outbound message with no legal wire form; no sequence number spent"
                 );
-                return Ok(Sent::Dropped);
+                Ok(Sent::Dropped)
             }
-            Err(WriteFailure::Fatal(err)) => return Err(err),
+            Err(WriteFailure::Fatal(err)) => Err(err),
         }
-        lock_heartbeat(&self.runtime).on_message_sent();
-        Ok(Sent::Yes)
     }
 
     /// Runs `to_admin` / `to_app` on `pending` and rechecks its body.
@@ -1515,35 +1904,24 @@ impl<A: Application> Reactor<A> {
         true
     }
 
-    /// Writes an already-built replay frame to the socket, bounded by the write
-    /// timeout.
+    /// Feeds an already-built replay frame to the write buffer.
     ///
     /// A replayed message keeps the sequence number and body it was first sent
-    /// with, so nothing is allocated and nothing is re-filed. It already
+    /// with, so no number is spent and nothing is re-filed. It already
     /// carries `PossDupFlag` (43) = Y and its original `OrigSendingTime` (122),
     /// both stamped by [`wire::resend_frame`], so it is written verbatim rather
     /// than run back through the callback path.
     ///
     /// # Errors
-    /// [`EngineError::WriteTimeout`] when the peer is not reading, and the
-    /// transport's own error otherwise. Both are terminal for the session.
-    async fn send_replay(
-        &self,
-        framed: &mut FixFramed,
-        frame: BytesMut,
-    ) -> Result<(), EngineError> {
-        let write_timeout = self.write_timeout;
-        match timeout(write_timeout, framed.send(frame)).await {
-            Err(_) => return Err(EngineError::WriteTimeout(write_timeout)),
-            Ok(Err(err)) => return Err(err.into()),
-            Ok(Ok(())) => {}
-        }
-        lock_heartbeat(&self.runtime).on_message_sent();
-        Ok(())
+    /// [`EngineError::Codec`] when the rebuilt frame exceeds
+    /// `max_message_size`, which is terminal for the session.
+    fn send_replay(&mut self, framed: &mut FixFramed, frame: &[u8]) -> Result<(), EngineError> {
+        self.writer.feed(framed, frame).map_err(EngineError::from)
     }
 
-    /// Writes a SequenceReset-GapFill covering `at_seq..new_seq`, numbered with
-    /// `at_seq`, without spending a sender sequence number.
+    /// Feeds a SequenceReset-GapFill covering `at_seq..new_seq`, numbered with
+    /// `at_seq`, to the write buffer, without spending a sender sequence
+    /// number.
     ///
     /// A gap fill re-occupies the range it replaces, so it is written at
     /// `at_seq` rather than through [`Reactor::send`], and is **not** filed:
@@ -1551,10 +1929,9 @@ impl<A: Application> Reactor<A> {
     /// resendable.
     ///
     /// # Errors
-    /// Only a fatal transport failure ([`EngineError::WriteTimeout`] or a
-    /// transport error) is returned. A body the callback left unframeable is a
-    /// hole the peer will re-request and is dropped rather than closing the
-    /// session.
+    /// Only a fatal failure (a frame above `max_message_size`) is returned.
+    /// A body the callback left unframeable is a hole the peer will
+    /// re-request and is dropped rather than closing the session.
     async fn send_gap_fill(
         &mut self,
         framed: &mut FixFramed,
@@ -1566,10 +1943,7 @@ impl<A: Application> Reactor<A> {
             return Ok(());
         }
         match self.write_at(framed, at_seq, &gap_fill, false).await {
-            Ok(()) => {
-                lock_heartbeat(&self.runtime).on_message_sent();
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(WriteFailure::Encode(err)) => {
                 tracing::warn!(
                     session = %self.session_id,
@@ -1655,12 +2029,25 @@ impl<A: Application> Reactor<A> {
         }
     }
 
-    /// Periodic heartbeat, TestRequest, and timeout checks.
+    /// Periodic write-timeout, heartbeat, TestRequest, and timeout checks.
     async fn on_tick(
         &mut self,
         framed: &mut FixFramed,
         phase: Phase,
     ) -> Result<Phase, SessionClosed> {
+        // The write timeout: output that has made no progress at all for the
+        // whole timeout means a counterparty that stopped reading. Output
+        // that reached the socket since the last tick counts as sending for
+        // the heartbeat clock, as a completed flush does.
+        match self.writer.on_tick(driver_now(), self.write_timeout) {
+            WriteCheck::Fine => {}
+            WriteCheck::Progressed => lock_heartbeat(&self.runtime).on_message_sent(),
+            WriteCheck::Stalled => {
+                let err = EngineError::WriteTimeout(self.write_timeout);
+                return Err(self.close_on_write_failure(phase, &err));
+            }
+        }
+
         // The logout deadline lives in the typestate: LogoutPending is defined
         // by the instant its Logout was sent, so there is no second copy of it
         // to drift.
@@ -1678,16 +2065,7 @@ impl<A: Application> Reactor<A> {
         // after). A Logout the counterparty sent meanwhile is answered once
         // the resend is done, or now if the logout timeout has run out.
         if self.resend_in_progress() {
-            if let Some(owed) = &self.logout_owed
-                && owed.since.elapsed() >= self.config.logout_timeout
-            {
-                tracing::warn!(
-                    session = %self.session_id,
-                    "the resend owed to a counterparty that logged out did not finish within the \
-                     logout timeout: replying to its Logout without the rest"
-                );
-                return self.reply_owed_logout(framed, phase, true).await;
-            }
+            let phase = self.cut_resend_for_owed_logout(framed, phase).await?;
             if lock_heartbeat(&self.runtime).is_timed_out() {
                 teardown(phase);
                 return Err(closed(
@@ -1737,7 +2115,10 @@ impl<A: Application> Reactor<A> {
                 Ok(Sent::Yes) => lock_heartbeat(&self.runtime).on_test_request_sent(test_req_id),
                 Ok(Sent::Dropped | Sent::Deferred) => {}
             }
-        } else if send_heartbeat {
+        } else if send_heartbeat && !self.writer.pending {
+            // Output still waiting to be written is traffic the counterparty
+            // is about to receive, so an idle Heartbeat is due only once
+            // nothing is waiting.
             let heartbeat = self.factory.heartbeat(None);
             if let Err(err) = self.send(framed, heartbeat).await {
                 teardown(phase);
@@ -2460,8 +2841,9 @@ impl<A: Application> Reactor<A> {
     /// unchanged by answering a resend.
     ///
     /// A valid request is queued ([`Reactor::queue_resend`]) and answered by
-    /// the reactor loop one frame per pass, between inbound reads, so two
-    /// sides answering large requests at once keep draining each other.
+    /// resend steps of the reactor loop, which feed the write buffer while
+    /// inbound is still read, so two sides answering large requests at once
+    /// keep draining each other.
     async fn on_resend_request(
         &mut self,
         framed: &mut FixFramed,
@@ -2535,51 +2917,63 @@ impl<A: Application> Reactor<A> {
     ///
     /// The answer to an inbound `ResendRequest` (2), and the resend a
     /// counterparty's `NextExpectedMsgSeqNum` (789) on the Logon exchange asks
-    /// for. Resends are answered in the order they were queued, each written
-    /// by [`Reactor::resend_step`] one frame at a time. An empty range queues
-    /// nothing, and past [`MAX_QUEUED_RESENDS`] a request is merged into the
-    /// last queued one.
+    /// for. Resends are answered in the order they were queued, each fed to
+    /// the write buffer by [`Reactor::resend_step`] a few frames at a time. An
+    /// empty range queues nothing, and past [`MAX_QUEUED_RESENDS`] a request
+    /// is merged into the last queued one.
     fn queue_resend(&mut self, begin_seq: u64, new_seq: u64) {
         if let Some(job) = ResendJob::new(begin_seq, new_seq, self.store.is_none()) {
             push_resend(&mut self.resends, job);
         }
     }
 
-    /// Writes the next frame of the resend at the head of the queue (a
-    /// replayed message or a gap fill), reading the store a page at a time
-    /// as it goes, and drops the resend once it is complete.
+    /// Feeds the next frames of the resend at the head of the queue
+    /// (replayed messages and gap fills) to the write buffer, until the
+    /// buffer reaches [`WRITE_BUFFER_HIGH_WATER`], a store page has to be
+    /// read, or the resend is complete; a complete resend is dropped.
     ///
-    /// One frame per call keeps the reactor reading between frames: the loop
-    /// that calls this reads any frame the counterparty has already sent
-    /// before it writes the next one.
+    /// Nothing here waits for the socket: the frames are appended, and the
+    /// reactor loop writes them out while it goes on reading, so a step costs
+    /// the same whether the counterparty is reading or not. A page read ends
+    /// the step, so the loop reads inbound and yields between pages.
     ///
     /// # Errors
-    /// The session is closed when a write fails, or when the store reports
-    /// itself corrupted ([`StoreError::Corrupted`]): a store that finds its
-    /// own records damaged cannot say which messages it still holds intact,
-    /// so the rest of the range is not gap-filled. Every other read failure
-    /// (a store that cannot be read, a read that overruns the store timeout,
-    /// a frame that does not rebuild) degrades to a gap fill.
+    /// The session is closed when a frame cannot be fed (one above
+    /// `max_message_size`), or when the store reports itself corrupted
+    /// ([`StoreError::Corrupted`]): a store that finds its own records damaged
+    /// cannot say which messages it still holds intact, so the rest of the
+    /// range is not gap-filled. Every other read failure (a store that cannot
+    /// be read, a read that overruns the store timeout, a frame that does not
+    /// rebuild) degrades to a gap fill.
     async fn resend_step(
         &mut self,
         framed: &mut FixFramed,
         phase: Phase,
     ) -> Result<Phase, SessionClosed> {
+        self.reads_since_resend_step = 0;
+        // The owed Logout's deadline is checked before every step, not only
+        // on the tick: a step can feed the rest of a resend at once, and must
+        // not do so past the deadline.
+        let phase = self.cut_resend_for_owed_logout(framed, phase).await?;
         let Some(mut job) = self.resends.pop_front() else {
             return Ok(phase);
         };
-        match self.advance_resend(framed, &mut job).await {
-            Ok(ResendProgress::More) => {
-                self.resends.push_front(job);
-                Ok(phase)
-            }
-            Ok(ResendProgress::Done) if self.resends.is_empty() => {
-                self.finish_resends(framed, phase).await
-            }
-            Ok(ResendProgress::Done) => Ok(phase),
-            Err(err) => {
-                teardown(phase);
-                Err(closed(format!("resend failed: {err}"), false))
+        loop {
+            match self.advance_resend(framed, &mut job).await {
+                Ok(ResendProgress::Wrote)
+                    if framed.write_buffer().len() < WRITE_BUFFER_HIGH_WATER => {}
+                Ok(ResendProgress::Wrote | ResendProgress::ReadPage) => {
+                    self.resends.push_front(job);
+                    return Ok(phase);
+                }
+                Ok(ResendProgress::Done) if self.resends.is_empty() => {
+                    return self.finish_resends(framed, phase).await;
+                }
+                Ok(ResendProgress::Done) => return Ok(phase),
+                Err(err) => {
+                    teardown(phase);
+                    return Err(closed(format!("resend failed: {err}"), false));
+                }
             }
         }
     }
@@ -2632,6 +3026,32 @@ impl<A: Application> Reactor<A> {
         Ok(phase)
     }
 
+    /// Replies at once to a Logout the counterparty sent while a resend was
+    /// owed, dropping what is left of the resend, when the logout timeout has
+    /// run out since it arrived; otherwise hands the phase back untouched.
+    ///
+    /// # Errors
+    /// The session closes with the Logout exchange when the reply was due.
+    async fn cut_resend_for_owed_logout(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+    ) -> Result<Phase, SessionClosed> {
+        let due = self
+            .logout_owed
+            .as_ref()
+            .is_some_and(|owed| owed.since.elapsed() >= self.config.logout_timeout);
+        if !due {
+            return Ok(phase);
+        }
+        tracing::warn!(
+            session = %self.session_id,
+            "the resend owed to a counterparty that logged out did not finish within the \
+             logout timeout: replying to its Logout without the rest"
+        );
+        self.reply_owed_logout(framed, phase, true).await
+    }
+
     /// Replies to the counterparty's Logout and closes the session.
     ///
     /// `abandoned` is set when the logout timeout ran out before the resend
@@ -2677,11 +3097,12 @@ impl<A: Application> Reactor<A> {
         }
     }
 
-    /// Writes at most one frame of `job`.
+    /// Feeds at most one frame of `job` to the write buffer, or reads one
+    /// page of it from the store.
     ///
     /// `reply_cursor` is the next number the reply still owes the peer; it
-    /// advances only past what has been written, so holes, administrative
-    /// messages and unrebuildable frames are covered by the gap fill written
+    /// advances only past what has been fed, so holes, administrative
+    /// messages and unrebuildable frames are covered by the gap fill fed
     /// before the next replayed message, or by the trailing one.
     async fn advance_resend(
         &mut self,
@@ -2689,11 +3110,11 @@ impl<A: Application> Reactor<A> {
         job: &mut ResendJob,
     ) -> Result<ResendProgress, EngineError> {
         loop {
-            // A replayed message whose gap fill went out on the previous call.
+            // A replayed message whose gap fill was fed on the previous call.
             if let Some((seq, frame)) = job.pending.take() {
-                self.send_replay(framed, frame).await?;
+                self.send_replay(framed, &frame)?;
                 job.reply_cursor = seq.checked_add(1).unwrap_or(job.new_seq);
-                return Ok(ResendProgress::More);
+                return Ok(ResendProgress::Wrote);
             }
             if let Some(message) = job.page.next() {
                 let seq = message.seq_num();
@@ -2726,26 +3147,26 @@ impl<A: Application> Reactor<A> {
                 };
                 // Everything between the cursor and this message (holes,
                 // admin messages, frames that would not rebuild) is one fill,
-                // written first; the message follows on the next call.
+                // fed first; the message follows on the next call.
                 if seq > job.reply_cursor {
                     self.send_gap_fill(framed, job.reply_cursor, seq).await?;
                     job.reply_cursor = seq;
                     job.pending = Some((seq, frame));
-                    return Ok(ResendProgress::More);
+                    return Ok(ResendProgress::Wrote);
                 }
-                self.send_replay(framed, frame).await?;
+                self.send_replay(framed, &frame)?;
                 // `seq <= end_seq < new_seq <= u64::MAX`, so this cannot
                 // overflow; it is checked rather than assumed because a
                 // wrapped sequence number would corrupt the session it is
                 // meant to repair.
                 job.reply_cursor = seq.checked_add(1).unwrap_or(job.new_seq);
-                return Ok(ResendProgress::More);
+                return Ok(ResendProgress::Wrote);
             }
             // A page read is a step of its own: the loop reads inbound and
             // yields between pages, whatever the page held.
             if !job.store_done {
                 self.read_resend_page(job).await?;
-                return Ok(ResendProgress::More);
+                return Ok(ResendProgress::ReadPage);
             }
             // Whatever the replay did not cover (a trailing run of admin
             // messages, holes, or the entire range when there is no store) is
@@ -2960,9 +3381,9 @@ impl<A: Application> Reactor<A> {
     /// is consumed by [`Reactor::release_held_logon`].
     ///
     /// The resend is the one a `ResendRequest` for exactly that range would
-    /// get, queued here ([`Reactor::queue_resend`]) and written by the reactor
-    /// loop one frame per pass, between inbound reads, ahead of any live
-    /// application message. Its range was decided by the handshake against
+    /// get, queued here ([`Reactor::queue_resend`]) and written by resend
+    /// steps of the reactor loop, alternating with inbound reads, ahead of any
+    /// live application message. Its range was decided by the handshake against
     /// the counters of the Logon exchange and lies below this session's own
     /// Logon or acknowledgement, so it is within what this session has sent;
     /// it is checked again here, and a range that is empty or reaches past
@@ -3485,7 +3906,8 @@ pub(crate) struct SessionParams<A: Application> {
     /// sides declared `NextExpectedMsgSeqNum` (789); mutually exclusive with
     /// `opening_gap`.
     pub(crate) held_logon: Option<(u64, u64)>,
-    /// Bound on a single socket write.
+    /// The write timeout: bound on a handshake write, and on how long an
+    /// established session's output may make no progress.
     pub(crate) write_timeout: Duration,
     /// Capacity of the outbound command queue.
     pub(crate) outbound_capacity: usize,
@@ -3544,6 +3966,7 @@ where
     let (app_tx, app_rx) = mpsc::channel(app_queue_capacity);
     let (reject_tx, reject_rx) = mpsc::channel(app_queue_capacity);
     let garbled = config.garbled_frame_limit.map(GarbledFrameWindow::new);
+    let writer = Writer::new(config.max_message_size);
 
     // The dispatcher stops when the reactor drops `app_tx`, which `run_reactor`
     // does on every exit path.
@@ -3574,10 +3997,12 @@ where
         resend: None,
         held_logon: None,
         resends: VecDeque::new(),
+        reads_since_resend_step: 0,
         deferred: VecDeque::new(),
         logout_owed: None,
         spanning_rerequested: None,
         write_timeout,
+        writer,
         app_tx,
         garbled,
     };
@@ -3741,6 +4166,158 @@ mod tests {
             (4, 30),
             "a covered range changes nothing"
         );
+    }
+
+    /// A framed pipe as the reactor holds one, and the peer's raw end.
+    fn framed_pipe(capacity: usize) -> (FixFramed, tokio::io::DuplexStream) {
+        let (near, far) = tokio::io::duplex(capacity);
+        (
+            Framed::new(crate::stream::SessionStream::erased(near), FixCodec::new()),
+            far,
+        )
+    }
+
+    /// A well-formed FIX.4.4 Heartbeat frame.
+    fn heartbeat_frame() -> Vec<u8> {
+        let body = "35=0\x0149=VENUE\x0156=CLIENT\x0134=2\x0152=20261018-12:00:00.000\x01";
+        let head = format!("8=FIX.4.4\x019={}\x01{body}", body.len());
+        let checksum = ironfix_tagvalue::checksum::calculate_checksum(head.as_bytes());
+        format!("{head}10={checksum:03}\x01").into_bytes()
+    }
+
+    #[test]
+    fn test_writer_tick_with_nothing_waiting_is_fine() {
+        let mut writer = Writer::new(1024);
+        let now = Instant::now();
+        assert_eq!(writer.on_tick(now, Duration::ZERO), WriteCheck::Fine);
+        assert!(writer.stalled_since.is_none(), "no clock runs while idle");
+    }
+
+    #[test]
+    fn test_writer_tick_stalls_only_after_the_timeout_without_progress() {
+        let timeout = Duration::from_millis(300);
+        let mut writer = Writer::new(1024);
+        writer.pending = true;
+        let start = Instant::now();
+        assert_eq!(
+            writer.on_tick(start, timeout),
+            WriteCheck::Fine,
+            "clock starts"
+        );
+        let Some(early) = start.checked_add(Duration::from_millis(200)) else {
+            panic!("the clock has room")
+        };
+        assert_eq!(writer.on_tick(early, timeout), WriteCheck::Fine);
+        let Some(late) = start.checked_add(timeout) else {
+            panic!("the clock has room")
+        };
+        assert_eq!(writer.on_tick(late, timeout), WriteCheck::Stalled);
+    }
+
+    #[test]
+    fn test_writer_progress_restarts_the_write_timeout() {
+        let timeout = Duration::from_millis(300);
+        let mut writer = Writer::new(1024);
+        writer.pending = true;
+        let start = Instant::now();
+        assert_eq!(writer.on_tick(start, timeout), WriteCheck::Fine);
+        let Some(later) = start.checked_add(Duration::from_millis(250)) else {
+            panic!("the clock has room")
+        };
+        writer.progressed = true;
+        assert_eq!(writer.on_tick(later, timeout), WriteCheck::Progressed);
+        assert!(!writer.progressed, "progress is taken by the tick");
+        let Some(past_first) = start.checked_add(timeout) else {
+            panic!("the clock has room")
+        };
+        assert_eq!(
+            writer.on_tick(past_first, timeout),
+            WriteCheck::Fine,
+            "the timeout runs from the last progress, not from the first wait"
+        );
+        writer.flushed();
+        assert!(!writer.pending && writer.stalled_since.is_none());
+    }
+
+    #[test]
+    fn test_writer_close_budget_is_what_is_left_of_the_timeout() {
+        let timeout = Duration::from_millis(300);
+        let mut writer = Writer::new(1024);
+        let start = Instant::now();
+        assert_eq!(
+            writer.close_budget(start, timeout),
+            timeout,
+            "nothing waited yet"
+        );
+        writer.stalled_since = Some(start);
+        let Some(later) = start.checked_add(Duration::from_millis(100)) else {
+            panic!("the clock has room")
+        };
+        assert_eq!(
+            writer.close_budget(later, timeout),
+            Duration::from_millis(200)
+        );
+        let Some(past) = start.checked_add(Duration::from_secs(1)) else {
+            panic!("the clock has room")
+        };
+        assert_eq!(writer.close_budget(past, timeout), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn test_writer_feed_refuses_a_frame_above_max_message_size() {
+        let (mut framed, _far) = framed_pipe(64);
+        let mut writer = Writer::new(8);
+        let refused = writer.feed(&mut framed, b"0123456789");
+        assert!(
+            matches!(refused, Err(CodecError::MessageTooLarge { .. })),
+            "{refused:?}"
+        );
+        assert!(framed.write_buffer().is_empty(), "nothing appended");
+        assert!(!writer.pending);
+        assert!(writer.feed(&mut framed, b"01234567").is_ok());
+        assert_eq!(framed.write_buffer().len(), 8, "appended, not written");
+        assert!(writer.pending);
+    }
+
+    /// The flush waits on a pipe the peer is not reading, and the inbound
+    /// frame the peer sent is read all the same: a write never stops the
+    /// reading.
+    #[tokio::test]
+    async fn test_poll_socket_reads_while_the_flush_waits() {
+        use tokio::io::AsyncWriteExt;
+        let (mut framed, mut far) = framed_pipe(32);
+        let mut writer = Writer::new(1024);
+        let outbound = vec![b'x'; 256];
+        assert!(writer.feed(&mut framed, &outbound).is_ok());
+        let inbound = heartbeat_frame();
+        // The peer writes a frame larger than the pipe and never reads.
+        let peer = {
+            let inbound = inbound.clone();
+            tokio::spawn(async move {
+                let written = far.write_all(&inbound).await;
+                (written.is_ok(), far)
+            })
+        };
+        let event = timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| poll_socket(&mut framed, &mut writer, true, cx)),
+        )
+        .await;
+        let Ok(SocketEvent::Inbound(Some(Ok(frame)))) = event else {
+            panic!("the inbound frame is read while the flush waits: {event:?}")
+        };
+        assert_eq!(frame.as_ref(), inbound.as_slice());
+        assert!(writer.pending, "the flush is still waiting");
+        assert!(writer.progressed, "the pipe took what it holds");
+        assert_eq!(
+            framed.write_buffer().len(),
+            outbound.len() - 32,
+            "the rest waits in the write buffer"
+        );
+        let Ok((written, _far)) = peer.await else {
+            panic!("the peer task joins")
+        };
+        assert!(written, "the peer's whole frame was taken");
     }
 
     #[test]

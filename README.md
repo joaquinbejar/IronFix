@@ -122,8 +122,9 @@ engine wiring (#96) does not exist.
   engine owns the socket: heartbeats and TestRequests at the negotiated
   interval, CompID and `SendingTime` validation, sequence-gap detection with
   bounded `ResendRequest` recovery, `SequenceReset` / gap fill, `PossDupFlag`
-  and `OrigSendingTime` handling, session-level `Reject`, a socket write
-  timeout, the Logout handshake, and `FIXT.1.1` BeginString with `ApplVerID`
+  and `OrigSendingTime` handling, session-level `Reject`, a write timeout
+  (output that makes no progress closes the session), the Logout handshake,
+  and `FIXT.1.1` BeginString with `ApplVerID`
   for FIX 5.0 sessions. A FIX 5.0 session also checks the application version
   its counterparty declares and uses against its own version plus
   `SessionConfig::allowed_appl_versions`: `DefaultApplVerID` is required by
@@ -146,9 +147,12 @@ engine wiring (#96) does not exist.
   application messages with `PossDupFlag = Y` and the original `SendingTime`
   in `OrigSendingTime`; administrative messages, and anything the store
   cannot produce, are covered by gap fill (a store that reports itself
-  corrupted closes the session instead). A resend is written one frame at a time
-  between inbound reads, so two sides resending large backlogs at once do not
-  block each other, and every message that takes a new number follows it (a
+  corrupted closes the session instead). The reactor never waits inside a
+  write: frames go into a write buffer that is flushed while inbound is still
+  read, so two sides resending large backlogs, or sending live traffic, to
+  each other at once do not block each other. A resend alternates with
+  inbound reads in a bounded ratio, so a counterparty that never pauses
+  cannot hold it back, and every message that takes a new number follows it (a
   counterparty's Logout is answered after the resend it is owed). A session
   starts from the store's counters unless it resets the sequence. Store
   writes are fallible and ordered: a frame is filed and the next sender number

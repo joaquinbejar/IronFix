@@ -146,10 +146,13 @@
 //! to park it indefinitely, and neither can now:
 //!
 //! - **A stalled peer.** A counterparty that stops reading closes its receive
-//!   window and parks a socket write forever. Every write is therefore bounded
-//!   by [`Initiator::with_write_timeout`], and its expiry closes the session —
-//!   the same verdict heartbeat detection would have reached, reached in
-//!   bounded time.
+//!   window and would park a socket write forever. The reactor never waits
+//!   inside a write: frames are appended to the write buffer, which one
+//!   branch of the loop writes out while it goes on reading, so two sides
+//!   writing to each other at once keep draining each other. Output that
+//!   makes no progress for [`Initiator::with_write_timeout`] closes the
+//!   session, the same verdict heartbeat detection would have reached,
+//!   reached in bounded time.
 //! - **A slow `from_app`.** Inbound application messages are handed to a
 //!   separate dispatcher task over a bounded queue
 //!   ([`Initiator::with_app_queue_capacity`]), so an application handler never
@@ -247,7 +250,8 @@ pub struct Initiator<A: Application = NoOpApplication> {
     config_check: Result<(), SessionConfigError>,
     /// TCP connect timeout.
     connect_timeout: Duration,
-    /// Bound on a single socket write.
+    /// The write timeout: bound on a handshake write, and on how long an
+    /// established session's output may make no progress.
     write_timeout: Duration,
     /// Initial (sender, target) sequence numbers for session continuity.
     initial_sequences: Option<(u64, u64)>,
@@ -419,20 +423,25 @@ impl<A: Application + 'static> Initiator<A> {
         self
     }
 
-    /// Sets how long a single socket write may take before the session is
-    /// closed (default 10s).
+    /// Sets the write timeout (default 10s): how long the session's output
+    /// may wait without any of it reaching the counterparty.
     ///
     /// A counterparty that stops reading closes its TCP receive window, and a
-    /// write into a closed window never completes. Without a bound the reactor
-    /// parks inside that write with its liveness timers, so the session hangs
-    /// instead of being declared dead. Expiry closes the session with
-    /// [`EngineError::WriteTimeout`].
+    /// write into a closed window never completes. During the Logon handshake
+    /// a write that takes longer than this fails `connect` / `establish` with
+    /// [`EngineError::WriteTimeout`]. Once the session is established the
+    /// reactor never waits inside a write: output waits in the write buffer
+    /// while the reactor goes on reading, and the session is closed once that
+    /// output has made no progress at all for this long (checked every
+    /// 100 ms, so at most 200 ms after the timeout). A long resend to a slow
+    /// counterparty that keeps reading is therefore never cut short.
     ///
     /// A zero timeout is raised to one tick: a write that is given no time at
     /// all can never succeed.
     ///
     /// # Arguments
-    /// * `timeout` - Maximum duration of one write
+    /// * `timeout` - Longest a handshake write may take, and longest the
+    ///   session's output may make no progress
     #[must_use]
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout.max(TICK_INTERVAL);

@@ -123,11 +123,32 @@ impl Connection {
     /// already seen. Use [`Connection::wait_closed`] to observe the end of the
     /// session and `next_sender_seq` to observe progress.
     ///
-    /// While the session is resending what the counterparty missed (an
-    /// answer to its `ResendRequest`, or the resend its
-    /// `NextExpectedMsgSeqNum` (789) asked for), queued messages wait behind
-    /// the resend; once the outbound queue (`with_outbound_capacity` on the
-    /// `Initiator` or `Acceptor`) is full, `send` waits for the whole resend.
+    /// # When `send` waits
+    ///
+    /// `send` returns as soon as the message is in the outbound queue
+    /// (`with_outbound_capacity` on the `Initiator` or `Acceptor`, default
+    /// 1024 messages); it waits only while that queue is full. The session
+    /// takes messages from the queue in order, and stops taking them in two
+    /// cases, so the queue can fill:
+    ///
+    /// - **While the session is resending** what the counterparty missed (an
+    ///   answer to its `ResendRequest`, or the resend its
+    ///   `NextExpectedMsgSeqNum` (789) asked for). A message that takes a new
+    ///   `MsgSeqNum` must not reach the counterparty in the middle of the
+    ///   resend, so queued messages wait behind it, then go out in order,
+    ///   after the resend and the session's own replies held behind it. Once
+    ///   the queue is full, `send` waits for the whole resend, which may last
+    ///   as long as the counterparty takes to read it.
+    /// - **While the counterparty reads more slowly than the session
+    ///   writes.** Output waiting for the socket stops being added to at
+    ///   64 KiB, so `send` is held back by the counterparty's reading rather
+    ///   than the waiting output growing. Output that makes no progress at
+    ///   all for the write timeout closes the session, and `send` then
+    ///   returns [`EngineError::Closed`].
+    ///
+    /// A caller that must not wait can bound the call with
+    /// `tokio::time::timeout`; a message whose `send` was abandoned that way
+    /// was not queued.
     pub async fn send(&self, message: OutboundMessage) -> Result<(), EngineError> {
         crate::outbound::check_sendable(&message)?;
         self.commands
@@ -141,6 +162,17 @@ impl Connection {
     /// A Logout message is sent to the counterparty; the session closes when
     /// the Logout acknowledgement arrives or the logout timeout elapses.
     /// Use [`Connection::wait_closed`] to observe completion.
+    ///
+    /// The logout request travels through the same queue as
+    /// [`Connection::send`], behind the messages already queued, and waits
+    /// as they do (see "When `send` waits"). While the session is resending
+    /// what the counterparty missed, the Logout waits behind the resend: FIX
+    /// lets the counterparty fill its gap first, so the Logout goes out once
+    /// the resend and the messages held behind it are written, and the logout
+    /// timeout starts then, not when this method was called. A resend can
+    /// therefore delay the close by as long as the counterparty takes to read
+    /// it; output that makes no progress for the write timeout still closes
+    /// the session.
     ///
     /// # Errors
     /// Returns [`EngineError::Closed`] if the session is already closed.

@@ -3025,22 +3025,76 @@ async fn test_consumer_logout_waits_behind_a_resend() {
     );
 }
 
+/// Reads the next frame from a scripted peer's end of a pipe, within 5 s.
+async fn next_pipe_frame(framed: &mut Framed<tokio::io::DuplexStream, FixCodec>) -> BytesMut {
+    let polled = ok(
+        timeout(Duration::from_secs(5), framed.next()).await,
+        "frame must arrive within 5s",
+    );
+    ok(some(polled, "stream must stay open"), "frame must decode")
+}
+
 /// Every message that takes a new number waits behind a resend: a TestRequest
 /// (4) and a gapped Heartbeat (9) arrive while the 789 resend of 300 reports
 /// is being written, and the application sends a live report. The resend
 /// goes out whole and in order; then the Heartbeat answering the
 /// TestRequest, the ResendRequest for the gap (from 5) and the live report,
 /// in that order, under 303, 304 and 305. No number is used twice.
+///
+/// The reports are padded so the resend (about 200 KB) is larger than what
+/// the engine buffers before waiting for the socket plus what the 4 KiB pipe
+/// holds, and the scripted initiator reads nothing until it has sent the
+/// TestRequest and the Heartbeat: the resend is therefore still being written
+/// when they arrive, whatever order the engine picks its work in.
 #[tokio::test]
 async fn test_new_numbers_wait_behind_a_resend() {
-    let store = venue_report_backlog().await;
-    let (venue_app, _rx) = RecordingApp::new();
-    let acceptor = Arc::new(
-        Acceptor::new(venue_789(), Arc::clone(&venue_app))
-            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    let store = Arc::new(MemoryStore::new());
+    ok(
+        store.store(1, &MsgType::Logon, &venue_ack(1, &[])).await,
+        "seed the Logon",
     );
-    let (mut framed, connection, ack) = establish(acceptor, client_logon(3, &[(789, "2")])).await;
+    let padding = "x".repeat(500);
+    for seq in 2..=301u64 {
+        let mut body = REPORT_BODY.to_vec();
+        body.push((58, padding.as_str()));
+        ok(
+            store
+                .store(seq, &MsgType::ExecutionReport, &venue_msg("8", seq, &body))
+                .await,
+            "seed a report",
+        );
+    }
+    ok(
+        store.set_next_sender_seq(302).await,
+        "seed the sender counter",
+    );
+    ok(
+        store.set_next_target_seq(3).await,
+        "seed the target counter",
+    );
+    let (venue_app, _rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(venue_789(), Arc::clone(&venue_app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let (client_io, venue_io) = tokio::io::duplex(4 * 1024);
+    let served = tokio::spawn(async move { acceptor.serve_stream(venue_io).await });
+    let mut framed = Framed::new(client_io, FixCodec::new());
+    ok(
+        framed.send(client_logon(3, &[(789, "2")])).await,
+        "the client logs on",
+    );
+    let ack = next_pipe_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&ack), "A", "the Logon is acknowledged");
     assert_eq!(field(&ack, 34).as_deref(), Some("302"));
+    let connection = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), served).await,
+                "handshake within 5s",
+            ),
+            "venue task joins",
+        ),
+        "acceptor establishes the session",
+    );
     ok(
         framed.send(client_msg("1", 4, &[(112, "PING")])).await,
         "a TestRequest",
@@ -3058,7 +3112,7 @@ async fn test_new_numbers_wait_behind_a_resend() {
     ok(connection.send(report).await, "a live report");
 
     for seq in 2..=301u64 {
-        let frame = next_frame(&mut framed).await;
+        let frame = next_pipe_frame(&mut framed).await;
         assert_eq!(field(&frame, 34), Some(seq.to_string()), "resent in order");
         assert_eq!(
             field(&frame, 43).as_deref(),
@@ -3066,15 +3120,15 @@ async fn test_new_numbers_wait_behind_a_resend() {
             "nothing new in between"
         );
     }
-    let heartbeat = next_frame(&mut framed).await;
+    let heartbeat = next_pipe_frame(&mut framed).await;
     assert_eq!(msg_type_of(&heartbeat), "0");
     assert_eq!(field(&heartbeat, 34).as_deref(), Some("303"));
     assert_eq!(field(&heartbeat, 112).as_deref(), Some("PING"));
-    let request = next_frame(&mut framed).await;
+    let request = next_pipe_frame(&mut framed).await;
     assert_eq!(msg_type_of(&request), "2");
     assert_eq!(field(&request, 34).as_deref(), Some("304"));
     assert_eq!(field(&request, 7).as_deref(), Some("5"));
-    let live = next_frame(&mut framed).await;
+    let live = next_pipe_frame(&mut framed).await;
     assert_eq!(msg_type_of(&live), "8");
     assert_eq!(field(&live, 34).as_deref(), Some("305"));
     assert_eq!(field(&live, 43), None);
