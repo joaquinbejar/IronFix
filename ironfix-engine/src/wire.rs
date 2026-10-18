@@ -617,6 +617,10 @@ pub(crate) const DEFAULT_APPL_VER_ID: u32 = 1137;
 /// message. A standard-header field (`FIXT11.xml`, `<header>`), and only that.
 pub(crate) const APPL_VER_ID: u32 = 1128;
 
+/// `RefApplVerID` (1130): on a FIXT.1.1 Reject, the `ApplVerID` of the
+/// rejected message.
+pub(crate) const REF_APPL_VER_ID: u32 = 1130;
+
 /// Longest application-version value echoed in a log line, a Reject or a
 /// Logout `Text` (58). The value is counterparty-controlled, so it is bounded;
 /// a legal one is a single digit.
@@ -702,6 +706,23 @@ impl ApplVersionProblem {
             Self::Unknown { .. } | Self::NotAccepted { .. } => 18,
         };
         RejectReason::new(code, self.to_string()).with_ref_tag(self.tag())
+    }
+
+    /// The `RefApplVerID` (1130) a Reject for this problem carries: the
+    /// rejected message's `ApplVerID` (1128), when it is a code that names a
+    /// version (`2` to `9`) and the session does not accept it.
+    ///
+    /// `None` for every other problem: a 1137 problem concerns a Logon,
+    /// which has no `ApplVerID` of its own; a value that names no version
+    /// (`0` and `1` included, which name versions [`FixVersion`] does not
+    /// model) has nothing validated to echo; and a repeated or misplaced
+    /// 1128 has no single value to name.
+    #[must_use]
+    pub(crate) fn ref_appl_ver_id(&self) -> Option<&str> {
+        match self {
+            Self::NotAccepted { tag, code, .. } if *tag == APPL_VER_ID => Some(code),
+            _ => None,
+        }
     }
 }
 
@@ -1505,14 +1526,35 @@ impl MessageFactory {
         ref_msg_type: &str,
         reason: &RejectReason,
     ) -> PendingMessage {
+        self.session_reject_with_appl_ver(ref_seq, ref_msg_type, reason, None)
+    }
+
+    /// Builds a session-level Reject (35=3) that also names the `ApplVerID`
+    /// of the rejected message in `RefApplVerID` (1130), a FIXT.1.1 Reject
+    /// field.
+    ///
+    /// The fields follow the FIXT.1.1 Reject layout: `RefSeqNum` (45),
+    /// `RefTagID` (371), `RefMsgType` (372), `RefApplVerID` (1130),
+    /// `SessionRejectReason` (373), `Text` (58). `ref_appl_ver_id` must be a
+    /// code the caller has validated; it is written verbatim.
+    #[must_use]
+    pub(crate) fn session_reject_with_appl_ver(
+        &self,
+        ref_seq: u64,
+        ref_msg_type: &str,
+        reason: &RejectReason,
+        ref_appl_ver_id: Option<&str>,
+    ) -> PendingMessage {
         let mut message = OutboundMessage::new(MsgType::Reject);
         message.push_uint(45, ref_seq);
         if let Some(ref_tag) = reason.ref_tag {
             message.push_uint(371, u64::from(ref_tag));
         }
-        message
-            .push_str(372, ref_msg_type)
-            .push_uint(373, u64::from(reason.code));
+        message.push_str(372, ref_msg_type);
+        if let Some(code) = ref_appl_ver_id {
+            message.push_str(REF_APPL_VER_ID, code);
+        }
+        message.push_uint(373, u64::from(reason.code));
         if !reason.text.is_empty() {
             message.push_str(58, &reason.text);
         }
@@ -3011,6 +3053,47 @@ mod tests {
             guard.check_application(&decode(&frame)),
             Err(ApplVersionProblem::NotAccepted { tag: 1128, .. })
         ));
+    }
+
+    #[test]
+    fn test_session_reject_with_appl_ver_places_ref_appl_ver_id() {
+        let mut factory = factory_for("FIX.5.0SP2");
+        let reason = RejectReason::new(18, "not accepted").with_ref_tag(1128);
+        let pending = factory.session_reject_with_appl_ver(2, "D", &reason, Some("7"));
+        let frame = framed(&mut factory, 3, &pending);
+        assert_eq!(field_of(&frame, 1130).as_deref(), Some("7"));
+        // The FIXT.1.1 Reject layout: 45, 371, 372, 1130, 373, 58.
+        let raw = decode(&frame);
+        let order: Vec<u32> = raw
+            .fields()
+            .map(|field| field.tag)
+            .filter(|tag| [45, 371, 372, 1130, 373, 58].contains(tag))
+            .collect();
+        assert_eq!(order, vec![45, 371, 372, 1130, 373, 58]);
+
+        let plain = factory.session_reject(2, "D", &reason);
+        assert_eq!(field_of(&framed(&mut factory, 4, &plain), 1130), None);
+    }
+
+    #[test]
+    fn test_appl_problem_ref_appl_ver_id_names_only_a_refused_1128_code() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        let refused =
+            |extra: &[(u32, &str)]| match guard.check_application(&decode(&report_with(extra))) {
+                Err(problem) => problem,
+                Ok(()) => panic!("{extra:?} must be refused"),
+            };
+        assert_eq!(refused(&[(1128, "7")]).ref_appl_ver_id(), Some("7"));
+        assert_eq!(refused(&[(1128, "6")]).ref_appl_ver_id(), Some("6"));
+        // A value that names no version, and a repetition, name nothing.
+        assert_eq!(refused(&[(1128, "0")]).ref_appl_ver_id(), None);
+        assert_eq!(refused(&[(1128, "X")]).ref_appl_ver_id(), None);
+        assert_eq!(refused(&[(1128, "7"), (1128, "7")]).ref_appl_ver_id(), None);
+        // A 1137 problem concerns a Logon, which has no ApplVerID.
+        match guard.check_logon(&decode(&logon_with(&[(1137, "7")])), true) {
+            Err(problem) => assert_eq!(problem.ref_appl_ver_id(), None),
+            Ok(declared) => panic!("1137=7 must be refused, got {declared:?}"),
+        }
     }
 
     #[test]

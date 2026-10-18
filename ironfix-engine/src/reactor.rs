@@ -1499,6 +1499,16 @@ impl<A: Application> Reactor<A> {
         reason: &RejectReason,
     ) -> Result<Phase, SessionClosed> {
         let reject = self.factory.session_reject(ref_seq, ref_msg_type, reason);
+        self.send_reject(framed, phase, reject).await
+    }
+
+    /// Sends a Reject the caller has built and keeps the session running.
+    async fn send_reject(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        reject: PendingMessage,
+    ) -> Result<Phase, SessionClosed> {
         if let Err(err) = self.send(framed, reject).await {
             teardown(phase);
             return Err(closed(format!("send failed: {err}"), false));
@@ -2509,7 +2519,8 @@ impl<A: Application> Reactor<A> {
     /// on. The message never reaches `from_app`. The Reject is sent like any
     /// other session frame, and the session stays up: the version is a
     /// property of this message, not of the session, whose default the
-    /// handshake already checked.
+    /// handshake already checked. When the rejected 1128 names a version
+    /// (`2` to `9`), the Reject echoes it in `RefApplVerID` (1130).
     async fn reject_appl_version(
         &mut self,
         framed: &mut FixFramed,
@@ -2541,9 +2552,17 @@ impl<A: Application> Reactor<A> {
             return Err(exhausted(phase, err));
         }
         self.note_inbound_progress();
+        // A 1128 that names a version the session refuses is echoed in
+        // RefApplVerID (1130), so the counterparty sees which version the
+        // Reject is about.
         let reason = problem.reject_reason();
-        self.send_session_reject(framed, phase, seq, ref_msg_type, &reason)
-            .await
+        let reject = self.factory.session_reject_with_appl_ver(
+            seq,
+            ref_msg_type,
+            &reason,
+            problem.ref_appl_ver_id(),
+        );
+        self.send_reject(framed, phase, reject).await
     }
 
     /// Hands one validated, in-sequence inbound application frame to the

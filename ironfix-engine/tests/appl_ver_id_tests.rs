@@ -757,6 +757,11 @@ async fn test_disallowed_appl_ver_id_is_rejected_and_its_number_consumed() {
     assert_eq!(field(&reject, 373).as_deref(), Some("18"));
     assert_eq!(field(&reject, 371).as_deref(), Some("1128"));
     assert_eq!(field(&reject, 34).as_deref(), Some("2"));
+    assert_eq!(
+        field(&reject, 1130).as_deref(),
+        Some("7"),
+        "RefApplVerID names the refused version"
+    );
     let text = some(field(&reject, 58), "the Reject says why");
     assert!(text.contains("ApplVerID (1128) 7 (FIX.5.0)"), "{text}");
     assert_no_app_message(&mut venue_rx, "the rejected order").await;
@@ -789,10 +794,11 @@ async fn test_disallowed_appl_ver_id_is_rejected_and_its_number_consumed() {
 }
 
 /// A message whose `ApplVerID` names a FIX 4.x version (FIX 4.4 carried over
-/// FIXT.1.1), or is repeated, is rejected too (18 and 13 respectively), each
-/// consuming its number.
+/// FIXT.1.1), is repeated in the header, or names no version is rejected too
+/// (18, 13 and 18), each consuming its number; only the first names a version
+/// to echo in `RefApplVerID` (1130).
 #[tokio::test]
-async fn test_fix4_or_repeated_appl_ver_id_is_rejected() {
+async fn test_fix4_repeated_or_unknown_appl_ver_id_is_rejected() {
     let (venue_app, mut venue_rx) = RecordingApp::new();
     let acceptor = Arc::new(Acceptor::new(
         venue_config("FIX.5.0SP2"),
@@ -810,6 +816,7 @@ async fn test_fix4_or_repeated_appl_ver_id_is_rejected() {
     let reject = next_frame(&mut framed).await;
     assert_eq!(field(&reject, 373).as_deref(), Some("18"));
     assert_eq!(field(&reject, 371).as_deref(), Some("1128"));
+    assert_eq!(field(&reject, 1130).as_deref(), Some("6"));
     let text = some(field(&reject, 58), "the Reject says why");
     assert!(
         text.contains("ApplVerID (1128) 6 (FIX.4.4) is not an application version"),
@@ -831,9 +838,23 @@ async fn test_fix4_or_repeated_appl_ver_id_is_rejected() {
     assert_eq!(field(&reject, 45).as_deref(), Some("3"));
     assert_eq!(field(&reject, 373).as_deref(), Some("13"));
     assert_eq!(field(&reject, 371).as_deref(), Some("1128"));
+    assert_eq!(field(&reject, 1130), None, "a repetition names no version");
 
-    assert_no_app_message(&mut venue_rx, "neither order").await;
-    assert_eq!(connection.next_target_seq(), 4);
+    // A value that names no version (0 is FIX.2.7, which FixVersion does not
+    // model) is reason 18 with nothing to echo in RefApplVerID.
+    ok(
+        framed
+            .send(client_fixt("D", 4, &[(1128, "0")], &ORDER_BODY))
+            .await,
+        "client sends an order in FIX.2.7",
+    );
+    let reject = next_frame(&mut framed).await;
+    assert_eq!(field(&reject, 45).as_deref(), Some("4"));
+    assert_eq!(field(&reject, 373).as_deref(), Some("18"));
+    assert_eq!(field(&reject, 1130), None);
+
+    assert_no_app_message(&mut venue_rx, "no order").await;
+    assert_eq!(connection.next_target_seq(), 5);
 }
 
 /// `ApplVerID` (1128) is a standard-header field: one placed after the body
@@ -861,6 +882,7 @@ async fn test_appl_ver_id_outside_the_header_is_rejected_with_reason_14() {
     assert_eq!(field(&reject, 45).as_deref(), Some("2"));
     assert_eq!(field(&reject, 373).as_deref(), Some("14"));
     assert_eq!(field(&reject, 371).as_deref(), Some("1128"));
+    assert_eq!(field(&reject, 1130), None);
     assert_no_app_message(&mut venue_rx, "the misplaced order").await;
     assert_eq!(connection.next_target_seq(), 3, "its number is consumed");
 

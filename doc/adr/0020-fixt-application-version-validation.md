@@ -107,6 +107,17 @@ the header, 1 for a missing required tag, `RefTagID` the tag. The refusal
 text echoes at most 16 bytes of the value, escaped, and names the accepted
 versions; neither tag can carry a credential.
 
+When the in-session Reject is a reason 18 for a 1128 that names a version
+(`2` to `9`), it also carries that code in `RefApplVerID` (1130), the FIXT.1.1
+Reject field for the rejected message's `ApplVerID`, placed after
+`RefMsgType` (372) as the FIXT.1.1 layout orders it. A 1128 that names no
+version (`0` and `1` included: FIX 2.7 and FIX 3.0 are `ApplVerID` values with
+no `FixVersion`) has nothing validated to echo, and a repeated or misplaced
+one has no single value; neither carries 1130. The handshake's 1137 refusals
+carry none either: a Logon has no `ApplVerID` of its own. `RejectReason` is a
+public struct with public fields, so the field is added by a crate-private
+factory method rather than by a new `RejectReason` field.
+
 ### Reason 18
 
 `SessionRejectReason` 18 is "Invalid/Unsupported Application Version"

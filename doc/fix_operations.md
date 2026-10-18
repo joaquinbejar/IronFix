@@ -769,6 +769,7 @@ timer measures a gap that is making no progress at all, not a slow replay.
 |-----|------------|-------------|
 | 371 | RefTagID | Tag number causing rejection |
 | 372 | RefMsgType | Message type of rejected message |
+| 1130 | RefApplVerID | FIXT.1.1 only: `ApplVerID` of the rejected message |
 | 373 | SessionRejectReason | Reason code |
 | 58 | Text | Human-readable explanation |
 
@@ -815,7 +816,7 @@ FIX 4.x session (which carries no `ApplVerID` to reject).
 | 10 | Inbound `SendingTime` (52) differs from the local clock by more than the configured tolerance |
 | 13 | FIX 5.0 only: `ApplVerID` (1128) more than once in the standard header of an inbound application message, or `DefaultApplVerID` (1137) more than once on the Logon acknowledgement (initiator); `RefTagID` = the repeated tag |
 | 14 | FIX 5.0 only: `ApplVerID` (1128), a standard-header field, after the header of an inbound application message has ended; `RefTagID` = 1128, the number is consumed and the message never reaches `from_app` |
-| 18 | FIX 5.0 only: an inbound application message whose `ApplVerID` (1128) names no version or a version the session does not accept (`RefTagID` = 1128; the message's number is consumed and it never reaches `from_app`), or a Logon acknowledgement whose `DefaultApplVerID` (1137) fails the same rule (`RefTagID` = 1137, followed by a Logout; initiator) |
+| 18 | FIX 5.0 only: an inbound application message whose `ApplVerID` (1128) names no version or a version the session does not accept (`RefTagID` = 1128, and `RefApplVerID` (1130) = the refused code when it names a version, `2` to `9`; the message's number is consumed and it never reaches `from_app`), or a Logon acknowledgement whose `DefaultApplVerID` (1137) fails the same rule (`RefTagID` = 1137, followed by a Logout; initiator) |
 | any | Whatever an `Application::from_admin` / `from_app` implementation returns in its `RejectReason` |
 
 **Reason 10 (SendingTime accuracy) is implemented.** Every inbound frame's
@@ -1759,7 +1760,7 @@ and are refused as unknown. Both are reason 18.
 |---|---|---|
 | Acceptor, inbound Logon | 1137 required, once, naming an accepted version | Logout with the reason and the accepted versions, after `from_admin` (filed when a store is attached; never resets it); `EngineError::ApplVersion` |
 | Initiator, Logon ack | 1137, when present, once and naming an accepted version | Reject (18, or 13 when repeated; `RefTagID` 1137) and Logout; `EngineError::ApplVersion` |
-| Both roles, in session | 1128 on an application message, when present, in the standard header, once, naming an accepted version | Reject (18; 13 when repeated in the header; 14 when outside it; `RefTagID` 1128); the number is consumed and persisted, `from_app` is not called, the session stays up |
+| Both roles, in session | 1128 on an application message, when present, in the standard header, once, naming an accepted version | Reject (18; 13 when repeated in the header; 14 when outside it; `RefTagID` 1128; `RefApplVerID` (1130) = the code, on an 18 for a code that names a version); the number is consumed and persisted, `from_app` is not called, the session stays up |
 
 1128 is a standard-header field (`FIXT11.xml`), so it is read positionally,
 as the CompIDs are: one in the header (the leading run of standard-header
