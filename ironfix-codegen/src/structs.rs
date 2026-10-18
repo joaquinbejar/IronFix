@@ -36,6 +36,16 @@
 //! itself (directly, through other components, or through a group entry), and
 //! nesting past [`MAX_NESTING_DEPTH`] are errors. The structs are then built;
 //! an undefined field or a name with no Rust identifier is an error there.
+//!
+//! The pass expands each component once, so the nesting depth is checked
+//! along the first path that reaches a component, not along every path. A
+//! component reached first near the top and later from deep inside another
+//! component is not expanded again from there. The views
+//! ([`CodeGenerator::generate_views`](crate::CodeGenerator::generate_views))
+//! expand components in place along every path, so a dictionary can pass
+//! [`CodeGenerator::generate`](crate::CodeGenerator::generate) and still fail
+//! `generate_views` with [`GeneratorError::MaxDepthExceeded`]. Either way the
+//! recursion is bounded.
 
 use crate::generator::{
     DECIMAL_ALIAS, GeneratorError, MAX_NESTING_DEPTH, field_doc, field_type_to_rust,
@@ -258,6 +268,7 @@ impl<'d> Builder<'d> {
                 limit: MAX_NESTING_DEPTH,
             });
         }
+        let next = deeper(depth, scope)?;
         for member in members {
             match member {
                 MemberRef::Field(_) => {}
@@ -266,7 +277,7 @@ impl<'d> Builder<'d> {
                     self.reach(
                         group.members().collect(),
                         &group_scope,
-                        depth + 1,
+                        next,
                         stack,
                         reached,
                     )?;
@@ -297,7 +308,7 @@ impl<'d> Builder<'d> {
                     self.reach(
                         component.members().collect(),
                         &format!("component {name}"),
-                        depth + 1,
+                        next,
                         stack,
                         reached,
                     )?;
@@ -326,6 +337,7 @@ impl<'d> Builder<'d> {
                 limit: MAX_NESTING_DEPTH,
             });
         }
+        let next = deeper(depth, &owner.scope)?;
 
         let mut fields: Vec<StructFieldModel> = Vec::with_capacity(members.len());
         // Field tags and group count tags are tracked apart: a dictionary that
@@ -376,7 +388,8 @@ impl<'d> Builder<'d> {
                         });
                     }
                     let names = self.names_mut(owner.module);
-                    let (base, entry) = entry_names(names, &to_type_ident(&candidate));
+                    let (base, entry) =
+                        entry_names(names, &to_type_ident(&candidate), &group.name)?;
                     let ident = resolve_field_name(&mut used_names, &group.name, group.count_tag)?;
                     fields.push(StructFieldModel {
                         doc: format!(
@@ -433,7 +446,7 @@ impl<'d> Builder<'d> {
                 name: entry,
                 base,
             };
-            self.build_owner(entry_owner, group.members().collect(), depth + 1)?;
+            self.build_owner(entry_owner, group.members().collect(), next)?;
         }
         Ok(())
     }
@@ -461,12 +474,37 @@ fn type_base(name: &str, what: &'static str) -> Result<String, GeneratorError> {
     }
 }
 
+/// Returns the nesting depth one level below `depth`.
+///
+/// # Errors
+///
+/// [`GeneratorError::MaxDepthExceeded`] naming `scope` if the depth does
+/// not fit a `usize`. Callers check `depth` against [`MAX_NESTING_DEPTH`]
+/// first, so this is a backstop.
+fn deeper(depth: usize, scope: &str) -> Result<usize, GeneratorError> {
+    depth
+        .checked_add(1)
+        .ok_or_else(|| GeneratorError::MaxDepthExceeded {
+            scope: scope.to_string(),
+            limit: MAX_NESTING_DEPTH,
+        })
+}
+
 /// Claims the names of a group entry in `used`: its base, which the groups
 /// nested in it are named after, and its struct name, the base followed by
 /// `Entry`. A numeric suffix after `candidate` settles a collision with
 /// either.
-#[must_use]
-fn entry_names(used: &mut HashSet<String>, candidate: &str) -> (String, String) {
+///
+/// # Errors
+///
+/// [`GeneratorError::UnnameableItem`] for the group `group_name` if the
+/// suffix runs out of `usize` values before a free pair of names is found.
+/// Each taken name blocks at most two suffixes, so the loop ends long before.
+fn entry_names(
+    used: &mut HashSet<String>,
+    candidate: &str,
+    group_name: &str,
+) -> Result<(String, String), GeneratorError> {
     let mut suffix = 1usize;
     loop {
         let base = if suffix == 1 {
@@ -478,15 +516,26 @@ fn entry_names(used: &mut HashSet<String>, candidate: &str) -> (String, String) 
         if !used.contains(&base) && !used.contains(&entry) {
             used.insert(base.clone());
             used.insert(entry.clone());
-            return (base, entry);
+            return Ok((base, entry));
         }
-        suffix += 1;
+        suffix = suffix
+            .checked_add(1)
+            .ok_or_else(|| GeneratorError::UnnameableItem {
+                what: "group",
+                name: group_name.to_string(),
+            })?;
     }
 }
 
 /// Resolves the identifier of a component field, unique within its struct:
 /// the component name in snake case, then with a `_component` suffix, then
 /// with a numeric one.
+///
+/// # Errors
+///
+/// [`GeneratorError::UnnameableItem`] if the name is not an identifier in
+/// snake case, or if the numeric suffix runs out of `usize` values (each
+/// taken name blocks at most one, so the loop ends long before).
 fn resolve_component_name(
     used: &mut HashSet<String>,
     name: &str,
@@ -511,7 +560,12 @@ fn resolve_component_name(
         if used.insert(candidate.clone()) {
             return Ok(candidate);
         }
-        suffix += 1;
+        suffix = suffix
+            .checked_add(1)
+            .ok_or_else(|| GeneratorError::UnnameableItem {
+                what: "component",
+                name: name.to_string(),
+            })?;
     }
 }
 
@@ -580,19 +634,19 @@ mod tests {
     fn test_entry_names_claims_base_and_entry() {
         let mut used = HashSet::new();
         assert_eq!(
-            entry_names(&mut used, "PartiesNoPartyIDs"),
-            (
+            entry_names(&mut used, "PartiesNoPartyIDs", "NoPartyIDs"),
+            Ok((
                 "PartiesNoPartyIDs".to_string(),
                 "PartiesNoPartyIDsEntry".to_string()
-            )
+            ))
         );
         // The same candidate again takes a numeric suffix, on both names.
         assert_eq!(
-            entry_names(&mut used, "PartiesNoPartyIDs"),
-            (
+            entry_names(&mut used, "PartiesNoPartyIDs", "NoPartyIDs"),
+            Ok((
                 "PartiesNoPartyIDs2".to_string(),
                 "PartiesNoPartyIDs2Entry".to_string()
-            )
+            ))
         );
     }
 
@@ -601,8 +655,20 @@ mod tests {
         // A type already named like the entry struct pushes both names on.
         let mut used = HashSet::from(["XNoAEntry".to_string()]);
         assert_eq!(
-            entry_names(&mut used, "XNoA"),
-            ("XNoA2".to_string(), "XNoA2Entry".to_string())
+            entry_names(&mut used, "XNoA", "NoA"),
+            Ok(("XNoA2".to_string(), "XNoA2Entry".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_deeper_is_a_typed_error_at_the_end_of_usize() {
+        assert_eq!(deeper(3, "message D"), Ok(4));
+        assert_eq!(
+            deeper(usize::MAX, "message D"),
+            Err(GeneratorError::MaxDepthExceeded {
+                scope: "message D".to_string(),
+                limit: MAX_NESTING_DEPTH,
+            })
         );
     }
 
