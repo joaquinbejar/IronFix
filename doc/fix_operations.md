@@ -960,9 +960,12 @@ declared size exceeds `max_message_size` (skipping it would mean buffering it,
 or trusting its attacker-chosen length to size the discard), and `Io`. A frame
 that frames but whose header fails to decode (MsgType not third, BodyLength
 invalid) is garbled at the decode level; the codec cannot see it, and the
-engine treats it like a frame the codec skipped. A frame whose header decodes
-but whose body does not (an invalid tag, a bad data length) is not garbled; see
-*The engine* below.
+engine treats it like a frame the codec skipped. The verdict follows where
+decoding failed: a malformed field among the first three (a third field
+`abc=0`) is garbled even though the decoder reports an invalid tag. A frame
+whose header decodes but whose body does not (an invalid tag, a bad data
+length), or whose MsgType value is unacceptable, is not garbled; see *The
+engine* below.
 
 *Skipping inside the codec.* `tokio_util::Framed` ends its stream after any
 decoder error, so a garbled frame cannot be skipped by the caller of a

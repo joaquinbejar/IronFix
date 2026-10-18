@@ -5307,3 +5307,47 @@ async fn test_malformed_body_logon_ack_is_skipped_under_the_same_deadline() {
         "acceptor task",
     );
 }
+
+/// A frame whose third field is a malformed tag (`abc=0`) is garbled (MsgType
+/// is not third), even though the decoder reports an invalid tag. Two of them,
+/// with valid traffic in between, reach a limit of two: valid traffic between
+/// them does not reset or bypass the count.
+#[tokio::test]
+async fn test_invalid_third_field_tag_counts_toward_the_limit() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let bad = || raw_frame(b"abc=0\x0135=0\x0149=VENUE\x0156=CLIENT\x0134=2\x01");
+
+        let mut burst = bad();
+        burst.extend_from_slice(&venue_msg("1", 2, &[(112, "BETWEEN")]));
+        ok(framed.send(burst).await, "send one bad frame + one valid");
+        let reply = next_frame(&mut framed).await;
+        assert_eq!(field(&reply, 112).as_deref(), Some("BETWEEN"));
+
+        ok(framed.send(bad()).await, "send the second bad frame");
+        let logout = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logout), "5");
+        assert!(some(field(&logout, 58), "logout must carry Text").contains("garbled"));
+        while let Ok(Some(Ok(_))) = timeout(Duration::from_secs(5), framed.next()).await {}
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let config = client_config(Duration::from_secs(30))
+        .with_garbled_frame_limit(Some(garbled_limit(2, Duration::from_secs(60))));
+    let initiator = Initiator::new(config, Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s",
+    );
+    ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+}

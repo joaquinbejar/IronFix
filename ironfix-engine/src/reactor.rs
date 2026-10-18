@@ -333,11 +333,11 @@ struct HandshakeSkips {
 }
 
 impl HandshakeSkips {
-    /// Counts one skipped frame of the kind `error` describes. At `u64::MAX`
-    /// a count stops moving rather than wrapping; the timeout bounds the loop
-    /// regardless.
-    fn record(&mut self, error: &DecodeError) {
-        let count = if wire::decode_is_garbled(error) {
+    /// Counts one skipped `frame` of the kind `error` describes. At
+    /// `u64::MAX` a count stops moving rather than wrapping; the timeout
+    /// bounds the loop regardless.
+    fn record(&mut self, error: &DecodeError, frame: &[u8]) {
+        let count = if wire::decode_is_garbled(error, frame) {
             &mut self.garbled
         } else {
             &mut self.malformed
@@ -360,7 +360,7 @@ async fn next_decodable_frame(framed: &mut FixFramed, skips: &mut HandshakeSkips
                 // Owned error, so the borrow of `frame` ends before it moves.
                 match wire::decode_frame(&frame).err() {
                     None => return HandshakeRead::Frame(frame),
-                    Some(err) => skips.record(&err),
+                    Some(err) => skips.record(&err, &frame),
                 }
             }
         }
@@ -1958,10 +1958,11 @@ impl<A: Application> Reactor<A> {
         let raw = match wire::decode_frame(&frame) {
             Ok(raw) => raw,
             // A frame whose header does not decode (MsgType (35) not third,
-            // BodyLength invalid, ...) is garbled: it is ignored exactly like
-            // one the codec skipped, and counts toward the same limit. The log
-            // names the defect, never the error's text, which can quote input.
-            Err(err) if wire::decode_is_garbled(&err) => {
+            // BodyLength invalid, a malformed field among the first three) is
+            // garbled: it is ignored exactly like one the codec skipped, and
+            // counts toward the same limit. The log names the defect, never
+            // the error's text, which can quote input.
+            Err(err) if wire::decode_is_garbled(&err, &frame) => {
                 return self
                     .on_garbled(framed, phase, 1, wire::decode_defect(&err))
                     .await;

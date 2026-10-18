@@ -83,10 +83,14 @@ themselves are unchanged.
 
 A frame that frames but whose header fails to decode (MsgType not third,
 BodyLength invalid) is garbled at the decode level. The codec cannot see that;
-the engine treats it exactly like a frame the codec skipped (see below). A
+the engine treats it exactly like a frame the codec skipped (see below). The
+verdict follows where decoding failed: a failure while the first three fields
+are not structurally `8=…`, `9=…`, `35=…` is garbled even when the decoder
+reports it as an invalid tag (a third field `abc=0` is MsgType not third). A
 frame whose header decodes but whose body does not (an invalid tag, a bad data
-length) is **not** garbled and is not counted; the engine drops it as it
-always did.
+length), or whose MsgType value is unacceptable (FIX answers that with a
+Reject, reason 11), is **not** garbled and is not counted; the engine drops it
+as it always did.
 
 ### The resync anchor
 

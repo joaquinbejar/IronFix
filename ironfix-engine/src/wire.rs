@@ -672,28 +672,60 @@ pub(crate) fn decode_frame(frame: &[u8]) -> Result<RawMessage<'_>, DecodeError> 
     decoder.decode()
 }
 
-/// Returns whether a frame that framed but did not decode is *garbled* in the
-/// FIX Session Layer's sense.
+/// Returns whether `frame`, which framed but failed to decode with `error`, is
+/// *garbled* in the FIX Session Layer's sense.
 ///
 /// Garbled means the header cannot be trusted: BeginString (8) not first,
 /// BodyLength (9) not second or invalid, MsgType (35) not third, or a CheckSum
 /// (10) mismatch. Such a frame is ignored and counts toward
 /// [`SessionConfig::garbled_frame_limit`].
 ///
-/// Every other decode failure (an invalid tag, an unterminated field, a bad
-/// data length or Length value, an invalid MsgType value, ...) is a malformed
-/// *body* behind a header that framed and decoded. It is not garbled: the
-/// reactor drops it with a warning, as it always has, and does not count it.
+/// The verdict follows **where** decoding failed, not which error it raised:
+/// the decoder can stop on a malformed third field (`abc=0`) with an invalid
+/// tag before it ever reports MsgType missing, and that is still MsgType not
+/// third. So any failure while the first three fields are not structurally
+/// `8=…`, `9=…`, `35=…`, each SOH-terminated, is garbled.
+///
+/// Every other failure is a malformed *body* behind a sound header (an invalid
+/// tag, an unterminated field, a bad data length or Length value). So is a
+/// MsgType field whose value is unacceptable: the field sits where it should,
+/// and FIX answers an invalid MsgType with a Reject (reason 11), not by
+/// treating the message as garbled. None of these is garbled: the reactor
+/// drops them with a warning, as it always has, and does not count them.
 #[must_use]
-pub(crate) const fn decode_is_garbled(error: &DecodeError) -> bool {
-    matches!(
-        error,
+pub(crate) fn decode_is_garbled(error: &DecodeError, frame: &[u8]) -> bool {
+    match error {
         DecodeError::InvalidBeginString
-            | DecodeError::MissingBodyLength
-            | DecodeError::InvalidBodyLength
-            | DecodeError::MissingMsgType
-            | DecodeError::ChecksumMismatch { .. }
-    )
+        | DecodeError::MissingBodyLength
+        | DecodeError::InvalidBodyLength
+        | DecodeError::MissingMsgType
+        | DecodeError::ChecksumMismatch { .. } => true,
+        DecodeError::InvalidMsgType(_) => false,
+        _ => !header_fields_in_place(frame),
+    }
+}
+
+/// The FIX field delimiter.
+const SOH: u8 = 0x01;
+
+/// Returns whether the first three fields of `frame` are, structurally, `8=…`,
+/// `9=…` and `35=…`, each terminated by SOH. Values are not checked.
+#[must_use]
+fn header_fields_in_place(frame: &[u8]) -> bool {
+    let mut rest = frame;
+    for tag in [&b"8="[..], b"9=", b"35="] {
+        let Some(end) = rest.iter().position(|&byte| byte == SOH) else {
+            return false;
+        };
+        if !rest.get(..end).is_some_and(|field| field.starts_with(tag)) {
+            return false;
+        }
+        let Some(next) = end.checked_add(1).and_then(|start| rest.get(start..)) else {
+            return false;
+        };
+        rest = next;
+    }
+    true
 }
 
 /// Names the defect behind a frame that framed but did not decode, for a log
@@ -1190,7 +1222,7 @@ mod tests {
         match decode_frame(frame) {
             Err(err) => {
                 assert_eq!(decode_defect(&err), "MsgType (35) not third");
-                assert!(decode_is_garbled(&err));
+                assert!(decode_is_garbled(&err, frame));
             }
             Ok(_) => panic!("a frame with MsgType out of place must not decode"),
         }
@@ -1209,6 +1241,8 @@ mod tests {
 
     #[test]
     fn test_decode_is_garbled_covers_header_defects_only() {
+        // A frame whose first three fields are in place.
+        let sound_header = b"8=FIX.4.4\x019=16\x0135=0\x0134=2\x01abc=1\x0110=000\x01";
         let garbled = [
             DecodeError::InvalidBeginString,
             DecodeError::MissingBodyLength,
@@ -1220,7 +1254,10 @@ mod tests {
             },
         ];
         for err in &garbled {
-            assert!(decode_is_garbled(err), "{err:?} is a header defect");
+            assert!(
+                decode_is_garbled(err, sound_header),
+                "{err:?} is a header defect"
+            );
         }
 
         let malformed_body = [
@@ -1232,18 +1269,49 @@ mod tests {
             DecodeError::MissingRequiredField { tag: 36 },
         ];
         for err in &malformed_body {
-            assert!(!decode_is_garbled(err), "{err:?} is a malformed body");
+            assert!(
+                !decode_is_garbled(err, sound_header),
+                "{err:?} behind a sound header is a malformed body"
+            );
         }
 
         // A real frame: header and MsgType are fine, a body tag is not.
-        let frame = b"8=FIX.4.4\x019=16\x0135=0\x0134=2\x01abc=1\x0110=000\x01";
-        match decode_frame(frame) {
+        match decode_frame(sound_header) {
             Err(err) => {
                 assert!(matches!(err, DecodeError::InvalidTag(_)), "{err:?}");
-                assert!(!decode_is_garbled(&err), "{err:?}");
+                assert!(!decode_is_garbled(&err, sound_header), "{err:?}");
             }
             Ok(_) => panic!("a frame with a non-numeric tag must not decode"),
         }
+    }
+
+    #[test]
+    fn test_decode_is_garbled_by_position_of_the_failure() {
+        // The third field is `abc=0`: the decoder stops on an invalid tag
+        // before it can report MsgType missing, but the failure sits inside
+        // the header, so the frame is garbled (MsgType not third).
+        let third_field_bad = b"8=FIX.4.4\x019=11\x01abc=0\x0135=0\x0110=000\x01";
+        match decode_frame(third_field_bad) {
+            Err(err) => {
+                assert!(matches!(err, DecodeError::InvalidTag(_)), "{err:?}");
+                assert!(decode_is_garbled(&err, third_field_bad), "{err:?}");
+            }
+            Ok(_) => panic!("a frame with a non-numeric third tag must not decode"),
+        }
+
+        // An unacceptable MsgType value in the right place is FIX's invalid
+        // MsgType (Reject reason 11), not garbling.
+        let invalid_value = DecodeError::InvalidMsgType(ironfix_core::error::MsgTypeError::Empty);
+        assert!(!decode_is_garbled(
+            &invalid_value,
+            b"8=FIX.4.4\x019=4\x0135=\x01"
+        ));
+
+        // The structural check itself.
+        assert!(header_fields_in_place(b"8=FIX.4.4\x019=5\x0135=0\x01"));
+        assert!(!header_fields_in_place(b"8=FIX.4.4\x019=5\x0134=2\x01"));
+        assert!(!header_fields_in_place(b"8=FIX.4.4\x019=5"));
+        assert!(!header_fields_in_place(b""));
     }
 
     #[test]
