@@ -381,9 +381,9 @@ impl CodeGenerator {
             self.collect(
                 dict,
                 &scope,
-                &message.fields,
-                &message.groups,
-                &message.components,
+                message.fields(),
+                message.groups(),
+                message.components(),
                 false,
                 0,
                 &mut stack,
@@ -472,9 +472,9 @@ impl CodeGenerator {
                 self.collect(
                     dict,
                     &nested_scope,
-                    &component.fields,
-                    &component.groups,
-                    &component.components,
+                    component.fields(),
+                    component.groups(),
+                    component.components(),
                     true,
                     depth + 1,
                     stack,
@@ -582,9 +582,9 @@ impl CodeGenerator {
                     self.collect(
                         dict,
                         &group_scope,
-                        &def.fields,
-                        &def.groups,
-                        &def.components,
+                        def.fields(),
+                        def.groups(),
+                        def.components(),
                         false,
                         depth + 1,
                         &mut stack,
@@ -1342,7 +1342,8 @@ mod tests {
         dict.add_message(MessageDef::new(
             "D",
             "NewOrderSingle",
-            MessageCategory::App, // A dictionary that lists the count field directly as well as the
+            MessageCategory::App,
+            // A dictionary that lists the count field directly as well as the
             // group it counts. Dropping either would lose information.
             vec![
                 SchemaMember::Field(SchemaFieldRef {

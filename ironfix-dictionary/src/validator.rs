@@ -2780,14 +2780,14 @@ mod tests {
             Some(message) => message,
             None => panic!("StreamAssignmentRequest is defined"),
         };
-        let component = match message.components.first() {
+        let component = match message.components().first() {
             Some(reference) => reference.name.as_str(),
             None => panic!("StreamAssignmentRequest references StrmAsgnReqGrp"),
         };
         let group = session
             .application()
             .get_component(component)
-            .and_then(|def| def.groups.iter().find(|group| group.count_tag == 1499));
+            .and_then(|def| def.groups().iter().find(|group| group.count_tag == 1499));
         match group {
             Some(group) => assert_eq!(group.delimiter_tag, 453),
             None => panic!("NoAsgnReqs(1499) is defined in {component}"),
@@ -2915,7 +2915,7 @@ mod tests {
         for (msg_type, count_tag) in [("U6", 100), ("U7", 120)] {
             let group = dict
                 .get_message(msg_type)
-                .and_then(|message| message.groups.iter().find(|g| g.count_tag == count_tag));
+                .and_then(|message| message.groups().iter().find(|g| g.count_tag == count_tag));
             match group {
                 Some(group) => assert_eq!(group.delimiter_tag, 110, "{msg_type}"),
                 None => panic!("{msg_type} carries group {count_tag}"),

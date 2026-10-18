@@ -1069,20 +1069,20 @@ mod tests {
         assert!(dict.trailer.iter().any(|f| f.tag == 10 && f.required));
         let nos = some(dict.get_message("D"), "NewOrderSingle defined");
         assert!(
-            nos.fields
+            nos.fields()
                 .iter()
                 .any(|f| f.name == "HandlInst" && f.required)
         );
         let er = some(dict.get_message("8"), "ExecutionReport defined");
         assert!(
-            er.fields
+            er.fields()
                 .iter()
                 .any(|f| f.name == "ExecTransType" && f.required)
         );
         // FIX 4.2 has no components; its groups hang off the message.
         assert!(dict.components.is_empty());
         let allocs = some(
-            nos.groups.iter().find(|g| g.name == "NoAllocs"),
+            nos.groups().iter().find(|g| g.name == "NoAllocs"),
             "NoAllocs group on NewOrderSingle",
         );
         assert_eq!(allocs.count_tag, 78);
@@ -1114,7 +1114,7 @@ mod tests {
         assert!(dict.messages().all(|m| m.category == MessageCategory::App));
         let nos = some(dict.get_message("D"), "NewOrderSingle defined");
         assert!(
-            nos.components
+            nos.components()
                 .iter()
                 .any(|c| c.name == "Instrument" && c.required)
         );
@@ -1139,7 +1139,7 @@ mod tests {
         let logon = some(dict.get_message("A"), "Logon defined");
         assert!(
             logon
-                .fields
+                .fields()
                 .iter()
                 .any(|f| f.name == "DefaultApplVerID" && f.required)
         );
@@ -1152,11 +1152,11 @@ mod tests {
         // definition made that reference a dangling UnknownComponent.
         let dict = ok(Dictionary::fixt11(), "FIXT 1.1 loads");
         let group = some(dict.get_component("MsgTypeGrp"), "MsgTypeGrp defined");
-        assert!(group.fields.is_empty());
-        assert!(group.groups.is_empty());
-        assert!(group.components.is_empty());
+        assert!(group.fields().is_empty());
+        assert!(group.groups().is_empty());
+        assert!(group.components().is_empty());
         let logon = some(dict.get_message("A"), "Logon defined");
-        assert!(logon.components.iter().any(|c| c.name == "MsgTypeGrp"));
+        assert!(logon.components().iter().any(|c| c.name == "MsgTypeGrp"));
     }
 
     #[test]
@@ -1167,7 +1167,7 @@ mod tests {
             let message = some(dict.get_message("n"), "XMLnonFIX defined");
             assert_eq!(message.name, "XMLnonFIX");
             assert_eq!(message.category, MessageCategory::Admin);
-            assert!(message.fields.is_empty());
+            assert!(message.fields().is_empty());
         }
     }
 
@@ -1188,9 +1188,9 @@ mod tests {
         </fix>";
         let dict = ok(Dictionary::from_quickfix_xml(xml), "empty component loads");
         let nothing = some(dict.get_component("Nothing"), "empty component defined");
-        assert!(nothing.fields.is_empty());
+        assert!(nothing.fields().is_empty());
         let ping = some(dict.get_message("U1"), "Ping defined");
-        assert!(ping.components.iter().any(|c| c.name == "Nothing"));
+        assert!(ping.components().iter().any(|c| c.name == "Nothing"));
     }
 
     #[test]
@@ -1331,8 +1331,12 @@ mod tests {
         let nos = some(dict.get_message("D"), "NewOrderSingle defined");
         assert_eq!(nos.name, "NewOrderSingle");
         assert_eq!(nos.category, MessageCategory::App);
-        assert!(nos.fields.iter().any(|f| f.name == "ClOrdID" && f.required));
-        assert!(nos.components.iter().any(|c| c.name == "Instrument"));
+        assert!(
+            nos.fields()
+                .iter()
+                .any(|f| f.name == "ClOrdID" && f.required)
+        );
+        assert!(nos.components().iter().any(|c| c.name == "Instrument"));
 
         let heartbeat = some(dict.get_message("0"), "Heartbeat defined");
         assert_eq!(heartbeat.category, MessageCategory::Admin);
@@ -1346,12 +1350,12 @@ mod tests {
         // but only optionally carries Parties.
         let nos = some(dict.get_message("D"), "NewOrderSingle defined");
         let instrument = some(
-            nos.components.iter().find(|c| c.name == "Instrument"),
+            nos.components().iter().find(|c| c.name == "Instrument"),
             "NewOrderSingle references Instrument",
         );
         assert!(instrument.required);
         let parties = some(
-            nos.components.iter().find(|c| c.name == "Parties"),
+            nos.components().iter().find(|c| c.name == "Parties"),
             "NewOrderSingle references Parties",
         );
         assert!(!parties.required);
@@ -1362,11 +1366,11 @@ mod tests {
         let dict = fix44();
 
         let instrument = some(dict.get_component("Instrument"), "Instrument defined");
-        assert!(instrument.fields.iter().any(|f| f.name == "Symbol"));
+        assert!(instrument.fields().iter().any(|f| f.name == "Symbol"));
 
         let parties = some(dict.get_component("Parties"), "Parties defined");
         let no_party_ids = some(
-            parties.groups.iter().find(|g| g.name == "NoPartyIDs"),
+            parties.groups().iter().find(|g| g.name == "NoPartyIDs"),
             "NoPartyIDs group",
         );
         assert_eq!(no_party_ids.count_tag, 453);
@@ -1374,7 +1378,7 @@ mod tests {
         // Nested component reference within the group.
         assert!(
             no_party_ids
-                .components
+                .components()
                 .iter()
                 .any(|c| c.name == "PtysSubGrp")
         );
@@ -1473,7 +1477,7 @@ mod tests {
         for group in groups {
             let key = format!("{parent}/{}", group.name);
             out.insert(key.clone(), listed(group.members()));
-            loaded_groups(&key, &group.groups, out);
+            loaded_groups(&key, group.groups(), out);
         }
     }
 
@@ -1485,12 +1489,12 @@ mod tests {
         for message in dict.messages() {
             let key = format!("message:{}", message.name);
             out.insert(key.clone(), listed(message.members()));
-            loaded_groups(&key, &message.groups, &mut out);
+            loaded_groups(&key, message.groups(), &mut out);
         }
         for component in dict.components.values() {
             let key = format!("component:{}", component.name);
             out.insert(key.clone(), listed(component.members()));
-            loaded_groups(&key, &component.groups, &mut out);
+            loaded_groups(&key, component.groups(), &mut out);
         }
         loaded_groups("header", &dict.header_groups, &mut out);
         loaded_groups("trailer", &dict.trailer_groups, &mut out);
@@ -1527,7 +1531,7 @@ mod tests {
         // the component sits between fields, which the per-kind lists alone
         // cannot say.
         let component = some(fix44().get_component("PreAllocGrp"), "PreAllocGrp");
-        let allocs = some(component.groups.first(), "NoAllocs");
+        let allocs = some(component.groups().first(), "NoAllocs");
         assert_eq!(allocs.count_tag, 78);
         let order: Vec<String> = allocs
             .members()
@@ -1540,18 +1544,19 @@ mod tests {
         assert_eq!(order, ["79", "661", "736", "467", "NestedParties", "80"]);
         let nested = some(fix44().get_component("NestedParties"), "NestedParties");
         assert_eq!(
-            nested.groups.first().map(|group| group.count_tag),
+            nested.groups().first().map(|group| group.count_tag),
             Some(539)
         );
     }
 
     #[test]
-    fn test_members_reconcile_with_lists_edited_after_construction() {
+    fn test_definitions_keep_order_and_kinds_in_step_through_push() {
         let field = |tag: u32| FieldRef {
             tag,
             name: tag.to_string(),
             required: false,
         };
+        let group = GroupDef::new(78, "NoAllocs", 79, false, [Member::Field(field(79))]);
         let mut component = ComponentDef::new(
             "Edited",
             [
@@ -1569,12 +1574,40 @@ mod tests {
                 ('F', "2".to_string())
             ]
         );
-        // Pushed after construction: after the recorded members.
-        component.fields.push(field(3));
-        assert_eq!(names(&component).last(), Some(&('F', "3".to_string())));
-        // Removed after construction: skipped, the rest keep their order.
-        component.fields.clear();
-        assert_eq!(names(&component), [('C', "Inner".to_string())]);
+        // `push` appends in dictionary order and to its kind's list: the two
+        // views cannot disagree, since the lists are not editable otherwise.
+        component.push(Member::Group(group));
+        component.push(Member::Field(field(3)));
+        assert_eq!(
+            names(&component),
+            [
+                ('F', "1".to_string()),
+                ('C', "Inner".to_string()),
+                ('F', "2".to_string()),
+                ('G', "NoAllocs".to_string()),
+                ('F', "3".to_string())
+            ]
+        );
+        let tags: Vec<u32> = component.fields().iter().map(|field| field.tag).collect();
+        assert_eq!(tags, [1, 2, 3]);
+        assert_eq!(component.groups().len(), 1);
+        assert_eq!(component.components().len(), 1);
+        // The iterator knows how many members remain.
+        let mut members = component.members();
+        assert_eq!(members.len(), 5);
+        let _ = members.next();
+        assert_eq!(members.size_hint(), (4, Some(4)));
+        assert_eq!(members.by_ref().count(), 4);
+        assert!(members.next().is_none());
+
+        let mut message = MessageDef::new("U1", "Grown", MessageCategory::App, []);
+        assert_eq!(message.members().len(), 0);
+        message.push(Member::Component(ComponentRef::new("Edited", true)));
+        message.push(Member::Field(field(11)));
+        assert_eq!(
+            listed(message.members()),
+            [('C', "Edited".to_string()), ('F', "11".to_string())]
+        );
     }
 
     #[test]
@@ -2021,6 +2054,6 @@ mod tests {
         let dict = ok(Dictionary::from_quickfix_xml(xml), "dialect loads");
         let ping = some(dict.get_message("U1"), "custom message defined");
         assert_eq!(ping.name, "Ping");
-        assert_eq!(some(ping.fields.first(), "Ping has a field").tag, 112);
+        assert_eq!(some(ping.fields().first(), "Ping has a field").tag, 112);
     }
 }

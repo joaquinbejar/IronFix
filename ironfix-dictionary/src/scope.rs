@@ -206,13 +206,13 @@ impl<'d> ScopeBuilder<'d> {
         let envelope = level.all_tags();
 
         self.dict = body;
-        for field in &msg_def.fields {
+        for field in msg_def.fields() {
             level.add_field(field.tag, &field.name, field.required);
         }
-        for group in &msg_def.groups {
+        for group in msg_def.groups() {
             self.add_group(&mut level, group, group.required, true, 0, &mut path);
         }
-        for component in &msg_def.components {
+        for component in msg_def.components() {
             self.add_component(&mut level, component, true, 0, &mut path);
         }
         level.finish();
@@ -249,13 +249,13 @@ impl<'d> ScopeBuilder<'d> {
 
         let mut entry = Level::default();
         entry.members.push(group.delimiter_tag);
-        for field in &group.fields {
+        for field in group.fields() {
             entry.add_field(field.tag, &field.name, field.required);
         }
-        for nested in &group.groups {
+        for nested in group.groups() {
             self.add_group(&mut entry, nested, nested.required, true, depth + 1, path);
         }
-        for component in &group.components {
+        for component in group.components() {
             self.add_component(&mut entry, component, true, depth + 1, path);
         }
         // Each required tag is kept once, at its first (schema) position, so
@@ -308,13 +308,13 @@ impl<'d> ScopeBuilder<'d> {
         }
 
         let required = collect_required && reference.required;
-        for field in &component.fields {
+        for field in component.fields() {
             level.add_field(field.tag, &field.name, required && field.required);
         }
-        for group in &component.groups {
+        for group in component.groups() {
             self.add_group(level, group, group.required, required, depth + 1, path);
         }
-        for nested in &component.components {
+        for nested in component.components() {
             self.add_component(level, nested, required, depth + 1, path);
         }
 
