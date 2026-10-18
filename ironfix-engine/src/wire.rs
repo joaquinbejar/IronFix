@@ -130,7 +130,7 @@ fn framable_versions() -> String {
 /// configured counterparty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IdentityMismatch {
-    /// The offending tag (49, 56, 50 or 57).
+    /// The offending tag (49, 56, 50, 57, 142 or 143).
     pub(crate) tag: u32,
     /// The value the configuration requires.
     pub(crate) expected: String,
@@ -163,7 +163,7 @@ impl std::fmt::Display for IdentityMismatch {
 /// The set is the standard header of FIX 4.0 through 5.0 SP2 taken together:
 /// the framing fields, the routing and CompID fields, `MsgSeqNum` (34), the
 /// PossDup/PossResend pair, `SendingTime` (52) and `OrigSendingTime` (122),
-/// the `NoHops` group (627 and its 628/629/630 entries), and the FIXT.1.1
+/// `OnBehalfOfSendingTime` (370), the `NoHops` group (627 and its 628/629/630 entries), and the FIXT.1.1
 /// application-version fields (1128, 1129, 1156). A tag outside this set is
 /// the first field of the message body.
 const fn is_standard_header_tag(tag: u32) -> bool {
@@ -194,6 +194,7 @@ const fn is_standard_header_tag(tag: u32) -> bool {
             | 213
             | 347
             | 369
+            | 370
             | 627
             | 628
             | 629
@@ -220,6 +221,44 @@ fn in_standard_header(raw: &RawMessage<'_>, tag: u32) -> bool {
         }
     }
     false
+}
+
+/// How often a tag occurs in the standard header of a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeaderField<'a> {
+    /// The header does not carry the tag.
+    Absent,
+    /// The header carries the tag once, with this raw value.
+    Once(&'a [u8]),
+    /// The header carries the tag more than once (`SessionRejectReason` 13,
+    /// "tag appears more than once"): no occurrence can be trusted over the
+    /// others.
+    Repeated,
+}
+
+/// Reads `tag` from the standard header of `raw`.
+///
+/// The header is the leading run of standard-header tags, as for
+/// [`in_standard_header`]: a `tag` that occurs only in the body is
+/// [`HeaderField::Absent`], and a tag outside the standard header set is never
+/// found. The whole header is scanned, so a tag repeated in it is
+/// [`HeaderField::Repeated`] rather than its first value. One scan, no
+/// allocation, and the value is returned as raw bytes, so a caller bounding an
+/// untrusted value sees every byte before deciding whether it is text at all.
+pub(crate) fn header_field<'a>(raw: &RawMessage<'a>, tag: u32) -> HeaderField<'a> {
+    let mut found = HeaderField::Absent;
+    for field in raw.fields() {
+        if !is_standard_header_tag(field.tag) {
+            break;
+        }
+        if field.tag == tag {
+            if found != HeaderField::Absent {
+                return HeaderField::Repeated;
+            }
+            found = HeaderField::Once(field.value);
+        }
+    }
+    found
 }
 
 /// Reads `MsgSeqNum` (34) from the standard header of `raw`.
@@ -322,7 +361,8 @@ pub(crate) fn parse_heartbeat_interval(raw: &RawMessage<'_>) -> Result<u64, Hear
 }
 
 /// The identity every inbound message must carry, derived from the session
-/// configuration with sender and target reversed.
+/// configuration with sender and target reversed: the CompIDs always, and the
+/// sub and location IDs the session configures.
 ///
 /// A cross-wired connection that is never checked advances sequence state
 /// against the wrong counterparty and delivers another session's traffic to
@@ -339,6 +379,10 @@ pub(crate) struct PeerIdentity {
     sender_sub_id: Option<String>,
     /// Required inbound `TargetSubID` (57), when configured.
     target_sub_id: Option<String>,
+    /// Required inbound `SenderLocationID` (142), when configured.
+    sender_location_id: Option<String>,
+    /// Required inbound `TargetLocationID` (143), when configured.
+    target_location_id: Option<String>,
 }
 
 impl PeerIdentity {
@@ -350,13 +394,18 @@ impl PeerIdentity {
             target_comp_id: config.sender_comp_id.as_str().to_string(),
             sender_sub_id: config.target_sub_id.clone(),
             target_sub_id: config.sender_sub_id.clone(),
+            sender_location_id: config.target_location_id.clone(),
+            target_location_id: config.sender_location_id.clone(),
         }
     }
 
     /// Checks an inbound message's identity fields.
     ///
-    /// Sub IDs are only checked when configured; an unconfigured sub ID
-    /// places no requirement on the counterparty.
+    /// Sub and location IDs are only checked when configured; an
+    /// unconfigured one places no requirement on the counterparty. This is
+    /// the rule an [`AcceptorRegistry`](crate::AcceptorRegistry) routes a
+    /// Logon by, so a routed session enforces on every message the identity
+    /// it was routed on.
     ///
     /// Each field must both carry the expected value **and** occur in the
     /// standard header. A CompID that appears only after the message body
@@ -372,6 +421,12 @@ impl PeerIdentity {
         }
         if let Some(expected) = &self.target_sub_id {
             check_field(raw, 57, expected)?;
+        }
+        if let Some(expected) = &self.sender_location_id {
+            check_field(raw, 142, expected)?;
+        }
+        if let Some(expected) = &self.target_location_id {
+            check_field(raw, 143, expected)?;
         }
         Ok(())
     }
@@ -1854,6 +1909,122 @@ mod tests {
         ]);
 
         assert_eq!(identity.validate(&decode(&frame)), Ok(()));
+    }
+
+    #[test]
+    fn test_header_field_reads_the_header_only_and_returns_raw_bytes() {
+        let frame = frame_with_raw_fields(&[
+            (35, b"A"),
+            (49, b"CLIENT"),
+            (56, b"VENUE"),
+            (34, b"1"),
+            (142, b"LON\x80"),
+            (52, b"20260721-10:00:00.000"),
+            (98, b"0"),
+            // Body: a 57 here is not the header's.
+            (57, b"DESK"),
+        ]);
+        let raw = decode(&frame);
+
+        assert_eq!(header_field(&raw, 49), HeaderField::Once(b"CLIENT"));
+        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"VENUE"));
+        // Not UTF-8, returned as bytes for the caller to bound.
+        assert_eq!(header_field(&raw, 142), HeaderField::Once(b"LON\x80"));
+        assert_eq!(header_field(&raw, 57), HeaderField::Absent);
+        assert_eq!(header_field(&raw, 50), HeaderField::Absent);
+        // A body tag is never a header field, even as the first body field.
+        assert_eq!(header_field(&raw, 98), HeaderField::Absent);
+    }
+
+    #[test]
+    fn test_header_field_reports_a_repeated_tag() {
+        let frame = frame_with_fields(&[
+            (35, "A"),
+            (49, "CLIENT"),
+            (56, "VENUE"),
+            (34, "1"),
+            (49, "OTHER"),
+            (52, "20260721-10:00:00.000"),
+            (98, "0"),
+            // A body copy does not make the header's 56 repeated.
+            (56, "VENUE"),
+        ]);
+        let raw = decode(&frame);
+
+        assert_eq!(header_field(&raw, 49), HeaderField::Repeated);
+        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"VENUE"));
+    }
+
+    #[test]
+    fn test_on_behalf_of_sending_time_is_a_header_field() {
+        // 370 sits between 34 and 56; the header run must not end at it.
+        let frame = frame_with_fields(&[
+            (35, "D"),
+            (49, "VENUE"),
+            (34, "2"),
+            (370, "20260721-10:00:00.000"),
+            (56, "CLIENT"),
+            (52, "20260721-10:00:00.000"),
+            (11, "ORDER-1"),
+        ]);
+        let raw = decode(&frame);
+
+        assert!(is_standard_header_tag(370));
+        assert_eq!(header_field(&raw, 56), HeaderField::Once(b"CLIENT"));
+        assert_eq!(
+            PeerIdentity::new(&config_for("FIX.4.4")).validate(&raw),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_peer_identity_checks_configured_location_ids() {
+        let mut config = config_for("FIX.4.4");
+        config.sender_location_id = Some("NYC".to_string());
+        config.target_location_id = Some("LON".to_string());
+        let identity = PeerIdentity::new(&config);
+        let with_locations = |sender: &str, target: &str| {
+            frame_with_fields(&[
+                (35, "D"),
+                (49, "VENUE"),
+                (56, "CLIENT"),
+                (34, "2"),
+                (142, sender),
+                (143, target),
+                (52, "20260721-10:00:00.000"),
+                (11, "ORDER-1"),
+            ])
+        };
+
+        // Reversed: the peer's 142 is our target location, its 143 ours.
+        assert_eq!(
+            identity.validate(&decode(&with_locations("LON", "NYC"))),
+            Ok(())
+        );
+        match identity.validate(&decode(&with_locations("PAR", "NYC"))) {
+            Err(mismatch) => assert_eq!(mismatch.tag, 142),
+            Ok(()) => panic!("a wrong SenderLocationID must be refused"),
+        }
+        match identity.validate(&decode(&with_locations("LON", "PAR"))) {
+            Err(mismatch) => assert_eq!(mismatch.tag, 143),
+            Ok(()) => panic!("a wrong TargetLocationID must be refused"),
+        }
+        let without = frame_with_fields(&[
+            (35, "D"),
+            (49, "VENUE"),
+            (56, "CLIENT"),
+            (34, "2"),
+            (52, "20260721-10:00:00.000"),
+        ]);
+        match identity.validate(&decode(&without)) {
+            Err(mismatch) => assert_eq!(mismatch.tag, 142),
+            Ok(()) => panic!("a configured location ID must be carried"),
+        }
+        // Unconfigured: no requirement.
+        assert_eq!(
+            PeerIdentity::new(&config_for("FIX.4.4")).validate(&decode(&without)),
+            Ok(())
+        );
     }
 
     #[test]

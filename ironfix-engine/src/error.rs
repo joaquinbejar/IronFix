@@ -6,6 +6,7 @@
 
 //! Engine error types.
 
+use crate::registry::{LogonIdentity, LookupError};
 use ironfix_core::error::{DecodeError, EncodeError, StoreError};
 use ironfix_session::config::SessionConfigError;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
@@ -153,13 +154,70 @@ pub enum EngineError {
         stored: u64,
     },
 
-    /// The counterparty's identity fields (49/56, and 50/57 when
+    /// The counterparty's identity fields (49/56, and 50/57 and 142/143 when
     /// configured) did not match the session configuration.
     #[error("identity mismatch: {detail}")]
     IdentityMismatch {
         /// Which field mismatched, with the expected and received values.
         detail: String,
     },
+
+    /// An inbound Logon cannot be routed to a session by an
+    /// [`AcceptorRegistry`](crate::AcceptorRegistry): one of its identity
+    /// fields is absent from the standard header (`SenderCompID` (49),
+    /// `TargetCompID` (56)), repeated in it (`SessionRejectReason` 13, "tag
+    /// appears more than once"), empty, longer than
+    /// [`MAX_ID_LEN`](ironfix_session::config::MAX_ID_LEN) bytes, or carries
+    /// a byte outside printable ASCII.
+    ///
+    /// Checked before any registered session or the lookup is consulted. The
+    /// connection is closed without a reply; no store is touched and no
+    /// [`Application`](crate::Application) callback runs.
+    #[error("unroutable logon: tag {tag} {detail}")]
+    UnroutableLogon {
+        /// The identity field that failed: 49, 56, 50, 57, 142 or 143.
+        tag: u32,
+        /// What is wrong with it. It never quotes the value.
+        detail: String,
+    },
+
+    /// No session is registered in an
+    /// [`AcceptorRegistry`](crate::AcceptorRegistry) for the identity an
+    /// inbound Logon claims, and no
+    /// [`SessionLookup`](crate::SessionLookup) admitted one.
+    ///
+    /// The connection is closed without a reply; no store is touched and no
+    /// [`Application`](crate::Application) callback runs.
+    #[error("no session for the logon identity {identity}")]
+    UnknownSession {
+        /// The identity the Logon claimed, in its own orientation (its
+        /// `SenderCompID` (49) first). Every value in it has passed the
+        /// routing bounds.
+        identity: Box<LogonIdentity>,
+    },
+
+    /// A [`SessionLookup`](crate::SessionLookup) admitted a session, but the
+    /// [`AcceptorRegistry`](crate::AcceptorRegistry) already holds as many
+    /// lookup-admitted sessions as
+    /// [`AcceptorRegistry::with_max_sessions`](crate::AcceptorRegistry::with_max_sessions)
+    /// allows.
+    ///
+    /// The connection is closed without a reply; no store is touched and no
+    /// [`Application`](crate::Application) callback runs.
+    #[error("the registry already holds {max} lookup-admitted sessions")]
+    SessionLimit {
+        /// The configured maximum number of lookup-admitted sessions.
+        max: usize,
+    },
+
+    /// A [`SessionLookup`](crate::SessionLookup) could not decide whether to
+    /// admit a session: its directory is unavailable, as opposed to refusing
+    /// the identity.
+    ///
+    /// The connection is closed without a reply; no store is touched and no
+    /// [`Application`](crate::Application) callback runs.
+    #[error("session lookup failed: {0}")]
+    Lookup(#[from] LookupError),
 
     /// The Logon acknowledgement carried a `BeginString` (8) that does not
     /// match the configured session version.

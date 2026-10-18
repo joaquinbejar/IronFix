@@ -21,8 +21,11 @@
 //! reconnection is the consumer's for the initiator: an `Acceptor` is a single
 //! configured session (one expected counterparty), and each accepted
 //! connection becomes its own live session with its own sequence state. A
-//! server that fronts several counterparties runs one accept loop and matches
-//! each inbound connection to the `Acceptor` configured for it.
+//! server that fronts several counterparties on one listener registers one
+//! `Acceptor` per counterparty in an
+//! [`AcceptorRegistry`](crate::AcceptorRegistry), which reads each inbound
+//! Logon once, routes it by the CompIDs it claims, and runs the routed
+//! `Acceptor`'s handshake on it, the same handshake `serve` runs.
 //!
 //! # Handshake conformance
 //!
@@ -30,8 +33,8 @@
 //! `doc/fix_operations.md` ("Logon"): it must decode and be a Logon; its
 //! `BeginString` (8) must match this session's version and its `EncryptMethod`
 //! (98) must be 0 (None); it must carry `MsgSeqNum` (34) **in the standard
-//! header**; then counterparty identity (49/56, plus 50/57 when configured) is
-//! checked and the single admission slot is claimed — a second concurrent Logon
+//! header**; then counterparty identity (49/56, plus 50/57 and 142/143 when
+//! configured) is checked and the single admission slot is claimed — a second concurrent Logon
 //! for the same counterparty is refused rather than allowed to fork the session;
 //! then `SendingTime` (52) accuracy and the `from_admin` authentication hook;
 //! then a `ResetSeqNumFlag` (141) Logon must carry `MsgSeqNum` 1; then the
@@ -58,6 +61,9 @@
 //!   Logout as before. Matching CompIDs authenticate nobody: they are
 //!   caller-supplied, so a peer that knows them but not the credentials must
 //!   not be able to write to the journal or move the session's counters.
+//!   While this session is live, a Logon refused for its version, encryption
+//!   or CompIDs gets nothing in either mode, as a duplicate does: anything it
+//!   could be sent would be numbered from a stream the live session owns.
 //! - **A Logon without a valid `MsgSeqNum`** (absent, outside the header, or
 //!   0): nothing, in either mode.
 //! - **A duplicate Logon** for a session already live: nothing, in either
@@ -166,13 +172,18 @@ use crate::reactor::{
 use crate::wire::{
     self, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard, UnsupportedVersion,
 };
+use bytes::BytesMut;
 use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
 use ironfix_session::config::SessionConfigError;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
-use ironfix_session::{Disconnected, HeartbeatManager, SequenceManager, Session, SessionConfig};
+use ironfix_session::{
+    Connecting, Disconnected, HeartbeatManager, SequenceManager, Session, SessionConfig,
+};
 use ironfix_store::MessageStore;
+use ironfix_transport::CodecError;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -321,6 +332,26 @@ impl<A: Application + 'static> Acceptor<A> {
             admitted: Arc::clone(&self.admitted),
             session_id: self.session_id.clone(),
         })
+    }
+
+    /// Whether this acceptor's session is live: its admission slot is held.
+    ///
+    /// Read without claiming the slot, for a refusal decided before the
+    /// claim: while the session is live, nothing an unauthenticated newcomer
+    /// could be sent belongs to the sequence stream.
+    fn session_is_live(&self) -> bool {
+        self.admitted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&self.session_id)
+    }
+
+    /// The address of the attached store, if any, so a registry can tell
+    /// whether two acceptors share one store. Compared, never dereferenced.
+    pub(crate) fn store_address(&self) -> Option<*const ()> {
+        self.store
+            .store()
+            .map(|store| Arc::as_ptr(store).cast::<()>())
     }
 
     /// Attaches a message store to every session this acceptor admits.
@@ -521,7 +552,7 @@ impl<A: Application + 'static> Acceptor<A> {
     /// [`EngineError::Config`] for an unusable configuration, and
     /// [`EngineError::UnsupportedVersion`] for a `BeginString` this engine
     /// cannot frame conformantly.
-    fn preflight(&self) -> Result<FixVersion, EngineError> {
+    pub(crate) fn preflight(&self) -> Result<FixVersion, EngineError> {
         if let Err(err) = &self.config_check {
             return Err(EngineError::Config(err.clone()));
         }
@@ -572,14 +603,30 @@ impl<A: Application + 'static> Acceptor<A> {
     /// to the outbound journal and advance the session's counters) nor be
     /// numbered without reusing, with different content, a number the
     /// session's stream already holds.
+    ///
+    /// `before_admission` marks a refusal decided before this connection
+    /// claimed the admission slot (version, encryption, CompIDs). If the slot
+    /// is held then, the session is live on another connection and nothing is
+    /// sent in either mode, as for a duplicate Logon: the live session owns
+    /// the sequence stream, and a refusal numbered from the provisional
+    /// counters would reuse one of its numbers.
     async fn refuse_unauthenticated<const N: usize>(
         &self,
         session_id: &SessionId,
         framed: &mut FixFramed,
         factory: &mut MessageFactory,
+        before_admission: bool,
         refusal: &str,
         messages: [PendingMessage; N],
     ) {
+        if before_admission && self.session_is_live() {
+            tracing::warn!(
+                session = %session_id,
+                refusal,
+                "refusing a Logon without a reply: the session is live on another connection"
+            );
+            return;
+        }
         if self.store.store().is_some() {
             tracing::warn!(
                 session = %session_id,
@@ -684,8 +731,10 @@ impl<A: Application + 'static> Acceptor<A> {
     ///   `EncryptMethod` (98), the wrong CompIDs, a `SendingTime` (52) out of
     ///   tolerance, or credentials `from_admin` refuses). With a store attached
     ///   the connection is closed without a reply and the store is not touched;
-    ///   without one a Reject (373 = 9 or 10) and/or Logout is sent, as before.
-    ///   Matching CompIDs authenticate nobody.
+    ///   without one a Reject (373 = 9 or 10) and/or Logout is sent, as before,
+    ///   unless this session is live, in which case a Logon refused for its
+    ///   version, encryption or CompIDs gets no reply either. Matching CompIDs
+    ///   authenticate nobody.
     /// - **A Logon without a valid `MsgSeqNum` (34)** (absent, outside the
     ///   standard header, or 0) is closed without a reply in either mode.
     /// - **A second Logon for a session already live** is closed without a
@@ -740,12 +789,6 @@ impl<A: Application + 'static> Acceptor<A> {
         let _ = stream.set_nodelay(true);
         let mut framed = Framed::new(stream, session_codec(&self.config, version));
 
-        let mut factory = MessageFactory::new(&self.config, version);
-        let identity = PeerIdentity::new(&self.config);
-        let sending_time = SendingTimeGuard::new(&self.config);
-        let write_timeout = self.write_timeout;
-        let store_timeout = self.store.timeout(write_timeout);
-
         // Await the inbound Logon. Garbled frames are skipped, and the logon
         // timeout covers the whole wait, so a Logon that never arrives intact
         // is a LogonTimeout.
@@ -765,6 +808,94 @@ impl<A: Application + 'static> Acceptor<A> {
                     return Err(err.into());
                 }
             };
+
+        self.complete_handshake(version, session, framed, logon_frame, None)
+            .await
+    }
+
+    /// Runs this session's handshake on a Logon that was read, and routed to
+    /// this acceptor, by an [`AcceptorRegistry`](crate::AcceptorRegistry).
+    ///
+    /// Everything [`Acceptor::serve`] does after the Logon has arrived is done
+    /// here unchanged: the same checks in the same order, the same refusal
+    /// policy, the same store order and the same reactor. What differs is only
+    /// what came before. The configuration check and `on_create` run now, once
+    /// the session is known, rather than before the read; the socket's codec
+    /// is replaced by this session's own (its message-size ceiling, checksum
+    /// setting and resync anchor), which governs every frame after the Logon;
+    /// and the Logon, framed under the registry's ceiling, is held to this
+    /// session's `max_message_size` too, so a frame this session's codec would
+    /// have refused is refused here, without a reply.
+    ///
+    /// `authenticated`, when given, is set once `from_admin` has accepted the
+    /// Logon, whatever happens after: the registry keeps a session its lookup
+    /// admitted only if a handshake got that far.
+    ///
+    /// # Errors
+    /// [`EngineError::Codec`] for a Logon above this session's
+    /// `max_message_size`; otherwise any error [`Acceptor::serve`] can produce
+    /// once the Logon has been read.
+    pub(crate) async fn serve_logon(
+        &self,
+        mut framed: FixFramed,
+        logon_frame: BytesMut,
+        authenticated: Option<&AtomicBool>,
+    ) -> Result<Connection, EngineError> {
+        let version = self.preflight()?;
+
+        let session_id = self.session_id.clone();
+        self.application.on_create(&session_id).await;
+
+        // Typestate: Disconnected -> Connecting (acceptor side).
+        let session = Session::<Disconnected>::new(session_id.to_string()).accept();
+
+        // From here on the socket is this session's: frames after the Logon
+        // are framed under its own settings, exactly as on `serve`. The codec
+        // holds no partial frame (it settles whenever it returns one), and any
+        // bytes already read stay in the `Framed` buffer for the new codec.
+        *framed.codec_mut() = session_codec(&self.config, version);
+        let max_size = self.config.max_message_size;
+        if logon_frame.len() > max_size {
+            let _ = session.disconnect();
+            return Err(CodecError::MessageTooLarge {
+                size: logon_frame.len(),
+                max_size,
+            }
+            .into());
+        }
+
+        self.complete_handshake(version, session, framed, logon_frame, authenticated)
+            .await
+    }
+
+    /// The acceptor half of the Logon handshake, from a Logon frame that has
+    /// already been read (and decoded once) on `framed`, up to the spawned
+    /// reactor.
+    ///
+    /// Shared by [`Acceptor::serve`] and the registry path
+    /// ([`Acceptor::serve_logon`]), so a routed session is checked, refused,
+    /// persisted and run exactly as a session served directly.
+    ///
+    /// `authenticated`, when given, is set as soon as `from_admin` accepts the
+    /// Logon.
+    ///
+    /// # Errors
+    /// Every handshake error [`Acceptor::serve`] documents after the read.
+    async fn complete_handshake(
+        &self,
+        version: FixVersion,
+        session: Session<Connecting>,
+        mut framed: FixFramed,
+        logon_frame: BytesMut,
+        authenticated: Option<&AtomicBool>,
+    ) -> Result<Connection, EngineError> {
+        let session_id = self.session_id.clone();
+
+        let mut factory = MessageFactory::new(&self.config, version);
+        let identity = PeerIdentity::new(&self.config);
+        let sending_time = SendingTimeGuard::new(&self.config);
+        let write_timeout = self.write_timeout;
+        let store_timeout = self.store.timeout(write_timeout);
 
         // Typestate: Connecting -> LogonReceived.
         let session = session.on_logon_received();
@@ -815,6 +946,7 @@ impl<A: Application + 'static> Acceptor<A> {
                     &session_id,
                     &mut framed,
                     &mut factory,
+                    true,
                     &detail,
                     [logout],
                 )
@@ -837,6 +969,7 @@ impl<A: Application + 'static> Acceptor<A> {
                     &session_id,
                     &mut framed,
                     &mut factory,
+                    true,
                     &detail,
                     [logout],
                 )
@@ -873,6 +1006,7 @@ impl<A: Application + 'static> Acceptor<A> {
                     &session_id,
                     &mut framed,
                     &mut factory,
+                    true,
                     &detail,
                     [reject, logout],
                 )
@@ -915,6 +1049,7 @@ impl<A: Application + 'static> Acceptor<A> {
                     &session_id,
                     &mut framed,
                     &mut factory,
+                    false,
                     &detail,
                     [reject, logout],
                 )
@@ -935,6 +1070,7 @@ impl<A: Application + 'static> Acceptor<A> {
                     &session_id,
                     &mut framed,
                     &mut factory,
+                    false,
                     &reason.text,
                     [logout],
                 )
@@ -947,6 +1083,9 @@ impl<A: Application + 'static> Acceptor<A> {
 
             // Authenticated from here on: a refusal is sent like any session
             // frame, filed when a store is attached.
+            if let Some(authenticated) = authenticated {
+                authenticated.store(true, Ordering::Release);
+            }
 
             // ResetSeqNumFlag (141): FIX requires MsgSeqNum = 1 on a Logon that
             // itself carries ResetSeqNumFlag = Y: the reset and the number

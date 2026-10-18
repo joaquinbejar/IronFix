@@ -19,12 +19,12 @@
 //! # Inbound conformance
 //!
 //! Every inbound frame is checked in this order: decode, `MsgSeqNum` (34)
-//! presence, counterparty identity (49/56, plus 50/57 when configured),
-//! `SendingTime` (52) accuracy, then heartbeat bookkeeping, then sequence
-//! validation. Identity and clock come before the heartbeat bookkeeping
-//! deliberately — traffic from the wrong counterparty, or from one whose clock
-//! is wrong, must not keep the session alive, reach the [`Application`], or
-//! move sequence state.
+//! presence, counterparty identity (49/56, plus 50/57 and 142/143 when
+//! configured), `SendingTime` (52) accuracy, then heartbeat bookkeeping, then
+//! sequence validation. Identity and clock come before the heartbeat
+//! bookkeeping deliberately — traffic from the wrong counterparty, or from one
+//! whose clock is wrong, must not keep the session alive, reach the
+//! [`Application`], or move sequence state.
 //!
 //! # Bounded recovery
 //!
@@ -373,16 +373,59 @@ pub(crate) enum HandshakeRead {
 /// only, never frame bytes. The codec's count is drained here, so nothing
 /// skipped during the handshake counts toward
 /// [`SessionConfig::garbled_frame_limit`], which governs the Active session.
-pub(crate) async fn read_handshake_frame(
+///
+/// `session_id` labels the report: the session's identifier, or, before an
+/// [`AcceptorRegistry`](crate::AcceptorRegistry) has routed the Logon to a
+/// session, a fixed label that names no counterparty.
+pub(crate) async fn read_handshake_frame<S>(
     framed: &mut FixFramed,
     logon_timeout: Duration,
-    session_id: &SessionId,
-) -> HandshakeRead {
+    session_id: &S,
+) -> HandshakeRead
+where
+    S: std::fmt::Display + Sync + ?Sized,
+{
     let mut skips = HandshakeSkips::default();
-    let outcome = match timeout(logon_timeout, next_decodable_frame(framed, &mut skips)).await {
-        Err(_) => HandshakeRead::TimedOut,
-        Ok(outcome) => outcome,
-    };
+    let outcome = timeout(logon_timeout, next_decodable_frame(framed, &mut skips))
+        .await
+        .unwrap_or(HandshakeRead::TimedOut);
+    report_handshake_skips(framed, &skips, &outcome, session_id);
+    outcome
+}
+
+/// [`read_handshake_frame`] bounded by a `deadline` instead of a duration, so
+/// a caller can bound the read and the work that follows it with one budget:
+/// the [`AcceptorRegistry`](crate::AcceptorRegistry) reads a Logon and then
+/// resolves its session within one logon timeout.
+pub(crate) async fn read_handshake_frame_until<S>(
+    framed: &mut FixFramed,
+    deadline: tokio::time::Instant,
+    session_id: &S,
+) -> HandshakeRead
+where
+    S: std::fmt::Display + Sync + ?Sized,
+{
+    let mut skips = HandshakeSkips::default();
+    let outcome = tokio::time::timeout_at(deadline, next_decodable_frame(framed, &mut skips))
+        .await
+        .unwrap_or(HandshakeRead::TimedOut);
+    report_handshake_skips(framed, &skips, &outcome, session_id);
+    outcome
+}
+
+/// Reports the frames a handshake read skipped, once, when it ends: as a
+/// warning that the handshake failed after them, or that it succeeded despite
+/// them. Counts and the session label only, never frame bytes. Drains the
+/// codec's garbled count, so nothing skipped during the handshake counts
+/// toward [`SessionConfig::garbled_frame_limit`].
+fn report_handshake_skips<S>(
+    framed: &mut FixFramed,
+    skips: &HandshakeSkips,
+    outcome: &HandshakeRead,
+    session_id: &S,
+) where
+    S: std::fmt::Display + ?Sized,
+{
     let framing = framed.codec_mut().take_garbled_count();
     if framing > 0 || skips.garbled > 0 || skips.malformed > 0 {
         let succeeded = matches!(outcome, HandshakeRead::Frame(_));
@@ -395,7 +438,6 @@ pub(crate) async fn read_handshake_frame(
             "ignored undecodable inbound frame(s) during the Logon handshake"
         );
     }
-    outcome
 }
 
 /// Frames that framed but did not decode during one handshake read, for the
