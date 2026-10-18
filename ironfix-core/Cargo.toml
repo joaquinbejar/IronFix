@@ -22,3 +22,11 @@ rust_decimal.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
+dhat.workspace = true
+
+# Installs dhat as the global allocator to count the allocations of the
+# `Timestamp` formatters, so it runs as its own binary without the libtest
+# harness: no other test and no harness thread allocates while it measures.
+[[test]]
+name = "timestamp_allocations"
+harness = false

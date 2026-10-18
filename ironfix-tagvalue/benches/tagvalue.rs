@@ -16,6 +16,8 @@
 //!   built inline by the `Encoder` under test.
 //! - `tagvalue/checksum` — `calculate_checksum` across payload sizes, with the
 //!   scalar `format`/`parse` of the tag 10 field in `tagvalue/checksum_field`.
+//! - `tagvalue/sending_time` — `Timestamp::format_millis` and `format_micros`,
+//!   the UTCTimestamp an outbound header stamps as `SendingTime` (52).
 //!
 //! This harness only makes measurement possible. It records no baseline and
 //! asserts no latency or throughput figure: run `make bench` to obtain numbers
@@ -24,6 +26,7 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use ironfix_core::Timestamp;
 use ironfix_tagvalue::checksum::{format_checksum, parse_checksum};
 use ironfix_tagvalue::{Decoder, Encoder, calculate_checksum};
 
@@ -167,5 +170,32 @@ fn bench_checksum(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_decode, bench_encode, bench_checksum);
+fn bench_sending_time(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tagvalue/sending_time");
+
+    // 2024-02-29T12:34:56.789012345Z: a fixed instant, so the clock read
+    // stays out of the measurement.
+    let stamp = match Timestamp::from_nanos(1_709_210_096_789_012_345) {
+        Ok(stamp) => stamp,
+        Err(err) => panic!("bench instant is representable: {err}"),
+    };
+
+    group.bench_function("format_millis", |b| {
+        b.iter(|| black_box(black_box(stamp).format_millis()));
+    });
+
+    group.bench_function("format_micros", |b| {
+        b.iter(|| black_box(black_box(stamp).format_micros()));
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_decode,
+    bench_encode,
+    bench_checksum,
+    bench_sending_time
+);
 criterion_main!(benches);
