@@ -46,7 +46,7 @@ The architecture prioritizes three often-competing goals through careful design 
 *Status: partially built. The tag=value decoder is zero-copy — parsed field values borrow the input buffer and are never copied — and the encoder targets a pre-allocated buffer. The decoder's field index is a `SmallVec<[FieldRef; 32]>` that stays inline for the first 32 fields and spills to the heap only for a message with more than 32 fields. Arena allocation is not implemented — there is no `bumpalo` dependency. Nothing is measured.*
 
 **Compile-time correctness** leverages Rust's type system for session state machines (typestate pattern), message validation, and field access. Generated code from FIX dictionaries provides type-safe field accessors, catching errors at compile time rather than runtime.
-*Status: partially built. The session FSM is a sealed typestate today. The `ironfix-derive` macros generate real `FixMessage` / `FixField` implementations and `ironfix-codegen` emits message structs from a `Dictionary`, but nothing in the workspace consumes either, so field access on the session path is still untyped tag lookup.*
+*Status: partially built. The session FSM is a sealed typestate today. The `ironfix-derive` macros generate real `FixMessage` / `FixField` implementations, and `ironfix-codegen` emits message structs from a `Dictionary` and, opt-in, borrowed views with typed accessors, enumerations with an `Other` fallback, static group layouts and body writers (ADR-0012). Nothing in the workspace consumes any of them, so field access on the session path is still untyped tag lookup.*
 
 **Flexible deployment** supports both ultra-low-latency synchronous modes (kernel bypass, busy-polling) and standard async Tokio patterns for applications where operational simplicity matters more than tail latency.
 *Status: not built. IronFix is async-only. There is no synchronous mode, no kernel bypass and no busy-polling path.*
@@ -669,7 +669,7 @@ impl MessageProcessor {
 
 ### Decision 4: Code generation with runtime fallback
 
-**Status: only the fallback is in use.** The runtime dictionary path (`ironfix-dictionary`) works. The generators exist (`ironfix-derive` implements `#[derive(FixMessage)]` / `#[derive(FixField)]`, and `ironfix-codegen` emits data-only message structs that carry no trait impls), but nothing in the workspace consumes them. The code below is a design sketch, not the shipped generator; see the `ironfix-derive` and `ironfix-codegen` crate docs for the real attribute syntax and output.
+**Status: only the fallback is in use.** The runtime dictionary path (`ironfix-dictionary`) works. The generators exist (`ironfix-derive` implements `#[derive(FixMessage)]` / `#[derive(FixField)]`; `ironfix-codegen` emits data-only message structs that carry no trait impls and, through the opt-in `CodeGenerator::generate_views`, borrowed message views, enumerations, `const` group layouts for the group reader, and body writers to a generated `Sink`; see `doc/adr/0012-generated-views-enums-and-writers.md`), but nothing in the workspace consumes them. The code below is a design sketch, not the shipped generator; see the `ironfix-derive` and `ironfix-codegen` crate docs for the real attribute syntax and output.
 
 **Rationale**: Generated code provides type safety and compile-time validation, but runtime dictionary support enables flexibility for custom tags and exchange-specific variations.
 

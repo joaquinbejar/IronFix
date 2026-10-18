@@ -99,7 +99,9 @@ exists yet.
   groups at compile time with `GroupSpec` / `GroupSet`), then read a decoded
   message's groups as borrowed views: `layout.read(&msg, 453)` checks the
   whole group with the validator's own walk and yields one `GroupEntry` per
-  entry, with own-level field lookup and nested groups. A malformed group is
+  entry, with own-level field lookup and nested groups; `GroupSet::field`
+  finds a message-level field without taking the same tag inside a group
+  entry for it. A malformed group is
   a typed `GroupError`, never a partial view. A successful read (iteration
   and field lookup included) and a read that fails with a structural error
   allocate nothing, for groups of up to 512 entry-level members (every group
@@ -113,7 +115,18 @@ exists yet.
   `DecodeError` / `EncodeError` paths (compile-tested in
   `ironfix-derive/tests/`), and `ironfix-codegen` emits Rust from a loaded
   `Dictionary` (a golden sample and the full FIX 4.2 and FIXT 1.1 outputs are
-  compile-tested in `ironfix-codegen/tests/`).
+  compile-tested in `ironfix-codegen/tests/`). Opt-in,
+  `CodeGenerator::generate_views` emits borrowed message views with typed
+  accessors (`rust_decimal::Decimal` for prices and quantities), an
+  enumeration per field with declared values (an undeclared value reads as
+  `Other`), `const` group layouts for the group reader, and writers that send
+  a body, groups in dictionary order, to a `FnMut(u32, &[u8])` closure or a
+  generated `Sink`. The output carries no `#[allow]`; its golden files (a
+  sample, FIXT 1.1, and FIX 4.4 Heartbeat, Logon and NewOrderSingle) are
+  compiled and exercised against real frames in
+  `ironfix-codegen/tests/generated_views.rs`; the full FIX 4.4, 4.2 and
+  5.0 SP2 outputs were checked with clippy out of tree only
+  (`doc/adr/0012-generated-views-enums-and-writers.md`).
 - **FAST primitives** in `ironfix-fast`: stop-bit encode/decode of unsigned
   and signed integers, ASCII strings and byte vectors, each in nullable and
   non-nullable form, plus presence maps, all round-trip tested. The `Operator`
@@ -170,8 +183,11 @@ around it.
   it with `Dictionary::from_quickfix_xml` and compose that
   (`ironfix-dictionary/spec/README.md`).
 - **Generated code has no consumer.** Nothing in the workspace uses the
-  derives or `ironfix-codegen` output, so field access on the session path is
-  untyped tag lookup (`ironfix-codegen/src/lib.rs`).
+  derives or `ironfix-codegen` output (data structs or views), so field
+  access on the session path is untyped tag lookup
+  (`ironfix-codegen/src/lib.rs`). Generated views cover the message body
+  only, and are generated from one dictionary: a FIXT.1.1 + FIX 5.0
+  composition is not an input.
 - **FAST has no template layer.** There is no FAST template XML parser, no
   operator application (copy, delta, increment, tail), no decimal codec and no
   sequence decoding, so `ironfix-fast` decodes the fields of a message only when
@@ -223,7 +239,7 @@ by quickfixengine.org (<http://www.quickfixengine.org/>).
 | `ironfix-store` | The `MessageStore` trait, `MemoryStore`, and the persistent `FileStore` |
 | `ironfix-transport` | `FixCodec`, a Tokio codec that frames FIX messages. No TCP helpers, no TLS |
 | `ironfix-fast` | FAST encoding/decoding primitives: stop-bit, presence maps, the operator table. No template layer |
-| `ironfix-codegen` | Build-time Rust generation from a `Dictionary` (no in-workspace consumer) |
+| `ironfix-codegen` | Build-time Rust generation from a `Dictionary`: data structs, and opt-in views, enumerations and writers (no in-workspace consumer) |
 | `ironfix-derive` | `#[derive(FixMessage)]` / `#[derive(FixField)]` for the `ironfix-core` traits (no in-workspace consumer) |
 | `ironfix-engine` | The composition root: `Initiator`, `Acceptor`, `EngineBuilder`, `Connection`, the `Application` trait |
 | `ironfix-example` | Umbrella facade (`prelude`) plus the runnable examples |
