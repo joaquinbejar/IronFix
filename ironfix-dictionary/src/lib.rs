@@ -44,8 +44,10 @@
 //!   borrowed views: [`GroupEntries`] yields one [`GroupEntry`] per entry,
 //!   with own-level field lookup and nested groups. The whole group is
 //!   checked up front with the validator's own positional walk, so a
-//!   malformed group is a [`GroupError`], never a partial view, and the read
-//!   path allocates nothing
+//!   malformed group is a [`GroupError`], never a partial view. A successful
+//!   read, and one that fails with a structural error, allocate nothing for
+//!   groups of up to 512 entry-level members (every embedded group); see the
+//!   [`group`] module docs for the error paths that do
 //!
 //! This product includes software developed by quickfixengine.org
 //! (<http://www.quickfixengine.org/>).

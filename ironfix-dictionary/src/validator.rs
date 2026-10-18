@@ -77,9 +77,10 @@
 //!   problems it rejects with `SessionRejectReason(373)=1` (required tag
 //!   missing); this validator reports the group's structural error and
 //!   suppresses that group's per-entry errors.
-//! - **Missing tags are reported in schema order.** QuickFIX reports the
-//!   lowest missing tag number first; this validator reports them in the
-//!   order its expanded schema lists them (see the error order below).
+//! - **Missing tags are not reported lowest first.** QuickFIX reports the
+//!   lowest missing tag number first. This validator reports missing fields
+//!   in the order its expanded schema lists them, and missing groups by
+//!   ascending count tag after every missing field (see "Error order" below).
 //!
 //! # How groups are checked
 //!
@@ -129,18 +130,48 @@
 //! own per-entry errors, not those of the entry that encloses it. A count of
 //! `0` with no entries checks nothing.
 //!
-//! Error order. Within an entry: first the group's own required fields, in
-//! declaration order; then the required members contributed by components
-//! referenced as required, component by component in declaration order (a
-//! component's own fields, then the components it references, depth first);
-//! then missing required nested groups by ascending count tag. Each tag is
-//! reported once, at its first position. A field declared *after* a component
-//! is therefore reported before that component's members: [`GroupDef`](crate::schema::GroupDef) keeps a
-//! group's fields, groups and components in separate lists, so their
-//! interleaving in the XML is not available to the validator. Across entries,
-//! errors come in the order entries close, so a nested group's entries come
-//! before the entry that encloses them. All per-entry errors follow the
-//! message's structural errors.
+//! Order of per-entry errors. Within an entry: first the group's own required
+//! fields, in declaration order; then the required members contributed by
+//! components referenced as required, component by component in declaration
+//! order (a component's own fields, then the components it references, depth
+//! first); then missing required nested groups by ascending count tag. Each
+//! tag is reported once, at its first position. A field declared *after* a
+//! component is therefore reported before that component's members:
+//! [`GroupDef`](crate::schema::GroupDef) keeps a group's fields, groups and
+//! components in separate lists, so their interleaving in the XML is not
+//! available to the validator. Across entries, errors come in the order
+//! entries close, so a nested group's entries come before the entry that
+//! encloses them.
+//!
+//! # Error order
+//!
+//! [`Validator::validate`] reports errors in a fixed order, the same on every
+//! run and for every load of the same dictionary, under [`Validator::new`] and
+//! [`Validator::for_session`] alike:
+//!
+//! 1. [`ValidationError::BeginStringMismatch`] (for a session only).
+//! 2. [`ValidationError::UnknownMsgType`], after which nothing else is checked.
+//! 3. Schema errors of the message's expanded schema
+//!    ([`ValidationError::SchemaTooDeep`], [`ValidationError::SchemaTooLarge`],
+//!    [`ValidationError::UnknownComponent`]), in expansion order.
+//! 4. Value errors ([`ValidationError::UnknownTag`],
+//!    [`ValidationError::InvalidFieldFormat`],
+//!    [`ValidationError::InvalidEnumValue`]), at most one per field, in wire
+//!    order.
+//! 5. Structural errors, in the order a single walk over the message meets
+//!    them: [`ValidationError::DuplicateTag`] and
+//!    [`ValidationError::FieldNotAllowedForMessage`] at the message level,
+//!    and for each group instance its count, delimiter and repeated-tag
+//!    errors as they appear, with its count mismatch when the instance ends
+//!    (a nested group's before its enclosing group's).
+//! 6. Per-entry errors ([`ValidationError::MissingRequiredFieldInGroupEntry`])
+//!    of the well-formed group instances, in the order above.
+//! 7. [`ValidationError::MissingRequiredField`] in schema order: header
+//!    fields, trailer fields, the message's own fields, then the members of
+//!    required components, depth first, each in declaration order.
+//! 8. [`ValidationError::MissingRequiredGroup`] by ascending count tag.
+//! 9. [`ValidationError::ErrorLimitReached`], last, when the output was
+//!    capped.
 //!
 //! **Behaviour change.** Before per-entry checking existed, a message whose
 //! group entries lacked required members validated; it is now rejected, so
@@ -902,7 +933,7 @@ impl<'s> walk::Visitor<'s> for Checks<'_, '_, '_> {
         });
     }
 
-    fn leave_group(&mut self, _group: GroupSpec<'s>, well_formed: bool) {
+    fn leave_group(&mut self, _group: GroupSpec<'s>, well_formed: bool, _entries: u64) {
         let Some(pending) = self.stack.pop() else {
             return;
         };
@@ -1716,11 +1747,57 @@ mod tests {
         }));
     }
 
+    /// A MarketDataRequest (35=V) without its two required groups,
+    /// NoRelatedSym(146) and NoMDEntryTypes(267).
+    const MARKET_DATA_REQUEST_WITHOUT_GROUPS: [&str; 11] = [
+        "8=FIX.4.4",
+        "9=100",
+        "35=V",
+        "49=SENDER",
+        "56=TARGET",
+        "34=1",
+        "52=20260712-10:00:00",
+        "262=REQ-1",
+        "263=1",
+        "264=1",
+        "10=000",
+    ];
+
+    /// The two missing-group errors, in their documented order: ascending
+    /// count tag.
+    fn missing_market_data_groups() -> Vec<ValidationError> {
+        vec![
+            ValidationError::MissingRequiredGroup {
+                count_tag: 146,
+                name: "NoRelatedSym".to_string(),
+            },
+            ValidationError::MissingRequiredGroup {
+                count_tag: 267,
+                name: "NoMDEntryTypes".to_string(),
+            },
+        ]
+    }
+
     #[test]
     fn test_validate_missing_required_group_is_reported() {
-        // MarketDataRequest(V) requires NoMDEntryTypes(267) and
-        // NoRelatedSym(146); omitting both must name both groups.
-        let found = errors(validate(&[
+        // Both groups are named, in ascending count-tag order, and the order
+        // is the same on every run.
+        let first = validate(&MARKET_DATA_REQUEST_WITHOUT_GROUPS);
+        assert_eq!(first, Err(missing_market_data_groups()));
+        for _ in 0..16 {
+            assert_eq!(validate(&MARKET_DATA_REQUEST_WITHOUT_GROUPS), first);
+        }
+    }
+
+    #[test]
+    fn test_validate_error_order_is_identical_across_runs_and_dictionary_reloads() {
+        // One error of each kind the order documents, from one message: a
+        // value error (263=9 is not a SubscriptionRequestType), a structural
+        // error (Symbol(55) is not a MarketDataRequest field), a missing field
+        // (MDReqID(262)) and two missing groups. Each fresh load of the same
+        // XML builds its own hash maps, so a hash-ordered error list would
+        // differ between loads.
+        let message = [
             "8=FIX.4.4",
             "9=100",
             "35=V",
@@ -1728,19 +1805,39 @@ mod tests {
             "56=TARGET",
             "34=1",
             "52=20260712-10:00:00",
-            "262=REQ-1",
-            "263=1",
+            "263=9",
             "264=1",
+            "55=EURUSD",
             "10=000",
-        ]));
-        assert!(found.contains(&ValidationError::MissingRequiredGroup {
-            count_tag: 267,
-            name: "NoMDEntryTypes".to_string(),
-        }));
-        assert!(found.contains(&ValidationError::MissingRequiredGroup {
-            count_tag: 146,
-            name: "NoRelatedSym".to_string(),
-        }));
+        ];
+        let mut expected = vec![
+            ValidationError::InvalidEnumValue {
+                tag: 263,
+                name: "SubscriptionRequestType".to_string(),
+                value: "9".to_string(),
+            },
+            ValidationError::FieldNotAllowedForMessage {
+                tag: 55,
+                msg_type: "V".to_string(),
+            },
+            ValidationError::MissingRequiredField {
+                tag: 262,
+                name: "MDReqID".to_string(),
+            },
+        ];
+        expected.extend(missing_market_data_groups());
+        let expected = Err(expected);
+
+        assert_eq!(validate(&message), expected);
+        for _ in 0..4 {
+            let reloaded = ok(
+                Dictionary::from_quickfix_xml(include_str!("../spec/FIX44.xml")),
+                "FIX 4.4 reloads",
+            );
+            for _ in 0..4 {
+                assert_eq!(validate_with(&reloaded, &message), expected);
+            }
+        }
     }
 
     /// Expands every message `body` defines, with its header and trailer

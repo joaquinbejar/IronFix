@@ -37,6 +37,9 @@ pub(crate) struct Level {
     /// Groups that may open at this level. Sorted by count tag and unique
     /// once the level is finished; the first expansion of a count tag wins.
     pub(crate) groups: Vec<LayoutGroup>,
+    /// The count tags of `groups`, in the same order: a dense array to search
+    /// instead of the groups themselves.
+    pub(crate) group_tags: Vec<u32>,
 }
 
 impl Level {
@@ -57,6 +60,7 @@ impl Level {
         self.members.dedup();
         self.groups.sort_by_key(|group| group.count_tag);
         self.groups.dedup_by_key(|group| group.count_tag);
+        self.group_tags = self.groups.iter().map(|group| group.count_tag).collect();
     }
 
     /// Returns true if `tag` may appear at this level.
@@ -67,8 +71,8 @@ impl Level {
     /// Returns the group whose count field is `count_tag`, if one may open at
     /// this level.
     pub(crate) fn group(&self, count_tag: u32) -> Option<&LayoutGroup> {
-        self.groups
-            .binary_search_by_key(&count_tag, |group| group.count_tag)
+        self.group_tags
+            .binary_search(&count_tag)
             .ok()
             .and_then(|index| self.groups.get(index))
     }

@@ -45,12 +45,20 @@
 //!   absent group is `Ok(None)`.
 //! - **Top-level means top-level.** [`MessageLayout::read`] finds the count
 //!   field at the message level only: the same tag inside another group's
-//!   entries is skipped with that group.
-//! - **No allocation on the read path.** Reading, iterating entries, looking
-//!   up fields and reading nested groups borrow ranges of the message's field
-//!   list and allocate nothing, for every group whose entry level has at most
-//!   1024 member tags (every group of the embedded dictionaries).
-//!   `tests/group_reader_allocations.rs` proves it with a counting allocator.
+//!   entries is skipped with that group. One read is one pass over the
+//!   message: the group asked for is checked while it is located, and the
+//!   rest of the message is still scanned so a second instance of its count
+//!   field is reported ([`GroupError::DuplicateGroup`]).
+//! - **No allocation on the read path.** A successful read, iterating its
+//!   entries, looking fields up and reading nested groups borrow ranges of the
+//!   message's field list and allocate nothing; so does a read that fails
+//!   with a structural error (count, delimiter, repeated tag, depth). This
+//!   holds for every group whose entry level has at most 512 member tags
+//!   (every group of the embedded dictionaries; a wider group allocates one
+//!   small buffer per walk). The error paths that carry strings do allocate
+//!   their error ([`GroupError::MsgTypeMismatch`] holds two).
+//!   `tests/group_reader_allocations.rs` proves the allocation-free paths with
+//!   a counting allocator.
 //! - **Counts are digits.** A count is one or more ASCII digits fitting in a
 //!   `u64`; `+1`, `-1`, `abc` and overflowing values are
 //!   [`GroupError::InvalidCount`].
@@ -60,8 +68,9 @@
 //! [`GroupSpec::new`] and [`GroupSet::new`] are `const fn`s over sorted
 //! `&'static [u32]` tag lists, so generated code can describe a message's
 //! groups as `static` data, with no dictionary at run time, and read them the
-//! same way. Their arguments are checked at construction, so a mistake in
-//! generated tables is a compile-time error.
+//! same way. Their arguments are checked at construction and a bad table is a
+//! [`SpecError`]; in a `const` item that matches the error to a `panic!`, as
+//! generated code should, it becomes a compile error.
 
 use crate::composition::SessionDictionary;
 use crate::schema::Dictionary;
@@ -356,6 +365,7 @@ impl<'s> GroupSpec<'s> {
     }
 
     /// Returns the tag of the count field (NumInGroup).
+    #[inline]
     #[must_use]
     pub const fn count_tag(&self) -> u32 {
         match self.repr {
@@ -365,6 +375,7 @@ impl<'s> GroupSpec<'s> {
     }
 
     /// Returns the tag every entry starts with.
+    #[inline]
     #[must_use]
     pub const fn delimiter_tag(&self) -> u32 {
         match self.repr {
@@ -375,6 +386,7 @@ impl<'s> GroupSpec<'s> {
 
     /// Returns the tags that may appear at an entry's own level, ascending:
     /// the delimiter, the member fields, and the count tags of nested groups.
+    #[inline]
     #[must_use]
     pub fn members(&self) -> &'s [u32] {
         match self.repr {
@@ -384,6 +396,7 @@ impl<'s> GroupSpec<'s> {
     }
 
     /// Returns true if `tag` may appear at an entry's own level.
+    #[inline]
     #[must_use]
     pub fn is_member(&self, tag: u32) -> bool {
         self.members().binary_search(&tag).is_ok()
@@ -403,7 +416,10 @@ impl<'s> GroupSpec<'s> {
                 repr: SetRepr::Static(nested),
             },
             SpecRepr::Layout(group) => GroupSet {
-                repr: SetRepr::Layout(&group.entry.groups),
+                repr: SetRepr::Layout {
+                    groups: &group.entry.groups,
+                    tags: &group.entry.group_tags,
+                },
             },
         }
     }
@@ -412,8 +428,14 @@ impl<'s> GroupSpec<'s> {
 /// How a [`GroupSet`] is stored.
 #[derive(Debug, Clone, Copy)]
 enum SetRepr<'s> {
+    /// Static specs, searched by count tag directly.
     Static(&'s [GroupSpec<'s>]),
-    Layout(&'s [LayoutGroup]),
+    /// A layout's groups, with their count tags in a dense sorted array that
+    /// is searched instead of the groups themselves.
+    Layout {
+        groups: &'s [LayoutGroup],
+        tags: &'s [u32],
+    },
 }
 
 /// Sibling groups, searchable by count tag: the groups that may open at a
@@ -444,7 +466,7 @@ impl<'s> GroupSet<'s> {
     pub const fn len(&self) -> usize {
         match self.repr {
             SetRepr::Static(groups) => groups.len(),
-            SetRepr::Layout(groups) => groups.len(),
+            SetRepr::Layout { groups, .. } => groups.len(),
         }
     }
 
@@ -463,8 +485,8 @@ impl<'s> GroupSet<'s> {
                 .ok()
                 .and_then(|index| groups.get(index))
                 .copied(),
-            SetRepr::Layout(groups) => groups
-                .binary_search_by_key(&count_tag, |group| group.count_tag)
+            SetRepr::Layout { groups, tags } => tags
+                .binary_search(&count_tag)
                 .ok()
                 .and_then(|index| groups.get(index))
                 .map(GroupSpec::from_layout),
@@ -472,10 +494,14 @@ impl<'s> GroupSet<'s> {
     }
 
     /// Returns the groups, ascending by count tag.
-    pub fn iter(&self) -> impl Iterator<Item = GroupSpec<'s>> + 's {
+    ///
+    /// The iterator borrows the groups (`'s`), not this `GroupSet`, so it can
+    /// outlive a temporary set: `layout.groups().iter()` may be returned from
+    /// a function.
+    pub fn iter(&self) -> impl Iterator<Item = GroupSpec<'s>> + use<'s> {
         let (statics, layouts): (&'s [GroupSpec<'s>], &'s [LayoutGroup]) = match self.repr {
             SetRepr::Static(groups) => (groups, &[]),
-            SetRepr::Layout(groups) => (&[], groups),
+            SetRepr::Layout { groups, .. } => (&[], groups),
         };
         statics
             .iter()
@@ -488,8 +514,10 @@ impl<'s> GroupSet<'s> {
     ///
     /// The count field is looked for at the message level only: the runs of
     /// the other groups of the set are skipped, so the same tag inside one of
-    /// their entries is not taken for it. The whole instance is then checked,
-    /// nested groups included, before any view is handed out.
+    /// their entries is not taken for it. The instance is checked as it is
+    /// located, nested groups included, before any view is handed out. The
+    /// message is scanned once, to its end, so a second instance of the count
+    /// field is caught.
     ///
     /// # Errors
     /// [`GroupError::NotInLayout`] if `count_tag` is not a group of the set,
@@ -505,25 +533,27 @@ impl<'s> GroupSet<'s> {
             return Err(GroupError::NotInLayout { count_tag });
         };
         let fields = msg.field_slice();
-        let mut found: Option<usize> = None;
+        let mut found: Option<GroupEntries<'m, 'a, 's>> = None;
         let mut index = 0;
         while let Some(field) = fields.get(index) {
-            let Some(group) = self.get(field.tag) else {
-                index += 1;
-                continue;
-            };
             if field.tag == count_tag {
                 if found.is_some() {
                     return Err(GroupError::DuplicateGroup { count_tag });
                 }
-                found = Some(index);
+                // Check the instance while locating it: one walk gives both
+                // its verdict and its extent.
+                let mut check = FirstError::default();
+                let end = walk::walk_group(fields, index, spec, 0, &mut check);
+                found = Some(check.into_entries(fields, index, end, spec, 0)?);
+                index = end;
+                continue;
             }
-            index = walk::walk_group(fields, index, group, 0, &mut Skip);
+            index = match self.get(field.tag) {
+                Some(group) => walk::walk_group(fields, index, group, 0, &mut Skip),
+                None => index + 1,
+            };
         }
-        match found {
-            Some(index) => GroupEntries::checked(fields, index, spec, 0).map(Some),
-            None => Ok(None),
-        }
+        Ok(found)
     }
 }
 
@@ -538,7 +568,10 @@ impl<'s> GroupSet<'s> {
 #[derive(Debug, Clone)]
 pub struct MessageLayout {
     msg_type: String,
+    /// Top-level groups, sorted by count tag.
     groups: Vec<LayoutGroup>,
+    /// Their count tags, in the same order.
+    group_tags: Vec<u32>,
 }
 
 impl MessageLayout {
@@ -588,6 +621,7 @@ impl MessageLayout {
         Ok(Self {
             msg_type: msg_type.to_string(),
             groups: scope.level.groups,
+            group_tags: scope.level.group_tags,
         })
     }
 
@@ -601,7 +635,10 @@ impl MessageLayout {
     #[must_use]
     pub fn groups(&self) -> GroupSet<'_> {
         GroupSet {
-            repr: SetRepr::Layout(&self.groups),
+            repr: SetRepr::Layout {
+                groups: &self.groups,
+                tags: &self.group_tags,
+            },
         }
     }
 
@@ -634,10 +671,14 @@ impl MessageLayout {
     }
 }
 
-/// Records the first structural error of a walk.
+/// Records the first structural error of a walk, and the number of entries
+/// of the group it walked.
 #[derive(Default)]
 struct FirstError {
     error: Option<GroupError>,
+    /// Entries of the last group instance to end: the walked group itself,
+    /// since its nested groups end before it.
+    entries: u64,
 }
 
 impl FirstError {
@@ -645,6 +686,38 @@ impl FirstError {
         if self.error.is_none() {
             self.error = Some(error);
         }
+    }
+
+    /// Turns a finished walk of the group whose count field is at `index`
+    /// and whose run ends before `end` into its entries, or into the first
+    /// error the walk met.
+    fn into_entries<'m, 'a, 's>(
+        self,
+        fields: &'m [FieldRef<'a>],
+        index: usize,
+        end: usize,
+        spec: GroupSpec<'s>,
+        depth: usize,
+    ) -> Result<GroupEntries<'m, 'a, 's>, GroupError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        // A well-formed instance has as many entries as it declares, each at
+        // least one field long, so the count fits in `usize`.
+        let remaining = usize::try_from(self.entries).map_err(|_| GroupError::CountMismatch {
+            count_tag: spec.count_tag(),
+            declared: self.entries,
+            actual: 0,
+        })?;
+        Ok(GroupEntries {
+            fields,
+            spec,
+            cursor: index + 1,
+            end,
+            next_index: 0,
+            remaining,
+            depth,
+        })
     }
 }
 
@@ -684,6 +757,10 @@ impl<'s> Visitor<'s> for FirstError {
             limit: MAX_SCOPE_DEPTH,
         });
     }
+
+    fn leave_group(&mut self, _group: GroupSpec<'s>, _well_formed: bool, entries: u64) {
+        self.entries = entries;
+    }
 }
 
 /// The entries of one checked group instance, in wire order.
@@ -708,41 +785,29 @@ pub struct GroupEntries<'m, 'a, 's> {
 }
 
 impl<'m, 'a, 's> GroupEntries<'m, 'a, 's> {
-    /// Checks the group instance whose count field is at `index` and, if it
-    /// is well-formed, returns its entries.
-    fn checked(
+    /// Entries of a group instance already checked as part of the instance
+    /// that encloses it: no walk. `fields` is the enclosing entry, so the
+    /// nested run ends within it, and the declared count bounds the
+    /// iteration.
+    fn trusted(
         fields: &'m [FieldRef<'a>],
         index: usize,
         spec: GroupSpec<'s>,
         depth: usize,
-    ) -> Result<Self, GroupError> {
-        let mut check = FirstError::default();
-        let end = walk::walk_group(fields, index, spec, depth, &mut check);
-        if let Some(error) = check.error {
-            return Err(error);
-        }
+    ) -> Self {
         let declared = fields
             .get(index)
             .and_then(|field| walk::parse_count(field.value))
-            .ok_or(GroupError::InvalidCount {
-                count_tag: spec.count_tag(),
-            })?;
-        // A well-formed group has exactly `declared` entries, each holding at
-        // least its delimiter field, so the count fits in `usize`.
-        let remaining = usize::try_from(declared).map_err(|_| GroupError::CountMismatch {
-            count_tag: spec.count_tag(),
-            declared,
-            actual: 0,
-        })?;
-        Ok(Self {
+            .unwrap_or(0);
+        Self {
             fields,
             spec,
             cursor: index + 1,
-            end,
+            end: fields.len(),
             next_index: 0,
-            remaining,
+            remaining: usize::try_from(declared).unwrap_or(0),
             depth,
-        })
+        }
     }
 
     /// Returns the group's structure.
@@ -762,9 +827,11 @@ impl<'m, 'a, 's> Iterator for GroupEntries<'m, 'a, 's> {
     type Item = GroupEntry<'m, 'a, 's>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.cursor >= self.end || self.remaining == 0 {
+        if self.cursor >= self.end {
             return None;
         }
+        let remaining = self.remaining.checked_sub(1)?;
+        let next_index = self.next_index.checked_add(1)?;
         let start = self.cursor;
         let stop = walk::entry_end(self.fields, start, self.spec, self.depth);
         let entry_fields = self.fields.get(start..stop)?;
@@ -775,8 +842,8 @@ impl<'m, 'a, 's> Iterator for GroupEntries<'m, 'a, 's> {
             depth: self.depth,
         };
         self.cursor = stop;
-        self.next_index += 1;
-        self.remaining -= 1;
+        self.next_index = next_index;
+        self.remaining = remaining;
         Some(entry)
     }
 
@@ -801,6 +868,7 @@ pub struct GroupEntry<'m, 'a, 's> {
 
 impl<'m, 'a, 's> GroupEntry<'m, 'a, 's> {
     /// Returns the entry's 0-based index within its group instance.
+    #[inline]
     #[must_use]
     pub const fn index(&self) -> u64 {
         self.index
@@ -814,6 +882,10 @@ impl<'m, 'a, 's> GroupEntry<'m, 'a, 's> {
 
     /// Returns the entry's fields in wire order, starting with its delimiter,
     /// the fields of groups nested in it included.
+    ///
+    /// A borrowed slice, free to call: for reading several fields of an entry
+    /// in one pass, iterate it instead of calling [`GroupEntry::get`] per tag.
+    #[inline]
     #[must_use]
     pub const fn fields(&self) -> &'m [FieldRef<'a>] {
         self.fields
@@ -821,6 +893,11 @@ impl<'m, 'a, 's> GroupEntry<'m, 'a, 's> {
 
     /// Returns the field `tag` at the entry's own level: a field of a group
     /// nested in the entry is not returned, even if it carries the same tag.
+    ///
+    /// Linear in the entry's length (nested groups are skipped run by run),
+    /// with no allocation. To read many tags of one entry, a single pass over
+    /// [`GroupEntry::fields`] is cheaper than one `get` per tag.
+    #[inline]
     #[must_use]
     pub fn get(&self, tag: u32) -> Option<&'m FieldRef<'a>> {
         self.find(tag).and_then(|index| self.fields.get(index))
@@ -838,22 +915,23 @@ impl<'m, 'a, 's> GroupEntry<'m, 'a, 's> {
         let Some(nested) = self.spec.nested(count_tag) else {
             return Err(GroupError::NotInLayout { count_tag });
         };
-        match self.find(count_tag) {
-            Some(index) => {
-                GroupEntries::checked(self.fields, index, nested, self.depth + 1).map(Some)
-            }
-            None => Ok(None),
-        }
+        Ok(self
+            .find(count_tag)
+            .map(|index| GroupEntries::trusted(self.fields, index, nested, self.depth + 1)))
     }
 
     /// Returns the position, within the entry, of `tag` at its own level.
     fn find(&self, tag: u32) -> Option<usize> {
+        let nested_groups = self.spec.nested_groups();
+        if nested_groups.is_empty() {
+            return self.fields.iter().position(|field| field.tag == tag);
+        }
         let mut index = 0;
         while let Some(field) = self.fields.get(index) {
             if field.tag == tag {
                 return Some(index);
             }
-            index = match self.spec.nested(field.tag) {
+            index = match nested_groups.get(field.tag) {
                 Some(nested) => {
                     walk::walk_group(self.fields, index, nested, self.depth + 1, &mut Skip)
                 }
@@ -1590,5 +1668,117 @@ mod tests {
         ] {
             assert_eq!(walk::parse_count(bad), None, "{bad:?}");
         }
+    }
+
+    /// Returns the top-level count tags of `layout`. Compiles only because
+    /// [`GroupSet::iter`] borrows the groups, not the temporary set
+    /// `layout.groups()` returns.
+    fn top_level_count_tags(layout: &MessageLayout) -> impl Iterator<Item = u32> + '_ {
+        layout.groups().iter().map(|spec| spec.count_tag())
+    }
+
+    /// The same pattern for a nested set: the iterator outlives the
+    /// temporary returned by `nested_groups()`.
+    fn nested_count_tags(spec: GroupSpec<'_>) -> impl Iterator<Item = u32> + '_ {
+        spec.nested_groups().iter().map(|nested| nested.count_tag())
+    }
+
+    #[test]
+    fn test_group_set_iter_outlives_a_temporary_set() {
+        let layout = fix44_layout("D");
+        let tags: Vec<u32> = top_level_count_tags(&layout).collect();
+        assert!(tags.contains(&453));
+        assert!(tags.contains(&627));
+        let Some(parties) = layout.group(453) else {
+            panic!("NoPartyIDs is a top-level group of NewOrderSingle");
+        };
+        assert_eq!(nested_count_tags(parties).collect::<Vec<_>>(), vec![802]);
+        assert_eq!(nested_count_tags(PARTIES).collect::<Vec<_>>(), vec![802]);
+    }
+
+    #[test]
+    fn test_read_nested_group_followed_by_its_entry_own_fields() {
+        // NoPartySubIDs(802) sits in the middle of the party entry: its run
+        // ends at PartyIDSource(447), which belongs to the party again.
+        let layout = fix44_layout("D");
+        let frame = frame(
+            "D",
+            &order_with(&[
+                "453=1",
+                "448=BROKER-A",
+                "802=1",
+                "523=SUB-1",
+                "447=D",
+                "452=7",
+            ]),
+        );
+        let msg = decode(&frame);
+        let Some(mut parties) = ok(layout.read(&msg, 453), "NoPartyIDs reads") else {
+            panic!("NoPartyIDs is present");
+        };
+        let Some(party) = parties.next() else {
+            panic!("one party");
+        };
+        assert_eq!(party.get(447).map(|field| field.value), Some(&b"D"[..]));
+        assert_eq!(party.get(452).map(|field| field.value), Some(&b"7"[..]));
+        let Some(sub_ids) = ok(party.group(802), "NoPartySubIDs reads") else {
+            panic!("the party carries NoPartySubIDs");
+        };
+        assert_eq!(sub_ids.len(), 1);
+        let entries: Vec<GroupEntry<'_, '_, '_>> = sub_ids.collect();
+        let tags: Vec<Vec<u32>> = entries
+            .iter()
+            .map(|entry| entry.fields().iter().map(|field| field.tag).collect())
+            .collect();
+        assert_eq!(tags, vec![vec![523]]);
+    }
+
+    /// A static group wider than the walk's inline seen-tag set: count tag
+    /// 5000, delimiter 10000, and 1100 members 10000..11100, so it spills to
+    /// the heap.
+    fn wide_spec() -> Option<GroupSpec<'static>> {
+        let members: Vec<u32> = (10_000..11_100).collect();
+        assert!(members.len() > walk::INLINE_MEMBERS);
+        let members: &'static [u32] = Box::leak(members.into_boxed_slice());
+        GroupSpec::new(5000, 10_000, members, &[]).ok()
+    }
+
+    #[test]
+    fn test_read_group_wider_than_the_inline_seen_set() {
+        let Some(spec) = wide_spec() else {
+            panic!("the wide spec builds");
+        };
+        let groups = [spec];
+        let Ok(set) = GroupSet::new(&groups) else {
+            panic!("a one-group set is valid");
+        };
+
+        // Two entries; the looked-up tags rank above 1024 in the member list.
+        let two = frame(
+            "U1",
+            &["5000=2", "10000=a", "11050=x", "10000=b", "11099=y"],
+        );
+        let msg = decode(&two);
+        let Some(entries) = ok(set.read(&msg, 5000), "wide group reads") else {
+            panic!("the wide group is present");
+        };
+        let collected: Vec<GroupEntry<'_, '_, '_>> = entries.collect();
+        let (Some(first), Some(second)) = (collected.first(), collected.get(1)) else {
+            panic!("two entries");
+        };
+        assert_eq!(first.get(11_050).map(|field| field.value), Some(&b"x"[..]));
+        assert_eq!(second.get(11_099).map(|field| field.value), Some(&b"y"[..]));
+        assert!(first.get(11_099).is_none());
+
+        // A high-ranked tag repeated within one entry is still caught.
+        let repeated = frame("U1", &["5000=1", "10000=a", "11050=x", "11050=y"]);
+        let msg = decode(&repeated);
+        assert_eq!(
+            set.read(&msg, 5000).err(),
+            Some(GroupError::RepeatedTag {
+                count_tag: 5000,
+                tag: 11_050,
+            })
+        );
     }
 }
