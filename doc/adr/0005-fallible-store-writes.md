@@ -129,8 +129,10 @@ take it unchanged when it gets a store (#60).
   `set_next_target_seq` change from `fn(&self, u64)` to
   `async fn(&self, u64) -> Result<(), StoreError>`. Every implementation must
   update both methods, and callers must await them and handle the `Result`.
-  `cargo-semver-checks` may not report a signature change made through
-  `async_trait`, so it is declared here and in the commit footer.
+  `cargo-semver-checks --baseline-rev origin/main` reports it as
+  `trait_method_return_value_added` on both setters; it is also declared here
+  and in the commit footer, because the tool does not describe the `async`
+  half of the change.
 - **Semver (additive):** `ironfix_engine::persistence` module,
   `StoreFailurePolicy` (with `closes_session`), and
   `Initiator::with_store_failure_policy`.
