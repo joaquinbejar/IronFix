@@ -7,9 +7,11 @@
 //! Code generator for FIX dictionaries.
 //!
 //! Generates Rust source code from a loaded [`Dictionary`]: one `u32` constant
-//! per field tag, and one struct per message.
+//! per field tag, and one struct per message ([`CodeGenerator::generate`]);
+//! and, opt-in and in a separate file, borrowed views, enumerations and
+//! writers ([`CodeGenerator::generate_views`]).
 //!
-//! # What the generated code contains
+//! # What the default output contains
 //!
 //! ```text
 //! // Generated FIX.4.4 definitions.
@@ -45,21 +47,24 @@
 //!
 //! # What it does not contain
 //!
-//! The generated structs are **data definitions only**: no `FixMessage`
-//! implementations, no encode/decode. Deriving those is `ironfix-derive`'s job,
-//! and the two are not
-//! wired together — nothing in this workspace consumes either.
+//! The structs of [`CodeGenerator::generate`] are **data definitions only**:
+//! no `FixMessage` implementations, no encode/decode. Reading and writing
+//! typed fields is what the opt-in [`CodeGenerator::generate_views`] output
+//! is for (borrowed views, enumerations, static group layouts and writers; see
+//! `doc/adr/0012-generated-views-enums-and-writers.md`). Nothing in this
+//! workspace consumes either output.
 //!
-//! # Fidelity limits, stated rather than hidden
+//! # Fidelity limits of the default output, stated rather than hidden
 //!
 //! - **Field order is not wire order.** A struct lists its direct fields, then
 //!   the fields contributed by its components, then its repeating groups. The
 //!   QuickFIX XML interleaving is not retained by the loader, so it cannot be
 //!   reproduced here.
-//! - **Component-contributed fields are always optional.** A `MessageDef`
-//!   records the *names* of the components it uses, not whether each is
-//!   required, so a field that is required inside a component is emitted as
-//!   `Option<T>` — the representable choice that cannot be wrong.
+//! - **Component-contributed fields are always optional.** This output
+//!   predates `ComponentRef::required` and keeps a field that is required
+//!   inside a component as `Option<T>`, the representable choice that cannot
+//!   be wrong; changing it would silently change consumers' generated code.
+//!   The views follow the reference's requiredness, as the validator does.
 //! - **Group entries are flattened the same way** and are validated by nothing
 //!   here; conformance checking is `ironfix_dictionary::Validator`.
 
@@ -93,7 +98,7 @@ const NON_RAW_KEYWORDS: [&str; 4] = ["crate", "self", "Self", "super"];
 /// without ever repeating a name — so a hand-built dictionary yields
 /// [`GeneratorError::MaxDepthExceeded`] instead of overflowing the stack. It
 /// matches the loader's `MAX_COMPONENT_DEPTH`.
-const MAX_NESTING_DEPTH: usize = 32;
+pub(crate) const MAX_NESTING_DEPTH: usize = 32;
 
 /// Rust keywords, strict and reserved, that a FIX field name can collide with.
 ///
@@ -289,6 +294,56 @@ impl CodeGenerator {
         }
 
         Ok(code)
+    }
+
+    /// Generates borrowed views, enumerations and writers from a dictionary.
+    ///
+    /// Opt-in and separate from [`CodeGenerator::generate`], whose output it
+    /// does not change: the returned source is a second, self-contained file
+    /// with four modules.
+    ///
+    /// - `enums`: one enumeration per field with declared values that a view
+    ///   or writer uses, with an `Other(&[u8])` variant so an undeclared wire
+    ///   value is still readable. Multi-value fields read and write as tokens.
+    /// - `layouts`: one `ironfix_dictionary::GroupSpec` constant per
+    ///   repeating-group definition and one `ironfix_dictionary::GroupSet`
+    ///   constant per message, built at compile time, so reading needs no
+    ///   dictionary at run time.
+    /// - `views`: one `XxxView<'m, 'a>` per message over a decoded
+    ///   `ironfix_core::message::RawMessage`, and one view type per group
+    ///   definition (shared by every message that uses it), with typed
+    ///   accessors that borrow the decoded buffer.
+    /// - `writers`: one `XxxFields<'v>` per message and group definition,
+    ///   whose `write` sends the body, groups in dictionary order, to any
+    ///   `FnMut(u32, &[u8])` sink.
+    ///
+    /// The generated code depends on the `ironfix-core`,
+    /// `ironfix-dictionary` and `rust_decimal` crates, and contains no
+    /// `#[allow]`. Only [`GeneratorConfig::visibility`] applies: components
+    /// are always expanded, because a view must know every group of a
+    /// message to tell a message-level field from one inside a group.
+    ///
+    /// # Errors
+    /// Returns [`GeneratorError`] under the same fail-closed rules as
+    /// [`CodeGenerator::generate`]: an undefined field or component, a
+    /// component cycle, nesting past the depth limit, or a name with no Rust
+    /// identifier (`what` is then `field`, `message`, `group` or
+    /// `component`).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ironfix_codegen::CodeGenerator;
+    /// use ironfix_dictionary::Dictionary;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let views = CodeGenerator::new().generate_views(Dictionary::fix44()?)?;
+    /// std::fs::write("fix44_views.rs", views)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn generate_views(&self, dict: &Dictionary) -> Result<String, GeneratorError> {
+        crate::views::generate(dict, &self.config.visibility)
     }
 
     /// Emits the `fields` module of tag constants, sorted by tag.
@@ -677,7 +732,7 @@ struct StructFieldModel {
 }
 
 /// Appends `text` and a newline to `code`.
-fn line(code: &mut String, text: &str) {
+pub(crate) fn line(code: &mut String, text: &str) {
     code.push_str(text);
     code.push('\n');
 }
@@ -728,7 +783,7 @@ fn resolve_field_name(
 
 /// Returns a name not already in `used`, disambiguating first by `tag` and
 /// then by a numeric suffix.
-fn unique_name(used: &mut HashSet<String>, base: &str, tag: u32) -> String {
+pub(crate) fn unique_name(used: &mut HashSet<String>, base: &str, tag: u32) -> String {
     if used.insert(base.to_string()) {
         return base.to_string();
     }
@@ -747,7 +802,7 @@ fn unique_name(used: &mut HashSet<String>, base: &str, tag: u32) -> String {
 }
 
 /// Returns a type name not already used in the generated module.
-fn unique_type_name(used: &mut HashSet<String>, candidate: &str) -> String {
+pub(crate) fn unique_type_name(used: &mut HashSet<String>, candidate: &str) -> String {
     if used.insert(candidate.to_string()) {
         return candidate.to_string();
     }
@@ -762,7 +817,7 @@ fn unique_type_name(used: &mut HashSet<String>, candidate: &str) -> String {
 }
 
 /// Returns true if `name` is a Rust keyword.
-fn is_keyword(name: &str) -> bool {
+pub(crate) fn is_keyword(name: &str) -> bool {
     KEYWORDS.contains(&name)
 }
 
@@ -770,7 +825,7 @@ fn is_keyword(name: &str) -> bool {
 ///
 /// A keyword becomes a raw identifier (`yield` -> `r#yield`); the four
 /// keywords that cannot be written raw take a trailing underscore instead.
-fn to_field_ident(name: &str) -> String {
+pub(crate) fn to_field_ident(name: &str) -> String {
     if NON_RAW_KEYWORDS.contains(&name) {
         return format!("{name}_");
     }
@@ -784,7 +839,7 @@ fn to_field_ident(name: &str) -> String {
 ///
 /// Type positions cannot use `r#Self`, so a collision takes a trailing
 /// underscore.
-fn to_type_ident(name: &str) -> String {
+pub(crate) fn to_type_ident(name: &str) -> String {
     if is_keyword(name) {
         return format!("{name}_");
     }
@@ -800,14 +855,14 @@ fn to_type_ident(name: &str) -> String {
 /// possibly hand-built input, so such a name is rejected as a typed
 /// [`GeneratorError::UnnameableItem`] rather than emitted as
 /// `pub const FOO-BAR: u32` that will not compile.
-fn is_valid_ident(ident: &str) -> bool {
+pub(crate) fn is_valid_ident(ident: &str) -> bool {
     let mut chars = ident.chars();
     let starts_valid = matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic());
     starts_valid && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// Converts a string to `SCREAMING_SNAKE_CASE`.
-fn to_screaming_snake_case(s: &str) -> String {
+pub(crate) fn to_screaming_snake_case(s: &str) -> String {
     let mut result = String::new();
     let mut prev_lower = false;
 
@@ -823,7 +878,7 @@ fn to_screaming_snake_case(s: &str) -> String {
 }
 
 /// Converts a string to `snake_case`.
-fn to_snake_case(s: &str) -> String {
+pub(crate) fn to_snake_case(s: &str) -> String {
     let mut result = String::new();
     let mut prev_lower = false;
 
@@ -839,7 +894,7 @@ fn to_snake_case(s: &str) -> String {
 }
 
 /// Converts a string to `PascalCase`.
-fn to_pascal_case(s: &str) -> String {
+pub(crate) fn to_pascal_case(s: &str) -> String {
     let mut result = String::new();
     let mut capitalize_next = true;
 
