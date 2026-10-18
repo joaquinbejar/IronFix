@@ -1,0 +1,26 @@
+[package]
+name = "ironfix-codegen-check"
+description = "Compiles the ironfix-codegen views of embedded dictionaries under the workspace lints (not published)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# A CI check, not a library: never published, and left out of
+# `make publish-all` (PUBLISH_ORDER) and the semver matrix.
+publish = false
+
+# The crates the generated views name.
+[dependencies]
+ironfix-core.workspace = true
+ironfix-dictionary.workspace = true
+rust_decimal.workspace = true
+
+# build.rs generates the views from the embedded dictionaries.
+[build-dependencies]
+ironfix-codegen.workspace = true
+ironfix-dictionary.workspace = true
+
+[dev-dependencies]
+ironfix-tagvalue.workspace = true

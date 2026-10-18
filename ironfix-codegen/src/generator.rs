@@ -7,9 +7,11 @@
 //! Code generator for FIX dictionaries.
 //!
 //! Generates Rust source code from a loaded [`Dictionary`]: one `u32` constant
-//! per field tag, and one struct per message.
+//! per field tag, and one struct per message ([`CodeGenerator::generate`]);
+//! and, opt-in and in a separate file, borrowed views, enumerations and
+//! writers ([`CodeGenerator::generate_views`]).
 //!
-//! # What the generated code contains
+//! # What the default output contains
 //!
 //! ```text
 //! // Generated FIX.4.4 definitions.
@@ -45,21 +47,25 @@
 //!
 //! # What it does not contain
 //!
-//! The generated structs are **data definitions only**: no `FixMessage`
-//! implementations, no encode/decode. Deriving those is `ironfix-derive`'s job,
-//! and the two are not
-//! wired together — nothing in this workspace consumes either.
+//! The structs of [`CodeGenerator::generate`] are **data definitions only**:
+//! no `FixMessage` implementations, no encode/decode. Reading and writing
+//! typed fields is what the opt-in [`CodeGenerator::generate_views`] output
+//! is for (borrowed views, enumerations, static group layouts and writers; see
+//! `doc/adr/0012-generated-views-enums-and-writers.md`). Nothing in this
+//! workspace consumes either output.
 //!
-//! # Fidelity limits, stated rather than hidden
+//! # Fidelity limits of the default output, stated rather than hidden
 //!
 //! - **Field order is not wire order.** A struct lists its direct fields, then
 //!   the fields contributed by its components, then its repeating groups. The
-//!   QuickFIX XML interleaving is not retained by the loader, so it cannot be
-//!   reproduced here.
-//! - **Component-contributed fields are always optional.** A `MessageDef`
-//!   records the *names* of the components it uses, not whether each is
-//!   required, so a field that is required inside a component is emitted as
-//!   `Option<T>` — the representable choice that cannot be wrong.
+//!   dictionary now records the XML order (`members()`), and the views and
+//!   writers follow it; this output keeps its order so that existing
+//!   generated code does not change.
+//! - **Component-contributed fields are always optional.** This output
+//!   predates `ComponentRef::required` and keeps a field that is required
+//!   inside a component as `Option<T>`, the representable choice that cannot
+//!   be wrong; changing it would silently change consumers' generated code.
+//!   The views follow the reference's requiredness, as the validator does.
 //! - **Group entries are flattened the same way** and are validated by nothing
 //!   here; conformance checking is `ironfix_dictionary::Validator`.
 
@@ -93,7 +99,7 @@ const NON_RAW_KEYWORDS: [&str; 4] = ["crate", "self", "Self", "super"];
 /// without ever repeating a name — so a hand-built dictionary yields
 /// [`GeneratorError::MaxDepthExceeded`] instead of overflowing the stack. It
 /// matches the loader's `MAX_COMPONENT_DEPTH`.
-const MAX_NESTING_DEPTH: usize = 32;
+pub(crate) const MAX_NESTING_DEPTH: usize = 32;
 
 /// Rust keywords, strict and reserved, that a FIX field name can collide with.
 ///
@@ -172,6 +178,26 @@ pub enum GeneratorError {
         scope: String,
         /// The nesting-depth ceiling.
         limit: usize,
+    },
+
+    /// A `data` (or `XMLData`) field has no `Length` field to frame it.
+    ///
+    /// Raised by [`CodeGenerator::generate_views`] only. The dictionary does
+    /// not name LENGTH/DATA pairs; a `data` field is paired with the `Length`
+    /// field listed immediately before it, as every pair of the embedded
+    /// dictionaries is listed. A `data` field with no such field before it,
+    /// or one that opens a repeating-group entry (where its length would have
+    /// to come before the delimiter), cannot be written with its count, so a
+    /// decoder would read any SOH in it as a field terminator. The generator
+    /// refuses it rather than emit a writer that corrupts frames.
+    #[error(
+        "{scope}: data field {tag} is not immediately preceded by the length field that frames it"
+    )]
+    UnpairedDataField {
+        /// The `data` field's tag.
+        tag: u32,
+        /// Where it is listed, for example `component Signature`.
+        scope: String,
     },
 }
 
@@ -273,7 +299,7 @@ impl CodeGenerator {
             line(
                 &mut code,
                 &format!(
-                    "{} type {DECIMAL_ALIAS} = rust_decimal::Decimal;",
+                    "{} type {DECIMAL_ALIAS} = ::rust_decimal::Decimal;",
                     self.config.visibility
                 ),
             );
@@ -289,6 +315,64 @@ impl CodeGenerator {
         }
 
         Ok(code)
+    }
+
+    /// Generates borrowed views, enumerations and writers from a dictionary.
+    ///
+    /// Opt-in and separate from [`CodeGenerator::generate`], whose output it
+    /// does not change: the returned source is a second, self-contained file
+    /// with four modules.
+    ///
+    /// - `enums`: one enumeration per field with declared values that a view
+    ///   or writer uses, with an `Other(&[u8])` variant so an undeclared wire
+    ///   value is still readable. Multi-value fields read and write as tokens.
+    /// - `layouts`: one `ironfix_dictionary::GroupSpec` constant per
+    ///   repeating-group definition and one `ironfix_dictionary::GroupSet`
+    ///   constant per message, built at compile time, so reading needs no
+    ///   dictionary at run time.
+    /// - `views`: one `XxxView<'m, 'a>` per message over a decoded
+    ///   `ironfix_core::message::RawMessage`, and one view type per group
+    ///   definition (shared by every message that uses it), with typed
+    ///   accessors that borrow the decoded buffer and check each value
+    ///   against its FIX type's grammar, as the validator does.
+    /// - `writers`: one `XxxFields<'v>` per message and group definition,
+    ///   whose `write` checks every value and then sends the body in XML
+    ///   order (an entry: its delimiter first) to a generated
+    ///   `writers::Sink`: any
+    ///   `FnMut(u32, &[u8])` closure is one, and a target that frames
+    ///   LENGTH/DATA pairs itself (`ironfix_tagvalue::Encoder`,
+    ///   `ironfix_engine::OutboundMessage`) implements it.
+    ///
+    /// The generated code depends on the `ironfix-core`, `rust_decimal` and
+    /// `ironfix-dictionary` `^0.5` crates (it calls `GroupSet::field`,
+    /// `GroupSet::with_level_tags` and `FieldType::is_valid_value`), and contains no
+    /// `#[allow]`. Only [`GeneratorConfig::visibility`] applies: components
+    /// are always expanded, because a view must know every group of a
+    /// message to tell a message-level field from one inside a group.
+    ///
+    /// # Errors
+    /// Returns [`GeneratorError`] under the same fail-closed rules as
+    /// [`CodeGenerator::generate`]: an undefined field or component, a
+    /// component cycle, nesting past the depth limit, or a name with no Rust
+    /// identifier (`what` is then `field`, `message`, `group` or
+    /// `component`); and [`GeneratorError::UnpairedDataField`] for a `data`
+    /// field not listed right after its `Length` field, or opening a group
+    /// entry.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ironfix_codegen::CodeGenerator;
+    /// use ironfix_dictionary::Dictionary;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let views = CodeGenerator::new().generate_views(Dictionary::fix44()?)?;
+    /// std::fs::write("fix44_views.rs", views)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn generate_views(&self, dict: &Dictionary) -> Result<String, GeneratorError> {
+        crate::views::generate(dict, &self.config.visibility)
     }
 
     /// Emits the `fields` module of tag constants, sorted by tag.
@@ -613,7 +697,7 @@ impl CodeGenerator {
                             def.name, def.count_tag
                         ),
                         name: ident,
-                        ty: wrap_optional(&format!("Vec<{entry_name}>"), *required),
+                        ty: wrap_optional(&format!("::std::vec::Vec<{entry_name}>"), *required),
                         uses_decimal: false,
                     });
                 }
@@ -677,7 +761,7 @@ struct StructFieldModel {
 }
 
 /// Appends `text` and a newline to `code`.
-fn line(code: &mut String, text: &str) {
+pub(crate) fn line(code: &mut String, text: &str) {
     code.push_str(text);
     code.push('\n');
 }
@@ -687,7 +771,7 @@ fn wrap_optional(ty: &str, required: bool) -> String {
     if required {
         ty.to_string()
     } else {
-        format!("Option<{ty}>")
+        format!("::core::option::Option<{ty}>")
     }
 }
 
@@ -728,7 +812,7 @@ fn resolve_field_name(
 
 /// Returns a name not already in `used`, disambiguating first by `tag` and
 /// then by a numeric suffix.
-fn unique_name(used: &mut HashSet<String>, base: &str, tag: u32) -> String {
+pub(crate) fn unique_name(used: &mut HashSet<String>, base: &str, tag: u32) -> String {
     if used.insert(base.to_string()) {
         return base.to_string();
     }
@@ -747,7 +831,7 @@ fn unique_name(used: &mut HashSet<String>, base: &str, tag: u32) -> String {
 }
 
 /// Returns a type name not already used in the generated module.
-fn unique_type_name(used: &mut HashSet<String>, candidate: &str) -> String {
+pub(crate) fn unique_type_name(used: &mut HashSet<String>, candidate: &str) -> String {
     if used.insert(candidate.to_string()) {
         return candidate.to_string();
     }
@@ -762,7 +846,7 @@ fn unique_type_name(used: &mut HashSet<String>, candidate: &str) -> String {
 }
 
 /// Returns true if `name` is a Rust keyword.
-fn is_keyword(name: &str) -> bool {
+pub(crate) fn is_keyword(name: &str) -> bool {
     KEYWORDS.contains(&name)
 }
 
@@ -770,7 +854,7 @@ fn is_keyword(name: &str) -> bool {
 ///
 /// A keyword becomes a raw identifier (`yield` -> `r#yield`); the four
 /// keywords that cannot be written raw take a trailing underscore instead.
-fn to_field_ident(name: &str) -> String {
+pub(crate) fn to_field_ident(name: &str) -> String {
     if NON_RAW_KEYWORDS.contains(&name) {
         return format!("{name}_");
     }
@@ -784,7 +868,7 @@ fn to_field_ident(name: &str) -> String {
 ///
 /// Type positions cannot use `r#Self`, so a collision takes a trailing
 /// underscore.
-fn to_type_ident(name: &str) -> String {
+pub(crate) fn to_type_ident(name: &str) -> String {
     if is_keyword(name) {
         return format!("{name}_");
     }
@@ -800,14 +884,14 @@ fn to_type_ident(name: &str) -> String {
 /// possibly hand-built input, so such a name is rejected as a typed
 /// [`GeneratorError::UnnameableItem`] rather than emitted as
 /// `pub const FOO-BAR: u32` that will not compile.
-fn is_valid_ident(ident: &str) -> bool {
+pub(crate) fn is_valid_ident(ident: &str) -> bool {
     let mut chars = ident.chars();
     let starts_valid = matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic());
     starts_valid && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// Converts a string to `SCREAMING_SNAKE_CASE`.
-fn to_screaming_snake_case(s: &str) -> String {
+pub(crate) fn to_screaming_snake_case(s: &str) -> String {
     let mut result = String::new();
     let mut prev_lower = false;
 
@@ -823,7 +907,7 @@ fn to_screaming_snake_case(s: &str) -> String {
 }
 
 /// Converts a string to `snake_case`.
-fn to_snake_case(s: &str) -> String {
+pub(crate) fn to_snake_case(s: &str) -> String {
     let mut result = String::new();
     let mut prev_lower = false;
 
@@ -839,7 +923,7 @@ fn to_snake_case(s: &str) -> String {
 }
 
 /// Converts a string to `PascalCase`.
-fn to_pascal_case(s: &str) -> String {
+pub(crate) fn to_pascal_case(s: &str) -> String {
     let mut result = String::new();
     let mut capitalize_next = true;
 
@@ -894,8 +978,8 @@ fn field_type_to_rust(field_type: FieldType) -> &'static str {
         | FieldType::LocalMktTime
         | FieldType::TzTimeOnly
         | FieldType::TzTimestamp
-        | FieldType::Reserved => "String",
-        FieldType::Data | FieldType::XmlData => "Vec<u8>",
+        | FieldType::Reserved => "::std::string::String",
+        FieldType::Data | FieldType::XmlData => "::std::vec::Vec<u8>",
     }
 }
 
@@ -965,10 +1049,10 @@ mod tests {
     #[test]
     fn test_generate_fix44_maps_price_and_qty_to_decimal() {
         let code = generate(&CodeGenerator::new(), fix44());
-        assert!(code.contains("pub type FixDecimal = rust_decimal::Decimal;"));
+        assert!(code.contains("pub type FixDecimal = ::rust_decimal::Decimal;"));
         // Price (44) and OrderQty (38) both reach NewOrderSingle directly.
-        assert!(code.contains("pub price: Option<FixDecimal>,"));
-        assert!(code.contains("pub order_qty: Option<FixDecimal>,"));
+        assert!(code.contains("pub price: ::core::option::Option<FixDecimal>,"));
+        assert!(code.contains("pub order_qty: ::core::option::Option<FixDecimal>,"));
         // A price must never be binary floating point.
         assert!(!code.contains("f64"));
         assert!(!code.contains("f32"));
@@ -986,9 +1070,9 @@ mod tests {
     fn test_generate_fix44_wraps_optional_fields_and_leaves_required_bare() {
         let code = generate(&CodeGenerator::new(), fix44());
         // ClOrdID (11) is required in NewOrderSingle.
-        assert!(code.contains("pub cl_ord_id: String,"));
+        assert!(code.contains("pub cl_ord_id: ::std::string::String,"));
         // Account (1) is optional there.
-        assert!(code.contains("pub account: Option<String>,"));
+        assert!(code.contains("pub account: ::core::option::Option<::std::string::String>,"));
     }
 
     #[test]
@@ -1016,7 +1100,7 @@ mod tests {
     fn test_generate_fix44_emits_a_struct_per_repeating_group_entry() {
         let code = generate(&CodeGenerator::new(), fix44());
         assert!(code.contains("pub struct NewOrderSingleNoAllocsEntry {"));
-        assert!(code.contains("Vec<NewOrderSingleNoAllocsEntry>"));
+        assert!(code.contains("::std::vec::Vec<NewOrderSingleNoAllocsEntry>"));
     }
 
     #[test]
@@ -1169,13 +1253,16 @@ mod tests {
             embedded(Dictionary::fix42(), "FIX 4.2"),
         );
         assert!(code.starts_with("// Generated FIX.4.2 definitions."));
-        assert!(code.contains("pub type FixDecimal = rust_decimal::Decimal;"));
+        assert!(code.contains("pub type FixDecimal = ::rust_decimal::Decimal;"));
         let body = struct_body(&code, "NewOrderSingle");
         // HandlInst(21) is required in FIX 4.2 NewOrderSingle.
         assert!(body.contains("pub handl_inst: char,"), "{body}");
-        assert!(body.contains("pub price: Option<FixDecimal>,"), "{body}");
         assert!(
-            body.contains("pub order_qty: Option<FixDecimal>,"),
+            body.contains("pub price: ::core::option::Option<FixDecimal>,"),
+            "{body}"
+        );
+        assert!(
+            body.contains("pub order_qty: ::core::option::Option<FixDecimal>,"),
             "{body}"
         );
         assert!(!code.contains("f64"));
@@ -1193,7 +1280,7 @@ mod tests {
         assert!(!code.contains("FixDecimal"));
         let logon = struct_body(&code, "Logon");
         assert!(
-            logon.contains("pub default_appl_ver_id: String,"),
+            logon.contains("pub default_appl_ver_id: ::std::string::String,"),
             "{logon}"
         );
         assert!(logon.contains("pub heart_bt_int: i64,"), "{logon}");
@@ -1209,12 +1296,22 @@ mod tests {
             embedded(Dictionary::fix50sp2(), "FIX 5.0 SP2"),
         );
         assert!(code.starts_with("// Generated FIX.5.0SP2 definitions."));
-        assert!(code.contains("pub type FixDecimal = rust_decimal::Decimal;"));
+        assert!(code.contains("pub type FixDecimal = ::rust_decimal::Decimal;"));
         let body = struct_body(&code, "NewOrderSingle");
-        assert!(body.contains("pub cl_ord_id: String,"), "{body}");
-        assert!(body.contains("pub price: Option<FixDecimal>,"), "{body}");
+        assert!(
+            body.contains("pub cl_ord_id: ::std::string::String,"),
+            "{body}"
+        );
+        assert!(
+            body.contains("pub price: ::core::option::Option<FixDecimal>,"),
+            "{body}"
+        );
         // XID-typed fields (FIX 5.0 SP2 only) are emitted as String.
-        assert!(code.contains("pub cash_settl_term_xid: Option<String>,"));
+        assert!(
+            code.contains(
+                "pub cash_settl_term_xid: ::core::option::Option<::std::string::String>,"
+            )
+        );
         assert!(!code.contains("f64"));
         assert!(!code.contains("f32"));
     }
@@ -1331,7 +1428,7 @@ mod tests {
         let code = generate(&CodeGenerator::new(), &dict);
         // The dictionary does not record whether the component reference is
         // required, so the safe representation is Option.
-        assert!(code.contains("pub symbol: Option<String>,"));
+        assert!(code.contains("pub symbol: ::core::option::Option<::std::string::String>,"));
     }
 
     #[test]
@@ -1365,9 +1462,12 @@ mod tests {
             ],
         ));
         let code = generate(&CodeGenerator::new(), &dict);
-        assert!(code.contains("pub no_party_ids: Option<i64>,"), "{code}");
         assert!(
-            code.contains("pub no_party_ids_453: Option<Vec<NewOrderSingleNoPartyIDsEntry>>,"),
+            code.contains("pub no_party_ids: ::core::option::Option<i64>,"),
+            "{code}"
+        );
+        assert!(
+            code.contains("pub no_party_ids_453: ::core::option::Option<::std::vec::Vec<NewOrderSingleNoPartyIDsEntry>>,"),
             "{code}"
         );
     }
@@ -1400,7 +1500,7 @@ mod tests {
         let code = generate(&CodeGenerator::new(), &dict);
         assert_eq!(code.matches("pub symbol:").count(), 1);
         // The direct reference wins, so it keeps its required-ness.
-        assert!(code.contains("pub symbol: String,"));
+        assert!(code.contains("pub symbol: ::std::string::String,"));
     }
 
     #[test]

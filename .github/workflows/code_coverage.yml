@@ -38,6 +38,8 @@ jobs:
 
       # `benches/**` is excluded: the criterion harness is measurement code, not
       # library code, and counting it would inflate the coverage figure.
+      # `ironfix-codegen-check` is excluded too: it only compiles generated
+      # code (about 5 MB) so clippy checks it, and is not published.
       # The llvm engine is explicit: with Rust 1.99 and tarpaulin 0.37.5 the
       # Linux default (ptrace) produces spurious test failures and a segfault;
       # llvm is also what `make coverage` uses on macOS.
@@ -46,6 +48,7 @@ jobs:
           LOGLEVEL=WARN cargo tarpaulin
           --engine llvm
           --exclude-files 'benches/**'
+          --exclude ironfix-codegen-check
           --all-features
           --workspace
           --timeout 180

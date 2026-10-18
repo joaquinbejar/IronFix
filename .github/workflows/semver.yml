@@ -34,6 +34,9 @@ jobs:
   # The two exported derives (FixMessage, FixField) are still a public surface;
   # renaming or removing one is still a breaking change. It has to be caught in
   # review until the tool grows proc-macro support.
+  #
+  # ironfix-codegen-check is absent by policy: it is `publish = false`, a CI
+  # check that compiles generated code, with no public surface to gate.
   semver:
     name: semver (${{ matrix.package }})
     runs-on: ubuntu-latest

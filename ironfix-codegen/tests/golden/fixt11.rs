@@ -154,14 +154,14 @@ pub mod messages {
     #[derive(Debug, Clone)]
     pub struct Heartbeat {
         /// TestReqID (tag 112).
-        pub test_req_id: Option<String>,
+        pub test_req_id: ::core::option::Option<::std::string::String>,
     }
 
     /// TestRequest message (MsgType=1).
     #[derive(Debug, Clone)]
     pub struct TestRequest {
         /// TestReqID (tag 112).
-        pub test_req_id: String,
+        pub test_req_id: ::std::string::String,
     }
 
     /// ResendRequest message (MsgType=2).
@@ -179,30 +179,30 @@ pub mod messages {
         /// RefSeqNum (tag 45).
         pub ref_seq_num: i64,
         /// RefTagID (tag 371).
-        pub ref_tag_id: Option<i64>,
+        pub ref_tag_id: ::core::option::Option<i64>,
         /// RefMsgType (tag 372).
-        pub ref_msg_type: Option<String>,
+        pub ref_msg_type: ::core::option::Option<::std::string::String>,
         /// RefApplVerID (tag 1130).
-        pub ref_appl_ver_id: Option<String>,
+        pub ref_appl_ver_id: ::core::option::Option<::std::string::String>,
         /// RefApplExtID (tag 1406).
-        pub ref_appl_ext_id: Option<i64>,
+        pub ref_appl_ext_id: ::core::option::Option<i64>,
         /// RefCstmApplVerID (tag 1131).
-        pub ref_cstm_appl_ver_id: Option<String>,
+        pub ref_cstm_appl_ver_id: ::core::option::Option<::std::string::String>,
         /// SessionRejectReason (tag 373).
-        pub session_reject_reason: Option<i64>,
+        pub session_reject_reason: ::core::option::Option<i64>,
         /// Text (tag 58).
-        pub text: Option<String>,
+        pub text: ::core::option::Option<::std::string::String>,
         /// EncodedTextLen (tag 354).
-        pub encoded_text_len: Option<i64>,
+        pub encoded_text_len: ::core::option::Option<i64>,
         /// EncodedText (tag 355).
-        pub encoded_text: Option<Vec<u8>>,
+        pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
     /// SequenceReset message (MsgType=4).
     #[derive(Debug, Clone)]
     pub struct SequenceReset {
         /// GapFillFlag (tag 123).
-        pub gap_fill_flag: Option<bool>,
+        pub gap_fill_flag: ::core::option::Option<bool>,
         /// NewSeqNo (tag 36).
         pub new_seq_no: i64,
     }
@@ -211,13 +211,13 @@ pub mod messages {
     #[derive(Debug, Clone)]
     pub struct Logout {
         /// SessionStatus (tag 1409).
-        pub session_status: Option<i64>,
+        pub session_status: ::core::option::Option<i64>,
         /// Text (tag 58).
-        pub text: Option<String>,
+        pub text: ::core::option::Option<::std::string::String>,
         /// EncodedTextLen (tag 354).
-        pub encoded_text_len: Option<i64>,
+        pub encoded_text_len: ::core::option::Option<i64>,
         /// EncodedText (tag 355).
-        pub encoded_text: Option<Vec<u8>>,
+        pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
     /// Logon message (MsgType=A).
@@ -228,47 +228,47 @@ pub mod messages {
         /// HeartBtInt (tag 108).
         pub heart_bt_int: i64,
         /// RawDataLength (tag 95).
-        pub raw_data_length: Option<i64>,
+        pub raw_data_length: ::core::option::Option<i64>,
         /// RawData (tag 96).
-        pub raw_data: Option<Vec<u8>>,
+        pub raw_data: ::core::option::Option<::std::vec::Vec<u8>>,
         /// ResetSeqNumFlag (tag 141).
-        pub reset_seq_num_flag: Option<bool>,
+        pub reset_seq_num_flag: ::core::option::Option<bool>,
         /// NextExpectedMsgSeqNum (tag 789).
-        pub next_expected_msg_seq_num: Option<i64>,
+        pub next_expected_msg_seq_num: ::core::option::Option<i64>,
         /// MaxMessageSize (tag 383).
-        pub max_message_size: Option<i64>,
+        pub max_message_size: ::core::option::Option<i64>,
         /// TestMessageIndicator (tag 464).
-        pub test_message_indicator: Option<bool>,
+        pub test_message_indicator: ::core::option::Option<bool>,
         /// Username (tag 553).
-        pub username: Option<String>,
+        pub username: ::core::option::Option<::std::string::String>,
         /// Password (tag 554).
-        pub password: Option<String>,
+        pub password: ::core::option::Option<::std::string::String>,
         /// NewPassword (tag 925).
-        pub new_password: Option<String>,
+        pub new_password: ::core::option::Option<::std::string::String>,
         /// EncryptedPasswordMethod (tag 1400).
-        pub encrypted_password_method: Option<i64>,
+        pub encrypted_password_method: ::core::option::Option<i64>,
         /// EncryptedPasswordLen (tag 1401).
-        pub encrypted_password_len: Option<i64>,
+        pub encrypted_password_len: ::core::option::Option<i64>,
         /// EncryptedPassword (tag 1402).
-        pub encrypted_password: Option<Vec<u8>>,
+        pub encrypted_password: ::core::option::Option<::std::vec::Vec<u8>>,
         /// EncryptedNewPasswordLen (tag 1403).
-        pub encrypted_new_password_len: Option<i64>,
+        pub encrypted_new_password_len: ::core::option::Option<i64>,
         /// EncryptedNewPassword (tag 1404).
-        pub encrypted_new_password: Option<Vec<u8>>,
+        pub encrypted_new_password: ::core::option::Option<::std::vec::Vec<u8>>,
         /// SessionStatus (tag 1409).
-        pub session_status: Option<i64>,
+        pub session_status: ::core::option::Option<i64>,
         /// DefaultApplVerID (tag 1137).
-        pub default_appl_ver_id: String,
+        pub default_appl_ver_id: ::std::string::String,
         /// DefaultApplExtID (tag 1407).
-        pub default_appl_ext_id: Option<i64>,
+        pub default_appl_ext_id: ::core::option::Option<i64>,
         /// DefaultCstmApplVerID (tag 1408).
-        pub default_cstm_appl_ver_id: Option<String>,
+        pub default_cstm_appl_ver_id: ::core::option::Option<::std::string::String>,
         /// Text (tag 58).
-        pub text: Option<String>,
+        pub text: ::core::option::Option<::std::string::String>,
         /// EncodedTextLen (tag 354).
-        pub encoded_text_len: Option<i64>,
+        pub encoded_text_len: ::core::option::Option<i64>,
         /// EncodedText (tag 355).
-        pub encoded_text: Option<Vec<u8>>,
+        pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
     /// XMLnonFIX message (MsgType=n).

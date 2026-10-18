@@ -48,7 +48,8 @@
 //!   entries is skipped with that group. One read is one pass over the
 //!   message: the group asked for is checked while it is located, and the
 //!   rest of the message is still scanned so a second instance of its count
-//!   field is reported ([`GroupError::DuplicateGroup`]).
+//!   field is reported ([`GroupError::DuplicateGroup`]). [`GroupSet::field`]
+//!   looks a plain field up the same way, skipping the groups' runs.
 //! - **No allocation on the read path.** A successful read, iterating its
 //!   entries, looking fields up and reading nested groups borrow ranges of the
 //!   message's field list and allocate nothing; so does a read that fails
@@ -205,6 +206,15 @@ pub enum SpecError {
     /// The groups of a set are not strictly ascending by count tag.
     #[error("the groups of a set are not strictly ascending by count tag")]
     UnsortedGroups,
+    /// The level tags of a set are not strictly ascending.
+    #[error("the level tags of a set are not strictly ascending")]
+    UnsortedLevelTags,
+    /// A group's count tag is not one of the level tags of its set.
+    #[error("group {count_tag} is not one of the level tags of its set")]
+    GroupNotAtLevel {
+        /// Count tag of the group.
+        count_tag: u32,
+    },
 }
 
 /// Returns true if `tags` is strictly ascending.
@@ -420,8 +430,13 @@ impl<'s> GroupSpec<'s> {
     #[must_use]
     pub fn nested_groups(&self) -> GroupSet<'s> {
         match self.repr {
-            SpecRepr::Static { nested, .. } => GroupSet {
-                repr: SetRepr::Static(nested),
+            SpecRepr::Static {
+                nested, members, ..
+            } => GroupSet {
+                repr: SetRepr::Static {
+                    groups: nested,
+                    level: members,
+                },
             },
             SpecRepr::Layout(group) => GroupSet {
                 repr: SetRepr::Layout {
@@ -437,8 +452,12 @@ impl<'s> GroupSpec<'s> {
 /// How a [`GroupSet`] is stored.
 #[derive(Debug, Clone, Copy)]
 enum SetRepr<'s> {
-    /// Static specs, searched by count tag directly.
-    Static(&'s [GroupSpec<'s>]),
+    /// Static specs, searched by count tag directly, and the sorted tags of
+    /// the level they open at (empty when not given).
+    Static {
+        groups: &'s [GroupSpec<'s>],
+        level: &'s [u32],
+    },
     /// A layout's groups, with their count tags in a dense sorted array that
     /// is searched instead of the groups themselves, and the sorted tags of
     /// the scope the groups open in (the message level, or an entry).
@@ -457,7 +476,14 @@ pub struct GroupSet<'s> {
 }
 
 impl<'s> GroupSet<'s> {
-    /// Describes a message's top-level groups from static tables.
+    /// Describes a message's top-level groups from static tables, without
+    /// the message level's tags.
+    ///
+    /// Such a set reads like a [`MessageLayout`] except at one boundary: it
+    /// cannot tell that a field following a top-level group that already
+    /// holds every entry it declares (`453=0|58=X`) belongs to the message
+    /// level, so a tag the group's entries also accept is read as the group's.
+    /// [`GroupSet::with_level_tags`] removes the difference.
     ///
     /// # Errors
     /// Returns [`SpecError::UnsortedGroups`] unless `groups` is strictly
@@ -465,18 +491,87 @@ impl<'s> GroupSet<'s> {
     pub const fn new(groups: &'s [GroupSpec<'s>]) -> Result<Self, SpecError> {
         if groups_ascending(groups) {
             Ok(Self {
-                repr: SetRepr::Static(groups),
+                repr: SetRepr::Static { groups, level: &[] },
             })
         } else {
             Err(SpecError::UnsortedGroups)
         }
     }
 
-    /// The sorted tags of the scope the groups open in; empty for a static
-    /// set, which does not know them.
-    const fn enclosing(&self) -> &'s [u32] {
+    /// Describes a message's top-level groups from static tables, with every
+    /// tag that may appear at the message level, so the set reads exactly
+    /// like the [`MessageLayout`] of the same message.
+    ///
+    /// # Arguments
+    /// * `groups` - The top-level groups, strictly ascending by count tag
+    /// * `level_tags` - Every tag that may appear at the message level,
+    ///   strictly ascending: the header, body and trailer fields (those of
+    ///   components included) and the count tags of their groups. It is what
+    ///   [`GroupSet::level_tags`] returns for `layout.groups()`.
+    ///
+    /// The tags settle the boundary [`GroupSet::new`] cannot: once a group
+    /// holds every entry it declares, a field the message level also accepts
+    /// ends the group. No allocation, and `const`: generated code builds its
+    /// tables at compile time.
+    ///
+    /// # Errors
+    /// [`SpecError::UnsortedGroups`] unless `groups` is strictly ascending by
+    /// count tag, [`SpecError::UnsortedLevelTags`] unless `level_tags` is
+    /// strictly ascending, and [`SpecError::GroupNotAtLevel`] for a group
+    /// whose count tag is not in `level_tags`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironfix_dictionary::{GroupSet, GroupSpec};
+    ///
+    /// // NoPartyIDs(453), whose entries may carry Text(58), which the
+    /// // message level also accepts.
+    /// const PARTIES: GroupSpec<'static> = match GroupSpec::new(453, 448, &[58, 448], &[]) {
+    ///     Ok(spec) => spec,
+    ///     Err(_) => panic!("bad NoPartyIDs table"),
+    /// };
+    /// const GROUPS: GroupSet<'static> =
+    ///     match GroupSet::with_level_tags(&[PARTIES], &[11, 35, 58, 453]) {
+    ///         Ok(set) => set,
+    ///         Err(_) => panic!("bad group table"),
+    ///     };
+    /// assert_eq!(GROUPS.level_tags(), &[11, 35, 58, 453]);
+    /// ```
+    pub const fn with_level_tags(
+        groups: &'s [GroupSpec<'s>],
+        level_tags: &'s [u32],
+    ) -> Result<Self, SpecError> {
+        if !groups_ascending(groups) {
+            return Err(SpecError::UnsortedGroups);
+        }
+        if !strictly_ascending(level_tags) {
+            return Err(SpecError::UnsortedLevelTags);
+        }
+        let mut rest = groups;
+        while let [head, tail @ ..] = rest {
+            let count_tag = head.count_tag();
+            if !contains(level_tags, count_tag) {
+                return Err(SpecError::GroupNotAtLevel { count_tag });
+            }
+            rest = tail;
+        }
+        Ok(Self {
+            repr: SetRepr::Static {
+                groups,
+                level: level_tags,
+            },
+        })
+    }
+
+    /// Returns the sorted tags of the level the groups open at: the message
+    /// level for a message's top-level set, the entry's members for the groups
+    /// nested in an entry. Empty for a set built with [`GroupSet::new`],
+    /// which does not know them.
+    #[must_use]
+    pub const fn level_tags(&self) -> &'s [u32] {
         match self.repr {
-            SetRepr::Static(_) => &[],
+            SetRepr::Static { level, .. } => level,
             SetRepr::Layout { enclosing, .. } => enclosing,
         }
     }
@@ -485,7 +580,7 @@ impl<'s> GroupSet<'s> {
     #[must_use]
     pub const fn len(&self) -> usize {
         match self.repr {
-            SetRepr::Static(groups) => groups.len(),
+            SetRepr::Static { groups, .. } => groups.len(),
             SetRepr::Layout { groups, .. } => groups.len(),
         }
     }
@@ -500,7 +595,7 @@ impl<'s> GroupSet<'s> {
     #[must_use]
     pub fn get(&self, count_tag: u32) -> Option<GroupSpec<'s>> {
         match self.repr {
-            SetRepr::Static(groups) => groups
+            SetRepr::Static { groups, .. } => groups
                 .binary_search_by_key(&count_tag, GroupSpec::count_tag)
                 .ok()
                 .and_then(|index| groups.get(index))
@@ -520,7 +615,7 @@ impl<'s> GroupSet<'s> {
     /// a function.
     pub fn iter(&self) -> impl Iterator<Item = GroupSpec<'s>> + use<'s> {
         let (statics, layouts): (&'s [GroupSpec<'s>], &'s [LayoutGroup]) = match self.repr {
-            SetRepr::Static(groups) => (groups, &[]),
+            SetRepr::Static { groups, .. } => (groups, &[]),
             SetRepr::Layout { groups, .. } => (&[], groups),
         };
         statics
@@ -559,7 +654,7 @@ impl<'s> GroupSet<'s> {
             return Err(GroupError::NotInLayout { count_tag });
         };
         let fields = msg.field_slice();
-        let enclosing = self.enclosing();
+        let enclosing = self.level_tags();
         let mut found: Option<GroupEntries<'m, 'a, 's>> = None;
         let mut index = 0;
         while let Some(field) = fields.get(index) {
@@ -595,6 +690,77 @@ impl<'s> GroupSet<'s> {
             };
         }
         Ok(found)
+    }
+
+    /// Returns the first field `tag` at the message level of `msg`.
+    ///
+    /// The runs of the set's groups are skipped with the same positional walk
+    /// [`GroupSet::read`] uses, so a field inside one of their entries is not
+    /// taken for a message-level field with the same tag. The groups are not
+    /// checked here: a malformed group is still skipped by membership, and
+    /// reading it reports the error. A count tag asked for is found like any
+    /// other field. The group boundaries are those [`GroupSet::read`] uses,
+    /// the message level's tags included when the set knows them. A group
+    /// nested past the depth limit ends the search: what follows it cannot be
+    /// told apart from its entries, so `None` is returned rather than a field
+    /// that may be nested (reading that group reports
+    /// [`GroupError::TooDeep`]). No allocation, for groups of up to 512
+    /// entry-level members.
+    ///
+    /// A tag repeated at the message level is not reported here: the first
+    /// occurrence is returned and the others are ignored. A repeated tag is a
+    /// malformed message (session reject reason 13, "tag appears more than
+    /// once"); [`Validator`](crate::Validator) reports it as
+    /// [`ValidationError::DuplicateTag`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironfix_dictionary::{GroupSet, GroupSpec};
+    /// use ironfix_tagvalue::Decoder;
+    ///
+    /// // FIX 4.4 NoPartyIDs(453), whose entries may carry PartyIDSource(447).
+    /// const PARTIES: GroupSpec<'static> = match GroupSpec::new(453, 448, &[447, 448, 452], &[]) {
+    ///     Ok(spec) => spec,
+    ///     Err(_) => panic!("bad NoPartyIDs table"),
+    /// };
+    /// const GROUPS: GroupSet<'static> = match GroupSet::new(&[PARTIES]) {
+    ///     Ok(set) => set,
+    ///     Err(_) => panic!("bad group table"),
+    /// };
+    ///
+    /// let body = "35=D\x0111=ORDER-1\x01453=1\x01448=BROKER\x01447=D\x0155=EURUSD\x01";
+    /// let frame = format!("8=FIX.4.4\x019={}\x01{body}10=000\x01", body.len());
+    /// let mut decoder = Decoder::new(frame.as_bytes()).with_checksum_validation(false);
+    /// let message = decoder.decode()?;
+    ///
+    /// assert_eq!(GROUPS.field(&message, 55).map(|field| field.value), Some(&b"EURUSD"[..]));
+    /// // PartyIDSource(447) appears only inside a NoPartyIDs entry.
+    /// assert!(GROUPS.field(&message, 447).is_none());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn field<'m, 'a>(&self, msg: &'m RawMessage<'a>, tag: u32) -> Option<&'m FieldRef<'a>> {
+        let fields = msg.field_slice();
+        let enclosing = self.level_tags();
+        let mut index = 0;
+        while let Some(field) = fields.get(index) {
+            if field.tag == tag {
+                return Some(field);
+            }
+            index = match self.get(field.tag) {
+                Some(group) => {
+                    let mut skip = DepthGuard::default();
+                    let end = walk::walk_group(fields, index, group, 0, enclosing, &mut skip);
+                    if skip.too_deep.is_some() {
+                        return None;
+                    }
+                    end
+                }
+                None => index + 1,
+            };
+        }
+        None
     }
 }
 
@@ -1465,6 +1631,63 @@ mod tests {
     }
 
     #[test]
+    fn test_group_set_field_skips_the_runs_of_its_groups() {
+        let layout = dialect_layout("U5");
+        let groups = layout.groups();
+        // Extra(300) appears only inside the NoOuter entry: no message-level
+        // field. Plain(55) follows the group and is found.
+        let text = frame("U5", &["102=1", "200=A", "300=IN-GROUP", "55=P"]);
+        let msg = decode(&text);
+        assert!(groups.field(&msg, 300).is_none());
+        assert_eq!(
+            groups.field(&msg, 55).map(|field| field.value),
+            Some(&b"P"[..])
+        );
+        // A count tag is found like any field.
+        assert_eq!(
+            groups.field(&msg, 102).map(|field| field.value),
+            Some(&b"1"[..])
+        );
+        // A header field before the group is found.
+        assert_eq!(
+            groups.field(&msg, 35).map(|field| field.value),
+            Some(&b"U5"[..])
+        );
+
+        // A nested group's field is skipped with its enclosing run; the same
+        // tag after the run is the message-level one.
+        let text = frame(
+            "U5",
+            &["102=1", "200=A", "110=1", "210=NESTED", "55=P", "210=TOP"],
+        );
+        let msg = decode(&text);
+        assert_eq!(
+            groups.field(&msg, 210).map(|field| field.value),
+            Some(&b"TOP"[..])
+        );
+
+        // A malformed group (count 2, one entry) is still skipped by
+        // membership; reading it reports the error.
+        let text = frame("U5", &["102=2", "200=A", "300=IN-GROUP", "55=P"]);
+        let msg = decode(&text);
+        assert!(groups.field(&msg, 300).is_none());
+        assert_eq!(
+            groups.field(&msg, 55).map(|field| field.value),
+            Some(&b"P"[..])
+        );
+        assert!(layout.read(&msg, 102).is_err());
+
+        // The first message-level occurrence wins.
+        let text = frame("U5", &["55=FIRST", "55=SECOND"]);
+        let msg = decode(&text);
+        assert_eq!(
+            groups.field(&msg, 55).map(|field| field.value),
+            Some(&b"FIRST"[..])
+        );
+        assert!(groups.field(&msg, 9999).is_none());
+    }
+
+    #[test]
     fn test_entry_get_ignores_a_nested_group_field_with_the_same_tag() {
         // Extra(300) is a member of both NoOuter and NoInner: in this entry
         // only the nested NoInner carries it, so the entry's own level lacks
@@ -1876,6 +2099,123 @@ mod tests {
         });
         assert_eq!(set.read(&msg, 1034).err(), too_deep);
         assert_eq!(set.read(&msg, 1000).err(), too_deep);
+        // A field lookup stops there too, rather than take the 1034 nested in
+        // group 1000 for a message-level one.
+        assert!(set.field(&msg, 1034).is_none());
+        assert!(set.field(&msg, 2034).is_none());
+        assert_eq!(
+            set.field(&msg, 1000).map(|field| field.value),
+            Some(&b"1"[..])
+        );
+    }
+
+    #[test]
+    fn test_static_set_with_level_tags_reads_like_the_layout() {
+        // U5: NoInner(110) may open at the message level, and its entries
+        // accept Extra(300), which the message level does not; Plain(55) is a
+        // message-level field. Built from the layout's own tables, a static
+        // set with the message level's tags reads every boundary alike.
+        let layout = dialect_layout("U5");
+        let level: Vec<u32> = layout.groups().level_tags().to_vec();
+        assert!(level.contains(&55) && level.contains(&102) && level.contains(&110));
+        let Ok(inner) = GroupSpec::new(110, 210, &[210, 300], &[]) else {
+            panic!("NoInner builds");
+        };
+        let nested = [inner];
+        let Ok(outer) = GroupSpec::new(102, 200, &[110, 200, 300], &nested) else {
+            panic!("NoOuter builds");
+        };
+        let groups = [outer, inner];
+        let Ok(with_level) = GroupSet::with_level_tags(&groups, &level) else {
+            panic!("the set builds with the level tags");
+        };
+        let Ok(without_level) = GroupSet::new(&groups) else {
+            panic!("the set builds without them");
+        };
+        assert_eq!(with_level.level_tags(), level.as_slice());
+        assert!(without_level.level_tags().is_empty());
+        // A top-level NoInner that holds its one declared entry, followed by
+        // a second 210: only a NoInner entry accepts 210, so it is a count
+        // mismatch either way. Followed by 55, the message level's field,
+        // the group ends with or without the level tags.
+        for body in [
+            &["110=1", "210=A", "55=P"][..],
+            &["110=1", "210=A", "210=B"][..],
+            &["102=1", "200=A", "110=0", "300=OWN"][..],
+        ] {
+            let text = frame("U5", body);
+            let msg = decode(&text);
+            for count_tag in [102, 110] {
+                let from_layout = layout
+                    .read(&msg, count_tag)
+                    .map(|found| found.map(Iterator::count));
+                let from_static = with_level
+                    .read(&msg, count_tag)
+                    .map(|found| found.map(Iterator::count));
+                assert_eq!(from_static, from_layout, "{body:?} {count_tag}");
+            }
+            assert_eq!(
+                with_level.field(&msg, 55).map(|field| field.value),
+                layout.groups().field(&msg, 55).map(|field| field.value),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_static_set_with_level_tags_settles_the_top_level_boundary() {
+        // NoPartyIDs(453) entries accept Text(58), and so does the message
+        // level. With a count of 0, the 58 that follows is the message's: the
+        // level tags say so; without them the 58 leads an entry with no
+        // delimiter.
+        let Ok(parties) = GroupSpec::new(453, 448, &[58, 448], &[]) else {
+            panic!("NoPartyIDs builds");
+        };
+        let groups = [parties];
+        let Ok(with_level) = GroupSet::with_level_tags(&groups, &[11, 35, 58, 453]) else {
+            panic!("the set builds with the level tags");
+        };
+        let Ok(without_level) = GroupSet::new(&groups) else {
+            panic!("the set builds without them");
+        };
+        let text = frame("D", &["11=ORDER-1", "453=0", "58=top"]);
+        let msg = decode(&text);
+        assert_eq!(
+            with_level
+                .read(&msg, 453)
+                .map(|found| found.map(Iterator::count)),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            with_level.field(&msg, 58).map(|field| field.value),
+            Some(&b"top"[..])
+        );
+        assert_eq!(
+            without_level.read(&msg, 453).err(),
+            Some(GroupError::DelimiterMismatch {
+                count_tag: 453,
+                expected: 448,
+                found: 58,
+            })
+        );
+        assert!(without_level.field(&msg, 58).is_none());
+    }
+
+    #[test]
+    fn test_static_set_with_level_tags_construction_errors() {
+        assert_eq!(
+            GroupSet::with_level_tags(&[SUB_IDS, PARTIES], &[453, 802]).err(),
+            Some(SpecError::UnsortedGroups)
+        );
+        assert_eq!(
+            GroupSet::with_level_tags(&[PARTIES], &[453, 11]).err(),
+            Some(SpecError::UnsortedLevelTags)
+        );
+        assert_eq!(
+            GroupSet::with_level_tags(&[PARTIES], &[11, 35]).err(),
+            Some(SpecError::GroupNotAtLevel { count_tag: 453 })
+        );
+        assert!(GroupSet::with_level_tags(&[], &[]).is_ok());
     }
 
     #[test]

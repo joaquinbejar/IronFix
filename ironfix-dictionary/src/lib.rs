@@ -44,7 +44,8 @@
 //!   per message type from a dictionary (or [`GroupSpec`] / [`GroupSet`]
 //!   tables built at compile time) reads a decoded message's groups as
 //!   borrowed views: [`GroupEntries`] yields one [`GroupEntry`] per entry,
-//!   with own-level field lookup and nested groups. The whole group is
+//!   with own-level field lookup and nested groups, and [`GroupSet::field`]
+//!   finds a message-level field outside every group. The whole group is
 //!   checked up front with the validator's own positional walk, so a
 //!   malformed group is a [`GroupError`], never a partial view. A successful
 //!   read, and one that fails with a structural error, allocate nothing for
