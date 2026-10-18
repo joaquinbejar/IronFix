@@ -38,6 +38,14 @@
 //!   and trailer come from the transport side, the body from the application
 //!   side, and admin messages entirely from the transport side (see the
 //!   [`validator`] module docs for the differences from QuickFIX)
+//! - **Repeating-group reader** ([`group`]): a [`MessageLayout`] built once
+//!   per message type from a dictionary (or [`GroupSpec`] / [`GroupSet`]
+//!   tables built at compile time) reads a decoded message's groups as
+//!   borrowed views: [`GroupEntries`] yields one [`GroupEntry`] per entry,
+//!   with own-level field lookup and nested groups. The whole group is
+//!   checked up front with the validator's own positional walk, so a
+//!   malformed group is a [`GroupError`], never a partial view, and the read
+//!   path allocates nothing
 //!
 //! This product includes software developed by quickfixengine.org
 //! (<http://www.quickfixengine.org/>).
@@ -77,11 +85,17 @@
 //! buffer. Both names exist in the workspace; always qualify them.
 
 pub mod composition;
+pub mod group;
 pub mod loader;
 pub mod schema;
+mod scope;
 pub mod validator;
+mod walk;
 
 pub use composition::SessionDictionary;
+pub use group::{
+    GroupEntries, GroupEntry, GroupError, GroupSet, GroupSpec, MessageLayout, SpecError,
+};
 pub use loader::{DefinitionKind, DictionaryError, MAX_COMPONENT_DEPTH, MAX_NESTING_DEPTH};
 pub use schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef,
