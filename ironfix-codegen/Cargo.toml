@@ -15,3 +15,8 @@ ironfix-dictionary.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The generated views, enumerations and writers name these crates; the tests
+# compile the golden files against them and decode / encode real frames.
+ironfix-core.workspace = true
+ironfix-tagvalue.workspace = true
+rust_decimal.workspace = true

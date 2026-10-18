@@ -23,13 +23,13 @@
 //! cargo test -p ironfix-codegen --test regenerate_golden -- --ignored
 //! ```
 //!
-//! Generated files resolve `rust_decimal::Decimal`, and `rust_decimal` is not a
-//! dependency of `ironfix-codegen`. A `rust_decimal` module stands in for it
-//! so the rest of each generated file is still type-checked.
+//! Generated files resolve `rust_decimal::Decimal` against the real
+//! `rust_decimal`, a dev-dependency of `ironfix-codegen`.
 //!
 //! Not compiled here: the full FIX 4.4 output (about 1.4 MB) and the full
 //! FIX 5.0 SP2 output (about 50 MB). The generator's own unit tests check that
-//! both generate.
+//! both generate. The views output (`CodeGenerator::generate_views`) is
+//! compiled in `generated_views.rs`.
 
 #![allow(dead_code)]
 
@@ -37,18 +37,6 @@ mod common;
 
 mod generated {
     include!("golden/sample.rs");
-
-    /// Stands in for the `rust_decimal` crate, which is not a dependency of
-    /// `ironfix-codegen`.
-    ///
-    /// The generated alias resolves against this module, so everything else in
-    /// the generated file is compiled for real. That the alias points at
-    /// `rust_decimal::Decimal` in a consumer's crate is asserted textually in
-    /// the generator's own tests.
-    pub mod rust_decimal {
-        /// Stand-in for `rust_decimal::Decimal`.
-        pub type Decimal = i64;
-    }
 }
 
 // FIX 4.2 names its indication-of-interest message `IOI`, which the generator
@@ -57,12 +45,6 @@ mod generated {
 #[allow(clippy::upper_case_acronyms)]
 mod generated_fix42 {
     include!("golden/fix42.rs");
-
-    /// Stands in for `rust_decimal::Decimal`; see [`super::generated`].
-    pub mod rust_decimal {
-        /// Stand-in for `rust_decimal::Decimal`.
-        pub type Decimal = i64;
-    }
 }
 
 mod generated_fixt11 {
@@ -99,8 +81,8 @@ fn test_generated_fix42_carries_its_tags_and_types() {
     assert_eq!(fields::HANDL_INST, 21);
     assert_eq!(fields::MDENTRY_DATE, 272);
     // A FIX 4.2 price is the decimal alias, never binary floating point.
-    let price: generated_fix42::FixDecimal = 12345;
-    assert_eq!(price, 12345);
+    let price: generated_fix42::FixDecimal = rust_decimal::Decimal::new(12345, 2);
+    assert_eq!(price.to_string(), "123.45");
     let heartbeat = Heartbeat {
         test_req_id: Some("PING".to_string()),
     };
@@ -171,7 +153,7 @@ fn test_generated_types_are_constructible() {
         cl_ord_id_12: None,
         msg_seq_num: Some(1),
         poss_dup_flag: Some(false),
-        price: Some(12345),
+        price: Some(rust_decimal::Decimal::new(12345, 2)),
         side: '1',
         raw_data: Some(vec![0x41]),
         r#yield: None,

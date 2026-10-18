@@ -4,12 +4,13 @@
    Date: 21/7/26
 ******************************************************************************/
 
-//! Rewrites the golden files the generated-code test compiles.
+//! Rewrites the golden files the generated-code tests compile.
 //!
 //! Lives in its own target so it still builds when a golden file is stale or
 //! empty — which is exactly when it is needed.
 
 mod common;
+mod views_common;
 
 /// Writes `code` to `tests/golden/<file>`, failing the test on an I/O error.
 #[track_caller]
@@ -23,8 +24,9 @@ fn write_golden(file: &str, code: &str) {
     }
 }
 
-/// Rewrites `golden/sample.rs`, `golden/fix42.rs`, and `golden/fixt11.rs`
-/// from the current generator.
+/// Rewrites every golden file from the current generator: the default
+/// output (`sample.rs`, `fix42.rs`, `fixt11.rs`) and the views
+/// (`views_sample.rs`, `views_fix44_order.rs`, `views_fixt11.rs`).
 ///
 /// Ignored by default: it is a maintenance action, not a check.
 #[test]
@@ -33,4 +35,10 @@ fn test_regenerate_golden_file() {
     write_golden("sample.rs", &common::generate_sample());
     write_golden("fix42.rs", &common::generate_fix42());
     write_golden("fixt11.rs", &common::generate_fixt11());
+    write_golden("views_sample.rs", &views_common::generate_views_sample());
+    write_golden(
+        "views_fix44_order.rs",
+        &views_common::generate_views_fix44_order(),
+    );
+    write_golden("views_fixt11.rs", &views_common::generate_views_fixt11());
 }
