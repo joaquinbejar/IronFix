@@ -1,6 +1,7 @@
 # ADR-0005 — Fallible, ordered store writes and a fail-closed policy
 
-- **Status:** Accepted (issue #62, in the plan the owner approved)
+- **Status:** Accepted (issue #62, in the plan the owner approved; revised in
+  the #62 review round)
 - **Date:** 2026-10-18
 
 ## Context
@@ -29,11 +30,13 @@ counter write and `from_app` documented so it can test them.
 ## Options
 
 1. **Setters stay synchronous, return `Result`.** Smallest change, but a store
-   doing real I/O (a file, a replica) would block the reactor inside a
+   doing real I/O (a file, a replica) would block the runtime thread inside a
    synchronous call.
 2. **Setters become `async` and return `Result`** (chosen). Matches `store`,
    `get_range`, `reset` and `refresh`, which are already async, and lets a
-   durable store do I/O without blocking.
+   durable store do I/O without blocking the runtime thread. The session still
+   awaits each call, so a slow store still delays that session (see "Store
+   calls run on the reactor" below).
 3. **Inbound semantics: at least once.** Persist the target counter only after
    `from_app` returns. That requires the application dispatcher (a separate
    task) to report completions and the reactor to persist a watermark behind
@@ -53,48 +56,93 @@ counter write and `from_app` documented so it can test them.
 infallible in practice. The trait's module docs state the ordering contract
 below, and that a store error must never contain frame bytes.
 
+A new defaulted method, `file_outbound(seq, msg_type, frame, next_sender)`,
+files an outbound frame and then persists the next sender number. The default
+calls `store()` and then `set_next_sender_seq()`, stopping at the first error.
+A durable store can override it to make both changes in one atomic write, and
+the engine then pays one call per outbound message instead of two.
+
+`store()` has **replace** semantics: filing under a number that is already
+filed replaces the frame there. The engine relies on it, because a crash after
+a frame is filed and before its number is persisted makes the next session
+reuse that number for a message the peer never saw.
+
+`set_next_sender_seq` is **not** monotonic, and a store must not reject a
+lower value: a sequence reset brings it down (a Logon or Logon ack with
+`ResetSeqNumFlag` (141) = Y, the `reset_on_logout` / `reset_on_disconnect`
+close, a reset owed by the previous session), the close-time write after a
+failed `file_outbound` writes back the number that was not spent (one below
+what the failed call left behind, if it took effect and still reported a
+failure, as a call that overran the store timeout can), and an explicit
+`with_initial_sequences` seed can start below the stored value under
+`Continue`.
+
+`StoreError` gains `Timeout { timeout }` for a call that overran the store
+timeout. Both `StoreError` and `EngineError` are `#[non_exhaustive]`.
+
 ### The order
 
-The handshakes and the reactor go through the same helper
-(`persistence::SessionStore`), so the order cannot drift between them:
+The handshakes and the reactor go through the same step,
+`persistence::file_and_spend`, so the outbound order cannot drift between them
+(the acceptor's Reject and Logout, once it has a store (#60), take it too):
 
-1. **Outbound.** For a frame numbered N: file the frame under N; persist N+1
-   as the next sender number; spend N in memory; write the bytes. Filing comes
-   first, so the #89 row "counter update, before store write" cannot happen: a
-   crash between the two writes leaves frame N with counter N, and N is reused
-   for a message the peer never saw (overwriting the filed frame). A crash
-   after both leaves frame N and counter N+1: N is never reused, and a resend
-   of N replays the filed frame. Memory and store agree before any byte is
-   written, so a failed write afterwards cannot lead to N being reused either.
+1. **Outbound.** For a frame numbered N: compute N+1 with checked arithmetic;
+   file the frame under N and persist N+1 as the next sender number (one
+   `file_outbound` call); spend N in memory and check that N was the number
+   spent; write the bytes. Filing comes first, so the #89 row "counter update,
+   before store write" cannot happen: a crash between the two writes leaves
+   frame N with counter N, and N is reused for a message the peer never saw
+   (replacing the filed frame). A crash after both leaves frame N and counter
+   N+1: N is never reused, and a resend of N replays the filed frame. Memory
+   and store agree before any byte is written, so a failed write afterwards
+   cannot lead to N being reused either.
 2. **Inbound.** When M is accepted in sequence, M+1 is persisted as the next
-   target number before M is acted on: before an administrative message is
-   processed (so the receive cursor includes it, and a restart never asks for
-   it again), and before an application message is handed to the application.
-   For an application message a slot in the application queue is reserved
-   first, so a full queue still closes the session with M unspent. In the
-   initiator handshake, the Logon ack is validated (including `from_admin`)
-   before its number is consumed, and that number is persisted before the
-   session goes Active.
-3. **Other changes** (a `SequenceReset`, a gap fill, a reset) are persisted at
-   the end of the event that made them, before the next event is handled.
-4. **Only on change.** The reactor remembers the counter values it last wrote
+   target number before M is acted on, and before the in-memory expectation
+   moves: before an administrative message is processed (so the receive
+   cursor includes it, and a restart never asks for it again), before an
+   in-sequence `SequenceReset`-GapFill reaches `from_admin` (the fill occupies
+   M whatever happens next), and before an application message is handed to
+   the application. For an application message a slot in the application
+   queue is reserved first, so a full queue still closes the session with M
+   unspent. An accepted `NewSeqNo` (36) is persisted before the expectation
+   moves to it.
+3. **Exceptions.** Two inbound messages reach `from_admin` before their write:
+   - the initiator's Logon acknowledgement: `from_admin` may refuse the Logon,
+     and the ack's `ResetSeqNumFlag` has to be applied before its number can
+     be validated. Its number is persisted before the session goes Active and
+     before `on_logon`;
+   - a `SequenceReset` in Reset mode, which has no place in the sequence. Its
+     `NewSeqNo` is persisted once `from_admin` has accepted it.
+4. **Only on change.** The engine remembers the counter values it last wrote
    and writes a counter only when it moved, so an idle tick costs two integer
-   comparisons and no store call. Under `Continue` a value is recorded once its
-   write was attempted, so a failing store is not retried on every tick.
+   comparisons and no store call. The handshake hands its record to the
+   reactor (through `SessionParams`), and the counters a store reported at
+   seeding are recorded as written, so the reactor's first pass writes nothing
+   the handshake or the store already holds. Under `Continue` a value is
+   recorded once its write was attempted, so a failing store is not retried on
+   every tick.
+5. **A counterparty reset on the Logon ack.** When the ack carries
+   `ResetSeqNumFlag` = Y and our Logon did not ask for a reset, the store is
+   reset (under the policy) and the reset counters (next sender 2, next target
+   2) are persisted before `on_logon`. Before this, the store kept the previous
+   stream until the reactor's first pass: a connect abandoned inside
+   `on_logon` and then retried replayed the previous stream's frames into the
+   new session.
 
-### Inbound delivery semantics
+### Store calls run on the reactor
 
-At most once across a crash. With M+1 durable before M is handed over, a
-crash after that write and before `from_app` has finished with M loses M to
-the application: on restart the engine expects M+1 and never requests M again.
-The window is the application queue (up to its capacity) plus the message
-`from_app` is handling. The engine does not detect or report such a loss after
-a restart. While the process runs, a message whose target write did not
-succeed is never handed over, so nothing is skipped silently there.
+Every store call is awaited inline, because its result decides whether a frame
+may be written or a message acted on. A slow store therefore delays that
+session's reads, heartbeats and timeout detection for as long as each call
+takes. Every call is bounded by the store timeout
+(`Initiator::with_store_timeout`, default: the write timeout), and an overrun
+is `StoreError::Timeout`:
 
-#89 asks that a message lost this way be reported. Nothing in this change can
-report it. That needs an application-acknowledged cursor (at least once, with
-redelivery flagged by `PossDupFlag`) and is left for #89 to decide.
+- a write that overruns is a failed write under the policy;
+- the reset and the refresh `connect` makes before the Logon fail the connect
+  with `EngineError::Store`, whatever the policy;
+- a resend read (`get_page`) that overruns is answered with a gap fill, like
+  any other failed read.
 
 ### The policy
 
@@ -102,26 +150,93 @@ redelivery flagged by `PossDupFlag`) and is left for #89 to decide.
 re-exported at the crate root) with `Initiator::with_store_failure_policy`:
 
 - `Continue` (default, the behaviour before writes were fallible): log a
-  warning without frame bytes and carry on; the frame is written anyway.
+  warning without frame bytes and carry on as if the write had succeeded; the
+  frame is written anyway and the message acted on anyway. **It gives no crash
+  guarantee**: after a failed write, a crash can leave the store behind what
+  the counterparty has seen. It keeps a session running through a store
+  outage, and nothing more.
 - `CloseSession`: fail closed. A failed frame filing or sender-counter write
   means the frame is not written; a failed target write means the inbound
-  message is not acted on; the session closes without a Logout, since a Logout
-  would have to be filed through the store that just failed. During the
-  handshake `Initiator::connect` returns `EngineError::Store` and the frame is
-  never written.
+  message is not acted on and the expectation does not move; the session
+  closes, not gracefully, without a Logout, since a Logout would have to be
+  filed through the store that just failed. The failure is logged at error
+  level. During the handshake `Initiator::connect` returns
+  `EngineError::Store` and the frame is never written; that includes a store
+  failure while a Logon ack is being refused, which stops the refusal (no
+  Logout follows a refused Reject) and replaces the refusal's own error. A
+  reply to the counterparty's Logout that the store refuses makes the close
+  non-graceful, so `reset_on_logout` does not run. Only this policy turns the
+  order above into a guarantee.
+
+Some calls fail closed whatever the policy, because the session cannot start
+without them: the reset for a `ResetSeqNumFlag` Logon, the refresh that
+recovers the counters, and a reset owed by the previous session.
+
+Under `CloseSession`, a sender seed from `with_initial_sequences` below the
+store's next sender number is refused with
+`EngineError::InitialSequenceBelowStore` before anything is written: the store
+has frames at the numbers in between, so the counterparty has seen them.
 
 The policy is a session property, not an initiator one, so the Acceptor can
 take it unchanged when it gets a store (#60).
+
+### A reset that could not be made
+
+`reset_on_logout` and `reset_on_disconnect` reset the store as the session
+closes. If that reset fails, **no counter is written**: the reset values
+written over a store still holding the previous stream would describe
+neither. The `Initiator` records that a reset is owed, and its next `connect`
+resets the store before anything else, refusing the session with
+`EngineError::Store` if it still cannot, whatever the policy. The record lives
+in the `Initiator`, not in the store: a process restart forgets it, and the
+next session starts from the counters the store still holds.
+
+### Inbound delivery semantics
+
+At most once. With M+1 durable before M is handed over, a crash after that
+write and before `from_app` has finished with M loses M to the application:
+on restart the engine expects M+1 and never requests M again. The window is
+every message waiting in the application queue, up to its capacity
+(`DEFAULT_APP_QUEUE_CAPACITY` = 1024, `Initiator::with_app_queue_capacity`),
+plus the message `from_app` is handling.
+
+The same messages can be lost **while the process runs**, without a crash:
+when the session closes, the dispatcher gets `APP_DRAIN_TIMEOUT` (5 s) to
+finish its queue and is then aborted. The dispatcher records the number of
+each message it finishes, the reactor records the first and last numbers it
+handed over, and on an abort the engine logs at error level the range it
+handed over and `from_app` did not finish (the range can include the numbers
+of administrative messages processed in between). A typed close reason for it
+is #69.
+
+Under `CloseSession` a message whose target write failed is never handed over.
+Under `Continue` it is handed over anyway.
+
+**What this does not provide.** The engine does not detect or report, after a
+restart, the inbound messages lost across a crash, so #89's requirement that a
+lost message be reported is **not met** for inbound traffic by this change.
+Reporting needs:
+
+- a completion signal from the dispatcher back to the reactor;
+- a durable application watermark W, through a new defaulted `MessageStore`
+  method;
+- a typed report at restart of W+1 up to the persisted target minus one.
+
+At-least-once delivery additionally needs an inbound journal, or redelivery
+through a `ResendRequest` from W+1 with `PossDupFlag` handling. Both are
+tracked in #105.
 
 ### Not done
 
 - **Filing inbound frames** (an optional `store_inbound` with a default no-op,
   for audit and for takeover by a replicated store) is deferred: it costs an
   allocation and a store call per inbound frame, and no consumer needs it yet.
-- A failed `reset()` of the store when a session closes is still logged and
-  ignored: the session is already over.
+- **Reporting or redelivering inbound messages lost across a crash** is #105.
 - The close reason is a log string; a typed close outcome on `Connection` is
   #69.
+- The dispatcher-abort log line is not asserted by a test: capturing a
+  `tracing` event needs a subscriber in the engine's dev-dependencies, which
+  needs approval. The range computation is unit-tested.
 
 ## Consequences
 
@@ -133,17 +248,22 @@ take it unchanged when it gets a store (#60).
   `trait_method_return_value_added` on both setters; it is also declared here
   and in the commit footer, because the tool does not describe the `async`
   half of the change.
-- **Semver (additive):** `ironfix_engine::persistence` module,
-  `StoreFailurePolicy` (with `closes_session`), and
-  `Initiator::with_store_failure_policy`.
+- **Semver (additive):** `MessageStore::file_outbound` (defaulted),
+  `StoreError::Timeout`, `ironfix_engine::persistence` module,
+  `StoreFailurePolicy` (with `closes_session`),
+  `Initiator::with_store_failure_policy`, `Initiator::with_store_timeout`,
+  and `EngineError::InitialSequenceBelowStore`.
 - **Behaviour:** with the default policy nothing changes on the wire. The
   sender counter is now persisted before the write in the reactor, as it
   already was in the handshake, and counters are no longer rewritten on every
-  tick.
-- **No performance claim.** The common path adds no store call per tick; the
-  ordering adds no store call per message beyond the ones already made
-  (filing, plus one counter write per message whose counter moved). No figure
-  is stated without a `make bench` run on named hardware (ADR-0001).
+  tick or on the reactor's first pass.
+- **Cost of the trait shape.** `MessageStore` is an `async_trait`, so every
+  call allocates one boxed future. The outbound path makes one call per
+  sequenced message (`file_outbound`), and each counter that moved costs one
+  more. The engine holds the store as `&dyn MessageStore` while it writes
+  (`SessionStore`), with no extra `Arc` traffic per call. No figure is stated:
+  there is no measurement on named hardware (ADR-0001).
 - The crate DAG is unchanged: `ironfix-store` still depends on `core` only, and
   the policy lives in `ironfix-engine`. The ordering and policy decisions are
-  synchronous and read no clock (ADR-0002); only the store calls are async.
+  synchronous and read no clock (ADR-0002); only the store calls are async, and
+  their timeout is the driver's.

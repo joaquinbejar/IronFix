@@ -67,8 +67,9 @@ exists yet.
   frame is filed and the next sender number persisted before its bytes are
   written, and the next target number is persisted before an inbound message
   is acted on. `Initiator::with_store_failure_policy` chooses between warning
-  and continuing (the default) or failing closed, writing nothing the store
-  has not accepted.
+  and continuing (the default, which gives no crash guarantee) or failing
+  closed, writing nothing the store has not accepted. Every store call is
+  bounded by `Initiator::with_store_timeout`.
 - **A typestate session FSM** and checked sequence arithmetic in
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in
@@ -105,8 +106,10 @@ around it.
   numbers do not survive a restart (`ironfix-store/src/lib.rs`). The store is
   opt-in on `Initiator` only: `Acceptor` attaches none, so every resend it
   answers is a gap fill (`ironfix-engine/src/acceptor.rs`). Inbound
-  application messages are delivered at most once across a crash, and inbound
-  frames are not filed.
+  application messages are delivered at most once: a crash, or a session
+  close whose application queue does not drain in time, loses the messages
+  still queued. The close logs the lost range; nothing reports a loss across
+  a restart yet (#105). Inbound frames are not filed.
 - **One session per engine.** `EngineBuilder` takes exactly one
   `SessionConfig`; `into_initiator()` and `into_acceptor()` return
   `EngineError::Configuration` for zero or several
