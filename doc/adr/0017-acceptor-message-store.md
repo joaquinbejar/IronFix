@@ -45,7 +45,7 @@ Active; the reactor, which both roles share, does the rest unchanged.
 
 A store belongs to exactly one engine instance: two engines or processes
 writing to one store would interleave two sequence streams. The owed-reset
-record lives in memory in the engine (#78, #89).
+record lives in memory in the engine (#111).
 
 ### One seeding helper for both roles
 

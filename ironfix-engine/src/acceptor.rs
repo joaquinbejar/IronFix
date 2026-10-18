@@ -349,7 +349,7 @@ impl<A: Application + 'static> Acceptor<A> {
     /// two engines, or two processes, writing to one store would interleave two
     /// sequence streams in it. The record of a reset owed to the next session
     /// is held in memory by the acceptor, not in the store, so a restart
-    /// forgets it (#78, #89).
+    /// forgets it (#111).
     ///
     /// **Nothing reaches the store before the Logon is authenticated.** A Logon
     /// refused before `from_admin` has accepted it (wrong version, encryption,

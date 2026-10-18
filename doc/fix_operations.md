@@ -430,7 +430,11 @@ each carrying `MsgSeqNum` = the first number it covers, `GapFillFlag` (123) = Y,
 - **stored frames that cannot be rebuilt** — a frame that does not decode, or
   that carries no `SendingTime` (52) to copy into `OrigSendingTime` and so
   cannot be resent conformantly;
-- **the whole range**, if the store itself returns an error.
+- **the rest of the range**, if the store returns an error reading it, except
+  `StoreError::Corrupted`: a store that finds its own records damaged cannot
+  say which messages it still holds intact, so the engine closes the session
+  instead of gap-filling them, and the counterparty asks again in the next
+  session.
 
 A gap fill allocates no sender sequence number either: it occupies the range it
 replaces. So answering a resend never moves the session's own outbound
@@ -455,8 +459,14 @@ counters in a journal file: a session started on a reopened `FileStore`
 resumes from its counters, and a `ResendRequest` after the restart replays the
 original frames. What survives depends on its `SyncPolicy`: every write that
 returned `Ok` survives a process crash under every policy, and an OS crash or
-power loss only under `SyncPolicy::EveryWrite` (the default). A torn or
-damaged journal tail is cut when the store opens and is never replayed
+power loss only under `SyncPolicy::EveryWrite` (the default), and only under
+`StoreFailurePolicy::CloseSession` does a failed write keep its frame off the
+wire. When it opens, `FileStore` cuts only what an interrupted write can leave
+at the end of its journal (a cut record is never replayed); damage anywhere
+else makes it refuse to open with `StoreError::Corrupted` until an operator
+runs `FileStore::repair`, after which the session must reset its sequence
+(`ResetSeqNumFlag` (141) = Y). A missing journal is an error unless the store
+is configured to create it. These guarantees are stated for Unix
 (`doc/adr/0006-file-store.md`).
 
 **Store write order.** Every store call (`store`, `file_outbound`,
@@ -562,7 +572,10 @@ reset fails closed the same way for a session that resets), the next accepted
 Logon resets the store and its acknowledgement declares `141=Y` at 1; the
 record is cleared once that acknowledgement is sent. The record lives in the
 engine, in memory, so a process restart forgets it whichever store is
-attached; `FileStore` does not persist it (#89). For the same reason a store
+attached; `FileStore` does not persist it. A crash after the counterparty
+acknowledged a `ResetSeqNumFlag` reset and before the store made it durable
+therefore restarts from the previous stream's counters; making the intent
+durable is #111. For the same reason a store
 must belong to exactly one engine instance; `FileStore` enforces this with a
 lock file.
 
@@ -578,8 +591,10 @@ without a reply.
 *Cancellation and timeouts.* Every reset is recorded as owed before it is
 awaited and cleared only once it has succeeded, so a connect dropped while a
 reset is pending still leaves it owed. A store write that overruns the store
-timeout may still land later, so it too leaves a reset owed, and the next
-session starts with a reset and `ResetSeqNumFlag` (141) = Y. This relies on
+timeout may still land later, and one that fails may have changed the store
+before failing (the `MessageStore` contract cannot say otherwise), so either
+leaves a reset owed, under both policies, and the next session starts with a
+reset and `ResetSeqNumFlag` (141) = Y. This relies on
 the store applying its mutations in call order even when a call is dropped,
 which `MessageStore` now requires and `MemoryStore` and `FileStore` satisfy
 (`FileStore` runs each call behind a first-in, first-out lock held until its

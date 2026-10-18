@@ -62,11 +62,12 @@ exists yet.
 - **Resend from store** in both roles. Attach a `MessageStore` with
   `Initiator::with_store`, `Acceptor::with_store` or `EngineBuilder::with_store`
   (`MemoryStore` in memory, or `FileStore`, a journal file that survives a
-  restart) and an inbound `ResendRequest` replays the stored application
-  messages with `PossDupFlag = Y` and the original `SendingTime` in
-  `OrigSendingTime`;
-  administrative messages, and anything the store cannot produce, are covered
-  by gap fill. A session starts from the store's counters unless it resets the
+  restart and refuses to open over damage it cannot attribute to an
+  interrupted write) and an inbound `ResendRequest` replays the stored
+  application messages with `PossDupFlag = Y` and the original `SendingTime`
+  in `OrigSendingTime`; administrative messages, and anything the store
+  cannot produce, are covered by gap fill (a store that reports itself
+  corrupted closes the session instead). A session starts from the store's counters unless it resets the
   sequence. Store writes are fallible and ordered: a frame is filed and the
   next sender number persisted before its bytes are written, and the next
   target number is persisted before an inbound message is acted on.
@@ -127,11 +128,14 @@ works today" and appears below, it does not exist in the code — do not plan
 around it.
 
 - **Store limits.** There is no memory-mapped store, and `FileStore`'s
-  journal is never compacted: it grows until the sequence is reset. Only its
-  `SyncPolicy::EveryWrite` (the default) makes every acknowledged write
-  survive an OS crash or a power loss; `EveryN` and `Never` survive a process
-  crash only (`doc/adr/0006-file-store.md`). The record of a reset owed to
-  the next session lives in the engine's memory, not in the store. Inbound
+  journal is never compacted: it grows until the sequence is reset (#112).
+  Only its `SyncPolicy::EveryWrite` (the default) makes every acknowledged
+  write survive an OS crash or a power loss; `EveryN` and `Never` survive a
+  process crash only. Its guarantees reach the wire only under
+  `StoreFailurePolicy::CloseSession`, and are stated for Unix only
+  (`doc/adr/0006-file-store.md`). The record of a reset owed to the next
+  session lives in the engine's memory, not in the store, so a crash forgets
+  it (#111). Inbound
   application messages are delivered at most once: a crash, or a session
   close whose application queue does not drain in time, loses the messages
   still queued. The close logs the lost range; nothing reports a loss across

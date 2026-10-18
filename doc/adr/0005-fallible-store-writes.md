@@ -250,7 +250,9 @@ the store having finished:
   the store as possibly holding an outstanding write and records a reset as
   owed, so the next session starts a new stream (a reset, and
   `ResetSeqNumFlag` = Y) rather than building on counters a late write may
-  still move.
+  still move. Since #78 (ADR-0006) this applies to **every failed
+  mutation**, not only one that overruns: the contract gives a store no way
+  to say a failed write changed nothing, so its state after one is unknown.
 
 That second rule is sound only with a contract on the store, now stated in
 the `MessageStore` documentation: **mutations take effect in call order, even

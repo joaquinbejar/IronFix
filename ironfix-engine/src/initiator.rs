@@ -304,7 +304,7 @@ impl<A: Application + 'static> Initiator<A> {
     /// alone: two engines, or two processes, writing to one store would
     /// interleave two sequence streams in it. The record of a reset owed to the
     /// next session is held in memory by the initiator, not in the store, so a
-    /// restart forgets it (#78, #89). Call [`Initiator::connect`] again only
+    /// restart forgets it (#111). Call [`Initiator::connect`] again only
     /// once the previous session's [`Connection::wait_closed`] has returned.
     ///
     /// A failed write to the store is handled by

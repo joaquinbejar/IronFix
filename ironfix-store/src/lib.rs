@@ -39,10 +39,15 @@
 //! | [`FileStore`], [`SyncPolicy::Never`] | every write that returned `Ok` | nothing is promised |
 //!
 //! Only [`SyncPolicy::EveryWrite`] makes the engine's write order a guarantee
-//! against an OS crash or a power loss. A [`FileStore`] cuts a torn or damaged
-//! journal tail when it opens, and never returns a record it cannot vouch for
-//! (see the [`file`](mod@file) module and `doc/adr/0006-file-store.md`). There
-//! is no memory-mapped store.
+//! against an OS crash or a power loss, and only under the engine's
+//! `StoreFailurePolicy::CloseSession` does a failed write keep its frame off
+//! the wire. These guarantees are stated for Unix. When a [`FileStore`]
+//! opens, it cuts only what an interrupted write can leave at the end of its
+//! journal; damage anywhere else makes it refuse to open
+//! (`StoreError::Corrupted`) until an operator runs [`FileStore::repair`],
+//! after which the session must reset its sequence. It never returns a record
+//! it cannot vouch for (see the [`file`](mod@file) module and
+//! `doc/adr/0006-file-store.md`). There is no memory-mapped store.
 
 pub mod file;
 pub mod memory;
