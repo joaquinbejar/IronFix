@@ -6,12 +6,18 @@
 
 //! # IronFix codegen check
 //!
-//! Compiles the views, enumerations and writers that
-//! `ironfix_codegen::CodeGenerator::generate_views` emits for the embedded
-//! FIX 4.4, FIX 4.2 and FIXT 1.1 dictionaries, in full, as a library under
-//! the workspace lints: `make lint` (`clippy --all-targets -D warnings`) and
-//! `make doc` (`-D missing_docs`) check the generated text, which carries no
-//! `#[allow]`, and so does this crate.
+//! Compiles, in full, as a library under the workspace lints, what
+//! `ironfix_codegen::CodeGenerator` emits for the embedded dictionaries:
+//!
+//! - the views, enumerations and writers (`generate_views`) of FIX 4.4,
+//!   FIX 4.2 and FIXT 1.1, in the modules `fix44`, `fix42` and `fixt11`;
+//! - the data definitions (`generate`, the default output) of FIX 4.4,
+//!   FIX 4.2, FIXT 1.1 and FIX 5.0 SP2, in the module `data`.
+//!
+//! `make lint` (`clippy --all-targets -D warnings`) and `make doc`
+//! (`-D missing_docs`) check the generated text, which carries no
+//! `#[allow]`, and so does this crate. The FIX 5.0 SP2 views (about 31 MB of
+//! source) are not compiled here.
 //!
 //! It also compiles both outputs, `CodeGenerator::generate` and
 //! `CodeGenerator::generate_views`, for the dictionary that
@@ -51,9 +57,34 @@ pub mod orchestra_fix44_views {
     include!(concat!(env!("OUT_DIR"), "/orchestra_fix44_views.rs"));
 }
 
+/// The full data definitions (`CodeGenerator::generate`) of the embedded
+/// dictionaries: tag constants, message structs, one struct per component
+/// and one per repeating-group definition.
+pub mod data {
+    /// The data definitions of the embedded FIX 4.4 dictionary.
+    pub mod fix44 {
+        include!(concat!(env!("OUT_DIR"), "/fix44_data.rs"));
+    }
+
+    /// The data definitions of the embedded FIX 4.2 dictionary.
+    pub mod fix42 {
+        include!(concat!(env!("OUT_DIR"), "/fix42_data.rs"));
+    }
+
+    /// The data definitions of the embedded FIXT 1.1 dictionary.
+    pub mod fixt11 {
+        include!(concat!(env!("OUT_DIR"), "/fixt11_data.rs"));
+    }
+
+    /// The data definitions of the embedded FIX 5.0 SP2 dictionary.
+    pub mod fix50sp2 {
+        include!(concat!(env!("OUT_DIR"), "/fix50sp2_data.rs"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::fix44;
+    use super::{data, fix44};
     use ironfix_core::message::RawMessage;
     use ironfix_tagvalue::Decoder;
     use rust_decimal::Decimal;
@@ -177,5 +208,56 @@ mod tests {
             .map(|party| ok(party.party_id(), "PartyID"))
             .collect();
         assert_eq!(ids, ["TRADER"]);
+    }
+
+    /// The party IDs of a `Parties` component of the FIX 5.0 SP2 data
+    /// definitions.
+    fn party_ids(parties: &data::fix50sp2::components::Parties) -> Vec<&str> {
+        parties
+            .no_party_ids
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.party_id.as_deref())
+            .collect()
+    }
+
+    #[test]
+    fn test_full_fix50sp2_data_shares_one_type_per_component() {
+        use data::fix50sp2::components::{
+            Parties, PartiesNoPartyIDsEntry, PtysSubGrp, PtysSubGrpNoPartySubIDsEntry,
+        };
+        use data::fix50sp2::messages::{ExecutionReport, NewOrderSingle};
+
+        // Parties nests a group (NoPartySubIDs) through PtysSubGrp inside its
+        // own group's entries.
+        let parties = Parties {
+            no_party_ids: Some(vec![PartiesNoPartyIDsEntry {
+                party_id: Some("BROKER-1".to_owned()),
+                party_idsource: Some('D'),
+                party_role: Some(1),
+                party_role_qualifier: None,
+                ptys_sub_grp: Some(PtysSubGrp {
+                    no_party_sub_ids: Some(vec![PtysSubGrpNoPartySubIDsEntry {
+                        party_sub_id: Some("DESK-7".to_owned()),
+                        party_sub_idtype: Some(4),
+                    }]),
+                }),
+            }]),
+        };
+        assert_eq!(party_ids(&parties), ["BROKER-1"]);
+
+        // NewOrderSingle and ExecutionReport hold the same component type,
+        // so one function reads the parties of either.
+        let of_order: fn(&NewOrderSingle) -> Vec<&str> =
+            |order| order.parties.as_ref().map(party_ids).unwrap_or_default();
+        let of_report: fn(&ExecutionReport) -> Vec<&str> =
+            |report| report.parties.as_ref().map(party_ids).unwrap_or_default();
+        // A required component is a bare field: the symbol is one access away.
+        let symbol: fn(&NewOrderSingle) -> Option<&str> =
+            |order| order.instrument.symbol.as_deref();
+        // CumQty (14) is a required FIX Qty: a decimal, never binary floating
+        // point.
+        let cum_qty: fn(&ExecutionReport) -> Decimal = |report| report.cum_qty;
+        let _ = (of_order, of_report, symbol, cum_qty);
     }
 }
