@@ -83,15 +83,33 @@
 //!
 //! # A reset that could not be made
 //!
-//! `reset_on_logout` and `reset_on_disconnect` reset the store as the session
-//! closes. If that reset fails, no counter is written: the reset values
-//! written over a store still holding the previous stream would describe
-//! neither. The [`Initiator`](crate::Initiator) then records that a reset is
-//! owed, and its next `connect` resets the store before anything else,
-//! refusing the session with [`EngineError::Store`] if it still cannot,
-//! whatever the policy. The record lives in the `Initiator`, not in the
-//! store: a process restart forgets it, and the next session starts from the
-//! counters the store still holds.
+//! Two resets can fail after the decision to reset has been taken:
+//!
+//! - `reset_on_logout` and `reset_on_disconnect` reset the store as the
+//!   session closes. If that reset fails, no counter is written: the reset
+//!   values written over a store still holding the previous stream would
+//!   describe neither.
+//! - A Logon acknowledgement carrying `ResetSeqNumFlag` (141) = Y, when the
+//!   Logon did not ask for a reset, makes the engine reset the store and set
+//!   both counters to 2 (one [`MessageStore::reset_to`] call) before
+//!   `on_logon`. If that fails, the connect fails with [`EngineError::Store`],
+//!   whatever the policy: under any policy, carrying on would let a resend in
+//!   the new stream replay frames of the previous one.
+//!
+//! Either way the [`Initiator`](crate::Initiator) records that a reset is
+//! owed. Its next `connect` resets the store before anything else, refusing
+//! the session with [`EngineError::Store`] if it still cannot, whatever the
+//! policy, and its Logon then declares `ResetSeqNumFlag` (141) = Y and starts
+//! at 1, so both sides restart the sequence together rather than the retry
+//! being refused as too low. The record is cleared once that Logon is
+//! acknowledged. It lives in the `Initiator`, not in the store: a process
+//! restart forgets it, and the next session starts from the counters the
+//! store still holds.
+//!
+//! The default [`MessageStore::reset_to`] is three calls, not one atomic
+//! write: a crash between them leaves the store cleared with its initial
+//! counters, and the next session's Logon goes out at 1 without a reset. A
+//! durable store should override it.
 //!
 //! A store failure never logs frame bytes: an outbound Logon carries
 //! `Password` (554).
@@ -108,16 +126,17 @@ use std::time::Duration;
 /// What the engine does when a write to the attached [`MessageStore`] fails.
 ///
 /// Applies to every write the engine makes during a session: filing an
-/// outbound frame, persisting the next sender sequence number, persisting the
-/// next target sequence number, and resetting the store when the counterparty
-/// resets the sequence on its Logon acknowledgement. A call that does not
-/// finish within the store timeout counts as a failed write. Without a store
-/// attached there is nothing to fail and the policy has no effect.
+/// outbound frame, persisting the next sender sequence number, and persisting
+/// the next target sequence number. A call that does not finish within the
+/// store timeout counts as a failed write. Without a store attached there is
+/// nothing to fail and the policy has no effect.
 ///
-/// Some store calls fail closed whatever the policy, because the session
-/// cannot start without them: the reset for a `ResetSeqNumFlag` (141) Logon,
-/// the refresh that recovers the counters, and a reset owed by the previous
-/// session (see the [module documentation](self)).
+/// The resets and the refresh fail closed whatever the policy, because
+/// carrying on past any of them would run one sequence stream over another:
+/// the reset for a `ResetSeqNumFlag` (141) Logon, the reset when the
+/// counterparty declares `ResetSeqNumFlag` on its Logon acknowledgement, a
+/// reset owed by the previous session, and the refresh that recovers the
+/// counters (see the [module documentation](self)).
 ///
 /// # Example
 ///
@@ -189,8 +208,6 @@ enum StoreWrite<'m> {
     NextSender(u64),
     /// Persisting the next target sequence number.
     NextTarget(u64),
-    /// Resetting the store for a sequence reset.
-    Reset,
 }
 
 /// Runs one store call bounded by `timeout`, reporting an overrun as
@@ -310,17 +327,31 @@ impl<'s> SessionStore<'s> {
         }
     }
 
-    /// Resets the store (messages and counters) for a sequence reset.
+    /// Resets the store and sets both counters through one
+    /// [`MessageStore::reset_to`] call, for a sequence reset the counterparty
+    /// declared on its Logon acknowledgement.
+    ///
+    /// This one fails closed **whatever the policy**: carrying on with the
+    /// previous stream still filed lets a resend in the new stream replay its
+    /// frames under numbers the new stream also uses.
     ///
     /// # Errors
-    /// The store's error under [`StoreFailurePolicy::CloseSession`]. Under
-    /// [`StoreFailurePolicy::Continue`] the failure is logged and the previous
-    /// stream stays filed, so a later resend can replay frames of it.
-    pub(crate) async fn reset(self, session_id: &SessionId) -> Result<(), StoreError> {
-        match timed(self.timeout, self.store.reset()).await {
-            Ok(()) => Ok(()),
-            Err(err) => self.on_failure(session_id, StoreWrite::Reset, err),
-        }
+    /// The store's error, or [`StoreError::Timeout`], under every policy.
+    pub(crate) async fn reset_to(
+        self,
+        session_id: &SessionId,
+        next_sender: u64,
+        next_target: u64,
+    ) -> Result<(), StoreError> {
+        let reset = self.store.reset_to(next_sender, next_target);
+        timed(self.timeout, reset).await.inspect_err(|err| {
+            tracing::error!(
+                session = %session_id,
+                error = %err,
+                "cannot reset the store for the counterparty's sequence reset: refusing the \
+                 session rather than running the new stream over the previous one"
+            );
+        })
     }
 
     /// Applies the policy to one failed call: a warning and `Ok` to carry on,
@@ -362,12 +393,6 @@ impl<'s> SessionStore<'s> {
                 next,
                 error = %err,
                 "cannot persist the next target sequence number: continuing"
-            ),
-            StoreWrite::Reset => tracing::warn!(
-                session = %session_id,
-                error = %err,
-                "cannot reset the store for a sequence reset: continuing with the previous \
-                 stream still filed"
             ),
         }
         Ok(())

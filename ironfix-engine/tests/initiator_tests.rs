@@ -3572,6 +3572,7 @@ struct FailingStore {
     stall_target: AtomicBool,
     sender_writes: AtomicU64,
     target_writes: AtomicU64,
+    reset_to_calls: AtomicU64,
 }
 
 impl FailingStore {
@@ -3586,7 +3587,31 @@ impl FailingStore {
             stall_target: AtomicBool::new(false),
             sender_writes: AtomicU64::new(0),
             target_writes: AtomicU64::new(0),
+            reset_to_calls: AtomicU64::new(0),
         }
+    }
+
+    /// Files five orders of a previous stream and moves the counters past
+    /// them, as a session before a reset would have left the store.
+    async fn with_previous_stream(self, next_target: u64) -> Self {
+        for seq in 1..=5u64 {
+            let frame = venue_msg_from("CLIENT", "VENUE", "D", seq, &[(11, "OLD-SESSION")]);
+            ok(
+                self.inner
+                    .store(seq, &MsgType::NewOrderSingle, &frame)
+                    .await,
+                "seed a frame of the previous stream",
+            );
+        }
+        ok(
+            self.inner.set_next_sender_seq(6).await,
+            "seed the sender counter",
+        );
+        ok(
+            self.inner.set_next_target_seq(next_target).await,
+            "seed the target counter",
+        );
+        self
     }
 
     fn failing_reset() -> Self {
@@ -3667,6 +3692,14 @@ impl MessageStore for FailingStore {
             return Err(StoreError::Io("reset failed".to_string()));
         }
         self.inner.reset().await
+    }
+
+    /// Counted, then the same three steps as the trait's default.
+    async fn reset_to(&self, next_sender: u64, next_target: u64) -> Result<(), StoreError> {
+        self.reset_to_calls.fetch_add(1, Ordering::SeqCst);
+        self.reset().await?;
+        self.set_next_sender_seq(next_sender).await?;
+        self.set_next_target_seq(next_target).await
     }
 
     fn creation_time(&self) -> std::time::SystemTime {
@@ -6532,11 +6565,13 @@ async fn test_reset_on_the_logon_ack_resets_the_store_before_on_logon() {
     drop(connection);
 }
 
-/// Under `CloseSession`, a resetting Logon ack whose store cannot be reset
-/// fails `connect` with the store error before `on_logon`, writing nothing
-/// more.
+/// Under the default `Continue` policy too, a resetting Logon ack whose store
+/// cannot be reset fails `connect` before `on_logon`: carrying on would leave
+/// the previous stream filed under the numbers the new one uses, and a
+/// `ResendRequest` in the new stream would replay its frames. Nothing follows
+/// the Logon on the wire, and the reset goes through one `reset_to` call.
 #[tokio::test]
-async fn test_reset_on_the_logon_ack_fails_closed_when_the_store_cannot_be_reset() {
+async fn test_failed_reset_on_the_logon_ack_fails_closed_under_continue() {
     let (listener, addr) = bind_listener().await;
     let acceptor = tokio::spawn(async move {
         let mut framed = accept_framed(listener).await;
@@ -6547,14 +6582,18 @@ async fn test_reset_on_the_logon_ack_fails_closed_when_the_store_cannot_be_reset
                 .await,
             "send the resetting logon ack",
         );
+        // The venue asks for its whole new stream at once.
+        ok(
+            framed.send(venue_msg("2", 2, &[(7, "1"), (16, "0")])).await,
+            "send ResendRequest",
+        );
         msg_types_until_closed(&mut framed).await
     });
 
-    let store = Arc::new(FailingStore::failing_reset());
+    let store = Arc::new(FailingStore::failing_reset().with_previous_stream(4).await);
     let (app, _app_rx) = RecordingApp::new();
     let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
-        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
-        .with_store_failure_policy(StoreFailurePolicy::CloseSession);
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
 
     match initiator.connect(addr).await {
         Err(EngineError::Store(_)) => {}
@@ -6568,8 +6607,137 @@ async fn test_reset_on_the_logon_ack_fails_closed_when_the_store_cannot_be_reset
         ),
         "acceptor task",
     );
-    assert!(seen.is_empty(), "nothing follows the Logon: {seen:?}");
+    assert!(
+        seen.is_empty(),
+        "nothing follows the Logon, least of all a previous-stream order: {seen:?}"
+    );
     assert!(!app.events().contains(&"logon".to_string()));
+    assert_eq!(store.reset_to_calls.load(Ordering::SeqCst), 1);
+}
+
+/// Under `CloseSession`, a resetting Logon ack whose store cannot be reset
+/// fails `connect` and leaves the reset owed. Once the store recovers, the
+/// same `Initiator` makes the reset before its next Logon, which declares
+/// `ResetSeqNumFlag` (141) = Y at `MsgSeqNum` 1, so the counterparty restarts
+/// with it; a `ResendRequest` in that session replays nothing of the previous
+/// stream. The Logon after that one declares no reset: the debt is paid.
+#[tokio::test]
+async fn test_failed_reset_on_the_logon_ack_is_owed_to_the_retry() {
+    let (listener, addr) = bind_listener().await;
+    let acceptor = tokio::spawn(async move {
+        // First connection: the venue resets on its ack; the client refuses.
+        let (socket, _) = ok(listener.accept().await, "accept the first connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(
+            field(&logon, 34).as_deref(),
+            Some("6"),
+            "numbered from the store"
+        );
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]))
+                .await,
+            "send the resetting logon ack",
+        );
+        let refused = msg_types_until_closed(&mut framed).await;
+
+        // Second connection: the retry declares the reset itself.
+        let (socket, _) = ok(listener.accept().await, "accept the second connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let logon = next_frame(&mut framed).await;
+        let retry_logon = (field(&logon, 34), field(&logon, 141));
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]))
+                .await,
+            "acknowledge the reset",
+        );
+        ok(
+            framed.send(venue_msg("2", 2, &[(7, "1"), (16, "0")])).await,
+            "send ResendRequest",
+        );
+        let mut replies = Vec::new();
+        loop {
+            let frame = next_frame(&mut framed).await;
+            let msg_type = msg_type_of(&frame);
+            let done = msg_type == "4";
+            replies.push((msg_type, field(&frame, 11)));
+            if done {
+                break;
+            }
+        }
+        // The venue drops the connection; the client closes on it.
+        drop(framed);
+
+        // Third connection: nothing is owed any more.
+        let (socket, _) = ok(listener.accept().await, "accept the third connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let logon = next_frame(&mut framed).await;
+        let third_logon = (field(&logon, 34), field(&logon, 141));
+        (refused, retry_logon, replies, third_logon)
+    });
+
+    let store = Arc::new(FailingStore::failing_reset().with_previous_stream(2).await);
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+        .with_store_failure_policy(StoreFailurePolicy::CloseSession);
+
+    match initiator.connect(addr).await {
+        Err(EngineError::Store(_)) => {}
+        Err(other) => panic!("expected a store error, got {other:?}"),
+        Ok(_) => panic!("connect must fail when the store cannot be reset"),
+    }
+    assert!(!app.events().contains(&"logon".to_string()));
+    assert!(store.inner.contains(5), "the failed reset changed nothing");
+
+    // The store recovers, and the same initiator retries.
+    store.fail_reset.store(false, Ordering::SeqCst);
+    let connection = ok(initiator.connect(addr).await, "retry");
+    assert_eq!(
+        app.events()
+            .iter()
+            .filter(|event| *event == "logon")
+            .count(),
+        1
+    );
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s of the venue dropping the connection",
+    );
+
+    // A third connect: the Logon after the paid debt declares no reset. The
+    // stub reads it and hangs up, which ends this connect.
+    let third = timeout(Duration::from_secs(5), initiator.connect(addr)).await;
+    let (refused, retry_logon, replies, third_logon) = ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+    drop(third);
+
+    assert!(
+        refused.is_empty(),
+        "the refusal writes nothing: {refused:?}"
+    );
+    assert_eq!(
+        retry_logon,
+        (Some("1".to_string()), Some("Y".to_string())),
+        "the retry starts at 1 and declares ResetSeqNumFlag"
+    );
+    assert!(
+        replies.iter().all(|(msg_type, _)| msg_type != "D"),
+        "no frame of the previous stream may be replayed: {replies:?}"
+    );
+    assert_eq!(replies, vec![("4".to_string(), None)]);
+    assert_eq!(
+        third_logon.1, None,
+        "the reset was paid once acknowledged: the next Logon declares none"
+    );
+    assert_ne!(third_logon.0.as_deref(), Some("1"));
 }
 
 /// When the close-time reset of `reset_on_disconnect` fails, no counter is
@@ -6600,18 +6768,19 @@ async fn test_close_time_reset_failure_writes_no_counters_and_is_owed_to_the_nex
         let mut framed = Framed::new(socket, FixCodec::new());
         let refused = msg_types_until_closed(&mut framed).await;
 
-        // Third connection: the reset is made, so the Logon starts from 1.
+        // Third connection: the reset is made, so the Logon starts from 1 and
+        // declares the reset for the counterparty to make too.
         let (socket, _) = ok(listener.accept().await, "accept the third connection");
         let mut framed = Framed::new(socket, FixCodec::new());
         let logon = next_frame(&mut framed).await;
-        let logon_seq = field(&logon, 34);
+        let logon_fields = (field(&logon, 34), field(&logon, 141));
         ok(
             framed
-                .send(venue_msg("A", 1, &[(98, "0"), (108, "30")]))
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]))
                 .await,
             "send logon ack",
         );
-        (refused, logon_seq, framed)
+        (refused, logon_fields, framed)
     });
 
     let store = Arc::new(FailingStore::failing_reset());
@@ -6648,7 +6817,7 @@ async fn test_close_time_reset_failure_writes_no_counters_and_is_owed_to_the_nex
         initiator.connect(addr).await,
         "connect once the reset can be made",
     );
-    let (refused, logon_seq, _framed) = ok(
+    let (refused, logon_fields, _framed) = ok(
         ok(
             timeout(Duration::from_secs(10), acceptor).await,
             "acceptor done within 10s",
@@ -6659,7 +6828,11 @@ async fn test_close_time_reset_failure_writes_no_counters_and_is_owed_to_the_nex
         refused.is_empty(),
         "the refused connect writes nothing: {refused:?}"
     );
-    assert_eq!(logon_seq.as_deref(), Some("1"));
+    assert_eq!(
+        logon_fields,
+        (Some("1".to_string()), Some("Y".to_string())),
+        "the Logon after an owed reset starts at 1 and declares ResetSeqNumFlag"
+    );
     assert!(!store.inner.contains(2), "the previous stream is gone");
     drop(connection);
 }
@@ -6894,4 +7067,113 @@ async fn test_peer_logout_reply_refused_by_the_store_is_not_a_graceful_close() {
         "not graceful, so reset_on_logout did not clear the store"
     );
     assert_eq!(store.inner.next_sender_seq(), 3);
+}
+
+/// An application that breaks the test store as `on_logon` runs, so the first
+/// store write after the session goes Active fails.
+#[derive(Debug)]
+struct BreakStoreOnLogon {
+    store: Arc<FailingStore>,
+    logons: AtomicU64,
+    logouts: AtomicU64,
+}
+
+#[async_trait]
+impl Application for BreakStoreOnLogon {
+    async fn on_create(&self, _session_id: &SessionId) {}
+
+    async fn on_logon(&self, _session_id: &SessionId) {
+        self.logons.fetch_add(1, Ordering::SeqCst);
+        self.store.fail_store.store(true, Ordering::SeqCst);
+    }
+
+    async fn on_logout(&self, _session_id: &SessionId) {
+        self.logouts.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn to_admin(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_admin(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_app(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+}
+
+/// The `ResendRequest` for a gap in the Logon ack is sent once the session is
+/// Active, after `on_logon`. Under `CloseSession`, a store failure on it closes
+/// the session through the reactor's close path: `connect` succeeds, the
+/// request is never written, `on_logout` runs, and so does the close-time
+/// reset of `reset_on_disconnect`.
+#[tokio::test]
+async fn test_opening_resend_request_store_failure_closes_through_the_close_path() {
+    let (listener, addr) = bind_listener().await;
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let _logon = next_frame(&mut framed).await;
+        // The client expects 1; an ack numbered 3 is a gap.
+        ok(
+            framed
+                .send(venue_msg("A", 3, &[(98, "0"), (108, "30")]))
+                .await,
+            "send the gapped logon ack",
+        );
+        msg_types_until_closed(&mut framed).await
+    });
+
+    let store = Arc::new(FailingStore::working());
+    let app = Arc::new(BreakStoreOnLogon {
+        store: Arc::clone(&store),
+        logons: AtomicU64::new(0),
+        logouts: AtomicU64::new(0),
+    });
+    let mut config = client_config(Duration::from_secs(30));
+    config.reset_on_disconnect = true;
+    let initiator = Initiator::new(config, Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+        .with_store_failure_policy(StoreFailurePolicy::CloseSession);
+
+    let connection = ok(
+        initiator.connect(addr).await,
+        "the session went Active; closing it is the reactor's job",
+    );
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s",
+    );
+    let seen = ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+    assert!(
+        !seen.iter().any(|msg_type| msg_type == "2"),
+        "the ResendRequest the store refused must not be written: {seen:?}"
+    );
+    assert_eq!(app.logons.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        app.logouts.load(Ordering::SeqCst),
+        1,
+        "on_logout follows on_logon"
+    );
+    assert_eq!(
+        store.inner.message_count(),
+        0,
+        "the close-time reset ran and cleared the filed Logon"
+    );
+    assert_eq!(store.inner.next_sender_seq(), 1);
 }

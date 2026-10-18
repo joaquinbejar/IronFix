@@ -198,21 +198,22 @@ pub enum EngineError {
     /// A message-store operation the session depends on failed during setup.
     ///
     /// Raised by [`Initiator::connect`](crate::Initiator::connect) when the
-    /// store cannot be reset for a `ResetSeqNumFlag` (141) Logon, or for a
-    /// reset the previous session owes, or refreshed to recover its counters,
-    /// before the session starts, whatever the policy. Continuing anyway would
-    /// either file a new stream on top of a previous one's numbers or reuse a
-    /// `MsgSeqNum` the counterparty has already seen, so the session is refused
-    /// rather than started from a counter the store could not vouch for.
+    /// store cannot be reset for a `ResetSeqNumFlag` (141) Logon, for a reset
+    /// an earlier session owes, or for the `ResetSeqNumFlag` the counterparty
+    /// declared on its Logon ack, or refreshed to recover its counters,
+    /// whatever the policy. Continuing anyway would either run a new stream
+    /// over a previous one's numbers or reuse a `MsgSeqNum` the counterparty
+    /// has already seen, so the session is refused rather than started from a
+    /// counter the store could not vouch for. A failed reset for the ack is
+    /// owed to the next connect, whose Logon then declares the reset itself.
     ///
     /// Under [`StoreFailurePolicy::CloseSession`](crate::StoreFailurePolicy::CloseSession)
     /// it is also raised when a handshake store call fails: filing the Logon
-    /// together with the next sender number, resetting the store when the
-    /// Logon ack carries `ResetSeqNumFlag` (141) = Y, persisting the reset
-    /// counters or the target number the Logon ack consumed, and filing a
-    /// Reject or Logout that refuses the ack (this error then replaces the
-    /// refusal's own). The frame concerned is never written. During the Active
-    /// session the same failure closes the session instead.
+    /// together with the next sender number, persisting the target number the
+    /// Logon ack consumed, and filing a Reject or Logout that refuses the ack
+    /// (this error then replaces the refusal's own). The frame concerned is
+    /// never written. Once `on_logon` has run, the same failure closes the
+    /// session instead, through `on_logout`.
     ///
     /// A store call that overruns the store timeout fails with
     /// [`StoreError::Timeout`].

@@ -738,11 +738,15 @@ struct Reactor<A: Application> {
 /// The session reactor: owns the socket, multiplexes inbound frames,
 /// outbound commands, application rejections, and heartbeat timers until the
 /// session closes.
+///
+/// `opening_gap` is a gap the Logon exchange found, as (first missing number,
+/// highest number seen); its `ResendRequest` is the reactor's first act.
 async fn run_reactor<A: Application + 'static>(
     mut framed: FixFramed,
     channels: ReactorChannels,
     mut ctx: Reactor<A>,
     session: Session<Active>,
+    opening_gap: Option<(u64, u64)>,
 ) {
     let ReactorChannels {
         mut commands,
@@ -751,7 +755,24 @@ async fn run_reactor<A: Application + 'static>(
         mut dispatcher,
         app_completed,
     } = channels;
-    let mut phase = Some(Phase::Active(session));
+    // The gap is requested here rather than by the handshake: `on_logon` has
+    // already run, so a failure to send the request (a store refusal under the
+    // fail-closed policy, a peer that stopped reading) has to close the
+    // session through the path below, which runs `on_logout`, the close-time
+    // reset and the last counter writes. A failure leaves no phase, and the
+    // first pass of the loop ends the session with it.
+    let (mut phase, mut opening_failure) = match opening_gap {
+        Some((expected, high_water)) => {
+            let opened = ctx
+                .request_resend(&mut framed, Phase::Active(session), expected, high_water)
+                .await;
+            match opened {
+                Ok(phase) => (Some(phase), None),
+                Err(outcome) => (None, Some(outcome)),
+            }
+        }
+        None => (Some(Phase::Active(session)), None),
+    };
     let mut commands_open = true;
     let mut rejects_open = true;
     let mut tick = interval(TICK_INTERVAL);
@@ -775,10 +796,13 @@ async fn run_reactor<A: Application + 'static>(
     // of what it wrote, so the first pass below writes only what it did not.
     let outcome = loop {
         // The phase is put back by every handler that does not close the
-        // session, so it is always present here. Treating its absence as a
-        // close keeps the reactor panic-free rather than relying on that.
+        // session, so it is always present here once the opening request
+        // succeeded. Treating its absence otherwise as a close keeps the
+        // reactor panic-free rather than relying on that.
         let Some(current) = phase.take() else {
-            break closed("internal error: session phase lost", false);
+            break opening_failure
+                .take()
+                .unwrap_or_else(|| closed("internal error: session phase lost", false));
         };
         // Every counter change of the previous event (or of the handshake, on
         // the first pass) is persisted before the next event is handled; under
@@ -1426,6 +1450,9 @@ impl<A: Application> Reactor<A> {
         }
         let request = self.factory.resend_request(expected, 0);
         match self.send(framed, request).await {
+            Err(EngineError::Store(err)) => {
+                return Err(self.close_on_store_failure(phase, &err));
+            }
             Err(err) => {
                 teardown(phase);
                 return Err(closed(format!("send failed: {err}"), false));
@@ -2521,8 +2548,10 @@ pub(crate) struct SessionParams<A: Application> {
     /// Set by the reactor when its close-time store reset fails; the engine
     /// that owns the store performs the reset on its next session.
     pub(crate) reset_owed: Arc<AtomicBool>,
-    /// A gap detected during the handshake, seeded so the reactor tracks it.
-    pub(crate) resend: Option<ResendState>,
+    /// A gap detected in the Logon exchange, as (first missing number, highest
+    /// number seen). The reactor's first act is to request it, so a failure to
+    /// send that request closes the session through the normal close path.
+    pub(crate) opening_gap: Option<(u64, u64)>,
     /// Bound on a single socket write.
     pub(crate) write_timeout: Duration,
     /// Capacity of the outbound command queue.
@@ -2568,7 +2597,7 @@ where
         store_timeout,
         persisted,
         reset_owed,
-        resend,
+        opening_gap,
         write_timeout,
         outbound_capacity,
         app_queue_capacity,
@@ -2605,7 +2634,7 @@ where
         persisted,
         reset_owed,
         app_handed: None,
-        resend,
+        resend: None,
         write_timeout,
         app_tx,
         garbled,
@@ -2620,7 +2649,7 @@ where
     };
     tokio::spawn(async move {
         let _guard = guard;
-        run_reactor(framed, channels, reactor, session).await;
+        run_reactor(framed, channels, reactor, session, opening_gap).await;
     });
 
     (command_tx, closed_rx)
