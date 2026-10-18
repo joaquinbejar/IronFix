@@ -26,8 +26,10 @@
 //!   [`config::SessionConfigBuilder`], including the opt-in
 //!   [`GarbledFrameLimit`] on garbled inbound frames and, on a FIX 5.0
 //!   session, the application versions accepted from the counterparty
-//!   ([`SessionConfig::accepts_appl_version`]); both enforced by
-//!   `ironfix-engine`
+//!   ([`SessionConfig::accepts_appl_version`]), and the opt-in use of
+//!   `NextExpectedMsgSeqNum` (789) on the Logon exchange
+//!   ([`SessionConfig::send_next_expected_msg_seq_num`], FIX.4.4 and
+//!   FIXT.1.1 only); all enforced by `ironfix-engine`
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
 //! progress". The actual `ResendRequest` / `SequenceReset` / gap-fill message

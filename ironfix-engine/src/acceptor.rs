@@ -41,17 +41,27 @@
 //! once, in `DefaultApplVerID` (1137), an application version the session
 //! accepts ([`SessionConfig::accepts_appl_version`]);
 //! then a `ResetSeqNumFlag` (141) Logon must carry `MsgSeqNum` 1; then the
-//! `HeartBtInt` (108) the initiator requested is bounded; only then is an
-//! attached store reset (for 141, the local `reset_on_logon`, or an owed
-//! reset) or refreshed; and finally `MsgSeqNum` is validated and the ack,
-//! mirroring 141 and echoing 108, is sent. Waiting for the inbound Logon is
+//! `HeartBtInt` (108) the initiator requested is bounded; then, with
+//! [`SessionConfig::send_next_expected_msg_seq_num`] set, the Logon's
+//! `NextExpectedMsgSeqNum` (789) is read, and must be 1 on a 141 Logon; only
+//! then is an attached store reset (for 141, the local `reset_on_logon`, or an
+//! owed reset) or refreshed; then 789 is compared with the number the ack will
+//! take (above it, the initiator claims messages never sent; below it, the
+//! missed range is resent, up to but not including the ack, once Active); and
+//! finally `MsgSeqNum` is validated and the ack, mirroring 141, echoing 108 and
+//! declaring its own 789 when the flag is set, is sent. Waiting for the inbound Logon is
 //! bounded by [`SessionConfig::logon_timeout`]; a garbled frame that arrives
 //! first (a bad CheckSum or BodyLength, bytes before `8=`, or a frame whose
 //! MsgType (35) is not third) is skipped and the wait goes on against the same
 //! timeout. So is a frame whose header decodes but whose body does not: it is
 //! not garbled, but it cannot be read as a Logon either. A Logon that never
 //! arrives intact ends in [`EngineError::LogonTimeout`]. A gap in the Logon
-//! completes the handshake and immediately issues a `ResendRequest` (2).
+//! completes the handshake and immediately issues a `ResendRequest` (2),
+//! unless both sides declared `NextExpectedMsgSeqNum` (789): the initiator then
+//! resends the gap on its own, so the Logon is held and its number consumed
+//! once the gap is filled. One `ResendRequest` goes out only when the gap
+//! makes no progress for [`SessionConfig::resend_timeout`], a resend that
+//! stalls partway included.
 //!
 //! A refused Logon drives the typestate to `reject_logon` and the connection
 //! is dropped without reaching Active. What the peer is sent first depends on
@@ -73,7 +83,9 @@
 //!   mode. The live session owns the sequence stream.
 //! - **An authenticated peer** (`from_admin` accepted it) refused by its
 //!   `DefaultApplVerID` (1137: missing, repeated, not a code, or not accepted),
-//!   a 141 Logon not numbered 1, its `HeartBtInt`, or a `MsgSeqNum` too low: a
+//!   a 141 Logon not numbered 1, its `HeartBtInt`, its
+//!   `NextExpectedMsgSeqNum` (789, when used: malformed, or above what was
+//!   sent), or a `MsgSeqNum` too low: a
 //!   Logout carrying the reason, sent like every session frame, numbered from
 //!   the store's refreshed counters (or the seed) and filed when a store is
 //!   attached. Such a refusal never resets the store.
@@ -164,6 +176,7 @@
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
+use crate::next_expected;
 use crate::persistence::{
     PersistedCounters, SeedPlan, Seeded, StoreAttachment, StoreFailurePolicy, seed_session,
     seeded_counters,
@@ -660,7 +673,8 @@ impl<A: Application + 'static> Acceptor<A> {
     }
 
     /// Refuses a Logon that `from_admin` has accepted: its `DefaultApplVerID`,
-    /// `ResetSeqNumFlag` or `HeartBtInt` check failed.
+    /// `ResetSeqNumFlag`, `HeartBtInt` or `NextExpectedMsgSeqNum` check failed
+    /// before the store was touched.
     ///
     /// The peer is authenticated, so it gets the refusal (the Logout's text),
     /// sent like every frame of the session: numbered from a seed that never
@@ -750,8 +764,11 @@ impl<A: Application + 'static> Acceptor<A> {
     ///   FIX 5.0 session, by a `DefaultApplVerID` (1137) that is missing,
     ///   repeated, not an application-version code, or not a version the
     ///   session accepts; by a `ResetSeqNumFlag` (141) Logon not numbered 1; a
-    ///   missing or out of range `HeartBtInt` (108); or a `MsgSeqNum` below the
-    ///   expected one: the Logout is sent like every session frame, numbered
+    ///   missing or out of range `HeartBtInt` (108); a `NextExpectedMsgSeqNum`
+    ///   (789) that is malformed or above the number the ack would take, when
+    ///   [`SessionConfig::send_next_expected_msg_seq_num`] is set; or a
+    ///   `MsgSeqNum` below the expected one: the Logout is sent like every
+    ///   session frame, numbered
     ///   from the store's refreshed counters (or the seed) and filed when a
     ///   store is attached. Such a refusal never resets the store.
     ///
@@ -777,7 +794,8 @@ impl<A: Application + 'static> Acceptor<A> {
     /// (98), a `HeartBtInt` (108) that is missing, non-numeric, or out of range,
     /// and a second concurrent Logon for a session already established.
     /// [`EngineError::ApplVersion`] is a FIX 5.0 Logon's `DefaultApplVerID`
-    /// (1137) refused as above. A
+    /// (1137) refused as above, and [`EngineError::NextExpectedMsgSeqNum`] its
+    /// `NextExpectedMsgSeqNum` (789). A
     /// `BeginString` this engine cannot frame *at all* is refused up front with
     /// [`EngineError::UnsupportedVersion`], an unusable configuration with
     /// [`EngineError::Config`], and a zero initial seed that would be used with
@@ -913,6 +931,12 @@ impl<A: Application + 'static> Acceptor<A> {
 
         // (gap start, high-water) of a gap detected in the inbound Logon.
         let mut pending_resend: Option<(u64, u64)> = None;
+        // (first, first not resent) of what the Logon's NextExpectedMsgSeqNum
+        // (789) says the initiator missed.
+        let mut opening_replay: Option<(u64, u64)> = None;
+        // (gap start, Logon MsgSeqNum) of a gapped Logon held instead of
+        // requested, when both sides declared 789.
+        let mut held_logon: Option<(u64, u64)> = None;
         // The admission claim is taken once identity is validated and moved into
         // the reactor task on success; on any handshake failure after the claim
         // this local drops and frees the slot. These are assigned on the
@@ -1186,6 +1210,37 @@ impl<A: Application + 'static> Acceptor<A> {
                 }
             };
 
+            // NextExpectedMsgSeqNum (789), when this session uses it: the next
+            // number the initiator expects from us. A malformed value (repeated,
+            // 0, not a number) is refused like the Logon's other fields, before
+            // the store is touched. Whether the value asks for a resend, or for
+            // messages never sent, depends on the counters, so it is decided
+            // below.
+            let declared_next_expected = if self.config.send_next_expected_msg_seq_num {
+                match next_expected::read_next_expected(&raw) {
+                    Ok(declared) => declared,
+                    Err(problem) => {
+                        let detail = problem.to_string();
+                        tracing::warn!(session = %session_id, detail = %detail, "rejecting Logon NextExpectedMsgSeqNum");
+                        let logout = factory.logout(Some(&detail));
+                        let refused = self
+                            .refuse_authenticated(
+                                &session_id,
+                                &mut framed,
+                                &mut factory,
+                                &detail,
+                                [logout],
+                            )
+                            .await;
+                        let _ = session.reject_logon();
+                        refused?;
+                        return Err(EngineError::NextExpectedMsgSeqNum { detail });
+                    }
+                }
+            } else {
+                None
+            };
+
             // The Logon is accepted: only now is the store reset. The session
             // starts a new stream when the peer asks (141=Y), when it is
             // locally configured to (`reset_on_logon`), or when an earlier
@@ -1196,6 +1251,41 @@ impl<A: Application + 'static> Acceptor<A> {
             // is awaited until the acknowledgement declaring it is sent, so a
             // serve dropped or failed in between leaves it owed.
             reset = inbound_reset || self.config.reset_on_logon || self.store.reset_is_owed();
+
+            // A 789 describes the stream the initiator expects to continue. A
+            // reset it did not ask for (`reset_on_logon`, an owed reset)
+            // discards that stream, and the ack's 141=Y tells the initiator to
+            // restart too, so its 789 asks for nothing. A reset it asked for
+            // (141=Y) makes our ack message 1 of the new stream: its 789 must
+            // be 1, and that is known before the store is reset, so a refused
+            // Logon never resets it.
+            let declared_next_expected = match declared_next_expected {
+                Some(declared) if reset && !inbound_reset => {
+                    tracing::debug!(
+                        session = %session_id,
+                        declared = declared.get(),
+                        "ignoring the Logon's NextExpectedMsgSeqNum: this session resets the \
+                         sequence the counterparty did not ask to reset"
+                    );
+                    None
+                }
+                other => other,
+            };
+            if reset
+                && let Some(declared) = declared_next_expected
+                && let Err(problem) = next_expected::plan(declared, 1, 1)
+            {
+                let detail = problem.to_string();
+                tracing::warn!(session = %session_id, detail = %detail, "rejecting Logon NextExpectedMsgSeqNum");
+                let logout = factory.logout(Some(&detail));
+                let refused = self
+                    .refuse_authenticated(&session_id, &mut framed, &mut factory, &detail, [logout])
+                    .await;
+                let _ = session.reject_logon();
+                refused?;
+                return Err(EngineError::NextExpectedMsgSeqNum { detail });
+            }
+
             // The ticket pays only this reset: a store write that fails while
             // the acknowledgement is filed owes another.
             reset_ticket = (reset && self.store.store().is_some()).then(|| self.store.owe_reset());
@@ -1241,6 +1331,41 @@ impl<A: Application + 'static> Acceptor<A> {
                 }
             }
             let reply_heartbeat_secs = requested_heartbeat_secs;
+
+            // NextExpectedMsgSeqNum (789) against the counters the session now
+            // runs on: the ack takes the next sender number, so a 789 above it
+            // claims messages never sent, and one below it names messages the
+            // initiator missed, resent once Active. Decided before the Logon's
+            // own MsgSeqNum is validated, so a refused Logon is not consumed;
+            // the Logout is numbered from those counters and filed, as for a
+            // Logon too low. After a reset the ack is 1 and a 789 above 1 was
+            // refused before the store was reset, so this never refuses then.
+            if let Some(declared) = declared_next_expected {
+                let ack_seq = runtime.sequences.next_sender_seq().value();
+                match next_expected::plan(declared, ack_seq, ack_seq) {
+                    Ok(plan) => opening_replay = plan.replay_range(),
+                    Err(problem) => {
+                        let detail = problem.to_string();
+                        tracing::warn!(session = %session_id, detail = %detail, "rejecting Logon NextExpectedMsgSeqNum");
+                        let logout = factory.logout(Some(&detail));
+                        let refused = refuse_handshake(
+                            self.application.as_ref(),
+                            &session_id,
+                            &mut framed,
+                            &mut factory,
+                            &runtime.sequences,
+                            store.as_mut(),
+                            write_timeout,
+                            &detail,
+                            [logout],
+                        )
+                        .await;
+                        let _ = session.reject_logon();
+                        refused?;
+                        return Err(EngineError::NextExpectedMsgSeqNum { detail });
+                    }
+                }
+            }
 
             // The reset rule both roles share: in a Logon exchange that resets
             // the sequence, each side's Logon or acknowledgement is message 1
@@ -1299,8 +1424,22 @@ impl<A: Application + 'static> Acceptor<A> {
                     refused?;
                     return Err(EngineError::Sequence(detail));
                 }
+                // Both sides declared 789: our ack names `expected` as the
+                // next number we expect, so the initiator resends the gap
+                // below its Logon on its own. The Logon is held, its number
+                // consumed once that gap is filled, and no ResendRequest
+                // crosses the resend (QuickFIX/C++ does the same). The
+                // filtered 789 is used: it is None when this side drives a
+                // reset. Otherwise the gap is requested as the reactor's first
+                // act.
                 SequenceResult::Gap { expected, received } => {
-                    pending_resend = Some((expected, received));
+                    if self.config.send_next_expected_msg_seq_num
+                        && declared_next_expected.is_some()
+                    {
+                        held_logon = Some((expected, received));
+                    } else {
+                        pending_resend = Some((expected, received));
+                    }
                 }
             }
 
@@ -1309,8 +1448,16 @@ impl<A: Application + 'static> Acceptor<A> {
             // resets in lockstep. `send_handshake_admin` frames it under the
             // next sender sequence number (1 after a reset), files it and
             // persists the next sender number when a store is attached, and
-            // spends the number only then.
-            let logon_ack = factory.logon(reply_heartbeat_secs, reset);
+            // spends the number only then. With NextExpectedMsgSeqNum (789)
+            // on, the ack declares the next number expected from the
+            // initiator now that its Logon is processed: its number plus one
+            // in sequence, 2 after a reset, and the first missing number when
+            // the Logon opened a gap (a gapped Logon is not consumed).
+            let next_expected = self
+                .config
+                .send_next_expected_msg_seq_num
+                .then(|| runtime.sequences.next_target_seq().value());
+            let logon_ack = factory.logon(reply_heartbeat_secs, reset, next_expected);
             if let Err(err) = send_handshake_admin(
                 self.application.as_ref(),
                 &session_id,
@@ -1367,6 +1514,8 @@ impl<A: Application + 'static> Acceptor<A> {
                 .map_or_else(PersistedCounters::default, |handshake| handshake.persisted),
             reset_owed: self.store.owed_record(),
             opening_gap: pending_resend,
+            opening_replay,
+            held_logon,
             write_timeout,
             outbound_capacity: self.outbound_capacity,
             app_queue_capacity: self.app_queue_capacity,

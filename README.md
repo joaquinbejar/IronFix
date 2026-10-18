@@ -104,10 +104,14 @@ messages and the engine wiring do not exist yet.
   application messages with `PossDupFlag = Y` and the original `SendingTime`
   in `OrigSendingTime`; administrative messages, and anything the store
   cannot produce, are covered by gap fill (a store that reports itself
-  corrupted closes the session instead). A session starts from the store's counters unless it resets the
-  sequence. Store writes are fallible and ordered: a frame is filed and the
-  next sender number persisted before its bytes are written, and the next
-  target number is persisted before an inbound message is acted on.
+  corrupted closes the session instead). A resend is written one frame at a time
+  between inbound reads, so two sides resending large backlogs at once do not
+  block each other, and every message that takes a new number follows it (a
+  counterparty's Logout is answered after the resend it is owed). A session
+  starts from the store's counters unless it resets the sequence. Store
+  writes are fallible and ordered: a frame is filed and the next sender number
+  persisted before its bytes are written, and the next target number is
+  persisted before an inbound message is acted on.
   `with_store_failure_policy` chooses between warning and continuing (the
   default, which gives no crash guarantee) or failing closed, writing nothing
   the store has not accepted. Every store call is bounded by
@@ -118,7 +122,26 @@ messages and the engine wiring do not exist yet.
   refused before authentication (wrong version, encryption, CompIDs, clock or
   credentials) gets no reply; a second Logon for a session already live gets
   no reply in every case; an authenticated peer refused after that
-  (`HeartBtInt`, `MsgSeqNum`) gets a filed Logout saying why.
+  (`DefaultApplVerID` on a FIX 5.0 session, a `ResetSeqNumFlag` Logon not
+  numbered 1, `HeartBtInt`, `NextExpectedMsgSeqNum` when it is used,
+  `MsgSeqNum`) gets a filed Logout saying why.
+- **`NextExpectedMsgSeqNum` (789) on Logon**, opt-in with
+  `SessionConfig::send_next_expected_msg_seq_num` on FIX.4.4 and FIXT.1.1
+  sessions (refused below FIX.4.4), in both roles. The Logon and its
+  acknowledgement declare the next `MsgSeqNum` each side expects (1 on a
+  `ResetSeqNumFlag` Logon). A counterparty's 789 below the session's own Logon
+  makes it resend exactly the missed range once Active, through the resend
+  path above; one above what was sent refuses the Logon with a Logout, before
+  `on_logon`. The resend stops before the session's own Logon. A side that
+  declared 789 and receives a gapped Logon from a counterparty that declared
+  it too sends no `ResendRequest`, which would cross that resend: it holds the
+  Logon, consumes its number once the resend fills the gap below it, and
+  falls back to one `ResendRequest` when the gap makes no progress for one
+  `resend_timeout`, a resend that stalls partway included. Between two IronFix engines a restarted side
+  gets back what it missed with no `ResendRequest` either way. 789 is
+  bilateral: enable it on both sides, since a counterparty such as
+  QuickFIX/C++ that declares it waits for a resend a session without the flag
+  never sends (`doc/adr/0021-next-expected-msg-seq-num.md`).
 - **A typestate session FSM** and checked sequence arithmetic in
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in

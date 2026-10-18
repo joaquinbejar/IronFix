@@ -39,6 +39,7 @@
 //! | `sender_location_id` / `target_location_id` | ASCII | as above | unset |
 //! | `allowed_appl_versions` | [`FixVersion`] set | empty, or FIX.5.0 / FIX.5.0SP1 / FIX.5.0SP2 on a FIX 5.0 session | empty: the configured version only |
 //! | `require_ack_default_appl_ver_id` | flag | any; read by a FIX 5.0 initiator only | `false` |
+//! | `send_next_expected_msg_seq_num` | flag | `true` only on FIX.4.4 or a FIXT.1.1 session | `false` |
 //! | `reset_on_*`, `validate_*` | flag | any | see [`SessionConfig::new`] |
 //!
 //! # `HeartBtInt` (108) is whole seconds
@@ -62,6 +63,18 @@
 //! [`SessionConfig::accepts_appl_version`] is that rule. `ironfix-engine`
 //! enforces it. A FIX 4.x session carries neither field, so the set must be
 //! empty there.
+//!
+//! # `NextExpectedMsgSeqNum` (789) on the Logon
+//!
+//! FIX.4.4 and FIXT.1.1 define `NextExpectedMsgSeqNum` (789) on the Logon:
+//! the next `MsgSeqNum` the sender expects to receive, so each side learns at
+//! Logon which of its messages the other missed.
+//! [`SessionConfig::send_next_expected_msg_seq_num`] opts a session into it,
+//! in both directions: `ironfix-engine` then declares 789 on its own Logon or
+//! Logon acknowledgement and acts on the counterparty's. It is bilateral:
+//! both sides must enable it. Earlier versions do not define the field, so
+//! the flag is refused there
+//! ([`SessionConfigError::NextExpectedMsgSeqNumUnsupported`]).
 
 use crate::heartbeat::MAX_HEARTBEAT_INTERVAL_SECS;
 use ironfix_core::types::{COMP_ID_MAX_LEN, CompId};
@@ -267,6 +280,21 @@ pub enum SessionConfigError {
         /// The session's configured `begin_string`.
         begin_string: String,
     },
+
+    /// [`SessionConfig::send_next_expected_msg_seq_num`] is set on a session
+    /// whose version does not define `NextExpectedMsgSeqNum` (789).
+    ///
+    /// The field exists on the Logon from FIX.4.4 on, and on every FIXT.1.1
+    /// session (FIX.5.0, FIX.5.0SP1, FIX.5.0SP2). FIX.4.0 to FIX.4.3 do not
+    /// define it, so sending it would put an undefined tag on the Logon, and a
+    /// counterparty on those versions does not send it.
+    #[error(
+        "send_next_expected_msg_seq_num is set on a {begin_string} session, but NextExpectedMsgSeqNum (789) is defined only from FIX.4.4 and on FIXT.1.1 sessions (FIX.5.0, FIX.5.0SP1, FIX.5.0SP2)"
+    )]
+    NextExpectedMsgSeqNumUnsupported {
+        /// The session's configured `begin_string`.
+        begin_string: String,
+    },
 }
 
 /// Bound on garbled inbound frames: the session is closed once
@@ -421,6 +449,34 @@ fn validate_appl_versions(
         }),
         None => Ok(()),
     }
+}
+
+/// Whether the version `begin_string` names defines `NextExpectedMsgSeqNum`
+/// (789) on its Logon: FIX.4.4 and every version framed as FIXT.1.1. A string
+/// that names no version defines nothing.
+fn defines_next_expected_msg_seq_num(begin_string: &str) -> bool {
+    matches!(
+        begin_string.parse::<FixVersion>(),
+        Ok(FixVersion::Fix44
+            | FixVersion::Fix50
+            | FixVersion::Fix50Sp1
+            | FixVersion::Fix50Sp2
+            | FixVersion::Fixt11)
+    )
+}
+
+/// Validates [`SessionConfig::send_next_expected_msg_seq_num`]: unset, or set
+/// on a session whose version defines `NextExpectedMsgSeqNum` (789).
+fn validate_next_expected_msg_seq_num(
+    begin_string: &str,
+    enabled: bool,
+) -> Result<(), SessionConfigError> {
+    if enabled && !defines_next_expected_msg_seq_num(begin_string) {
+        return Err(SessionConfigError::NextExpectedMsgSeqNumUnsupported {
+            begin_string: begin_string.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Validates the heartbeat interval against what tag 108 can carry.
@@ -626,6 +682,39 @@ pub struct SessionConfig {
     /// receives, and a FIX 4.x Logon carries no 1137, so the flag has no
     /// effect there.
     pub require_ack_default_appl_ver_id: bool,
+    /// Whether the session uses `NextExpectedMsgSeqNum` (789) on the Logon
+    /// exchange, in both directions.
+    ///
+    /// When set, `ironfix-engine` declares 789 on the session's own Logon (an
+    /// initiator) or Logon acknowledgement (an acceptor): the next `MsgSeqNum`
+    /// it expects to receive, which is 1 on a Logon declaring
+    /// `ResetSeqNumFlag` (141) = Y. It also acts on the 789 the counterparty
+    /// declares: a value below the `MsgSeqNum` of the session's own Logon or
+    /// acknowledgement makes it resend the messages the counterparty missed,
+    /// up to but not including that Logon, once the session is Active; a
+    /// value above the next `MsgSeqNum` the session sends (the counterparty
+    /// claims messages that were never sent) refuses the Logon with a Logout.
+    /// And when both sides declared 789 and the counterparty's Logon or
+    /// acknowledgement arrives with a gap below it, the session sends no
+    /// `ResendRequest`: the counterparty resends that gap on its own, because
+    /// of this session's 789, so its Logon is held and consumed once the gap
+    /// is filled. One `ResendRequest` goes out only when the gap makes no
+    /// progress for [`SessionConfig::resend_timeout`], a resend that stalls
+    /// partway included. When unset, no 789 is sent and a counterparty's 789
+    /// is ignored, as before.
+    ///
+    /// 789 is bilateral: enable it on both sides. A counterparty that uses it
+    /// while this session does not may wait on a resend this session never
+    /// sends: QuickFIX/C++, for one, acts on an inbound 789 whatever its own
+    /// setting, and when it declared 789 itself it sends no `ResendRequest`
+    /// for a gapped Logon and runs no resend timer.
+    ///
+    /// Range: any flag on a FIX.4.4 or FIXT.1.1 session (FIX.5.0, FIX.5.0SP1,
+    /// FIX.5.0SP2); `true` on an earlier version is refused by
+    /// [`SessionConfig::validate`] with
+    /// [`SessionConfigError::NextExpectedMsgSeqNumUnsupported`], since those
+    /// versions do not define the field. Default: `false`.
+    pub send_next_expected_msg_seq_num: bool,
 }
 
 impl SessionConfig {
@@ -671,6 +760,7 @@ impl SessionConfig {
             target_location_id: None,
             allowed_appl_versions: Vec::new(),
             require_ack_default_appl_ver_id: false,
+            send_next_expected_msg_seq_num: false,
         }
     }
 
@@ -690,8 +780,9 @@ impl SessionConfig {
     /// non-encodable identity string, a fractional or out-of-range heartbeat
     /// interval, a zero or excessive handshake timeout, a message-size
     /// limit outside [`MIN_MESSAGE_SIZE_LIMIT`]..=[`MAX_MESSAGE_SIZE_LIMIT`],
-    /// or an [`SessionConfig::allowed_appl_versions`] set the session cannot
-    /// honour.
+    /// an [`SessionConfig::allowed_appl_versions`] set the session cannot
+    /// honour, or [`SessionConfig::send_next_expected_msg_seq_num`] on a
+    /// version that does not define `NextExpectedMsgSeqNum` (789).
     pub fn validate(&self) -> Result<(), SessionConfigError> {
         validate_id("begin_string", &self.begin_string)?;
         validate_heartbeat_interval(self.heartbeat_interval)?;
@@ -717,7 +808,8 @@ impl SessionConfig {
                 validate_id(field, value)?;
             }
         }
-        validate_appl_versions(&self.begin_string, &self.allowed_appl_versions)
+        validate_appl_versions(&self.begin_string, &self.allowed_appl_versions)?;
+        validate_next_expected_msg_seq_num(&self.begin_string, self.send_next_expected_msg_seq_num)
     }
 
     /// Whether `version` is an application version this session accepts from
@@ -783,6 +875,18 @@ impl SessionConfig {
     #[must_use]
     pub const fn with_require_ack_default_appl_ver_id(mut self, require: bool) -> Self {
         self.require_ack_default_appl_ver_id = require;
+        self
+    }
+
+    /// Sets whether the session uses `NextExpectedMsgSeqNum` (789) on the
+    /// Logon exchange, sending it and acting on the counterparty's.
+    ///
+    /// `true` only on a FIX.4.4 or FIXT.1.1 session. Checked by
+    /// [`SessionConfig::validate`], not here. See
+    /// [`SessionConfig::send_next_expected_msg_seq_num`].
+    #[must_use]
+    pub const fn with_send_next_expected_msg_seq_num(mut self, send: bool) -> Self {
+        self.send_next_expected_msg_seq_num = send;
         self
     }
 
@@ -989,6 +1093,8 @@ pub struct SessionConfigBuilder {
     allowed_appl_versions: Vec<FixVersion>,
     /// Strict mode: require 1137 on the Logon acknowledgement.
     require_ack_default_appl_ver_id: bool,
+    /// Use `NextExpectedMsgSeqNum` (789) on the Logon exchange.
+    send_next_expected_msg_seq_num: bool,
 }
 
 impl Default for SessionConfigBuilder {
@@ -1012,6 +1118,7 @@ impl Default for SessionConfigBuilder {
             target_location_id: None,
             allowed_appl_versions: Vec::new(),
             require_ack_default_appl_ver_id: false,
+            send_next_expected_msg_seq_num: false,
         }
     }
 }
@@ -1200,6 +1307,20 @@ impl SessionConfigBuilder {
         self
     }
 
+    /// Sets whether the session uses `NextExpectedMsgSeqNum` (789) on the
+    /// Logon exchange, sending it and acting on the counterparty's (default
+    /// `false`).
+    ///
+    /// `true` only on a FIX.4.4 or FIXT.1.1 session; anything earlier is
+    /// refused by [`SessionConfigBuilder::build`] with
+    /// [`SessionConfigError::NextExpectedMsgSeqNumUnsupported`]. See
+    /// [`SessionConfig::send_next_expected_msg_seq_num`].
+    #[must_use = "builders do nothing unless .build() is called"]
+    pub const fn send_next_expected_msg_seq_num(mut self, send: bool) -> Self {
+        self.send_next_expected_msg_seq_num = send;
+        self
+    }
+
     /// Builds the configuration, validating every knob.
     ///
     /// # Errors
@@ -1262,6 +1383,7 @@ impl SessionConfigBuilder {
             target_location_id: self.target_location_id,
             allowed_appl_versions: self.allowed_appl_versions,
             require_ack_default_appl_ver_id: self.require_ack_default_appl_ver_id,
+            send_next_expected_msg_seq_num: self.send_next_expected_msg_seq_num,
         };
         config.validate()?;
         Ok(config)
@@ -2004,6 +2126,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- NextExpectedMsgSeqNum (789) ----------------------------------------
+
+    #[test]
+    fn test_send_next_expected_msg_seq_num_defaults_to_false() {
+        assert!(!config().send_next_expected_msg_seq_num);
+        assert!(!built(required()).send_next_expected_msg_seq_num);
+    }
+
+    #[test]
+    fn test_send_next_expected_msg_seq_num_builds_on_every_version_defining_789() {
+        for begin_string in ["FIX.4.4", "FIX.5.0", "FIX.5.0SP1", "FIX.5.0SP2", "FIXT.1.1"] {
+            let config = built(
+                required()
+                    .begin_string(begin_string)
+                    .send_next_expected_msg_seq_num(true),
+            );
+            assert!(config.send_next_expected_msg_seq_num, "{begin_string}");
+        }
+    }
+
+    #[test]
+    fn test_build_with_send_next_expected_msg_seq_num_below_fix44_is_rejected() {
+        for begin_string in ["FIX.4.0", "FIX.4.1", "FIX.4.2", "FIX.4.3"] {
+            assert_eq!(
+                build_error(
+                    required()
+                        .begin_string(begin_string)
+                        .send_next_expected_msg_seq_num(true)
+                ),
+                SessionConfigError::NextExpectedMsgSeqNumUnsupported {
+                    begin_string: begin_string.to_string(),
+                },
+                "{begin_string}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_with_send_next_expected_msg_seq_num_on_an_unknown_version_is_rejected() {
+        // A string that names no version defines no 789 either.
+        assert_eq!(
+            build_error(
+                required()
+                    .begin_string("FIX.9.9")
+                    .send_next_expected_msg_seq_num(true)
+            ),
+            SessionConfigError::NextExpectedMsgSeqNumUnsupported {
+                begin_string: "FIX.9.9".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_send_next_expected_msg_seq_num_off_is_valid_on_every_version() {
+        for begin_string in ["FIX.4.0", "FIX.4.2", "FIX.4.4", "FIX.5.0SP2"] {
+            let config = SessionConfig::new(comp_id("SENDER"), comp_id("TARGET"), begin_string)
+                .with_send_next_expected_msg_seq_num(false);
+            assert_eq!(config.validate(), Ok(()), "{begin_string}");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_a_hand_assembled_next_expected_flag_on_fix42() {
+        let mut config = SessionConfig::new(comp_id("SENDER"), comp_id("TARGET"), "FIX.4.2");
+        config.send_next_expected_msg_seq_num = true;
+        assert_eq!(
+            config.validate(),
+            Err(SessionConfigError::NextExpectedMsgSeqNumUnsupported {
+                begin_string: "FIX.4.2".to_string(),
+            })
+        );
+        let config = config.with_send_next_expected_msg_seq_num(false);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_with_send_next_expected_msg_seq_num_sets_the_flag() {
+        let config = config().with_send_next_expected_msg_seq_num(true);
+        assert!(config.send_next_expected_msg_seq_num);
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_next_expected_unsupported_error_names_the_version_and_the_tag() {
+        let message = SessionConfigError::NextExpectedMsgSeqNumUnsupported {
+            begin_string: "FIX.4.2".to_string(),
+        }
+        .to_string();
+        assert!(message.contains("FIX.4.2"), "{message}");
+        assert!(message.contains("789"), "{message}");
     }
 
     #[test]

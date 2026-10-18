@@ -84,6 +84,27 @@
 //! 1128), its number consumed, and never reaches `from_app`. FIX 4.x
 //! sessions carry neither field and check neither.
 //!
+//! # `NextExpectedMsgSeqNum` (789)
+//!
+//! With [`SessionConfig::send_next_expected_msg_seq_num`] set (FIX.4.4 and
+//! FIXT.1.1 only), the Logon declares in 789 the next `MsgSeqNum` expected from
+//! the acceptor (1 when it declares `ResetSeqNumFlag` (141)), and the
+//! acknowledgement's 789 is held against this session's counters, those of a
+//! reset the acknowledgement declares included, before that reset reaches the
+//! store: a value above the next number this session sends fails the handshake
+//! with a Logout and [`EngineError::NextExpectedMsgSeqNum`]; a value that is
+//! 0, not a number or repeated with a Reject (`RefTagID` 789) and a Logout; a
+//! value below this session's Logon makes the session resend that range, up to
+//! but not including the Logon, once Active, as it would answer a
+//! `ResendRequest`. When the acknowledgement declares 789 too and arrives with
+//! a gap below it, no `ResendRequest` is sent: the acceptor resends that gap on
+//! its own because of this Logon's 789, so the acknowledgement is held and its
+//! number consumed once the gap is filled. One `ResendRequest` goes out only
+//! when the gap makes no progress for [`SessionConfig::resend_timeout`], a
+//! resend that stalls partway included.
+//! Without the flag no 789 is sent and the acknowledgement's is ignored. 789 is
+//! bilateral: both sides must enable it.
+//!
 //! # Resend and the message store
 //!
 //! [`Initiator::with_store`] attaches a [`MessageStore`]. Every sequenced
@@ -169,6 +190,7 @@
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
+use crate::next_expected::{self, NextExpectedPlan};
 use crate::persistence::{
     PersistedCounters, SeedPlan, Seeded, StoreAttachment, StoreFailurePolicy, seed_session,
 };
@@ -543,7 +565,11 @@ impl<A: Application + 'static> Initiator<A> {
     /// sequence counter has reached `u64::MAX` and the session must be reset
     /// before it can number another message; and, on a FIX 5.0 session,
     /// [`EngineError::ApplVersion`], when the ack carries a `DefaultApplVerID`
-    /// (1137) the session does not accept. A `BeginString` this engine
+    /// (1137) the session does not accept; and, with
+    /// [`SessionConfig::send_next_expected_msg_seq_num`] set,
+    /// [`EngineError::NextExpectedMsgSeqNum`], when the ack's
+    /// `NextExpectedMsgSeqNum` (789) is malformed or above the next number
+    /// this session sends. A `BeginString` this engine
     /// cannot frame conformantly is refused up front with
     /// [`EngineError::UnsupportedVersion`], an unusable configuration with
     /// [`EngineError::Config`], and a zero initial sequence seed with
@@ -653,7 +679,20 @@ impl<A: Application + 'static> Initiator<A> {
         // A reset the store owes is declared like a configured one, so the
         // counterparty restarts the sequence with us instead of reading our
         // MsgSeqNum 1 as too low.
-        let logon = factory.logon(self.config.heartbeat_interval_secs(), reset_logon);
+        //
+        // With NextExpectedMsgSeqNum (789) on, the Logon declares the next
+        // number expected from the acceptor: the seeded target counter, which
+        // is 1 when the Logon declares a reset.
+        let logon_seq = runtime.sequences.next_sender_seq().value();
+        let next_expected = self
+            .config
+            .send_next_expected_msg_seq_num
+            .then(|| runtime.sequences.next_target_seq().value());
+        let logon = factory.logon(
+            self.config.heartbeat_interval_secs(),
+            reset_logon,
+            next_expected,
+        );
         if let Err(err) = send_handshake_admin(
             self.application.as_ref(),
             &session_id,
@@ -694,6 +733,12 @@ impl<A: Application + 'static> Initiator<A> {
 
         // (gap start, high-water) of a gap detected in the Logon ack itself.
         let mut pending_resend: Option<(u64, u64)> = None;
+        // (first, first not resent) of what the ack's NextExpectedMsgSeqNum
+        // (789) says the acceptor missed.
+        let mut opening_replay: Option<(u64, u64)> = None;
+        // (gap start, ack MsgSeqNum) of a gapped ack held instead of
+        // requested, when both sides declared 789.
+        let mut held_logon: Option<(u64, u64)> = None;
         {
             let raw = wire::decode_frame(&ack)?;
             match raw.msg_type() {
@@ -952,19 +997,132 @@ impl<A: Application + 'static> Initiator<A> {
             // reset and must be honored before MsgSeqNum is validated,
             // otherwise the ack's 34=1 reads as fatally too low against
             // continuity-seeded counters.
-            if raw.get_field_str(141) == Some("Y") {
-                // FIX requires MsgSeqNum = 1 on a Logon carrying
-                // ResetSeqNumFlag = Y: the reset and the number it arrives
-                // under have to agree. A peer that declares a reset and then
-                // numbers the message anything else is describing two
-                // different streams, so the handshake fails rather than
-                // guessing which half to believe.
-                if ack_seq != 1 {
-                    let _ = session.on_logon_reject();
-                    return Err(EngineError::Sequence(format!(
-                        "Logon ack set ResetSeqNumFlag=Y but carried MsgSeqNum {ack_seq}, not 1"
-                    )));
+            let ack_resets = raw.get_field_str(141) == Some("Y");
+            // FIX requires MsgSeqNum = 1 on a Logon carrying ResetSeqNumFlag =
+            // Y: the reset and the number it arrives under have to agree. A
+            // peer that declares a reset and then numbers the message anything
+            // else is describing two different streams, so the handshake fails
+            // rather than guessing which half to believe.
+            if ack_resets && ack_seq != 1 {
+                let _ = session.on_logon_reject();
+                return Err(EngineError::Sequence(format!(
+                    "Logon ack set ResetSeqNumFlag=Y but carried MsgSeqNum {ack_seq}, not 1"
+                )));
+            }
+
+            // NextExpectedMsgSeqNum (789), when this session uses it: the
+            // next number the acceptor expects from us, computed once it had
+            // our Logon. Compared with the counters the ack's own reset sets,
+            // if it declares one (our Logon is then message 1 of the new
+            // stream, and 2 goes next), and decided before that reset is made,
+            // so a refused ack never resets the store. A value above the next
+            // number we send claims messages never sent: Logout, and no
+            // session. A value below our Logon names messages the acceptor
+            // missed: resent once Active. 789 moves no counter.
+            let mut ack_declares_789 = false;
+            if self.config.send_next_expected_msg_seq_num {
+                let (own_logon_seq, next_outbound) = if ack_resets {
+                    (1, 2)
+                } else {
+                    (logon_seq, runtime.sequences.next_sender_seq().value())
+                };
+                let declared = next_expected::read_next_expected(&raw);
+                ack_declares_789 = matches!(declared, Ok(Some(_)));
+                // A reset this side declared that the ack does not echo: under
+                // the reset rule the ack is the acceptor's message 1 whatever
+                // its number, and its 789 may describe the stream the reset
+                // discards, so a well-formed value is ignored, as the acceptor
+                // ignores the Logon's 789 for a reset it drives alone. A
+                // malformed value is still refused, and an ack that echoes 141
+                // knew of the reset, so its 789 is still checked.
+                let declared = match declared {
+                    Ok(Some(value)) if reset_logon && !ack_resets => {
+                        // 2 is what an acceptor that took our Logon as message
+                        // 1 of a new stream expects. Anything else says it kept
+                        // its old stream: it will read our next message (2) as
+                        // too low.
+                        if value.get() == 2 {
+                            tracing::debug!(
+                                session = %session_id,
+                                declared = value.get(),
+                                "ignoring the Logon ack's NextExpectedMsgSeqNum: it does not \
+                                 echo the sequence reset this session declared"
+                            );
+                        } else {
+                            tracing::warn!(
+                                session = %session_id,
+                                declared = value.get(),
+                                "the Logon ack does not echo the sequence reset this session \
+                                 declared and its NextExpectedMsgSeqNum is not 2: the acceptor \
+                                 likely kept its old stream and will refuse this session's next \
+                                 message (MsgSeqNum 2) as too low"
+                            );
+                        }
+                        Ok(None)
+                    }
+                    other => other,
+                };
+                let decided = declared.and_then(|declared| {
+                    declared
+                        .map(|declared| next_expected::plan(declared, own_logon_seq, next_outbound))
+                        .transpose()
+                });
+                match decided {
+                    Ok(plan) => opening_replay = plan.and_then(NextExpectedPlan::replay_range),
+                    Err(problem) => {
+                        let detail = problem.to_string();
+                        tracing::warn!(
+                            session = %session_id,
+                            detail = %detail,
+                            "refusing the Logon ack's NextExpectedMsgSeqNum"
+                        );
+                        let logout = factory.logout(Some(&detail));
+                        // A malformed 789 is Rejected like the ack's other
+                        // malformed fields; one above what was sent gets the
+                        // Logout alone.
+                        let refused = match problem.reject_reason() {
+                            Some(reason) => {
+                                let reject = factory.session_reject(
+                                    ack_seq,
+                                    MsgType::Logon.as_str(),
+                                    &reason,
+                                );
+                                refuse_handshake(
+                                    self.application.as_ref(),
+                                    &session_id,
+                                    &mut framed,
+                                    &mut factory,
+                                    &runtime.sequences,
+                                    store.as_mut(),
+                                    write_timeout,
+                                    &detail,
+                                    [reject, logout],
+                                )
+                                .await
+                            }
+                            None => {
+                                refuse_handshake(
+                                    self.application.as_ref(),
+                                    &session_id,
+                                    &mut framed,
+                                    &mut factory,
+                                    &runtime.sequences,
+                                    store.as_mut(),
+                                    write_timeout,
+                                    &detail,
+                                    [logout],
+                                )
+                                .await
+                            }
+                        };
+                        let _ = session.on_logon_reject();
+                        refused?;
+                        return Err(EngineError::NextExpectedMsgSeqNum { detail });
+                    }
                 }
+            }
+
+            if ack_resets {
                 tracing::info!(
                     session = %session_id,
                     "counterparty set ResetSeqNumFlag on the Logon ack: resetting sequence numbers"
@@ -1043,8 +1201,18 @@ impl<A: Application + 'static> Initiator<A> {
                         "logon ack MsgSeqNum too low: expected {expected}, received {received}"
                     )));
                 }
+                // Both sides declared 789: our Logon named `expected` as the
+                // next number we expect, so the acceptor resends the gap below
+                // its ack on its own. The ack is held, its number consumed
+                // once that gap is filled, and no ResendRequest crosses the
+                // resend (QuickFIX/C++ does the same). Otherwise the gap is
+                // requested as the reactor's first act.
                 SequenceResult::Gap { expected, received } => {
-                    pending_resend = Some((expected, received));
+                    if self.config.send_next_expected_msg_seq_num && ack_declares_789 {
+                        held_logon = Some((expected, received));
+                    } else {
+                        pending_resend = Some((expected, received));
+                    }
                 }
             }
         }
@@ -1085,6 +1253,8 @@ impl<A: Application + 'static> Initiator<A> {
                 .map_or_else(PersistedCounters::default, |handshake| handshake.persisted),
             reset_owed: self.store.owed_record(),
             opening_gap: pending_resend,
+            opening_replay,
+            held_logon,
             write_timeout,
             outbound_capacity: self.outbound_capacity,
             app_queue_capacity: self.app_queue_capacity,

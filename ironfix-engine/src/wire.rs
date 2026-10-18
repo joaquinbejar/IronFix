@@ -778,11 +778,12 @@ impl std::fmt::Display for ApplVersionProblem {
 
 /// Where a tag occurs anywhere in a message, header, body or trailer.
 ///
-/// Used for `DefaultApplVerID` (1137), a body field of the Logon: an
-/// application reads it with [`RawMessage::get_field_str`], which finds the
-/// first occurrence wherever it is, so the value the session checks has to be
-/// the only one the message carries.
-fn message_field<'a>(raw: &RawMessage<'a>, tag: u32) -> FieldOccurrence<'a> {
+/// Used for `DefaultApplVerID` (1137) and `NextExpectedMsgSeqNum` (789), body
+/// fields of the Logon: an application reads them with
+/// [`RawMessage::get_field_str`], which finds the first occurrence wherever it
+/// is, so the value the session checks has to be the only one the message
+/// carries.
+pub(crate) fn message_field<'a>(raw: &RawMessage<'a>, tag: u32) -> FieldOccurrence<'a> {
     let mut found = FieldOccurrence::Absent;
     for field in raw.fields() {
         if field.tag == tag {
@@ -1453,14 +1454,33 @@ impl MessageFactory {
         self.encoder.finish()
     }
 
-    /// Builds a Logon (35=A) with EncryptMethod=0, HeartBtInt and, for a
+    /// Builds a Logon (35=A) with EncryptMethod=0, HeartBtInt,
+    /// `ResetSeqNumFlag` (141) = Y when `reset_seq`,
+    /// `NextExpectedMsgSeqNum` (789) when `next_expected` is given and, for a
     /// FIXT.1.1 session, DefaultApplVerID (1137).
+    ///
+    /// The fields follow the order the FIX.4.4 and FIXT.1.1 Logon defines
+    /// them in: 98, 108, 141, 789, then 1137. `next_expected` is the next
+    /// `MsgSeqNum` this session expects to receive; the caller passes it only
+    /// when [`SessionConfig::send_next_expected_msg_seq_num`] is set, which
+    /// configuration validation allows only on versions that define 789.
     #[must_use]
-    pub(crate) fn logon(&self, heartbeat_secs: u64, reset_seq: bool) -> PendingMessage {
+    pub(crate) fn logon(
+        &self,
+        heartbeat_secs: u64,
+        reset_seq: bool,
+        next_expected: Option<u64>,
+    ) -> PendingMessage {
         let mut message = OutboundMessage::new(MsgType::Logon);
         message.push_uint(98, 0).push_uint(108, heartbeat_secs);
         if reset_seq {
             message.push_bool(141, true);
+        }
+        if let Some(next_expected) = next_expected {
+            message.push_uint(
+                crate::next_expected::NEXT_EXPECTED_MSG_SEQ_NUM,
+                next_expected,
+            );
         }
         if let Some(appl_ver_id) = self.version.appl_ver_id() {
             message.push_str(1137, appl_ver_id);
@@ -1742,7 +1762,7 @@ mod tests {
     #[test]
     fn test_logon_frame_roundtrip() {
         let mut factory = factory();
-        let logon = factory.logon(30, true);
+        let logon = factory.logon(30, true, None);
         let frame = framed(&mut factory, 1, &logon);
         let raw = decode(&frame);
         assert_eq!(raw.msg_type(), &MsgType::Logon);
@@ -1754,6 +1774,37 @@ mod tests {
         assert_eq!(raw.get_field_str(141), Some("Y"));
         // Pre-5.0 session: no application version fields.
         assert_eq!(raw.get_field_str(1137), None);
+        // Not asked for: no NextExpectedMsgSeqNum.
+        assert_eq!(raw.get_field_str(789), None);
+    }
+
+    #[test]
+    fn test_logon_carries_next_expected_msg_seq_num_in_logon_order() {
+        // FIX.4.4: 98, 108, 141, 789.
+        let mut factory = factory();
+        let logon = factory.logon(30, true, Some(1));
+        let frame = framed(&mut factory, 1, &logon);
+        let raw = decode(&frame);
+        assert_eq!(raw.get_field_str(789), Some("1"));
+        let body: Vec<u32> = raw
+            .fields()
+            .map(|field| field.tag)
+            .filter(|tag| matches!(tag, 98 | 108 | 141 | 789 | 1137))
+            .collect();
+        assert_eq!(body, [98, 108, 141, 789]);
+
+        // FIXT.1.1: 789 before DefaultApplVerID (1137), without 141.
+        let mut factory = factory_for("FIX.5.0SP2");
+        let logon = factory.logon(30, false, Some(42));
+        let frame = framed(&mut factory, 7, &logon);
+        let raw = decode(&frame);
+        assert_eq!(raw.get_field_str(789), Some("42"));
+        let body: Vec<u32> = raw
+            .fields()
+            .map(|field| field.tag)
+            .filter(|tag| matches!(tag, 98 | 108 | 141 | 789 | 1137))
+            .collect();
+        assert_eq!(body, [98, 108, 789, 1137]);
     }
 
     #[test]
@@ -1788,7 +1839,7 @@ mod tests {
         // One encoder is reused for the life of the session; a message must
         // never carry residue of the one before it.
         let mut factory = factory();
-        let logon = factory.logon(30, false);
+        let logon = factory.logon(30, false, None);
         let first = framed(&mut factory, 1, &logon);
         let heartbeat = factory.heartbeat(Some("TEST-1"));
         let second = framed(&mut factory, 2, &heartbeat);
@@ -1877,7 +1928,7 @@ mod tests {
         };
         let mut factory = MessageFactory::new(&config, version);
 
-        let logon = factory.logon(30, false);
+        let logon = factory.logon(30, false, None);
         let frame = framed(&mut factory, 1, &logon);
         let raw = decode(&frame);
         // SenderLocationID (142) and TargetLocationID (143) are routing fields
@@ -1890,7 +1941,7 @@ mod tests {
     #[test]
     fn test_header_omits_unset_location_ids() {
         let mut factory = factory();
-        let logon = factory.logon(30, false);
+        let logon = factory.logon(30, false, None);
         let frame = framed(&mut factory, 1, &logon);
         let raw = decode(&frame);
         assert_eq!(raw.get_field_str(142), None);
@@ -1927,7 +1978,7 @@ mod tests {
             assert_eq!(resolved, Ok(version));
 
             let mut factory = factory_for(version.as_str());
-            let logon = factory.logon(30, false);
+            let logon = factory.logon(30, false, None);
             let frame = framed(&mut factory, 1, &logon);
             let raw = decode(&frame);
             assert_eq!(
@@ -1989,7 +2040,7 @@ mod tests {
     #[test]
     fn test_fix50sp2_logon_carries_fixt_begin_string_and_default_appl_ver_id() {
         let mut factory = factory_for("FIX.5.0SP2");
-        let logon = factory.logon(30, false);
+        let logon = factory.logon(30, false, None);
         let frame = framed(&mut factory, 1, &logon);
         let raw = decode(&frame);
         assert_eq!(raw.begin_string(), Ok("FIXT.1.1"));
