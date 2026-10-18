@@ -22,9 +22,10 @@ PATH_CRATES := ironfix-core ironfix-dictionary ironfix-tagvalue ironfix-session 
 # because crates.io resolves the version requirements at upload time.
 # ironfix-codegen-check is deliberately absent: it is `publish = false`, a CI
 # check that compiles the generated views of the embedded dictionaries.
-# ironfix-sofh depends on ironfix-core only, so it goes right after it, and
-# ironfix-fixp (ironfix-core plus the external ironsbe-core) right after that
-# (ADR-0003).
+# ironfix-sofh depends on no IronFix crate (#122), so any position works; it
+# stays right after ironfix-core, with ironfix-fixp (ironfix-core plus the
+# external ironsbe-core) right after that (ADR-0003). ironfix-fast has no
+# internal dependency either, and ironfix-transport needs only ironfix-tagvalue.
 PUBLISH_ORDER := ironfix-core ironfix-sofh ironfix-fixp ironfix-derive ironfix-tagvalue \
 	ironfix-dictionary ironfix-store ironfix-session ironfix-transport ironfix-fast \
 	ironfix-codegen ironfix-engine ironfix-example

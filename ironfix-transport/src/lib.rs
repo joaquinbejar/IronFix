@@ -31,8 +31,8 @@
 //! ## Not provided
 //!
 //! Despite the crate name, there are **no TCP connector or acceptor helpers and
-//! no TLS support** here — there is no `rustls` dependency, and the crate's only
-//! IronFix dependencies are `ironfix-core` and `ironfix-tagvalue`. Opening a
+//! no TLS support** here. There is no `rustls` dependency, and the crate's only
+//! IronFix dependency is `ironfix-tagvalue`, for the CheckSum helpers. Opening a
 //! socket is the caller's job; `ironfix_engine::Initiator` calls
 //! `TcpStream::connect` directly and wraps the result in this codec.
 
