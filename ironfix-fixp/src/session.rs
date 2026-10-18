@@ -302,6 +302,9 @@ struct Outstanding {
 struct PeerFinished {
     /// FinishedReceiving has gone out (section 4.7.2).
     receiving_sent: bool,
+    /// On a sequenced flow, `LastSeqNo + 1`: no `NextSeqNo` may go past it
+    /// any more (section 6.3; Appendix A 7.4.5).
+    end: Option<u64>,
 }
 
 /// A retransmission batch being received: the next message is `next`, and
@@ -331,11 +334,14 @@ pub(crate) struct Session {
     /// Sequence number of this side's next application message.
     outbound_next: u64,
     /// Sequence number of the counterparty's next real-time application
-    /// message, on a sequenced counterparty flow. Starts at 1; the first
-    /// establishment may move it (see [`Session::on_established`]).
+    /// message, on a sequenced counterparty flow. Holds the fallback 1 while
+    /// `start_pending`.
     inbound_next: Option<u64>,
-    /// Whether the session has been established at least once.
-    established_once: bool,
+    /// Nothing has fixed where the counterparty's numbering stands yet: no
+    /// `NextSeqNo` (establishment, Sequence, Context) and no application
+    /// message. The first `NextSeqNo` sets it; an application message first
+    /// takes the fallback 1.
+    start_pending: bool,
     /// Unrecovered gaps of a Recoverable inbound flow, in order.
     missing: VecDeque<Gap>,
     outstanding: Option<Outstanding>,
@@ -351,14 +357,15 @@ impl Session {
             local_flow,
             remote_flow,
             outbound_next: 1,
-            // FIXP numbers application messages from 1 when nothing else is
-            // announced (sections 3.5.1 and 5.1.1; Appendix A 7.1.8).
+            // The fallback start, used only if an application message comes
+            // before any NextSeqNo: numbering from 1 (section 5.1.1;
+            // Appendix A 7.1.8).
             inbound_next: if remote_flow.is_sequenced() {
                 Some(1)
             } else {
                 None
             },
-            established_once: false,
+            start_pending: remote_flow.is_sequenced(),
             missing: VecDeque::new(),
             outstanding: None,
             replay: None,
@@ -409,10 +416,10 @@ impl Session {
     }
 
     /// Returns `true` if a counterparty `NextSeqNo` would move its sequenced
-    /// flow backwards. The first establishment sets the numbering instead,
-    /// so nothing regresses before it.
+    /// flow backwards. Until something fixes where the numbering stands, the
+    /// first `NextSeqNo` sets it, so nothing regresses.
     pub(crate) fn regresses(&self, next: Option<u64>) -> bool {
-        if !self.established_once {
+        if self.start_pending {
             return false;
         }
         match (self.remote_flow.is_sequenced(), next, self.inbound_next) {
@@ -443,11 +450,10 @@ impl Session {
     /// EstablishmentAck and resumes the recovery of earlier gaps
     /// (FIXP v1.1 sections 4.3.1 and 4.3.2).
     ///
-    /// On the first establishment the announced number is where the
-    /// counterparty's numbering starts: Appendix A 7.2.2 and 7.3.1 start at
-    /// 100, 200 and 1000. Without one, numbering starts at 1. On a
-    /// re-establishment the announced number is checked against what
-    /// arrived, and a higher one is a gap.
+    /// Until something has fixed where the counterparty's numbering stands,
+    /// the announced number sets it: Appendix A 7.2.2 and 7.3.1 start at 100,
+    /// 200 and 1000. Afterwards it is checked against what arrived, and a
+    /// higher one is a gap. See [`Session::on_next_seq`].
     pub(crate) fn on_established(
         &mut self,
         core: &mut Core,
@@ -455,17 +461,11 @@ impl Session {
         next: Option<u64>,
         now: Instant,
     ) -> Bound {
-        if let (true, Some(next)) = (self.remote_flow.is_sequenced(), next) {
-            if !self.established_once {
-                if next == 0 {
-                    return self.violation(core, binding, "NextSeqNo of zero");
-                }
-                self.inbound_next = Some(next);
-            } else if self.on_next_seq(core, binding, next, now) == Bound::Unbind {
-                return Bound::Unbind;
-            }
+        if let (true, Some(next)) = (self.remote_flow.is_sequenced(), next)
+            && self.on_next_seq(core, binding, next, now) == Bound::Unbind
+        {
+            return Bound::Unbind;
         }
-        self.established_once = true;
         if self.request_missing(core, binding, now) == Bound::Unbind {
             return Bound::Unbind;
         }
@@ -657,6 +657,9 @@ impl Session {
                 Bound::Stay,
             ),
             FlowType::Recoverable | FlowType::Idempotent => {
+                // An application message before any NextSeqNo: the fallback
+                // start of 1 now stands.
+                self.start_pending = false;
                 let Some(seq) = self.inbound_next else {
                     return (
                         Delivery::Discard,
@@ -696,12 +699,36 @@ impl Session {
         if next == 0 {
             return self.violation(core, binding, "NextSeqNo of zero");
         }
+        // Section 6.3 and Appendix A 7.4.5: after FinishedSending the
+        // counterparty's flow is over, so no NextSeqNo may announce numbers
+        // past its LastSeqNo, and no gap is opened there.
+        if let Some(PeerFinished { end: Some(end), .. }) = self.peer_finished
+            && next > end
+        {
+            return self.violation(
+                core,
+                binding,
+                "NextSeqNo past the LastSeqNo of FinishedSending",
+            );
+        }
         // Section 3.5.4: a context switch ends a retransmission batch. One
-        // still short of its Count was cut off: the provider stopped it.
+        // still short of its Count was cut off: the provider stopped it. A
+        // stall already reported is waited out again from the cut, now as an
+        // interrupted batch, so the stall policy can act on it.
         if self.replay.take().is_some()
             && let Some(outstanding) = self.outstanding.as_mut()
         {
             outstanding.interrupted = true;
+            outstanding.stall_reported = false;
+            outstanding.last_progress = now;
+        }
+        // Nothing has fixed where the counterparty's numbering stands: on a
+        // stream nothing can precede its first NextSeqNo, so that is where it
+        // starts (Appendix A 7.2.2 and 7.3.1), not a gap after 1.
+        if self.start_pending {
+            self.start_pending = false;
+            self.inbound_next = Some(next);
+            return Bound::Stay;
         }
         let Some(expected) = self.inbound_next else {
             self.inbound_next = Some(next);
@@ -1121,6 +1148,7 @@ impl Session {
         core.event(Event::PeerFinishedSending {
             last_seq_no: message.last_seq_no,
         });
+        let mut end = None;
         if self.remote_flow.is_sequenced() {
             // Section 4.7.1: it must carry LastSeqNo on a numbered flow.
             let Some(last) = message.last_seq_no else {
@@ -1145,9 +1173,11 @@ impl Session {
             if self.on_next_seq(core, binding, next, now) == Bound::Unbind {
                 return Bound::Unbind;
             }
+            end = Some(next);
         }
         self.peer_finished = Some(PeerFinished {
             receiving_sent: false,
+            end,
         });
         self.maybe_finish_receiving(core, binding);
         Bound::Stay
@@ -1676,9 +1706,9 @@ mod tests {
         session.inbound_next = Some(10);
         assert!(
             !session.regresses(Some(9)),
-            "the first establishment sets the numbering"
+            "the first NextSeqNo sets the numbering"
         );
-        session.established_once = true;
+        session.start_pending = false;
         assert!(session.regresses(Some(9)));
         assert!(!session.regresses(Some(10)));
         assert!(!session.regresses(None));
@@ -1770,6 +1800,7 @@ mod tests {
         let (mut core, mut session, mut binding) =
             bare_with(config, origin, FlowType::Recoverable, FlowType::Idempotent);
         session.inbound_next = Some(1);
+        session.start_pending = false;
         let bound = session.on_next_seq(&mut core, &mut binding, u64::MAX, origin);
         assert_eq!(bound, Bound::Unbind);
         assert!(
@@ -1793,6 +1824,7 @@ mod tests {
         };
         let (mut core, mut session, mut binding) =
             bare_with(config, origin, FlowType::Recoverable, FlowType::Recoverable);
+        session.start_pending = false;
         // A gap of exactly the bound is accepted and requested...
         assert_eq!(
             session.on_next_seq(&mut core, &mut binding, 11, origin),
@@ -2100,10 +2132,11 @@ mod flow_tests {
     }
 
     #[test]
-    fn test_without_an_announced_next_seq_numbering_starts_at_one() {
-        // An EstablishmentAck without NextSeqNo: the server's numbering
-        // starts at 1 (sections 3.5.1 and 5.1.1; Appendix A 7.1.8), so a
-        // first Sequence(5) reveals that 1 to 4 are missing.
+    fn test_without_an_announced_start_the_first_sequence_sets_it() {
+        // An EstablishmentAck without NextSeqNo is legal (sections 4.3.1 and
+        // 4.3.2 limit when it is sent). On a stream nothing can precede the
+        // counterparty's first Sequence, so a first Sequence(5) is where its
+        // numbering starts, not a gap of 1 to 4.
         let origin = Instant::now();
         let mut client = FixpClient::new(
             config(),
@@ -2137,15 +2170,51 @@ mod flow_tests {
             origin,
         );
         let _ = drain(&mut client);
-        assert_eq!(client.next_inbound_seq(), Some(SeqNum::new(1)));
         client.handle_message(&sequence(5), origin);
-        let outputs = drain(&mut client);
-        assert!(events(&outputs).contains(&Event::SequenceGap {
-            from: SeqNum::new(1),
-            count: 4,
-        }));
-        let request = one_request(&outputs);
-        assert_eq!((request.from_seq_no, request.count), (1, 4));
+        assert!(drain(&mut client).is_empty(), "no gap, no request");
+        assert!(!client.has_pending_recovery());
+        assert_eq!(client.next_inbound_seq(), Some(SeqNum::new(5)));
+        assert_eq!(client.on_application_message(origin), accepted(5, false));
+        // From then on numbering is checked: a jump is a gap.
+        client.handle_message(&sequence(9), origin);
+        let request = one_request(&drain(&mut client));
+        assert_eq!((request.from_seq_no, request.count), (6, 3));
+    }
+
+    #[test]
+    fn test_server_takes_the_first_sequence_of_an_unannounced_client_flow() {
+        // The client's Establish announces nothing and its first Sequence is
+        // 100: no NotApplied for 1 to 99.
+        let origin = Instant::now();
+        let mut server = server(origin);
+        server.handle_message(
+            &SessionMessage::Negotiate(crate::messages::Negotiate {
+                session_id: SESSION,
+                timestamp: Nanotime::from_nanos(1),
+                client_flow: FlowType::Idempotent,
+                credentials: None,
+            }),
+            origin,
+        );
+        assert_eq!(
+            server.accept_negotiation(FlowType::Recoverable, None, origin),
+            Ok(())
+        );
+        server.handle_message(
+            &SessionMessage::Establish(crate::messages::Establish {
+                session_id: SESSION,
+                timestamp: Nanotime::from_nanos(2),
+                keepalive_interval: 1_000,
+                next_seq_no: None,
+                credentials: None,
+            }),
+            origin,
+        );
+        assert_eq!(server.accept_establishment(origin), Ok(()));
+        let _ = drain(&mut server);
+        server.handle_message(&sequence(100), origin);
+        assert!(drain(&mut server).is_empty(), "no NotApplied");
+        assert_eq!(server.on_application_message(origin), accepted(100, false));
     }
 
     #[test]
@@ -2183,7 +2252,17 @@ mod flow_tests {
             origin,
         );
         let _ = drain(&mut client);
+        // An application message before any NextSeqNo takes the fallback 1,
+        // and fixes the numbering: a Sequence(5) next is a gap of 2 to 4.
         assert_eq!(client.on_application_message(origin), accepted(1, false));
+        client.handle_message(&sequence(5), origin);
+        let outputs = drain(&mut client);
+        assert!(events(&outputs).contains(&Event::SequenceGap {
+            from: SeqNum::new(2),
+            count: 3,
+        }));
+        let request = one_request(&outputs);
+        assert_eq!((request.from_seq_no, request.count), (2, 3));
     }
 
     #[test]
@@ -2427,6 +2506,51 @@ mod flow_tests {
             count: 3,
         })));
         assert_eq!(messages.last(), Some(&finished_receiving()));
+    }
+
+    #[test]
+    fn test_no_next_seq_past_last_seq_no_after_finished_sending() {
+        // Section 6.3 and Appendix A 7.4.5: once the counterparty has sent
+        // FinishedSending its flow is over. A Sequence that announces numbers
+        // past LastSeqNo terminates, and no gap (no NotApplied, no
+        // RetransmitRequest) is opened for numbers it never sent.
+        let origin = Instant::now();
+        let (mut client, mut server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        assert_eq!(send_apps(&mut client, &mut server, 2, origin).len(), 2);
+        server.handle_message(&finished_sending(Some(2)), origin);
+        assert_eq!(sent(&drain(&mut server)), vec![finished_receiving()]);
+        // LastSeqNo + 1 announces nothing new: tolerated.
+        server.handle_message(&sequence(3), origin);
+        assert!(drain(&mut server).is_empty());
+        // Past it: terminated, with no NotApplied for 3 to 6.
+        server.handle_message(&sequence(7), origin);
+        let outputs = drain(&mut server);
+        assert!(events(&outputs).contains(&Event::ProtocolViolation {
+            reason: "NextSeqNo past the LastSeqNo of FinishedSending"
+        }));
+        assert!(
+            !sent(&outputs)
+                .iter()
+                .any(|message| matches!(message, SessionMessage::NotApplied(_)))
+        );
+        assert_terminates(&outputs, TerminationCode::UnspecifiedError);
+        // The same for a Context on a Recoverable flow: no RetransmitRequest.
+        let (mut client, mut server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        let _ = send_apps(&mut server, &mut client, 2, origin);
+        client.handle_message(&finished_sending(Some(2)), origin);
+        let _ = drain(&mut client);
+        client.handle_message(
+            &SessionMessage::Context(Context {
+                session_id: SESSION,
+                next_seq_no: 10,
+            }),
+            origin,
+        );
+        let outputs = drain(&mut client);
+        assert!(requests(&outputs).is_empty());
+        assert_terminates(&outputs, TerminationCode::UnspecifiedError);
     }
 
     #[test]
@@ -2781,17 +2905,27 @@ mod flow_tests {
         let _ = drain(server);
     }
 
+    /// A client and a server that both use `config`, established at `origin`.
     fn client_with(config: FixpConfig, origin: Instant) -> (FixpClient, FixpServer) {
-        let client = FixpClient::new(config, anchor(origin), SESSION, FlowType::Idempotent, None);
+        let client = FixpClient::new(
+            config.clone(),
+            anchor(origin),
+            SESSION,
+            FlowType::Idempotent,
+            None,
+        );
+        let server = FixpServer::new(config, anchor(origin), origin);
         let (mut client, mut server) =
-            negotiate_pair(client, server(origin), FlowType::Recoverable, origin);
+            negotiate_pair(client, server, FlowType::Recoverable, origin);
         crate::testkit::establish(&mut client, &mut server, origin);
         (client, server)
     }
 
+    /// A 10 s keepalive on both sides, longer than `retransmit_timeout`: the
+    /// counterparty's heartbeat Sequence can then come after a stall.
     fn with_policy(policy: crate::RetransmitStallPolicy) -> FixpConfig {
         match FixpConfig::builder()
-            .keepalive_interval(KEEPALIVE)
+            .keepalive_interval(Duration::from_secs(10))
             .retransmit_timeout(RETRANSMIT_TIMEOUT)
             .retransmit_stall_policy(policy)
             .build()
@@ -2923,10 +3057,13 @@ mod flow_tests {
     #[test]
     fn test_default_stall_policy_asks_again_after_an_interrupted_batch() {
         // A Sequence cut the batch short of its Count (section 3.5.4): the
-        // provider stopped serving, so the rest is requested again.
+        // provider stopped serving, so the rest is requested again
+        // retransmit_timeout after the cut.
         let origin = Instant::now();
-        let (mut client, _server) =
-            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        let (mut client, _server) = client_with(
+            with_policy(crate::RetransmitStallPolicy::ReRequestAfterContextSwitch),
+            origin,
+        );
         client.handle_message(&sequence(11), origin);
         let first = one_request(&drain(&mut client));
         client.handle_message(
@@ -2941,8 +3078,10 @@ mod flow_tests {
         for seq in 1..=4 {
             assert_eq!(client.on_application_message(origin), accepted(seq, true));
         }
-        client.handle_message(&sequence(11), at(origin, 1_500));
-        let stall = origin + RETRANSMIT_TIMEOUT;
+        let cut = at(origin, 1_500);
+        client.handle_message(&sequence(11), cut);
+        let stall = cut + RETRANSMIT_TIMEOUT;
+        assert_eq!(client.poll_timeout(), Some(stall));
         client.handle_timeout(stall - Duration::from_millis(1));
         assert!(requests(&drain(&mut client)).is_empty());
         client.handle_timeout(stall);
@@ -2954,6 +3093,63 @@ mod flow_tests {
         let second = one_request(&outputs);
         assert_eq!((second.from_seq_no, second.count), (5, 6));
         assert!(second.timestamp > first.timestamp);
+    }
+
+    #[test]
+    fn test_default_stall_policy_asks_again_when_the_cut_follows_the_stall() {
+        // The batch goes quiet first: the stall is reported and waited out.
+        // The provider's heartbeat Sequence then cuts the batch short. The
+        // cut must restart the stall timer, or the request stays outstanding
+        // for good and nothing is ever requested again on this binding.
+        let origin = Instant::now();
+        let (mut client, _server) = client_with(
+            with_policy(crate::RetransmitStallPolicy::ReRequestAfterContextSwitch),
+            origin,
+        );
+        client.handle_message(&sequence(11), origin);
+        let first = one_request(&drain(&mut client));
+        client.handle_message(
+            &SessionMessage::Retransmission(Retransmission {
+                session_id: SESSION,
+                request_timestamp: first.timestamp,
+                next_seq_no: 1,
+                count: 10,
+            }),
+            origin,
+        );
+        for seq in 1..=4 {
+            assert_eq!(client.on_application_message(origin), accepted(seq, true));
+        }
+        // Quiet for retransmit_timeout, not cut: reported, no request.
+        let stall = origin + RETRANSMIT_TIMEOUT;
+        client.handle_timeout(stall);
+        let outputs = drain(&mut client);
+        assert!(events(&outputs).contains(&Event::RetransmitTimedOut {
+            from: SeqNum::new(1),
+            count: 10,
+        }));
+        assert!(requests(&outputs).is_empty());
+        // Then the cut, and the timer runs again from it.
+        let cut = stall + Duration::from_millis(500);
+        client.handle_message(&sequence(11), cut);
+        assert!(drain(&mut client).is_empty());
+        assert_eq!(client.poll_timeout(), Some(cut + RETRANSMIT_TIMEOUT));
+        client.handle_timeout(cut + RETRANSMIT_TIMEOUT - Duration::from_millis(1));
+        assert!(requests(&drain(&mut client)).is_empty());
+        client.handle_timeout(cut + RETRANSMIT_TIMEOUT);
+        let outputs = drain(&mut client);
+        let second = one_request(&outputs);
+        assert_eq!((second.from_seq_no, second.count), (5, 6));
+        // The answer recovers the rest.
+        let answered = cut + RETRANSMIT_TIMEOUT;
+        let deliveries = replay(&mut client, &second, 5, 6, answered);
+        assert_eq!(deliveries.last(), Some(&accepted(10, true)));
+        assert!(events(&drain(&mut client)).contains(&Event::RecoveryComplete));
+        assert!(!client.has_pending_recovery());
+        // Nothing is left outstanding: a later gap is requested at once.
+        client.handle_message(&sequence(15), answered);
+        let later = one_request(&drain(&mut client));
+        assert_eq!((later.from_seq_no, later.count), (11, 4));
     }
 
     #[test]
@@ -2974,8 +3170,9 @@ mod flow_tests {
         );
         let _ = client.on_application_message(origin);
         // Even an interrupted batch is only reported.
-        client.handle_message(&sequence(11), at(origin, 1_500));
-        client.handle_timeout(origin + RETRANSMIT_TIMEOUT);
+        let cut = at(origin, 1_500);
+        client.handle_message(&sequence(11), cut);
+        client.handle_timeout(cut + RETRANSMIT_TIMEOUT);
         let outputs = drain(&mut client);
         assert!(events(&outputs).contains(&Event::RetransmitTimedOut {
             from: SeqNum::new(1),

@@ -82,8 +82,10 @@ pub enum RetransmitStallPolicy {
     /// The default. Ask again for what is still missing only when the
     /// provider has visibly stopped serving: a Sequence or Context arrived
     /// while a batch was still short of its `Count` (a context switch ends
-    /// the batch, section 3.5.4) and `retransmit_timeout` has passed since.
-    /// Otherwise report the stall and keep waiting, as `EventOnly` does.
+    /// the batch, section 3.5.4) and `retransmit_timeout` has passed since
+    /// that cut. Otherwise report the stall and keep waiting, as `EventOnly`
+    /// does; a cut that comes after the stall was reported starts the timer
+    /// again from the cut.
     ///
     /// Residual risk: a provider that cut a batch short but still considers
     /// the request in progress (IronFix's own provider does, if its driver

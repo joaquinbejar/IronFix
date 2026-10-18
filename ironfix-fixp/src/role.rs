@@ -176,8 +176,11 @@ macro_rules! bound_api {
             }
 
             /// The sequence number expected for the counterparty's next
-            /// real-time application message, once a Sequence (or an
-            /// equivalent) has announced it.
+            /// real-time application message, on a sequenced flow, once
+            /// negotiated. Until the counterparty announces where its
+            /// numbering stands (an establishment `NextSeqNo`, a Sequence
+            /// or a Context), this is the fallback 1 that an application
+            /// message arriving first would get.
             #[must_use]
             pub fn next_inbound_seq(&self) -> Option<ironfix_core::SeqNum> {
                 self.session()

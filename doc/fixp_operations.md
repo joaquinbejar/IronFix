@@ -162,12 +162,17 @@ Implemented and tested:
 - Outbound on an Unsequenced flow: no number; on a None flow: refused
   (`test_send_application_on_an_unsequenced_flow_has_no_number`,
   `test_send_application_on_a_none_flow_is_refused`).
-- Inbound: numbering starts at 1 unless the first establishment announces
-  another start, as Appendix A 7.2.2 and 7.3.1 do; after that an announced
-  number is checked like a Sequence
-  (`test_without_an_announced_next_seq_numbering_starts_at_one`,
+- Inbound: the counterparty's numbering starts at the first `NextSeqNo` it
+  announces: in its first establishment (Appendix A 7.2.2 and 7.3.1 start at
+  100, 200 and 1000), or, if that announced none (sections 4.3.1 and 4.3.2
+  allow it), in its first Sequence or Context, since on a stream nothing can
+  precede it. Only an application message arriving before any announcement
+  takes the fallback 1. From then on an announced number is checked, and a
+  higher one is a gap
+  (`test_the_first_establishment_sets_where_numbering_starts`,
+  `test_without_an_announced_start_the_first_sequence_sets_it`,
+  `test_server_takes_the_first_sequence_of_an_unannounced_client_flow`,
   `test_an_application_message_with_no_sequence_is_number_one`,
-  `test_the_first_establishment_sets_where_numbering_starts`,
   `test_inbound_messages_are_numbered_from_the_announced_next_seq`). A
   Sequence equal to the expected number is a heartbeat.
 - Inbound violations, each answered with Terminate `UnspecifiedError`: a
@@ -213,12 +218,17 @@ Implemented and tested, as the requester:
   reported once (`Event::RetransmitTimedOut`) and handled by
   `RetransmitStallPolicy`:
   - `ReRequestAfterContextSwitch`, the default: asks again for what is still
-    missing only if a Sequence or Context cut the last batch short of its
-    Count (section 3.5.4), otherwise waits. Against IronFix's own provider
-    pacing its batches more slowly than `retransmit_timeout`, no premature
-    second request is sent and the provider does not terminate
+    missing only `retransmit_timeout` after a Sequence or Context cut the
+    last batch short of its Count (section 3.5.4), otherwise waits. A cut
+    that arrives after the stall was reported restarts the timer from the
+    cut, so the request is still made and later gaps are not blocked (the
+    case where the provider's heartbeat interval is at least
+    `retransmit_timeout`). Against IronFix's own provider pacing its batches
+    more slowly than `retransmit_timeout`, no premature second request is
+    sent and the provider does not terminate
     (`test_default_stall_policy_waits_for_a_paced_ironfix_provider`,
-    `test_default_stall_policy_asks_again_after_an_interrupted_batch`).
+    `test_default_stall_policy_asks_again_after_an_interrupted_batch`,
+    `test_default_stall_policy_asks_again_when_the_cut_follows_the_stall`).
   - `EventOnly`: never asks again (`test_event_only_stall_policy_never_asks_again`).
   - `Terminate`: terminates with `UnspecifiedError`; the gap is requested
     again after re-establishment, when no retransmission can be in progress
@@ -335,6 +345,11 @@ Implemented and tested, receiving side only:
 - A repeated FinishedSending (its heartbeat role, section 4.7.1) gets no
   second answer (Appendix A 7.4.2); an application message after it is a
   violation (section 6.3).
+- After it, a Sequence or Context announcing numbers past `LastSeqNo`
+  terminates (section 6.3, Appendix A 7.4.5) and no gap is opened for
+  numbers the counterparty never sent; one equal to `LastSeqNo + 1`
+  announces nothing new and is accepted
+  (`test_no_next_seq_past_last_seq_no_after_finished_sending`).
 - Violations: FinishedReceiving (this side never sent FinishedSending), no
   `LastSeqNo` on a sequenced flow, a `LastSeqNo` below what already arrived,
   another session (`test_invalid_finalization_messages_are_violations`). On
@@ -372,7 +387,8 @@ Implemented and tested:
 | RetransmitRequest for numbers not yet sent | 4.6.2.3 and Appendix A 7.3.5: RetransmitReject `OutOfRange`; 6.3: a violation | RetransmitReject `OutOfRange`; a zero `Count` too |
 | Code of the answer to a Terminate | 4.4.1 says to answer, not with which code | `Finished` |
 | `NextSeqNo` lower than expected | Appendix A 7.2.2, 7.2.3, 7.3.1.2 (informative) | Terminate `UnspecifiedError`; a server refuses such an Establish with `Unspecified` instead |
-| Where numbering starts | 5.1.1 (multicast) and Appendix A 7.1.8 start at 1; Appendix A 7.2.2 and 7.3.1 start at 100, 200, 1000 | 1, unless the first establishment announces another start |
+| Where numbering starts | 5.1.1 (multicast) and Appendix A 7.1.8 start at 1; Appendix A 7.2.2 and 7.3.1 start at 100, 200, 1000; 4.3.1 and 4.3.2 limit when an establishment announces it | The first `NextSeqNo` announced (establishment, else first Sequence or Context); 1 only if an application message comes first |
+| A Sequence after FinishedSending | Appendix A 7.4.5 terminates on one after FinishedReceiving | Terminate if it announces numbers past `LastSeqNo`; accept `LastSeqNo + 1`, which announces nothing new |
 | Stalled RetransmitRequest | 4.6.2.2: asking again is "the requester's responsibility"; 4.6.1, 4.6.4, 6.3: no second request while one is in progress | `RetransmitStallPolicy`, default: ask again only after a context switch cut a batch short |
 | After a RetransmitReject | Not specified | The range is abandoned and reported |
 | Leniency on the counterparty's silence | 4.4: "some leniency" | Grace equal to its interval by default (configurable, at most `MAX_TIMER`) |

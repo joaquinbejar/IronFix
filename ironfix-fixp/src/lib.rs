@@ -98,10 +98,11 @@
 //! - **Handshake timeouts**: every wait, on either side, is bounded by
 //!   `handshake_timeout`, and a lapse closes the transport.
 //! - **Sequencing** (section 3.5): implicit numbering after Sequence,
-//!   EstablishmentAck or Retransmission, from 1 unless the first
-//!   establishment announces another start; a Sequence before the first
-//!   application message after any context switch; Context accepted as a
-//!   Sequence when it names this session.
+//!   EstablishmentAck or Retransmission, starting where the counterparty
+//!   first announces it (or at 1 if an application message comes first); a
+//!   Sequence before the first application message after any context switch;
+//!   Context accepted as a Sequence when it names this session; after a
+//!   counterparty's FinishedSending, no number past its `LastSeqNo`.
 //! - **Recoverable flow** (section 4.6): gap detection, RetransmitRequest
 //!   with one request in flight, chunked to `max_retransmit_count`, at most
 //!   `max_pending_gaps` gaps of at most `max_gap_len` each, Retransmission
@@ -161,12 +162,19 @@
 //! - A `NextSeqNo` lower than expected terminates (Appendix A 7.2.2, 7.2.3);
 //!   on a server's re-establishment it is refused with EstablishmentReject
 //!   `Unspecified` instead.
-//! - Numbering starts at 1 unless the first establishment announces another
-//!   start (Appendix A 7.2.2 and 7.3.1 start at 100, 200 and 1000).
+//! - The counterparty's numbering starts at the first `NextSeqNo` it
+//!   announces, in its first establishment or else in its first Sequence or
+//!   Context (Appendix A 7.2.2 and 7.3.1 start at 100, 200 and 1000; on a
+//!   stream nothing can precede that announcement). An application message
+//!   before any announcement is number 1.
+//! - After a counterparty's FinishedSending, a Sequence or Context
+//!   announcing numbers past its `LastSeqNo` terminates (section 6.3,
+//!   Appendix A 7.4.5); one equal to `LastSeqNo + 1` announces nothing new
+//!   and is accepted.
 //! - A stalled RetransmitRequest is handled by the [`RetransmitStallPolicy`];
-//!   the default asks again only after a Sequence cut a batch short
-//!   (section 3.5.4), because a second request while the provider is still
-//!   serving is a violation (sections 4.6.1, 4.6.4, 6.3).
+//!   the default asks again only `retransmit_timeout` after a Sequence cut
+//!   a batch short (section 3.5.4), because a second request while the
+//!   provider is still serving is a violation (sections 4.6.1, 4.6.4, 6.3).
 //! - A RetransmitReject abandons the requested range: those messages are not
 //!   requested again, and [`Event::RetransmitRejected`] says so.
 //! - The counterparty's silence ends the session after its keepalive
