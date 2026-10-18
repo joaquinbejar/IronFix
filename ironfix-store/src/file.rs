@@ -34,20 +34,21 @@
 //!   neither is.
 //! - [`MessageStore::reset`] and [`MessageStore::reset_to`] write a complete
 //!   new journal (header only, carrying the new counters) to
-//!   `<name>.journal.tmp` and rename it over the journal: after a crash the
-//!   store is entirely the old stream or entirely the new one.
+//!   `<name>.journal.tmp`, flush it, rename it over the journal and flush the
+//!   directory, whatever the [`SyncPolicy`]: after a crash the store is
+//!   entirely the old stream or entirely the new one.
 //! - Every other write is one record.
 //!
 //! # Call order
 //!
-//! Calls run one at a time, in the order they were first polled, through an
-//! internal first-in, first-out lock, and the file I/O of each call runs on a
-//! blocking thread that holds that lock until the I/O is finished. A caller
+//! Every call takes an internal first-in, first-out lock and keeps it, on the
+//! blocking thread that does its file I/O, until the I/O is finished. A caller
 //! may drop a call's future (the engine bounds every store call with a
-//! timeout): a call dropped while it waits for the lock writes nothing, and a
-//! call dropped once its I/O has started still completes it before any later
-//! call starts. A dropped call can therefore take effect after reporting
-//! nothing, but never after, or interleaved with, a later call.
+//! timeout): a call dropped before it holds the lock writes nothing, and once
+//! it holds the lock its I/O completes before any later call starts, even if
+//! its future is dropped. A dropped call can therefore take effect without
+//! reporting it, but never after, or interleaved with, a later call: the
+//! [`MessageStore`] call-order contract.
 //!
 //! # Durability
 //!
@@ -55,35 +56,60 @@
 //! anything that returned `Ok` survives the process crashing. What survives
 //! the operating system crashing or a power loss depends on the
 //! [`SyncPolicy`]; only [`SyncPolicy::EveryWrite`] makes every `Ok` survive
-//! it.
+//! it, and only under the engine's `StoreFailurePolicy::CloseSession` does a
+//! failed write keep its frame off the wire (under `Continue` the frame is
+//! sent anyway and the engine owes the next session a sequence reset). These
+//! guarantees are stated for Unix: elsewhere the directory is not flushed
+//! and the store is untested.
 //!
 //! # Recovery
 //!
 //! [`FileStore::open`] and [`MessageStore::refresh`] read the whole journal.
-//! A record the file ends inside (a write a crash interrupted), or one whose
-//! header or CRC check fails, is cut from the file together with everything
-//! after it and is never returned; [`FileStore::last_truncation`] reports the
-//! cut. A record whose header is well formed but declares a body larger than
-//! the configured limit, a record that passes its CRC but does not decode,
-//! and a header that is not a version-1 journal header are refused with
-//! [`StoreError::Corrupted`]: the store does not open, and nothing is cut.
+//! Recovery cuts only what an interrupted write can leave, and refuses the
+//! rest:
+//!
+//! - **Cut**: a record the file ends inside; a record whose body fails its
+//!   CRC and is the last one in the file; a damaged record header within one
+//!   maximum-size record of the end; damage followed only by zero bytes.
+//!   Under [`SyncPolicy::EveryN`]`(n)` the window is `n` maximum-size
+//!   records; under [`SyncPolicy::Never`] damage is cut wherever it is. A cut
+//!   removes the record and everything after it, so the record is never
+//!   returned, and [`FileStore::last_truncation`] reports it.
+//! - **Refuse** with [`StoreError::Corrupted`], cutting nothing: damage
+//!   outside that window (data already written, and acknowledged, is damaged);
+//!   a well-formed record header declaring a body larger than the configured
+//!   limit; a record that passes its CRC but does not decode; a header that is
+//!   not a version-1 journal header.
+//!   [`FileStore::repair`] cuts such a journal at its first unreadable record,
+//!   on an operator's decision, after which the session must reset its
+//!   sequence (`ResetSeqNumFlag` (141) = Y).
+//!
+//! A failed write is undone. A failed flush cuts the journal back to the end
+//! of its last successful flush, because after a failed flush the operating
+//! system may have dropped writes it had accepted, and leaves the store
+//! refusing every call except a reset until [`MessageStore::refresh`] has made
+//! that cut durable: an error from a write means it was not filed.
 //!
 //! # One store, one owner
 //!
 //! While a store is open it holds an advisory lock on `<name>.lock`
-//! ([`std::fs::File::try_lock`]), so a second store opened on the same files,
-//! in this process or another, fails with [`StoreError::Io`] instead of
-//! interleaving two sequence streams in one journal.
+//! ([`std::fs::File::try_lock`], which needs Rust 1.89 or later), so a second
+//! store opened on the same files, in this process or another, fails with
+//! [`StoreError::Io`] instead of interleaving two sequence streams in one
+//! journal. The operating system releases the lock when the process dies. It
+//! is advisory, and network file systems may not honour it; where the platform
+//! cannot lock at all, opening fails rather than proceeding unlocked.
+//! Dropping a store releases the lock once any call still running finishes;
+//! [`FileStore::close`] waits for that.
 //!
 //! # Limits
 //!
 //! - The journal grows until it is reset: every counter write adds a 21-byte
 //!   record, and a frame filed again under the same number leaves the earlier
-//!   one in the file. There is no compaction.
+//!   one in the file. There is no compaction (#112).
 //! - Opening and refreshing read the whole journal.
 //! - A frame above [`FileStoreConfig::max_frame_size`] is refused.
 //! - Inbound frames are not filed; only the target counter is kept.
-//! - The directory is flushed after a rename on Unix only.
 
 mod config;
 mod crc32;
@@ -95,7 +121,9 @@ pub use config::{
 };
 pub use format::{Truncation, TruncationCause};
 
-use crate::file::format::{HEADER_LEN_U64, Header, IndexEntry, MAX_BODY_OVERHEAD, io_error};
+use crate::file::format::{
+    DamageRule, HEADER_LEN_U64, Header, IndexEntry, MAX_BODY_OVERHEAD, io_error,
+};
 use crate::stored::StoredMessage;
 use crate::traits::MessageStore;
 use async_trait::async_trait;
@@ -104,17 +132,21 @@ use ironfix_core::message::MsgType;
 use parking_lot::{Mutex as SyncMutex, RwLock};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{BufReader, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+use tokio::runtime::Handle;
 use tokio::sync::{Mutex, OwnedMutexGuard};
+
+/// Most frames a page read reserves room for up front.
+const PAGE_CAPACITY_HINT: usize = 256;
 
 /// A persistent [`MessageStore`] backed by one append-only journal file.
 ///
 /// See the [module documentation](self) for the layout, the atomicity of each
-/// call, the durability of each [`SyncPolicy`], and recovery.
+/// call, the durability of each [`SyncPolicy`], recovery, and the lock.
 ///
 /// # Example
 ///
@@ -123,7 +155,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 /// use std::sync::Arc;
 ///
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = FileStoreConfig::try_new("/var/lib/ironfix", "FIX.4.4-CLIENT-VENUE")?;
+/// let config = FileStoreConfig::try_new("/var/lib/ironfix", "FIX.4.4-CLIENT-VENUE")?
+///     .with_create_if_missing(true);
 /// let store: Arc<dyn MessageStore> = Arc::new(FileStore::open(config).await?);
 /// // Attach it with `Initiator::with_store` or `Acceptor::with_store`.
 /// # let _ = store;
@@ -151,11 +184,21 @@ struct Shared {
     next_target: AtomicU64,
     /// Creation time of the journal.
     creation_time: RwLock<SystemTime>,
-    /// The cut the last open or refresh made, if any.
+    /// The last cut made since the store was opened, if any.
     truncation: SyncMutex<Option<Truncation>>,
 }
 
 impl Shared {
+    /// A blank state, filled in when the journal is loaded.
+    fn new() -> Self {
+        Self {
+            next_sender: AtomicU64::new(1),
+            next_target: AtomicU64::new(1),
+            creation_time: RwLock::new(SystemTime::UNIX_EPOCH),
+            truncation: SyncMutex::new(None),
+        }
+    }
+
     /// Publishes the state of a freshly loaded or replaced journal.
     fn publish(&self, header: &Header, next_sender: u64, next_target: u64) {
         self.next_sender.store(next_sender, Ordering::SeqCst);
@@ -163,17 +206,44 @@ impl Shared {
         *self.creation_time.write() = header.creation_time;
     }
 
-    /// Publishes the state of a journal loaded from disk, and the cut its
-    /// recovery made.
+    /// Publishes the state of a journal loaded from disk, and records the cut
+    /// its recovery made. A clean load keeps the last cut on record.
     fn install(&self, scan: &format::Scan) {
         self.publish(&scan.header, scan.next_sender, scan.next_target);
-        *self.truncation.lock() = scan.truncation;
+        if let Some(truncation) = scan.truncation {
+            *self.truncation.lock() = Some(truncation);
+        }
+    }
+}
+
+/// What has to happen before a journal that failed mid-write can be used
+/// again. While anything is pending the store refuses every call except a
+/// reset and a refresh.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Pending {
+    /// Cut the journal back to this offset and flush the cut.
+    cut_back_to: Option<u64>,
+    /// Flush the directory, to make a rename durable.
+    directory_flush: bool,
+    /// Reopen the journal from its path.
+    reopen: bool,
+}
+
+impl Pending {
+    /// Whether nothing is pending.
+    const fn is_clear(&self) -> bool {
+        self.cut_back_to.is_none() && !self.directory_flush && !self.reopen
+    }
+
+    /// Records that the journal must be cut back to `offset`, keeping the
+    /// earliest such offset.
+    fn cut_back(&mut self, offset: u64) {
+        self.cut_back_to = Some(self.cut_back_to.map_or(offset, |at| at.min(offset)));
     }
 }
 
 /// The open journal: its file, the index of filed frames, and the bookkeeping
-/// for the sync policy. Only ever touched on a blocking thread, behind the
-/// journal lock.
+/// for the sync policy. Touched only behind the journal lock.
 #[derive(Debug)]
 struct Journal {
     /// The configuration.
@@ -186,13 +256,15 @@ struct Journal {
     index: BTreeMap<u64, IndexEntry>,
     /// File offset just past the last record: where the next one goes.
     end: u64,
+    /// File offset up to which the journal is known to be on stable storage:
+    /// where it stood after its last successful flush (or when it was
+    /// loaded).
+    durable_end: u64,
     /// Records appended since the journal was last flushed, under
     /// [`SyncPolicy::EveryN`].
     unsynced: u32,
-    /// Set when the file may no longer match the in-memory state (a failed
-    /// flush, or a failed undo of a failed write). Every call but
-    /// [`MessageStore::refresh`] then fails until a refresh reloads the file.
-    poisoned: bool,
+    /// What a failed write left to do before the journal is usable again.
+    pending: Pending,
     /// The values the synchronous getters read.
     shared: Arc<Shared>,
     /// Test-only fault injection and flush counting; empty outside tests.
@@ -210,6 +282,9 @@ struct Probe {
     /// Makes the next journal flush fail.
     #[cfg(test)]
     fail_next_flush: bool,
+    /// Makes the next directory flush after a rename fail.
+    #[cfg(test)]
+    fail_next_dir_flush: bool,
     /// Journal and replacement-file flushes made.
     #[cfg(test)]
     file_flushes: u64,
@@ -250,6 +325,18 @@ impl Probe {
         }
     }
 
+    /// Reports whether a test injected the failure of the next directory
+    /// flush after a rename.
+    #[allow(clippy::unused_self)]
+    fn dir_flush_fails(&mut self) -> bool {
+        #[cfg(test)]
+        {
+            std::mem::take(&mut self.fail_next_dir_flush)
+        }
+        #[cfg(not(test))]
+        false
+    }
+
     /// Counts a directory flush.
     #[allow(clippy::unused_self)]
     fn dir_flush(&mut self) {
@@ -261,37 +348,33 @@ impl Probe {
 }
 
 impl Journal {
-    /// Fails if a failed flush or undo left the journal unusable.
+    /// Fails if a failed write left something pending.
     fn usable(&self) -> Result<(), StoreError> {
-        if self.poisoned {
-            return Err(StoreError::Io(
-                "the journal may not match the store after a failed write; refresh or reopen \
-                 the store"
-                    .to_string(),
-            ));
+        if self.pending.is_clear() {
+            return Ok(());
         }
-        Ok(())
+        Err(StoreError::Io(
+            "the journal is not usable after a failed write; refresh the store (or reset it) \
+             before using it again"
+                .to_string(),
+        ))
     }
 
     /// Appends one encoded record and flushes it as the policy requires.
     /// Returns the record's offset.
     ///
     /// A failed write is undone by cutting the file back to where the record
-    /// started; if that fails too, or the flush fails, the journal is
-    /// poisoned.
+    /// started; if that fails, the cut is left pending. A failed flush cuts
+    /// the journal back to its last successful flush (see [`Journal::flush`]).
     fn append(&mut self, record: &[u8]) -> Result<u64, StoreError> {
         let offset = self.end;
         let new_end = u64::try_from(record.len())
             .ok()
             .and_then(|len| offset.checked_add(len))
             .ok_or_else(|| StoreError::Io("journal offset overflows".to_string()))?;
-        let written = self
-            .file
-            .seek(SeekFrom::Start(offset))
-            .and_then(|_| self.file.write_all(record));
-        if let Err(err) = written {
+        if let Err(err) = write_at(&mut self.file, record, offset) {
             if self.file.set_len(offset).is_err() {
-                self.poisoned = true;
+                self.pending.cut_back(offset);
             }
             return Err(io_error("cannot append to the journal", &err));
         }
@@ -312,20 +395,35 @@ impl Journal {
         Ok(offset)
     }
 
-    /// Flushes the journal file's data to stable storage. A failure poisons
-    /// the journal: after a failed flush the operating system may have
-    /// dropped data that earlier writes reported as written.
+    /// Flushes the journal file's data to stable storage.
+    ///
+    /// After a failed flush the operating system may have dropped data it had
+    /// accepted from earlier writes, and a later flush can report success
+    /// without bringing it back. The journal is therefore cut back to where
+    /// its last successful flush left it, and the cut is left pending until
+    /// a refresh has made it durable: everything written since that flush is
+    /// treated as not filed.
     fn flush(&mut self) -> Result<(), StoreError> {
-        if self.probe.journal_flush() {
-            self.poisoned = true;
-            return Err(StoreError::Io("injected flush failure".to_string()));
+        let flushed = if self.probe.journal_flush() {
+            Err(std::io::Error::other("injected flush failure"))
+        } else {
+            self.file.sync_data()
+        };
+        match flushed {
+            Ok(()) => {
+                self.durable_end = self.end;
+                self.unsynced = 0;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.file.set_len(self.durable_end);
+                self.pending.cut_back(self.durable_end);
+                Err(io_error(
+                    "cannot flush the journal; the writes since its last flush are cut",
+                    &err,
+                ))
+            }
         }
-        if let Err(err) = self.file.sync_data() {
-            self.poisoned = true;
-            return Err(io_error("cannot flush the journal", &err));
-        }
-        self.unsynced = 0;
-        Ok(())
     }
 
     /// Indexes a frame record appended at `offset`.
@@ -347,7 +445,7 @@ impl Journal {
         end: u64,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StoreError> {
-        let mut messages = Vec::new();
+        let mut messages = Vec::with_capacity(limit.min(PAGE_CAPACITY_HINT));
         for (seq, entry) in self.index.range(begin..=end).take(limit) {
             messages.push(format::read_frame(&mut self.file, *seq, *entry)?);
         }
@@ -355,47 +453,94 @@ impl Journal {
     }
 
     /// Replaces the journal with an empty one starting from the given
-    /// counters, through a new file renamed into place.
+    /// counters: a new file, flushed, renamed into place, and the directory
+    /// flushed. Runs on a journal left unusable by a failed write too, and a
+    /// success clears what was pending: the replaced journal no longer
+    /// matters.
     fn replace(&mut self, next_sender: u64, next_target: u64) -> Result<(), StoreError> {
         let header = Header {
             creation_time: SystemTime::now(),
             next_sender,
             next_target,
         };
-        let replaced = write_replacement(&self.config, &header, &mut self.probe);
-        // The rename is the commit point. Past it, the journal on disk is the
-        // new one whether or not the directory flush worked, so the store
-        // switches to it before reporting a flush failure.
-        let flushed = match replaced {
-            Replacement::NotCommitted(err) => return Err(err),
-            Replacement::Committed(flushed) => flushed,
+        write_replacement(&self.config, &header, &mut self.probe)?;
+        // The rename is the commit point: past it, the journal on disk is the
+        // new one whether or not what follows works.
+        self.pending = Pending::default();
+        self.index.clear();
+        self.end = HEADER_LEN_U64;
+        self.durable_end = HEADER_LEN_U64;
+        self.unsynced = 0;
+        self.shared.publish(&header, next_sender, next_target);
+        let dir_flushed = if self.probe.dir_flush_fails() {
+            Err(StoreError::Io(
+                "injected directory flush failure".to_string(),
+            ))
+        } else {
+            flush_directory(self.config.directory())
         };
         match open_journal_file(&self.config) {
             Ok(file) => self.file = file,
             Err(err) => {
-                self.poisoned = true;
+                self.pending.reopen = true;
+                self.pending.directory_flush = dir_flushed.is_err();
                 return Err(err);
             }
         }
-        self.index.clear();
-        self.end = HEADER_LEN_U64;
-        self.unsynced = 0;
-        self.poisoned = false;
-        self.shared.publish(&header, next_sender, next_target);
-        flushed
+        match dir_flushed {
+            Ok(()) => {
+                self.probe.dir_flush();
+                Ok(())
+            }
+            Err(err) => {
+                self.pending.directory_flush = true;
+                Err(err)
+            }
+        }
     }
 
-    /// Reloads the journal from disk, cutting a damaged or incomplete tail.
+    /// Completes what a failed write left pending, then rereads the journal
+    /// from disk, cutting what recovery allows and flushing it unless the
+    /// policy is [`SyncPolicy::Never`].
     fn reload(&mut self) -> Result<(), StoreError> {
-        let Loaded { file, scan } = load(&self.config, &mut self.probe)?;
+        if self.pending.directory_flush {
+            flush_directory(self.config.directory())?;
+            self.probe.dir_flush();
+            self.pending.directory_flush = false;
+        }
+        if let Some(offset) = self.pending.cut_back_to {
+            cut_back(&self.config, offset)?;
+            self.probe.file_flush();
+            self.pending.cut_back_to = None;
+        }
+        let Loaded { file, scan } = load(
+            &self.config,
+            self.config.sync_policy().damage_rule(),
+            &mut self.probe,
+        )?;
         self.shared.install(&scan);
         self.file = file;
         self.index = scan.index;
         self.end = scan.end;
+        self.durable_end = scan.end;
         self.unsynced = 0;
-        self.poisoned = false;
+        self.pending = Pending::default();
         Ok(())
     }
+}
+
+/// Writes all of `record` at `offset`.
+#[cfg(unix)]
+fn write_at(file: &mut File, record: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, record, offset)
+}
+
+/// Writes all of `record` at `offset`.
+#[cfg(not(unix))]
+fn write_at(file: &mut File, record: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(record)
 }
 
 /// The largest record body `config` allows, in bytes.
@@ -425,42 +570,60 @@ fn open_journal_file(config: &FileStoreConfig) -> Result<File, StoreError> {
         })
 }
 
-/// Reads the journal from disk and cuts a damaged or incomplete tail.
-fn load(config: &FileStoreConfig, probe: &mut Probe) -> Result<Loaded, StoreError> {
+/// Reads the journal from disk, cuts what `rule` allows, and flushes the
+/// result unless the policy is [`SyncPolicy::Never`] (a salvage is always
+/// flushed). Flushing at load makes what was loaded the durable starting
+/// point, whatever the previous owner left unflushed.
+fn load(
+    config: &FileStoreConfig,
+    rule: DamageRule,
+    probe: &mut Probe,
+) -> Result<Loaded, StoreError> {
     let mut file = open_journal_file(config)?;
     let file_len = file
         .metadata()
         .map_err(|err| io_error("cannot read the journal's length", &err))?
         .len();
-    let scan = format::scan(BufReader::new(&mut file), file_len, max_body(config))?;
+    let scan = format::scan(BufReader::new(&mut file), file_len, max_body(config), rule)?;
     if let Some(truncation) = scan.truncation {
         file.set_len(truncation.offset())
-            .map_err(|err| io_error("cannot cut the journal's damaged tail", &err))?;
-        if config.sync_policy().flushes_replacements() {
-            probe.file_flush();
-            file.sync_data()
-                .map_err(|err| io_error("cannot flush the journal's cut", &err))?;
-        }
+            .map_err(|err| io_error("cannot cut the journal", &err))?;
+    }
+    if config.sync_policy().flushes() || rule == DamageRule::Salvage {
+        probe.file_flush();
+        file.sync_data()
+            .map_err(|err| io_error("cannot flush the journal", &err))?;
     }
     Ok(Loaded { file, scan })
 }
 
-/// How writing a replacement journal ended.
-enum Replacement {
-    /// Nothing changed on disk (but a leftover temporary file, removed at the
-    /// next open).
-    NotCommitted(StoreError),
-    /// The replacement was renamed into place; the result is the directory
-    /// flush that followed.
-    Committed(Result<(), StoreError>),
+/// Cuts the journal back to `offset`, if it is longer, and flushes the cut.
+fn cut_back(config: &FileStoreConfig, offset: u64) -> Result<(), StoreError> {
+    let file = open_journal_file(config)?;
+    let len = file
+        .metadata()
+        .map_err(|err| io_error("cannot read the journal's length", &err))?
+        .len();
+    if len > offset {
+        file.set_len(offset)
+            .map_err(|err| io_error("cannot cut the journal back", &err))?;
+    }
+    file.sync_data()
+        .map_err(|err| io_error("cannot flush the journal's cut", &err))
 }
 
-/// Writes a journal holding only `header` to the temporary path, flushes it as
-/// the policy requires, renames it over the journal, and flushes the
-/// directory.
-fn write_replacement(config: &FileStoreConfig, header: &Header, probe: &mut Probe) -> Replacement {
+/// Writes a journal holding only `header` to the temporary path, flushes it,
+/// and renames it over the journal. The caller flushes the directory.
+///
+/// # Errors
+/// [`StoreError::Io`] if any step fails; nothing has then changed on disk but
+/// a leftover temporary file, which the next open removes.
+fn write_replacement(
+    config: &FileStoreConfig,
+    header: &Header,
+    probe: &mut Probe,
+) -> Result<(), StoreError> {
     let temp = config.temp_path();
-    let flush = config.sync_policy().flushes_replacements();
     let written = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -468,60 +631,114 @@ fn write_replacement(config: &FileStoreConfig, header: &Header, probe: &mut Prob
             .truncate(true)
             .open(&temp)?;
         file.write_all(&format::encode_header(header))?;
-        if flush {
-            file.sync_all()?;
-        }
-        Ok::<(), std::io::Error>(())
+        file.sync_all()
     })();
     if let Err(err) = written {
         let _ = std::fs::remove_file(&temp);
-        return Replacement::NotCommitted(io_error("cannot write the new journal", &err));
+        return Err(io_error("cannot write the new journal", &err));
     }
-    if flush {
-        probe.file_flush();
-    }
+    probe.file_flush();
     if let Err(err) = std::fs::rename(&temp, config.journal_path()) {
         let _ = std::fs::remove_file(&temp);
-        return Replacement::NotCommitted(io_error(
-            "cannot rename the new journal into place",
-            &err,
-        ));
+        return Err(io_error("cannot rename the new journal into place", &err));
     }
-    if !flush {
-        return Replacement::Committed(Ok(()));
-    }
-    let flushed = flush_directory(config.directory());
-    if cfg!(unix) && flushed.is_ok() {
-        probe.dir_flush();
-    }
-    Replacement::Committed(flushed)
+    Ok(())
 }
 
-/// Flushes a directory, so a rename in it is durable.
+/// Flushes a directory, so a rename or a creation in it is durable.
 #[cfg(unix)]
 fn flush_directory(directory: &Path) -> Result<(), StoreError> {
+    // A relative path with one component has an empty parent: the current
+    // directory.
+    let directory = if directory.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        directory
+    };
     File::open(directory)
         .and_then(|dir| dir.sync_all())
-        .map_err(|err| io_error("cannot flush the store directory", &err))
+        .map_err(|err| {
+            io_error(
+                &format!("cannot flush the directory {}", directory.display()),
+                &err,
+            )
+        })
 }
 
-/// Flushes a directory, so a rename in it is durable. Not supported off Unix,
-/// where a directory cannot be opened as a file.
+/// Flushes a directory, so a rename or a creation in it is durable. Not done
+/// off Unix, where a directory cannot be opened as a file.
 #[cfg(not(unix))]
 fn flush_directory(_directory: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Opens or creates the journal in `config`'s directory: takes the lock,
-/// removes a replacement a crash left behind, creates an empty journal if
-/// there is none, and loads it.
-fn open_journal(config: FileStoreConfig, shared: Arc<Shared>) -> Result<Journal, StoreError> {
-    std::fs::create_dir_all(config.directory()).map_err(|err| {
-        io_error(
-            &format!("cannot create {}", config.directory().display()),
-            &err,
-        )
-    })?;
+/// Creates `directory` and any missing parent, flushing each new directory
+/// into its parent so the creation is durable.
+fn create_directory(directory: &Path, probe: &mut Probe) -> Result<(), StoreError> {
+    // The directories that do not exist yet, deepest first.
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut at = Some(directory);
+    while let Some(path) = at {
+        if path.as_os_str().is_empty()
+            || path
+                .try_exists()
+                .map_err(|err| io_error("cannot look for the store directory", &err))?
+        {
+            break;
+        }
+        missing.push(path.to_path_buf());
+        at = path.parent();
+    }
+    std::fs::create_dir_all(directory)
+        .map_err(|err| io_error(&format!("cannot create {}", directory.display()), &err))?;
+    for created in missing.iter().rev() {
+        if let Some(parent) = created.parent() {
+            flush_directory(parent)?;
+            probe.dir_flush();
+        }
+    }
+    Ok(())
+}
+
+/// The error for a store that does not exist and is not to be created.
+#[cold]
+#[inline(never)]
+fn missing_store(config: &FileStoreConfig) -> StoreError {
+    StoreError::Io(format!(
+        "store {} has no journal in {}; set create_if_missing to create a new store",
+        config.name(),
+        config.directory().display()
+    ))
+}
+
+/// Opens the journal in `config`'s directory: creates it if missing and
+/// `create` is set, takes the lock, removes a replacement a crash left behind,
+/// and loads the journal, cutting what `rule` allows.
+fn open_journal(
+    config: FileStoreConfig,
+    shared: Arc<Shared>,
+    rule: DamageRule,
+    create: bool,
+) -> Result<Journal, StoreError> {
+    let mut probe = Probe::default();
+    let journal_exists = |config: &FileStoreConfig| {
+        config
+            .journal_path()
+            .try_exists()
+            .map_err(|err| io_error("cannot look for the journal", &err))
+    };
+    let directory_exists = config
+        .directory()
+        .try_exists()
+        .map_err(|err| io_error("cannot look for the store directory", &err))?;
+    if !directory_exists {
+        if !create {
+            return Err(missing_store(&config));
+        }
+        create_directory(config.directory(), &mut probe)?;
+    } else if !create && !journal_exists(&config)? {
+        return Err(missing_store(&config));
+    }
 
     let lock = OpenOptions::new()
         .read(true)
@@ -544,6 +761,8 @@ fn open_journal(config: FileStoreConfig, shared: Arc<Shared>) -> Result<Journal,
                 config.directory().display()
             )));
         }
+        // Includes a platform or file system that cannot lock: the store is
+        // not opened unlocked.
         Err(TryLockError::Error(err)) => {
             return Err(io_error(
                 &format!("cannot lock {}", config.lock_path().display()),
@@ -560,25 +779,21 @@ fn open_journal(config: FileStoreConfig, shared: Arc<Shared>) -> Result<Journal,
         Err(err) => return Err(io_error("cannot remove an unfinished reset", &err)),
     }
 
-    let mut probe = Probe::default();
-
-    let exists = config
-        .journal_path()
-        .try_exists()
-        .map_err(|err| io_error("cannot look for the journal", &err))?;
-    if !exists {
+    if !journal_exists(&config)? {
+        if !create {
+            return Err(missing_store(&config));
+        }
         let header = Header {
             creation_time: SystemTime::now(),
             next_sender: 1,
             next_target: 1,
         };
-        match write_replacement(&config, &header, &mut probe) {
-            Replacement::NotCommitted(err) | Replacement::Committed(Err(err)) => return Err(err),
-            Replacement::Committed(Ok(())) => {}
-        }
+        write_replacement(&config, &header, &mut probe)?;
+        flush_directory(config.directory())?;
+        probe.dir_flush();
     }
 
-    let Loaded { file, scan } = load(&config, &mut probe)?;
+    let Loaded { file, scan } = load(&config, rule, &mut probe)?;
     shared.install(&scan);
     Ok(Journal {
         config,
@@ -586,8 +801,9 @@ fn open_journal(config: FileStoreConfig, shared: Arc<Shared>) -> Result<Journal,
         _lock: lock,
         index: scan.index,
         end: scan.end,
+        durable_end: scan.end,
         unsynced: 0,
-        poisoned: false,
+        pending: Pending::default(),
         shared,
         probe,
     })
@@ -600,27 +816,79 @@ fn task_failed(err: &tokio::task::JoinError) -> StoreError {
     StoreError::Io(format!("file store task did not complete: {err}"))
 }
 
+/// The Tokio runtime the store's blocking I/O runs on.
+///
+/// # Errors
+/// [`StoreError::Io`] outside a Tokio runtime, where starting a blocking task
+/// would panic (and abort the process under `panic = "abort"`).
+fn runtime() -> Result<Handle, StoreError> {
+    Handle::try_current().map_err(|_| {
+        StoreError::Io("a FileStore must be used from inside a Tokio runtime".to_string())
+    })
+}
+
 impl FileStore {
-    /// Opens the store `config` describes, creating its directory and an empty
-    /// journal (both counters at 1) if they do not exist, and recovering the
-    /// journal if they do.
+    /// Opens the store `config` describes and recovers its journal.
+    ///
+    /// With [`FileStoreConfig::with_create_if_missing`] set, a missing
+    /// directory and journal are created (an empty journal, both counters at
+    /// 1, flushed with its directory); otherwise a missing journal is an
+    /// error. The journal is flushed once loaded, unless the policy is
+    /// [`SyncPolicy::Never`].
     ///
     /// # Errors
-    /// [`StoreError::Io`] if the files cannot be created, opened, read or
-    /// locked, including when another `FileStore` already has them open;
-    /// [`StoreError::Corrupted`] if the journal is not a readable version-1
-    /// journal (see the [module documentation](self), "Recovery").
+    /// [`StoreError::Io`] if the files are missing (and not to be created) or
+    /// cannot be created, opened, read, flushed or locked, including when
+    /// another `FileStore` already has them open or the platform cannot lock
+    /// them, and outside a Tokio runtime; [`StoreError::Corrupted`] if
+    /// recovery refuses the journal (see the [module documentation](self),
+    /// "Recovery").
     pub async fn open(config: FileStoreConfig) -> Result<Self, StoreError> {
-        let shared = Arc::new(Shared {
-            next_sender: AtomicU64::new(1),
-            next_target: AtomicU64::new(1),
-            creation_time: RwLock::new(SystemTime::UNIX_EPOCH),
-            truncation: SyncMutex::new(None),
-        });
+        let rule = config.sync_policy().damage_rule();
+        let create = config.create_if_missing();
+        Self::open_with(config, rule, create).await
+    }
+
+    /// Cuts the journal `config` describes at its first record that cannot
+    /// be read, wherever it is and for whatever reason, flushes the cut, and
+    /// closes the store again. Returns the cut, or `None` if the journal was
+    /// intact.
+    ///
+    /// This is the operator's decision to salvage a journal that
+    /// [`FileStore::open`] refuses. The records cut away can include ones that
+    /// were acknowledged and whose bytes the counterparty received, counters
+    /// included, so the counters the repaired journal holds can be behind the
+    /// session: **the next session must reset its sequence**
+    /// (`ResetSeqNumFlag` (141) = Y), for example with `reset_on_logon`, or by
+    /// calling [`MessageStore::reset`] before attaching the store. Resuming
+    /// from the repaired counters can reuse a `MsgSeqNum` (34) with different
+    /// content.
+    ///
+    /// # Errors
+    /// [`StoreError::Io`] if the journal is missing or cannot be opened, cut,
+    /// flushed or locked, and outside a Tokio runtime;
+    /// [`StoreError::Corrupted`] if its header is not a version-1 journal
+    /// header.
+    pub async fn repair(config: FileStoreConfig) -> Result<Option<Truncation>, StoreError> {
+        let store = Self::open_with(config, DamageRule::Salvage, false).await?;
+        let truncation = store.last_truncation();
+        store.close().await?;
+        Ok(truncation)
+    }
+
+    /// Opens the store with an explicit damage rule and creation choice.
+    async fn open_with(
+        config: FileStoreConfig,
+        rule: DamageRule,
+        create: bool,
+    ) -> Result<Self, StoreError> {
+        let handle = runtime()?;
+        let shared = Arc::new(Shared::new());
         let journal = {
             let config = config.clone();
             let shared = Arc::clone(&shared);
-            tokio::task::spawn_blocking(move || open_journal(config, shared))
+            handle
+                .spawn_blocking(move || open_journal(config, shared, rule, create))
                 .await
                 .map_err(|err| task_failed(&err))??
         };
@@ -637,13 +905,12 @@ impl FileStore {
         &self.config
     }
 
-    /// Returns the cut the last open or refresh made to the journal, or
-    /// `None` if the journal was intact.
+    /// Returns the last cut a recovery made to the journal since the store
+    /// was opened, or `None` if none was made. A later clean refresh does not
+    /// clear it.
     ///
     /// `ironfix-store` does not log, so this is how a cut is reported: an
-    /// application may log it, or refuse to start a session over a
-    /// [`TruncationCause::Damaged`] one, which can have dropped records that
-    /// were acknowledged.
+    /// application may log it.
     #[must_use]
     pub fn last_truncation(&self) -> Option<Truncation> {
         *self.shared.truncation.lock()
@@ -654,11 +921,14 @@ impl FileStore {
     ///
     /// Under [`SyncPolicy::EveryN`] and [`SyncPolicy::Never`] this is how to
     /// make the writes so far survive an operating-system crash, for example
-    /// when a session closes.
+    /// when a session closes. The engine never calls it: keep a clone of the
+    /// `Arc<FileStore>` to call it yourself.
     ///
     /// # Errors
-    /// [`StoreError::Io`] if the flush fails; the store then fails every call
-    /// until [`MessageStore::refresh`] succeeds.
+    /// [`StoreError::Io`] if the flush fails (the writes since the last
+    /// successful flush are then cut, and the store refuses every call but a
+    /// reset until a refresh succeeds), if the store is already unusable after
+    /// a failed write, or outside a Tokio runtime.
     pub async fn sync(&self) -> Result<(), StoreError> {
         self.run(|journal| {
             journal.usable()?;
@@ -667,26 +937,59 @@ impl FileStore {
         .await
     }
 
+    /// Closes the store: waits for any call still running on a blocking
+    /// thread, flushes writes left unflushed under [`SyncPolicy::EveryN`],
+    /// and releases the lock.
+    ///
+    /// Dropping a store releases the lock too, but only once a call still
+    /// running finishes, and flushes nothing. A store shared as
+    /// `Arc<dyn MessageStore>` cannot be closed this way; it is dropped with
+    /// its last reference.
+    ///
+    /// # Errors
+    /// [`StoreError::Io`] if the flush fails; the lock is released anyway.
+    pub async fn close(self) -> Result<(), StoreError> {
+        let flushed = self
+            .run(|journal| {
+                if journal.unsynced > 0 && journal.pending.is_clear() {
+                    journal.flush()
+                } else {
+                    Ok(())
+                }
+            })
+            .await;
+        // The call above held the journal lock until its I/O was done, so this
+        // is the last reference to the journal: dropping it closes the files
+        // and releases the lock.
+        drop(self);
+        flushed
+    }
+
     /// Runs `op` on the journal on a blocking thread, holding the journal lock
     /// from before the thread is started until `op` returns.
     ///
-    /// The lock is first-in, first-out, so calls run in the order they were
-    /// first polled. Dropping the returned future while it waits for the lock
-    /// cancels the call; dropping it later does not stop `op`, which keeps the
-    /// lock until it is done, so no later call can run before or beside it.
+    /// The lock is first-in, first-out, so calls run in the order they reach
+    /// it. Dropping the returned future before the lock is held cancels the
+    /// call; once it is held, dropping the future does not stop `op`, which
+    /// keeps the lock until it is done, so no later call can run before or
+    /// beside it.
     async fn run<T, F>(&self, op: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Journal) -> Result<T, StoreError> + Send + 'static,
     {
+        let handle = runtime()?;
         let guard: OwnedMutexGuard<Journal> = Arc::clone(&self.journal).lock_owned().await;
-        tokio::task::spawn_blocking(move || {
-            let mut journal = guard;
-            journal.probe.stall();
-            op(&mut journal)
-        })
-        .await
-        .map_err(|err| task_failed(&err))?
+        // No await between taking the lock and starting the thread that keeps
+        // it.
+        handle
+            .spawn_blocking(move || {
+                let mut journal = guard;
+                journal.probe.stall();
+                op(&mut journal)
+            })
+            .await
+            .map_err(|err| task_failed(&err))?
     }
 
     /// Validates a range and runs a bounded read over it.
@@ -721,7 +1024,13 @@ impl FileStore {
         self.journal.lock().await.probe.fail_next_flush = true;
     }
 
-    /// Test-only: the (file, directory) flushes made so far.
+    /// Test-only: makes the next directory flush after a rename fail.
+    #[cfg(test)]
+    async fn fail_next_dir_flush(&self) {
+        self.journal.lock().await.probe.fail_next_dir_flush = true;
+    }
+
+    /// Test-only: the (file, directory) flushes made so far, since open.
     #[cfg(test)]
     async fn flushes(&self) -> (u64, u64) {
         let journal = self.journal.lock().await;
@@ -778,7 +1087,9 @@ impl MessageStore for FileStore {
     }
 
     /// A natively bounded read: only the at most `limit` frames of the page
-    /// are read from the file.
+    /// are read from the file, one positional read each. A record that fails
+    /// its checks fails the whole page with [`StoreError::Corrupted`]; it is
+    /// never skipped, and no frame after it in the page is returned.
     async fn get_page(
         &self,
         begin: u64,
@@ -855,24 +1166,29 @@ impl MessageStore for FileStore {
 
     /// Replaces the journal with an empty one starting from the given
     /// counters and a new creation time, in one atomic change: the new
-    /// journal is written to a temporary file and renamed over the old one,
-    /// so a crash leaves one or the other, never a mix.
+    /// journal is written to a temporary file, flushed, renamed over the old
+    /// one, and the directory flushed, whatever the [`SyncPolicy`], so a crash
+    /// leaves one or the other, never a mix.
+    ///
+    /// Runs even on a store left unusable by a failed write, and a success
+    /// makes it usable again: the replaced journal no longer matters. A
+    /// failure to flush the directory after the rename leaves the store
+    /// unusable until a refresh has flushed it.
     async fn reset_to(&self, next_sender: u64, next_target: u64) -> Result<(), StoreError> {
-        self.run(move |journal| {
-            journal.usable()?;
-            journal.replace(next_sender, next_target)
-        })
-        .await
+        self.run(move |journal| journal.replace(next_sender, next_target))
+            .await
     }
 
     fn creation_time(&self) -> SystemTime {
         *self.shared.creation_time.read()
     }
 
-    /// Rereads the journal from disk: the counters, the index and the creation
-    /// time are replaced by what the file holds, and a damaged or incomplete
-    /// tail is cut (see [`FileStore::last_truncation`]). This also clears the
-    /// state a failed flush leaves behind.
+    /// Completes what a failed write left pending (a directory flush, the cut
+    /// back to the last successful flush, made durable), then rereads the
+    /// journal from disk: the counters, the index and the creation time are
+    /// replaced by what the file holds, recovery cuts what it allows (see
+    /// [`FileStore::last_truncation`]), and the journal is flushed unless the
+    /// policy is [`SyncPolicy::Never`].
     async fn refresh(&self) -> Result<(), StoreError> {
         self.run(Journal::reload).await
     }
@@ -910,7 +1226,13 @@ mod tests {
             Self(path)
         }
 
+        /// A configuration that creates the store on first open.
         fn config(&self) -> FileStoreConfig {
+            self.existing().with_create_if_missing(true)
+        }
+
+        /// A configuration that only opens a store that already exists.
+        fn existing(&self) -> FileStoreConfig {
             ok(
                 FileStoreConfig::try_new(&self.0, "FIX.4.4-CLIENT-VENUE"),
                 "test config",
@@ -994,6 +1316,39 @@ mod tests {
                 end: u64::MAX
             })
         );
+    }
+
+    #[tokio::test]
+    async fn test_file_store_missing_store_is_an_error_without_create_if_missing() {
+        let dir = TempDir::new("missing");
+        let opened = FileStore::open(dir.existing()).await;
+        assert!(
+            matches!(opened, Err(StoreError::Io(ref reason)) if reason.contains("create_if_missing")),
+            "{opened:?}"
+        );
+        assert!(!dir.0.exists(), "nothing is created");
+
+        // An existing directory without a journal is no different.
+        ok(std::fs::create_dir_all(&dir.0), "create the directory");
+        assert!(FileStore::open(dir.existing()).await.is_err());
+        assert!(!dir.existing().journal_path().exists());
+    }
+
+    #[tokio::test]
+    async fn test_file_store_create_if_missing_creates_nested_directories() {
+        let dir = TempDir::new("nested");
+        ok(std::fs::create_dir_all(&dir.0), "the test directory");
+        let Ok(config) = FileStoreConfig::try_new(dir.0.join("a").join("b"), "session") else {
+            panic!("valid name");
+        };
+        let store = open(config.clone().with_create_if_missing(true)).await;
+        // Two directories created, each flushed into its parent, then the
+        // journal's own rename flushed.
+        assert_eq!(store.flushes().await.1, 3);
+        drop(store);
+        // Once created, the store opens without create_if_missing.
+        let store = open(config).await;
+        assert_eq!(store.next_sender_seq(), 1);
     }
 
     #[tokio::test]
@@ -1163,40 +1518,136 @@ mod tests {
         assert_eq!(store.next_sender_seq(), 4);
     }
 
-    #[tokio::test]
-    async fn test_file_store_flipped_byte_fails_the_crc_and_is_never_returned() {
-        let dir = TempDir::new("flipped");
-        let config = dir.config();
-        let after_one;
-        {
-            let store = open(config.clone()).await;
-            file(&store, 1).await;
-            after_one = journal_len(&config);
-            file(&store, 2).await;
-            file(&store, 3).await;
+    /// Files records 1 to 3 and returns the offset each one starts at and the
+    /// journal's length after them.
+    async fn three_records(config: &FileStoreConfig) -> ([u64; 3], u64) {
+        let store = open(config.clone()).await;
+        let mut starts = [0u64; 3];
+        for (seq, start) in (1u64..).zip(starts.iter_mut()) {
+            *start = journal_len(config);
+            file(&store, seq).await;
         }
-        // Damage a frame byte inside record 2: it and everything after it go.
-        let mut bytes = journal_bytes(&config);
-        let at = usize::try_from(after_one).unwrap_or(usize::MAX) + 40;
-        let Some(byte) = bytes.get_mut(at) else {
-            panic!("record 2 must be longer than 40 bytes");
+        (starts, journal_len(config))
+    }
+
+    /// Flips one bit of the journal at `at`.
+    fn flip(config: &FileStoreConfig, at: u64) {
+        let mut bytes = journal_bytes(config);
+        let Some(byte) = usize::try_from(at).ok().and_then(|at| bytes.get_mut(at)) else {
+            panic!("offset {at} must be inside the journal");
         };
         *byte ^= 0x01;
-        write_journal(&config, &bytes);
+        write_journal(config, &bytes);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_damage_before_the_last_record_refuses_to_open() {
+        let dir = TempDir::new("damage-middle");
+        let config = dir.config();
+        let ([_, second, _], len) = three_records(&config).await;
+        // A frame byte inside record 2, with record 3 written after it: damage
+        // to data already written, not an interrupted write.
+        flip(&config, second + 40);
+        let damaged = journal_bytes(&config);
+
+        let opened = FileStore::open(config.clone()).await;
+        assert!(
+            matches!(
+                opened,
+                Err(StoreError::Corrupted { ref reason }) if reason.contains("repair")
+            ),
+            "{opened:?}"
+        );
+        // Refused, not cut: the journal is untouched.
+        assert_eq!(journal_len(&config), len);
+        assert_eq!(journal_bytes(&config), damaged);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_damaged_last_record_is_cut_and_never_returned() {
+        let dir = TempDir::new("damage-last");
+        let config = dir.config();
+        let ([_, _, third], _) = three_records(&config).await;
+        flip(&config, third + 40);
 
         let store = open(config.clone()).await;
-        assert_eq!(seqs(&store, 1, 10, 10).await, vec![1]);
-        assert_eq!(store.next_sender_seq(), 2);
+        assert_eq!(seqs(&store, 1, 10, 10).await, vec![1, 2]);
+        assert_eq!(store.next_sender_seq(), 3);
         assert_eq!(
-            store.get_range(2, 3).await,
-            Err(StoreError::RangeNotAvailable { begin: 2, end: 3 })
+            store.get_range(3, 3).await,
+            Err(StoreError::RangeNotAvailable { begin: 3, end: 3 })
         );
         let Some(truncation) = store.last_truncation() else {
             panic!("the cut must be reported");
         };
         assert_eq!(truncation.cause(), TruncationCause::Damaged);
-        assert_eq!(truncation.offset(), after_one);
-        assert_eq!(journal_len(&config), after_one);
+        assert_eq!(truncation.offset(), third);
+        assert_eq!(journal_len(&config), third);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_never_policy_cuts_damage_anywhere() {
+        let dir = TempDir::new("damage-never");
+        let config = dir.config_with(SyncPolicy::Never);
+        let ([_, second, _], _) = three_records(&config).await;
+        flip(&config, second + 40);
+
+        // A policy that flushes nothing promises nothing after an OS crash, so
+        // damage anywhere may be what one left: it is cut, and reported.
+        let store = open(config).await;
+        assert_eq!(seqs(&store, 1, 10, 10).await, vec![1]);
+        assert_eq!(
+            store
+                .last_truncation()
+                .map(|cut| (cut.offset(), cut.cause())),
+            Some((second, TruncationCause::Damaged))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_store_every_n_cuts_damage_within_its_unflushed_window() {
+        let dir = TempDir::new("damage-every-n");
+        let Some(four) = NonZeroU32::new(4) else {
+            panic!("non-zero");
+        };
+        let config = dir.config_with(SyncPolicy::EveryN(four));
+        let ([_, second, _], _) = three_records(&config).await;
+        flip(&config, second + 40);
+        // Two records from the end, inside a four-write window: cut.
+        let store = open(config).await;
+        assert_eq!(seqs(&store, 1, 10, 10).await, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_repair_cuts_a_refused_journal_at_its_first_bad_record() {
+        let dir = TempDir::new("repair");
+        let config = dir.config();
+        let ([_, second, _], _) = three_records(&config).await;
+        flip(&config, second + 40);
+        assert!(FileStore::open(config.clone()).await.is_err());
+
+        let repaired = ok(FileStore::repair(config.clone()).await, "repair");
+        assert_eq!(
+            repaired.map(|cut| (cut.offset(), cut.cause())),
+            Some((second, TruncationCause::Damaged))
+        );
+        // The repair closed the store, so it opens again at once.
+        let store = open(config.clone()).await;
+        assert_eq!(seqs(&store, 1, 10, 10).await, vec![1]);
+        assert_eq!(store.next_sender_seq(), 2);
+        drop(store);
+        // An intact journal needs no repair.
+        assert_eq!(ok(FileStore::repair(config).await, "second repair"), None);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_repair_of_a_missing_store_is_an_error() {
+        let dir = TempDir::new("repair-missing");
+        assert!(matches!(
+            FileStore::repair(dir.config()).await,
+            Err(StoreError::Io(_))
+        ));
+        assert!(!dir.0.exists(), "a repair never creates a store");
     }
 
     #[tokio::test]
@@ -1223,6 +1674,30 @@ mod tests {
         );
         // Refused, not cut: the bytes are still there for an operator.
         assert_eq!(journal_len(&config), bytes.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_record_damaged_after_open_fails_the_page_not_just_the_record() {
+        let dir = TempDir::new("damaged-on-read");
+        let config = dir.config();
+        let store = open(config.clone()).await;
+        let mut starts = Vec::new();
+        for seq in 1..=3 {
+            starts.push(journal_len(&config));
+            file(&store, seq).await;
+        }
+        let Some(second) = starts.get(1).copied() else {
+            panic!("three records were filed");
+        };
+        // The disk changes under the open store.
+        flip(&config, second + 40);
+        assert!(matches!(
+            store.get_page(1, 3, 10).await,
+            Err(StoreError::Corrupted { reason }) if reason.contains("MsgSeqNum 2")
+        ));
+        // A page that does not reach the damaged record is still served.
+        assert_eq!(seqs(&store, 1, 1, 10).await, vec![1]);
+        assert_eq!(seqs(&store, 3, 3, 10).await, vec![3]);
     }
 
     #[tokio::test]
@@ -1457,23 +1932,31 @@ mod tests {
         );
         assert_eq!(journal_len(&config), good);
 
-        // A clean refresh clears the report.
+        // A clean refresh keeps the report.
         ok(store.refresh().await, "second refresh");
-        assert_eq!(store.last_truncation(), None);
+        assert_eq!(store.last_truncation().map(|cut| cut.offset()), Some(good));
+    }
+
+    #[tokio::test]
+    async fn test_file_store_open_creates_and_flushes_the_journal() {
+        let dir = TempDir::new("open-flushes");
+        let store = open(dir.config_with(SyncPolicy::EveryWrite)).await;
+        // The new journal file, then the loaded journal; the store directory
+        // (into its parent) and the new journal's rename.
+        let expected_dirs = if cfg!(unix) { 2 } else { 0 };
+        assert_eq!(store.flushes().await, (2, expected_dirs));
     }
 
     #[tokio::test]
     async fn test_file_store_sync_policy_every_write_flushes_each_append() {
         let dir = TempDir::new("every-write");
         let store = open(dir.config_with(SyncPolicy::EveryWrite)).await;
-        // Creating the journal flushed the new file (and, on Unix, its
-        // directory).
-        assert_eq!(store.flushes().await.0, 1);
+        let (base, _) = store.flushes().await;
         for seq in 1..=3 {
             file(&store, seq).await;
         }
         ok(store.set_next_target_seq(2).await, "target counter");
-        assert_eq!(store.flushes().await.0, 5);
+        assert_eq!(store.flushes().await.0 - base, 4);
     }
 
     #[tokio::test]
@@ -1500,20 +1983,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_store_sync_policy_never_flushes_only_on_request() {
+    async fn test_file_store_every_n_refresh_flushes_what_is_pending() {
+        let dir = TempDir::new("every-n-refresh");
+        let Some(three) = NonZeroU32::new(3) else {
+            panic!("non-zero");
+        };
+        let store = open(dir.config_with(SyncPolicy::EveryN(three))).await;
+        let (base, _) = store.flushes().await;
+        file(&store, 1).await;
+        file(&store, 2).await;
+        assert_eq!(store.flushes().await.0 - base, 0, "two writes are pending");
+        // The refresh restarts the count, so it flushes what was pending:
+        // otherwise up to 2 + 2 writes could be unflushed after it.
+        ok(store.refresh().await, "refresh");
+        assert_eq!(store.flushes().await.0 - base, 1);
+        file(&store, 3).await;
+        file(&store, 4).await;
+        assert_eq!(store.flushes().await.0 - base, 1);
+        file(&store, 5).await;
+        assert_eq!(store.flushes().await.0 - base, 2);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_sync_policy_never_flushes_only_resets_and_requests() {
         let dir = TempDir::new("never");
         let config = dir.config_with(SyncPolicy::Never);
+        let dirs = |count: u64| if cfg!(unix) { count } else { 0 };
         {
             let store = open(config.clone()).await;
-            assert_eq!(store.flushes().await, (0, 0), "not even at creation");
+            // Creating a journal is a replacement, flushed whatever the
+            // policy; the loaded journal is not flushed.
+            assert_eq!(store.flushes().await, (1, dirs(2)));
             for seq in 1..=5 {
                 file(&store, seq).await;
             }
+            assert_eq!(
+                store.flushes().await,
+                (1, dirs(2)),
+                "appends are not flushed"
+            );
+            // A reset is flushed whatever the policy: file and directory.
             ok(store.reset_to(3, 3).await, "reset_to");
+            assert_eq!(store.flushes().await, (2, dirs(3)));
             file(&store, 3).await;
-            assert_eq!(store.flushes().await, (0, 0));
             ok(store.sync().await, "explicit sync");
-            assert_eq!(store.flushes().await, (1, 0));
+            assert_eq!(store.flushes().await, (3, dirs(3)));
         }
         // Unflushed writes still reached the operating system: they survive
         // the store (and the process) going away.
@@ -1540,10 +2054,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_file_store_failed_flush_poisons_until_refresh() {
+    async fn test_file_store_failed_flush_cuts_back_and_err_means_not_filed() {
         let dir = TempDir::new("poison");
-        let store = open(dir.config()).await;
+        let config = dir.config();
+        let store = open(config.clone()).await;
         file(&store, 1).await;
+        let durable = journal_len(&config);
         store.fail_next_flush().await;
         assert!(matches!(
             store
@@ -1551,9 +2067,11 @@ mod tests {
                 .await,
             Err(StoreError::Io(_))
         ));
-        // The failed call did not advance the counter it reported failing.
+        // The write since the last flush is cut at once, and the counter it
+        // carried was never published.
+        assert_eq!(journal_len(&config), durable);
         assert_eq!(store.next_sender_seq(), 2);
-        // Every call fails until a refresh rereads the file.
+        // Every call but a reset or a refresh fails until the cut is durable.
         assert!(matches!(
             store.set_next_target_seq(2).await,
             Err(StoreError::Io(_))
@@ -1564,11 +2082,136 @@ mod tests {
         ));
         assert!(matches!(store.sync().await, Err(StoreError::Io(_))));
         ok(store.refresh().await, "refresh");
-        // The write reached the file before its flush failed, so the reload
-        // finds it: the call took effect although it reported a failure.
+        // An error meant "not filed": the reload does not bring 2 back.
+        assert_eq!(seqs(&store, 1, 10, 10).await, vec![1]);
+        assert_eq!(store.next_sender_seq(), 2);
+        file(&store, 2).await;
+        drop(store);
+        let store = open(config).await;
         assert_eq!(seqs(&store, 1, 10, 10).await, vec![1, 2]);
-        assert_eq!(store.next_sender_seq(), 3);
-        file(&store, 3).await;
+    }
+
+    #[tokio::test]
+    async fn test_file_store_failed_flush_under_every_n_cuts_every_unflushed_write() {
+        let dir = TempDir::new("poison-every-n");
+        let Some(three) = NonZeroU32::new(3) else {
+            panic!("non-zero");
+        };
+        let config = dir.config_with(SyncPolicy::EveryN(three));
+        let store = open(config.clone()).await;
+        for seq in 1..=3 {
+            file(&store, seq).await;
+        }
+        file(&store, 4).await;
+        file(&store, 5).await;
+        store.fail_next_flush().await;
+        assert!(matches!(store.sync().await, Err(StoreError::Io(_))));
+        ok(store.refresh().await, "refresh");
+        // 4 and 5 were never flushed: after a failed flush they cannot be
+        // vouched for, so they are gone, and so is the counter they carried.
+        assert_eq!(seqs(&store, 1, 10, 10).await, vec![1, 2, 3]);
+        assert_eq!(store.next_sender_seq(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_reset_runs_on_a_poisoned_store_and_clears_it() {
+        let dir = TempDir::new("poison-reset");
+        let config = dir.config();
+        let store = open(config.clone()).await;
+        file(&store, 1).await;
+        store.fail_next_flush().await;
+        assert!(store.set_next_target_seq(5).await.is_err());
+        ok(
+            store.reset_to(1, 1).await,
+            "a reset runs on a poisoned store",
+        );
+        file(&store, 1).await;
+        drop(store);
+        let store = open(config).await;
+        assert_eq!(seqs(&store, 1, 10, 10).await, vec![1]);
+        assert_eq!(store.next_sender_seq(), 2);
+        assert_eq!(store.next_target_seq(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_failed_directory_flush_poisons_until_refresh_flushes_it() {
+        let dir = TempDir::new("dir-flush");
+        let config = dir.config();
+        let store = open(config.clone()).await;
+        file(&store, 1).await;
+        store.fail_next_dir_flush().await;
+        assert!(matches!(
+            store.reset_to(4, 5).await,
+            Err(StoreError::Io(reason)) if reason.contains("directory")
+        ));
+        // The rename happened: the store reports the new stream...
+        assert_eq!(store.next_sender_seq(), 4);
+        // ...but is unusable until the rename is known to be durable.
+        assert!(store.set_next_target_seq(6).await.is_err());
+        ok(store.refresh().await, "refresh flushes the directory");
+        ok(store.set_next_target_seq(6).await, "usable again");
+        drop(store);
+        let store = open(config).await;
+        assert!(seqs(&store, 1, 10, 10).await.is_empty());
+        assert_eq!(store.next_sender_seq(), 4);
+        assert_eq!(store.next_target_seq(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_file_store_close_releases_the_lock_and_keeps_the_writes() {
+        let dir = TempDir::new("close");
+        let Some(ten) = NonZeroU32::new(10) else {
+            panic!("non-zero");
+        };
+        let config = dir.config_with(SyncPolicy::EveryN(ten));
+        let store = open(config.clone()).await;
+        file(&store, 1).await;
+        ok(store.close().await, "close");
+        // Released at once: no call can still be holding it.
+        let store = open(config).await;
+        assert_eq!(seqs(&store, 1, 10, 10).await, vec![1]);
+    }
+
+    /// Polls `future` to completion on this thread, outside any Tokio
+    /// runtime.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        struct ThreadWaker(std::thread::Thread);
+        impl std::task::Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = std::task::Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            match future.as_mut().poll(&mut context) {
+                std::task::Poll::Ready(output) => return output,
+                std::task::Poll::Pending => std::thread::park(),
+            }
+        }
+    }
+
+    #[test]
+    fn test_file_store_outside_a_tokio_runtime_is_an_error_not_a_panic() {
+        let dir = TempDir::new("no-runtime");
+        let runtime = ok(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build(),
+            "runtime",
+        );
+        let store = runtime.block_on(open(dir.config()));
+        // Polled by an executor that is not Tokio.
+        assert!(matches!(
+            block_on(store.set_next_target_seq(3)),
+            Err(StoreError::Io(reason)) if reason.contains("Tokio runtime")
+        ));
+        assert!(matches!(
+            block_on(FileStore::open(dir.config())),
+            Err(StoreError::Io(reason)) if reason.contains("Tokio runtime")
+        ));
+        drop(store);
     }
 
     #[tokio::test]

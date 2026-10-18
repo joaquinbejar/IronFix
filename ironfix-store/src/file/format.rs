@@ -50,11 +50,11 @@
 
 use crate::file::crc32::crc32;
 use crate::stored::StoredMessage;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use ironfix_core::error::StoreError;
 use ironfix_core::message::{MSG_TYPE_MAX_LEN, MsgType};
 use std::collections::BTreeMap;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The first eight bytes of every journal.
@@ -75,6 +75,12 @@ pub(crate) const RECORD_HEADER_LEN: usize = 12;
 /// Length of a record header as a file offset, in bytes.
 const RECORD_HEADER_LEN_U64: u64 = 12;
 
+/// Length of a counter record body: the kind and a u64.
+const COUNTER_BODY_LEN: u32 = 9;
+
+/// Length of a whole counter record, in bytes.
+pub(crate) const COUNTER_RECORD_LEN: usize = RECORD_HEADER_LEN + COUNTER_BODY_LEN as usize;
+
 /// Largest part of a record body that is not frame bytes: the kind, the
 /// sequence number, the next sender number, the `MsgType` length and the
 /// longest `MsgType`.
@@ -92,28 +98,34 @@ const KIND_NEXT_TARGET: u8 = 4;
 /// Billion, the number of nanoseconds in a second.
 const NANOS_PER_SECOND: u32 = 1_000_000_000;
 
-/// Why a [`FileStore`](super::FileStore) cut its journal short when it opened
-/// or refreshed it.
+/// Size of the buffer used to check that a tail is all zero bytes.
+const ZERO_CHECK_CHUNK: usize = 4096;
+
+/// Why a [`FileStore`](super::FileStore) cut its journal short when it opened,
+/// refreshed or repaired it.
 ///
-/// Recovery never returns a record it cannot vouch for: the first record that
-/// is incomplete or fails its checks is removed from the file, **together
-/// with everything after it**, and the store carries on from the last good
-/// record. See [`FileStore::last_truncation`](super::FileStore::last_truncation).
+/// Recovery never returns a record it cannot vouch for. A record cut away is
+/// removed from the file **together with everything after it**. Which damage
+/// is cut and which refuses the journal is set out in the
+/// [module documentation](super), "Recovery".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TruncationCause {
     /// The file ends inside a record: a write was interrupted, which is what a
     /// crash during an append leaves. Only the interrupted write is lost.
     Incomplete,
-    /// A record's header or body failed its check. A crash can leave this
-    /// too, under a policy that does not flush every write, but so can damage
-    /// to data already on disk: then records written, and acknowledged, after
-    /// the damaged one are lost with it, and the counters they carried with
-    /// them.
+    /// A record's header or body failed its check, where an interrupted write
+    /// can have left it (at the tail, within what the sync policy leaves
+    /// unflushed, or followed only by zero bytes), or anywhere under
+    /// [`SyncPolicy::Never`](super::SyncPolicy::Never) and
+    /// [`FileStore::repair`](super::FileStore::repair). After a repair, the
+    /// records dropped can include ones that were acknowledged, counters
+    /// included.
     Damaged,
 }
 
-/// A cut the store made to its journal while opening or refreshing it.
+/// A cut the store made to its journal while opening, refreshing or repairing
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Truncation {
     /// File offset the journal was cut at, in bytes: the start of the first
@@ -143,6 +155,30 @@ impl Truncation {
     pub const fn cause(&self) -> TruncationCause {
         self.cause
     }
+}
+
+/// Which damage recovery may cut; anything else refuses the journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DamageRule {
+    /// Cut only damage an interrupted write can have left: a record whose
+    /// body fails its CRC and is the last in the file, a damaged record header
+    /// within one maximum-size record of the end, or either one followed only
+    /// by zero bytes. With `records` above 1 (a policy that leaves up to that
+    /// many writes unflushed) the window is `records` maximum-size records for
+    /// both. Under [`SyncPolicy::EveryWrite`](super::SyncPolicy::EveryWrite)
+    /// and [`SyncPolicy::EveryN`](super::SyncPolicy::EveryN).
+    Tail {
+        /// How many writes the policy can leave unflushed.
+        records: u64,
+    },
+    /// Cut at the first record that fails its check, wherever it is. Under
+    /// [`SyncPolicy::Never`](super::SyncPolicy::Never), which promises
+    /// nothing after an operating-system crash.
+    Anywhere,
+    /// Cut at the first record that cannot be read for any reason, including
+    /// a well-formed one this configuration refuses. Only for
+    /// [`FileStore::repair`](super::FileStore::repair).
+    Salvage,
 }
 
 /// The fixed part of a journal: when it was created and the counters it
@@ -204,11 +240,55 @@ enum Record<'a> {
     NextTarget(u64),
 }
 
+/// Positional reads of a journal: one call reads one whole record.
+pub(crate) trait ReadAt {
+    /// Fills `buf` from the bytes at `offset`.
+    ///
+    /// # Errors
+    /// The I/O error, including an unexpected end of file.
+    fn read_record_at(&mut self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;
+}
+
+impl ReadAt for std::fs::File {
+    #[cfg(unix)]
+    fn read_record_at(&mut self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(self, buf, offset)
+    }
+
+    #[cfg(not(unix))]
+    fn read_record_at(&mut self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        self.seek(SeekFrom::Start(offset))?;
+        self.read_exact(buf)
+    }
+}
+
+#[cfg(test)]
+impl<T: AsRef<[u8]>> ReadAt for std::io::Cursor<T> {
+    fn read_record_at(&mut self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        self.seek(SeekFrom::Start(offset))?;
+        self.read_exact(buf)
+    }
+}
+
 /// Builds a [`StoreError::Corrupted`] for a reason.
 #[cold]
 #[inline(never)]
 fn corrupted(reason: String) -> StoreError {
     StoreError::Corrupted { reason }
+}
+
+/// Builds the [`StoreError::Corrupted`] for damage recovery may not cut.
+#[cold]
+#[inline(never)]
+fn refused(offset: u64, what: &str, remaining: u64) -> StoreError {
+    corrupted(format!(
+        "record at offset {offset} {what}, and the {remaining} bytes from there to the end of \
+         the journal are more than an interrupted write can leave: this is damage to data \
+         already written, so the store refuses to open. FileStore::repair cuts the journal \
+         there; the session must then reset its sequence (ResetSeqNumFlag 141=Y)"
+    ))
 }
 
 /// Builds a [`StoreError::Io`] for an I/O error, with what was being done.
@@ -285,7 +365,8 @@ pub(crate) fn decode_header(bytes: &[u8; HEADER_LEN]) -> Result<Header, StoreErr
     })
 }
 
-/// Encodes a frame record: kind 1 without `next_sender`, kind 2 with it.
+/// Encodes a frame record, kind 1 without `next_sender` and kind 2 with it,
+/// in one allocation.
 ///
 /// `max_frame_size` is the configured limit, in bytes.
 ///
@@ -318,60 +399,72 @@ pub(crate) fn encode_frame_record(
         reason: format!("msg type of {} bytes cannot be filed", code.len()),
     })?;
     let fixed: u32 = if next_sender.is_some() { 18 } else { 10 };
+    let overflow = || StoreError::StoreFailed {
+        seq_num: seq,
+        reason: "record length overflows".to_string(),
+    };
     let body_len = fixed
         .checked_add(u32::from(code_len))
         .and_then(|len| len.checked_add(frame_len))
-        .ok_or_else(|| StoreError::StoreFailed {
-            seq_num: seq,
-            reason: "record length overflows".to_string(),
-        })?;
+        .ok_or_else(overflow)?;
+    let record_len = usize::try_from(body_len)
+        .ok()
+        .and_then(|len| len.checked_add(RECORD_HEADER_LEN))
+        .ok_or_else(overflow)?;
 
-    let mut body = Vec::with_capacity(RECORD_HEADER_LEN + body_len as usize);
-    body.push(if next_sender.is_some() {
+    let mut record = Vec::with_capacity(record_len);
+    record.extend_from_slice(&[0u8; RECORD_HEADER_LEN]);
+    record.push(if next_sender.is_some() {
         KIND_FRAME_AND_SENDER
     } else {
         KIND_FRAME
     });
-    body.extend_from_slice(&seq.to_le_bytes());
+    record.extend_from_slice(&seq.to_le_bytes());
     if let Some(next_sender) = next_sender {
-        body.extend_from_slice(&next_sender.to_le_bytes());
+        record.extend_from_slice(&next_sender.to_le_bytes());
     }
-    body.push(code_len);
-    body.extend_from_slice(code);
-    body.extend_from_slice(frame);
-    Ok(seal(body, body_len))
+    record.push(code_len);
+    record.extend_from_slice(code);
+    record.extend_from_slice(frame);
+    seal(&mut record, body_len);
+    Ok(record)
 }
 
-/// Encodes a counter record.
+/// Encodes a counter record on the stack.
 #[must_use]
-fn encode_counter_record(kind: u8, value: u64) -> Vec<u8> {
-    let mut body = Vec::with_capacity(RECORD_HEADER_LEN + 9);
-    body.push(kind);
-    body.extend_from_slice(&value.to_le_bytes());
-    seal(body, 9)
+fn encode_counter_record(kind: u8, value: u64) -> [u8; COUNTER_RECORD_LEN] {
+    let mut record = [0u8; COUNTER_RECORD_LEN];
+    if let Some((_, body)) = record.split_at_mut_checked(RECORD_HEADER_LEN) {
+        let mut out = Writer::new(body);
+        out.put(&[kind]);
+        out.put(&value.to_le_bytes());
+    }
+    seal(&mut record, COUNTER_BODY_LEN);
+    record
 }
 
 /// Encodes a next-sender record.
 #[must_use]
-pub(crate) fn encode_next_sender_record(next_sender: u64) -> Vec<u8> {
+pub(crate) fn encode_next_sender_record(next_sender: u64) -> [u8; COUNTER_RECORD_LEN] {
     encode_counter_record(KIND_NEXT_SENDER, next_sender)
 }
 
 /// Encodes a next-target record.
 #[must_use]
-pub(crate) fn encode_next_target_record(next_target: u64) -> Vec<u8> {
+pub(crate) fn encode_next_target_record(next_target: u64) -> [u8; COUNTER_RECORD_LEN] {
     encode_counter_record(KIND_NEXT_TARGET, next_target)
 }
 
-/// Prefixes `body` (of `body_len` bytes) with its record header.
-#[must_use]
-fn seal(body: Vec<u8>, body_len: u32) -> Vec<u8> {
-    let mut record = Vec::with_capacity(RECORD_HEADER_LEN + body.len());
-    record.extend_from_slice(&body_len.to_le_bytes());
-    record.extend_from_slice(&(!body_len).to_le_bytes());
-    record.extend_from_slice(&crc32(&body).to_le_bytes());
-    record.extend_from_slice(&body);
-    record
+/// Fills in the record header of `record`, whose body (of `body_len` bytes)
+/// follows the 12 header bytes reserved for it.
+fn seal(record: &mut [u8], body_len: u32) {
+    if let Some((head, body)) = record.split_at_mut_checked(RECORD_HEADER_LEN) {
+        let crc = crc32(body);
+        let mut out = Writer::new(head);
+        out.put(&body_len.to_le_bytes());
+        out.put(&(!body_len).to_le_bytes());
+        out.put(&crc.to_le_bytes());
+    }
 }
 
 /// Returns the body length of an encoded record, as [`IndexEntry`] keeps it.
@@ -426,24 +519,61 @@ fn decode_body(body: &[u8]) -> Result<Record<'_>, String> {
     }
 }
 
+/// Reads the next `len` bytes from `reader` and reports whether every one is
+/// zero. Reads in bounded chunks.
+fn rest_is_zero<R: Read>(reader: &mut R, len: u64) -> Result<bool, StoreError> {
+    let mut chunk = [0u8; ZERO_CHECK_CHUNK];
+    let mut left = len;
+    while left > 0 {
+        let take =
+            usize::try_from(left).map_or(ZERO_CHECK_CHUNK, |left| left.min(ZERO_CHECK_CHUNK));
+        let Some(part) = chunk.get_mut(..take) else {
+            return Ok(false);
+        };
+        reader
+            .read_exact(part)
+            .map_err(|err| io_error("cannot read the journal's tail", &err))?;
+        if part.iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+        // `take` is at most `left`.
+        left -= take as u64;
+    }
+    Ok(true)
+}
+
+/// The largest record `max_body` allows, header included, in bytes.
+const fn max_record(max_body: u64) -> u64 {
+    RECORD_HEADER_LEN_U64 + max_body
+}
+
+/// Whether `remaining` bytes fit in `records` maximum-size records.
+fn within_records(remaining: u64, records: u64, max_body: u64) -> bool {
+    // An overflowing window is larger than any file.
+    records
+        .checked_mul(max_record(max_body))
+        .is_none_or(|window| remaining <= window)
+}
+
 /// Reads a journal from its start, `file_len` bytes long, and recovers what
 /// it holds.
 ///
 /// `max_body` is the largest record body the configuration allows, in bytes;
-/// no more than that is ever allocated for one record.
-///
-/// The scan stops at the first record that is incomplete or fails its checks
-/// and reports the cut in [`Scan::truncation`]; it does not modify the file.
+/// no more than that is ever allocated for one record. `rule` decides which
+/// damage is cut (reported in [`Scan::truncation`]) and which refuses the
+/// journal. The scan does not modify the file.
 ///
 /// # Errors
-/// [`StoreError::Corrupted`] if the header is not a version-1 journal header,
-/// if a record with a well-formed header declares a body of 0 bytes or above
-/// `max_body`, or if a record that passes its CRC does not decode.
-/// [`StoreError::Io`] if reading fails.
+/// [`StoreError::Corrupted`] if the header is not a version-1 journal header;
+/// if damage `rule` does not allow to be cut is found; unless `rule` is
+/// [`DamageRule::Salvage`], if a record with a well-formed header declares a
+/// body of 0 bytes or above `max_body`, or a record that passes its CRC does
+/// not decode. [`StoreError::Io`] if reading fails.
 pub(crate) fn scan<R: Read>(
     mut reader: R,
     file_len: u64,
     max_body: u64,
+    rule: DamageRule,
 ) -> Result<Scan, StoreError> {
     if file_len < HEADER_LEN_U64 {
         return Err(corrupted(format!(
@@ -479,6 +609,7 @@ pub(crate) fn scan<R: Read>(
             dropped_bytes: remaining,
             cause,
         };
+        // A partial record header is always an interrupted write at the tail.
         if remaining < RECORD_HEADER_LEN_U64 {
             scan.truncation = Some(cut(TruncationCause::Incomplete));
             break;
@@ -491,27 +622,58 @@ pub(crate) fn scan<R: Read>(
         let len = fields.u32()?;
         let check = fields.u32()?;
         let crc = fields.u32()?;
+
         if check != !len {
+            let may_cut = match rule {
+                DamageRule::Anywhere | DamageRule::Salvage => true,
+                DamageRule::Tail { records } => {
+                    within_records(remaining, records, max_body)
+                        || (record_header == [0u8; RECORD_HEADER_LEN]
+                            && rest_is_zero(&mut reader, remaining - RECORD_HEADER_LEN_U64)?)
+                }
+            };
+            if !may_cut {
+                return Err(refused(offset, "has a damaged record header", remaining));
+            }
             scan.truncation = Some(cut(TruncationCause::Damaged));
             break;
         }
         if len == 0 || u64::from(len) > max_body {
+            if rule == DamageRule::Salvage {
+                scan.truncation = Some(cut(TruncationCause::Damaged));
+                break;
+            }
             return Err(corrupted(format!(
                 "record at offset {offset} declares a {len}-byte body; this store reads bodies \
                  of 1 to {max_body} bytes (was the journal written with a larger max frame size?)"
             )));
         }
         let record_len = RECORD_HEADER_LEN_U64 + u64::from(len);
+        // The file ends inside a well-formed record: an interrupted write.
         if remaining < record_len {
             scan.truncation = Some(cut(TruncationCause::Incomplete));
             break;
         }
         // Bounded by `max_body`, checked above.
-        body.resize(len as usize, 0);
+        let body_len = usize::try_from(len)
+            .map_err(|_| corrupted(format!("record at offset {offset} is too long")))?;
+        body.resize(body_len, 0);
         reader
             .read_exact(&mut body)
             .map_err(|err| io_error("cannot read a journal record", &err))?;
         if crc32(&body) != crc {
+            let after = remaining - record_len;
+            let may_cut = match rule {
+                DamageRule::Anywhere | DamageRule::Salvage => true,
+                DamageRule::Tail { records } => {
+                    after == 0
+                        || (records > 1 && within_records(remaining, records, max_body))
+                        || rest_is_zero(&mut reader, after)?
+                }
+            };
+            if !may_cut {
+                return Err(refused(offset, "fails its checksum", remaining));
+            }
             scan.truncation = Some(cut(TruncationCause::Damaged));
             break;
         }
@@ -532,6 +694,10 @@ pub(crate) fn scan<R: Read>(
             }
             Ok(Record::NextSender(value)) => scan.next_sender = value,
             Ok(Record::NextTarget(value)) => scan.next_target = value,
+            Err(_) if rule == DamageRule::Salvage => {
+                scan.truncation = Some(cut(TruncationCause::Damaged));
+                break;
+            }
             Err(reason) => {
                 return Err(corrupted(format!("record at offset {offset}: {reason}")));
             }
@@ -543,14 +709,14 @@ pub(crate) fn scan<R: Read>(
     Ok(scan)
 }
 
-/// Reads the frame filed under `seq` from the record `entry` points at,
-/// checking the record again on the way.
+/// Reads the frame filed under `seq` from the record `entry` points at, in one
+/// positional read, checking the record again on the way.
 ///
 /// # Errors
 /// [`StoreError::Corrupted`] if the record no longer matches the index or
 /// fails its CRC (the disk changed under the store); [`StoreError::Io`] if
 /// reading fails.
-pub(crate) fn read_frame<F: Read + Seek>(
+pub(crate) fn read_frame<F: ReadAt>(
     file: &mut F,
     seq: u64,
     entry: IndexEntry,
@@ -561,47 +727,49 @@ pub(crate) fn read_frame<F: Read + Seek>(
             "record for MsgSeqNum {seq} at offset {offset} {what}"
         ))
     };
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|err| io_error("cannot seek in the journal", &err))?;
-    let mut record_header = [0u8; RECORD_HEADER_LEN];
-    file.read_exact(&mut record_header)
-        .map_err(|err| io_error("cannot read a journal record header", &err))?;
-    let mut fields = Reader::new(&record_header);
-    let len = fields.u32()?;
-    let check = fields.u32()?;
-    let crc = fields.u32()?;
-    if len != body_len || check != !len {
-        return Err(mismatch("no longer matches the index"));
-    }
     // `body_len` was bounded by the configured limit when it was indexed.
-    let mut body = vec![0u8; body_len as usize];
-    file.read_exact(&mut body)
+    let record_len = usize::try_from(body_len)
+        .ok()
+        .and_then(|len| len.checked_add(RECORD_HEADER_LEN))
+        .ok_or_else(|| mismatch("is too long to read"))?;
+    let mut record = vec![0u8; record_len];
+    file.read_record_at(&mut record, offset)
         .map_err(|err| io_error("cannot read a journal record", &err))?;
-    if crc32(&body) != crc {
-        return Err(mismatch("fails its checksum"));
-    }
-    let (msg_type, frame_at) = match decode_body(&body) {
-        Ok(Record::Frame {
-            seq: filed,
-            msg_type,
-            frame,
-            ..
-        }) if filed == seq => {
-            // The frame is the tail of the body, so this never underflows.
-            let at = body
-                .len()
-                .checked_sub(frame.len())
-                .ok_or_else(|| mismatch("has a frame longer than its body"))?;
-            (msg_type, at)
+
+    let (msg_type, frame_at) = {
+        let (head, body) = record
+            .split_at_checked(RECORD_HEADER_LEN)
+            .ok_or_else(|| mismatch("is shorter than its header"))?;
+        let mut fields = Reader::new(head);
+        let len = fields.u32()?;
+        let check = fields.u32()?;
+        let crc = fields.u32()?;
+        if len != body_len || check != !len {
+            return Err(mismatch("no longer matches the index"));
         }
-        Ok(_) => return Err(mismatch("is not that message's frame")),
-        Err(reason) => return Err(mismatch(&reason)),
+        if crc32(body) != crc {
+            return Err(mismatch("fails its checksum"));
+        }
+        match decode_body(body) {
+            Ok(Record::Frame {
+                seq: filed,
+                msg_type,
+                frame,
+                ..
+            }) if filed == seq => {
+                // The frame is the tail of the record.
+                let at = record_len
+                    .checked_sub(frame.len())
+                    .ok_or_else(|| mismatch("has a frame longer than itself"))?;
+                (msg_type, at)
+            }
+            Ok(_) => return Err(mismatch("is not that message's frame")),
+            Err(reason) => return Err(mismatch(&reason)),
+        }
     };
-    Ok(StoredMessage::new(
-        seq,
-        msg_type,
-        Bytes::from(body).slice(frame_at..),
-    ))
+    let mut payload = Bytes::from(record);
+    payload.advance(frame_at);
+    Ok(StoredMessage::new(seq, msg_type, payload))
 }
 
 /// Writes fields into a fixed buffer, front to back.
@@ -619,8 +787,8 @@ impl<'b> Writer<'b> {
     }
 
     /// Appends `bytes`. The callers size the buffer for every field they
-    /// write; a field that does not fit is dropped, and the header CRC then
-    /// fails, rather than panicking.
+    /// write; a field that does not fit is dropped, and the record's checks
+    /// then fail, rather than panicking.
     fn put(&mut self, bytes: &[u8]) {
         let Some(end) = self.at.checked_add(bytes.len()) else {
             return;
@@ -703,6 +871,9 @@ mod tests {
     /// A generous body limit for the format tests.
     const MAX_BODY: u64 = 1024;
 
+    /// The rule a store flushing every write uses.
+    const EVERY_WRITE: DamageRule = DamageRule::Tail { records: 1 };
+
     /// Fails the test with context instead of `.unwrap()` / `.expect()`.
     #[track_caller]
     fn ok<T, E: std::fmt::Debug>(result: Result<T, E>, what: &str) -> T {
@@ -728,8 +899,12 @@ mod tests {
         bytes
     }
 
+    fn scan_with(bytes: &[u8], rule: DamageRule) -> Result<Scan, StoreError> {
+        scan(Cursor::new(bytes), bytes.len() as u64, MAX_BODY, rule)
+    }
+
     fn scan_bytes(bytes: &[u8]) -> Result<Scan, StoreError> {
-        scan(Cursor::new(bytes), bytes.len() as u64, MAX_BODY)
+        scan_with(bytes, EVERY_WRITE)
     }
 
     fn frame(seq: u64, next: Option<u64>, frame: &[u8]) -> Vec<u8> {
@@ -737,6 +912,19 @@ mod tests {
             encode_frame_record(seq, next, &MsgType::NewOrderSingle, frame, 512),
             "frame record must encode",
         )
+    }
+
+    /// A journal of three frame records, and the offset of each record.
+    fn three_frames() -> (Vec<u8>, [usize; 3]) {
+        let records = [
+            frame(1, None, b"one"),
+            frame(2, None, b"two"),
+            frame(3, None, b"three"),
+        ];
+        let first = HEADER_LEN;
+        let second = first + records[0].len();
+        let third = second + records[1].len();
+        (journal(&records), [first, second, third])
     }
 
     #[test]
@@ -798,9 +986,9 @@ mod tests {
         let bytes = journal(&[
             frame(1, None, b"one"),
             frame(2, Some(3), b"two"),
-            encode_next_target_record(5),
+            encode_next_target_record(5).to_vec(),
             frame(1, None, b"uno"),
-            encode_next_sender_record(4),
+            encode_next_sender_record(4).to_vec(),
         ]);
         let scan = ok(scan_bytes(&bytes), "scan");
         assert_eq!(scan.header, header());
@@ -867,35 +1055,95 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_stops_at_a_body_failing_its_crc() {
-        let first = frame(1, None, b"one");
-        let mut bytes = journal(&[first.clone(), frame(2, None, b"two"), frame(3, None, b"3")]);
-        // Flip a frame byte of record 2.
-        let at = HEADER_LEN + first.len() + RECORD_HEADER_LEN + 12;
-        bytes[at] ^= 0x20;
-        let scan = ok(scan_bytes(&bytes), "damage is recovered, not an error");
-        assert_eq!(scan.index.keys().copied().collect::<Vec<_>>(), vec![1]);
-        let good_end = (HEADER_LEN + first.len()) as u64;
+    fn test_scan_cuts_a_last_record_failing_its_crc() {
+        let (mut bytes, [_, _, third]) = three_frames();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x20;
+        let scan = ok(scan_bytes(&bytes), "a damaged last record is cut");
+        assert_eq!(scan.index.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(
             scan.truncation,
             Some(Truncation {
-                offset: good_end,
-                dropped_bytes: bytes.len() as u64 - good_end,
+                offset: third as u64,
+                dropped_bytes: (bytes.len() - third) as u64,
                 cause: TruncationCause::Damaged,
             })
         );
     }
 
     #[test]
-    fn test_scan_stops_at_a_zeroed_record_header() {
+    fn test_scan_refuses_a_record_failing_its_crc_before_the_last() {
+        let (mut bytes, [_, second, _]) = three_frames();
+        // Flip a frame byte of record 2: record 3 was written after it.
+        bytes[second + RECORD_HEADER_LEN + 12] ^= 0x20;
+        assert!(matches!(
+            scan_bytes(&bytes),
+            Err(StoreError::Corrupted { reason })
+                if reason.contains(&format!("offset {second}")) && reason.contains("repair")
+        ));
+        // A policy that leaves three writes unflushed cuts it instead.
+        let scan = ok(
+            scan_with(&bytes, DamageRule::Tail { records: 3 }),
+            "within the unflushed window",
+        );
+        assert_eq!(scan.index.keys().copied().collect::<Vec<_>>(), vec![1]);
+        // So does a policy that promises nothing, and a repair.
+        for rule in [DamageRule::Anywhere, DamageRule::Salvage] {
+            let scan = ok(scan_with(&bytes, rule), "cut anywhere");
+            assert_eq!(
+                scan.truncation.map(|cut| (cut.offset(), cut.cause())),
+                Some((second as u64, TruncationCause::Damaged))
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_cuts_a_crc_failure_followed_only_by_zeros() {
+        let (mut bytes, [_, _, third]) = three_frames();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x20;
+        // A file system can leave the file longer than what reached it.
+        bytes.extend_from_slice(&[0u8; 5000]);
+        let scan = ok(scan_bytes(&bytes), "zeros after the damage are cut");
+        assert_eq!(scan.truncation.map(|cut| cut.offset()), Some(third as u64));
+    }
+
+    #[test]
+    fn test_scan_cuts_a_zeroed_tail_of_any_length() {
         let mut bytes = journal(&[frame(1, None, b"one")]);
-        bytes.extend_from_slice(&[0u8; 64]);
+        // Far more than one maximum-size record, but no record is ever zeros.
+        bytes.extend_from_slice(&[0u8; 3 * 1024 * 4]);
         let scan = ok(scan_bytes(&bytes), "zeroes are recovered, not an error");
         assert_eq!(
             scan.truncation.map(|cut| cut.cause()),
             Some(TruncationCause::Damaged)
         );
         assert_eq!(scan.index.len(), 1);
+    }
+
+    #[test]
+    fn test_scan_damaged_record_header_is_cut_only_within_one_record_of_the_end() {
+        let (bytes, [_, second, _]) = three_frames();
+        // Garbage over record 2's header, with record 3 still behind it: the
+        // remaining bytes fit one maximum-size record, so it may be a torn
+        // write and is cut.
+        let mut torn = bytes.clone();
+        torn[second..second + 4].copy_from_slice(&[0xAB; 4]);
+        let scan = ok(scan_bytes(&torn), "within one record of the end");
+        assert_eq!(scan.truncation.map(|cut| cut.offset()), Some(second as u64));
+
+        // The same damage with more than a maximum-size record behind it is
+        // damage to written data.
+        let mut damaged = bytes;
+        damaged[second..second + 4].copy_from_slice(&[0xAB; 4]);
+        for seq in 4..12 {
+            damaged.extend_from_slice(&frame(seq, None, &[b'x'; 200]));
+        }
+        assert!(matches!(
+            scan_bytes(&damaged),
+            Err(StoreError::Corrupted { reason }) if reason.contains("damaged record header")
+        ));
+        assert!(scan_with(&damaged, DamageRule::Anywhere).is_ok());
     }
 
     #[test]
@@ -911,6 +1159,16 @@ mod tests {
             scan_bytes(&bytes),
             Err(StoreError::Corrupted { reason }) if reason.contains("4294967295")
         ));
+        assert!(matches!(
+            scan_with(&bytes, DamageRule::Anywhere),
+            Err(StoreError::Corrupted { .. })
+        ));
+        // Only a repair cuts it.
+        let scan = ok(scan_with(&bytes, DamageRule::Salvage), "salvage");
+        assert_eq!(
+            scan.truncation.map(|cut| cut.offset()),
+            Some(HEADER_LEN_U64)
+        );
     }
 
     #[test]
@@ -925,14 +1183,28 @@ mod tests {
         ));
     }
 
+    /// Seals a hand-built body into a record.
+    fn sealed(body: &[u8]) -> Vec<u8> {
+        let mut record = vec![0u8; RECORD_HEADER_LEN];
+        record.extend_from_slice(body);
+        let len = u32::try_from(body.len()).unwrap_or(u32::MAX);
+        seal(&mut record, len);
+        record
+    }
+
     #[test]
     fn test_scan_unknown_record_kind_with_a_valid_crc_is_corrupted() {
         let mut bytes = journal(&[]);
-        bytes.extend_from_slice(&seal(vec![9, 1, 2, 3], 4));
+        bytes.extend_from_slice(&sealed(&[9, 1, 2, 3]));
         assert!(matches!(
             scan_bytes(&bytes),
             Err(StoreError::Corrupted { reason }) if reason.contains("unknown record kind 9")
         ));
+        let scan = ok(scan_with(&bytes, DamageRule::Salvage), "salvage");
+        assert_eq!(
+            scan.truncation.map(|cut| cut.cause()),
+            Some(TruncationCause::Damaged)
+        );
     }
 
     #[test]
@@ -941,7 +1213,7 @@ mod tests {
         let mut body = vec![KIND_NEXT_TARGET];
         body.extend_from_slice(&5u64.to_le_bytes());
         body.push(0);
-        bytes.extend_from_slice(&seal(body, 10));
+        bytes.extend_from_slice(&sealed(&body));
         assert!(matches!(
             scan_bytes(&bytes),
             Err(StoreError::Corrupted { .. })
@@ -956,8 +1228,7 @@ mod tests {
         body.push(2);
         body.extend_from_slice(&[0xFF, 0xFE]);
         body.extend_from_slice(b"frame");
-        let len = body.len() as u32;
-        bytes.extend_from_slice(&seal(body, len));
+        bytes.extend_from_slice(&sealed(&body));
         assert!(matches!(
             scan_bytes(&bytes),
             Err(StoreError::Corrupted { reason }) if reason.contains("invalid MsgType")
@@ -973,6 +1244,15 @@ mod tests {
         ));
         // At the limit it encodes.
         assert!(encode_frame_record(4, Some(5), &MsgType::NewOrderSingle, &[b'x'; 8], 8).is_ok());
+    }
+
+    #[test]
+    fn test_encode_frame_record_allocates_exactly_once() {
+        let record = frame(3, Some(4), b"8=FIX.4.4\x0135=D\x01");
+        // Header, kind, seq, next sender, code length, "D", frame.
+        assert_eq!(record.len(), 12 + 1 + 8 + 8 + 1 + 1 + 15);
+        assert_eq!(record.capacity(), record.len());
+        assert_eq!(record_body_len(&record) as usize, record.len() - 12);
     }
 
     #[test]
@@ -998,10 +1278,11 @@ mod tests {
     }
 
     #[test]
-    fn test_record_body_len_reads_the_length_field() {
+    fn test_counter_record_is_the_fixed_length() {
         let record = encode_next_sender_record(3);
         assert_eq!(record_body_len(&record), 9);
-        assert_eq!(record.len(), RECORD_HEADER_LEN + 9);
+        assert_eq!(record.len(), COUNTER_RECORD_LEN);
+        assert_eq!(COUNTER_RECORD_LEN, 21);
         assert_eq!(MAX_BODY_OVERHEAD, 26);
     }
 }

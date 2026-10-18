@@ -8,6 +8,7 @@
 //! what they are called, how large a frame may be, and when the journal is
 //! flushed to stable storage.
 
+use crate::file::format::DamageRule;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -34,6 +35,14 @@ pub const MAX_FRAME_SIZE_LIMIT: u32 = 64 * 1024 * 1024;
 /// file systems cap a file name at 255 bytes.
 pub const MAX_STORE_NAME_LEN: usize = 128;
 
+/// Device names Windows reserves in every directory, with or without an
+/// extension. A store name whose first dot-separated part is one of them,
+/// in any case, is refused, so a store's files can be created on Windows.
+const WINDOWS_RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// [`DEFAULT_MAX_FRAME_SIZE`] as the type the configuration holds, resolved at
 /// compile time.
 const DEFAULT_MAX_FRAME: NonZeroU32 = match NonZeroU32::new(DEFAULT_MAX_FRAME_SIZE) {
@@ -48,24 +57,36 @@ const DEFAULT_MAX_FRAME: NonZeroU32 = match NonZeroU32::new(DEFAULT_MAX_FRAME_SI
 /// store call returns, under every policy, so a write that returned `Ok`
 /// survives the **process** crashing. The policy decides what survives the
 /// **operating system** crashing or the machine losing power, which is what a
-/// flush (`fsync`, through [`std::fs::File::sync_data`]) protects against.
-/// See `doc/adr/0006-file-store.md` for what each policy guarantees against
-/// the crash points of issue #89.
+/// flush ([`std::fs::File::sync_data`]; on Apple platforms the standard
+/// library implements it with `F_FULLFSYNC`) protects against. See
+/// `doc/adr/0006-file-store.md` for what each policy guarantees against the
+/// crash points of issue #89. What a flush costs is not measured here:
+/// `ironfix-store/benches/file_store.rs` exercises it, and no figure is
+/// published.
 ///
-/// A reset ([`MessageStore::reset`](crate::MessageStore::reset),
+/// Whatever the policy, a reset
+/// ([`MessageStore::reset`](crate::MessageStore::reset),
 /// [`MessageStore::reset_to`](crate::MessageStore::reset_to)) and the creation
-/// of a new journal write a complete new journal and rename it into place.
-/// Under [`SyncPolicy::EveryWrite`] and [`SyncPolicy::EveryN`] the new file is
-/// flushed before the rename and its directory after it; under
-/// [`SyncPolicy::Never`] neither is.
+/// of a new journal flush the new file before renaming it into place and the
+/// directory after, so an operating-system crash never undoes a reset.
+///
+/// The policy also decides how much damage at the end of the journal
+/// [`FileStore::open`](super::FileStore::open) accepts as an interrupted
+/// write, so open a journal with the policy it was written under.
+///
+/// These guarantees are stated for Unix. Elsewhere the directory is not
+/// flushed, and the store is untested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum SyncPolicy {
     /// Flush after every journal write, before the call returns `Ok`.
     ///
-    /// The only policy under which a write that returned `Ok` survives an
-    /// operating-system crash or a power loss, and so the only one that turns
-    /// the engine's write order into a guarantee against them. The default.
+    /// The engine writes the store once per outbound message and once per
+    /// inbound message (the receive cursor), so this is one flush per message
+    /// in each direction. The only policy under which a write that returned
+    /// `Ok` survives an operating-system crash or a power loss, and so the
+    /// only one that turns the engine's write order into a guarantee against
+    /// them. The default.
     #[default]
     EveryWrite,
     /// Flush after every `n`-th journal write.
@@ -74,25 +95,41 @@ pub enum SyncPolicy {
     /// returned `Ok` can be lost, together with the write in flight. A lost
     /// write can be a frame the counterparty already received and the sender
     /// counter that numbered it, so the next session can reuse a `MsgSeqNum`
-    /// (34) with different content. `EveryN(1)` behaves as
+    /// (34) with different content. There is **no time bound**: on a quiet
+    /// session the last writes stay unflushed until `n` accumulate, the store
+    /// is refreshed or closed, or [`FileStore::sync`](super::FileStore::sync)
+    /// is called (the engine never calls it). `EveryN(1)` behaves as
     /// [`SyncPolicy::EveryWrite`].
     EveryN(NonZeroU32),
-    /// Never flush, except through an explicit
-    /// [`FileStore::sync`](super::FileStore::sync).
+    /// Never flush the journal's writes, except through an explicit
+    /// [`FileStore::sync`](super::FileStore::sync), which the engine never
+    /// calls.
     ///
     /// Survives a process crash only. On an operating-system crash or a power
-    /// loss any number of writes that returned `Ok` can be lost, and a journal
-    /// replaced by a reset can come back empty, in which case
-    /// [`FileStore::open`](super::FileStore::open) refuses it as corrupted.
+    /// loss any number of writes that returned `Ok` can be lost, and damage
+    /// anywhere in the journal is cut at the next open rather than refused.
     Never,
 }
 
 impl SyncPolicy {
-    /// Whether a reset and a journal creation flush the new file and its
-    /// directory.
+    /// Whether the journal is flushed when it is opened, refreshed or cut.
     #[must_use]
-    pub(crate) const fn flushes_replacements(self) -> bool {
+    pub(crate) const fn flushes(self) -> bool {
         !matches!(self, Self::Never)
+    }
+
+    /// Which damage a journal written under this policy may be cut at when it
+    /// is opened: what an interrupted write can leave, given how many writes
+    /// the policy leaves unflushed.
+    #[must_use]
+    pub(crate) const fn damage_rule(self) -> DamageRule {
+        match self {
+            Self::EveryWrite => DamageRule::Tail { records: 1 },
+            Self::EveryN(every) => DamageRule::Tail {
+                records: every.get() as u64,
+            },
+            Self::Never => DamageRule::Anywhere,
+        }
     }
 }
 
@@ -131,6 +168,15 @@ pub enum FileStoreConfigError {
     #[error("store name must not start with '.'")]
     LeadingDot,
 
+    /// The store name is, before its first `.`, a device name Windows
+    /// reserves (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to
+    /// `LPT9`, in any case).
+    #[error("store name {name:?} is a device name Windows reserves")]
+    ReservedName {
+        /// The rejected name.
+        name: String,
+    },
+
     /// The maximum frame size is above [`MAX_FRAME_SIZE_LIMIT`].
     #[error("max frame size of {size} bytes is above the {max}-byte limit")]
     MaxFrameSizeTooLarge {
@@ -155,7 +201,16 @@ pub enum FileStoreConfigError {
 ///   streams.
 ///
 /// Name each session's store differently (for example after its
-/// `BeginString` and CompIDs) when several share a directory.
+/// `BeginString` and CompIDs) when several share a directory, and treat names
+/// as **case-insensitive**: on a case-insensitive file system (the default on
+/// macOS and Windows) two names that differ only in case are the same files.
+/// The lock then refuses the second store while the first is open, but two
+/// sessions opened one after the other would share one journal.
+///
+/// A missing journal is an error unless
+/// [`with_create_if_missing`](Self::with_create_if_missing) is set, so a
+/// store that was expected to exist (a wrong directory, an unmounted volume)
+/// is never silently replaced by a fresh one at 1/1.
 ///
 /// Valid by construction: the fields are private and every constructor and
 /// setter that can receive an invalid value validates it.
@@ -168,6 +223,7 @@ pub enum FileStoreConfigError {
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = FileStoreConfig::try_new("/var/lib/ironfix", "FIX.4.4-CLIENT-VENUE")?
+///     .with_create_if_missing(true)
 ///     .with_sync_policy(SyncPolicy::EveryN(NonZeroU32::new(16).ok_or("zero")?))
 ///     .with_max_frame_size(NonZeroU32::new(256 * 1024).ok_or("zero")?)?;
 /// assert_eq!(config.name(), "FIX.4.4-CLIENT-VENUE");
@@ -176,7 +232,7 @@ pub enum FileStoreConfigError {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStoreConfig {
-    /// Directory holding the store's files; created at open if missing.
+    /// Directory holding the store's files.
     directory: PathBuf,
     /// File-name-safe store name.
     name: String,
@@ -184,25 +240,29 @@ pub struct FileStoreConfig {
     sync_policy: SyncPolicy,
     /// Largest frame accepted, in bytes.
     max_frame_size: NonZeroU32,
+    /// Whether opening creates the directory and an empty journal when they
+    /// are missing.
+    create_if_missing: bool,
 }
 
 impl FileStoreConfig {
     /// Creates a configuration for the store `name` in `directory`, with
-    /// [`SyncPolicy::EveryWrite`] and [`DEFAULT_MAX_FRAME_SIZE`].
+    /// [`SyncPolicy::EveryWrite`], [`DEFAULT_MAX_FRAME_SIZE`], and
+    /// `create_if_missing` off.
     ///
     /// # Arguments
-    /// * `directory` - Directory for the store's files; created at open if it
-    ///   does not exist
+    /// * `directory` - Directory for the store's files
     /// * `name` - The store's name, used in its file names: 1 to
     ///   [`MAX_STORE_NAME_LEN`] bytes of ASCII letters, digits, `.`, `-` and
-    ///   `_`, not starting with `.`
+    ///   `_`, not starting with `.` and not a Windows device name
     ///
     /// # Errors
     /// [`FileStoreConfigError::EmptyName`],
     /// [`FileStoreConfigError::NameTooLong`],
-    /// [`FileStoreConfigError::IllegalCharacter`] or
-    /// [`FileStoreConfigError::LeadingDot`] for a name that cannot be used as
-    /// part of a file name.
+    /// [`FileStoreConfigError::IllegalCharacter`],
+    /// [`FileStoreConfigError::LeadingDot`] or
+    /// [`FileStoreConfigError::ReservedName`] for a name that cannot be used
+    /// as part of a file name.
     pub fn try_new(
         directory: impl Into<PathBuf>,
         name: impl Into<String>,
@@ -214,7 +274,18 @@ impl FileStoreConfig {
             name,
             sync_policy: SyncPolicy::default(),
             max_frame_size: DEFAULT_MAX_FRAME,
+            create_if_missing: false,
         })
+    }
+
+    /// Sets whether [`FileStore::open`](super::FileStore::open) creates the
+    /// directory (flushing each directory it creates into its parent) and an
+    /// empty journal, with both counters at 1, when they are missing (default
+    /// `false`: a missing journal is an error).
+    #[must_use = "builders do nothing unless the result is used"]
+    pub const fn with_create_if_missing(mut self, create: bool) -> Self {
+        self.create_if_missing = create;
+        self
     }
 
     /// Sets when the journal is flushed (default [`SyncPolicy::EveryWrite`]).
@@ -273,6 +344,12 @@ impl FileStoreConfig {
         self.max_frame_size
     }
 
+    /// Returns whether opening creates a missing directory and journal.
+    #[must_use]
+    pub const fn create_if_missing(&self) -> bool {
+        self.create_if_missing
+    }
+
     /// Returns the path of the journal, `<directory>/<name>.journal`.
     #[must_use]
     pub fn journal_path(&self) -> PathBuf {
@@ -313,6 +390,15 @@ fn validate_name(name: &str) -> Result<(), FileStoreConfigError> {
     if name.starts_with('.') {
         return Err(FileStoreConfigError::LeadingDot);
     }
+    let stem = name.split('.').next().unwrap_or(name);
+    if WINDOWS_RESERVED_NAMES
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
+    {
+        return Err(FileStoreConfigError::ReservedName {
+            name: name.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -330,6 +416,7 @@ mod tests {
         assert_eq!(config.directory(), Path::new("/tmp/ironfix"));
         assert_eq!(config.sync_policy(), SyncPolicy::EveryWrite);
         assert_eq!(config.max_frame_size().get(), DEFAULT_MAX_FRAME_SIZE);
+        assert!(!config.create_if_missing());
         assert_eq!(
             config.journal_path(),
             Path::new("/tmp/ironfix/FIX.4.4-CLIENT_VENUE.journal")
@@ -429,10 +516,51 @@ mod tests {
     }
 
     #[test]
+    fn test_file_store_config_with_create_if_missing_sets_it() {
+        let Ok(config) = FileStoreConfig::try_new("/tmp", "session") else {
+            panic!("valid name");
+        };
+        assert!(config.with_create_if_missing(true).create_if_missing());
+    }
+
+    #[test]
+    fn test_file_store_config_try_new_windows_device_name_is_rejected() {
+        for name in ["CON", "nul", "Com1", "LPT9", "aux.session", "prn.x.y"] {
+            assert_eq!(
+                FileStoreConfig::try_new("/tmp", name),
+                Err(FileStoreConfigError::ReservedName {
+                    name: name.to_string()
+                }),
+                "{name}"
+            );
+        }
+        // Only the whole first part is reserved.
+        for name in ["CONSOLE", "com10", "session.NUL", "LPT"] {
+            assert!(FileStoreConfig::try_new("/tmp", name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
     fn test_sync_policy_defaults_to_every_write() {
         assert_eq!(SyncPolicy::default(), SyncPolicy::EveryWrite);
-        assert!(SyncPolicy::EveryWrite.flushes_replacements());
-        assert!(SyncPolicy::EveryN(NonZeroU32::MIN).flushes_replacements());
-        assert!(!SyncPolicy::Never.flushes_replacements());
+        assert!(SyncPolicy::EveryWrite.flushes());
+        assert!(SyncPolicy::EveryN(NonZeroU32::MIN).flushes());
+        assert!(!SyncPolicy::Never.flushes());
+    }
+
+    #[test]
+    fn test_sync_policy_damage_rule_follows_the_unflushed_window() {
+        assert_eq!(
+            SyncPolicy::EveryWrite.damage_rule(),
+            DamageRule::Tail { records: 1 }
+        );
+        let Some(eight) = NonZeroU32::new(8) else {
+            panic!("non-zero");
+        };
+        assert_eq!(
+            SyncPolicy::EveryN(eight).damage_rule(),
+            DamageRule::Tail { records: 8 }
+        );
+        assert_eq!(SyncPolicy::Never.damage_rule(), DamageRule::Anywhere);
     }
 }
