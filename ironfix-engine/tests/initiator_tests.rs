@@ -3385,21 +3385,62 @@ async fn test_resend_request_unbounded_replays_to_the_last_sent_message() {
     );
 }
 
+/// A directory for one test, removed when the test ends, pass or fail.
+struct TestDir(std::path::PathBuf);
+
+impl TestDir {
+    fn new(name: &str) -> Self {
+        let path =
+            std::env::temp_dir().join(format!("ironfix-engine-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        Self(path)
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The fields of `frame`, in order, without the ones a resend may change:
+/// BodyLength (9), CheckSum (10), PossDupFlag (43), SendingTime (52) and
+/// OrigSendingTime (122).
+fn resend_invariant_fields(frame: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    let mut decoder = Decoder::new(frame);
+    let raw = ok(decoder.decode(), "frame must decode");
+    raw.fields()
+        .filter(|field| !matches!(field.tag().value(), 9 | 10 | 43 | 52 | 122))
+        .map(|field| (field.tag().value(), field.as_bytes().to_vec()))
+        .collect()
+}
+
+/// Asserts that `replayed` is `original` resent: every field the same, in the
+/// same order, apart from the ones a resend changes, with PossDupFlag (43) = Y
+/// and the original SendingTime (52) as OrigSendingTime (122).
+#[track_caller]
+fn assert_resent(replayed: &[u8], original: &[u8]) {
+    assert_eq!(
+        resend_invariant_fields(replayed),
+        resend_invariant_fields(original),
+        "a resend carries the original message under its original number"
+    );
+    assert_eq!(field(replayed, 43).as_deref(), Some("Y"));
+    assert_eq!(field(replayed, 122), field(original, 52));
+}
+
 /// A `FileStore` carries a session across a restart: the first engine is
 /// dropped and its store closed, the store is reopened in a new `Initiator`,
 /// and the new session resumes from the stored counters and answers a
-/// `ResendRequest` with the original frames, under their original numbers,
-/// carrying `PossDupFlag` (43) = Y and the original `SendingTime` in
-/// `OrigSendingTime` (122).
+/// `ResendRequest` with the original frames under their original numbers,
+/// field for field, with `PossDupFlag` (43) = Y and the original `SendingTime`
+/// in `OrigSendingTime` (122). Administrative messages, the previous process's
+/// included, are gap-filled.
 #[tokio::test]
 async fn test_file_store_resends_original_messages_after_a_restart() {
-    let dir = std::env::temp_dir().join(format!(
-        "ironfix-engine-file-store-restart-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TestDir::new("file-store-restart");
     let config = ok(
-        FileStoreConfig::try_new(&dir, "FIX.4.4-CLIENT-VENUE"),
+        FileStoreConfig::try_new(&dir.0, "FIX.4.4-CLIENT-VENUE"),
         "store config",
     );
 
@@ -3408,14 +3449,24 @@ async fn test_file_store_resends_original_messages_after_a_restart() {
     let (listener, addr) = bind_listener().await;
     let first_venue = tokio::spawn(async move {
         let mut framed = accept_logon(listener).await;
-        let sent = drain_orders(&mut framed, 2, 3).await;
+        let mut orders = Vec::new();
+        for seq in 2..=4u64 {
+            let order = next_frame(&mut framed).await;
+            assert_eq!(msg_type_of(&order), "D");
+            assert_eq!(field(&order, 34), Some(seq.to_string()));
+            assert_eq!(field(&order, 43), None, "an original send");
+            orders.push(order);
+        }
         ok(framed.send(venue_msg("5", 2, &[])).await, "venue logout");
         let reply = next_frame(&mut framed).await;
         assert_eq!(msg_type_of(&reply), "5");
         assert_eq!(field(&reply, 34).as_deref(), Some("5"));
-        sent
+        orders
     });
-    let store = Arc::new(ok(FileStore::open(config.clone()).await, "open the store"));
+    let store = Arc::new(ok(
+        FileStore::open(config.clone().with_create_if_missing(true)).await,
+        "create the store",
+    ));
     {
         let (app, _app_rx) = RecordingApp::new();
         let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
@@ -3427,7 +3478,7 @@ async fn test_file_store_resends_original_messages_after_a_restart() {
             "first session closes within 5s",
         );
     }
-    let sent = ok(
+    let orders = ok(
         ok(
             timeout(Duration::from_secs(5), first_venue).await,
             "first venue done within 5s",
@@ -3447,7 +3498,8 @@ async fn test_file_store_resends_original_messages_after_a_restart() {
     );
     drop(store);
 
-    // Second process: the reopened store holds both counters and the frames.
+    // Second process: the store must already exist, and holds both counters
+    // and the frames.
     let store = ok(FileStore::open(config).await, "reopen the store");
     assert_eq!(store.next_sender_seq(), 6);
     assert_eq!(store.next_target_seq(), 3);
@@ -3469,15 +3521,34 @@ async fn test_file_store_resends_original_messages_after_a_restart() {
                 .await,
             "send the Logon ack at the stored target counter",
         );
+
+        // A bounded request for the previous process's orders.
         ok(
             framed.send(venue_msg("2", 4, &[(7, "2"), (16, "4")])).await,
-            "ask for the previous process's orders",
+            "ask for 2..=4",
         );
-        for (seq, original) in (2..).zip(sent.iter()) {
+        for original in &orders {
             let replayed = next_frame(&mut framed).await;
-            assert_replay_of(&replayed, seq, original);
+            assert_resent(&replayed, original);
         }
-        ok(framed.send(venue_msg("5", 5, &[])).await, "venue logout");
+
+        // The whole session: the Logon of the previous process (1), its
+        // Logout (5) and this process's Logon (6) are administrative and
+        // gap-filled; the orders are replayed between them.
+        ok(
+            framed.send(venue_msg("2", 5, &[(7, "1"), (16, "0")])).await,
+            "ask for 1..=infinity",
+        );
+        let leading = next_frame(&mut framed).await;
+        assert_gap_fill(&leading, 1, 2);
+        for original in &orders {
+            let replayed = next_frame(&mut framed).await;
+            assert_resent(&replayed, original);
+        }
+        let trailing = next_frame(&mut framed).await;
+        assert_gap_fill(&trailing, 5, 7);
+
+        ok(framed.send(venue_msg("5", 6, &[])).await, "venue logout");
         let reply = next_frame(&mut framed).await;
         assert_eq!(msg_type_of(&reply), "5");
         assert_eq!(
@@ -3503,7 +3574,163 @@ async fn test_file_store_resends_original_messages_after_a_restart() {
         "second venue task",
     );
     drop(initiator);
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store whose reads report the store corrupted, standing in for a durable
+/// store that finds one of its records damaged when a resend reads it.
+#[derive(Debug)]
+struct CorruptStore {
+    inner: MemoryStore,
+}
+
+#[async_trait]
+impl MessageStore for CorruptStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), StoreError> {
+        self.inner.store(seq_num, msg_type, message).await
+    }
+
+    async fn get_range(&self, _begin: u64, _end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        Err(StoreError::Corrupted {
+            reason: "a record failed its checksum".to_string(),
+        })
+    }
+
+    fn next_sender_seq(&self) -> u64 {
+        self.inner.next_sender_seq()
+    }
+
+    fn next_target_seq(&self) -> u64 {
+        self.inner.next_target_seq()
+    }
+
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.inner.set_next_sender_seq(seq).await
+    }
+
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.inner.set_next_target_seq(seq).await
+    }
+
+    async fn reset(&self) -> Result<(), StoreError> {
+        self.inner.reset().await
+    }
+
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.inner.creation_time()
+    }
+}
+
+/// A store that reports itself corrupted while a resend is read cannot say
+/// which messages it still holds: the engine closes the session rather than
+/// gap-filling application messages the counterparty may never have received.
+#[tokio::test]
+async fn test_corrupted_store_closes_the_session_instead_of_gap_filling_a_resend() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let _ = drain_orders(&mut framed, 2, 2).await;
+        ok(
+            framed.send(venue_msg("2", 2, &[(7, "2"), (16, "3")])).await,
+            "ask for the orders",
+        );
+        // Everything the client sends until it hangs up.
+        let mut after = Vec::new();
+        while let Ok(Some(Ok(frame))) = timeout(Duration::from_secs(5), framed.next()).await {
+            after.push((msg_type_of(&frame), field(&frame, 43)));
+        }
+        after
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::new(CorruptStore {
+            inner: MemoryStore::new(),
+        }));
+    let connection = ok(initiator.connect(addr).await, "connect");
+    send_orders(&connection, 2).await;
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the session closes within 5s",
+    );
+
+    let after = ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+    assert!(
+        after
+            .iter()
+            .all(|(msg_type, poss_dup)| msg_type != "4" && poss_dup.is_none()),
+        "neither a gap fill nor a replay answers the request: {after:?}"
+    );
+}
+
+/// A store write that fails outright, not only one that overruns the store
+/// timeout, may have changed the store before failing: under `Continue` the
+/// session carries on, and the next connect resets the store and logs on at
+/// 1 with `ResetSeqNumFlag` (141).
+#[tokio::test]
+async fn test_a_failed_store_write_leaves_a_reset_owed_under_continue() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let (socket, _) = ok(listener.accept().await, "accept the first connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let _logon = next_frame(&mut framed).await;
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30")]))
+                .await,
+            "send logon ack",
+        );
+        // Continue: the order is sent although the store refused it.
+        let order = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&order), "D");
+        drop(framed);
+
+        let (socket, _) = ok(listener.accept().await, "accept the second connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let logon = next_frame(&mut framed).await;
+        (field(&logon, 34), field(&logon, 141), framed)
+    });
+
+    let store = Arc::new(FailingStore::working());
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let first = ok(initiator.connect(addr).await, "connect");
+    store.fail_store.store(true, Ordering::SeqCst);
+    send_orders(&first, 1).await;
+    ok(
+        timeout(Duration::from_secs(5), first.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+    store.fail_store.store(false, Ordering::SeqCst);
+
+    // The reconnect stops at the Logon; the stub reads it and keeps the socket.
+    let _ = timeout(Duration::from_secs(2), initiator.connect(addr)).await;
+    let (seq, reset, _framed) = ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+    assert_eq!(
+        seq.as_deref(),
+        Some("1"),
+        "the next session starts a new stream"
+    );
+    assert_eq!(reset.as_deref(), Some("Y"), "and declares it");
 }
 
 /// A store carries sequence numbers as well as messages: a session started
