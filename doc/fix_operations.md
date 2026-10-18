@@ -138,7 +138,9 @@ and stops at the first failure:
    the same standard-header contract step 2 applies to the CompIDs — so a 34 that
    occurs only after the body is treated as missing and fails the handshake. The
    value read there is then validated at this step: too low fails the handshake,
-   and a gap completes the handshake and immediately issues a ResendRequest.
+   and a gap completes the handshake and immediately issues a ResendRequest,
+   unless both sides declared `NextExpectedMsgSeqNum` (789): the ack is then
+   held instead (see "NextExpectedMsgSeqNum (789), both roles").
    After a reset the initiator declared (`reset_on_logon`, or a reset an
    earlier session owes), the ack is not validated: under the reset rule it is
    the acceptor's message 1 whatever its number, and 2 is expected next.
@@ -266,7 +268,8 @@ the Logon:
    is attached.
 
 A gap in the inbound Logon completes the handshake and immediately issues a
-`ResendRequest` (2). Once Active, the session runs the same reactor as the
+`ResendRequest` (2), unless both sides declared `NextExpectedMsgSeqNum` (789):
+the Logon is then held instead (below). Once Active, the session runs the same reactor as the
 initiator, so every inbound-frame rule below applies identically to both roles.
 
 **NextExpectedMsgSeqNum (789), both roles**
@@ -283,6 +286,13 @@ reported by the builder, by `SessionConfig::validate` and by both engines
 (`EngineError::Config`) before a connection is taken or dialled
 (`doc/adr/0021-next-expected-msg-seq-num.md`).
 
+**789 is bilateral: enable it on both sides.** Engines differ on what they do
+with it. QuickFIX/C++ acts on an inbound 789 whatever its own setting says,
+and when it declared 789 itself it holds a gapped Logon and sends no
+`ResendRequest` for the gap, with no resend timer. Such a counterparty logging
+on to an IronFix session with the flag off declares 789, gets none back and
+waits for a resend this session never sends, until later traffic makes it ask.
+
 *What is declared.* The session's own next expected inbound `MsgSeqNum`,
 placed after `ResetSeqNumFlag` (141) and before `DefaultApplVerID` (1137):
 
@@ -292,7 +302,7 @@ placed after `ResetSeqNumFlag` (141) and before `DefaultApplVerID` (1137):
 | Initiator Logon with `141=Y` | 1: the acknowledgement of a reset is message 1 |
 | Acceptor acknowledgement, the Logon in sequence | the Logon's `MsgSeqNum` + 1 |
 | Acceptor acknowledgement with `141=Y` | 2: the Logon it answers is message 1 of the new stream |
-| Acceptor acknowledgement, the Logon gapped | the first missing number: a gapped Logon is not consumed |
+| Acceptor acknowledgement, the Logon gapped | the first missing number: a gapped Logon is not consumed at the handshake (it is held or requested, below) |
 
 *What the counterparty's 789 does.* It is compared with the `MsgSeqNum` of the
 session's own Logon (initiator) or acknowledgement (acceptor) and with the next
@@ -307,25 +317,35 @@ moves a counter.
 | from the session's own Logon up to the next number it sends | nothing to resend |
 
 The resend is the session reactor's second opening act, right after the
-`ResendRequest` for a gap the Logon exchange found. A gap in the Logon's own
-`MsgSeqNum` is still requested as before: 789 changes nothing about the
-inbound side.
+`ResendRequest` for a gap the Logon exchange found, if one was requested.
 
-*Interaction with a receiver that does not hold a gapped Logon.* The resend
-stops before the session's own Logon, which a receiver that holds a gapped
-Logon until the gap before it is filled then consumes. IronFix's own receiver
-does not hold it yet (a gap queue is #71): it processes the gapped Logon
-without consuming it, and recovers its number through the `ResendRequest` it
-sends. When the answer to that request covers the Logon with a gap fill that
-starts below the number the receiver then expects (the message before the
-Logon is administrative, typically the previous session's Logout), that fill
-is ignored as a possible duplicate, and the Logon's number is recovered by the
-request's retry after `SessionConfig::resend_timeout` (10 s by default).
-Nothing is lost and no number is reused, but between two IronFix engines the
-receiver's expectation waits for up to one resend timeout after the 789
-resend. Whether the resend should also gap-fill the session's own Logon is an
-open protocol question (`doc/adr/0021-next-expected-msg-seq-num.md`, "Open
-questions").
+*A gapped Logon or acknowledgement, held.* 789 is the Logon sender's built-in
+`ResendRequest`: the counterparty that reads this session's 789 resends the
+gap on its own, below its own Logon. So when this session declared 789, the
+counterparty's Logon or acknowledgement carries a well-formed 789 too, and it
+arrives with a gap below it, the session does **not** send a `ResendRequest`,
+which would cross that resend (QuickFIX/C++ behaves the same):
+
+- The Logon is held: it was processed at the handshake, and only its
+  `MsgSeqNum` is left to take. Once the inbound expectation reaches that
+  number, the number plus one is persisted as the next target and the
+  expectation moves past it, as for any inbound message; if a gap fill jumps
+  past it instead (a counterparty that fills through its own Logon), the hold
+  is dropped.
+- The gap is armed as recovery with nothing requested: a gapped frame arriving
+  meanwhile sends no request either. A counterparty that never resends gets
+  exactly one `ResendRequest`, from the first missing number, once the gap has
+  made no progress for `SessionConfig::resend_timeout`, also with
+  `max_resend_requests` = 1; after that the usual retry and Logout rules
+  apply. Frames from beyond the held Logon that arrived while it was held are
+  not covered by the counterparty's resend and are requested as soon as the
+  Logon is consumed.
+- A counterparty whose Logon or acknowledgement declares no 789, or a session
+  with the flag off, gets the immediate `ResendRequest` as before.
+
+Between two IronFix engines with the flag on, a restarted side therefore gets
+back what it missed with no `ResendRequest` either way, and the next live
+message is delivered in sequence right after the resend.
 
 **Routing a Logon to its session (several counterparties on one listener)**
 
@@ -1768,9 +1788,10 @@ ADR-0011.
   (`SessionConfig::send_next_expected_msg_seq_num`, FIX.4.4 and FIXT.1.1 only)
   in both roles: declared on the Logon and its acknowledgement; a
   counterparty's 789 below this session's own Logon resends the missed range
-  once Active, one above what was sent refuses the Logon with a Logout. See
-  "NextExpectedMsgSeqNum (789), both roles" under "Logon", and its open
-  question on the range.
+  once Active, one above what was sent refuses the Logon with a Logout, and a
+  gapped Logon from a counterparty that declared 789 is held instead of
+  requested. Bilateral: both sides must enable it. See
+  "NextExpectedMsgSeqNum (789), both roles" under "Logon".
 
 ### Phase 2: Order Entry (High Priority)
 - [ ] New Order Single

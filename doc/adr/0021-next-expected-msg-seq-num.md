@@ -1,8 +1,8 @@
 # ADR-0021 — NextExpectedMsgSeqNum (789) on the Logon exchange, in both roles
 
-- **Status:** Accepted (issue #79, in the plan the owner approved; the replay
-  range stopping before the session's own Logon is the plan's choice and is
-  marked for protocol review, see "Open questions")
+- **Status:** Accepted (issue #79, in the plan the owner approved; the handling
+  of a gapped Logon was decided in the #79 protocol review, see "A gapped Logon
+  or acknowledgement")
 - **Date:** 2026-10-18
 
 ## Context
@@ -48,10 +48,20 @@ before a connection is taken or dialled.
 
 The flag governs **both directions**: with it set the session declares 789
 and acts on the counterparty's; with it unset no 789 is sent and a
-counterparty's is ignored, as before. QuickFIX/J's
-`EnableNextExpectedMsgSeqNum` gates both directions the same way. Gating the
-inbound side keeps the default behaviour unchanged: a counterparty that sends
-789 to a session that did not opt in is not suddenly logged out over it.
+counterparty's is ignored, as before. Gating the inbound side keeps the
+default behaviour unchanged: a counterparty that sends 789 to a session that
+did not opt in is not suddenly logged out over it, and the issue's tasks name
+one option "to enable 789".
+
+The cost is that **789 is bilateral: both sides must enable it.** Engines
+differ here. QuickFIX/C++ (`src/C++/Session.cpp`, `Session::nextLogon`) acts on
+an inbound 789 whatever its own `SendNextExpectedMsgSeqNum` setting says, and,
+when it declared 789 itself, queues a gapped Logon and records the gap as
+already requested instead of sending a `ResendRequest`, with no resend timer.
+Such a counterparty logging on to an IronFix session with the flag off
+declares 789, gets none back, and waits for a resend IronFix never sends; the
+gap is only recovered once later traffic makes it ask. The flag's
+documentation and `doc/fix_operations.md` say so.
 
 ### What the session declares
 
@@ -64,8 +74,9 @@ places 789 after 141 and before `DefaultApplVerID` (1137)):
 - **Acceptor acknowledgement:** the target counter once the initiator's Logon
   has been processed: the Logon's number plus one when it was in sequence, 2
   after a reset (under the reset rule of ADR-0017 the Logon is message 1 of the
-  new stream), and the first missing number when the Logon opened a gap,
-  because a gapped Logon is not consumed.
+  new stream), and the first missing number when the Logon opened a gap: a
+  gapped Logon is not consumed at the handshake (it is held or requested, see
+  below).
 
 So `141=Y` goes with 789 = 1 on the Logon that opens the exchange, and with
 789 = 2 on the acknowledgement of it: in both cases 789 is "the next number
@@ -141,37 +152,61 @@ acknowledgement's other malformed fields: a session Reject (`SessionRejectReason
 13 repeated, 6 not a number, 5 for 0; `RefTagID` 789) and a Logout. A value
 above what was sent gets the Logout alone, as FIX prescribes for that error.
 
+### A gapped Logon or acknowledgement
+
+789 is the Logon sender's built-in `ResendRequest`: by declaring the next
+number it expects, a side asks the other to resend everything from there, and
+the other does so right after the Logon exchange, below its own Logon (the
+range above stops before it). So when both sides declared 789 and the
+counterparty's Logon or acknowledgement arrives with a gap below it, sending a
+`ResendRequest` as well would cross that resend: the counterparty would answer
+the same range twice, and the second answer, arriving below the receiver's
+expectation, is dropped as a possible duplicate, so the number of the Logon
+itself was left to the request's retry timer. Avoiding that crossing request is
+what 789 exists for. The decision, taken in the #79 protocol review and
+matching QuickFIX/C++ (`Session::nextLogon` queues the Logon and records the
+range as requested; `Session::nextQueued` then only increments the target for
+a queued Logon or `ResendRequest`):
+
+- **The gapped Logon is held, not requested**, when this session declared 789
+  and the counterparty's Logon or acknowledgement carries a well-formed 789
+  (evidence that it resends on its own). The acceptor uses the 789 after the
+  reset filter above, so a Logon whose 789 is ignored because this side drives
+  a reset is not held (no gap arises after a reset anyway). Without the
+  counterparty's 789 the gap is requested at once, as before. QuickFIX/C++
+  holds on its own flag alone; requiring the counterparty's 789 as well keeps
+  the immediate request for a counterparty that is not known to resend.
+- **The Logon's number is consumed once the gap below it is filled.** The
+  reactor (`Reactor::release_held_logon`, after every inbound frame) watches
+  the expectation: below the held number it waits; at it, it persists the
+  number plus one as the next target and then moves the expectation, the order
+  every inbound message takes (ADR-0005); above it (a counterparty that fills
+  through its own Logon, one gap fill from the expected number to the Logon's
+  plus one) the hold is simply dropped. The Logon itself was processed at the
+  handshake, so only its number is left to take, as QuickFIX/C++ does for a
+  queued Logon. Arithmetic is checked: an exhausted counter closes the session.
+- **The gap is armed as an implied recovery** (`ResendState::implied`, with no
+  request counted): a gapped frame arriving meanwhile sends no request either,
+  and a counterparty that never resends gets exactly one real `ResendRequest`
+  from the first missing number once the gap has made no progress for
+  `SessionConfig::resend_timeout`, which a limit of one request still allows;
+  partial progress keeps the recovery implied. Frames from beyond the held
+  Logon that arrived while it was held are not covered by the 789 resend, so
+  they are requested as soon as the Logon is consumed, not after the timeout.
+  QuickFIX/C++ has no such timer; this fallback is IronFix's.
+
+The replay range is unchanged: `plan` still answers `789 .. own_logon_seq`,
+stopping before the session's own Logon, which the counterparty holds and
+consumes in the same way.
+
 ### What does not change
 
-A gap in the Logon's own `MsgSeqNum` still draws a `ResendRequest` (issue #79:
-"stays as today"), in both roles. The typestate is unchanged, and so are the
-heartbeat timers, the store contract and the write order: the replay files
-nothing and spends no number.
-
-## Open questions
-
-- **The replay stops before the session's own Logon.** The approved plan
-  replays `789 .. own_logon_seq` exclusive of that Logon, which matches the
-  FIX model in which the receiver holds a gapped Logon until the gap before it
-  is filled and then consumes it (QuickFIX/J does). IronFix's own receiver does
-  not hold it (no gap queue yet, #71): a gapped Logon is processed, not
-  consumed, and its number is recovered by the `ResendRequest` it sends. When
-  the answer to that request covers the Logon with a gap fill that starts
-  below the number the receiver then expects (the message before the Logon is
-  administrative, typically the previous session's Logout), the receiver
-  ignores that fill as a possible duplicate, and the Logon's number is
-  recovered only by the request's retry after `SessionConfig::resend_timeout`
-  (10 s by default). Nothing is lost and no number is reused, but between two
-  IronFix engines the receiver's expectation waits on the Logon's number for
-  up to one resend timeout; live messages arriving meanwhile are gapped and
-  re-requested by that retry. Two remedies are open for protocol review:
-  replay through the session's own Logon (gap-filling it) whenever 789 is
-  below it, which the issue text ("replay `789..` as if a `ResendRequest` had
-  arrived") also reads as and which a conformant receiver that consumed the
-  Logon ignores as a duplicate; or the gap queue of #71.
-- **Inbound gated by the same flag.** The issue's tasks name one option "to
-  enable 789"; gating both directions is the reading taken here. Honouring a
-  received 789 unconditionally would change the default behaviour.
+A gapped Logon from a counterparty that declared no 789, or on a session with
+the flag off, still draws a `ResendRequest` as the reactor's first act
+(ADR-0005 item 6). The typestate is unchanged, and so are the heartbeat timers,
+the store contract and the write order: the replay files nothing and spends no
+number, and the held Logon's number is persisted before the expectation moves
+past it.
 
 ## Consequences
 
@@ -183,14 +218,19 @@ nothing and spends no number.
   `EngineError::NextExpectedMsgSeqNum` (both enums `#[non_exhaustive]`). No
   existing item changes signature. The `next_expected` module, the factory's
   extra Logon parameter, `SessionParams::opening_replay` and
-  `Reactor::resend_range` are crate-private.
+  `SessionParams::held_logon`, `ResendState::implied`, `Reactor::resend_range`
+  and `Reactor::release_held_logon` are crate-private.
 - **Behaviour:** none with the flag off. With it on, the Logon exchange
-  carries 789, and a counterparty's 789 can replay a range after `on_logon` or
-  refuse the Logon before it.
+  carries 789, a counterparty's 789 can replay a range after `on_logon` or
+  refuse the Logon before it, and a gapped Logon from a counterparty that
+  declared 789 is held instead of requested. Between two IronFix engines with
+  the flag on, a restarted side gets back what it missed with no
+  `ResendRequest` either way, and the next live message is in sequence.
 - The crate DAG is unchanged: `session` gains a flag and a check over `core`
   types, `engine` the decisions. No dependency was added.
 - No performance claim (ADR-0001): the Logon exchange reads one more field,
   and the replay is the existing resend path; nothing was measured.
-- **Not done:** 789 is not consulted outside the Logon exchange; the gap
-  queue that would let the receiver consume a gapped Logon is #71; the joint
-  crash and takeover suite that exercises 789 across injected crashes is #89.
+- **Not done:** 789 is not consulted outside the Logon exchange; only the
+  Logon's number is held, and a general queue of messages received across a
+  gap is #71; the joint crash and takeover suite that exercises 789 across
+  injected crashes is #89.

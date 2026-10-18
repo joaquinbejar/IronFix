@@ -118,7 +118,9 @@ messages and the engine wiring do not exist yet.
   refused before authentication (wrong version, encryption, CompIDs, clock or
   credentials) gets no reply; a second Logon for a session already live gets
   no reply in every case; an authenticated peer refused after that
-  (`HeartBtInt`, `MsgSeqNum`) gets a filed Logout saying why.
+  (`DefaultApplVerID` on a FIX 5.0 session, a `ResetSeqNumFlag` Logon not
+  numbered 1, `HeartBtInt`, `NextExpectedMsgSeqNum` when it is used,
+  `MsgSeqNum`) gets a filed Logout saying why.
 - **`NextExpectedMsgSeqNum` (789) on Logon**, opt-in with
   `SessionConfig::send_next_expected_msg_seq_num` on FIX.4.4 and FIXT.1.1
   sessions (refused below FIX.4.4), in both roles. The Logon and its
@@ -126,10 +128,16 @@ messages and the engine wiring do not exist yet.
   `ResetSeqNumFlag` Logon). A counterparty's 789 below the session's own Logon
   makes it resend exactly the missed range once Active, through the resend
   path above; one above what was sent refuses the Logon with a Logout, before
-  `on_logon`. The resend stops before the session's own Logon; between two
-  IronFix engines the receiver then recovers that Logon's number through its
-  own `ResendRequest`, which can take one `resend_timeout`
-  (`doc/adr/0021-next-expected-msg-seq-num.md`).
+  `on_logon`. The resend stops before the session's own Logon. A side that
+  declared 789 and receives a gapped Logon from a counterparty that declared
+  it too sends no `ResendRequest`, which would cross that resend: it holds the
+  Logon, consumes its number once the resend fills the gap below it, and
+  falls back to one `ResendRequest` after `resend_timeout` only if the
+  counterparty never resends. Between two IronFix engines a restarted side
+  gets back what it missed with no `ResendRequest` either way. 789 is
+  bilateral: enable it on both sides, since a counterparty such as
+  QuickFIX/C++ that declares it waits for a resend a session without the flag
+  never sends (`doc/adr/0021-next-expected-msg-seq-num.md`).
 - **A typestate session FSM** and checked sequence arithmetic in
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in
