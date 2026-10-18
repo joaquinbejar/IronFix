@@ -31,6 +31,11 @@
 //! Consequently [`FixVersion::as_str`] (the version's own name, e.g.
 //! `FIX.5.0SP2`) and [`FixVersion::begin_string`] (what goes in tag 8, e.g.
 //! `FIXT.1.1`) are different questions and must not be confused.
+//!
+//! The application version is read back the same way it is stamped:
+//! [`FixVersion::from_appl_ver_id`] is the inverse of
+//! [`FixVersion::appl_ver_id`], so a session that checks an inbound 1137 or
+//! 1128 answers from the same table it stamps from.
 
 use crate::error::UnknownFixVersion;
 use serde::{Deserialize, Serialize};
@@ -144,6 +149,47 @@ impl FixVersion {
             Self::Fix40 | Self::Fix41 | Self::Fix42 | Self::Fix43 | Self::Fix44 | Self::Fixt11 => {
                 None
             }
+        }
+    }
+
+    /// Returns the version an inbound `DefaultApplVerID` (1137) or
+    /// `ApplVerID` (1128) value names, or `None` when it names none this
+    /// workspace frames.
+    ///
+    /// This is the exact inverse of [`FixVersion::appl_ver_id`]: `7` =
+    /// FIX.5.0, `8` = FIX.5.0SP1, `9` = FIX.5.0SP2, and nothing else. The
+    /// `ApplVerID` enumeration also defines codes for earlier versions (`0` =
+    /// FIX.2.7, `1` = FIX.3.0, `2` = FIX.4.0 … `6` = FIX.4.4), which a
+    /// counterparty may use to carry FIX 4.x messages over FIXT.1.1. They are
+    /// `None` here for the reason [`FixVersion::appl_ver_id`] does not return
+    /// them: a [`FixVersion`] of the 4.x family is a pre-FIXT session with its
+    /// own `BeginString`, not an application version of a FIXT one, so mapping
+    /// `6` to [`FixVersion::Fix44`] would describe a session this workspace
+    /// does not run.
+    ///
+    /// Matching is exact, as for [`FromStr`]: the value travels on the wire
+    /// verbatim, so `09`, ` 9` or `9.0` name no version.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironfix_core::FixVersion;
+    ///
+    /// assert_eq!(FixVersion::from_appl_ver_id("9"), Some(FixVersion::Fix50Sp2));
+    /// assert_eq!(FixVersion::from_appl_ver_id("6"), None);
+    /// for version in FixVersion::ALL {
+    ///     if let Some(code) = version.appl_ver_id() {
+    ///         assert_eq!(FixVersion::from_appl_ver_id(code), Some(version));
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub const fn from_appl_ver_id(value: &str) -> Option<Self> {
+        match value.as_bytes() {
+            [b'7'] => Some(Self::Fix50),
+            [b'8'] => Some(Self::Fix50Sp1),
+            [b'9'] => Some(Self::Fix50Sp2),
+            _ => None,
         }
     }
 
@@ -268,6 +314,66 @@ mod tests {
     fn test_fix_version_from_str_is_case_sensitive() {
         assert!("fix.4.4".parse::<FixVersion>().is_err());
         assert!("FIX.5.0sp2".parse::<FixVersion>().is_err());
+    }
+
+    #[test]
+    fn test_fix_version_from_appl_ver_id_inverts_appl_ver_id() {
+        for version in FixVersion::ALL {
+            match version.appl_ver_id() {
+                Some(code) => assert_eq!(FixVersion::from_appl_ver_id(code), Some(version)),
+                None => assert!(
+                    FixVersion::ALL
+                        .into_iter()
+                        .filter_map(FixVersion::appl_ver_id)
+                        .all(|code| FixVersion::from_appl_ver_id(code) != Some(version)),
+                    "{version:?} carries no ApplVerID, so no code may name it"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_fix_version_from_appl_ver_id_maps_the_fifty_family() {
+        assert_eq!(FixVersion::from_appl_ver_id("7"), Some(FixVersion::Fix50));
+        assert_eq!(
+            FixVersion::from_appl_ver_id("8"),
+            Some(FixVersion::Fix50Sp1)
+        );
+        assert_eq!(
+            FixVersion::from_appl_ver_id("9"),
+            Some(FixVersion::Fix50Sp2)
+        );
+    }
+
+    #[test]
+    fn test_fix_version_from_appl_ver_id_refuses_every_other_value() {
+        // The pre-5.0 codes of the ApplVerID enumeration (0 to 6) name no
+        // FIXT application version this workspace frames, and matching is
+        // exact.
+        for value in [
+            "0",
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "10",
+            "",
+            "07",
+            "09",
+            " 9",
+            "9 ",
+            "9.0",
+            "FIX.5.0SP2",
+            "x",
+        ] {
+            assert_eq!(
+                FixVersion::from_appl_ver_id(value),
+                None,
+                "'{value}' must name no version"
+            );
+        }
     }
 
     #[test]
