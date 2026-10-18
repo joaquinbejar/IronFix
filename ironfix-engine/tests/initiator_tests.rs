@@ -3674,6 +3674,84 @@ async fn test_corrupted_store_closes_the_session_instead_of_gap_filling_a_resend
     );
 }
 
+/// A `FileStore` whose journal is cut under a live session, after the orders
+/// were filed: the engine closes the session rather than gap-filling orders
+/// the store may still hold.
+///
+/// The ResendRequest's own target counter is written before the replay, at
+/// the store's end of journal, which leaves the cut region reading as zeros:
+/// the replay then finds the record failing its checksum. A read that finds
+/// the file ending inside an indexed record (nothing written after the cut)
+/// is reported corrupted the same way; that path is covered in
+/// `ironfix-store`, where no write intervenes.
+#[tokio::test]
+async fn test_file_store_cut_under_the_session_closes_it_instead_of_gap_filling() {
+    let dir = TestDir::new("file-store-cut");
+    let config = ok(
+        FileStoreConfig::try_new(&dir.0, "FIX.4.4-CLIENT-VENUE"),
+        "store config",
+    )
+    .with_create_if_missing(true);
+    let journal = config.journal_path();
+    let (listener, addr) = bind_listener().await;
+    let (filed_tx, filed_rx) = tokio::sync::oneshot::channel::<()>();
+    let (cut_tx, cut_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let _ = drain_orders(&mut framed, 2, 2).await;
+        let _ = filed_tx.send(());
+        let _ = cut_rx.await;
+        ok(
+            framed.send(venue_msg("2", 2, &[(7, "2"), (16, "3")])).await,
+            "ask for the orders",
+        );
+        let mut after = Vec::new();
+        while let Ok(Some(Ok(frame))) = timeout(Duration::from_secs(5), framed.next()).await {
+            after.push((msg_type_of(&frame), field(&frame, 43)));
+        }
+        after
+    });
+
+    let store = ok(FileStore::open(config).await, "open the store");
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::new(store));
+    let connection = ok(initiator.connect(addr).await, "connect");
+    send_orders(&connection, 2).await;
+    ok(
+        timeout(Duration::from_secs(5), filed_rx).await,
+        "orders read within 5s",
+    )
+    .ok();
+    // Cut the journal inside the last order's record, behind the store.
+    let len = ok(std::fs::metadata(&journal), "journal metadata").len();
+    let file = ok(
+        std::fs::OpenOptions::new().write(true).open(&journal),
+        "open the journal",
+    );
+    ok(file.set_len(len - 10), "cut the journal");
+    let _ = cut_tx.send(());
+
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the session closes within 5s",
+    );
+    let after = ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+    assert!(
+        after
+            .iter()
+            .all(|(msg_type, poss_dup)| msg_type != "4" && poss_dup.is_none()),
+        "neither a gap fill nor a replay answers the request: {after:?}"
+    );
+}
+
 /// A store write that fails outright, not only one that overruns the store
 /// timeout, may have changed the store before failing: under `Continue` the
 /// session carries on, and the next connect resets the store and logs on at
