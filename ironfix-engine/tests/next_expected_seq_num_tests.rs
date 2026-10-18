@@ -2332,6 +2332,154 @@ async fn test_fixt_initiator_against_acceptor_with_next_expected() {
 }
 
 // ---------------------------------------------------------------------------
+// Initiator: a reset it declared that the ack does not echo
+// ---------------------------------------------------------------------------
+
+/// After a reset the initiator declared (`reset_on_logon`), an ack that does
+/// not echo `ResetSeqNumFlag` is the acceptor's message 1 whatever its
+/// number (the reset rule), and its 789 may describe the stream the reset
+/// discards: it is ignored. An ack at 7 with 789 = 9 is accepted, nothing is
+/// replayed or refused, and 2 is expected next.
+#[tokio::test]
+async fn test_initiator_reset_logon_ignores_the_789_of_an_ack_without_141() {
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let (mut framed, logon) = read_client_logon(listener).await;
+        assert_eq!(field(&logon, 141).as_deref(), Some("Y"));
+        assert_eq!(field(&logon, 789).as_deref(), Some("1"));
+        ok(
+            framed.send(venue_ack(7, &[(789, "9")])).await,
+            "the venue acknowledges in its old stream",
+        );
+        assert_silent(&mut framed, "nothing replayed or refused").await;
+        framed
+    });
+    let (client_app, _rx) = RecordingApp::new();
+    let connection = ok(
+        Initiator::new(
+            client_789().with_reset_on_logon(true),
+            Arc::clone(&client_app),
+        )
+        .connect(addr)
+        .await,
+        "the ack is accepted as message 1",
+    );
+    assert!(client_app.logged_on());
+    assert_eq!(connection.next_target_seq(), 2);
+    assert_eq!(connection.next_sender_seq(), 2);
+    let _framed = ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+}
+
+/// The same for a reset an earlier session owes: the Logon declares it, the
+/// ack does not echo it, and the ack's 789 (9) is ignored.
+#[tokio::test]
+async fn test_initiator_owed_reset_ignores_the_789_of_an_ack_without_141() {
+    let store = Arc::new(FlakyResetStore::new());
+    let (client_app, _rx) = RecordingApp::new();
+    let mut config = client_789();
+    config.reset_on_disconnect = true;
+    let initiator = Initiator::new(config, Arc::clone(&client_app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+
+    // First session: its close-time reset fails, so the reset is owed.
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let (mut framed, _logon) = read_client_logon(listener).await;
+        ok(
+            framed.send(venue_ack(1, &[(789, "2")])).await,
+            "the venue acknowledges",
+        );
+        framed
+    });
+    let connection = ok(initiator.connect(addr).await, "first connect");
+    let framed = ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+    store.fail_reset.store(true, Ordering::SeqCst);
+    drop(framed);
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+    store.fail_reset.store(false, Ordering::SeqCst);
+
+    // Second session: the owed reset is declared; the ack ignores it.
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let (mut framed, logon) = read_client_logon(listener).await;
+        assert_eq!(field(&logon, 34).as_deref(), Some("1"));
+        assert_eq!(field(&logon, 141).as_deref(), Some("Y"));
+        ok(
+            framed.send(venue_ack(7, &[(789, "9")])).await,
+            "the venue acknowledges in its old stream",
+        );
+        assert_silent(&mut framed, "nothing replayed or refused").await;
+        framed
+    });
+    let connection = ok(initiator.connect(addr).await, "second connect");
+    assert_eq!(connection.next_target_seq(), 2);
+    assert_eq!(connection.next_sender_seq(), 2);
+    let _framed = ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+}
+
+/// What a declared reset does not relax: an ack that echoes
+/// `ResetSeqNumFlag` knew of the reset, so its 789 is still held to the new
+/// stream (3 is above the next number sent, 2: refused), and a malformed 789
+/// is refused whatever the ack declares.
+#[tokio::test]
+async fn test_initiator_reset_logon_still_checks_an_echoing_or_malformed_789() {
+    for (ack_extra, mention) in [
+        (&[(141u32, "Y"), (789, "3")][..], "higher than expected"),
+        (&[(789u32, "abc")][..], "not a sequence number"),
+    ] {
+        let (listener, addr) = bind_listener().await;
+        let ack = venue_ack(1, ack_extra);
+        let venue = tokio::spawn(async move {
+            let (mut framed, _logon) = read_client_logon(listener).await;
+            ok(framed.send(ack).await, "the venue acknowledges");
+            let mut types = Vec::new();
+            while let Ok(Some(Ok(frame))) = timeout(Duration::from_secs(2), framed.next()).await {
+                types.push(msg_type_of(&frame));
+            }
+            types
+        });
+        let (client_app, _rx) = RecordingApp::new();
+        let result = Initiator::new(
+            client_789().with_reset_on_logon(true),
+            Arc::clone(&client_app),
+        )
+        .connect(addr)
+        .await;
+        assert_next_expected_refusal(&result, &["789", mention]);
+        assert!(!client_app.logged_on());
+        let types = ok(
+            ok(
+                timeout(Duration::from_secs(5), venue).await,
+                "venue done within 5s",
+            ),
+            "venue task",
+        );
+        assert_eq!(types.last().map(String::as_str), Some("5"), "a Logout");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // End to end: a real Initiator reconnecting to a real Acceptor over FileStores
 // ---------------------------------------------------------------------------
 

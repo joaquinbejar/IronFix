@@ -1028,6 +1028,25 @@ impl<A: Application + 'static> Initiator<A> {
                 };
                 let declared = next_expected::read_next_expected(&raw);
                 ack_declares_789 = matches!(declared, Ok(Some(_)));
+                // A reset this side declared that the ack does not echo: under
+                // the reset rule the ack is the acceptor's message 1 whatever
+                // its number, and its 789 may describe the stream the reset
+                // discards, so a well-formed value is ignored, as the acceptor
+                // ignores the Logon's 789 for a reset it drives alone. A
+                // malformed value is still refused, and an ack that echoes 141
+                // knew of the reset, so its 789 is still checked.
+                let declared = match declared {
+                    Ok(Some(value)) if reset_logon && !ack_resets => {
+                        tracing::debug!(
+                            session = %session_id,
+                            declared = value.get(),
+                            "ignoring the Logon ack's NextExpectedMsgSeqNum: it does not echo \
+                             the sequence reset this session declared"
+                        );
+                        Ok(None)
+                    }
+                    other => other,
+                };
                 let decided = declared.and_then(|declared| {
                     declared
                         .map(|declared| next_expected::plan(declared, own_logon_seq, next_outbound))
