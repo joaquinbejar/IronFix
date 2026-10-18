@@ -189,7 +189,7 @@ use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResu
 use ironfix_session::{Disconnected, HeartbeatManager, Session, SessionConfig};
 use ironfix_store::MessageStore;
 use std::num::NonZeroU64;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::time::timeout;
@@ -632,10 +632,10 @@ impl<A: Application + 'static> Initiator<A> {
                 return Err(err);
             }
         };
-        let runtime = Arc::new(SessionRuntime {
+        let runtime = Arc::new(SessionRuntime::new(
             sequences,
-            heartbeat: Mutex::new(HeartbeatManager::new(self.config.heartbeat_interval)),
-        });
+            HeartbeatManager::new(self.config.heartbeat_interval),
+        ));
         let mut factory = MessageFactory::new(&self.config, version);
         let identity = PeerIdentity::new(&self.config);
         let sending_time = SendingTimeGuard::new(&self.config);
@@ -832,11 +832,14 @@ impl<A: Application + 'static> Initiator<A> {
             // (reason 18; 13 for a repeated 1137; 1 for a missing one in
             // strict mode; RefTagID 1137) and a Logout.
             match appl_version.check_logon(&raw, self.config.require_ack_default_appl_ver_id) {
-                Ok(Some(declared)) => tracing::debug!(
-                    session = %session_id,
-                    default_appl_version = %declared,
-                    "counterparty declared its default application version"
-                ),
+                Ok(Some(declared)) => {
+                    tracing::debug!(
+                        session = %session_id,
+                        default_appl_version = %declared,
+                        "counterparty declared its default application version"
+                    );
+                    runtime.record_counterparty_default_appl_version(declared);
+                }
                 Ok(None) => {}
                 Err(problem) => {
                     let detail = problem.to_string();

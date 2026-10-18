@@ -1108,13 +1108,19 @@ impl<A: Application + 'static> Acceptor<A> {
             // like the other authenticated refusals; it is checked before the
             // store is reset, so a refused Logon never resets it. A FIX 4.x
             // Logon carries no 1137 and is not checked.
-            match appl_version.check_logon(&raw, true) {
-                Ok(Some(declared)) => tracing::debug!(
-                    session = %session_id,
-                    default_appl_version = %declared,
-                    "counterparty declared its default application version"
-                ),
-                Ok(None) => {}
+            // The declared version is kept for the session's runtime once it
+            // exists (`Connection::counterparty_default_appl_version`).
+            let declared_appl_version = match appl_version.check_logon(&raw, true) {
+                Ok(declared) => {
+                    if let Some(declared) = declared {
+                        tracing::debug!(
+                            session = %session_id,
+                            default_appl_version = %declared,
+                            "counterparty declared its default application version"
+                        );
+                    }
+                    declared
+                }
                 Err(problem) => {
                     let detail = problem.to_string();
                     tracing::warn!(session = %session_id, detail = %detail, "rejecting Logon DefaultApplVerID");
@@ -1132,7 +1138,7 @@ impl<A: Application + 'static> Acceptor<A> {
                     refused?;
                     return Err(EngineError::ApplVersion { detail });
                 }
-            }
+            };
 
             // ResetSeqNumFlag (141): FIX requires MsgSeqNum = 1 on a Logon that
             // itself carries ResetSeqNumFlag = Y: the reset and the number
@@ -1210,10 +1216,13 @@ impl<A: Application + 'static> Acceptor<A> {
                     "resetting sequence numbers on Logon"
                 );
             }
-            runtime = Arc::new(SessionRuntime {
+            runtime = Arc::new(SessionRuntime::new(
                 sequences,
-                heartbeat: Mutex::new(HeartbeatManager::new(self.config.heartbeat_interval)),
-            });
+                HeartbeatManager::new(self.config.heartbeat_interval),
+            ));
+            if let Some(declared) = declared_appl_version {
+                runtime.record_counterparty_default_appl_version(declared);
+            }
             // Every frame from here on goes through this binding: filed, and its
             // number persisted, before it is written.
             store = self.store.handshake(persisted, write_timeout);

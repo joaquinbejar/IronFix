@@ -595,6 +595,13 @@ pub struct SessionConfig {
     /// configured version only. Read the rule through
     /// [`SessionConfig::accepts_appl_version`].
     ///
+    /// When the set admits more than one version, which one the counterparty
+    /// chose matters to the application: `ironfix-engine` keeps the 1137 it
+    /// accepted and exposes it on its `Connection`
+    /// (`counterparty_default_appl_version`), as the version of every inbound
+    /// message without 1128, and the application can also read 1137 off the
+    /// Logon itself in its `from_admin` callback.
+    ///
     /// Range: empty, or FIX.5.0, FIX.5.0SP1 and FIX.5.0SP2 on a session whose
     /// `begin_string` is one of them. A FIX 4.x session carries neither field,
     /// so a set there, or a set naming a version without an `ApplVerID` code

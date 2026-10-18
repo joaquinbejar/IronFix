@@ -467,6 +467,11 @@ async fn test_acceptor_fixt_logon_with_default_appl_ver_id_9_reaches_active() {
     assert_eq!(field(&ack, 8).as_deref(), Some("FIXT.1.1"));
     assert_eq!(field(&ack, 1137).as_deref(), Some("9"));
     assert!(venue_app.logged_on());
+    assert_eq!(
+        connection.counterparty_default_appl_version(),
+        Some(FixVersion::Fix50Sp2),
+        "the declared default is kept"
+    );
 
     // An application message stamped with the session's own version is
     // delivered.
@@ -558,8 +563,12 @@ async fn test_acceptor_accepts_an_allowed_default_appl_ver_id_besides_its_own() 
     let (mut framed, connection, ack) =
         establish(acceptor, client_fixt_logon(1, &[(1137, "8")])).await;
 
-    // The acceptor still declares its own version.
+    // The acceptor still declares its own version, and keeps the peer's.
     assert_eq!(field(&ack, 1137).as_deref(), Some("9"));
+    assert_eq!(
+        connection.counterparty_default_appl_version(),
+        Some(FixVersion::Fix50Sp1)
+    );
 
     for (seq, appl_ver_id) in [(2u64, "8"), (3, "9")] {
         ok(
@@ -713,6 +722,11 @@ async fn test_initiator_accepts_an_ack_without_or_with_its_own_default_appl_ver_
         );
         assert!(client_app.logged_on());
         assert_eq!(connection.next_target_seq(), 2);
+        // An ack without 1137 declares no default; one with 9 declares SP2.
+        let declared = ack_extra
+            .first()
+            .and_then(|(_, code)| FixVersion::from_appl_ver_id(code));
+        assert_eq!(connection.counterparty_default_appl_version(), declared);
         let _framed = ok(
             ok(
                 timeout(Duration::from_secs(5), venue).await,
@@ -1023,6 +1037,11 @@ async fn test_fix4_sessions_are_unaffected() {
             let (mut framed, connection, ack) = establish(acceptor, logon).await;
             assert_eq!(field(&ack, 1137), None, "{version} declares no 1137");
             assert!(venue_app.logged_on(), "{version} reaches Active");
+            assert_eq!(
+                connection.counterparty_default_appl_version(),
+                None,
+                "a {version} session keeps no application version"
+            );
 
             ok(
                 framed

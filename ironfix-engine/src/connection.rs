@@ -14,8 +14,9 @@
 use crate::application::SessionId;
 use crate::error::EngineError;
 use crate::outbound::OutboundMessage;
+use ironfix_core::version::FixVersion;
 use ironfix_session::{HeartbeatManager, SequenceManager};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, watch};
 
 /// Commands sent from a [`Connection`] handle to the session reactor.
@@ -34,6 +35,30 @@ pub(crate) struct SessionRuntime {
     pub(crate) sequences: SequenceManager,
     /// Heartbeat and TestRequest timing state.
     pub(crate) heartbeat: Mutex<HeartbeatManager>,
+    /// The default application version the counterparty declared in
+    /// `DefaultApplVerID` (1137) on its Logon, once the handshake has
+    /// checked it; unset on a FIX 4.x session and when it declared none.
+    /// Set at most once, during the handshake, and read-only afterwards.
+    pub(crate) counterparty_default_appl_version: OnceLock<FixVersion>,
+}
+
+impl SessionRuntime {
+    /// Builds the runtime of a session about to run its handshake.
+    #[must_use]
+    pub(crate) fn new(sequences: SequenceManager, heartbeat: HeartbeatManager) -> Self {
+        Self {
+            sequences,
+            heartbeat: Mutex::new(heartbeat),
+            counterparty_default_appl_version: OnceLock::new(),
+        }
+    }
+
+    /// Records the default application version the counterparty declared,
+    /// once the handshake has accepted it. A second call is ignored: the
+    /// Logon exchange declares it once.
+    pub(crate) fn record_counterparty_default_appl_version(&self, version: FixVersion) {
+        let _ = self.counterparty_default_appl_version.set(version);
+    }
 }
 
 /// Handle to a live FIX session.
@@ -169,5 +194,31 @@ impl Connection {
     #[must_use]
     pub fn next_target_seq(&self) -> u64 {
         self.runtime.sequences.next_target_seq().value()
+    }
+
+    /// Returns the default application version the counterparty declared in
+    /// `DefaultApplVerID` (1137) on its Logon, on a FIX 5.0 session (framed
+    /// as FIXT.1.1).
+    ///
+    /// It is the application version of every inbound application message
+    /// that carries no `ApplVerID` (1128); a message with 1128 is in the
+    /// version 1128 names. The handshake checked it against
+    /// [`SessionConfig::accepts_appl_version`](ironfix_session::SessionConfig::accepts_appl_version),
+    /// so it is always a version this session accepts, possibly another than
+    /// its own when [`SessionConfig::allowed_appl_versions`](ironfix_session::SessionConfig::allowed_appl_versions)
+    /// is set.
+    ///
+    /// `None` on a FIX 4.x session, which carries no 1137, and on an
+    /// initiator whose Logon acknowledgement declared none (accepted unless
+    /// [`SessionConfig::require_ack_default_appl_ver_id`](ironfix_session::SessionConfig::require_ack_default_appl_ver_id)
+    /// is set): the counterparty's messages without 1128 are then taken to be
+    /// in this session's own configured version. On an acceptor it is never
+    /// `None` for a FIX 5.0 session, since the Logon must declare it.
+    #[must_use]
+    pub fn counterparty_default_appl_version(&self) -> Option<FixVersion> {
+        self.runtime
+            .counterparty_default_appl_version
+            .get()
+            .copied()
     }
 }

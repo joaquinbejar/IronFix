@@ -156,9 +156,22 @@ exists for a Reject to belong to. `serve` returns `EngineError::ApplVersion {
 detail }`, a new variant (`EngineError` is `#[non_exhaustive]`). A session
 routed by an `AcceptorRegistry` runs the same handshake, so it behaves the same.
 
-The acknowledgement keeps declaring the acceptor's own version in 1137; the
-peer's declared default is logged at debug level and is not adopted for
-outbound traffic.
+The acknowledgement keeps declaring the acceptor's own version in 1137, and
+the peer's declared default is not adopted for outbound traffic.
+
+### The declared default is kept
+
+The 1137 a handshake accepted is kept in the session's runtime and exposed as
+`Connection::counterparty_default_appl_version() -> Option<FixVersion>`
+(added in review): the version of every inbound application message without
+1128. With an allowed set of more than one version, it is how the application
+learns which one the counterparty chose; it can also read 1137 off the Logon
+in `from_admin`. It is `None` on a FIX 4.x session and on an initiator whose
+ack declared none (accepted unless in strict mode, below); on a FIX 5.0
+acceptor it is always set, since the Logon must declare it. It is stored in a
+`OnceLock` in the shared runtime because the initiator builds its runtime
+before the acknowledgement arrives; it is written once, during the
+handshake, and only read afterwards.
 
 ### Initiator: the ack's 1137 when present
 
@@ -221,6 +234,7 @@ calling `deliver_app` directly; the method's documentation says so.
   `SessionConfig::require_ack_default_appl_ver_id` (a field),
   `SessionConfig::with_require_ack_default_appl_ver_id`,
   `SessionConfigBuilder::require_ack_default_appl_ver_id`;
+  `Connection::counterparty_default_appl_version`;
   `SessionConfigError::UnusableApplVersion` and `EngineError::ApplVersion`
   (both enums `#[non_exhaustive]`). No existing item changes signature.
 - **Behaviour, FIX 5.0 sessions only:** an acceptor refuses a Logon whose 1137
@@ -230,8 +244,11 @@ calling `deliver_app` directly; the method's documentation says so.
   placed outside it is rejected and not delivered. A FIX 5.0 peer that previously logged on with
   another version, or none, is now refused. FIX 4.x sessions are unchanged.
 - **Not done:** no dictionary is selected by `ApplVerID`; the peer's default
-  is not adopted for outbound messages; FIX 4.x over FIXT.1.1 (`ApplVerID` 2 to
-  6) is refused; `CstmApplVerID` (1129), `ApplExtID` (1156),
+  is kept and exposed but not adopted for outbound messages; the
+  per-message-type versions a Logon may declare (the `NoMsgTypes` (384) group with
+  `RefMsgType` (372), `RefApplVerID` (1130) and `DefaultVerIndicator` (1410))
+  are not honoured, so 1128 and the declared default are the only versions
+  checked; FIX 4.x over FIXT.1.1 (`ApplVerID` 2 to 6) is refused; `CstmApplVerID` (1129), `ApplExtID` (1156),
   `DefaultApplExtID` (1407) and `DefaultCstmApplVerID` (1408) are not
   checked.
 - The crate DAG is unchanged: `core` gains a function, `session` a field and a

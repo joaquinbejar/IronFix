@@ -1779,7 +1779,16 @@ checked.
 - No dictionary is consulted: an accepted `ApplVerID` selects nothing, and the
   engine never validates a message body against an application dictionary.
 - The counterparty's declared default is not adopted for outbound traffic:
-  the session always declares and stamps its own configured version.
+  the session always declares and stamps its own configured version. It is
+  kept and exposed as `Connection::counterparty_default_appl_version` (the
+  version of every inbound message without 1128; `None` on FIX 4.x and on an
+  initiator whose ack declared none), and the application can also read 1137
+  off the Logon in `from_admin`.
+- Per-message-type versions declared on the Logon are not honoured: the
+  `NoMsgTypes` (384) group, with `RefMsgType` (372), `RefApplVerID` (1130) and
+  `DefaultVerIndicator` (1410), is neither read nor sent, so a counterparty
+  that declares a different default version for some message types has each
+  such message checked against its 1128 and the Logon's single default only.
 - FIX 4.x messages carried over FIXT.1.1 (`ApplVerID` `2` to `6`) are refused:
   the engine frames a FIX 4.x version only as a FIX 4.x session.
 - `CstmApplVerID` (1129), `ApplExtID` (1156), `DefaultApplExtID` (1407) and

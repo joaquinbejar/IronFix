@@ -33,7 +33,8 @@
 //!   it holds. Each session keeps its own sequence numbers, store and
 //!   heartbeat.
 //! - **[`Connection`]**: a cheap-clone handle returned by both engines — send,
-//!   logout, await close, read sequence numbers.
+//!   logout, await close, read sequence numbers and, on a FIX 5.0 session,
+//!   the counterparty's declared default application version.
 //! - **[`OutboundMessage`]**: the body you hand to [`Connection::send`]; the
 //!   engine stamps the header, `MsgSeqNum` and trailer.
 //! - **[`Application`]**: the QuickFIX-shaped callback trait
