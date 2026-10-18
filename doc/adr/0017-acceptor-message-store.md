@@ -60,32 +60,43 @@ owed reset. Every reset and refresh fails closed whatever the policy.
 
 ### The order of the acceptor's checks
 
-Version, encryption method, `MsgSeqNum` placement, identity, admission (one
-live session), `SendingTime`, `from_admin`, `141=Y` carrying `MsgSeqNum` 1,
+Version, encryption method, `MsgSeqNum` (present in the header, and not 0),
+identity, admission (one live session), `SendingTime`, `from_admin`; the peer
+is authenticated from here on; then `141=Y` carrying `MsgSeqNum` 1,
 `HeartBtInt`; then the store is reset (if the session resets) or refreshed;
-then `MsgSeqNum` is validated and the acknowledgement sent. Only a Logon that
-passes every check can reset the store.
+then `MsgSeqNum` is validated and the acknowledgement sent. The store is not
+touched before authentication, and only a Logon that passes every check can
+reset it.
 
 ### Who a refused Logon is answered for
 
-1. **An unknown peer** (version, encryption, missing `MsgSeqNum`, CompIDs). It
-   is not known to be the counterparty. With a store attached it gets no reply:
-   a frame could neither be filed (that would let it write to the journal and
-   move the counters) nor numbered without reusing a number of the stream.
-   Without a store the Reject and/or Logout are sent as before, numbered from
-   the seed or 1, except for a missing `MsgSeqNum`, which never had a reply.
+1. **An unauthenticated peer** (version, encryption, CompIDs, `SendingTime`,
+   credentials refused by `from_admin`). With a store attached it gets no reply
+   and the store is not touched: a frame could neither be filed (that would let
+   it write to the journal and move the counters) nor numbered without reusing
+   a number of the stream. Without a store the Reject and/or Logout are sent as
+   before, numbered from the seed or 1. A Logon without a valid `MsgSeqNum`
+   (absent, outside the header, or 0) gets no reply in either mode.
 2. **A duplicate Logon** for a session already live. It gets no reply with or
    without a store: the live session owns the sequence stream, and nothing the
    newcomer could be sent belongs to it. This changes the store-less behaviour,
    which used to send a Logout (FIX session test case 1S(b)).
-3. **The configured counterparty, holding the admission slot**, refused by the
-   `SendingTime` check (Reject 373 = 10, then Logout), by `from_admin` (Logout
-   with its text), by a `141=Y` Logon not numbered 1, or by its `HeartBtInt`.
-   It gets the Reject and Logout, so it learns why, sent like every session
-   frame: numbered from a seed that never resets (the store's refreshed
-   counters, or the configured seed) and filed when a store is attached. A
-   `MsgSeqNum` below the expected one is refused the same way from the
-   session's own seed. None of these refusals resets the store.
+3. **An authenticated peer** (`from_admin` accepted it), refused by a `141=Y`
+   Logon not numbered 1, by its `HeartBtInt`, or by a `MsgSeqNum` below the
+   expected one. It gets a Logout saying why, sent like every session frame:
+   numbered from a seed that never resets (the store's refreshed counters, or
+   the configured seed) and filed when a store is attached. None of these
+   refusals resets the store.
+
+Matching CompIDs authenticate nobody: they are caller-supplied. A Logon
+refused by the `SendingTime` check or by `from_admin` therefore belongs to
+group 1, not group 3: with a store attached it gets no reply and the store is
+not touched, so a peer that knows the CompIDs but not the credentials cannot
+append to the journal or advance the session's counters. (An earlier revision
+of this ADR filed those refusals; review found that hole.) A Logon numbered 0
+names no message and is refused with a missing `MsgSeqNum`, before identity:
+no reply in either mode, and it never reaches the reset rule, which takes only
+a positive old-stream number as message 1.
 
 ### The reset rule both roles share
 
@@ -143,13 +154,13 @@ off the listener, as `Initiator::connect` does before dialling.
 - **Behaviour changes, with or without a store:** a duplicate Logon gets no
   reply; an acceptor with an unusable configuration refuses to serve, and
   `accept` refuses before taking a connection; a zero initial seed that would
-  be used is refused instead of raised to 1; the counterparty refused by
-  `SendingTime` or `from_admin` gets frames numbered from the session's
-  counters (the store's, or the seed) rather than provisional ones; and after
-  a reset the acceptor drives, a peer Logon numbered N > 1 no longer draws a
-  `ResendRequest`. The initiator, after a reset it declared, no longer opens
-  a gap for an ack that does not echo the reset.
-- **Behaviour with a store:** an unknown peer gets no reply. A misconfigured
+  be used is refused instead of raised to 1; a Logon numbered 0 gets no reply;
+  and after a reset the acceptor drives, a peer Logon numbered N > 1 no longer
+  draws a `ResendRequest`. The initiator, after a reset it declared, no longer
+  opens a gap for an ack with a positive number that does not echo the reset;
+  an ack numbered 0 is still refused as too low.
+- **Behaviour with a store:** an unauthenticated peer (wrong CompIDs, clock or
+  credentials included) gets no reply. A misconfigured or unauthorised
   counterparty sees the connection close; the reason is in the acceptor's log
   and in the error `serve` returns.
 - The crate DAG is unchanged. The decisions are synchronous and read no clock

@@ -72,13 +72,13 @@ exists yet.
   default, which gives no crash guarantee) or failing closed, writing nothing
   the store has not accepted. Every store call is bounded by
   `with_store_timeout`. A store belongs to exactly one engine. The acceptor
-  touches its store only once the peer is known to be the counterparty, and
-  resets it only for a Logon that passes every check, so a refused
-  `ResetSeqNumFlag` Logon cannot clear it. With a store attached, a Logon from
-  an unknown peer (wrong version, encryption or CompIDs) is refused without a
-  reply; a second Logon for a session already live is refused without a reply
-  in every case; the configured counterparty refused after that (clock,
-  `from_admin`, `HeartBtInt`) gets a filed Reject and/or Logout saying why.
+  touches its store only once the peer is authenticated (`from_admin` accepted
+  it), and resets it only for a Logon that passes every check, so a refused
+  `ResetSeqNumFlag` Logon cannot clear it. With a store attached, a Logon
+  refused before authentication (wrong version, encryption, CompIDs, clock or
+  credentials) gets no reply; a second Logon for a session already live gets
+  no reply in every case; an authenticated peer refused after that
+  (`HeartBtInt`, `MsgSeqNum`) gets a filed Logout saying why.
 - **A typestate session FSM** and checked sequence arithmetic in
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in

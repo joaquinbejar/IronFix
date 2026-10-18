@@ -171,8 +171,8 @@ acknowledgement sent. The differences from the initiator are role-symmetric:
   application queue (up to 5 s) and `on_logout`; a Logon arriving before then
   is refused the same way.
 - **The message store.** With `Acceptor::with_store`, the store is touched only
-  once the peer is known to be the counterparty (after identity and
-  admission), and reset only for a Logon that passes every check (for `141=Y`,
+  once the peer is authenticated (after identity, admission, `SendingTime` and
+  `from_admin`), and reset only for a Logon that passes every check (for `141=Y`,
   `reset_on_logon`, or a reset an earlier session owes; one `reset_to` call,
   before the acknowledgement is filed, failing closed whatever the policy).
   Otherwise the session starts from the store's refreshed counters, or the
@@ -184,22 +184,24 @@ A refused Logon drives the typestate through `reject_logon` and the connection
 is dropped without ever reaching Active. What is sent first depends on who sent
 the Logon:
 
-1. **An unknown peer** — wrong `BeginString` or `EncryptMethod`, no `MsgSeqNum`
-   in the header, wrong CompIDs. With a store attached, nothing: a frame could
-   neither be filed (that would let an unknown peer write to the outbound
-   journal and move its counters) nor be numbered without reusing, with
-   different content, a number the session's stream already holds. Without a
-   store, a Reject (reason 9 for identity) and/or a Logout, numbered from the
-   seed or 1, as before. A Logon with no `MsgSeqNum` has no reply in either
-   mode.
-2. **A duplicate Logon** — nothing, in either mode (above).
-3. **The configured counterparty, holding the admission slot** — refused by
-   `SendingTime` (a Reject with `SessionRejectReason` (373) = 10, then a
-   Logout), by `from_admin` (a Logout with its text), by a `141=Y` Logon not
-   numbered 1, by its `HeartBtInt`, or by a `MsgSeqNum` too low (a Logout).
-   These are sent like every session frame: numbered from the store's
+1. **An unauthenticated peer** — wrong `BeginString` or `EncryptMethod`, wrong
+   CompIDs, a `SendingTime` out of tolerance, or credentials that `from_admin`
+   refuses. Matching CompIDs authenticate nobody: they are caller-supplied.
+   With a store attached, nothing is sent and the store is not touched: a frame
+   could neither be filed (that would let a peer that knows the CompIDs but not
+   the credentials append to the outbound journal and advance the session's
+   counters) nor be numbered without reusing, with different content, a number
+   the session's stream already holds. Without a store, a Reject (reason 9 for
+   identity, 10 for the clock) and/or a Logout, numbered from the seed or 1, as
+   before.
+2. **A Logon without a valid `MsgSeqNum`** — absent, outside the header, or 0
+   (which names no message): nothing, in either mode.
+3. **A duplicate Logon** — nothing, in either mode (above).
+4. **An authenticated peer** (`from_admin` accepted it) — refused by a `141=Y`
+   Logon not numbered 1, by its `HeartBtInt`, or by a `MsgSeqNum` too low: a
+   Logout saying why, sent like every session frame, numbered from the store's
    refreshed counters (or the seed), never from a reset, and filed when a store
-   is attached, so the counterparty learns why.
+   is attached.
 
 A gap in the inbound Logon completes the handshake and immediately issues a
 `ResendRequest` (2). Once Active, the session runs the same reactor as the
