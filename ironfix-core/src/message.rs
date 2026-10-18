@@ -587,6 +587,18 @@ impl<'a> RawMessage<'a> {
         self.fields.iter()
     }
 
+    /// Returns all fields as a slice, in wire order.
+    ///
+    /// The same fields [`RawMessage::fields`] iterates, borrowed as one
+    /// contiguous slice so a reader can address them by index (for example to
+    /// hand out a sub-slice per repeating-group entry) without collecting or
+    /// allocating.
+    #[inline]
+    #[must_use]
+    pub fn field_slice(&self) -> &[FieldRef<'a>] {
+        &self.fields
+    }
+
     /// Returns the number of fields in the message.
     #[inline]
     #[must_use]
@@ -1206,6 +1218,31 @@ mod tests {
         assert_eq!(msg.begin_string(), Ok("FIX.4.4"));
         assert_eq!(msg.body(), Ok(&b"35=0\x01"[..]));
         assert_eq!(msg.len(), buffer.len());
+    }
+
+    #[test]
+    fn test_raw_message_field_slice_matches_fields_in_wire_order() {
+        let buffer: &[u8] = b"8=FIX.4.4\x0135=0\x01112=PING\x01";
+        let mut fields: SmallVec<[FieldRef<'_>; 32]> = SmallVec::new();
+        fields.push(FieldRef::new(8, &buffer[2..9]));
+        fields.push(FieldRef::new(35, &buffer[13..14]));
+        fields.push(FieldRef::new(112, &buffer[19..23]));
+        let Ok(msg) = RawMessage::new(buffer, 2..9, 10..buffer.len(), MsgType::Heartbeat, fields)
+        else {
+            panic!("in-bounds ranges must be accepted");
+        };
+
+        let slice = msg.field_slice();
+        assert_eq!(slice.len(), msg.field_count());
+        let tags: Vec<u32> = slice.iter().map(|field| field.tag).collect();
+        assert_eq!(tags, vec![8, 35, 112]);
+        assert!(
+            slice
+                .iter()
+                .zip(msg.fields())
+                .all(|(left, right)| left.tag == right.tag && left.value == right.value)
+        );
+        assert_eq!(slice.get(2).map(|field| field.value), Some(&b"PING"[..]));
     }
 
     #[test]

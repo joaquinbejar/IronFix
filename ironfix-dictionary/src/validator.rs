@@ -77,9 +77,10 @@
 //!   problems it rejects with `SessionRejectReason(373)=1` (required tag
 //!   missing); this validator reports the group's structural error and
 //!   suppresses that group's per-entry errors.
-//! - **Missing tags are reported in schema order.** QuickFIX reports the
-//!   lowest missing tag number first; this validator reports them in the
-//!   order its expanded schema lists them (see the error order below).
+//! - **Missing tags are not reported lowest first.** QuickFIX reports the
+//!   lowest missing tag number first. This validator reports missing fields
+//!   in the order its expanded schema lists them, and missing groups by
+//!   ascending count tag after every missing field (see "Error order" below).
 //!
 //! # How groups are checked
 //!
@@ -91,6 +92,22 @@
 //! a member, so entries detached from their count field are not silently
 //! absorbed, and two different groups that happen to share a delimiter tag
 //! can no longer be confused for one another.
+//!
+//! One boundary is settled by the enclosing scope. Once a group holds every
+//! entry its count declares (at once, for a count of `0`), a field that would
+//! open another entry, or lead one without its delimiter, ends the group if
+//! the enclosing scope (the entry the group is nested in, or the message
+//! level) also accepts that tag: `110=0|300=X`, where `300` is a member of
+//! both the nested group and the enclosing entry, is an empty group followed
+//! by the enclosing entry's `300`. A field only the group accepts still opens
+//! an entry, so a group with more entries than it declares is still a
+//! [`ValidationError::GroupCountMismatch`].
+//!
+//! The walk is the one the repeating-group reader ([`crate::group`]) uses,
+//! so the two agree on entry boundaries and on which group instances are
+//! malformed. A count must be one or more ASCII digits fitting in a `u64`:
+//! a sign (`+1` included, which [`str::parse`] would accept), a decimal point
+//! or an overflowing value is [`ValidationError::InvalidGroupCount`].
 //!
 //! ## Required members of each entry
 //!
@@ -123,18 +140,48 @@
 //! own per-entry errors, not those of the entry that encloses it. A count of
 //! `0` with no entries checks nothing.
 //!
-//! Error order. Within an entry: first the group's own required fields, in
-//! declaration order; then the required members contributed by components
-//! referenced as required, component by component in declaration order (a
-//! component's own fields, then the components it references, depth first);
-//! then missing required nested groups by ascending count tag. Each tag is
-//! reported once, at its first position. A field declared *after* a component
-//! is therefore reported before that component's members: [`GroupDef`] keeps a
-//! group's fields, groups and components in separate lists, so their
-//! interleaving in the XML is not available to the validator. Across entries,
-//! errors come in the order entries close, so a nested group's entries come
-//! before the entry that encloses them. All per-entry errors follow the
-//! message's structural errors.
+//! Order of per-entry errors. Within an entry: first the group's own required
+//! fields, in declaration order; then the required members contributed by
+//! components referenced as required, component by component in declaration
+//! order (a component's own fields, then the components it references, depth
+//! first); then missing required nested groups by ascending count tag. Each
+//! tag is reported once, at its first position. A field declared *after* a
+//! component is therefore reported before that component's members:
+//! [`GroupDef`](crate::schema::GroupDef) keeps a group's fields, groups and
+//! components in separate lists, so their interleaving in the XML is not
+//! available to the validator. Across entries, errors come in the order
+//! entries close, so a nested group's entries come before the entry that
+//! encloses them.
+//!
+//! # Error order
+//!
+//! [`Validator::validate`] reports errors in a fixed order, the same on every
+//! run and for every load of the same dictionary, under [`Validator::new`] and
+//! [`Validator::for_session`] alike:
+//!
+//! 1. [`ValidationError::BeginStringMismatch`] (for a session only).
+//! 2. [`ValidationError::UnknownMsgType`], after which nothing else is checked.
+//! 3. Schema errors of the message's expanded schema
+//!    ([`ValidationError::SchemaTooDeep`], [`ValidationError::SchemaTooLarge`],
+//!    [`ValidationError::UnknownComponent`]), in expansion order.
+//! 4. Value errors ([`ValidationError::UnknownTag`],
+//!    [`ValidationError::InvalidFieldFormat`],
+//!    [`ValidationError::InvalidEnumValue`]), at most one per field, in wire
+//!    order.
+//! 5. Structural errors, in the order a single walk over the message meets
+//!    them: [`ValidationError::DuplicateTag`] and
+//!    [`ValidationError::FieldNotAllowedForMessage`] at the message level,
+//!    and for each group instance its count, delimiter and repeated-tag
+//!    errors as they appear, with its count mismatch when the instance ends
+//!    (a nested group's before its enclosing group's).
+//! 6. Per-entry errors ([`ValidationError::MissingRequiredFieldInGroupEntry`])
+//!    of the well-formed group instances, in the order above.
+//! 7. [`ValidationError::MissingRequiredField`] in schema order: header
+//!    fields, trailer fields, the message's own fields, then the members of
+//!    required components, depth first, each in declaration order.
+//! 8. [`ValidationError::MissingRequiredGroup`] by ascending count tag.
+//! 9. [`ValidationError::ErrorLimitReached`], last, when the output was
+//!    capped.
 //!
 //! **Behaviour change.** Before per-entry checking existed, a message whose
 //! group entries lacked required members validated; it is now rejected, so
@@ -164,11 +211,12 @@
 //!   the codec or by the engine.
 
 use crate::composition::SessionDictionary;
-use crate::schema::{
-    ComponentRef, Dictionary, FieldDef, FieldType, GroupDef, MessageCategory, MessageDef,
-};
+use crate::group::GroupSpec;
+use crate::schema::{Dictionary, FieldDef, FieldType, MessageCategory, MessageDef};
+use crate::scope::{LayoutGroup, Scope, ScopeBuilder};
+use crate::walk::{self, EntryTags};
 use ironfix_core::message::RawMessage;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Maximum group/component nesting the validator will expand.
 ///
@@ -385,265 +433,6 @@ pub enum ValidationError {
     },
 }
 
-/// One structural level of a message: the message body itself, or the
-/// members of a single repeating-group entry.
-#[derive(Debug, Default)]
-struct Level {
-    /// Tags that may appear at this level, including group count tags.
-    allowed: HashSet<u32>,
-    /// Tags that must appear at this level, with their field names.
-    required: Vec<(u32, String)>,
-    /// Groups that may open at this level, keyed by count tag.
-    groups: HashMap<u32, GroupNode>,
-}
-
-impl Level {
-    fn add_field(&mut self, tag: u32, name: &str, required: bool) {
-        self.allowed.insert(tag);
-        if required {
-            self.required.push((tag, name.to_string()));
-        }
-    }
-
-    /// Returns every tag that may appear at this level or inside any group
-    /// entry below it.
-    ///
-    /// Iterative, so its depth is not bounded by the call stack; the tree it
-    /// walks is itself bounded by [`MAX_SCOPE_DEPTH`] and [`MAX_SCOPE_NODES`].
-    fn all_tags(&self) -> HashSet<u32> {
-        let mut tags = HashSet::new();
-        let mut pending: Vec<&Self> = vec![self];
-        while let Some(level) = pending.pop() {
-            tags.extend(level.allowed.iter().copied());
-            pending.extend(level.groups.values().map(|group| &group.entry));
-        }
-        tags
-    }
-}
-
-/// A repeating group and the level formed by one of its entries.
-#[derive(Debug)]
-struct GroupNode {
-    count_tag: u32,
-    name: String,
-    delimiter_tag: u32,
-    required: bool,
-    entry: Level,
-}
-
-/// The expanded schema of one message.
-#[derive(Debug)]
-struct Scope {
-    /// The message level: header, trailer, and body merged.
-    level: Level,
-    /// Every tag the header and trailer contribute, members of header and
-    /// trailer groups included. These resolve against the transport
-    /// dictionary.
-    envelope: HashSet<u32>,
-}
-
-/// Expands a [`MessageDef`] into the level tree the walker validates against.
-struct ScopeBuilder<'d> {
-    /// The dictionary component references currently resolve against: the
-    /// transport while the header and trailer are expanded, then the
-    /// dictionary that defines the message body.
-    dict: &'d Dictionary,
-    budget: usize,
-    errors: Vec<ValidationError>,
-}
-
-impl<'d> ScopeBuilder<'d> {
-    /// Expands `msg_def` with its header and trailer from `transport` and its
-    /// body components resolved against `body`, returning the scope and every
-    /// schema error met on the way (ceilings, undefined components).
-    ///
-    /// For a single-dictionary validator `transport` and `body` are the same
-    /// dictionary.
-    fn expand(
-        transport: &'d Dictionary,
-        body: &'d Dictionary,
-        msg_def: &MessageDef,
-    ) -> (Scope, Vec<ValidationError>) {
-        let mut builder = Self {
-            dict: transport,
-            budget: MAX_SCOPE_NODES,
-            errors: Vec::new(),
-        };
-        let scope = builder.build(transport, body, msg_def);
-        (scope, builder.errors)
-    }
-
-    /// Charges one node against the budget and checks the depth ceiling.
-    fn spend(&mut self, name: &str, depth: usize) -> bool {
-        if depth > MAX_SCOPE_DEPTH {
-            self.errors.push(ValidationError::SchemaTooDeep {
-                name: name.to_string(),
-                limit: MAX_SCOPE_DEPTH,
-            });
-            return false;
-        }
-        match self.budget.checked_sub(1) {
-            Some(remaining) => {
-                self.budget = remaining;
-                true
-            }
-            None => {
-                if !self.errors.contains(&ValidationError::SchemaTooLarge {
-                    limit: MAX_SCOPE_NODES,
-                }) {
-                    self.errors.push(ValidationError::SchemaTooLarge {
-                        limit: MAX_SCOPE_NODES,
-                    });
-                }
-                false
-            }
-        }
-    }
-
-    /// Builds the message level: header and trailer from `transport`, then
-    /// body fields, groups, and directly referenced components from `body`.
-    fn build(
-        &mut self,
-        transport: &'d Dictionary,
-        body: &'d Dictionary,
-        msg_def: &MessageDef,
-    ) -> Scope {
-        let mut level = Level::default();
-        let mut path = HashSet::new();
-
-        self.dict = transport;
-        for field in &transport.header {
-            level.add_field(field.tag, &field.name, field.required);
-        }
-        for group in &transport.header_groups {
-            self.add_group(&mut level, group, group.required, true, 0, &mut path);
-        }
-        for field in &transport.trailer {
-            level.add_field(field.tag, &field.name, field.required);
-        }
-        for group in &transport.trailer_groups {
-            self.add_group(&mut level, group, group.required, true, 0, &mut path);
-        }
-        let envelope = level.all_tags();
-
-        self.dict = body;
-        for field in &msg_def.fields {
-            level.add_field(field.tag, &field.name, field.required);
-        }
-        for group in &msg_def.groups {
-            self.add_group(&mut level, group, group.required, true, 0, &mut path);
-        }
-        for component in &msg_def.components {
-            self.add_component(&mut level, component, true, 0, &mut path);
-        }
-
-        Scope { level, envelope }
-    }
-
-    /// Adds a group to `level` and builds the level formed by one entry.
-    ///
-    /// The group's component references resolve against `self.dict`.
-    /// `required` and `collect_required` decide only whether the group itself
-    /// must appear at `level`. The entry level always collects its members'
-    /// required flags, because per the FIX rule they apply to every entry of
-    /// every group instance present, whether or not the group is required:
-    /// required fields, nested groups marked required, and the required
-    /// members of components referenced as required. The required members of
-    /// a component referenced as *optional* are never collected, even when
-    /// some other member of that component appears in the entry. This is
-    /// stricter than QuickFIX, which collects an entry's required fields only
-    /// for a required group, and (in C++) none from components inside a group.
-    fn add_group(
-        &mut self,
-        level: &mut Level,
-        group: &GroupDef,
-        required: bool,
-        collect_required: bool,
-        depth: usize,
-        path: &mut HashSet<String>,
-    ) {
-        if !self.spend(&group.name, depth) {
-            return;
-        }
-        level.allowed.insert(group.count_tag);
-
-        let mut entry = Level::default();
-        entry.allowed.insert(group.delimiter_tag);
-        for field in &group.fields {
-            entry.add_field(field.tag, &field.name, field.required);
-        }
-        for nested in &group.groups {
-            self.add_group(&mut entry, nested, nested.required, true, depth + 1, path);
-        }
-        for component in &group.components {
-            self.add_component(&mut entry, component, true, depth + 1, path);
-        }
-        // Each required tag is kept once, in its first (dictionary) position,
-        // so the per-entry check is linear in the required set. The delimiter
-        // is dropped: it opens every entry, so it can never be missing.
-        let mut unique: HashSet<u32> = HashSet::with_capacity(entry.required.len());
-        entry
-            .required
-            .retain(|(tag, _)| *tag != group.delimiter_tag && unique.insert(*tag));
-
-        // A group already present at this level keeps its first expansion;
-        // two groups sharing a count tag at one level is a schema defect,
-        // not something to resolve here.
-        level.groups.entry(group.count_tag).or_insert(GroupNode {
-            count_tag: group.count_tag,
-            name: group.name.clone(),
-            delimiter_tag: group.delimiter_tag,
-            required: required && collect_required,
-            entry,
-        });
-    }
-
-    /// Expands a component reference into `level`.
-    ///
-    /// The reference resolves against `self.dict`. `collect_required` says
-    /// whether requiredness is meaningful where the reference sits; combined
-    /// with the reference's own flag it gives the effective requiredness, so a
-    /// component's required members can only make a message invalid when the
-    /// reference that pulled it in was itself required.
-    fn add_component(
-        &mut self,
-        level: &mut Level,
-        reference: &ComponentRef,
-        collect_required: bool,
-        depth: usize,
-        path: &mut HashSet<String>,
-    ) {
-        if !self.spend(&reference.name, depth) {
-            return;
-        }
-        let Some(component) = self.dict.get_component(&reference.name) else {
-            self.errors.push(ValidationError::UnknownComponent {
-                name: reference.name.clone(),
-            });
-            return;
-        };
-        // A cycle can only reach here through a hand-built dictionary; the
-        // loader rejects one. Expanding a component twice at different
-        // places is legitimate, so the guard is per path, not global.
-        if !path.insert(reference.name.clone()) {
-            return;
-        }
-
-        let required = collect_required && reference.required;
-        for field in &component.fields {
-            level.add_field(field.tag, &field.name, required && field.required);
-        }
-        for group in &component.groups {
-            self.add_group(level, group, group.required, required, depth + 1, path);
-        }
-        for nested in &component.components {
-            self.add_component(level, nested, required, depth + 1, path);
-        }
-
-        path.remove(&reference.name);
-    }
-}
-
 /// Answers which [`FieldDef`] a tag of the message being validated has.
 ///
 /// Envelope tags (the header and trailer of the transport dictionary)
@@ -652,19 +441,41 @@ impl<'d> ScopeBuilder<'d> {
 struct TagResolver<'d, 's> {
     transport: &'d Dictionary,
     body: &'d Dictionary,
-    envelope: &'s HashSet<u32>,
+    /// Sorted and unique.
+    envelope: &'s [u32],
 }
 
 impl<'d> TagResolver<'d, '_> {
     /// Returns the definition of `tag`, or `None` if the dictionary that
     /// answers it does not define it.
     fn field(&self, tag: u32) -> Option<&'d FieldDef> {
-        if self.envelope.contains(&tag) {
+        if self.envelope.binary_search(&tag).is_ok() {
             self.transport.get_field(tag)
         } else {
             self.body.get_field(tag)
         }
     }
+}
+
+/// Resolves a message type to its definition and to the dictionary that
+/// answers its body.
+///
+/// An admin message the transport dictionary defines wins; otherwise the
+/// application dictionary must define the message type. With a single
+/// dictionary, pass it as both.
+pub(crate) fn resolve<'d>(
+    transport: &'d Dictionary,
+    application: &'d Dictionary,
+    msg_type: &str,
+) -> Option<(&'d MessageDef, &'d Dictionary)> {
+    if let Some(def) = transport.get_message(msg_type)
+        && def.category == MessageCategory::Admin
+    {
+        return Some((def, transport));
+    }
+    application
+        .get_message(msg_type)
+        .map(|def| (def, application))
 }
 
 /// Validates parsed messages against a [`Dictionary`], or against a
@@ -752,20 +563,13 @@ impl<'d> Validator<'d> {
         }
     }
 
-    /// Resolves a message type to its definition and to the dictionary that
-    /// answers its body.
-    ///
-    /// An admin message the transport dictionary defines wins; otherwise the
-    /// application dictionary must define the message type.
-    fn resolve(&self, msg_type: &str) -> Option<(&'d MessageDef, &'d Dictionary)> {
-        if let Some(def) = self.transport.get_message(msg_type)
-            && def.category == MessageCategory::Admin
-        {
-            return Some((def, self.transport));
-        }
-        self.application
-            .get_message(msg_type)
-            .map(|def| (def, self.application))
+    /// Builds the group layout this validator would walk `msg_type` with.
+    #[cfg(test)]
+    pub(crate) fn layout(
+        &self,
+        msg_type: &str,
+    ) -> Result<crate::group::MessageLayout, crate::group::GroupError> {
+        crate::group::MessageLayout::resolved(self.transport, self.application, msg_type)
     }
 
     /// Validates a parsed message against the dictionary.
@@ -779,7 +583,7 @@ impl<'d> Validator<'d> {
     /// ends with [`ValidationError::ErrorLimitReached`]. `Ok(())` means the
     /// message passed all checks.
     pub fn validate(&self, msg: &RawMessage<'_>) -> Result<(), Vec<ValidationError>> {
-        let fields: Vec<_> = msg.fields().collect();
+        let fields = msg.field_slice();
         let mut sink = ErrorSink::default();
 
         // A missing BeginString(8) is reported as a missing required header
@@ -797,7 +601,7 @@ impl<'d> Validator<'d> {
         }
 
         let msg_type = msg.msg_type().as_str().to_string();
-        let Some((msg_def, body)) = self.resolve(&msg_type) else {
+        let Some((msg_def, body)) = resolve(self.transport, self.application, &msg_type) else {
             sink.push(ValidationError::UnknownMsgType { msg_type });
             return sink.finish();
         };
@@ -814,15 +618,20 @@ impl<'d> Validator<'d> {
         };
 
         // Value-level checks apply wherever a field sits.
-        for field in &fields {
+        for field in fields {
             check_value(&tags, field, &mut sink);
         }
 
         // Structural walk over the message level. Per-entry errors of every
-        // well-formed group instance stay provisional in `entry_errors` until
-        // the walk ends, and then follow the structural ones.
+        // well-formed group instance stay provisional in `checks.accepted`
+        // until the walk ends, and then follow the structural ones.
+        let mut checks = Checks {
+            tags: &tags,
+            sink,
+            stack: Vec::new(),
+            accepted: Pending::default(),
+        };
         let mut seen: HashSet<u32> = HashSet::new();
-        let mut entry_errors = Pending::default();
         let mut index = 0;
         while let Some(field) = fields.get(index) {
             let tag = field.tag;
@@ -832,28 +641,36 @@ impl<'d> Validator<'d> {
                 continue;
             };
             if !seen.insert(tag) {
-                sink.push(ValidationError::DuplicateTag {
+                checks.sink.push(ValidationError::DuplicateTag {
                     tag,
                     name: def.name.clone(),
                 });
             }
-            if let Some(group) = level.groups.get(&tag) {
-                let (next, accepted) = walk_group(&tags, &fields, index, group, &mut sink);
-                if let Some(accepted) = accepted {
-                    ErrorSink::adopt(&mut entry_errors, accepted);
-                }
-                index = next;
+            if let Some(group) = level.group(tag) {
+                index = walk::walk_group(
+                    fields,
+                    index,
+                    GroupSpec::from_layout(group),
+                    0,
+                    &level.members,
+                    &mut checks,
+                );
                 continue;
             }
-            if !level.allowed.contains(&tag) {
-                sink.push(ValidationError::FieldNotAllowedForMessage {
-                    tag,
-                    msg_type: msg_type.clone(),
-                });
+            if !level.allows(tag) {
+                checks
+                    .sink
+                    .push(ValidationError::FieldNotAllowedForMessage {
+                        tag,
+                        msg_type: msg_type.clone(),
+                    });
             }
             index += 1;
         }
-        sink.commit(entry_errors);
+        let Checks {
+            mut sink, accepted, ..
+        } = checks;
+        sink.commit(accepted);
 
         // Required fields. CheckSum(10) is consumed by the decoder and never
         // appears among the parsed fields, so it is skipped here.
@@ -866,7 +683,7 @@ impl<'d> Validator<'d> {
             }
         }
 
-        for group in level.groups.values() {
+        for group in &level.groups {
             if group.required && !seen.contains(&group.count_tag) {
                 sink.push(ValidationError::MissingRequiredGroup {
                     count_tag: group.count_tag,
@@ -1033,166 +850,121 @@ fn check_value(
     }
 }
 
-/// Walks one group instance, starting at its count field.
+/// Turns the events of the shared group walk ([`walk::walk_group`]) into
+/// validation errors.
 ///
 /// Structural errors (count, delimiter, a tag repeated inside an entry) are
 /// committed to `sink` straight away. Per-entry errors, the required members
-/// missing from an entry of this group or of any group nested in it, are
-/// produced by [`check_entry_required`] at every entry boundary and held
-/// provisionally: they are handed back to the caller only if this group
-/// instance turns out well-formed (every entry delimiter-led, no tag repeated
-/// within an entry, and the declared count equal to the entries found).
-/// Otherwise they are dropped, because the group already carries a
-/// structural error.
+/// missing from an entry, are produced by [`check_entry_required`] at every
+/// entry boundary and held provisionally in the [`Pending`] buffer of the
+/// group being walked. When a group instance ends, its buffer moves into the
+/// enclosing group's (or, for a top-level group, into `accepted`) if the
+/// instance is well-formed (every entry delimiter-led, no tag repeated within
+/// an entry, and the declared count equal to the entries found); otherwise it
+/// is dropped, because the group already carries a structural error.
 ///
-/// Nothing here is sized from the declared count: entries are counted as
-/// they are found, so a count of `99999999999` costs no more than the fields
+/// Nothing here is sized from a declared count: the walk counts entries as it
+/// finds them, so a count of `99999999999` costs no more than the fields
 /// actually present.
-///
-/// Returns the index of the first field after the group, and the group's
-/// provisional per-entry errors when it is well-formed (`None` when they were
-/// dropped).
-fn walk_group(
-    tags: &TagResolver<'_, '_>,
-    fields: &[&ironfix_core::field::FieldRef<'_>],
-    index: usize,
-    group: &GroupNode,
-    sink: &mut ErrorSink,
-) -> (usize, Option<Pending>) {
-    let Some(count_field) = fields.get(index) else {
-        return (index, None);
-    };
-    let count_value = String::from_utf8_lossy(count_field.value);
-    let declared = match count_value.parse::<u64>() {
-        Ok(declared) => Some(declared),
-        Err(_) => {
-            sink.push(ValidationError::InvalidGroupCount {
-                tag: group.count_tag,
-                name: group.name.clone(),
-                value: count_value.into_owned(),
-            });
-            None
-        }
-    };
-
-    let mut cursor = index + 1;
-    let mut entries: u64 = 0;
-    let mut unparseable = false;
-    let mut seen_in_entry: HashSet<u32> = HashSet::new();
-    let mut pending = Pending::default();
-
-    while let Some(field) = fields.get(cursor) {
-        let tag = field.tag;
-        if tag == group.delimiter_tag {
-            let Some(next) = entries.checked_add(1) else {
-                break;
-            };
-            // The delimiter closes the entry in progress, if any, and opens
-            // the next one.
-            if let Some(closed) = entries.checked_sub(1) {
-                check_entry_required(group, closed, &seen_in_entry, &mut |error| {
-                    sink.hold(&mut pending, error);
-                });
-            }
-            entries = next;
-            seen_in_entry.clear();
-            seen_in_entry.insert(tag);
-            // The delimiter is the entry's first field, and that field can
-            // itself be the count tag of a nested group: FIX 5.0 SP2
-            // NoAsgnReqs(1499) entries open with NoPartyIDs(453). The nested
-            // group's members follow it, so it has to be walked from here,
-            // not stepped over like a plain field. The delimiter is recorded
-            // as seen above, so a required nested group that is the delimiter
-            // counts as present in the entry it opens.
-            cursor = match group.entry.groups.get(&tag) {
-                Some(nested) => walk_nested(tags, fields, cursor, nested, sink, &mut pending),
-                None => cursor + 1,
-            };
-            continue;
-        }
-        if !group.entry.allowed.contains(&tag) {
-            // First field that is not a member of this group: the group
-            // ends here, and whatever follows belongs to the outer level.
-            break;
-        }
-        if entries == 0 {
-            // Members appear before any delimiter, so the first entry is
-            // not delimiter-led and the group cannot be split into
-            // entries unambiguously.
-            sink.push(ValidationError::GroupDelimiterMismatch {
-                count_tag: group.count_tag,
-                name: group.name.clone(),
-                expected: group.delimiter_tag,
-                found: tag,
-            });
-            unparseable = true;
-            entries = 1;
-            seen_in_entry.clear();
-        }
-        if !seen_in_entry.insert(tag) {
-            sink.push(ValidationError::RepeatedTagInGroupEntry {
-                count_tag: group.count_tag,
-                group: group.name.clone(),
-                tag,
-                name: tags
-                    .field(tag)
-                    .map_or_else(String::new, |def| def.name.clone()),
-            });
-            unparseable = true;
-        }
-        cursor = match group.entry.groups.get(&tag) {
-            // A nested group's per-entry errors join this group's pending
-            // ones, so they are dropped too if this group is malformed. A
-            // malformed nested group drops only its own.
-            Some(nested) => walk_nested(tags, fields, cursor, nested, sink, &mut pending),
-            None => cursor + 1,
-        };
-    }
-
-    // The run has ended: close the last entry, if one was opened.
-    if let Some(closed) = entries.checked_sub(1) {
-        check_entry_required(group, closed, &seen_in_entry, &mut |error| {
-            sink.hold(&mut pending, error);
-        });
-    }
-
-    if let Some(declared) = declared
-        && !unparseable
-        && declared != entries
-    {
-        sink.push(ValidationError::GroupCountMismatch {
-            count_tag: group.count_tag,
-            name: group.name.clone(),
-            declared,
-            actual: entries,
-            delimiter_tag: group.delimiter_tag,
-        });
-    }
-
-    if !unparseable && declared == Some(entries) {
-        (cursor, Some(pending))
-    } else {
-        sink.release(pending);
-        (cursor, None)
-    }
+struct Checks<'v, 'd, 'e> {
+    tags: &'v TagResolver<'d, 'e>,
+    sink: ErrorSink,
+    /// One buffer per group instance being walked, innermost last.
+    stack: Vec<Pending>,
+    /// Per-entry errors of the well-formed top-level groups, still
+    /// provisional.
+    accepted: Pending,
 }
 
-/// Walks a group nested in an entry of an enclosing group, moving its
-/// provisional per-entry errors, when it is well-formed, into the enclosing
-/// group's `pending` buffer. Returns the index of the first field after it.
-fn walk_nested(
-    tags: &TagResolver<'_, '_>,
-    fields: &[&ironfix_core::field::FieldRef<'_>],
-    index: usize,
-    nested: &GroupNode,
-    sink: &mut ErrorSink,
-    pending: &mut Pending,
-) -> usize {
-    let (next, accepted) = walk_group(tags, fields, index, nested, sink);
-    if let Some(accepted) = accepted {
-        ErrorSink::adopt(pending, accepted);
+/// Returns a group's name for an error message.
+fn group_name(group: GroupSpec<'_>) -> String {
+    group
+        .layout()
+        .map_or_else(String::new, |layout| layout.name.clone())
+}
+
+impl<'s> walk::Visitor<'s> for Checks<'_, '_, '_> {
+    fn enter_group(&mut self, _group: GroupSpec<'s>) {
+        self.stack.push(Pending::default());
     }
-    next
+
+    fn invalid_count(&mut self, group: GroupSpec<'s>, value: &[u8]) {
+        self.sink.push(ValidationError::InvalidGroupCount {
+            tag: group.count_tag(),
+            name: group_name(group),
+            value: String::from_utf8_lossy(value).into_owned(),
+        });
+    }
+
+    fn delimiter_mismatch(&mut self, group: GroupSpec<'s>, found: u32) {
+        self.sink.push(ValidationError::GroupDelimiterMismatch {
+            count_tag: group.count_tag(),
+            name: group_name(group),
+            expected: group.delimiter_tag(),
+            found,
+        });
+    }
+
+    fn repeated_tag(&mut self, group: GroupSpec<'s>, tag: u32) {
+        self.sink.push(ValidationError::RepeatedTagInGroupEntry {
+            count_tag: group.count_tag(),
+            group: group_name(group),
+            tag,
+            name: self
+                .tags
+                .field(tag)
+                .map_or_else(String::new, |def| def.name.clone()),
+        });
+    }
+
+    fn entry_closed(&mut self, group: GroupSpec<'s>, entry: u64, seen: &EntryTags<'s>) {
+        let Some(layout) = group.layout() else {
+            return;
+        };
+        let sink = &mut self.sink;
+        let Some(pending) = self.stack.last_mut() else {
+            return;
+        };
+        check_entry_required(layout, entry, seen, &mut |error| {
+            sink.hold(pending, error);
+        });
+    }
+
+    fn count_mismatch(&mut self, group: GroupSpec<'s>, declared: u64, actual: u64) {
+        self.sink.push(ValidationError::GroupCountMismatch {
+            count_tag: group.count_tag(),
+            name: group_name(group),
+            declared,
+            actual,
+            delimiter_tag: group.delimiter_tag(),
+        });
+    }
+
+    fn too_deep(&mut self, group: GroupSpec<'s>) {
+        // A layout built by the scope expansion never nests past the limit;
+        // this reports a walk that would.
+        self.sink.push(ValidationError::SchemaTooDeep {
+            name: group_name(group),
+            limit: MAX_SCOPE_DEPTH,
+        });
+    }
+
+    fn leave_group(&mut self, _group: GroupSpec<'s>, well_formed: bool, _entries: u64) {
+        let Some(pending) = self.stack.pop() else {
+            return;
+        };
+        if !well_formed {
+            self.sink.release(pending);
+            return;
+        }
+        // A nested group's per-entry errors join the enclosing group's, so
+        // they are dropped too if that group is malformed. A malformed nested
+        // group drops only its own.
+        match self.stack.last_mut() {
+            Some(parent) => ErrorSink::adopt(parent, pending),
+            None => ErrorSink::adopt(&mut self.accepted, pending),
+        }
+    }
 }
 
 /// End-of-entry hook: reports, through `report`, the required members
@@ -1207,14 +979,14 @@ fn walk_nested(
 /// built), then every nested group marked required whose count tag is
 /// absent, by ascending count tag.
 ///
-/// [`walk_group`] calls this at every entry boundary. It is kept apart from
-/// the walk, and reports through a callback rather than into a collector of
-/// its own, so that another reader of group entries can apply the same check
-/// at its own entry boundaries.
+/// The shared walk calls it, through [`Checks`], at every entry boundary
+/// ([`walk::Visitor::entry_closed`]). It reports through a callback rather
+/// than into a collector of its own, so another reader of group entries can
+/// apply the same check at its own entry boundaries.
 fn check_entry_required(
-    group: &GroupNode,
+    group: &LayoutGroup,
     entry: u64,
-    seen: &HashSet<u32>,
+    seen: &EntryTags<'_>,
     report: &mut dyn FnMut(ValidationError),
 ) {
     let missing = |tag: u32, name: &str| ValidationError::MissingRequiredFieldInGroupEntry {
@@ -1226,20 +998,17 @@ fn check_entry_required(
     };
 
     for (tag, name) in &group.entry.required {
-        if !seen.contains(tag) {
+        if !seen.contains(*tag) {
             report(missing(*tag, name));
         }
     }
 
-    let mut absent: Vec<&GroupNode> = group
-        .entry
-        .groups
-        .values()
-        .filter(|nested| nested.required && !seen.contains(&nested.count_tag))
-        .collect();
-    absent.sort_by_key(|nested| nested.count_tag);
-    for nested in absent {
-        report(missing(nested.count_tag, &nested.name));
+    // `groups` is sorted by count tag, so missing nested groups are reported
+    // in ascending count-tag order.
+    for nested in &group.entry.groups {
+        if nested.required && !seen.contains(nested.count_tag) {
+            report(missing(nested.count_tag, &nested.name));
+        }
     }
 }
 
@@ -1250,7 +1019,9 @@ mod tests {
     // always spelled with a qualifier here; `ironfix_core::field::FieldRef`
     // appears in full above.
     use crate::schema::FieldRef as SchemaFieldRef;
-    use crate::schema::{ComponentDef, Dictionary, FieldDef, MessageCategory};
+    use crate::schema::{
+        ComponentDef, ComponentRef, Dictionary, FieldDef, GroupDef, MessageCategory,
+    };
     use ironfix_tagvalue::Decoder;
     use std::fmt::Debug;
 
@@ -1316,7 +1087,128 @@ mod tests {
         let msg = build(fields);
         let mut decoder = Decoder::new(msg.as_bytes()).with_checksum_validation(false);
         let raw = ok(decoder.decode(), "test message decodes");
-        validator.validate(&raw)
+        let result = validator.validate(&raw);
+        assert_reader_agrees(validator, &raw, &result);
+        result
+    }
+
+    /// Count tags of `group` and of every group nested in it, at any depth.
+    fn subtree_count_tags(group: GroupSpec<'_>) -> Vec<u32> {
+        let mut tags = Vec::new();
+        let mut pending = vec![group];
+        while let Some(spec) = pending.pop() {
+            tags.push(spec.count_tag());
+            pending.extend(spec.nested_groups().iter());
+        }
+        tags
+    }
+
+    /// Asserts that the group reader agrees with the validator on every
+    /// top-level group of `raw`.
+    ///
+    /// Every validator test goes through [`validate_using`], so this sweeps
+    /// every validator fixture. For each group the message's layout can open
+    /// at its top level: the reader rejects it exactly when the validator
+    /// reports a structural error (count, delimiter, repeated tag, duplicate
+    /// count field) for it or for a group nested in it; when the reader
+    /// accepts it, it yields as many entries as the count declares, each led
+    /// by the delimiter. A structural error whose count tag lies under two
+    /// top-level groups present in the message cannot be attributed, so it
+    /// neither requires nor forbids a rejection.
+    #[track_caller]
+    fn assert_reader_agrees(
+        validator: Validator<'_>,
+        raw: &RawMessage<'_>,
+        result: &Result<(), Vec<ValidationError>>,
+    ) {
+        let errors: &[ValidationError] = match result {
+            Ok(()) => &[],
+            Err(errors) => errors,
+        };
+        if errors
+            .iter()
+            .any(|error| matches!(error, ValidationError::ErrorLimitReached { .. }))
+        {
+            // A truncated report may lack the structural error.
+            return;
+        }
+        let Ok(layout) = validator.layout(raw.msg_type().as_str()) else {
+            return;
+        };
+        let present: Vec<(GroupSpec<'_>, Vec<u32>)> = layout
+            .groups()
+            .iter()
+            .filter(|group| matches!(layout.read(raw, group.count_tag()), Ok(Some(_)) | Err(_)))
+            .map(|group| (group, subtree_count_tags(group)))
+            .collect();
+        let owners = |tag: u32| {
+            present
+                .iter()
+                .filter(|(_, tags)| tags.contains(&tag))
+                .count()
+        };
+
+        for group in layout.groups().iter() {
+            let count_tag = group.count_tag();
+            let read = layout.read(raw, count_tag);
+            let subtree = subtree_count_tags(group);
+            let mut attributed = false;
+            let mut ambiguous = false;
+            for error in errors {
+                let tag = match error {
+                    ValidationError::InvalidGroupCount { tag, .. } => *tag,
+                    ValidationError::GroupCountMismatch { count_tag, .. }
+                    | ValidationError::GroupDelimiterMismatch { count_tag, .. }
+                    | ValidationError::RepeatedTagInGroupEntry { count_tag, .. } => *count_tag,
+                    ValidationError::DuplicateTag { tag, .. } if *tag == count_tag => *tag,
+                    _ => continue,
+                };
+                if !subtree.contains(&tag) {
+                    continue;
+                }
+                if owners(tag) > 1 {
+                    ambiguous = true;
+                } else {
+                    attributed = true;
+                }
+            }
+            match read {
+                Err(error) => assert!(
+                    attributed || ambiguous,
+                    "reader rejected group {count_tag} ({error}) but the validator reported \
+                     no structural error for it: {errors:?}"
+                ),
+                Ok(Some(entries)) => {
+                    assert!(
+                        !attributed,
+                        "reader accepted group {count_tag} but the validator reported a \
+                         structural error for it: {errors:?}"
+                    );
+                    let declared = raw
+                        .field_slice()
+                        .iter()
+                        .find(|field| field.tag == count_tag)
+                        .and_then(|field| walk::parse_count(field.value));
+                    let mut seen: u64 = 0;
+                    for entry in entries {
+                        assert_eq!(entry.index(), seen);
+                        assert_eq!(
+                            entry.fields().first().map(|field| field.tag),
+                            Some(group.delimiter_tag()),
+                            "entry {seen} of group {count_tag} is not delimiter-led"
+                        );
+                        seen += 1;
+                    }
+                    if !ambiguous {
+                        assert_eq!(Some(seen), declared, "group {count_tag} entry count");
+                    }
+                }
+                Ok(None) => assert!(
+                    !raw.field_slice().iter().any(|field| field.tag == count_tag) || !attributed,
+                    "reader found no top-level group {count_tag}: {errors:?}"
+                ),
+            }
+        }
     }
 
     /// Builds a message, recomputing BodyLength (9) from the actual body so the
@@ -1703,6 +1595,38 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn test_validate_signed_group_count_is_an_invalid_count() {
+        // `+1` parses as a Rust u64 but is not a FIX NumInGroup: the value
+        // check reports its form and the group walk refuses it as a count,
+        // as the group reader does.
+        let found = errors(validate(&with_header(&[
+            "11=ORDER-1",
+            "453=+1",
+            "448=BROKER-A",
+            "55=EURUSD",
+            "54=1",
+            "60=20260712-10:00:00",
+            "40=1",
+        ])));
+        assert_eq!(
+            found,
+            vec![
+                ValidationError::InvalidFieldFormat {
+                    tag: 453,
+                    name: "NoPartyIDs".to_string(),
+                    value: "+1".to_string(),
+                    field_type: FieldType::NumInGroup,
+                },
+                ValidationError::InvalidGroupCount {
+                    tag: 453,
+                    name: "NoPartyIDs".to_string(),
+                    value: "+1".to_string(),
+                },
+            ]
+        );
+    }
+
     /// Builds a dialect whose message carries two distinct groups that share
     /// a delimiter tag.
     fn dialect_with_two_groups_sharing_a_delimiter() -> Dictionary {
@@ -1839,11 +1763,57 @@ mod tests {
         }));
     }
 
+    /// A MarketDataRequest (35=V) without its two required groups,
+    /// NoRelatedSym(146) and NoMDEntryTypes(267).
+    const MARKET_DATA_REQUEST_WITHOUT_GROUPS: [&str; 11] = [
+        "8=FIX.4.4",
+        "9=100",
+        "35=V",
+        "49=SENDER",
+        "56=TARGET",
+        "34=1",
+        "52=20260712-10:00:00",
+        "262=REQ-1",
+        "263=1",
+        "264=1",
+        "10=000",
+    ];
+
+    /// The two missing-group errors, in their documented order: ascending
+    /// count tag.
+    fn missing_market_data_groups() -> Vec<ValidationError> {
+        vec![
+            ValidationError::MissingRequiredGroup {
+                count_tag: 146,
+                name: "NoRelatedSym".to_string(),
+            },
+            ValidationError::MissingRequiredGroup {
+                count_tag: 267,
+                name: "NoMDEntryTypes".to_string(),
+            },
+        ]
+    }
+
     #[test]
     fn test_validate_missing_required_group_is_reported() {
-        // MarketDataRequest(V) requires NoMDEntryTypes(267) and
-        // NoRelatedSym(146); omitting both must name both groups.
-        let found = errors(validate(&[
+        // Both groups are named, in ascending count-tag order, and the order
+        // is the same on every run.
+        let first = validate(&MARKET_DATA_REQUEST_WITHOUT_GROUPS);
+        assert_eq!(first, Err(missing_market_data_groups()));
+        for _ in 0..16 {
+            assert_eq!(validate(&MARKET_DATA_REQUEST_WITHOUT_GROUPS), first);
+        }
+    }
+
+    #[test]
+    fn test_validate_error_order_is_identical_across_runs_and_dictionary_reloads() {
+        // One error of each kind the order documents, from one message: a
+        // value error (263=9 is not a SubscriptionRequestType), a structural
+        // error (Symbol(55) is not a MarketDataRequest field), a missing field
+        // (MDReqID(262)) and two missing groups. Each fresh load of the same
+        // XML builds its own hash maps, so a hash-ordered error list would
+        // differ between loads.
+        let message = [
             "8=FIX.4.4",
             "9=100",
             "35=V",
@@ -1851,19 +1821,39 @@ mod tests {
             "56=TARGET",
             "34=1",
             "52=20260712-10:00:00",
-            "262=REQ-1",
-            "263=1",
+            "263=9",
             "264=1",
+            "55=EURUSD",
             "10=000",
-        ]));
-        assert!(found.contains(&ValidationError::MissingRequiredGroup {
-            count_tag: 267,
-            name: "NoMDEntryTypes".to_string(),
-        }));
-        assert!(found.contains(&ValidationError::MissingRequiredGroup {
-            count_tag: 146,
-            name: "NoRelatedSym".to_string(),
-        }));
+        ];
+        let mut expected = vec![
+            ValidationError::InvalidEnumValue {
+                tag: 263,
+                name: "SubscriptionRequestType".to_string(),
+                value: "9".to_string(),
+            },
+            ValidationError::FieldNotAllowedForMessage {
+                tag: 55,
+                msg_type: "V".to_string(),
+            },
+            ValidationError::MissingRequiredField {
+                tag: 262,
+                name: "MDReqID".to_string(),
+            },
+        ];
+        expected.extend(missing_market_data_groups());
+        let expected = Err(expected);
+
+        assert_eq!(validate(&message), expected);
+        for _ in 0..4 {
+            let reloaded = ok(
+                Dictionary::from_quickfix_xml(include_str!("../spec/FIX44.xml")),
+                "FIX 4.4 reloads",
+            );
+            for _ in 0..4 {
+                assert_eq!(validate_with(&reloaded, &message), expected);
+            }
+        }
     }
 
     /// Expands every message `body` defines, with its header and trailer
@@ -3772,6 +3762,79 @@ mod tests {
                 entry_missing(100, "NoX", 0, 400, "After"),
                 entry_missing(100, "NoX", 0, 300, "Inside"),
             ]
+        );
+    }
+
+    /// NoOuter(102) entries (delimiter Shared(200), optional Extra(300))
+    /// nest the optional NoInner(110), whose entries (delimiter InnerKey(210))
+    /// may carry Extra(300) as well.
+    const EMPTY_CHILD_XML: &str = r"<fix type='FIX' major='4' minor='4'>
+        <header>
+            <field name='BeginString' required='Y'/>
+            <field name='BodyLength' required='Y'/>
+            <field name='MsgType' required='Y'/>
+        </header>
+        <trailer><field name='CheckSum' required='Y'/></trailer>
+        <messages>
+            <message name='Nesting' msgtype='U5' msgcat='app'>
+                <group name='NoOuter' required='N'>
+                    <field name='Shared' required='Y'/>
+                    <field name='Extra' required='N'/>
+                    <group name='NoInner' required='N'>
+                        <field name='InnerKey' required='Y'/>
+                        <field name='Extra' required='N'/>
+                    </group>
+                </group>
+            </message>
+        </messages>
+        <fields>
+            <field number='8' name='BeginString' type='STRING'/>
+            <field number='9' name='BodyLength' type='LENGTH'/>
+            <field number='10' name='CheckSum' type='STRING'/>
+            <field number='35' name='MsgType' type='STRING'/>
+            <field number='102' name='NoOuter' type='NUMINGROUP'/>
+            <field number='110' name='NoInner' type='NUMINGROUP'/>
+            <field number='200' name='Shared' type='STRING'/>
+            <field number='210' name='InnerKey' type='STRING'/>
+            <field number='300' name='Extra' type='STRING'/>
+        </fields>
+    </fix>";
+
+    #[track_caller]
+    fn validate_empty_child(body: &[&str]) -> Result<(), Vec<ValidationError>> {
+        let dict = ok(
+            Dictionary::from_quickfix_xml(EMPTY_CHILD_XML),
+            "empty-child dialect loads",
+        );
+        let mut fields = vec!["8=FIX.4.4", "9=100", "35=U5"];
+        fields.extend_from_slice(body);
+        fields.push("10=000");
+        validate_with(&dict, &fields)
+    }
+
+    #[test]
+    fn test_validate_empty_nested_group_followed_by_an_enclosing_field_passes() {
+        // NoInner is empty; Extra(300) belongs to both NoInner and NoOuter,
+        // and with a count of 0 it is the enclosing NoOuter entry's field.
+        assert_eq!(
+            validate_empty_child(&["102=1", "200=A", "110=0", "300=OWN"]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn test_validate_empty_nested_group_with_its_own_entry_is_still_malformed() {
+        // InnerKey(210) can only open a NoInner entry, which a count of 0
+        // does not declare.
+        assert_eq!(
+            validate_empty_child(&["102=1", "200=A", "110=0", "210=X"]),
+            Err(vec![ValidationError::GroupCountMismatch {
+                count_tag: 110,
+                name: "NoInner".to_string(),
+                declared: 0,
+                actual: 1,
+                delimiter_tag: 210,
+            }])
         );
     }
 }
