@@ -286,4 +286,6 @@ skipped them.
 - The crate DAG is unchanged: `ironfix-transport` still depends on `core` and
   `tagvalue` only, `ironfix-session` on `core` only, and the window logic lives
   in `ironfix-engine` (crate-private) until the ADR-0002 extraction moves the
-  reactor's decisions into the sans-IO core.
+  reactor's decisions into the sans-IO core. (#122 later dropped
+  `ironfix-transport`'s unused direct `core` edge; it reaches `core` through
+  `tagvalue`.)

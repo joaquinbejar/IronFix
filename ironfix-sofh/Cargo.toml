@@ -11,10 +11,9 @@ keywords.workspace = true
 categories.workspace = true
 
 # Framing never interprets the payload, so there is deliberately no SBE codec
-# here. ironfix-core is declared per ADR-0003 (`sofh -> core`) and is unused
-# today: no ironfix-core item appears in this crate's code yet.
+# here and no internal dependency: the `sofh -> core` edge ADR-0003 planned was
+# never used and was dropped (#122, see the ADR's Consequences).
 [dependencies]
-ironfix-core.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 tokio-util.workspace = true

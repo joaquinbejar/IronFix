@@ -1,6 +1,8 @@
 # ADR-0003 — FIXP and SOFH live in the IronFix workspace, on the IronSBE codec
 
-- **Status:** Accepted (owner decision on issue #65, 2026-10-17)
+- **Status:** Accepted (owner decision on issue #65, 2026-10-17). Amended by
+  #122 (2026-10-18): `ironfix-sofh` has no internal dependency; see
+  Consequences.
 - **Date:** 2026-10-17
 
 ## Context
@@ -59,6 +61,24 @@ decision and pinned to a compatible 0.7 range when `ironfix-fixp` lands.
 - **Crate DAG** gains two leaves next to `session`: `sofh -> core` and
   `fixp -> core + ironsbe-core`; `engine` additionally depends on `sofh` and
   `fixp` under the `fixp` feature. No existing edge changes.
+
+  > **Amended by #122, 2026-10-18.** `ironfix-sofh` no longer depends on
+  > `ironfix-core`: it is a leaf with no internal dependency, not
+  > `sofh -> core`, which also supersedes "depends on `ironfix-core` only" in
+  > the #94 entry below. The edge was declared but never used. SOFH framing
+  > reads a length and an encoding type and names no core type, and
+  > `FixError` has no framing variant to bridge `SofhError` into; that bridge
+  > belongs in `EngineError` when the engine wiring (#96) lands. Keeping the
+  > edge made a standalone build of `ironfix-sofh` pull `ironfix-core` and its
+  > tree (`rust_decimal`, `chrono` with its platform time-zone crates,
+  > `num-traits`, `num-derive`, `smallvec`, `arrayvec` and `serde_derive`)
+  > for nothing. Dropping it is not a breaking change, because no core
+  > type appears in the crate's public API. `fixp -> core + ironsbe-core` is
+  > unchanged: `ironfix-fixp` uses the core vocabulary (`SeqNum`,
+  > `Timestamp`). The same issue dropped the unused `core` edge of
+  > `ironfix-transport` (which still reaches `core` through `tagvalue`) and of
+  > `ironfix-fast`. The `make publish-all` order still holds, since removing
+  > an edge only relaxes it.
 - **Release process:** both crates join the lockstep version, the
   `make publish-all` order (after `core`, before `engine`), and the
   `semver.yml` matrix after their first publish. IronFix releases now also
