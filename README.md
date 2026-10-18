@@ -51,12 +51,17 @@ messages and the engine wiring do not exist yet.
   names every value the v1.0 table registers (SBE 1.0 big- and
   little-endian, tag=value, FAST, FIXML and the rest) and preserves any other
   value rather than rejecting it, so a receiver can skip a message it has no
-  codec for. `SofhCodec` is a Tokio codec that splits frames off the read
-  buffer without copying, refuses a declared length below 7 bytes or above
-  `with_max_message_size` (1 MiB by default) before reserving anything, and
-  treats every framing error as fatal for the stream: SOFH has no
-  resynchronisation anchor. It does not interpret payloads and nothing in
-  the engine uses it yet.
+  codec for. `SofhCodec` is a Tokio codec that hands each payload out as a
+  `Bytes` view of the read buffer, without copying the payload bytes. That
+  view shares the buffer's allocation, so a frame kept alive pins it, and
+  each refill that runs out of room while frames are kept allocates a new
+  buffer and copies the unread tail: size the read buffer with
+  `Framed::with_capacity`, or copy small payloads out, if you keep frames
+  (see "Retaining frames" in `ironfix_sofh::codec`). The codec refuses a
+  declared length below 7 bytes or above `with_max_message_size` (1 MiB by
+  default) before reserving anything, and treats every framing error as
+  fatal for the stream: SOFH has no resynchronisation anchor. It does not
+  interpret payloads and nothing in the engine uses it yet.
 - **A client engine and a server engine** in `ironfix-engine`. `Initiator`
   dials over TCP and runs the initiator half of the Logon handshake. `Acceptor`
   serves inbound connections for one configured counterparty and runs the
@@ -491,8 +496,10 @@ make bench-clean         # Remove benchmark data
 
 Benchmarks cover the hot paths: tag=value decode/encode and checksum
 (`ironfix-tagvalue`), the FAST stop-bit and presence-map primitives
-(`ironfix-fast`), the `FixCodec` framing loop (`ironfix-transport`), and the
-`SofhCodec` framing loop (`ironfix-sofh`).
+(`ironfix-fast`), the `FixCodec` framing loop (`ironfix-transport`), the
+`SofhCodec` framing loop (`ironfix-sofh`), and the `FileStore` journal
+(`ironfix-store`, `file_store`: filing and sequence writes under each
+`SyncPolicy`, a resend page, and reopening a 10 000-frame journal).
 
 ℹ️ The harness ships **no recorded baseline and no published figures**. Every
 performance number in `doc/` is a design target; treat any figure as unmeasured

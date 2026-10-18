@@ -14,11 +14,14 @@
 //! names the payload's encoding (Simple Binary Encoding, FIX tag=value, FAST,
 //! and others). It is how SBE messages, and FIXP sessions, are framed on TCP.
 //!
-//! - [`SofhHeader`]: the header, with `const fn` encode and decode;
+//! - [`SofhHeader`]: the header, with `const fn` `to_bytes` / `from_bytes`
+//!   and a `decode` that reads it off the front of a buffer;
 //! - [`EncodingType`]: the registered encoding types, with unregistered values
 //!   preserved;
 //! - [`SofhCodec`]: a `tokio_util` `Decoder` yielding [`SofhFrame`]s and an
-//!   `Encoder` framing payloads, with a size ceiling;
+//!   `Encoder` framing payloads, with a size ceiling. A decoded payload is a
+//!   `Bytes` view of the read buffer, not a copy; read
+//!   [Retaining frames](codec#retaining-frames) before keeping frames;
 //! - [`SofhError`]: every framing failure, typed.
 //!
 //! The codec frames, it does not interpret: it never decodes a payload and

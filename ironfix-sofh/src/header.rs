@@ -65,14 +65,16 @@ impl SofhHeader {
     /// message of at least one byte.
     pub const MIN_MESSAGE_LENGTH: u32 = 7;
 
-    /// Builds a header from a `Message_Length` (in bytes, header included)
-    /// and an encoding type.
+    /// Builds a header from an encoding type and a `Message_Length` (in
+    /// bytes, header included).
+    ///
+    /// Every constructor in this crate takes the encoding type first.
     ///
     /// # Errors
     /// [`SofhError::MessageLengthTooSmall`] if `message_length` is below
     /// [`SofhHeader::MIN_MESSAGE_LENGTH`].
     #[inline]
-    pub const fn new(message_length: u32, encoding_type: EncodingType) -> Result<Self, SofhError> {
+    pub const fn new(encoding_type: EncodingType, message_length: u32) -> Result<Self, SofhError> {
         if message_length < Self::MIN_MESSAGE_LENGTH {
             return Err(SofhError::MessageLengthTooSmall {
                 length: message_length,
@@ -85,18 +87,20 @@ impl SofhHeader {
         })
     }
 
-    /// Builds the header that frames a payload of `payload_len` bytes.
+    /// Builds the header that frames a payload of `payload_len` bytes with
+    /// the given encoding type.
     ///
     /// # Errors
     /// - [`SofhError::MessageLengthTooSmall`] for an empty payload;
     /// - [`SofhError::PayloadTooLong`] when `payload_len` plus the header does
     ///   not fit the 4-octet `Message_Length` field.
-    pub fn for_payload(payload_len: usize, encoding_type: EncodingType) -> Result<Self, SofhError> {
+    #[inline]
+    pub fn for_payload(encoding_type: EncodingType, payload_len: usize) -> Result<Self, SofhError> {
         let message_length = u32::try_from(payload_len)
             .ok()
             .and_then(|len| len.checked_add(HEADER_LEN_U32))
             .ok_or(SofhError::PayloadTooLong { payload_len })?;
-        Self::new(message_length, encoding_type)
+        Self::new(encoding_type, message_length)
     }
 
     /// Returns the `Message_Length`: the frame length in bytes, header
@@ -149,8 +153,8 @@ impl SofhHeader {
     pub const fn from_bytes(bytes: [u8; Self::LEN]) -> Result<Self, SofhError> {
         let [l0, l1, l2, l3, e0, e1] = bytes;
         Self::new(
-            u32::from_be_bytes([l0, l1, l2, l3]),
             EncodingType::from_u16(u16::from_be_bytes([e0, e1])),
+            u32::from_be_bytes([l0, l1, l2, l3]),
         )
     }
 
@@ -179,8 +183,8 @@ mod tests {
     use super::*;
 
     /// Builds a header expected to be valid.
-    fn header(message_length: u32, encoding_type: EncodingType) -> SofhHeader {
-        match SofhHeader::new(message_length, encoding_type) {
+    fn header(encoding_type: EncodingType, message_length: u32) -> SofhHeader {
+        match SofhHeader::new(encoding_type, message_length) {
             Ok(header) => header,
             Err(error) => panic!("fixture header is valid: {error}"),
         }
@@ -188,10 +192,10 @@ mod tests {
 
     #[test]
     fn test_sofh_header_to_bytes_is_big_endian_length_then_encoding() {
-        let bytes = header(0x0102_0304, EncodingType::SbeV1LittleEndian).to_bytes();
+        let bytes = header(EncodingType::SbeV1LittleEndian, 0x0102_0304).to_bytes();
         assert_eq!(bytes, [0x01, 0x02, 0x03, 0x04, 0xEB, 0x50]);
 
-        let bytes = header(7, EncodingType::TagValue).to_bytes();
+        let bytes = header(EncodingType::TagValue, 7).to_bytes();
         assert_eq!(bytes, [0x00, 0x00, 0x00, 0x07, 0xF0, 0x00]);
     }
 
@@ -203,7 +207,7 @@ mod tests {
             (1_048_576, EncodingType::from_u16(0xFA7F)),
             (u32::MAX, EncodingType::from_u16(0xFFFF)),
         ] {
-            let original = header(length, encoding);
+            let original = header(encoding, length);
             assert_eq!(SofhHeader::from_bytes(original.to_bytes()), Ok(original));
         }
     }
@@ -212,7 +216,7 @@ mod tests {
     fn test_sofh_header_new_rejects_every_length_below_seven() {
         for length in 0..SofhHeader::MIN_MESSAGE_LENGTH {
             assert_eq!(
-                SofhHeader::new(length, EncodingType::TagValue),
+                SofhHeader::new(EncodingType::TagValue, length),
                 Err(SofhError::MessageLengthTooSmall {
                     length,
                     min_length: 7,
@@ -223,9 +227,9 @@ mod tests {
 
     #[test]
     fn test_sofh_header_new_accepts_the_minimum_and_the_maximum() {
-        assert_eq!(header(7, EncodingType::Json).payload_len(), 1);
+        assert_eq!(header(EncodingType::Json, 7).payload_len(), 1);
         assert_eq!(
-            header(u32::MAX, EncodingType::Json).payload_len(),
+            header(EncodingType::Json, u32::MAX).payload_len(),
             u32::MAX - 6
         );
     }
@@ -243,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_sofh_header_decode_waits_for_six_bytes() {
-        let bytes = header(42, EncodingType::GpbV1).to_bytes();
+        let bytes = header(EncodingType::GpbV1, 42).to_bytes();
         for available in 0..SofhHeader::LEN {
             let Some(prefix) = bytes.get(..available) else {
                 panic!("prefix is inside the header");
@@ -252,17 +256,17 @@ mod tests {
         }
         assert_eq!(
             SofhHeader::decode(&bytes),
-            Ok(Some(header(42, EncodingType::GpbV1)))
+            Ok(Some(header(EncodingType::GpbV1, 42)))
         );
     }
 
     #[test]
     fn test_sofh_header_decode_reads_only_the_first_six_bytes() {
-        let mut bytes = header(9, EncodingType::Asn1BerV1).to_bytes().to_vec();
+        let mut bytes = header(EncodingType::Asn1BerV1, 9).to_bytes().to_vec();
         bytes.extend_from_slice(&[0xFF, 0x00, 0x00]);
         assert_eq!(
             SofhHeader::decode(&bytes),
-            Ok(Some(header(9, EncodingType::Asn1BerV1)))
+            Ok(Some(header(EncodingType::Asn1BerV1, 9)))
         );
     }
 
@@ -280,19 +284,19 @@ mod tests {
     #[test]
     fn test_sofh_header_for_payload_adds_the_header_length() {
         assert_eq!(
-            SofhHeader::for_payload(1, EncodingType::Bson),
-            Ok(header(7, EncodingType::Bson))
+            SofhHeader::for_payload(EncodingType::Bson, 1),
+            Ok(header(EncodingType::Bson, 7))
         );
         assert_eq!(
-            SofhHeader::for_payload(100, EncodingType::FixmlSchemaV1),
-            Ok(header(106, EncodingType::FixmlSchemaV1))
+            SofhHeader::for_payload(EncodingType::FixmlSchemaV1, 100),
+            Ok(header(EncodingType::FixmlSchemaV1, 106))
         );
     }
 
     #[test]
     fn test_sofh_header_for_payload_rejects_an_empty_payload() {
         assert_eq!(
-            SofhHeader::for_payload(0, EncodingType::TagValue),
+            SofhHeader::for_payload(EncodingType::TagValue, 0),
             Err(SofhError::MessageLengthTooSmall {
                 length: 6,
                 min_length: 7,
@@ -308,8 +312,8 @@ mod tests {
             return;
         };
         assert_eq!(
-            SofhHeader::for_payload(largest, EncodingType::SbeV1BigEndian),
-            Ok(header(u32::MAX, EncodingType::SbeV1BigEndian))
+            SofhHeader::for_payload(EncodingType::SbeV1BigEndian, largest),
+            Ok(header(EncodingType::SbeV1BigEndian, u32::MAX))
         );
     }
 
@@ -324,7 +328,7 @@ mod tests {
         }
         for payload_len in too_long {
             assert_eq!(
-                SofhHeader::for_payload(payload_len, EncodingType::TagValue),
+                SofhHeader::for_payload(EncodingType::TagValue, payload_len),
                 Err(SofhError::PayloadTooLong { payload_len })
             );
         }
