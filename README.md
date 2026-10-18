@@ -59,17 +59,20 @@ exists yet.
   for FIX 5.0 sessions. `HeartBtInt = 0` disables heartbeating (ask for it
   with `SessionConfigBuilder::disable_heartbeats`), and any inbound message
   clears a pending TestRequest.
-- **Resend from store** on the initiator. Attach a `MessageStore` with
-  `Initiator::with_store` and an inbound `ResendRequest` replays the stored
-  application messages with `PossDupFlag = Y` and the original `SendingTime`
-  in `OrigSendingTime`; administrative messages, and anything the store cannot
-  produce, are covered by gap fill. Store writes are fallible and ordered: a
-  frame is filed and the next sender number persisted before its bytes are
-  written, and the next target number is persisted before an inbound message
-  is acted on. `Initiator::with_store_failure_policy` chooses between warning
-  and continuing (the default, which gives no crash guarantee) or failing
-  closed, writing nothing the store has not accepted. Every store call is
-  bounded by `Initiator::with_store_timeout`.
+- **Resend from store** in both roles. Attach a `MessageStore` with
+  `Initiator::with_store`, `Acceptor::with_store` or `EngineBuilder::with_store`
+  and an inbound `ResendRequest` replays the stored application messages with
+  `PossDupFlag = Y` and the original `SendingTime` in `OrigSendingTime`;
+  administrative messages, and anything the store cannot produce, are covered
+  by gap fill. A session starts from the store's counters unless it resets the
+  sequence. Store writes are fallible and ordered: a frame is filed and the
+  next sender number persisted before its bytes are written, and the next
+  target number is persisted before an inbound message is acted on.
+  `with_store_failure_policy` chooses between warning and continuing (the
+  default, which gives no crash guarantee) or failing closed, writing nothing
+  the store has not accepted. Every store call is bounded by
+  `with_store_timeout`. The acceptor touches its store only once the Logon is
+  authenticated, so an unauthenticated `ResetSeqNumFlag` Logon cannot clear it.
 - **A typestate session FSM** and checked sequence arithmetic in
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in
@@ -103,9 +106,7 @@ around it.
 
 - **No persistent store.** `MemoryStore` is the only `MessageStore`; there is
   no `FileStore` and no memory-mapped store, so stored messages and sequence
-  numbers do not survive a restart (`ironfix-store/src/lib.rs`). The store is
-  opt-in on `Initiator` only: `Acceptor` attaches none, so every resend it
-  answers is a gap fill (`ironfix-engine/src/acceptor.rs`). Inbound
+  numbers do not survive a restart (`ironfix-store/src/lib.rs`). Inbound
   application messages are delivered at most once: a crash, or a session
   close whose application queue does not drain in time, loses the messages
   still queued. The close logs the lost range; nothing reports a loss across

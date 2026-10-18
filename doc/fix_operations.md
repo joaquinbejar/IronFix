@@ -152,11 +152,29 @@ are role-symmetric:
   admits one live session at a time for its counterparty. A second concurrent
   Logon while a session is established is refused with a Logout ("session
   already active") rather than allowed to fork the session into two independent
-  sequence streams; the slot frees when the live session closes.
+  sequence streams; the slot frees when the live session closes, after its
+  close path (store writes included) has run.
+- **The message store.** With `Acceptor::with_store`, the store is touched only
+  once the Logon is **authenticated**: after the version, encryption, identity,
+  admission, `SendingTime` and `from_admin` checks, and after `141=Y` has been
+  checked against `MsgSeqNum = 1`. Only then is the store reset (for `141=Y`,
+  `reset_on_logon`, or a reset an earlier session owes; one `reset_to` call,
+  before the acknowledgement is filed, failing closed whatever the policy) or
+  refreshed for its counters (or the `with_initial_sequences` seed used), so an
+  unauthenticated `141=Y` Logon can neither clear the outbound journal nor
+  write to it. Every frame sent from then on (a refusing Logout, the
+  acknowledgement) is filed, and the Logon's number is persisted before the
+  session goes Active.
 
 A failure at any step sends a session Reject (reason 9 for identity, the
 `SendingTime` reason for a clock problem) and/or a Logout, drives the typestate
-through `reject_logon`, and drops the connection without ever reaching Active. A
+through `reject_logon`, and drops the connection without ever reaching Active.
+The one exception: with a store attached, a Logon refused **before it is
+authenticated** gets no Reject and no Logout. A frame sent then could not be
+filed without letting an unauthenticated peer write to the outbound journal and
+move its counters (and, for a duplicate Logon, race the live session's own
+writes), and could not be numbered without reusing, with different content, a
+number the session's stream already holds; the connection is simply closed. A
 gap in the inbound Logon completes the handshake and immediately issues a
 `ResendRequest` (2). Once Active, the session runs the same reactor as the
 initiator, so every inbound-frame rule below applies identically to both roles.
@@ -329,12 +347,15 @@ sent and **nothing at all** arrived in the interval that followed.
 
 **What IronFix implements today**
 
-All four mandate items are implemented, **provided a message store is attached**
-with `Initiator::with_store(Arc<dyn MessageStore>)`. Every sequenced outbound
-frame is then filed in the store under its `MsgSeqNum`, before it goes on the
-wire, and is available to be replayed. Without a store there is nothing to
-replay and the engine falls back to answering the whole range with one gap fill
-(see "Without a store" below).
+All four mandate items are implemented in **both roles**, **provided a message
+store is attached**: `Initiator::with_store(Arc<dyn MessageStore>)`,
+`Acceptor::with_store(Arc<dyn MessageStore>)`, or `EngineBuilder::with_store`,
+which both terminal methods honour. Every sequenced outbound frame, the Logon
+and its acknowledgement included, is then filed in the store under its
+`MsgSeqNum`, before it goes on the wire, and is available to be replayed. Both
+roles run the same reactor, so the replay below is identical for them. Without
+a store there is nothing to replay and the engine falls back to answering the
+whole range with one gap fill (see "Without a store" below).
 
 *Validation, identical in both modes:*
 
@@ -409,10 +430,11 @@ sequence number survives a restart. A durable store is separate, tracked work.
 `get_page`)
 is asynchronous and can fail, and the session awaits each one inline: a slow
 store delays the session for as long as the call takes. Each call is bounded
-by the store timeout (`Initiator::with_store_timeout`, default: the write
-timeout), and an overrun is `StoreError::Timeout`. With a store attached the
-engine writes in this order, in the Logon handshake and in the session reactor
-alike, through one shared step (`doc/adr/0005-fallible-store-writes.md`):
+by the store timeout (`with_store_timeout` on the `Initiator` or the
+`Acceptor`, default: the write timeout), and an overrun is
+`StoreError::Timeout`. With a store attached the engine writes in this order,
+in both roles' Logon handshakes and in the session reactor alike, through one
+shared step (`doc/adr/0005-fallible-store-writes.md`):
 
 1. *Outbound:* the frame is filed under its `MsgSeqNum` N and N+1 persisted as
    the next sender number, in one `file_outbound` call; then N is spent in
@@ -467,8 +489,9 @@ method) and a typed report at restart; at-least-once delivery additionally
 needs an inbound journal or redelivery through a `ResendRequest`. Both are
 tracked in #105.
 
-**Store failure policy.** `Initiator::with_store_failure_policy` chooses what a
-failed write (or one that overran the store timeout) means:
+**Store failure policy.** `with_store_failure_policy` (on the `Initiator` or
+the `Acceptor`) chooses what a failed write (or one that overran the store
+timeout) means:
 
 - `StoreFailurePolicy::Continue` (the default, and the behaviour before writes
   were fallible): log a warning without frame bytes and carry on as if the
@@ -499,13 +522,20 @@ close-time reset of `reset_on_logout` / `reset_on_disconnect` fails (no
 counter is then written) or when the reset for the counterparty's
 `ResetSeqNumFlag` fails. The `Initiator`'s next `connect` then resets the
 store before anything else, and its Logon declares `ResetSeqNumFlag` (141) = Y
-at `MsgSeqNum` 1, so the counterparty restarts the sequence with it. The
-record is cleared once that Logon is acknowledged, and lives in the
-`Initiator`, so a process restart forgets it.
+at `MsgSeqNum` 1, so the counterparty restarts the sequence with it; the
+record is cleared once that Logon is acknowledged. On the `Acceptor` (whose
+reset fails closed the same way when the counterparty's Logon carries
+`141=Y`), the next authenticated Logon resets the store and its
+acknowledgement declares `141=Y` at 1; the record is cleared once that
+acknowledgement is sent. The record lives in the engine, so a process restart
+forgets it.
 
 With a store attached, call `Initiator::connect` again only once the previous
 session's `Connection::wait_closed` has returned: until then the closing
 session still writes to the store and may record a reset owed to the next one.
+The `Acceptor` enforces this itself: its admission slot is released only after
+a session's close path has run, so the next Logon cannot share the store with a
+closing session.
 
 *Cancellation and timeouts.* Every reset is recorded as owed before it is
 awaited and cleared only once it has succeeded, so a connect dropped while a
@@ -522,9 +552,7 @@ crash between them leaves the store cleared with its initial counters, and the
 next Logon goes out at 1 without `ResetSeqNumFlag`. A durable store should
 override it.
 
-The `Acceptor` attaches no store yet, so the policy has nothing to act on
-there. Not done: inbound frames are not filed (only the target counter is
-kept).
+Not done: inbound frames are not filed (only the target counter is kept).
 
 **Outbound `EndSeqNo` sentinel — a version caveat.** When the engine detects an
 inbound gap it requests retransmission with `EndSeqNo` (16) = 0, the open-ended
