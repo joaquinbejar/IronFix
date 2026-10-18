@@ -2260,10 +2260,7 @@ impl WriterUses {
                         uses.decimal |= field.kind == Kind::Decimal;
                         uses.enums |= field.kind.enum_tag().is_some();
                     }
-                    Member::Group(group) => {
-                        uses.present |= group.required;
-                        uses.display = true;
-                    }
+                    Member::Group(_) => uses.display = true,
                 }
             }
         }
@@ -2749,13 +2746,9 @@ fn writer_checks(level: &Level) -> Vec<String> {
                     Kind::Bool | Kind::Int | Kind::Decimal => {}
                 }
             }
-            Member::Group(group) => {
-                if group.required {
-                    checks.push(format!(
-                        "present(!self.{ident}.is_empty(), {})?;",
-                        group.count_tag
-                    ));
-                }
+            // A required group is written with its count even with no
+            // entries (`NoXxx=0`), so it is never missing.
+            Member::Group(_) => {
                 checks.push(format!("for entry in self.{ident} {{"));
                 checks.push("    entry.check()?;".to_string());
                 checks.push("}".to_string());
@@ -2798,6 +2791,18 @@ fn writer_emits(model: &Model, level: &Level) -> Vec<String> {
                 };
                 emits.push(statement);
             }
+            // A required group's count is written even when it is zero: the
+            // count field is what the group requires, not an entry. An
+            // optional group with no entries is left out.
+            Member::Group(group) if group.required => {
+                emits.push(format!(
+                    "put_display(sink, {}, self.{ident}.len())?;",
+                    group.count_tag
+                ));
+                emits.push(format!("for entry in self.{ident} {{"));
+                emits.push("    entry.emit(sink)?;".to_string());
+                emits.push("}".to_string());
+            }
             Member::Group(group) => {
                 emits.push(format!("if !self.{ident}.is_empty() {{"));
                 emits.push(format!(
@@ -2833,15 +2838,16 @@ fn writer_field_doc(level: &Level, member: &Member) -> String {
             doc
         }
         Member::Group(group) => {
-            let mut doc = format!(
-                "{} (tag {}) repeating group: one item per entry, empty when absent.",
+            let presence = if group.required {
+                "Required: written with its count even when empty (count 0)."
+            } else {
+                "Empty when absent."
+            };
+            format!(
+                "{} (tag {}) repeating group: one item per entry. {presence}",
                 doc_text(&group.name),
                 group.count_tag
-            );
-            if group.required {
-                doc.push_str(" Required.");
-            }
-            doc
+            )
         }
     }
 }
@@ -2891,8 +2897,8 @@ fn emit_writer(
             "        /// as its count, then each entry with its delimiter first and its other members in XML order.",
             "        ///",
             "        /// # Errors",
-            "        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry",
-            "        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a",
+            "        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without",
+            "        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a",
             "        /// value other than data, a value that does not match its field's FIX type, a character (a",
             "        /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable\n        /// ASCII, or a multi-value token that is empty or carries a space. All are",
             "        /// checked before anything is written.",
@@ -3288,7 +3294,10 @@ mod tests {
     #[test]
     fn test_generate_views_checks_a_required_group_and_its_delimiter() {
         let code = views(&dict_with(Vec::new(), vec![allocs(true, 79)], Vec::new()));
-        assert!(code.contains("present(!self.no_allocs.is_empty(), 78)?;"));
+        // A required group is written with its count, zero included; it is
+        // never refused as missing.
+        assert!(!code.contains("present(!self.no_allocs.is_empty(), 78)?;"));
+        assert!(code.contains("            put_display(sink, 78, self.no_allocs.len())?;"));
         // The delimiter opens every entry, so its writer requires it even
         // though the dictionary marks it optional.
         assert!(code.contains("present(self.alloc_account.is_some(), 79)?;"));

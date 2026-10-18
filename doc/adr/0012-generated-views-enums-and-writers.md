@@ -154,8 +154,11 @@ methods in the consumer's crate, where the trait is local: over
 core API changed.
 
 **Writers check every value before writing anything.** A missing required
-field, required group or entry delimiter is
-`EncodeError::MissingRequiredField`. An empty value, SOH in any value other
+field or entry delimiter is `EncodeError::MissingRequiredField`. A required
+group requires its count field, not an entry: FIX allows `NoXxx=0` (FIX 4.4
+NewOrderList with `73=0` validates), so a required group with no entries is
+written with count 0, and only an optional group with no entries is left
+out. An empty value, SOH in any value other
 than `data`, a character that is not printable ASCII (a `char` field, the
 enumeration of a `char` field such as `Side::Other(b"\0")`, a
 `MultipleCharValue` token such as `Flags::Other(b"\n")`), and a multi-value
@@ -248,7 +251,7 @@ carries them; the bounded requirement leaves out a later breaking release.
   tests decode a FIX 4.4 NewOrderSingle with a nested party group and read
   every field, read undeclared enumeration values as `Other`, read
   multi-value tokens, check every typed error the views and writers raise,
-  enforce a required group at run time, and validate writer output against
+  write a required group with no entries as count 0, and validate writer output against
   the FIX 4.4 and sample dictionaries with `Validator`.
 - **What is checked from the generated text.** For every message of the four
   embedded dictionaries, the `layouts` constants are parsed back and compared

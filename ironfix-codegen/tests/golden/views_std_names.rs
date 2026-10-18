@@ -714,7 +714,7 @@ pub mod writers {
         pub text: ::core::option::Option<&'v str>,
         /// RawData (tag 96). Written with its length (tag 95), which is derived from it.
         pub raw_data: ::core::option::Option<&'v [u8]>,
-        /// NoItems (tag 5009) repeating group: one item per entry, empty when absent.
+        /// NoItems (tag 5009) repeating group: one item per entry. Empty when absent.
         pub no_items: &'v [OptionNoItemsFields<'v>],
     }
 
@@ -729,8 +729,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -804,8 +804,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -847,8 +847,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -890,8 +890,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are

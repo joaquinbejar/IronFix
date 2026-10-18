@@ -1058,8 +1058,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -1101,8 +1101,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -1147,8 +1147,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -1209,8 +1209,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -1273,8 +1273,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -1321,8 +1321,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -1405,8 +1405,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -1486,8 +1486,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are

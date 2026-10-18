@@ -1032,18 +1032,42 @@ fn test_length_delimited_group_writes_its_pair_first_and_reads_back() {
 }
 
 #[test]
-fn test_writer_enforces_a_required_group_at_run_time() {
-    let calls = Cell::new(0usize);
-    let mut counting = |_tag: u32, _value: &[u8]| calls.set(calls.get() + 1);
+fn test_writer_writes_a_required_group_with_no_entries_as_count_zero() {
+    // A required group requires its count field, not an entry: FIX allows
+    // `NoXxx=0` (FIX 4.4 NewOrderList with `73=0` validates), so a required
+    // group with no entries is written with count 0, never left out.
     let sampler = sample::writers::TypeSamplerFields {
         expire_seconds: Some(5),
         ..sample::writers::TypeSamplerFields::default()
     };
-    assert_eq!(
-        sampler.write(&mut counting),
-        Err(EncodeError::MissingRequiredField { tag: 5020 })
+    let bytes = encode("U1", |encoder| sampler.write(encoder));
+    assert!(
+        bytes.windows(8).any(|window| window == b"\x015020=0\x01"),
+        "the count is written"
     );
-    assert_eq!(calls.get(), 0, "nothing is written when a check fails");
+    let mut decoder = Decoder::new(&bytes);
+    let msg = ok(decoder.decode(), "the written frame decodes");
+    let dict = views_common::views_sample_dictionary();
+    assert_eq!(Validator::new(&dict).validate(&msg), Ok(()));
+    let view = some(
+        sample::views::TypeSamplerView::from_message(&msg),
+        "a TypeSampler view",
+    );
+    assert_eq!(
+        ok(view.no_docs(), "NoDocs").map(|entries| entries.count()),
+        Some(0)
+    );
+
+    // An optional group with no entries is still left out.
+    let order = sample::writers::NewOrderSingleFields {
+        cl_ord_id: Some("ORDER-1"),
+        side: Some(sample::enums::Side::Buy),
+        transact_time: Some("20260712-10:00:01"),
+        symbol: Some("EURUSD"),
+        ..sample::writers::NewOrderSingleFields::default()
+    };
+    let bytes = encode("D", |encoder| order.write(encoder));
+    assert!(!bytes.windows(5).any(|window| window == b"\x01453="));
 }
 
 #[test]

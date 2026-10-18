@@ -5787,8 +5787,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -5827,7 +5827,7 @@ pub mod writers {
         pub next_expected_msg_seq_num: ::core::option::Option<u64>,
         /// MaxMessageSize (tag 383).
         pub max_message_size: ::core::option::Option<u64>,
-        /// NoMsgTypes (tag 384) repeating group: one item per entry, empty when absent.
+        /// NoMsgTypes (tag 384) repeating group: one item per entry. Empty when absent.
         pub no_msg_types: &'v [LogonNoMsgTypesFields<'v>],
         /// TestMessageIndicator (tag 464).
         pub test_message_indicator: ::core::option::Option<bool>,
@@ -5848,8 +5848,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -5908,7 +5908,7 @@ pub mod writers {
         pub secondary_cl_ord_id: ::core::option::Option<&'v str>,
         /// ClOrdLinkID (tag 583).
         pub cl_ord_link_id: ::core::option::Option<&'v str>,
-        /// NoPartyIDs (tag 453) repeating group: one item per entry, empty when absent.
+        /// NoPartyIDs (tag 453) repeating group: one item per entry. Empty when absent.
         pub no_party_ids: &'v [PartiesNoPartyIDsFields<'v>],
         /// TradeOriginationDate (tag 229).
         pub trade_origination_date: ::core::option::Option<&'v str>,
@@ -5928,7 +5928,7 @@ pub mod writers {
         pub prealloc_method: ::core::option::Option<enums::PreallocMethod<'v>>,
         /// AllocID (tag 70).
         pub alloc_id: ::core::option::Option<&'v str>,
-        /// NoAllocs (tag 78) repeating group: one item per entry, empty when absent.
+        /// NoAllocs (tag 78) repeating group: one item per entry. Empty when absent.
         pub no_allocs: &'v [PreAllocGrpNoAllocsFields<'v>],
         /// SettlType (tag 63).
         pub settl_type: ::core::option::Option<enums::SettlType<'v>>,
@@ -5948,7 +5948,7 @@ pub mod writers {
         pub max_floor: ::core::option::Option<Decimal>,
         /// ExDestination (tag 100).
         pub ex_destination: ::core::option::Option<&'v str>,
-        /// NoTradingSessions (tag 386) repeating group: one item per entry, empty when absent.
+        /// NoTradingSessions (tag 386) repeating group: one item per entry. Empty when absent.
         pub no_trading_sessions: &'v [TrdgSesGrpNoTradingSessionsFields<'v>],
         /// ProcessCode (tag 81).
         pub process_code: ::core::option::Option<enums::ProcessCode<'v>>,
@@ -5960,7 +5960,7 @@ pub mod writers {
         pub security_id: ::core::option::Option<&'v str>,
         /// SecurityIDSource (tag 22).
         pub security_idsource: ::core::option::Option<enums::SecurityIDSource<'v>>,
-        /// NoSecurityAltID (tag 454) repeating group: one item per entry, empty when absent.
+        /// NoSecurityAltID (tag 454) repeating group: one item per entry. Empty when absent.
         pub no_security_alt_id: &'v [SecAltIDGrpNoSecurityAltIDFields<'v>],
         /// Product (tag 460).
         pub product: ::core::option::Option<enums::Product<'v>>,
@@ -6028,7 +6028,7 @@ pub mod writers {
         pub cpprogram: ::core::option::Option<enums::CPProgram<'v>>,
         /// CPRegType (tag 876).
         pub cpreg_type: ::core::option::Option<&'v str>,
-        /// NoEvents (tag 864) repeating group: one item per entry, empty when absent.
+        /// NoEvents (tag 864) repeating group: one item per entry. Empty when absent.
         pub no_events: &'v [EvntGrpNoEventsFields<'v>],
         /// DatedDate (tag 873).
         pub dated_date: ::core::option::Option<&'v str>,
@@ -6052,7 +6052,7 @@ pub mod writers {
         pub delivery_type: ::core::option::Option<enums::DeliveryType<'v>>,
         /// MarginRatio (tag 898).
         pub margin_ratio: ::core::option::Option<Decimal>,
-        /// NoUnderlyings (tag 711) repeating group: one item per entry, empty when absent.
+        /// NoUnderlyings (tag 711) repeating group: one item per entry. Empty when absent.
         pub no_underlyings: &'v [UndInstrmtGrpNoUnderlyingsFields<'v>],
         /// PrevClosePx (tag 140).
         pub prev_close_px: ::core::option::Option<Decimal>,
@@ -6062,7 +6062,7 @@ pub mod writers {
         pub locate_reqd: ::core::option::Option<bool>,
         /// TransactTime (tag 60). Required.
         pub transact_time: ::core::option::Option<&'v str>,
-        /// NoStipulations (tag 232) repeating group: one item per entry, empty when absent.
+        /// NoStipulations (tag 232) repeating group: one item per entry. Empty when absent.
         pub no_stipulations: &'v [StipulationsNoStipulationsFields<'v>],
         /// QtyType (tag 854).
         pub qty_type: ::core::option::Option<enums::QtyType<'v>>,
@@ -6221,8 +6221,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -6746,7 +6746,7 @@ pub mod writers {
         pub party_idsource: ::core::option::Option<enums::PartyIDSource<'v>>,
         /// PartyRole (tag 452).
         pub party_role: ::core::option::Option<enums::PartyRole<'v>>,
-        /// NoPartySubIDs (tag 802) repeating group: one item per entry, empty when absent.
+        /// NoPartySubIDs (tag 802) repeating group: one item per entry. Empty when absent.
         pub no_party_sub_ids: &'v [PtysSubGrpNoPartySubIDsFields<'v>],
     }
 
@@ -6833,7 +6833,7 @@ pub mod writers {
         pub alloc_settl_currency: ::core::option::Option<&'v str>,
         /// IndividualAllocID (tag 467).
         pub individual_alloc_id: ::core::option::Option<&'v str>,
-        /// NoNestedPartyIDs (tag 539) repeating group: one item per entry, empty when absent.
+        /// NoNestedPartyIDs (tag 539) repeating group: one item per entry. Empty when absent.
         pub no_nested_party_ids: &'v [NestedPartiesNoNestedPartyIDsFields<'v>],
         /// AllocQty (tag 80).
         pub alloc_qty: ::core::option::Option<Decimal>,
@@ -6887,7 +6887,7 @@ pub mod writers {
         pub nested_party_idsource: ::core::option::Option<char>,
         /// NestedPartyRole (tag 538).
         pub nested_party_role: ::core::option::Option<i64>,
-        /// NoNestedPartySubIDs (tag 804) repeating group: one item per entry, empty when absent.
+        /// NoNestedPartySubIDs (tag 804) repeating group: one item per entry. Empty when absent.
         pub no_nested_party_sub_ids: &'v [NstdPtysSubGrpNoNestedPartySubIDsFields<'v>],
     }
 
@@ -7078,7 +7078,7 @@ pub mod writers {
         pub underlying_security_id: ::core::option::Option<&'v str>,
         /// UnderlyingSecurityIDSource (tag 305).
         pub underlying_security_idsource: ::core::option::Option<&'v str>,
-        /// NoUnderlyingSecurityAltID (tag 457) repeating group: one item per entry, empty when absent.
+        /// NoUnderlyingSecurityAltID (tag 457) repeating group: one item per entry. Empty when absent.
         pub no_underlying_security_alt_id: &'v [UndSecAltIDGrpNoUnderlyingSecurityAltIDFields<'v>],
         /// UnderlyingProduct (tag 462).
         pub underlying_product: ::core::option::Option<i64>,
@@ -7158,7 +7158,7 @@ pub mod writers {
         pub underlying_current_value: ::core::option::Option<Decimal>,
         /// UnderlyingEndValue (tag 886).
         pub underlying_end_value: ::core::option::Option<Decimal>,
-        /// NoUnderlyingStips (tag 887) repeating group: one item per entry, empty when absent.
+        /// NoUnderlyingStips (tag 887) repeating group: one item per entry. Empty when absent.
         pub no_underlying_stips: &'v [UnderlyingStipulationsNoUnderlyingStipsFields<'v>],
     }
 

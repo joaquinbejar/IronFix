@@ -1166,8 +1166,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -1190,7 +1190,7 @@ pub mod writers {
         pub symbol: ::core::option::Option<&'v str>,
         /// SecurityType (tag 167).
         pub security_type: ::core::option::Option<enums::SecurityType<'v>>,
-        /// NoPartyIDs (tag 453) repeating group: one item per entry, empty when absent.
+        /// NoPartyIDs (tag 453) repeating group: one item per entry. Empty when absent.
         pub no_party_ids: &'v [PartiesNoPartyIDsFields<'v>],
     }
 
@@ -1205,8 +1205,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -1288,13 +1288,13 @@ pub mod writers {
         pub get_5001: ::core::option::Option<&'v str>,
         /// Flag (tag 5002).
         pub flag: ::core::option::Option<char>,
-        /// NoAllocs (tag 78) repeating group: one item per entry, empty when absent.
+        /// NoAllocs (tag 78) repeating group: one item per entry. Empty when absent.
         pub no_allocs: &'v [NewOrderSingleNoAllocsFields<'v>],
         /// Symbol (tag 55). Required.
         pub symbol: ::core::option::Option<&'v str>,
         /// SecurityType (tag 167).
         pub security_type: ::core::option::Option<enums::SecurityType<'v>>,
-        /// NoPartyIDs (tag 453) repeating group: one item per entry, empty when absent.
+        /// NoPartyIDs (tag 453) repeating group: one item per entry. Empty when absent.
         pub no_party_ids: &'v [PartiesNoPartyIDsFields<'v>],
     }
 
@@ -1309,8 +1309,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -1426,7 +1426,7 @@ pub mod writers {
         pub flags: &'v [enums::Flags<'v>],
         /// Mode (tag 5015).
         pub mode: ::core::option::Option<enums::Mode<'v>>,
-        /// NoDocs (tag 5020) repeating group: one item per entry, empty when absent. Required.
+        /// NoDocs (tag 5020) repeating group: one item per entry. Required: written with its count even when empty (count 0).
         pub no_docs: &'v [TypeSamplerNoDocsFields<'v>],
     }
 
@@ -1441,8 +1441,8 @@ pub mod writers {
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
-        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
-        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a
+        /// `EncodeError::MissingRequiredField` for an absent required field, or an entry without
+        /// its delimiter (a required group with no entries is written with count 0); `EncodeError::InvalidFieldValue` for an empty value, SOH in a
         /// value other than data, a value that does not match its field's FIX type, a character (a
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
@@ -1479,7 +1479,6 @@ pub mod writers {
             check_text(self.mode.map(|value| value.as_bytes()), 5015)?;
             check_grammar(self.mode.map(|value| value.as_bytes()), FieldType::Char, 5015)?;
             check_ascii(self.mode.map(|value| value.as_bytes()), 5015)?;
-            present(!self.no_docs.is_empty(), 5020)?;
             for entry in self.no_docs {
                 entry.check()?;
             }
@@ -1501,11 +1500,9 @@ pub mod writers {
             if let Some(value) = self.labels { sink.field(5013, value.as_bytes()); }
             if !self.flags.is_empty() { sink.field(5014, &enums::Flags::join(self.flags)); }
             if let Some(value) = self.mode { sink.field(5015, value.as_bytes()); }
-            if !self.no_docs.is_empty() {
-                put_display(sink, 5020, self.no_docs.len())?;
-                for entry in self.no_docs {
-                    entry.emit(sink)?;
-                }
+            put_display(sink, 5020, self.no_docs.len())?;
+            for entry in self.no_docs {
+                entry.emit(sink)?;
             }
             Ok(())
         }
@@ -1522,7 +1519,7 @@ pub mod writers {
         pub party_role: ::core::option::Option<i64>,
         /// Text (tag 58).
         pub text: ::core::option::Option<&'v str>,
-        /// NoPartySubIDs (tag 802) repeating group: one item per entry, empty when absent.
+        /// NoPartySubIDs (tag 802) repeating group: one item per entry. Empty when absent.
         pub no_party_sub_ids: &'v [PtysSubGrpNoPartySubIDsFields<'v>],
     }
 
