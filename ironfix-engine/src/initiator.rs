@@ -206,7 +206,7 @@ use crate::reactor::{
     SessionParams, TICK_INTERVAL, lock_heartbeat, read_handshake_frame, refuse_handshake,
     send_handshake_admin, session_codec, spawn_session,
 };
-use crate::stream::{self, BoxedStream};
+use crate::stream::SessionStream;
 use crate::wire::{
     self, ApplVersionGuard, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion,
 };
@@ -536,6 +536,10 @@ impl<A: Application + 'static> Initiator<A> {
     /// Dials the counterparty, completes the Logon handshake, and spawns
     /// the session reactor.
     ///
+    /// `TCP_NODELAY` is set on the dialled socket, and the socket is held by
+    /// value. To run the session over a stream you opened yourself, see
+    /// [`Initiator::establish`].
+    ///
     /// On success the session is Active: `on_logon` has fired and the
     /// returned [`Connection`] can send application messages. The reactor
     /// owns the socket and handles heartbeats, TestRequests, sequence
@@ -607,8 +611,9 @@ impl<A: Application + 'static> Initiator<A> {
             Ok(Ok(stream)) => stream,
         };
 
-        // TCP_NODELAY is set here, on the TCP path only.
-        self.logon(version, session, stream::tcp(stream)).await
+        // The only way to a TCP session: it sets TCP_NODELAY.
+        self.logon(version, session, SessionStream::tcp(stream))
+            .await
     }
 
     /// Establishes a session on a byte stream the caller has already
@@ -627,11 +632,24 @@ impl<A: Application + 'static> Initiator<A> {
     /// caller's to set on a TCP socket under the stream.
     ///
     /// The session owns the stream from here on and closes it when the
-    /// session ends; on an error the stream is dropped, which closes it.
+    /// session ends; on an error the stream is dropped, which closes it. The
+    /// logon and write timeouts bound only what happens from this call on: a
+    /// TLS handshake, or anything else, run on the stream before it is not
+    /// bounded by them and is the caller's to bound.
     ///
-    /// The stream is boxed once, here: every later read and write is a call
-    /// through its vtable, a cost paid per poll of the transport rather than
-    /// per message field. It has not been benchmarked.
+    /// The stream must be a well-behaved [`AsyncRead`]: `poll_read` fills the
+    /// `ReadBuf` it is handed and never swaps it for another one. The framing
+    /// layer (tokio-util) asserts this, and a stream that breaks it panics the
+    /// task reading it (the whole process, under `panic = "abort"`).
+    ///
+    /// The stream is boxed once, here, and the TCP path of
+    /// [`Initiator::connect`] is not: it holds its socket by value. Each
+    /// outbound frame written in one piece then costs three dynamic calls
+    /// (`is_write_vectored`, `poll_write_vectored`, `poll_flush`), and each
+    /// read poll one, the `Pending` poll on every wakeup included. Nothing has
+    /// measured that cost. Pass the stream's concrete type: a stream that is
+    /// already boxed (`Box<dyn ...>`, `Pin<Box<dyn ...>>`) is boxed again, for
+    /// two allocations and two vtable hops on every call.
     ///
     /// Everything [`Initiator::connect`] says about the returned
     /// [`Connection`] (dropping every handle logs out) and about one session
@@ -693,7 +711,8 @@ impl<A: Application + 'static> Initiator<A> {
         // connected; what `Connecting` means is that the Logon is not sent.
         let session = Session::<Disconnected>::new(session_id.to_string()).connect();
 
-        self.logon(version, session, stream::boxed(stream)).await
+        self.logon(version, session, SessionStream::erased(stream))
+            .await
     }
 
     /// The checks [`Initiator::connect`] and [`Initiator::establish`] make
@@ -755,7 +774,7 @@ impl<A: Application + 'static> Initiator<A> {
         &self,
         version: FixVersion,
         session: Session<Connecting>,
-        stream: BoxedStream,
+        stream: SessionStream,
     ) -> Result<Connection, EngineError> {
         let session_id = self.session_id.clone();
         let mut framed = Framed::new(stream, session_codec(&self.config, version));

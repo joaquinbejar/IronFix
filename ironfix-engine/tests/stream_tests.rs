@@ -4,8 +4,8 @@
    Date: 18/10/26
 ******************************************************************************/
 
-//! Integration tests for issue #63: both engines over a byte stream the
-//! caller provides, with no TCP at all.
+//! Integration tests for issue #63 (ADR-0007): both engines over a byte
+//! stream the caller provides, mostly with no TCP at all.
 //!
 //! `Initiator::establish`, `Acceptor::serve_stream` and
 //! `AcceptorRegistry::serve_stream` take any `AsyncRead + AsyncWrite` stream.
@@ -20,7 +20,9 @@
 //! rule that an unauthenticated peer never touches the acceptor's store, and
 //! the checks made before the stream is written to. A stream that closes
 //! mid-handshake ends in a typed `EngineError` in every entry point, and every
-//! entry point's future is `Send`, so it can be spawned.
+//! entry point's future is `Send`, so it can be spawned. Over TCP, the
+//! acceptor entry points are shown to set `TCP_NODELAY` on the socket itself,
+//! read through a second handle on it after a real handshake.
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -838,8 +840,84 @@ async fn test_stream_entry_points_refuse_before_writing() {
     assert!(app.events().is_empty(), "{:?}", app.events());
 }
 
-/// A TCP stream still reaches a session through `serve` unchanged, and a TCP
-/// stream handed to `serve_stream` works too, as any other stream does.
+/// Accepts one connection on `listener`, with `TCP_NODELAY` cleared, and
+/// returns it together with a second handle on the same socket, through
+/// which its options can still be read once an engine owns the first.
+async fn accept_with_probe(listener: &TcpListener) -> (TcpStream, std::net::TcpStream) {
+    let (accepted, _) = ok(listener.accept().await, "accept loopback");
+    ok(
+        accepted.set_nodelay(false),
+        "start with Nagle's algorithm on",
+    );
+    let accepted = ok(accepted.into_std(), "take the socket out of Tokio");
+    let probe = ok(accepted.try_clone(), "a second handle on the socket");
+    let stream = ok(
+        TcpStream::from_std(accepted),
+        "hand the socket back to Tokio",
+    );
+    (stream, probe)
+}
+
+/// The TCP entry points set `TCP_NODELAY` on the socket they are given,
+/// checked on the socket itself after a real handshake, through a second
+/// handle on it: `Acceptor::serve` and `AcceptorRegistry::serve`. The
+/// initiator's dialled socket is never handed to the caller, so
+/// `Initiator::connect` is covered by the unit test of the constructor it
+/// calls, the only way a TCP session is built.
+#[tokio::test]
+async fn test_tcp_entry_points_set_nodelay_on_the_socket() {
+    let listener = ok(TcpListener::bind("127.0.0.1:0").await, "bind loopback");
+    let addr = ok(listener.local_addr(), "listener address");
+
+    // Acceptor::serve.
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(venue_config("CLIENT"), venue_app);
+    let (member_app, _member_rx) = RecordingApp::new();
+    let initiator = Initiator::new(member_config("CLIENT"), member_app);
+    let ((served, probe), member) = tokio::join!(
+        async {
+            let (stream, probe) = accept_with_probe(&listener).await;
+            (timeout(STEP, acceptor.serve(stream)).await, probe)
+        },
+        timeout(STEP, initiator.connect(addr)),
+    );
+    let venue = ok(ok(served, "within 5s"), "Acceptor::serve logs on");
+    let member = ok(ok(member, "within 5s"), "the initiator logs on");
+    assert!(
+        ok(probe.nodelay(), "read TCP_NODELAY"),
+        "Acceptor::serve sets TCP_NODELAY"
+    );
+    drop(probe);
+    log_out(&member, &venue).await;
+
+    // AcceptorRegistry::serve.
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let registry = AcceptorRegistry::new();
+    ok(
+        registry.register(Acceptor::new(venue_config("MEMBER_A"), venue_app)),
+        "the session registers",
+    );
+    let (member_app, _member_rx) = RecordingApp::new();
+    let initiator = Initiator::new(member_config("MEMBER_A"), member_app);
+    let ((served, probe), member) = tokio::join!(
+        async {
+            let (stream, probe) = accept_with_probe(&listener).await;
+            (timeout(STEP, registry.serve(stream)).await, probe)
+        },
+        timeout(STEP, initiator.connect(addr)),
+    );
+    let venue = ok(ok(served, "within 5s"), "AcceptorRegistry::serve logs on");
+    let member = ok(ok(member, "within 5s"), "the initiator logs on");
+    assert!(
+        ok(probe.nodelay(), "read TCP_NODELAY"),
+        "AcceptorRegistry::serve sets TCP_NODELAY"
+    );
+    drop(probe);
+    log_out(&member, &venue).await;
+}
+
+/// A `TcpStream` can be handed to the stream entry points like any other
+/// stream, in both roles: it is erased like the rest, and the session runs.
 #[tokio::test]
 async fn test_serve_stream_accepts_a_tcp_stream() {
     let listener = ok(TcpListener::bind("127.0.0.1:0").await, "bind loopback");

@@ -190,7 +190,7 @@ use crate::reactor::{
     HandshakeRead, SessionParams, TICK_INTERVAL, lock_heartbeat, read_handshake_frame,
     refuse_handshake, send_handshake_admin, session_codec, spawn_session,
 };
-use crate::stream::{self, BoxedStream};
+use crate::stream::SessionStream;
 use crate::wire::{
     self, ApplVersionGuard, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard,
     UnsupportedVersion,
@@ -747,6 +747,11 @@ impl<A: Application + 'static> Acceptor<A> {
     /// Establishes a session on an already-accepted [`TcpStream`], completing
     /// the acceptor-side Logon handshake and spawning the session reactor.
     ///
+    /// `TCP_NODELAY` is set on the socket before the handshake, and the
+    /// socket is held by value: this path pays no allocation and no dynamic
+    /// call per poll. For any other kind of stream, see
+    /// [`Acceptor::serve_stream`].
+    ///
     /// On success the session is Active: `on_logon` has fired and the returned
     /// [`Connection`] can send application messages. The reactor owns the
     /// socket and handles heartbeats, TestRequests, sequence validation, and
@@ -813,8 +818,8 @@ impl<A: Application + 'static> Acceptor<A> {
     /// [`EngineError::InitialSequenceBelowStore`] for a sender seed below the
     /// store under [`StoreFailurePolicy::CloseSession`].
     pub async fn serve(&self, stream: TcpStream) -> Result<Connection, EngineError> {
-        // TCP_NODELAY is set here, on the TCP path only.
-        self.serve_boxed(stream::tcp(stream)).await
+        // The only way to a TCP session: it sets TCP_NODELAY.
+        self.serve_session_stream(SessionStream::tcp(stream)).await
     }
 
     /// Establishes a session on a byte stream the caller has already
@@ -835,11 +840,24 @@ impl<A: Application + 'static> Acceptor<A> {
     /// option through an arbitrary stream, so that is the caller's.
     ///
     /// The session owns the stream from here on and closes it when the
-    /// session ends; on an error the stream is dropped, which closes it.
+    /// session ends; on an error the stream is dropped, which closes it. The
+    /// logon and write timeouts bound only what happens from this call on: a
+    /// TLS handshake, or anything else, run on the stream before it is not
+    /// bounded by them and is the caller's to bound.
     ///
-    /// The stream is boxed once, here: every later read and write is a call
-    /// through its vtable, a cost paid per poll of the transport rather than
-    /// per message field. It has not been benchmarked.
+    /// The stream must be a well-behaved [`AsyncRead`]: `poll_read` fills the
+    /// `ReadBuf` it is handed and never swaps it for another one. The framing
+    /// layer (tokio-util) asserts this, and a stream that breaks it panics the
+    /// task reading it (the whole process, under `panic = "abort"`).
+    ///
+    /// The stream is boxed once, here, and the TCP path of
+    /// [`Acceptor::serve`] is not: it holds its socket by value. Each outbound
+    /// frame written in one piece then costs three dynamic calls
+    /// (`is_write_vectored`, `poll_write_vectored`, `poll_flush`), and each
+    /// read poll one, the `Pending` poll on every wakeup included. Nothing has
+    /// measured that cost. Pass the stream's concrete type: a stream that is
+    /// already boxed (`Box<dyn ...>`, `Pin<Box<dyn ...>>`) is boxed again, for
+    /// two allocations and two vtable hops on every call.
     ///
     /// See [`Initiator::establish`](crate::Initiator::establish) for an
     /// example running both roles over [`tokio::io::duplex`].
@@ -856,15 +874,17 @@ impl<A: Application + 'static> Acceptor<A> {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_boxed(stream::boxed(stream)).await
+        self.serve_session_stream(SessionStream::erased(stream))
+            .await
     }
 
-    /// [`Acceptor::serve`] and [`Acceptor::serve_stream`] on an erased
-    /// stream: reads the inbound Logon and runs the handshake on it.
+    /// [`Acceptor::serve`] and [`Acceptor::serve_stream`] on the session's
+    /// stream, TCP or erased: reads the inbound Logon and runs the handshake
+    /// on it.
     ///
     /// # Errors
     /// Every error [`Acceptor::serve`] documents.
-    async fn serve_boxed(&self, stream: BoxedStream) -> Result<Connection, EngineError> {
+    async fn serve_session_stream(&self, stream: SessionStream) -> Result<Connection, EngineError> {
         let version = self.preflight()?;
 
         let session_id = self.session_id.clone();

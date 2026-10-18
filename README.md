@@ -86,9 +86,14 @@ messages and the engine wiring do not exist yet.
   as a TLS stream built with the TLS crate of your choice, a Unix socket, or
   a `tokio::io::duplex` pipe for tests without sockets. `connect`, `serve`
   and `accept` are the TCP dial or accept (with `TCP_NODELAY` set) followed by
-  that same path. The stream is boxed once per session, so no public type
-  gains a type parameter; the cost is a call through a vtable on each poll of
-  the stream, which has not been benchmarked.
+  that same path. No public type gains a type parameter. The TCP path is
+  unaffected: its socket is held by value, with no allocation and no dynamic
+  call. A caller's stream is boxed once per session, and each outbound frame
+  written in one piece then costs three dynamic calls and each read poll one
+  (the `Pending` poll on every wakeup included); nothing has measured that
+  cost. Pass the concrete stream type, not one already boxed, and a stream
+  whose `poll_read` never swaps the `ReadBuf` it is given. See
+  `doc/adr/0007-engine-over-any-stream.md`.
 - **One session reactor shared by both roles.** Once Logon completes, the
   engine owns the socket: heartbeats and TestRequests at the negotiated
   interval, CompID and `SendingTime` validation, sequence-gap detection with

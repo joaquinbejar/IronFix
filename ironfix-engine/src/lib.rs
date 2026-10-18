@@ -28,12 +28,12 @@
 //!   the inbound Logon once, routes it by the CompIDs (and configured sub and
 //!   location IDs) it claims, read from the standard header and bounded
 //!   before anything is looked up, to a registered [`Acceptor`] or one a
-//!   [`SessionLookup`] admits, and runs that session's handshake on it. A Logon that cannot be routed is closed
-//!   without a reply, touching no store and running no callback. A session
-//!   the lookup admits is kept only once a Logon for it gets past
-//!   `from_admin`, and [`AcceptorRegistry::with_max_sessions`] caps how many
-//!   it holds. Each session keeps its own sequence numbers, store and
-//!   heartbeat.
+//!   [`SessionLookup`] admits, and runs that session's handshake on it. A
+//!   Logon that cannot be routed is closed without a reply, touching no store
+//!   and running no callback. A session the lookup admits is kept only once a
+//!   Logon for it gets past `from_admin`, and
+//!   [`AcceptorRegistry::with_max_sessions`] caps how many it holds. Each
+//!   session keeps its own sequence numbers, store and heartbeat.
 //! - **[`Connection`]**: a cheap-clone handle returned by both engines — send,
 //!   logout, await close, read sequence numbers and, on a FIX 5.0 session,
 //!   the counterparty's declared default application version.
@@ -49,30 +49,6 @@
 //! a Logon handshake completes, the inbound-frame contract — sequence
 //! validation, gap recovery, identity and clock checks, heartbeating, and the
 //! Logout handshake — is identical for the two roles.
-//!
-//! ## Transports
-//!
-//! A session runs over any byte stream that is
-//! `AsyncRead + AsyncWrite + Unpin + Send + 'static`, not only TCP. The TCP
-//! entry points ([`Initiator::connect`], [`Acceptor::serve`] and
-//! [`Acceptor::accept`], [`AcceptorRegistry::serve`] and
-//! [`AcceptorRegistry::accept`]) dial or accept a `TcpStream` and set
-//! `TCP_NODELAY` on it. [`Initiator::establish`], [`Acceptor::serve_stream`]
-//! and [`AcceptorRegistry::serve_stream`] take a stream the caller has already
-//! connected or accepted: a TLS stream built with the TLS stack of the
-//! caller's choice, a Unix socket, a proxied connection, or an in-memory
-//! [`tokio::io::duplex`] pipe (see the example on [`Initiator::establish`]).
-//! Everything else is the same on both paths: the handshake checks and their
-//! order, the logon and write timeouts, the store order, and the reactor. Only
-//! socket options are not: the engine cannot reach one through an arbitrary
-//! stream, so those are the caller's.
-//!
-//! The stream is boxed once, when the session starts, and every type the
-//! session uses ([`Connection`] included) stays free of a stream type
-//! parameter. The cost is one heap allocation per session and a call through
-//! a vtable on every poll of the stream (a read refilling the codec's buffer,
-//! a write or flush of a frame), not per message field. It has not been
-//! benchmarked.
 //!
 //! On a FIX 5.0 session (framed as FIXT.1.1) both roles also check the
 //! application version: the acceptor requires the Logon's `DefaultApplVerID`
@@ -108,6 +84,33 @@
 //! [`SessionConfig::garbled_frame_limit`] logs out a session whose link keeps
 //! garbling. Only a frame above `max_message_size` (after a Logout saying so)
 //! or an I/O error still ends the session at the codec.
+//!
+//! ## Transports
+//!
+//! A session runs over any byte stream that is
+//! `AsyncRead + AsyncWrite + Unpin + Send + 'static`, not only TCP. The TCP
+//! entry points ([`Initiator::connect`], [`Acceptor::serve`] and
+//! [`Acceptor::accept`], [`AcceptorRegistry::serve`] and
+//! [`AcceptorRegistry::accept`]) dial or accept a `TcpStream` and set
+//! `TCP_NODELAY` on it. [`Initiator::establish`], [`Acceptor::serve_stream`]
+//! and [`AcceptorRegistry::serve_stream`] take a stream the caller has already
+//! connected or accepted: a TLS stream built with the TLS stack of the
+//! caller's choice, a Unix socket, a proxied connection, or an in-memory
+//! [`tokio::io::duplex`] pipe (see the example on [`Initiator::establish`]).
+//! Everything else is the same on both paths: the handshake checks and their
+//! order, the logon and write timeouts, the store order, and the reactor. Only
+//! socket options are not: the engine cannot reach one through an arbitrary
+//! stream, so those are the caller's. A TLS handshake the caller runs before
+//! handing the stream over is outside the engine's logon timeout.
+//!
+//! No public type gains a stream type parameter, [`Connection`] included. The
+//! TCP path is unaffected by the seam: its socket is held by value, with no
+//! allocation and no dynamic call. A caller's stream is boxed once, when the
+//! session starts; each outbound frame written in one piece then costs three
+//! dynamic calls (`is_write_vectored`, `poll_write_vectored`, `poll_flush`)
+//! and each read poll one, the `Pending` poll on every wakeup included.
+//! Nothing has measured that cost. The decision is recorded in ADR-0007
+//! (`doc/adr/0007-engine-over-any-stream.md`).
 //!
 //! ## Current limitations
 //!

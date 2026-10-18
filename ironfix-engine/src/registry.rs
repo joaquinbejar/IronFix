@@ -152,7 +152,7 @@ use crate::application::{Application, NoOpApplication, SessionId};
 use crate::connection::Connection;
 use crate::error::EngineError;
 use crate::reactor::{HandshakeRead, read_handshake_frame_until};
-use crate::stream::{self, BoxedStream};
+use crate::stream::SessionStream;
 use crate::wire::{self, FieldOccurrence};
 use async_trait::async_trait;
 use ironfix_core::message::{MsgType, RawMessage};
@@ -1000,6 +1000,10 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     /// Reads the Logon on an already-accepted [`TcpStream`], routes it to its
     /// session and completes that session's handshake.
     ///
+    /// `TCP_NODELAY` is set on the socket before the Logon is read, and the
+    /// socket is held by value. For any other kind of stream, see
+    /// [`AcceptorRegistry::serve_stream`].
+    ///
     /// On success the routed session is Active, exactly as after
     /// [`Acceptor::serve`]: `on_create` and `on_logon` have fired for it, and
     /// the returned [`Connection`] belongs to it.
@@ -1033,8 +1037,8 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     /// [`EngineError::LogonRejected`] for a second Logon for a session already
     /// live.
     pub async fn serve(&self, stream: TcpStream) -> Result<Connection, EngineError> {
-        // TCP_NODELAY is set here, on the TCP path only.
-        self.serve_boxed(stream::tcp(stream)).await
+        // The only way to a TCP session: it sets TCP_NODELAY.
+        self.serve_session_stream(SessionStream::tcp(stream)).await
     }
 
     /// Reads the Logon on a byte stream the caller has already accepted,
@@ -1052,7 +1056,24 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     /// is not set: that is the caller's.
     ///
     /// The routed session owns the stream from here on; on an error the
-    /// stream is dropped, which closes it.
+    /// stream is dropped, which closes it. The registry's logon timeout bounds
+    /// only what happens from this call on: a TLS handshake, or anything else,
+    /// run on the stream before it is not bounded by it and is the caller's to
+    /// bound.
+    ///
+    /// The stream must be a well-behaved [`AsyncRead`]: `poll_read` fills the
+    /// `ReadBuf` it is handed and never swaps it for another one. The framing
+    /// layer (tokio-util) asserts this, and a stream that breaks it panics the
+    /// task reading it (the whole process, under `panic = "abort"`).
+    ///
+    /// The stream is boxed once, here, and the TCP path of
+    /// [`AcceptorRegistry::serve`] is not: it holds its socket by value. Each
+    /// outbound frame written in one piece then costs three dynamic calls
+    /// (`is_write_vectored`, `poll_write_vectored`, `poll_flush`), and each
+    /// read poll one, the `Pending` poll on every wakeup included. Nothing has
+    /// measured that cost. Pass the stream's concrete type: a stream that is
+    /// already boxed (`Box<dyn ...>`, `Pin<Box<dyn ...>>`) is boxed again, for
+    /// two allocations and two vtable hops on every call.
     ///
     /// # Arguments
     /// * `stream` - An accepted byte stream from a counterparty
@@ -1066,15 +1087,16 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_boxed(stream::boxed(stream)).await
+        self.serve_session_stream(SessionStream::erased(stream))
+            .await
     }
 
     /// [`AcceptorRegistry::serve`] and [`AcceptorRegistry::serve_stream`] on
-    /// an erased stream.
+    /// the connection's stream, TCP or erased.
     ///
     /// # Errors
     /// Every error [`AcceptorRegistry::serve`] documents.
-    async fn serve_boxed(&self, stream: BoxedStream) -> Result<Connection, EngineError> {
+    async fn serve_session_stream(&self, stream: SessionStream) -> Result<Connection, EngineError> {
         self.settings_check()?;
         // One deadline for the read and the lookup together. The bound is
         // checked to be at most `MAX_TIMEOUT`, so the sum cannot overflow; it

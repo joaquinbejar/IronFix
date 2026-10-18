@@ -390,11 +390,13 @@ pub struct MmapStore {
 > `Initiator`'s background reactor stamps the header/`MsgSeqNum`/trailer via the
 > private `wire::MessageFactory`, encodes with `ironfix-tagvalue`, and writes
 > through `FixCodec` on the session's byte stream: a `TcpStream` with
-> `TCP_NODELAY` set (`Initiator::connect`), or whatever stream the caller
-> handed to `Initiator::establish`, boxed once per session so each poll of it
-> is a dynamic call. There is no io_uring, no `SO_BUSY_POLL`, no hardware
-> timestamping, and no store write. The target latency below is a goal, not a
-> measurement.
+> `TCP_NODELAY` set (`Initiator::connect`), held by value with no dynamic
+> call, or whatever stream the caller handed to `Initiator::establish`, boxed
+> once per session, which costs three dynamic calls per outbound frame and one
+> per read poll (ADR-0007; not measured). There is no io_uring, no
+> `SO_BUSY_POLL` and no hardware timestamping; with a store attached each
+> frame is filed before it is written (`file_and_spend`, ADR-0005). The
+> target latency below is a goal, not a measurement.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -1507,11 +1509,10 @@ fn configure_thread_affinity() {
 > below were the original estimate and have no bearing on when anything will
 > land; do not quote them as commitments. Work has not followed this order —
 > for example, `ironfix-engine`'s `Initiator` and `Acceptor` (listed under
-> Phase 6) exist while file-based stores (Phase 2), TLS and a transport-level
-> TCP connector/acceptor (Phase 3; the engines open TCP themselves, or run
-> over any stream the caller opened), the FAST
-> template parser and multicast (Phase 4) and the code generation consumers
-> (Phase 5) do not.
+> Phase 6) exist while an mmap store (Phase 2), TLS and a transport-level TCP
+> connector/acceptor (Phase 3; the engines open TCP themselves, or run over
+> any stream the caller opened), the FAST template parser and multicast
+> (Phase 4) and the code generation consumers (Phase 5) do not.
 >
 > The living checklist is the "Implementation Priority" section of
 > `doc/fix_operations.md`. There is no `doc/ROADMAP.md`.
