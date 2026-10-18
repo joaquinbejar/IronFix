@@ -256,18 +256,79 @@ neither read, until the write timeout closed both sessions (found in review).
 
 Resends are now queued (`Reactor::queue_resend`) and written by the reactor
 loop one frame per pass (`Reactor::resend_step`), reading the store a page at a
-time as before. While one is queued, the loop reads any frame the counterparty
-has already sent before writing the next resend frame, so each side keeps
-draining the other, and inbound frames take the normal path. Live outbound
-application messages, and a Logout the consumer asks for, wait in the command
-queue until the resend is done, so a resend always stays ahead of them;
-administrative replies to inbound messages are still written as they arise.
+time; a page read is a step of its own and spends cooperative budget, so a run
+of skipped entries cannot keep the reactor from yielding. While a resend is
+queued, the loop's only read is the one before each resend frame: any frame the
+counterparty has already sent is read first, so each side keeps draining the
+other whatever branch the loop picks, and inbound frames take the normal path.
+
+**Nothing that takes a new number is written in the middle of a resend.** A
+new number reaching the counterparty inside the range being answered is
+outside it, and a receiver that does not queue gapped messages (IronFix itself,
+until #71) is left waiting for it: it reads the frame as gapped, fills the rest
+of the gap, and then expects that number, which nothing sends again until it
+asks (found in review; the base never interleaved, because it wrote a resend to
+completion). So while a resend is under way:
+
+- live application messages, and a Logout the consumer asks for, wait in the
+  command queue;
+- a Heartbeat answering a TestRequest, a session Reject (from the session or
+  the application dispatcher), and this session's own `ResendRequest` for an
+  inbound gap are held back and written, in order, once the resend is done
+  (`Reactor::finish_resends`). A held `ResendRequest` is built then, from the
+  gap as it stands, and skipped if the gap has closed; recovery is armed when
+  it is held, so later gapped frames do not ask again, and its stall clock
+  restarts when it is written;
+- the tick sends no Heartbeat or TestRequest (resend frames are traffic) and
+  does not chase a stalled gap of this session's own (its request could not go
+  out before the resend ends); it still enforces the logout and heartbeat
+  deadlines.
+
+Only messages that end the session are written at once: its Logouts and the
+Rejects that precede them. Past 1024 held messages (a counterparty sending
+TestRequests faster than the resend drains), a new one is written at once, so
+the hold stays bounded.
+
+**A Logout from the counterparty waits for the resend it is owed.** FIX gives
+the remote end the chance to fill any gap before it answers a Logout, and the
+base did, writing the whole resend before reading the Logout. Now a Logout
+arriving while a resend is owed marks the reply owed: the session keeps
+resending and reading, and replies once the resend and the messages held
+behind it are written, or, if the logout timeout runs out first, replies at
+once and drops the rest. This session's own Logout cannot start while it owes
+a resend (the consumer's waits behind it, and the stalled-gap Logout is not
+chased meanwhile), and a resend the counterparty asks for after this
+session's Logout is still answered, which FIX allows.
+
 Requests are answered in the order they arrived; past 64 queued, a new request
 is merged into the last unstarted one, widening it to cover both, so a
 counterparty cannot grow the queue without bound (a number neither request
-asked for reaches it as a possible duplicate). A session that sends a Logout
-drops what it still owes. This applies to every resend the reactor writes,
-with or without 789.
+asked for reaches it as a possible duplicate, so a merged request can take the
+counterparty past what one of the two asked for). This applies to every resend
+the reactor writes, with or without 789.
+
+### A gap fill that spans the expectation
+
+A possible-duplicate `SequenceReset`-GapFill numbered below the expectation is
+ignored, as FIX requires. One whose `NewSeqNo` reaches past the expectation
+says, though, that the counterparty has sent numbers this session still lacks.
+It arises when two resends of the counterparty overlap: after the fallback
+request has gone out, a late IronFix-shaped 789 resend that stops below the
+counterparty's Logon brings the expectation to the Logon's number, and the
+answer to the request then covers an administrative message below the Logon
+and the Logon itself with one fill that starts lower (found in review: the
+Logon's number was never filled, and with `max_resend_requests` = 1 the
+session logged out).
+
+The fill is still ignored; this session immediately re-requests from its
+expectation, so the answer starts there and arrives in sequence. The
+re-request is not charged against `max_resend_requests` (recovery already
+armed keeps its attempt count and restarts its clock; recovery armed by it
+starts implied), and it is made at most once per expected number, so a
+counterparty that keeps answering with a fill that starts too low cannot make
+it loop; the usual retries and Logout then bound the gap. Applying `NewSeqNo`
+from such a fill was the alternative; it would depart from the letter of
+"ignore" and was not taken.
 
 ### What does not change
 
@@ -289,16 +350,25 @@ past it.
   existing item changes signature. The `next_expected` module, the factory's
   extra Logon parameter, `SessionParams::opening_replay` and
   `SessionParams::held_logon`, `ResendState::implied`, the resend queue
-  (`ResendJob`, `Reactor::queue_resend`, `Reactor::resend_step`) and
+  (`ResendJob`, `Reactor::queue_resend`, `Reactor::resend_step`), the held
+  messages (`DeferredSend`, `Reactor::finish_resends`), the owed Logout and
   `Reactor::release_held_logon` are crate-private.
-- **Behaviour:** none with the flag off. With it on, the Logon exchange
-  carries 789, a counterparty's 789 can replay a range after `on_logon` or
-  refuse the Logon before it, and a gapped Logon from a counterparty that
-  declared 789 is held instead of requested. Between two IronFix engines with
-  the flag on, a restarted side gets back what it missed with no
-  `ResendRequest` either way, and the next live message is in sequence.
-  Whatever the flag, a resend is now written interleaved with inbound reads,
-  and live application messages sent while it is under way follow it.
+- **Behaviour, every session (whatever the flag):** a resend is written one
+  frame per reactor pass between inbound reads, ahead of every message that
+  takes a new number (application messages, Heartbeat replies, Rejects, this
+  session's own `ResendRequest`); `Connection::send` waits for the whole
+  resend once the outbound queue is full; a counterparty's Logout is answered
+  after the resend it is owed, within the logout timeout; and a
+  possible-duplicate gap fill below the expectation whose `NewSeqNo` spans
+  numbers still missing makes the session re-request them (see "A gap fill
+  that spans the expectation").
+- **Behaviour, with the flag on:** the Logon exchange carries 789, a
+  counterparty's 789 can replay a range after `on_logon` or refuse the Logon
+  before it, and a gapped Logon from a counterparty that declared 789 is held
+  instead of requested. Between two IronFix engines with the flag on, a
+  restarted side gets back what it missed with no `ResendRequest` either way,
+  and the next live message is in sequence. With the flag off nothing about
+  789 changes.
 - The crate DAG is unchanged: `session` gains a flag and a check over `core`
   types, `engine` the decisions. No dependency was added.
 - No performance claim (ADR-0001): the Logon exchange reads one more field,
@@ -307,6 +377,10 @@ past it.
   Logon's number is held, and a general queue of messages received across a
   gap is #71; the joint crash and takeover suite that exercises 789 across
   injected crashes is #89.
-- The overlapping gap fill recorded here as a known limit in an earlier
-  revision (after the fallback request, a fill numbered with an already
-  consumed Logon was dropped) is gone: a real request now ends the hold.
+- The overlapping gap fill of an earlier revision (after the fallback request,
+  a fill numbered with an already consumed Logon was dropped) no longer
+  arises there, since a real request now ends the hold. The same shape remains
+  possible elsewhere (a late 789 resend that stops below the Logon, then an
+  answer whose fill starts lower and runs through it), and is answered by the
+  re-request described in "A gap fill that spans the expectation", at the cost
+  of one round trip.

@@ -106,7 +106,8 @@ messages and the engine wiring do not exist yet.
   cannot produce, are covered by gap fill (a store that reports itself
   corrupted closes the session instead). A resend is written one frame at a time
   between inbound reads, so two sides resending large backlogs at once do not
-  block each other, and live application messages follow it. A session
+  block each other, and every message that takes a new number follows it (a
+  counterparty's Logout is answered after the resend it is owed). A session
   starts from the store's counters unless it resets the sequence. Store
   writes are fallible and ordered: a frame is filed and the next sender number
   persisted before its bytes are written, and the next target number is

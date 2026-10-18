@@ -372,6 +372,12 @@ which would cross that resend (QuickFIX/C++ behaves the same):
   request covers the Logon's own number and its answer fills it, so that
   number arrives in sequence, together with any administrative message past
   the Logon that arrived during the hold.
+- When two resends of the counterparty overlap (a late 789 resend that stops
+  below its Logon, then an answer to the request whose gap fill starts lower
+  and runs through the Logon), that fill is a possible duplicate below the
+  expectation and is ignored, but the numbers it spans are re-requested at
+  once (see "Sequence Reset"), so the recovery completes one round trip later
+  rather than stalling.
 - A counterparty whose Logon or acknowledgement declares no 789, or a session
   with the flag off, gets the immediate `ResendRequest` as before.
 
@@ -650,8 +656,9 @@ whole range with one gap fill (see "Without a store" below).
 `BeginSeqNo .. NewSeqNo`, where `NewSeqNo` = min(EndSeqNo + 1, next outbound
 sequence), or the next outbound sequence when `EndSeqNo` = 0 (infinity). A
 bounded request therefore never advances the counterparty past what it asked
-for, and every sequence number inside the range is accounted for by either a
-replayed message or a gap fill — never skipped.
+for (unless more than 64 requests were queued at once and it was merged with
+a later one, below), and every sequence number inside the range is accounted
+for by either a replayed message or a gap fill — never skipped.
 
 *What is replayed.* An **application** message that is present in the store and
 can be rebuilt is resent with:
@@ -705,14 +712,28 @@ time; before each resend frame the reactor reads any frame the counterparty
 has already sent, which then takes the normal inbound path. Two sides that
 owe each other more than the socket buffers hold, and resend at once, keep
 draining each other instead of both blocking on a full socket until the write
-timeout. Until the resend is done, live application messages (and a Logout the
-consumer asks for) wait in the outbound queue, so they always follow it;
-administrative replies to inbound messages are written as they arise. Requests
-are answered in the order they arrive; past 64 queued, a new request is merged
-into the last one not yet under way, widening it to cover both, so every
-number asked for is still answered (a number neither asked for reaches the
-counterparty as a possible duplicate). A session that sends a Logout drops
-what it still owes.
+timeout. Nothing that takes a new number is written in the middle of a resend:
+a new number inside the range being answered would leave a receiver that does
+not queue gapped messages (IronFix itself, until #71) waiting for it. Until the
+resend is done, live application messages (and a Logout the consumer asks for)
+wait in the outbound queue; a Heartbeat answering a TestRequest, a session
+Reject and the session's own `ResendRequest` for an inbound gap are held back
+and written, in order, right after it (a held `ResendRequest` is built then,
+from the gap as it stands, and skipped if the gap has closed); and no
+Heartbeat or TestRequest is sent for idleness, since resend frames are
+traffic. Only messages that end the session (its Logouts, and the Rejects
+before them) are written at once, and past 1024 held messages a new one is
+written at once too, so the hold stays bounded. A Logout from the counterparty
+waits for the resend it is owed (FIX gives the remote end the chance to fill
+any gap first): the reply goes out once the resend and the messages held
+behind it are written, or when `SessionConfig::logout_timeout` runs out,
+dropping the rest. A resend the counterparty asks for after this session's
+own Logout is still answered. `Connection::send` waits for the whole resend
+once the outbound queue is full. Requests are answered in the order they
+arrive; past 64 queued, a new request is merged into the last one not yet
+under way, widening it to cover both, so every number asked for is still
+answered (a number neither asked for reaches the counterparty as a possible
+duplicate).
 
 **A resend asked for at Logon.** With
 `SessionConfig::send_next_expected_msg_seq_num` set, a counterparty whose
@@ -1040,7 +1061,7 @@ arbitrary limit is invented here.
 |---|---|
 | `123` present but neither `Y` nor `N` (malformed GapFillFlag) | session Reject, reason 6 (incorrect data format), `RefTagID` = 123; the mode is not guessed from an uninterpretable field. An **absent** 123 stays Reset mode |
 | `123=Y`, MsgSeqNum gapped | ResendRequest for the missing range; `NewSeqNo` **not** applied. Classified **before** `from_admin`, so a rejecting application cannot suppress the required ResendRequest |
-| `123=Y`, MsgSeqNum too low with `PossDupFlag` = Y | dropped as an already-applied duplicate, **without** reaching `from_admin` |
+| `123=Y`, MsgSeqNum too low with `PossDupFlag` = Y | dropped as an already-applied duplicate, **without** reaching `from_admin`. When its `NewSeqNo` reaches past the expected number, the fill spans numbers still missing (two overlapping resends of the counterparty): they are re-requested at once from the expected number, at most once per expected number and not charged against `max_resend_requests`; `NewSeqNo` is still not applied |
 | `123=Y`, MsgSeqNum too low without `PossDupFlag` | Logout and disconnect, as for any other too-low message |
 | `from_admin` rejects an in-sequence fill or a Reset | session Reject with the application's reason; `NewSeqNo` not applied. An in-sequence GapFill still **consumes** its own MsgSeqNum — a rejected fill left unconsumed would wedge the inbound stream — while a Reset consumes nothing |
 | `NewSeqNo` (36) absent or unparseable | session Reject, reason 1, `RefTagID` = 36. An in-sequence GapFill (`123=Y`) still **consumes** its own MsgSeqNum, since it occupies that number even though its NewSeqNo is unusable; Reset mode (`123=N` or absent) consumes nothing. A gapped or too-low fill never reaches this branch — it is classified first (rows above) |
