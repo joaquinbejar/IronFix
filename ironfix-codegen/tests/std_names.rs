@@ -123,9 +123,9 @@ fn test_enumerations_named_after_std_items_read_and_write() {
         panic!("an Option view");
     };
     assert_eq!(ok(view.vec(), "Vec"), enums::Vec::Bravo);
-    assert_eq!(view.string(), Some(enums::String::XRay));
-    assert_eq!(view.option(), Some(enums::Option::One));
-    assert_eq!(view.result(), Some(enums::Result::Yes));
+    assert_eq!(ok(view.string(), "String"), Some(enums::String::XRay));
+    assert_eq!(ok(view.option(), "Option"), Some(enums::Option::One));
+    assert_eq!(ok(view.result(), "Result"), Some(enums::Result::Yes));
     let flags: Vec<enums::Flags<'_>> = match ok(view.flags(), "Flags") {
         Some(tokens) => tokens.collect(),
         None => panic!("the flags are present"),

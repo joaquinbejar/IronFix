@@ -50,8 +50,12 @@ file has four modules:
 
 - **`enums`**: one enumeration per field with declared values that a view or
   writer uses, ordered by tag, variants ordered by wire value. Every
-  enumeration has `Other(&'a [u8])`, so an undeclared venue value reads
-  instead of failing, and `const fn from_bytes` / `as_bytes` matching exact
+  enumeration has `Other(&'a [u8])`, so an undeclared venue value that is
+  well-formed for the field's FIX type reads instead of failing (a view
+  checks the type first: `54=AB` on a `char` field is
+  `DecodeError::InvalidFieldValue`, never `Other(b"AB")`, and so is a
+  scalar enumeration's optional accessor, which returns
+  `Result<Option<..>>`), and `const fn from_bytes` / `as_bytes` matching exact
   wire bytes (`01` is not `1`). A `Boolean` with declared values stays `bool`,
   and a `data` field stays bytes. A multi-value field reads with `tokens`
   (one item per space-separated value) and writes with `join`.

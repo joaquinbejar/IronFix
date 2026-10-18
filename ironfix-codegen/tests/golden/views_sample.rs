@@ -517,7 +517,7 @@ pub mod views {
 
         /// Side (tag 54). Required.
         pub fn side(&self) -> ::core::result::Result<enums::Side<'a>, DecodeError> {
-            required(self.get(54), 54).map(|field| enums::Side::from_bytes(field.value))
+            text(required(self.get(54), 54)?, FieldType::Char).map(|value| enums::Side::from_bytes(value.as_bytes()))
         }
 
         /// Text (tag 58).
@@ -531,9 +531,8 @@ pub mod views {
         }
 
         /// SecurityType (tag 167).
-        #[must_use]
-        pub fn security_type(&self) -> ::core::option::Option<enums::SecurityType<'a>> {
-            self.get(167).map(|field| enums::SecurityType::from_bytes(field.value))
+        pub fn security_type(&self) -> ::core::result::Result<::core::option::Option<enums::SecurityType<'a>>, DecodeError> {
+            self.get(167).map(|field| text(field, FieldType::String).map(|value| enums::SecurityType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// NoPartyIDs (tag 453) repeating group: its entries in wire order, `None` when absent.
@@ -595,7 +594,7 @@ pub mod views {
 
         /// Side (tag 54). Required.
         pub fn side(&self) -> ::core::result::Result<enums::Side<'a>, DecodeError> {
-            required(self.get(54), 54).map(|field| enums::Side::from_bytes(field.value))
+            text(required(self.get(54), 54)?, FieldType::Char).map(|value| enums::Side::from_bytes(value.as_bytes()))
         }
 
         /// TransactTime (tag 60). Required.
@@ -670,9 +669,8 @@ pub mod views {
         }
 
         /// SecurityType (tag 167).
-        #[must_use]
-        pub fn security_type(&self) -> ::core::option::Option<enums::SecurityType<'a>> {
-            self.get(167).map(|field| enums::SecurityType::from_bytes(field.value))
+        pub fn security_type(&self) -> ::core::result::Result<::core::option::Option<enums::SecurityType<'a>>, DecodeError> {
+            self.get(167).map(|field| text(field, FieldType::String).map(|value| enums::SecurityType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// NoPartyIDs (tag 453) repeating group: its entries in wire order, `None` when absent.
@@ -778,9 +776,8 @@ pub mod views {
         }
 
         /// Mode (tag 5015).
-        #[must_use]
-        pub fn mode(&self) -> ::core::option::Option<enums::Mode<'a>> {
-            self.get(5015).map(|field| enums::Mode::from_bytes(field.value))
+        pub fn mode(&self) -> ::core::result::Result<::core::option::Option<enums::Mode<'a>>, DecodeError> {
+            self.get(5015).map(|field| text(field, FieldType::Char).map(|value| enums::Mode::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// NoDocs (tag 5020) repeating group: its entries in wire order, `None` when absent.
@@ -820,9 +817,8 @@ pub mod views {
         }
 
         /// PartyIDSource (tag 447).
-        #[must_use]
-        pub fn party_idsource(&self) -> ::core::option::Option<enums::PartyIDSource<'a>> {
-            self.entry.get(447).map(|field| enums::PartyIDSource::from_bytes(field.value))
+        pub fn party_idsource(&self) -> ::core::result::Result<::core::option::Option<enums::PartyIDSource<'a>>, DecodeError> {
+            self.entry.get(447).map(|field| text(field, FieldType::Char).map(|value| enums::PartyIDSource::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// PartyRole (tag 452). Required.

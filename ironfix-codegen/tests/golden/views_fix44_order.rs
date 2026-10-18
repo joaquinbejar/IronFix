@@ -3948,7 +3948,7 @@ pub mod views {
 
         /// EncryptMethod (tag 98). Required.
         pub fn encrypt_method(&self) -> ::core::result::Result<enums::EncryptMethod<'a>, DecodeError> {
-            required(self.get(98), 98).map(|field| enums::EncryptMethod::from_bytes(field.value))
+            text(required(self.get(98), 98)?, FieldType::Int).map(|value| enums::EncryptMethod::from_bytes(value.as_bytes()))
         }
 
         /// HeartBtInt (tag 108). Required.
@@ -4075,33 +4075,28 @@ pub mod views {
         }
 
         /// AcctIDSource (tag 660).
-        #[must_use]
-        pub fn acct_idsource(&self) -> ::core::option::Option<enums::AcctIDSource<'a>> {
-            self.get(660).map(|field| enums::AcctIDSource::from_bytes(field.value))
+        pub fn acct_idsource(&self) -> ::core::result::Result<::core::option::Option<enums::AcctIDSource<'a>>, DecodeError> {
+            self.get(660).map(|field| text(field, FieldType::Int).map(|value| enums::AcctIDSource::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// AccountType (tag 581).
-        #[must_use]
-        pub fn account_type(&self) -> ::core::option::Option<enums::AccountType<'a>> {
-            self.get(581).map(|field| enums::AccountType::from_bytes(field.value))
+        pub fn account_type(&self) -> ::core::result::Result<::core::option::Option<enums::AccountType<'a>>, DecodeError> {
+            self.get(581).map(|field| text(field, FieldType::Int).map(|value| enums::AccountType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// DayBookingInst (tag 589).
-        #[must_use]
-        pub fn day_booking_inst(&self) -> ::core::option::Option<enums::DayBookingInst<'a>> {
-            self.get(589).map(|field| enums::DayBookingInst::from_bytes(field.value))
+        pub fn day_booking_inst(&self) -> ::core::result::Result<::core::option::Option<enums::DayBookingInst<'a>>, DecodeError> {
+            self.get(589).map(|field| text(field, FieldType::Char).map(|value| enums::DayBookingInst::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// BookingUnit (tag 590).
-        #[must_use]
-        pub fn booking_unit(&self) -> ::core::option::Option<enums::BookingUnit<'a>> {
-            self.get(590).map(|field| enums::BookingUnit::from_bytes(field.value))
+        pub fn booking_unit(&self) -> ::core::result::Result<::core::option::Option<enums::BookingUnit<'a>>, DecodeError> {
+            self.get(590).map(|field| text(field, FieldType::Char).map(|value| enums::BookingUnit::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// PreallocMethod (tag 591).
-        #[must_use]
-        pub fn prealloc_method(&self) -> ::core::option::Option<enums::PreallocMethod<'a>> {
-            self.get(591).map(|field| enums::PreallocMethod::from_bytes(field.value))
+        pub fn prealloc_method(&self) -> ::core::result::Result<::core::option::Option<enums::PreallocMethod<'a>>, DecodeError> {
+            self.get(591).map(|field| text(field, FieldType::Char).map(|value| enums::PreallocMethod::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// AllocID (tag 70).
@@ -4115,9 +4110,8 @@ pub mod views {
         }
 
         /// SettlType (tag 63).
-        #[must_use]
-        pub fn settl_type(&self) -> ::core::option::Option<enums::SettlType<'a>> {
-            self.get(63).map(|field| enums::SettlType::from_bytes(field.value))
+        pub fn settl_type(&self) -> ::core::result::Result<::core::option::Option<enums::SettlType<'a>>, DecodeError> {
+            self.get(63).map(|field| text(field, FieldType::Char).map(|value| enums::SettlType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// SettlDate (tag 64).
@@ -4126,21 +4120,18 @@ pub mod views {
         }
 
         /// CashMargin (tag 544).
-        #[must_use]
-        pub fn cash_margin(&self) -> ::core::option::Option<enums::CashMargin<'a>> {
-            self.get(544).map(|field| enums::CashMargin::from_bytes(field.value))
+        pub fn cash_margin(&self) -> ::core::result::Result<::core::option::Option<enums::CashMargin<'a>>, DecodeError> {
+            self.get(544).map(|field| text(field, FieldType::Char).map(|value| enums::CashMargin::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// ClearingFeeIndicator (tag 635).
-        #[must_use]
-        pub fn clearing_fee_indicator(&self) -> ::core::option::Option<enums::ClearingFeeIndicator<'a>> {
-            self.get(635).map(|field| enums::ClearingFeeIndicator::from_bytes(field.value))
+        pub fn clearing_fee_indicator(&self) -> ::core::result::Result<::core::option::Option<enums::ClearingFeeIndicator<'a>>, DecodeError> {
+            self.get(635).map(|field| text(field, FieldType::String).map(|value| enums::ClearingFeeIndicator::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// HandlInst (tag 21).
-        #[must_use]
-        pub fn handl_inst(&self) -> ::core::option::Option<enums::HandlInst<'a>> {
-            self.get(21).map(|field| enums::HandlInst::from_bytes(field.value))
+        pub fn handl_inst(&self) -> ::core::result::Result<::core::option::Option<enums::HandlInst<'a>>, DecodeError> {
+            self.get(21).map(|field| text(field, FieldType::Char).map(|value| enums::HandlInst::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// ExecInst (tag 18).
@@ -4169,9 +4160,8 @@ pub mod views {
         }
 
         /// ProcessCode (tag 81).
-        #[must_use]
-        pub fn process_code(&self) -> ::core::option::Option<enums::ProcessCode<'a>> {
-            self.get(81).map(|field| enums::ProcessCode::from_bytes(field.value))
+        pub fn process_code(&self) -> ::core::result::Result<::core::option::Option<enums::ProcessCode<'a>>, DecodeError> {
+            self.get(81).map(|field| text(field, FieldType::Char).map(|value| enums::ProcessCode::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// Symbol (tag 55).
@@ -4190,9 +4180,8 @@ pub mod views {
         }
 
         /// SecurityIDSource (tag 22).
-        #[must_use]
-        pub fn security_idsource(&self) -> ::core::option::Option<enums::SecurityIDSource<'a>> {
-            self.get(22).map(|field| enums::SecurityIDSource::from_bytes(field.value))
+        pub fn security_idsource(&self) -> ::core::result::Result<::core::option::Option<enums::SecurityIDSource<'a>>, DecodeError> {
+            self.get(22).map(|field| text(field, FieldType::String).map(|value| enums::SecurityIDSource::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// NoSecurityAltID (tag 454) repeating group: its entries in wire order, `None` when absent.
@@ -4201,9 +4190,8 @@ pub mod views {
         }
 
         /// Product (tag 460).
-        #[must_use]
-        pub fn product(&self) -> ::core::option::Option<enums::Product<'a>> {
-            self.get(460).map(|field| enums::Product::from_bytes(field.value))
+        pub fn product(&self) -> ::core::result::Result<::core::option::Option<enums::Product<'a>>, DecodeError> {
+            self.get(460).map(|field| text(field, FieldType::Int).map(|value| enums::Product::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// CFICode (tag 461).
@@ -4212,9 +4200,8 @@ pub mod views {
         }
 
         /// SecurityType (tag 167).
-        #[must_use]
-        pub fn security_type(&self) -> ::core::option::Option<enums::SecurityType<'a>> {
-            self.get(167).map(|field| enums::SecurityType::from_bytes(field.value))
+        pub fn security_type(&self) -> ::core::result::Result<::core::option::Option<enums::SecurityType<'a>>, DecodeError> {
+            self.get(167).map(|field| text(field, FieldType::String).map(|value| enums::SecurityType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// SecuritySubType (tag 762).
@@ -4233,9 +4220,8 @@ pub mod views {
         }
 
         /// PutOrCall (tag 201).
-        #[must_use]
-        pub fn put_or_call(&self) -> ::core::option::Option<enums::PutOrCall<'a>> {
-            self.get(201).map(|field| enums::PutOrCall::from_bytes(field.value))
+        pub fn put_or_call(&self) -> ::core::result::Result<::core::option::Option<enums::PutOrCall<'a>>, DecodeError> {
+            self.get(201).map(|field| text(field, FieldType::Int).map(|value| enums::PutOrCall::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// CouponPaymentDate (tag 224).
@@ -4371,9 +4357,8 @@ pub mod views {
         }
 
         /// CPProgram (tag 875).
-        #[must_use]
-        pub fn cpprogram(&self) -> ::core::option::Option<enums::CPProgram<'a>> {
-            self.get(875).map(|field| enums::CPProgram::from_bytes(field.value))
+        pub fn cpprogram(&self) -> ::core::result::Result<::core::option::Option<enums::CPProgram<'a>>, DecodeError> {
+            self.get(875).map(|field| text(field, FieldType::Int).map(|value| enums::CPProgram::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// CPRegType (tag 876).
@@ -4417,9 +4402,8 @@ pub mod views {
         }
 
         /// TerminationType (tag 788).
-        #[must_use]
-        pub fn termination_type(&self) -> ::core::option::Option<enums::TerminationType<'a>> {
-            self.get(788).map(|field| enums::TerminationType::from_bytes(field.value))
+        pub fn termination_type(&self) -> ::core::result::Result<::core::option::Option<enums::TerminationType<'a>>, DecodeError> {
+            self.get(788).map(|field| text(field, FieldType::Int).map(|value| enums::TerminationType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// StartDate (tag 916).
@@ -4433,9 +4417,8 @@ pub mod views {
         }
 
         /// DeliveryType (tag 919).
-        #[must_use]
-        pub fn delivery_type(&self) -> ::core::option::Option<enums::DeliveryType<'a>> {
-            self.get(919).map(|field| enums::DeliveryType::from_bytes(field.value))
+        pub fn delivery_type(&self) -> ::core::result::Result<::core::option::Option<enums::DeliveryType<'a>>, DecodeError> {
+            self.get(919).map(|field| text(field, FieldType::Int).map(|value| enums::DeliveryType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// MarginRatio (tag 898).
@@ -4455,7 +4438,7 @@ pub mod views {
 
         /// Side (tag 54). Required.
         pub fn side(&self) -> ::core::result::Result<enums::Side<'a>, DecodeError> {
-            required(self.get(54), 54).map(|field| enums::Side::from_bytes(field.value))
+            text(required(self.get(54), 54)?, FieldType::Char).map(|value| enums::Side::from_bytes(value.as_bytes()))
         }
 
         /// LocateReqd (tag 114).
@@ -4474,9 +4457,8 @@ pub mod views {
         }
 
         /// QtyType (tag 854).
-        #[must_use]
-        pub fn qty_type(&self) -> ::core::option::Option<enums::QtyType<'a>> {
-            self.get(854).map(|field| enums::QtyType::from_bytes(field.value))
+        pub fn qty_type(&self) -> ::core::result::Result<::core::option::Option<enums::QtyType<'a>>, DecodeError> {
+            self.get(854).map(|field| text(field, FieldType::Int).map(|value| enums::QtyType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// OrderQty (tag 38).
@@ -4495,9 +4477,8 @@ pub mod views {
         }
 
         /// RoundingDirection (tag 468).
-        #[must_use]
-        pub fn rounding_direction(&self) -> ::core::option::Option<enums::RoundingDirection<'a>> {
-            self.get(468).map(|field| enums::RoundingDirection::from_bytes(field.value))
+        pub fn rounding_direction(&self) -> ::core::result::Result<::core::option::Option<enums::RoundingDirection<'a>>, DecodeError> {
+            self.get(468).map(|field| text(field, FieldType::Char).map(|value| enums::RoundingDirection::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// RoundingModulus (tag 469).
@@ -4507,13 +4488,12 @@ pub mod views {
 
         /// OrdType (tag 40). Required.
         pub fn ord_type(&self) -> ::core::result::Result<enums::OrdType<'a>, DecodeError> {
-            required(self.get(40), 40).map(|field| enums::OrdType::from_bytes(field.value))
+            text(required(self.get(40), 40)?, FieldType::Char).map(|value| enums::OrdType::from_bytes(value.as_bytes()))
         }
 
         /// PriceType (tag 423).
-        #[must_use]
-        pub fn price_type(&self) -> ::core::option::Option<enums::PriceType<'a>> {
-            self.get(423).map(|field| enums::PriceType::from_bytes(field.value))
+        pub fn price_type(&self) -> ::core::result::Result<::core::option::Option<enums::PriceType<'a>>, DecodeError> {
+            self.get(423).map(|field| text(field, FieldType::Int).map(|value| enums::PriceType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// Price (tag 44).
@@ -4567,9 +4547,8 @@ pub mod views {
         }
 
         /// YieldType (tag 235).
-        #[must_use]
-        pub fn yield_type(&self) -> ::core::option::Option<enums::YieldType<'a>> {
-            self.get(235).map(|field| enums::YieldType::from_bytes(field.value))
+        pub fn yield_type(&self) -> ::core::result::Result<::core::option::Option<enums::YieldType<'a>>, DecodeError> {
+            self.get(235).map(|field| text(field, FieldType::String).map(|value| enums::YieldType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// Yield (tag 236).
@@ -4623,9 +4602,8 @@ pub mod views {
         }
 
         /// TimeInForce (tag 59).
-        #[must_use]
-        pub fn time_in_force(&self) -> ::core::option::Option<enums::TimeInForce<'a>> {
-            self.get(59).map(|field| enums::TimeInForce::from_bytes(field.value))
+        pub fn time_in_force(&self) -> ::core::result::Result<::core::option::Option<enums::TimeInForce<'a>>, DecodeError> {
+            self.get(59).map(|field| text(field, FieldType::Char).map(|value| enums::TimeInForce::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// EffectiveTime (tag 168).
@@ -4644,9 +4622,8 @@ pub mod views {
         }
 
         /// GTBookingInst (tag 427).
-        #[must_use]
-        pub fn gtbooking_inst(&self) -> ::core::option::Option<enums::GTBookingInst<'a>> {
-            self.get(427).map(|field| enums::GTBookingInst::from_bytes(field.value))
+        pub fn gtbooking_inst(&self) -> ::core::result::Result<::core::option::Option<enums::GTBookingInst<'a>>, DecodeError> {
+            self.get(427).map(|field| text(field, FieldType::Int).map(|value| enums::GTBookingInst::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// Commission (tag 12).
@@ -4655,9 +4632,8 @@ pub mod views {
         }
 
         /// CommType (tag 13).
-        #[must_use]
-        pub fn comm_type(&self) -> ::core::option::Option<enums::CommType<'a>> {
-            self.get(13).map(|field| enums::CommType::from_bytes(field.value))
+        pub fn comm_type(&self) -> ::core::result::Result<::core::option::Option<enums::CommType<'a>>, DecodeError> {
+            self.get(13).map(|field| text(field, FieldType::Char).map(|value| enums::CommType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// CommCurrency (tag 479).
@@ -4666,15 +4642,13 @@ pub mod views {
         }
 
         /// FundRenewWaiv (tag 497).
-        #[must_use]
-        pub fn fund_renew_waiv(&self) -> ::core::option::Option<enums::FundRenewWaiv<'a>> {
-            self.get(497).map(|field| enums::FundRenewWaiv::from_bytes(field.value))
+        pub fn fund_renew_waiv(&self) -> ::core::result::Result<::core::option::Option<enums::FundRenewWaiv<'a>>, DecodeError> {
+            self.get(497).map(|field| text(field, FieldType::Char).map(|value| enums::FundRenewWaiv::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// OrderCapacity (tag 528).
-        #[must_use]
-        pub fn order_capacity(&self) -> ::core::option::Option<enums::OrderCapacity<'a>> {
-            self.get(528).map(|field| enums::OrderCapacity::from_bytes(field.value))
+        pub fn order_capacity(&self) -> ::core::result::Result<::core::option::Option<enums::OrderCapacity<'a>>, DecodeError> {
+            self.get(528).map(|field| text(field, FieldType::Char).map(|value| enums::OrderCapacity::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// OrderRestrictions (tag 529).
@@ -4683,9 +4657,8 @@ pub mod views {
         }
 
         /// CustOrderCapacity (tag 582).
-        #[must_use]
-        pub fn cust_order_capacity(&self) -> ::core::option::Option<enums::CustOrderCapacity<'a>> {
-            self.get(582).map(|field| enums::CustOrderCapacity::from_bytes(field.value))
+        pub fn cust_order_capacity(&self) -> ::core::result::Result<::core::option::Option<enums::CustOrderCapacity<'a>>, DecodeError> {
+            self.get(582).map(|field| text(field, FieldType::Int).map(|value| enums::CustOrderCapacity::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// ForexReq (tag 121).
@@ -4699,9 +4672,8 @@ pub mod views {
         }
 
         /// BookingType (tag 775).
-        #[must_use]
-        pub fn booking_type(&self) -> ::core::option::Option<enums::BookingType<'a>> {
-            self.get(775).map(|field| enums::BookingType::from_bytes(field.value))
+        pub fn booking_type(&self) -> ::core::result::Result<::core::option::Option<enums::BookingType<'a>>, DecodeError> {
+            self.get(775).map(|field| text(field, FieldType::Int).map(|value| enums::BookingType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// Text (tag 58).
@@ -4736,15 +4708,13 @@ pub mod views {
         }
 
         /// PositionEffect (tag 77).
-        #[must_use]
-        pub fn position_effect(&self) -> ::core::option::Option<enums::PositionEffect<'a>> {
-            self.get(77).map(|field| enums::PositionEffect::from_bytes(field.value))
+        pub fn position_effect(&self) -> ::core::result::Result<::core::option::Option<enums::PositionEffect<'a>>, DecodeError> {
+            self.get(77).map(|field| text(field, FieldType::Char).map(|value| enums::PositionEffect::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// CoveredOrUncovered (tag 203).
-        #[must_use]
-        pub fn covered_or_uncovered(&self) -> ::core::option::Option<enums::CoveredOrUncovered<'a>> {
-            self.get(203).map(|field| enums::CoveredOrUncovered::from_bytes(field.value))
+        pub fn covered_or_uncovered(&self) -> ::core::result::Result<::core::option::Option<enums::CoveredOrUncovered<'a>>, DecodeError> {
+            self.get(203).map(|field| text(field, FieldType::Int).map(|value| enums::CoveredOrUncovered::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// MaxShow (tag 210).
@@ -4758,39 +4728,33 @@ pub mod views {
         }
 
         /// PegMoveType (tag 835).
-        #[must_use]
-        pub fn peg_move_type(&self) -> ::core::option::Option<enums::PegMoveType<'a>> {
-            self.get(835).map(|field| enums::PegMoveType::from_bytes(field.value))
+        pub fn peg_move_type(&self) -> ::core::result::Result<::core::option::Option<enums::PegMoveType<'a>>, DecodeError> {
+            self.get(835).map(|field| text(field, FieldType::Int).map(|value| enums::PegMoveType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// PegOffsetType (tag 836).
-        #[must_use]
-        pub fn peg_offset_type(&self) -> ::core::option::Option<enums::PegOffsetType<'a>> {
-            self.get(836).map(|field| enums::PegOffsetType::from_bytes(field.value))
+        pub fn peg_offset_type(&self) -> ::core::result::Result<::core::option::Option<enums::PegOffsetType<'a>>, DecodeError> {
+            self.get(836).map(|field| text(field, FieldType::Int).map(|value| enums::PegOffsetType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// PegLimitType (tag 837).
-        #[must_use]
-        pub fn peg_limit_type(&self) -> ::core::option::Option<enums::PegLimitType<'a>> {
-            self.get(837).map(|field| enums::PegLimitType::from_bytes(field.value))
+        pub fn peg_limit_type(&self) -> ::core::result::Result<::core::option::Option<enums::PegLimitType<'a>>, DecodeError> {
+            self.get(837).map(|field| text(field, FieldType::Int).map(|value| enums::PegLimitType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// PegRoundDirection (tag 838).
-        #[must_use]
-        pub fn peg_round_direction(&self) -> ::core::option::Option<enums::PegRoundDirection<'a>> {
-            self.get(838).map(|field| enums::PegRoundDirection::from_bytes(field.value))
+        pub fn peg_round_direction(&self) -> ::core::result::Result<::core::option::Option<enums::PegRoundDirection<'a>>, DecodeError> {
+            self.get(838).map(|field| text(field, FieldType::Int).map(|value| enums::PegRoundDirection::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// PegScope (tag 840).
-        #[must_use]
-        pub fn peg_scope(&self) -> ::core::option::Option<enums::PegScope<'a>> {
-            self.get(840).map(|field| enums::PegScope::from_bytes(field.value))
+        pub fn peg_scope(&self) -> ::core::result::Result<::core::option::Option<enums::PegScope<'a>>, DecodeError> {
+            self.get(840).map(|field| text(field, FieldType::Int).map(|value| enums::PegScope::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// DiscretionInst (tag 388).
-        #[must_use]
-        pub fn discretion_inst(&self) -> ::core::option::Option<enums::DiscretionInst<'a>> {
-            self.get(388).map(|field| enums::DiscretionInst::from_bytes(field.value))
+        pub fn discretion_inst(&self) -> ::core::result::Result<::core::option::Option<enums::DiscretionInst<'a>>, DecodeError> {
+            self.get(388).map(|field| text(field, FieldType::Char).map(|value| enums::DiscretionInst::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// DiscretionOffsetValue (tag 389).
@@ -4799,39 +4763,33 @@ pub mod views {
         }
 
         /// DiscretionMoveType (tag 841).
-        #[must_use]
-        pub fn discretion_move_type(&self) -> ::core::option::Option<enums::DiscretionMoveType<'a>> {
-            self.get(841).map(|field| enums::DiscretionMoveType::from_bytes(field.value))
+        pub fn discretion_move_type(&self) -> ::core::result::Result<::core::option::Option<enums::DiscretionMoveType<'a>>, DecodeError> {
+            self.get(841).map(|field| text(field, FieldType::Int).map(|value| enums::DiscretionMoveType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// DiscretionOffsetType (tag 842).
-        #[must_use]
-        pub fn discretion_offset_type(&self) -> ::core::option::Option<enums::DiscretionOffsetType<'a>> {
-            self.get(842).map(|field| enums::DiscretionOffsetType::from_bytes(field.value))
+        pub fn discretion_offset_type(&self) -> ::core::result::Result<::core::option::Option<enums::DiscretionOffsetType<'a>>, DecodeError> {
+            self.get(842).map(|field| text(field, FieldType::Int).map(|value| enums::DiscretionOffsetType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// DiscretionLimitType (tag 843).
-        #[must_use]
-        pub fn discretion_limit_type(&self) -> ::core::option::Option<enums::DiscretionLimitType<'a>> {
-            self.get(843).map(|field| enums::DiscretionLimitType::from_bytes(field.value))
+        pub fn discretion_limit_type(&self) -> ::core::result::Result<::core::option::Option<enums::DiscretionLimitType<'a>>, DecodeError> {
+            self.get(843).map(|field| text(field, FieldType::Int).map(|value| enums::DiscretionLimitType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// DiscretionRoundDirection (tag 844).
-        #[must_use]
-        pub fn discretion_round_direction(&self) -> ::core::option::Option<enums::DiscretionRoundDirection<'a>> {
-            self.get(844).map(|field| enums::DiscretionRoundDirection::from_bytes(field.value))
+        pub fn discretion_round_direction(&self) -> ::core::result::Result<::core::option::Option<enums::DiscretionRoundDirection<'a>>, DecodeError> {
+            self.get(844).map(|field| text(field, FieldType::Int).map(|value| enums::DiscretionRoundDirection::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// DiscretionScope (tag 846).
-        #[must_use]
-        pub fn discretion_scope(&self) -> ::core::option::Option<enums::DiscretionScope<'a>> {
-            self.get(846).map(|field| enums::DiscretionScope::from_bytes(field.value))
+        pub fn discretion_scope(&self) -> ::core::result::Result<::core::option::Option<enums::DiscretionScope<'a>>, DecodeError> {
+            self.get(846).map(|field| text(field, FieldType::Int).map(|value| enums::DiscretionScope::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// TargetStrategy (tag 847).
-        #[must_use]
-        pub fn target_strategy(&self) -> ::core::option::Option<enums::TargetStrategy<'a>> {
-            self.get(847).map(|field| enums::TargetStrategy::from_bytes(field.value))
+        pub fn target_strategy(&self) -> ::core::result::Result<::core::option::Option<enums::TargetStrategy<'a>>, DecodeError> {
+            self.get(847).map(|field| text(field, FieldType::Int).map(|value| enums::TargetStrategy::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// TargetStrategyParameters (tag 848).
@@ -4845,15 +4803,13 @@ pub mod views {
         }
 
         /// CancellationRights (tag 480).
-        #[must_use]
-        pub fn cancellation_rights(&self) -> ::core::option::Option<enums::CancellationRights<'a>> {
-            self.get(480).map(|field| enums::CancellationRights::from_bytes(field.value))
+        pub fn cancellation_rights(&self) -> ::core::result::Result<::core::option::Option<enums::CancellationRights<'a>>, DecodeError> {
+            self.get(480).map(|field| text(field, FieldType::Char).map(|value| enums::CancellationRights::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// MoneyLaunderingStatus (tag 481).
-        #[must_use]
-        pub fn money_laundering_status(&self) -> ::core::option::Option<enums::MoneyLaunderingStatus<'a>> {
-            self.get(481).map(|field| enums::MoneyLaunderingStatus::from_bytes(field.value))
+        pub fn money_laundering_status(&self) -> ::core::result::Result<::core::option::Option<enums::MoneyLaunderingStatus<'a>>, DecodeError> {
+            self.get(481).map(|field| text(field, FieldType::Char).map(|value| enums::MoneyLaunderingStatus::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// RegistID (tag 513).
@@ -4898,9 +4854,8 @@ pub mod views {
         }
 
         /// MsgDirection (tag 385).
-        #[must_use]
-        pub fn msg_direction(&self) -> ::core::option::Option<enums::MsgDirection<'a>> {
-            self.entry.get(385).map(|field| enums::MsgDirection::from_bytes(field.value))
+        pub fn msg_direction(&self) -> ::core::result::Result<::core::option::Option<enums::MsgDirection<'a>>, DecodeError> {
+            self.entry.get(385).map(|field| text(field, FieldType::Char).map(|value| enums::MsgDirection::from_bytes(value.as_bytes()))).transpose()
         }
     }
 
@@ -4935,15 +4890,13 @@ pub mod views {
         }
 
         /// PartyIDSource (tag 447).
-        #[must_use]
-        pub fn party_idsource(&self) -> ::core::option::Option<enums::PartyIDSource<'a>> {
-            self.entry.get(447).map(|field| enums::PartyIDSource::from_bytes(field.value))
+        pub fn party_idsource(&self) -> ::core::result::Result<::core::option::Option<enums::PartyIDSource<'a>>, DecodeError> {
+            self.entry.get(447).map(|field| text(field, FieldType::Char).map(|value| enums::PartyIDSource::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// PartyRole (tag 452).
-        #[must_use]
-        pub fn party_role(&self) -> ::core::option::Option<enums::PartyRole<'a>> {
-            self.entry.get(452).map(|field| enums::PartyRole::from_bytes(field.value))
+        pub fn party_role(&self) -> ::core::result::Result<::core::option::Option<enums::PartyRole<'a>>, DecodeError> {
+            self.entry.get(452).map(|field| text(field, FieldType::Int).map(|value| enums::PartyRole::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// NoPartySubIDs (tag 802) repeating group: its entries in wire order, `None` when absent.
@@ -4983,9 +4936,8 @@ pub mod views {
         }
 
         /// PartySubIDType (tag 803).
-        #[must_use]
-        pub fn party_sub_idtype(&self) -> ::core::option::Option<enums::PartySubIDType<'a>> {
-            self.entry.get(803).map(|field| enums::PartySubIDType::from_bytes(field.value))
+        pub fn party_sub_idtype(&self) -> ::core::result::Result<::core::option::Option<enums::PartySubIDType<'a>>, DecodeError> {
+            self.entry.get(803).map(|field| text(field, FieldType::Int).map(|value| enums::PartySubIDType::from_bytes(value.as_bytes()))).transpose()
         }
     }
 
@@ -5226,7 +5178,7 @@ pub mod views {
 
         /// EventType (tag 865). Required.
         pub fn event_type(&self) -> ::core::result::Result<enums::EventType<'a>, DecodeError> {
-            required(self.entry.get(865), 865).map(|field| enums::EventType::from_bytes(field.value))
+            text(required(self.entry.get(865), 865)?, FieldType::Int).map(|value| enums::EventType::from_bytes(value.as_bytes()))
         }
 
         /// EventDate (tag 866).
@@ -5607,7 +5559,7 @@ pub mod views {
 
         /// StipulationType (tag 233). Required.
         pub fn stipulation_type(&self) -> ::core::result::Result<enums::StipulationType<'a>, DecodeError> {
-            required(self.entry.get(233), 233).map(|field| enums::StipulationType::from_bytes(field.value))
+            text(required(self.entry.get(233), 233)?, FieldType::String).map(|value| enums::StipulationType::from_bytes(value.as_bytes()))
         }
 
         /// StipulationValue (tag 234).

@@ -555,9 +555,8 @@ pub mod views {
         }
 
         /// SessionRejectReason (tag 373).
-        #[must_use]
-        pub fn session_reject_reason(&self) -> ::core::option::Option<enums::SessionRejectReason<'a>> {
-            self.get(373).map(|field| enums::SessionRejectReason::from_bytes(field.value))
+        pub fn session_reject_reason(&self) -> ::core::result::Result<::core::option::Option<enums::SessionRejectReason<'a>>, DecodeError> {
+            self.get(373).map(|field| text(field, FieldType::Int).map(|value| enums::SessionRejectReason::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// Text (tag 58).
@@ -661,9 +660,8 @@ pub mod views {
         }
 
         /// SessionStatus (tag 1409).
-        #[must_use]
-        pub fn session_status(&self) -> ::core::option::Option<enums::SessionStatus<'a>> {
-            self.get(1409).map(|field| enums::SessionStatus::from_bytes(field.value))
+        pub fn session_status(&self) -> ::core::result::Result<::core::option::Option<enums::SessionStatus<'a>>, DecodeError> {
+            self.get(1409).map(|field| text(field, FieldType::Int).map(|value| enums::SessionStatus::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// Text (tag 58).
@@ -721,7 +719,7 @@ pub mod views {
 
         /// EncryptMethod (tag 98). Required.
         pub fn encrypt_method(&self) -> ::core::result::Result<enums::EncryptMethod<'a>, DecodeError> {
-            required(self.get(98), 98).map(|field| enums::EncryptMethod::from_bytes(field.value))
+            text(required(self.get(98), 98)?, FieldType::Int).map(|value| enums::EncryptMethod::from_bytes(value.as_bytes()))
         }
 
         /// HeartBtInt (tag 108). Required.
@@ -803,9 +801,8 @@ pub mod views {
         }
 
         /// SessionStatus (tag 1409).
-        #[must_use]
-        pub fn session_status(&self) -> ::core::option::Option<enums::SessionStatus<'a>> {
-            self.get(1409).map(|field| enums::SessionStatus::from_bytes(field.value))
+        pub fn session_status(&self) -> ::core::result::Result<::core::option::Option<enums::SessionStatus<'a>>, DecodeError> {
+            self.get(1409).map(|field| text(field, FieldType::Int).map(|value| enums::SessionStatus::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// DefaultApplVerID (tag 1137). Required.

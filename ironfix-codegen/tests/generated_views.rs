@@ -254,7 +254,10 @@ fn test_fix44_new_order_single_view_reads_every_field_and_the_nested_group() {
     let exec_inst: Vec<ExecInst<'_>> =
         some(ok(order.exec_inst(), "ExecInst"), "ExecInst").collect();
     assert_eq!(exec_inst, vec![ExecInst::NotHeld, ExecInst::AllOrNone]);
-    assert_eq!(order.time_in_force(), Some(TimeInForce::Day));
+    assert_eq!(
+        ok(order.time_in_force(), "TimeInForce"),
+        Some(TimeInForce::Day)
+    );
     assert_eq!(ok(order.text(), "Text"), Some("hello"));
     // Absent optional fields read as None.
     assert_eq!(ok(order.stop_px(), "StopPx"), None);
@@ -265,20 +268,32 @@ fn test_fix44_new_order_single_view_reads_every_field_and_the_nested_group() {
     let first = some(parties.next(), "the first party");
     assert_eq!(first.entry().index(), 0);
     assert_eq!(ok(first.party_id(), "PartyID"), "BROKER-A");
-    assert_eq!(first.party_idsource(), Some(PartyIDSource::Proprietary));
-    assert_eq!(first.party_role(), Some(PartyRole::ExecutingFirm));
+    assert_eq!(
+        ok(first.party_idsource(), "PartyIDSource"),
+        Some(PartyIDSource::Proprietary)
+    );
+    assert_eq!(
+        ok(first.party_role(), "PartyRole"),
+        Some(PartyRole::ExecutingFirm)
+    );
     let mut sub_ids = some(ok(first.no_party_sub_ids(), "NoPartySubIDs"), "the sub-IDs");
     let sub_id = some(sub_ids.next(), "one sub-ID");
     assert_eq!(ok(sub_id.party_sub_id(), "PartySubID"), "SUB-1");
-    assert_eq!(sub_id.party_sub_idtype(), Some(PartySubIDType::Person));
+    assert_eq!(
+        ok(sub_id.party_sub_idtype(), "PartySubIDType"),
+        Some(PartySubIDType::Person)
+    );
     assert!(sub_ids.next().is_none());
     let second = some(parties.next(), "the second party");
     assert_eq!(ok(second.party_id(), "PartyID"), "BROKER-B");
     assert_eq!(
-        second.party_idsource(),
+        ok(second.party_idsource(), "PartyIDSource"),
         Some(PartyIDSource::GeneralIdentifier)
     );
-    assert_eq!(second.party_role(), Some(PartyRole::ClientId));
+    assert_eq!(
+        ok(second.party_role(), "PartyRole"),
+        Some(PartyRole::ClientId)
+    );
     assert!(ok(second.no_party_sub_ids(), "absent NoPartySubIDs").is_none());
     assert!(parties.next().is_none());
 }
@@ -302,7 +317,7 @@ fn test_unknown_enum_value_reads_as_other_and_round_trips() {
             "11=ORDER-1",
             "54=Z",
             "60=20260712-10:00:01",
-            "40=QQ",
+            "40=Q",
             "18=1 ZZ",
         ],
     );
@@ -314,7 +329,7 @@ fn test_unknown_enum_value_reads_as_other_and_round_trips() {
     let side = ok(order.side(), "an undeclared Side still reads");
     assert_eq!(side, Side::Other(b"Z"));
     assert_eq!(side.as_bytes(), b"Z");
-    assert_eq!(ok(order.ord_type(), "OrdType"), OrdType::Other(b"QQ"));
+    assert_eq!(ok(order.ord_type(), "OrdType"), OrdType::Other(b"Q"));
     let tokens: Vec<ExecInst<'_>> = some(ok(order.exec_inst(), "ExecInst"), "ExecInst").collect();
     assert_eq!(tokens, vec![ExecInst::NotHeld, ExecInst::Other(b"ZZ")]);
 
@@ -324,6 +339,64 @@ fn test_unknown_enum_value_reads_as_other_and_round_trips() {
     }
     // Values match on exact bytes.
     assert_eq!(Side::from_bytes(b"01"), Side::Other(b"01"));
+}
+
+#[test]
+fn test_malformed_enum_value_is_an_error_not_other() {
+    use fix44::enums::{EncryptMethod, TimeInForce};
+    use fix44::views::{LogonView, NewOrderSingleView};
+
+    // Side(54) and TimeInForce(59) are `char`: two characters are no value
+    // of the type, declared or not. Before the grammar check they read as
+    // `Other(b"AB")`.
+    let bytes = frame(
+        "D",
+        &[
+            "11=ORDER-1",
+            "54=AB",
+            "60=20260712-10:00:01",
+            "40=2",
+            "59=AB",
+        ],
+    );
+    let msg = decode(&bytes);
+    let order = some(
+        NewOrderSingleView::from_message(&msg),
+        "a NewOrderSingle view",
+    );
+    assert!(matches!(
+        order.side(),
+        Err(DecodeError::InvalidFieldValue { tag: 54, .. })
+    ));
+    assert!(matches!(
+        order.time_in_force(),
+        Err(DecodeError::InvalidFieldValue { tag: 59, .. })
+    ));
+    // A well-formed undeclared value is still `Other`.
+    let bytes = frame("D", &["11=ORDER-1", "54=1", "59=Z"]);
+    let msg = decode(&bytes);
+    let order = some(
+        NewOrderSingleView::from_message(&msg),
+        "a NewOrderSingle view",
+    );
+    assert_eq!(
+        ok(order.time_in_force(), "TimeInForce"),
+        Some(TimeInForce::Other(b"Z"))
+    );
+
+    // EncryptMethod(98) is an `int`: `+5` is not one, `7` is (undeclared).
+    for (value, expected) in [("98=+5", None), ("98=7", Some(EncryptMethod::Other(b"7")))] {
+        let bytes = frame("A", &[value, "108=30"]);
+        let msg = decode(&bytes);
+        let logon = some(LogonView::from_message(&msg), "a Logon view");
+        match expected {
+            None => assert!(matches!(
+                logon.encrypt_method(),
+                Err(DecodeError::InvalidFieldValue { tag: 98, .. })
+            )),
+            Some(method) => assert_eq!(ok(logon.encrypt_method(), "EncryptMethod"), method),
+        }
+    }
 }
 
 #[test]
@@ -622,7 +695,10 @@ fn test_sample_writer_output_validates_and_keeps_every_shape() {
     assert_eq!(ok(view.field_to_venue(), "ToVenue"), Some("VENUE"));
     assert_eq!(ok(view.get_5001(), "Get"), Some("GET"));
     assert_eq!(ok(view.flag(), "Flag"), Some('F'));
-    assert_eq!(view.security_type(), Some(SecurityType::Quoted));
+    assert_eq!(
+        ok(view.security_type(), "SecurityType"),
+        Some(SecurityType::Quoted)
+    );
     let alloc = some(
         some(ok(view.no_allocs(), "NoAllocs"), "the allocations").next(),
         "one allocation",

@@ -1693,7 +1693,7 @@ impl ViewUses {
                 match member {
                     Member::Field(field) => {
                         let checked = field.kind.conversion().is_some()
-                            || matches!(field.kind, Kind::Tokens(_));
+                            || matches!(field.kind, Kind::Tokens(_) | Kind::Enum(_));
                         uses.field_ref |= field.required || checked;
                         uses.text |= checked;
                         if let Some((helper, _)) = field.kind.conversion()
@@ -2128,10 +2128,28 @@ fn emit_accessor(
                     }
                 }
                 (None, Kind::Enum(enum_tag)) => {
+                    // The value is checked against its FIX type first, so a
+                    // malformed value (`54=AB`, `98=+5`) is an error, and
+                    // only a well-formed undeclared value is `Other`.
                     let enum_name = model.enum_name(enum_tag);
                     let ty = format!("enums::{enum_name}<'a>");
-                    let map = format!("map(|field| enums::{enum_name}::from_bytes(field.value))");
-                    infallible(field.required, &ty, &lookup, &present, &map)
+                    let variant =
+                        format!("map(|value| enums::{enum_name}::from_bytes(value.as_bytes()))");
+                    if field.required {
+                        (
+                            format!("::core::result::Result<{ty}, DecodeError>"),
+                            format!("text({present}?, {grammar}).{variant}"),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "::core::result::Result<::core::option::Option<{ty}>, DecodeError>"
+                            ),
+                            format!(
+                                "{lookup}.map(|field| text(field, {grammar}).{variant}).transpose()"
+                            ),
+                        )
+                    }
                 }
                 (None, Kind::Tokens(enum_tag)) => {
                     // The whole value is checked first, so an empty token

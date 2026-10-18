@@ -318,25 +318,22 @@ pub mod views {
 
         /// Vec (tag 5001). Required.
         pub fn vec(&self) -> ::core::result::Result<enums::Vec<'a>, DecodeError> {
-            required(self.get(5001), 5001).map(|field| enums::Vec::from_bytes(field.value))
+            text(required(self.get(5001), 5001)?, FieldType::Char).map(|value| enums::Vec::from_bytes(value.as_bytes()))
         }
 
         /// String (tag 5002).
-        #[must_use]
-        pub fn string(&self) -> ::core::option::Option<enums::String<'a>> {
-            self.get(5002).map(|field| enums::String::from_bytes(field.value))
+        pub fn string(&self) -> ::core::result::Result<::core::option::Option<enums::String<'a>>, DecodeError> {
+            self.get(5002).map(|field| text(field, FieldType::String).map(|value| enums::String::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// Option (tag 5003).
-        #[must_use]
-        pub fn option(&self) -> ::core::option::Option<enums::Option<'a>> {
-            self.get(5003).map(|field| enums::Option::from_bytes(field.value))
+        pub fn option(&self) -> ::core::result::Result<::core::option::Option<enums::Option<'a>>, DecodeError> {
+            self.get(5003).map(|field| text(field, FieldType::Int).map(|value| enums::Option::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// Result (tag 5004).
-        #[must_use]
-        pub fn result(&self) -> ::core::option::Option<enums::Result<'a>> {
-            self.get(5004).map(|field| enums::Result::from_bytes(field.value))
+        pub fn result(&self) -> ::core::result::Result<::core::option::Option<enums::Result<'a>>, DecodeError> {
+            self.get(5004).map(|field| text(field, FieldType::Char).map(|value| enums::Result::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// Flags (tag 5005).
