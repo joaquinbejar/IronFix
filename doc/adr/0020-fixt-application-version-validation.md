@@ -1,8 +1,8 @@
-# ADR-0020 — Validating the application version on FIXT.1.1 sessions
+# ADR-0020: Validating the application version on FIXT.1.1 sessions
 
-- **Status:** Accepted (issue #67, in the plan the owner approved; the
-  initiator's leniency on an ack without 1137 follows the issue text, see
-  "Deviations")
+- **Status:** Accepted (issue #67, in the plan the owner approved, revised in
+  the #67 review round; the initiator's default leniency on an ack without
+  1137 follows the issue text, see "Deviations")
 - **Date:** 2026-10-18
 
 ## Context
@@ -241,18 +241,20 @@ calling `deliver_app` directly; the method's documentation says so.
   is missing, repeated, unknown or not accepted; an initiator refuses an ack
   whose present 1137 is (and, in strict mode, one without 1137); an
   application message whose 1128 is not accepted, repeated in the header or
-  placed outside it is rejected and not delivered. A FIX 5.0 peer that previously logged on with
-  another version, or none, is now refused. FIX 4.x sessions are unchanged.
+  placed outside it is rejected and not delivered. A FIX 5.0 peer that
+  previously logged on with another version, or none, is now refused. FIX 4.x
+  sessions are unchanged.
 - **Not done:** no dictionary is selected by `ApplVerID`; the peer's default
   is kept and exposed but not adopted for outbound messages; the
-  per-message-type versions a Logon may declare (the `NoMsgTypes` (384) group with
-  `RefMsgType` (372), `RefApplVerID` (1130) and `DefaultVerIndicator` (1410))
-  are not honoured, so 1128 and the declared default are the only versions
-  checked; FIX 4.x over FIXT.1.1 (`ApplVerID` 2 to 6) is refused; `CstmApplVerID` (1129), `ApplExtID` (1156),
-  `DefaultApplExtID` (1407) and `DefaultCstmApplVerID` (1408) are not
-  checked.
-- The crate DAG is unchanged: `core` gains a function, `session` a field and a
-  pure rule over `core` types, `engine` the checks. No dependency was added.
+  per-message-type versions a Logon may declare (the `NoMsgTypes` (384) group
+  with `RefMsgType` (372), `RefApplVerID` (1130) and `DefaultVerIndicator`
+  (1410)) are not honoured, so 1128 and the declared default are the only
+  versions checked; FIX 4.x over FIXT.1.1 (`ApplVerID` 2 to 6) is refused;
+  `CstmApplVerID` (1129), `ApplExtID` (1156), `DefaultApplExtID` (1407) and
+  `DefaultCstmApplVerID` (1408) are not checked.
+- The crate DAG is unchanged: `core` gains a function, `session` two fields
+  and a pure rule over `core` types, `engine` the checks and a getter. No
+  dependency was added; the declared default is held in a `std` `OnceLock`.
 - No performance claim (ADR-0001). The in-session check adds one scan of the
   message's fields per application message on a FIX 5.0 session, and
   allocates only when it refuses; nothing was measured.
