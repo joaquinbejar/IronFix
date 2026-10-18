@@ -48,7 +48,7 @@ document order and then the unreferenced definitions (`entries()`, `len()`,
 `DocumentTooLarge`, `AttributesTooLong`, `InvalidOrchestraId`,
 `UnknownOrchestraReference`, `DuplicateOrchestraDefinition`,
 `UnknownDatatype`, `MissingCountField`, `GroupCycle`, `TooManyMembers`,
-`EnvelopeReference`, `NameTooLong` and `TooManyUnmapped`; the existing variants are reused where they fit
+`EnvelopeReference`, `NameTooLong`, `TooManyUnmapped` and `TooManyFieldValues`; the existing variants are reused where they fit
 (`UnsupportedVersion`, `MissingAttribute`, `UnknownFieldType`, `EmptyGroup`,
 `ComponentCycle`, `NestingTooDeep`, `DuplicateDefinition`,
 `DuplicateFieldTag`, `Xml`). `DefinitionKind` is not extended: it is
@@ -111,8 +111,11 @@ Orchestra group name has no place in the model and is not kept.
 component names for the envelope, which the dictionary keeps apart from the
 body. A message's own reference to either is the envelope, not a member. A
 reference from a component or group is `EnvelopeReference`. A component the
-header or trailer references is expanded in place, its members keeping their
-own presence, because the dictionary holds the envelope as fields and groups.
+header or trailer references is expanded in place, because the dictionary
+holds the envelope as fields and groups. Its members keep their own presence
+when the reference is required; when it is optional they become optional,
+since they are required only with the block, through nested components too.
+The members of a group's entries keep theirs: they are required per entry.
 
 *Category.* The FIX standard repositories file the session-level messages
 under category `Session`; that is the dictionary's answer to admin versus
@@ -143,8 +146,18 @@ order, then the unreferenced definitions:
 - `Unreferenced`: a `base` group no message or component reaches, or a code
   set no field names. The dictionary holds a group only where it is
   referenced and a code set only on its fields. Every group is checked all
-  the same (its count field is present and every id it references
-  resolves), so an unreferenced group cannot hide a dangling id.
+  the same: its count field is present, every id it references resolves,
+  and the groups it nests form no cycle (`GroupCycle`) and no chain deeper
+  than a message can hold (`NestingTooDeep`), by a memoised walk from every
+  group (linear in the group references, its recursion bounded by the
+  nesting limit). An unreferenced group cannot hide a dangling id, a cycle
+  or an over-deep chain.
+
+A mapped section's own attributes (`<fixr:fields custom="x">`, self-closing
+sections included) are read like any element's: bounded by the attribute and
+name limits, and reported unless descriptive (`latestEP`, `xml:base`). A
+code's id is unique within its code set among `base` codes; a code of
+another scenario may reuse one.
 
 The issue asks for unknown elements to be typed errors; they are reported
 instead, because Orchestra allows elements from other namespaces and a
@@ -188,10 +201,12 @@ or an unbounded recursion:
 | `MAX_NESTING_DEPTH` | 32 | XML element nesting, and repeating-group nesting counted as in the QuickFIX loader (a message is level 1) |
 | `MAX_COMPONENT_DEPTH` | 32 | component chains (shared check), envelope component expansion, datatype base-type chains |
 | `MAX_ORCHESTRA_MEMBERS` | 262 144 | members produced by inlining groups |
+| `MAX_ORCHESTRA_FIELD_VALUES` | 131 072 | enumeration values the fields hold together: a field naming a code set holds its own copy (`FieldDef::values` is a plain `HashMap`, which sharing would change), so a code set named by many fields is copied once per field; counted before each copy (FIX Latest needs 27 103) |
 
 The parser is iterative over the document (it skips unmapped content without
-recursion). Three walks recurse, each bounded: group expansion, by the
-nesting limit, with group cycles rejected (`GroupCycle`); the expansion of
+recursion). Four walks recurse, each bounded: the check of the group graph,
+memoised, by the nesting limit; group expansion, by the nesting limit, with
+group cycles rejected (`GroupCycle`); the expansion of
 components in the header and trailer, by `MAX_COMPONENT_DEPTH`, with cycles
 rejected (`ComponentCycle`); and the shared assembly's walks over the
 component graph (the cycle and depth check, and the cached first-tag
@@ -206,12 +221,16 @@ report limits, a review measured documents of 18 KB to 16 MB at 340 MB to
 556 MB of resident memory: a 16 KiB name copied into every member or report
 entry that mentions it, and a report as long as the document. Each kept
 string is now at most 255 bytes and is copied into at most
-`MAX_ORCHESTRA_MEMBERS` members (twice: the expansion, then the assembly) or
-`MAX_ORCHESTRA_REPORT_ENTRIES` entries. `tests/orchestra_memory.rs` measures
-the peak heap with `dhat` at each limit (a flood of unmapped elements, the
-member limit with a 255-byte name, a full report of the longest locations,
+`MAX_ORCHESTRA_MEMBERS` members (twice: the expansion, then the assembly),
+`MAX_ORCHESTRA_REPORT_ENTRIES` entries or `MAX_ORCHESTRA_FIELD_VALUES`
+enumeration values (a review found one code set of 4 096 codes named by
+2 048 fields would copy 8 388 608 values, over 2 GB of names).
+`tests/orchestra_memory.rs` measures the peak heap with `dhat` at each limit
+(a flood of unmapped elements, the member limit with a 255-byte name, a full
+report of the longest locations, that shared code set with 255-byte names,
 and the largest expansion that loads) against bounds about twice the peaks
-measured: at most 87.6 MiB, for the expansion just under the member limit.
+measured: at most 87.6 MiB, for the expansion just under the member limit;
+47.6 MiB for the shared code set.
 A condition of a `rule` is copied once from the document, so all of them
 together are no longer than the document.
 
@@ -220,8 +239,9 @@ datatypes and code sets that map to no FIX type (`UnknownFieldType`,
 `UnknownDatatype`), groups without a `numInGroup` (`MissingCountField`) or
 members (`EmptyGroup`), ids that are not positive or do not fit a `u32`
 (`InvalidOrchestraId`), oversized attributes, names past the name limit
-(`NameTooLong`), a report past its limit (`TooManyUnmapped`), and truncated
-or ill-formed XML are each a typed error, with a unit test.
+(`NameTooLong`), a report past its limit (`TooManyUnmapped`), enumeration
+values past theirs (`TooManyFieldValues`), and truncated or ill-formed XML
+are each a typed error, with a unit test.
 
 **Fixture.** The FIX Trading Community's `FIX Standard/OrchestraFIX44.xml` at
 commit `cd24169a2abd8daba7c360987c7a46ca11873a12` (FIX 4.4 as of Extension
@@ -271,7 +291,7 @@ does not change.
 ## Consequences
 
 - Public surface: additions only. A new module (`orchestra`), four types,
-  six constants, the `from_orchestra_xml` method and thirteen
+  seven constants, the `from_orchestra_xml` method and fourteen
   `DictionaryError` variants (the enum is `#[non_exhaustive]`). `cargo semver-checks` reports
   nothing beyond ADR-0016's break.
 - Version support stays honest: Orchestra loading is tested on the FIX 4.4
