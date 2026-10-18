@@ -37,11 +37,12 @@ exists yet.
   pairs. Every malformed-input path is a typed error, never a panic.
 - **Framing** over a Tokio codec (`FixCodec`) with a bounded read buffer and an
   unconditionally verified trailer. Both engines skip garbled inbound frames (a
-  bad `CheckSum` or `BodyLength`, bytes before `8=`) as FIX requires: the frame
-  consumes no `MsgSeqNum`, is not counted as proof of life, and its gap is
-  recovered by `ResendRequest`. An optional `garbled_frame_limit` logs out a
-  link that keeps garbling. A frame above `max_message_size` still closes the
-  session.
+  bad `CheckSum` or `BodyLength`, bytes before `8=`, `MsgType` not third) as
+  FIX requires, in session and during the Logon handshake: the frame consumes
+  no `MsgSeqNum`, is not counted as proof of life, and its gap is recovered by
+  `ResendRequest`. An optional `garbled_frame_limit` logs out a link that keeps
+  garbling. A frame above `max_message_size` still closes the session, after a
+  Logout saying "message too large".
 - **A client engine and a server engine** in `ironfix-engine`. `Initiator`
   dials over TCP and runs the initiator half of the Logon handshake. `Acceptor`
   serves inbound connections for one configured counterparty and runs the
