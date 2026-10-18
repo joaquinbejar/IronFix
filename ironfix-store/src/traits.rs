@@ -7,6 +7,32 @@
 //! Message store trait definition.
 //!
 //! This module defines the abstract interface for message storage implementations.
+//!
+//! # The persistence contract
+//!
+//! Every write is fallible and asynchronous: [`MessageStore::store`],
+//! [`MessageStore::set_next_sender_seq`] and
+//! [`MessageStore::set_next_target_seq`] return a `Result`, so a store backed by
+//! a disk or a replica can report a write it could not make, and can do real
+//! I/O without blocking the session reactor. `Ok` means the value is as durable
+//! as the implementation promises; [`MemoryStore`](crate::MemoryStore) promises
+//! nothing beyond the process.
+//!
+//! `ironfix-engine` relies on the following ordering, which a durable store
+//! makes meaningful (see `doc/adr/0005-fallible-store-writes.md`):
+//!
+//! - An outbound frame is filed with `store`, and then the next sender
+//!   sequence number is persisted, **before** the frame's bytes reach the
+//!   socket. A crash can therefore leave a filed frame the peer never saw, or a
+//!   spent number, but never a frame on the wire the store cannot replay.
+//! - The next target sequence number is persisted **before** the inbound
+//!   message that advanced it is acted on: before an administrative message is
+//!   processed, and before an application message is handed to the
+//!   application.
+//! - A counter is written only when its value changed.
+//!
+//! Error values must never contain frame bytes: an outbound Logon carries
+//! `Password` (554), and the engine logs store errors.
 
 use crate::stored::StoredMessage;
 use async_trait::async_trait;
@@ -126,17 +152,36 @@ pub trait MessageStore: Send + Sync {
     /// Returns the next expected target sequence number.
     fn next_target_seq(&self) -> u64;
 
-    /// Sets the next sender sequence number.
+    /// Persists the next sender sequence number.
+    ///
+    /// The engine calls this after filing an outbound frame and before the
+    /// frame is written, with the number the next outbound message will carry.
+    /// It calls it only when the value changed, and the value never goes down
+    /// except through [`reset`](MessageStore::reset).
     ///
     /// # Arguments
-    /// * `seq` - The new sequence number
-    fn set_next_sender_seq(&self, seq: u64);
+    /// * `seq` - The next `MsgSeqNum` (34) to send
+    ///
+    /// # Errors
+    /// Returns `StoreError` if the number cannot be persisted. The error must
+    /// not contain frame bytes.
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError>;
 
-    /// Sets the next expected target sequence number.
+    /// Persists the next expected target sequence number.
+    ///
+    /// The engine calls this when an inbound message has been accepted in
+    /// sequence, before the message is acted on (processed, if administrative;
+    /// handed to the application, if not), and after any other change to the
+    /// expectation (a `SequenceReset`, a gap fill), only when the value
+    /// changed.
     ///
     /// # Arguments
-    /// * `seq` - The new sequence number
-    fn set_next_target_seq(&self, seq: u64);
+    /// * `seq` - The next inbound `MsgSeqNum` (34) expected
+    ///
+    /// # Errors
+    /// Returns `StoreError` if the number cannot be persisted. The error must
+    /// not contain frame bytes.
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError>;
 
     /// Resets the store, clearing all messages and resetting sequence numbers.
     ///
@@ -189,9 +234,13 @@ mod tests {
             1
         }
 
-        fn set_next_sender_seq(&self, _seq: u64) {}
+        async fn set_next_sender_seq(&self, _seq: u64) -> Result<(), StoreError> {
+            Ok(())
+        }
 
-        fn set_next_target_seq(&self, _seq: u64) {}
+        async fn set_next_target_seq(&self, _seq: u64) -> Result<(), StoreError> {
+            Ok(())
+        }
 
         async fn reset(&self) -> Result<(), StoreError> {
             Ok(())
@@ -208,6 +257,8 @@ mod tests {
         assert_eq!(store.next_sender_seq(), 1);
         assert_eq!(store.next_target_seq(), 1);
         assert!(store.store(1, &MsgType::Heartbeat, b"test").await.is_ok());
+        assert!(store.set_next_sender_seq(2).await.is_ok());
+        assert!(store.set_next_target_seq(2).await.is_ok());
         assert!(store.reset().await.is_ok());
     }
 }

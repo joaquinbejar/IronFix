@@ -103,6 +103,7 @@
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
+use crate::persistence::StoreFailurePolicy;
 use crate::reactor::{
     DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, HandshakeRead,
     ResendState, SessionParams, lock_heartbeat, read_handshake_frame, send_handshake_admin,
@@ -739,6 +740,7 @@ impl<A: Application + 'static> Acceptor<A> {
             application: Arc::clone(&self.application),
             session_id: session_id.clone(),
             store: None,
+            store_policy: StoreFailurePolicy::default(),
             resend,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             outbound_capacity: self.outbound_capacity,

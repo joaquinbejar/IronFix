@@ -58,7 +58,11 @@
 //! - **The store is opt-in and in-memory.** Attaching an
 //!   [`ironfix_store::MemoryStore`] with [`Initiator::with_store`] enables
 //!   resend-from-store replay, but there is no persistent implementation yet;
-//!   the acceptor attaches no store, so its resends are gap-filled.
+//!   the acceptor attaches no store, so its resends are gap-filled. Store
+//!   writes are ordered and fallible, and [`StoreFailurePolicy`] decides
+//!   whether a failed one is tolerated or closes the session (see
+//!   [`persistence`]). Inbound application messages are delivered at most once
+//!   across a crash.
 
 pub mod acceptor;
 pub mod application;
@@ -68,6 +72,7 @@ pub mod error;
 mod garbled;
 pub mod initiator;
 pub mod outbound;
+pub mod persistence;
 mod reactor;
 mod wire;
 
@@ -78,6 +83,7 @@ pub use connection::Connection;
 pub use error::EngineError;
 pub use initiator::Initiator;
 pub use outbound::{OutboundField, OutboundMessage};
+pub use persistence::StoreFailurePolicy;
 
 // Re-exported for convenience: the per-session configuration consumed by
 // [`Initiator`].

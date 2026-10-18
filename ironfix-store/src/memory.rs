@@ -174,12 +174,16 @@ impl MessageStore for MemoryStore {
         self.next_target_seq.load(Ordering::SeqCst)
     }
 
-    fn set_next_sender_seq(&self, seq: u64) {
+    /// Never fails: the counter is an atomic in this process.
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
         self.next_sender_seq.store(seq, Ordering::SeqCst);
+        Ok(())
     }
 
-    fn set_next_target_seq(&self, seq: u64) {
+    /// Never fails: the counter is an atomic in this process.
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
         self.next_target_seq.store(seq, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn reset(&self) -> Result<(), StoreError> {
@@ -443,8 +447,8 @@ mod tests {
     async fn test_memory_store_sequence_numbers_round_trip() {
         let store = MemoryStore::new();
 
-        store.set_next_sender_seq(10);
-        store.set_next_target_seq(20);
+        ok(store.set_next_sender_seq(10).await, "sender counter");
+        ok(store.set_next_target_seq(20).await, "target counter");
 
         assert_eq!(store.next_sender_seq(), 10);
         assert_eq!(store.next_target_seq(), 20);
@@ -455,8 +459,8 @@ mod tests {
         let store = MemoryStore::new();
 
         put(&store, 1, MsgType::Logon, b"msg1").await;
-        store.set_next_sender_seq(10);
-        store.set_next_target_seq(20);
+        ok(store.set_next_sender_seq(10).await, "sender counter");
+        ok(store.set_next_target_seq(20).await, "target counter");
 
         ok(store.reset().await, "reset must succeed");
 

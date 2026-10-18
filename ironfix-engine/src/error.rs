@@ -182,6 +182,13 @@ pub enum EngineError {
     /// either file a new stream on top of a previous one's numbers or reuse a
     /// `MsgSeqNum` the counterparty has already seen, so the session is refused
     /// rather than started from a counter the store could not vouch for.
+    ///
+    /// Under [`StoreFailurePolicy::CloseSession`](crate::StoreFailurePolicy::CloseSession)
+    /// it is also raised when a handshake write fails: filing the Logon,
+    /// persisting the next sender number before the Logon is written, or
+    /// persisting the target number the Logon ack consumed. The frame
+    /// concerned is never written. During the Active session the same failure
+    /// closes the session instead.
     #[error("store error: {0}")]
     Store(#[from] StoreError),
 

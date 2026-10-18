@@ -85,6 +85,12 @@
 //! **Without a store nothing can be replayed** and the whole requested range
 //! is answered with one gap fill.
 //!
+//! Store writes are ordered (frame and next sender number before the bytes;
+//! next target number before an inbound message is acted on) and fallible.
+//! [`Initiator::with_store_failure_policy`] chooses what a failed write means:
+//! carry on with a warning (the default), or fail closed, writing nothing the
+//! store has not accepted. See the [`persistence`](crate::persistence) module.
+//!
 //! All sequence arithmetic goes through the checked
 //! [`SequenceManager::try_allocate_sender_seq`] /
 //! [`SequenceManager::try_increment_target_seq`]; an exhausted counter tears
@@ -143,6 +149,7 @@
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
+use crate::persistence::{SessionStore, StoreFailurePolicy};
 use crate::reactor::{
     DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, HandshakeRead,
     ResendState, SessionParams, TICK_INTERVAL, lock_heartbeat, read_handshake_frame,
@@ -196,6 +203,8 @@ pub struct Initiator<A: Application = NoOpApplication> {
     /// Optional message store: outbound frames are filed here and replayed
     /// from here when the counterparty asks for a resend.
     store: Option<Arc<dyn MessageStore>>,
+    /// What a failed write to `store` means.
+    store_policy: StoreFailurePolicy,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
@@ -212,6 +221,7 @@ impl<A: Application> std::fmt::Debug for Initiator<A> {
             .field("outbound_capacity", &self.outbound_capacity)
             .field("app_queue_capacity", &self.app_queue_capacity)
             .field("store", &self.store.is_some())
+            .field("store_policy", &self.store_policy)
             .finish_non_exhaustive()
     }
 }
@@ -255,6 +265,7 @@ impl<A: Application + 'static> Initiator<A> {
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
             app_queue_capacity: DEFAULT_APP_QUEUE_CAPACITY,
             store: None,
+            store_policy: StoreFailurePolicy::Continue,
         }
     }
 
@@ -274,13 +285,36 @@ impl<A: Application + 'static> Initiator<A> {
     ///
     /// The store also carries sequence numbers: unless `reset_on_logon` is set
     /// or [`Initiator::with_initial_sequences`] is called, the session starts
-    /// from the counters the store reports, and both counters are mirrored back
-    /// into it as the session runs. Note that
+    /// from the counters the store reports, and both counters are persisted
+    /// back into it as the session runs, in the order described in the
+    /// [`persistence`](crate::persistence) module. Note that
     /// [`MemoryStore`](ironfix_store::MemoryStore) is the only implementation
     /// today and is **not** persistent, so this does not yet survive a restart.
+    ///
+    /// A failed write to the store is handled by
+    /// [`Initiator::with_store_failure_policy`]; the default carries on with a
+    /// warning.
     #[must_use]
     pub fn with_store(mut self, store: Arc<dyn MessageStore>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Sets what a failed write to the attached store means (default
+    /// [`StoreFailurePolicy::Continue`]).
+    ///
+    /// With [`StoreFailurePolicy::CloseSession`] the engine never puts a frame
+    /// on the wire, or acts on an inbound message, that the store has not
+    /// accepted: a failure during the Logon handshake makes
+    /// [`Initiator::connect`] return [`EngineError::Store`], and one during the
+    /// session closes it without writing the frame concerned. Without a store
+    /// this has no effect.
+    ///
+    /// # Arguments
+    /// * `policy` - The policy for store write failures
+    #[must_use]
+    pub const fn with_store_failure_policy(mut self, policy: StoreFailurePolicy) -> Self {
+        self.store_policy = policy;
         self
     }
 
@@ -556,7 +590,10 @@ impl<A: Application + 'static> Initiator<A> {
         let identity = PeerIdentity::new(&self.config);
         let sending_time = SendingTimeGuard::new(&self.config);
         let write_timeout = self.write_timeout;
-        let store = self.store.as_ref();
+        let store = self
+            .store
+            .as_ref()
+            .map(|store| SessionStore::new(store, self.store_policy));
 
         // Typestate: Connecting -> LogonSent.
         //
@@ -892,6 +929,15 @@ impl<A: Application + 'static> Initiator<A> {
                         let _ = session.on_logon_reject();
                         return Err(err.into());
                     }
+                    // The receive cursor includes the ack before the session
+                    // goes Active on it, as for every later inbound message.
+                    if let Some(store) = store {
+                        let next = runtime.sequences.next_target_seq().value();
+                        if let Err(err) = store.persist_target(&session_id, next).await {
+                            let _ = session.on_logon_reject();
+                            return Err(err.into());
+                        }
+                    }
                 }
                 SequenceResult::TooLow { expected, received } => {
                     let _ = session.on_logon_reject();
@@ -942,6 +988,7 @@ impl<A: Application + 'static> Initiator<A> {
             application: Arc::clone(&self.application),
             session_id: session_id.clone(),
             store: self.store.clone(),
+            store_policy: self.store_policy,
             resend,
             write_timeout,
             outbound_capacity: self.outbound_capacity,

@@ -16,7 +16,9 @@
 //! This crate provides:
 //! - **[`MessageStore`] trait**: the abstract interface for storing outbound
 //!   messages so a `ResendRequest` can be answered, and for persisting sequence
-//!   numbers across restarts
+//!   numbers across restarts. Every write, the counters included, is
+//!   asynchronous and fallible, and the engine relies on a stated ordering (see
+//!   the [`traits`] module docs)
 //! - **[`StoredMessage`]**: one message as it was filed — verbatim frame bytes,
 //!   its sequence number, and its recorded `MsgType`
 //! - **[`MemoryStore`]**: an in-memory implementation, backed by a

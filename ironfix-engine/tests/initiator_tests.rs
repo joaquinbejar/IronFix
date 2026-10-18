@@ -16,14 +16,14 @@ use ironfix_core::message::MsgType;
 use ironfix_core::message::RawMessage;
 use ironfix_core::types::{CompId, Timestamp};
 use ironfix_engine::application::{Application, RejectReason, SessionId};
-use ironfix_engine::{EngineError, Initiator, OutboundMessage};
+use ironfix_engine::{EngineError, Initiator, OutboundMessage, StoreFailurePolicy};
 use ironfix_session::sequence::SequenceCounter;
 use ironfix_session::{GarbledFrameLimit, SessionConfig, SessionConfigError};
 use ironfix_store::{MemoryStore, MessageStore, StoredMessage};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -3056,12 +3056,12 @@ impl MessageStore for ForgetfulStore {
         self.inner.next_target_seq()
     }
 
-    fn set_next_sender_seq(&self, seq: u64) {
-        self.inner.set_next_sender_seq(seq);
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.inner.set_next_sender_seq(seq).await
     }
 
-    fn set_next_target_seq(&self, seq: u64) {
-        self.inner.set_next_target_seq(seq);
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.inner.set_next_target_seq(seq).await
     }
 
     async fn reset(&self) -> Result<(), StoreError> {
@@ -3411,8 +3411,14 @@ async fn test_initiator_seeds_and_mirrors_sequence_numbers_through_the_store() {
     });
 
     let store = Arc::new(MemoryStore::new());
-    store.set_next_sender_seq(7);
-    store.set_next_target_seq(4);
+    ok(
+        store.set_next_sender_seq(7).await,
+        "seed the sender counter",
+    );
+    ok(
+        store.set_next_target_seq(4).await,
+        "seed the target counter",
+    );
 
     let (app, _app_rx) = RecordingApp::new();
     let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
@@ -3516,8 +3522,14 @@ async fn test_reset_on_logon_clears_a_populated_store() {
         store.store(41, &MsgType::NewOrderSingle, b"stale").await,
         "seed the store with a previous session's message",
     );
-    store.set_next_sender_seq(42);
-    store.set_next_target_seq(17);
+    ok(
+        store.set_next_sender_seq(42).await,
+        "seed the sender counter",
+    );
+    ok(
+        store.set_next_target_seq(17).await,
+        "seed the target counter",
+    );
 
     let (app, _app_rx) = RecordingApp::new();
     let initiator = Initiator::new(
@@ -3540,30 +3552,54 @@ async fn test_reset_on_logon_clears_a_populated_store() {
     );
 }
 
-/// A store whose `reset` and/or `refresh` fail, standing in for a persistent
-/// backend that cannot vouch for its counters when the session starts.
+/// A store whose operations fail on demand, standing in for a persistent
+/// backend that cannot vouch for its counters when the session starts, or that
+/// starts refusing writes in the middle of a session.
+///
+/// `reset` and `refresh` failures are fixed at construction; `store` and the
+/// two counter setters can be switched on at any point through the
+/// `fail_*` flags, so a test can let the handshake succeed and break the store
+/// afterwards.
 #[derive(Debug)]
 struct FailingStore {
     inner: MemoryStore,
     fail_reset: bool,
     fail_refresh: bool,
+    fail_store: AtomicBool,
+    fail_sender: AtomicBool,
+    fail_target: AtomicBool,
 }
 
 impl FailingStore {
-    fn failing_reset() -> Self {
+    fn working() -> Self {
         Self {
             inner: MemoryStore::new(),
-            fail_reset: true,
+            fail_reset: false,
             fail_refresh: false,
+            fail_store: AtomicBool::new(false),
+            fail_sender: AtomicBool::new(false),
+            fail_target: AtomicBool::new(false),
+        }
+    }
+
+    fn failing_reset() -> Self {
+        Self {
+            fail_reset: true,
+            ..Self::working()
         }
     }
 
     fn failing_refresh() -> Self {
         Self {
-            inner: MemoryStore::new(),
-            fail_reset: false,
             fail_refresh: true,
+            ..Self::working()
         }
+    }
+
+    /// The error every on-demand failure returns. It names the operation only,
+    /// never frame bytes, as the trait contract requires.
+    fn refused(what: &str) -> StoreError {
+        StoreError::Io(format!("{what} refused by the test store"))
     }
 }
 
@@ -3575,6 +3611,9 @@ impl MessageStore for FailingStore {
         msg_type: &MsgType,
         message: &[u8],
     ) -> Result<(), StoreError> {
+        if self.fail_store.load(Ordering::SeqCst) {
+            return Err(Self::refused("store"));
+        }
         self.inner.store(seq_num, msg_type, message).await
     }
 
@@ -3590,12 +3629,18 @@ impl MessageStore for FailingStore {
         self.inner.next_target_seq()
     }
 
-    fn set_next_sender_seq(&self, seq: u64) {
-        self.inner.set_next_sender_seq(seq);
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+        if self.fail_sender.load(Ordering::SeqCst) {
+            return Err(Self::refused("set_next_sender_seq"));
+        }
+        self.inner.set_next_sender_seq(seq).await
     }
 
-    fn set_next_target_seq(&self, seq: u64) {
-        self.inner.set_next_target_seq(seq);
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        if self.fail_target.load(Ordering::SeqCst) {
+            return Err(Self::refused("set_next_target_seq"));
+        }
+        self.inner.set_next_target_seq(seq).await
     }
 
     async fn reset(&self) -> Result<(), StoreError> {
@@ -5347,6 +5392,594 @@ async fn test_invalid_third_field_tag_counts_toward_the_limit() {
         ok(
             timeout(Duration::from_secs(10), acceptor).await,
             "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Store write failures and persistence order
+// ---------------------------------------------------------------------------
+
+/// Reads every frame the client writes until it hangs up, returning their
+/// MsgTypes. The stub never closes first, so the close is the client's.
+async fn msg_types_until_closed(framed: &mut Framed<TcpStream, FixCodec>) -> Vec<String> {
+    let mut seen = Vec::new();
+    while let Ok(Some(Ok(frame))) = timeout(Duration::from_secs(5), framed.next()).await {
+        seen.push(msg_type_of(&frame));
+    }
+    seen
+}
+
+/// Under the default `Continue` policy a failing store changes nothing on the
+/// wire: the Logon and the order are written anyway (with warnings), and the
+/// session keeps running. The store holds neither frame, which is what makes
+/// a later resend of them a gap fill.
+#[tokio::test]
+async fn test_store_failure_continue_writes_the_frame_and_keeps_the_session() {
+    let (listener, addr) = bind_listener().await;
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<()>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        let order = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&order), "D");
+        assert_eq!(field(&order, 34).as_deref(), Some("2"));
+        let _ = seen_tx.send(());
+        let _ = done_rx.await;
+    });
+
+    // Every write fails from the start, the handshake included.
+    let store = Arc::new(FailingStore::working());
+    store.fail_store.store(true, Ordering::SeqCst);
+    store.fail_sender.store(true, Ordering::SeqCst);
+    store.fail_target.store(true, Ordering::SeqCst);
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+        .with_store_failure_policy(StoreFailurePolicy::Continue);
+    let connection = ok(
+        initiator.connect(addr).await,
+        "Continue must not fail the handshake",
+    );
+    send_orders(&connection, 1).await;
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), seen_rx).await,
+            "order within 5s",
+        ),
+        "the order must reach the peer",
+    );
+    assert!(!connection.is_closed());
+    assert_eq!(store.inner.message_count(), 0, "nothing could be filed");
+
+    let _ = done_tx.send(());
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// Under `CloseSession`, an order whose filing fails, or whose next sender
+/// number cannot be persisted, is never written: the peer reads no bytes for
+/// it, and the session closes.
+#[tokio::test]
+async fn test_store_failure_close_session_writes_nothing_for_the_frame_and_closes() {
+    for (what, arm) in [("store", 0usize), ("set_next_sender_seq", 1usize)] {
+        let (listener, addr) = bind_listener().await;
+        let acceptor = tokio::spawn(async move {
+            let mut framed = accept_logon(listener).await;
+            msg_types_until_closed(&mut framed).await
+        });
+
+        let store = Arc::new(FailingStore::working());
+        let (app, _app_rx) = RecordingApp::new();
+        let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+            .with_store_failure_policy(StoreFailurePolicy::CloseSession);
+        let connection = ok(initiator.connect(addr).await, "connect");
+
+        // Break the store only now, after the handshake succeeded.
+        let flag = if arm == 0 {
+            &store.fail_store
+        } else {
+            &store.fail_sender
+        };
+        flag.store(true, Ordering::SeqCst);
+        send_orders(&connection, 1).await;
+
+        ok(
+            timeout(Duration::from_secs(5), connection.wait_closed()).await,
+            "closed within 5s",
+        );
+        let seen = ok(
+            ok(
+                timeout(Duration::from_secs(10), acceptor).await,
+                "acceptor done within 10s",
+            ),
+            "acceptor task",
+        );
+        assert!(
+            !seen.iter().any(|msg_type| msg_type == "D"),
+            "{what}: the order must never reach the peer, saw {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|msg_type| msg_type == "5"),
+            "{what}: no Logout is written through a failed store, saw {seen:?}"
+        );
+        assert!(!store.inner.contains(2), "{what}: order must not be filed");
+        assert!(app.events().contains(&"logout".to_string()));
+    }
+}
+
+/// Under `CloseSession`, a target counter that cannot be persisted closes the
+/// session before the inbound application message that advanced it is handed
+/// over: `from_app` never sees it.
+#[tokio::test]
+async fn test_target_counter_failure_closes_before_from_app() {
+    let (listener, addr) = bind_listener().await;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        // A round trip first, so the counters are persisted and the session is
+        // demonstrably running before the store breaks.
+        ok(
+            framed.send(venue_msg("1", 2, &[(112, "READY")])).await,
+            "send TestRequest",
+        );
+        let reply = next_frame(&mut framed).await;
+        assert_eq!(field(&reply, 112).as_deref(), Some("READY"));
+        let _ = ready_tx.send(());
+        let _ = armed_rx.await;
+
+        ok(
+            framed
+                .send(venue_msg(
+                    "8",
+                    3,
+                    &[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "send execution report",
+        );
+        msg_types_until_closed(&mut framed).await
+    });
+
+    let store = Arc::new(FailingStore::working());
+    let (app, mut app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+        .with_store_failure_policy(StoreFailurePolicy::CloseSession);
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), ready_rx).await,
+            "ready within 5s",
+        ),
+        "stub must reach the session",
+    );
+    assert_eq!(
+        store.inner.next_target_seq(),
+        3,
+        "the TestRequest is in the cursor"
+    );
+    store.fail_target.store(true, Ordering::SeqCst);
+    let _ = armed_tx.send(());
+
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s",
+    );
+    assert!(
+        timeout(Duration::from_millis(300), app_rx.recv())
+            .await
+            .is_err(),
+        "the execution report must never reach from_app"
+    );
+    assert_eq!(store.inner.next_target_seq(), 3);
+    let _ = ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// Under `CloseSession`, a store failure during the Logon handshake makes
+/// `connect` return `EngineError::Store`, and the Logon is never written.
+#[tokio::test]
+async fn test_store_failure_during_the_handshake_fails_connect() {
+    let (listener, addr) = bind_listener().await;
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        msg_types_until_closed(&mut framed).await
+    });
+
+    let store = Arc::new(FailingStore::working());
+    store.fail_store.store(true, Ordering::SeqCst);
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>)
+        .with_store_failure_policy(StoreFailurePolicy::CloseSession);
+
+    match initiator.connect(addr).await {
+        Err(EngineError::Store(_)) => {}
+        Err(other) => panic!("expected a store error, got {other:?}"),
+        Ok(_) => panic!("connect must fail when the Logon cannot be filed"),
+    }
+    let seen = ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+    assert!(seen.is_empty(), "the Logon must never be written: {seen:?}");
+}
+
+/// The frame is filed and the next sender number persisted before the peer
+/// can read the bytes: at the moment the stub reads each frame, the store
+/// already holds it and its next sender number is past it. A property check; the
+/// deterministic proof of the order is
+/// `test_outbound_bytes_wait_for_the_sender_counter_write`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_outbound_frame_and_counter_are_persisted_before_the_peer_reads_them() {
+    let (listener, addr) = bind_listener().await;
+    let store = Arc::new(MemoryStore::new());
+    let observer = Arc::clone(&store);
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_framed(listener).await;
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(field(&logon, 34).as_deref(), Some("1"));
+        assert!(observer.contains(1), "the Logon is filed before it is read");
+        assert_eq!(observer.next_sender_seq(), 2);
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30")]))
+                .await,
+            "send logon ack",
+        );
+
+        for seq in 2..=4u64 {
+            let order = next_frame(&mut framed).await;
+            assert_eq!(field(&order, 34), Some(seq.to_string()));
+            assert!(
+                observer.contains(seq),
+                "order {seq} is filed before it is read"
+            );
+            assert!(
+                observer.next_sender_seq() > seq,
+                "the counter is past order {seq} before it is read"
+            );
+        }
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let connection = ok(initiator.connect(addr).await, "connect");
+    send_orders(&connection, 3).await;
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+}
+
+/// An application that records the store's persisted target counter at the
+/// moment each callback sees an inbound message.
+#[derive(Debug)]
+struct CursorApp {
+    store: Arc<MemoryStore>,
+    seen: mpsc::UnboundedSender<(String, u64, u64)>,
+}
+
+impl CursorApp {
+    fn record(&self, message: &RawMessage<'_>) {
+        let seq = message
+            .get_field_str(34)
+            .and_then(|seq| seq.parse::<u64>().ok())
+            .unwrap_or_default();
+        let _ = self.seen.send((
+            message.msg_type().as_str().to_string(),
+            seq,
+            self.store.next_target_seq(),
+        ));
+    }
+}
+
+#[async_trait]
+impl Application for CursorApp {
+    async fn on_create(&self, _session_id: &SessionId) {}
+
+    async fn on_logon(&self, _session_id: &SessionId) {}
+
+    async fn on_logout(&self, _session_id: &SessionId) {}
+
+    async fn to_admin(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_admin(
+        &self,
+        message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        self.record(message);
+        Ok(())
+    }
+
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_app(
+        &self,
+        message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        self.record(message);
+        Ok(())
+    }
+}
+
+/// The target counter is persisted before an inbound message is acted on:
+/// when `from_admin` sees the Logon ack and the TestRequest, and when
+/// `from_app` sees the execution report, the store already expects the number
+/// after it.
+#[tokio::test]
+async fn test_target_counter_is_persisted_before_the_message_is_acted_on() {
+    let (listener, addr) = bind_listener().await;
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        ok(
+            framed.send(venue_msg("1", 2, &[(112, "PING")])).await,
+            "send TestRequest",
+        );
+        let _reply = next_frame(&mut framed).await;
+        ok(
+            framed
+                .send(venue_msg(
+                    "8",
+                    3,
+                    &[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "send execution report",
+        );
+        // Hold the socket until the client has seen the report.
+        let _ = timeout(Duration::from_secs(5), framed.next()).await;
+    });
+
+    let store = Arc::new(MemoryStore::new());
+    let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
+    let app = Arc::new(CursorApp {
+        store: Arc::clone(&store),
+        seen: seen_tx,
+    });
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    let mut observed = Vec::new();
+    while observed.len() < 3 {
+        let next = ok(
+            timeout(Duration::from_secs(5), seen_rx.recv()).await,
+            "callback within 5s",
+        );
+        observed.push(some(next, "callback channel must stay open"));
+    }
+    // The Logon ack is checked in the handshake, before its number is
+    // consumed, so the cursor there still reads 1; every message after it is
+    // acted on with its own number already in the cursor.
+    assert_eq!(
+        observed,
+        vec![
+            ("A".to_string(), 1, 1),
+            ("1".to_string(), 2, 3),
+            ("8".to_string(), 3, 4),
+        ]
+    );
+
+    ok(connection.logout().await, "logout");
+    acceptor.abort();
+}
+
+/// A store whose counter writes block at a chosen value until a gate opens,
+/// so a test can hold the engine between "persist" and "act" and see which
+/// side of that line an effect falls on.
+#[derive(Debug)]
+struct GatedStore {
+    inner: MemoryStore,
+    /// Sender-counter writes of this value or above wait for the gate.
+    sender_gate_at: u64,
+    /// Target-counter writes of this value or above wait for the gate.
+    target_gate_at: u64,
+    /// Opens the gate when set to `true`.
+    open: tokio::sync::watch::Receiver<bool>,
+}
+
+impl GatedStore {
+    fn new(sender_gate_at: u64, target_gate_at: u64) -> (Self, tokio::sync::watch::Sender<bool>) {
+        let (open_tx, open) = tokio::sync::watch::channel(false);
+        (
+            Self {
+                inner: MemoryStore::new(),
+                sender_gate_at,
+                target_gate_at,
+                open,
+            },
+            open_tx,
+        )
+    }
+
+    async fn wait_for_gate(&self) {
+        let mut open = self.open.clone();
+        let _ = open.wait_for(|open| *open).await;
+    }
+}
+
+#[async_trait]
+impl MessageStore for GatedStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), StoreError> {
+        self.inner.store(seq_num, msg_type, message).await
+    }
+
+    async fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        self.inner.get_range(begin, end).await
+    }
+
+    fn next_sender_seq(&self) -> u64 {
+        self.inner.next_sender_seq()
+    }
+
+    fn next_target_seq(&self) -> u64 {
+        self.inner.next_target_seq()
+    }
+
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+        if seq >= self.sender_gate_at {
+            self.wait_for_gate().await;
+        }
+        self.inner.set_next_sender_seq(seq).await
+    }
+
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        if seq >= self.target_gate_at {
+            self.wait_for_gate().await;
+        }
+        self.inner.set_next_target_seq(seq).await
+    }
+
+    async fn reset(&self) -> Result<(), StoreError> {
+        self.inner.reset().await
+    }
+
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.inner.creation_time()
+    }
+}
+
+/// Deterministic outbound order: while the write of the next sender number
+/// for an order is held open, the peer reads no byte of that order; it
+/// arrives only once the write completes.
+#[tokio::test]
+async fn test_outbound_bytes_wait_for_the_sender_counter_write() {
+    let (listener, addr) = bind_listener().await;
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        // Order 2 is sent, but its counter write (to 3) is held.
+        assert!(
+            timeout(Duration::from_millis(300), framed.next())
+                .await
+                .is_err(),
+            "no byte of the order may arrive before its counter is persisted"
+        );
+        let _ = held_tx.send(());
+        let order = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&order), "D");
+        assert_eq!(field(&order, 34).as_deref(), Some("2"));
+    });
+
+    let (store, open) = GatedStore::new(3, u64::MAX);
+    let store = Arc::new(store);
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let connection = ok(initiator.connect(addr).await, "connect");
+    send_orders(&connection, 1).await;
+
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), held_rx).await,
+            "held within 5s",
+        ),
+        "the stub must observe the hold",
+    );
+    assert!(
+        store.inner.contains(2),
+        "the order is filed before its counter"
+    );
+    let _ = open.send(true);
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
+        ),
+        "acceptor task",
+    );
+    assert_eq!(store.inner.next_sender_seq(), 3);
+}
+
+/// Deterministic inbound order: while the write of the next target number
+/// for an application message is held open, `from_app` does not see the
+/// message; it is handed over only once the write completes.
+#[tokio::test]
+async fn test_from_app_waits_for_the_target_counter_write() {
+    let (listener, addr) = bind_listener().await;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        ok(
+            framed
+                .send(venue_msg(
+                    "8",
+                    2,
+                    &[(37, "EX-1"), (17, "E-1"), (150, "0"), (39, "0")],
+                ))
+                .await,
+            "send execution report",
+        );
+        let _ = done_rx.await;
+    });
+
+    // The Logon ack takes the target to 2 (not held); the report's write of 3
+    // is held.
+    let (store, open) = GatedStore::new(u64::MAX, 3);
+    let store = Arc::new(store);
+    let (app, mut app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let _connection = ok(initiator.connect(addr).await, "connect");
+
+    assert!(
+        timeout(Duration::from_millis(300), app_rx.recv())
+            .await
+            .is_err(),
+        "from_app must not see the report before its counter is persisted"
+    );
+    let _ = open.send(true);
+    let received = ok(
+        timeout(Duration::from_secs(5), app_rx.recv()).await,
+        "report within 5s of the write completing",
+    );
+    assert_eq!(some(received, "app channel must stay open"), "8");
+    assert_eq!(store.inner.next_target_seq(), 3);
+
+    let _ = done_tx.send(());
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), acceptor).await,
+            "acceptor done within 5s",
         ),
         "acceptor task",
     );
