@@ -96,8 +96,13 @@
 //! 0, not a number or repeated with a Reject (`RefTagID` 789) and a Logout; a
 //! value below this session's Logon makes the session resend that range, up to
 //! but not including the Logon, once Active, as it would answer a
-//! `ResendRequest`. Without the flag no 789 is sent and the acknowledgement's
-//! is ignored.
+//! `ResendRequest`. When the acknowledgement declares 789 too and arrives with
+//! a gap below it, no `ResendRequest` is sent: the acceptor resends that gap on
+//! its own because of this Logon's 789, so the acknowledgement is held and its
+//! number consumed once the gap is filled, with one `ResendRequest` after
+//! [`SessionConfig::resend_timeout`] only if the acceptor never resends.
+//! Without the flag no 789 is sent and the acknowledgement's is ignored. 789 is
+//! bilateral: both sides must enable it.
 //!
 //! # Resend and the message store
 //!
@@ -730,6 +735,9 @@ impl<A: Application + 'static> Initiator<A> {
         // (first, first not resent) of what the ack's NextExpectedMsgSeqNum
         // (789) says the acceptor missed.
         let mut opening_replay: Option<(u64, u64)> = None;
+        // (gap start, ack MsgSeqNum) of a gapped ack held instead of
+        // requested, when both sides declared 789.
+        let mut held_logon: Option<(u64, u64)> = None;
         {
             let raw = wire::decode_frame(&ack)?;
             match raw.msg_type() {
@@ -1010,13 +1018,16 @@ impl<A: Application + 'static> Initiator<A> {
             // number we send claims messages never sent: Logout, and no
             // session. A value below our Logon names messages the acceptor
             // missed: resent once Active. 789 moves no counter.
+            let mut ack_declares_789 = false;
             if self.config.send_next_expected_msg_seq_num {
                 let (own_logon_seq, next_outbound) = if ack_resets {
                     (1, 2)
                 } else {
                     (logon_seq, runtime.sequences.next_sender_seq().value())
                 };
-                let decided = next_expected::read_next_expected(&raw).and_then(|declared| {
+                let declared = next_expected::read_next_expected(&raw);
+                ack_declares_789 = matches!(declared, Ok(Some(_)));
+                let decided = declared.and_then(|declared| {
                     declared
                         .map(|declared| next_expected::plan(declared, own_logon_seq, next_outbound))
                         .transpose()
@@ -1155,8 +1166,18 @@ impl<A: Application + 'static> Initiator<A> {
                         "logon ack MsgSeqNum too low: expected {expected}, received {received}"
                     )));
                 }
+                // Both sides declared 789: our Logon named `expected` as the
+                // next number we expect, so the acceptor resends the gap below
+                // its ack on its own. The ack is held, its number consumed
+                // once that gap is filled, and no ResendRequest crosses the
+                // resend (QuickFIX/C++ does the same). Otherwise the gap is
+                // requested as the reactor's first act.
                 SequenceResult::Gap { expected, received } => {
-                    pending_resend = Some((expected, received));
+                    if self.config.send_next_expected_msg_seq_num && ack_declares_789 {
+                        held_logon = Some((expected, received));
+                    } else {
+                        pending_resend = Some((expected, received));
+                    }
                 }
             }
         }
@@ -1198,6 +1219,7 @@ impl<A: Application + 'static> Initiator<A> {
             reset_owed: self.store.owed_record(),
             opening_gap: pending_resend,
             opening_replay,
+            held_logon,
             write_timeout,
             outbound_capacity: self.outbound_capacity,
             app_queue_capacity: self.app_queue_capacity,

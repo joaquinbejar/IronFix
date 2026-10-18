@@ -41,6 +41,13 @@
 //! [`SessionConfig::resend_attempt_limit`] attempts, after which the session is
 //! logged out.
 //!
+//! The one exception is a gapped Logon or acknowledgement when both sides
+//! declared `NextExpectedMsgSeqNum` (789): the counterparty resends that gap
+//! on its own, so the reactor sends nothing, holds the Logon and consumes its
+//! number once the gap below it is filled. The gap is still bounded: if it
+//! makes no progress for one resend timeout, a real `ResendRequest` goes out,
+//! and the usual retries follow.
+//!
 //! # Garbled inbound frames
 //!
 //! Both engines frame the socket with
@@ -710,6 +717,30 @@ impl ResendState {
         }
     }
 
+    /// Opens recovery for a gap that `NextExpectedMsgSeqNum` (789) already
+    /// asked the counterparty to fill, with **no** `ResendRequest` sent:
+    /// `attempts` is 0.
+    ///
+    /// The state is armed so a gapped frame arriving meanwhile does not send a
+    /// request that would cross the counterparty's 789 resend, and so a
+    /// counterparty that never resends is still chased: once the gap has made
+    /// no progress for the retry timeout, [`Reactor::on_resend_stalled`] sends
+    /// a real `ResendRequest`, which a limit of one request still allows.
+    #[must_use]
+    pub(crate) fn implied(expected: u64, high_water: u64, config: &SessionConfig) -> Self {
+        Self {
+            attempts: 0,
+            ..Self::first(expected, high_water, config)
+        }
+    }
+
+    /// Whether no `ResendRequest` has been sent for this gap yet: it is one
+    /// `NextExpectedMsgSeqNum` (789) asked the counterparty to fill.
+    #[must_use]
+    const fn is_implied(&self) -> bool {
+        self.attempts == 0
+    }
+
     /// Whether this gap has waited longer than its retry timeout.
     #[must_use]
     fn is_stalled(&self) -> bool {
@@ -738,7 +769,9 @@ impl ResendState {
     fn record_progress(&mut self, expected: u64) {
         self.expected = expected;
         self.requested_at = Instant::now();
-        self.attempts = 1;
+        // An implied gap (no request sent yet) stays implied, so a stall
+        // after partial progress still gets its one real request.
+        self.attempts = self.attempts.min(1);
     }
 }
 
@@ -780,6 +813,10 @@ struct Reactor<A: Application> {
     /// carries the instant the Logout went out, so the phase itself is the
     /// deadline.
     resend: Option<ResendState>,
+    /// The `MsgSeqNum` of a gapped Logon or acknowledgement held until the
+    /// `NextExpectedMsgSeqNum` (789) resend fills the gap below it, then
+    /// consumed ([`Reactor::release_held_logon`]).
+    held_logon: Option<u64>,
     /// Bound on a single socket write.
     write_timeout: Duration,
     /// Hand-off queue to the application dispatcher.
@@ -799,6 +836,11 @@ struct Opening {
     /// missed, as (first number, first number not resent); resent right after
     /// the gap is requested.
     replay: Option<(u64, u64)>,
+    /// A gapped Logon or acknowledgement held instead of requested, as (first
+    /// missing number, the held Logon's `MsgSeqNum`): both sides declared 789,
+    /// so the counterparty resends the gap below its Logon on its own, and the
+    /// Logon's number is consumed once that gap is filled.
+    held_logon: Option<(u64, u64)>,
 }
 
 /// The session reactor: owns the socket, multiplexes inbound frames,
@@ -880,9 +922,9 @@ async fn run_reactor<A: Application + 'static>(
                 // common case is one integer read and nothing else: no clock,
                 // no allocation.
                 Some(Ok(frame)) => match framed.codec_mut().take_garbled_count() {
-                    0 => ctx.on_frame(&mut framed, current, frame).await,
+                    0 => ctx.on_inbound(&mut framed, current, frame).await,
                     skipped => match ctx.on_garbled(&mut framed, current, skipped, GARBLED_FRAMING).await {
-                        Ok(current) => ctx.on_frame(&mut framed, current, frame).await,
+                        Ok(current) => ctx.on_inbound(&mut framed, current, frame).await,
                         Err(outcome) => Err(outcome),
                     },
                 },
@@ -2186,10 +2228,106 @@ impl<A: Application> Reactor<A> {
         Ok(phase)
     }
 
+    /// Handles one inbound frame ([`Reactor::on_frame`]), then consumes a held
+    /// Logon whose turn it now is ([`Reactor::release_held_logon`]).
+    async fn on_inbound(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        frame: BytesMut,
+    ) -> Result<Phase, SessionClosed> {
+        let phase = self.on_frame(framed, phase, frame).await?;
+        self.release_held_logon(framed, phase).await
+    }
+
+    /// Consumes a Logon or acknowledgement held by [`Reactor::open`] once the
+    /// inbound expectation reaches its number, as a receiver that queued it
+    /// would: the Logon was processed at the handshake, so only its number is
+    /// left to take.
+    ///
+    /// - Expectation below the held number: the gap is still being filled;
+    ///   nothing happens.
+    /// - Expectation above it: a gap fill jumped past the Logon (a
+    ///   counterparty that fills through its own Logon does); the hold is
+    ///   dropped.
+    /// - Expectation equal to it: `MsgSeqNum + 1` is persisted as the next
+    ///   target number and only then is the expectation moved, the order every
+    ///   inbound message takes (ADR-0005), and recovery progress is noted.
+    ///
+    /// If frames beyond the held Logon arrived while it was held, the 789
+    /// resend does not cover them and recovery is still armed with nothing
+    /// requested; they are requested at once rather than after the retry
+    /// timeout.
+    ///
+    /// # Errors
+    /// The session is closed on an exhausted target counter, a store write
+    /// that fails under the fail-closed policy, or a failure to send that
+    /// request.
+    async fn release_held_logon(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+    ) -> Result<Phase, SessionClosed> {
+        let Some(logon_seq) = self.held_logon else {
+            return Ok(phase);
+        };
+        let next_target = self.runtime.sequences.next_target_seq().value();
+        if next_target < logon_seq {
+            return Ok(phase);
+        }
+        self.held_logon = None;
+        if next_target > logon_seq {
+            tracing::debug!(
+                session = %self.session_id,
+                held_logon = logon_seq,
+                next_target,
+                "the gap below the held Logon was filled past it"
+            );
+            return Ok(phase);
+        }
+        let Some(next) = logon_seq.checked_add(1) else {
+            return Err(exhausted(
+                phase,
+                SequenceExhausted {
+                    counter: SequenceCounter::Target,
+                },
+            ));
+        };
+        if let Err(err) = self.persist_target(next).await {
+            return Err(self.close_on_store_failure(phase, &err));
+        }
+        if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
+            return Err(exhausted(phase, err));
+        }
+        self.note_inbound_progress();
+        tracing::debug!(
+            session = %self.session_id,
+            held_logon = logon_seq,
+            "consumed the held Logon: the gap below it is filled"
+        );
+        match self.resend {
+            Some(state) if state.is_implied() => {
+                self.resend = None;
+                self.request_resend(framed, phase, next, state.high_water)
+                    .await
+            }
+            _ => Ok(phase),
+        }
+    }
+
     /// The reactor's first acts, left by the Logon exchange: request a gap it
-    /// found in the counterparty's Logon or acknowledgement, then resend the
-    /// messages the counterparty's `NextExpectedMsgSeqNum` (789) said it
-    /// missed.
+    /// found in the counterparty's Logon or acknowledgement, or, when both
+    /// sides declared `NextExpectedMsgSeqNum` (789), hold that Logon instead;
+    /// then resend the messages the counterparty's 789 said it missed.
+    ///
+    /// A held Logon sends nothing. The gap below it is one the counterparty
+    /// resends on its own, because this session's 789 named it: requesting it
+    /// as well would cross that resend, which 789 exists to avoid. The gap is
+    /// armed as an implied recovery ([`ResendState::implied`]), so a gapped
+    /// frame arriving meanwhile sends no request either, and a counterparty
+    /// that never resends gets one real `ResendRequest` once the gap has made
+    /// no progress for [`SessionConfig::resend_timeout`]. The Logon's number
+    /// is consumed by [`Reactor::release_held_logon`].
     ///
     /// The resend is the one a `ResendRequest` for exactly that range would
     /// get ([`Reactor::resend_range`]). Its range was decided by the handshake
@@ -2211,6 +2349,17 @@ impl<A: Application> Reactor<A> {
             phase = self
                 .request_resend(framed, phase, expected, high_water)
                 .await?;
+        }
+        if let Some((expected, logon_seq)) = opening.held_logon {
+            tracing::info!(
+                session = %self.session_id,
+                expected,
+                held_logon = logon_seq,
+                "holding the gapped Logon: the counterparty resends the gap below it on its own \
+                 (NextExpectedMsgSeqNum)"
+            );
+            self.resend = Some(ResendState::implied(expected, logon_seq, &self.config));
+            self.held_logon = Some(logon_seq);
         }
         if let Some((begin_seq, new_seq)) = opening.replay {
             let next_sender = self.runtime.sequences.next_sender_seq().value();
@@ -2845,6 +2994,11 @@ pub(crate) struct SessionParams<A: Application> {
     /// them once Active, right after requesting any `opening_gap`, through the
     /// same replay a `ResendRequest` (2) gets.
     pub(crate) opening_replay: Option<(u64, u64)>,
+    /// A gapped Logon or acknowledgement held instead of requested, as (first
+    /// missing number, the held Logon's `MsgSeqNum`). Set only when both
+    /// sides declared `NextExpectedMsgSeqNum` (789); mutually exclusive with
+    /// `opening_gap`.
+    pub(crate) held_logon: Option<(u64, u64)>,
     /// Bound on a single socket write.
     pub(crate) write_timeout: Duration,
     /// Capacity of the outbound command queue.
@@ -2893,6 +3047,7 @@ where
         reset_owed,
         opening_gap,
         opening_replay,
+        held_logon,
         write_timeout,
         outbound_capacity,
         app_queue_capacity,
@@ -2931,6 +3086,7 @@ where
         reset_owed,
         app_handed: None,
         resend: None,
+        held_logon: None,
         write_timeout,
         app_tx,
         garbled,
@@ -2946,6 +3102,7 @@ where
     let opening = Opening {
         gap: opening_gap,
         replay: opening_replay,
+        held_logon,
     };
     tokio::spawn(async move {
         let _guard = guard;
@@ -2993,5 +3150,57 @@ mod tests {
             undelivered_range(Some((u64::MAX, u64::MAX)), u64::MAX),
             None
         );
+    }
+
+    /// A session configuration allowing `limit` ResendRequests per gap.
+    fn config_with_limit(limit: u32) -> SessionConfig {
+        let (Ok(sender), Ok(target)) = (
+            ironfix_core::types::CompId::new("CLIENT"),
+            ironfix_core::types::CompId::new("VENUE"),
+        ) else {
+            unreachable!("CLIENT and VENUE are valid CompIDs")
+        };
+        SessionConfig::new(sender, target, "FIX.4.4").with_max_resend_requests(limit)
+    }
+
+    #[test]
+    fn test_resend_state_implied_has_sent_nothing_yet() {
+        let config = config_with_limit(1);
+        let implied = ResendState::implied(3, 6, &config);
+        assert!(implied.is_implied());
+        assert_eq!(implied.expected, 3);
+        assert_eq!(implied.high_water, 6);
+        // Even a limit of one request leaves room for the real one.
+        assert!(implied.can_retry());
+
+        let first = ResendState::first(3, 6, &config);
+        assert!(!first.is_implied());
+        assert!(!first.can_retry());
+    }
+
+    #[test]
+    fn test_resend_state_implied_allows_exactly_one_real_request_at_limit_one() {
+        let config = config_with_limit(1);
+        let mut state = ResendState::implied(3, 6, &config);
+        state.record_retry();
+        assert!(!state.is_implied());
+        assert!(!state.can_retry(), "the one real request is spent");
+    }
+
+    #[test]
+    fn test_resend_state_progress_keeps_an_implied_gap_implied() {
+        let config = config_with_limit(1);
+        let mut implied = ResendState::implied(3, 6, &config);
+        implied.record_progress(4);
+        assert_eq!(implied.expected, 4);
+        assert!(
+            implied.is_implied(),
+            "a stall after partial progress still gets its one real request"
+        );
+
+        let mut real = ResendState::first(3, 6, &config);
+        real.record_retry();
+        real.record_progress(4);
+        assert_eq!(real.attempts, 1, "progress resets a real request's budget");
     }
 }

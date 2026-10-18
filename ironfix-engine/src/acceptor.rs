@@ -56,7 +56,11 @@
 //! timeout. So is a frame whose header decodes but whose body does not: it is
 //! not garbled, but it cannot be read as a Logon either. A Logon that never
 //! arrives intact ends in [`EngineError::LogonTimeout`]. A gap in the Logon
-//! completes the handshake and immediately issues a `ResendRequest` (2).
+//! completes the handshake and immediately issues a `ResendRequest` (2),
+//! unless both sides declared `NextExpectedMsgSeqNum` (789): the initiator then
+//! resends the gap on its own, so the Logon is held and its number consumed
+//! once the gap is filled, with one `ResendRequest` after
+//! [`SessionConfig::resend_timeout`] only if the initiator never resends.
 //!
 //! A refused Logon drives the typestate to `reject_logon` and the connection
 //! is dropped without reaching Active. What the peer is sent first depends on
@@ -929,6 +933,9 @@ impl<A: Application + 'static> Acceptor<A> {
         // (first, first not resent) of what the Logon's NextExpectedMsgSeqNum
         // (789) says the initiator missed.
         let mut opening_replay: Option<(u64, u64)> = None;
+        // (gap start, Logon MsgSeqNum) of a gapped Logon held instead of
+        // requested, when both sides declared 789.
+        let mut held_logon: Option<(u64, u64)> = None;
         // The admission claim is taken once identity is validated and moved into
         // the reactor task on success; on any handshake failure after the claim
         // this local drops and frees the slot. These are assigned on the
@@ -1416,8 +1423,22 @@ impl<A: Application + 'static> Acceptor<A> {
                     refused?;
                     return Err(EngineError::Sequence(detail));
                 }
+                // Both sides declared 789: our ack names `expected` as the
+                // next number we expect, so the initiator resends the gap
+                // below its Logon on its own. The Logon is held, its number
+                // consumed once that gap is filled, and no ResendRequest
+                // crosses the resend (QuickFIX/C++ does the same). The
+                // filtered 789 is used: it is None when this side drives a
+                // reset. Otherwise the gap is requested as the reactor's first
+                // act.
                 SequenceResult::Gap { expected, received } => {
-                    pending_resend = Some((expected, received));
+                    if self.config.send_next_expected_msg_seq_num
+                        && declared_next_expected.is_some()
+                    {
+                        held_logon = Some((expected, received));
+                    } else {
+                        pending_resend = Some((expected, received));
+                    }
                 }
             }
 
@@ -1493,6 +1514,7 @@ impl<A: Application + 'static> Acceptor<A> {
             reset_owed: self.store.owed_record(),
             opening_gap: pending_resend,
             opening_replay,
+            held_logon,
             write_timeout,
             outbound_capacity: self.outbound_capacity,
             app_queue_capacity: self.app_queue_capacity,

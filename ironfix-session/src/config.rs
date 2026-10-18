@@ -71,8 +71,9 @@
 //! Logon which of its messages the other missed.
 //! [`SessionConfig::send_next_expected_msg_seq_num`] opts a session into it,
 //! in both directions: `ironfix-engine` then declares 789 on its own Logon or
-//! Logon acknowledgement and acts on the counterparty's. Earlier versions do
-//! not define the field, so the flag is refused there
+//! Logon acknowledgement and acts on the counterparty's. It is bilateral:
+//! both sides must enable it. Earlier versions do not define the field, so
+//! the flag is refused there
 //! ([`SessionConfigError::NextExpectedMsgSeqNumUnsupported`]).
 
 use crate::heartbeat::MAX_HEARTBEAT_INTERVAL_SECS;
@@ -688,11 +689,24 @@ pub struct SessionConfig {
     /// initiator) or Logon acknowledgement (an acceptor): the next `MsgSeqNum`
     /// it expects to receive, which is 1 on a Logon declaring
     /// `ResetSeqNumFlag` (141) = Y. It also acts on the 789 the counterparty
-    /// declares: a value below the next `MsgSeqNum` the session sends makes it
-    /// resend the messages the counterparty missed once the session is Active,
-    /// and a value above it (the counterparty claims messages that were never
-    /// sent) refuses the Logon with a Logout. When unset, no 789 is sent and a
-    /// counterparty's 789 is ignored, as before.
+    /// declares: a value below the `MsgSeqNum` of the session's own Logon or
+    /// acknowledgement makes it resend the messages the counterparty missed,
+    /// up to but not including that Logon, once the session is Active; a
+    /// value above the next `MsgSeqNum` the session sends (the counterparty
+    /// claims messages that were never sent) refuses the Logon with a Logout.
+    /// And when both sides declared 789 and the counterparty's Logon or
+    /// acknowledgement arrives with a gap below it, the session sends no
+    /// `ResendRequest`: the counterparty resends that gap on its own, because
+    /// of this session's 789, so its Logon is held and consumed once the gap
+    /// is filled. A counterparty that never resends gets one `ResendRequest`
+    /// after [`SessionConfig::resend_timeout`]. When unset, no 789 is sent and
+    /// a counterparty's 789 is ignored, as before.
+    ///
+    /// 789 is bilateral: enable it on both sides. A counterparty that uses it
+    /// while this session does not may wait on a resend this session never
+    /// sends: QuickFIX/C++, for one, acts on an inbound 789 whatever its own
+    /// setting, and when it declared 789 itself it sends no `ResendRequest`
+    /// for a gapped Logon and runs no resend timer.
     ///
     /// Range: any flag on a FIX.4.4 or FIXT.1.1 session (FIX.5.0, FIX.5.0SP1,
     /// FIX.5.0SP2); `true` on an earlier version is refused by

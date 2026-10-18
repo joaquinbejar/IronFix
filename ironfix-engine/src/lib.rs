@@ -62,7 +62,11 @@
 //! Active what the counterparty's 789 says it missed (the range below its own
 //! Logon, through the same replay a `ResendRequest` gets), and refuses a Logon
 //! whose 789 claims messages never sent with
-//! [`EngineError::NextExpectedMsgSeqNum`], before `on_logon`.
+//! [`EngineError::NextExpectedMsgSeqNum`], before `on_logon`. A gapped Logon
+//! from a counterparty that declared 789 too is held rather than answered with
+//! a `ResendRequest`, which would cross the counterparty's own resend; its
+//! number is consumed once that resend fills the gap. 789 is bilateral: both
+//! sides must enable it.
 //!
 //! Both also frame their socket with garbled-frame recovery on
 //! ([`ironfix_transport::FixCodec::with_garbled_recovery`], anchored on the

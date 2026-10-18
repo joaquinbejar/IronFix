@@ -33,11 +33,17 @@
 //!
 //! The replayed range stops **before** this session's own Logon or
 //! acknowledgement. The counterparty has that message in hand as it reads
-//! the 789 answer, and 789 does not say whether it consumed it: a peer that
-//! queued a gapped Logon consumes it once the gap is filled, and a peer that
-//! did not asks for it, or for everything from the gap, with a
-//! `ResendRequest`, whose answer gap-fills it. Nothing is ever replayed at or
-//! above that number.
+//! the 789 answer: a counterparty that declared 789 holds the gapped Logon and
+//! consumes its number once the gap below it is filled, as IronFix and
+//! QuickFIX/C++ do, and one that did not asks for it with a `ResendRequest`,
+//! whose answer gap-fills it. Nothing is ever replayed at or above that
+//! number.
+//!
+//! The other half of the exchange lives in the reactor: when this session
+//! declared 789 and the counterparty's Logon or acknowledgement carries a
+//! well-formed 789 and arrives with a gap below it, no `ResendRequest` is sent,
+//! since the counterparty resends that gap on its own; the Logon is held and
+//! its number consumed once the gap is filled.
 //!
 //! Every decision here is synchronous, takes the counters it compares as
 //! parameters and reads no clock (ADR-0002). 789 never moves a sequence
