@@ -17,10 +17,13 @@ ironfix-core.workspace = true
 ironfix-dictionary.workspace = true
 rust_decimal.workspace = true
 
-# build.rs generates the views from the embedded dictionaries.
+# build.rs generates the views from the embedded dictionaries, and both
+# outputs from the FIX 4.4 Orchestra test fixture.
 [build-dependencies]
 ironfix-codegen.workspace = true
 ironfix-dictionary.workspace = true
 
+# The tests regenerate the Orchestra output to check it is what was compiled.
 [dev-dependencies]
+ironfix-codegen.workspace = true
 ironfix-tagvalue.workspace = true

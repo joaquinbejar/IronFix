@@ -9,6 +9,10 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# The FIX Orchestra test fixture is distributed under its own license
+# (Apache-2.0, see its README): keep it, and the test that includes it, out
+# of the published package.
+exclude = ["tests/fixtures/orchestra", "tests/orchestra_fix44.rs"]
 
 [dependencies]
 ironfix-core.workspace = true
@@ -25,4 +29,10 @@ dhat.workspace = true
 # measures.
 [[test]]
 name = "group_reader_allocations"
+harness = false
+
+# Measures the Orchestra loader's peak heap at its limits, with dhat as the
+# global allocator, so it too runs as its own binary without the harness.
+[[test]]
+name = "orchestra_memory"
 harness = false

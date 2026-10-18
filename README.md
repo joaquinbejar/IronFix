@@ -94,6 +94,14 @@ exists yet.
   against the pair with QuickFIX-like semantics: `BeginString` must be
   `FIXT.1.1`, header and trailer come from the transport, the body from the
   application, and admin messages entirely from the transport.
+- **A FIX Orchestra 1.0 loader** in `ironfix-dictionary`:
+  `Dictionary::from_orchestra_xml` reads the base scenario of an Orchestra
+  repository into the same `Dictionary` model and returns, next to it, an
+  `OrchestraReport` of what the model cannot hold (other scenarios,
+  conditional rules, forbidden or constant presence, value constraints,
+  workflow). It is tested against the FIX Trading Community's FIX 4.4
+  repository, compared with the embedded QuickFIX FIX 4.4 dictionary
+  (`doc/adr/0013-load-fix-orchestra-repositories.md`).
 - **A zero-copy repeating-group reader** in `ironfix-dictionary`. Build a
   `MessageLayout` once per message type from a dictionary (or describe the
   groups at compile time with `GroupSpec` / `GroupSet`), then read a decoded
@@ -186,9 +194,19 @@ around it.
   kept verbatim; to accept the group, load a FIXT 1.1 dictionary that defines
   it with `Dictionary::from_quickfix_xml` and compose that
   (`ironfix-dictionary/spec/README.md`).
+- **Orchestra loading is tested on FIX 4.4 only.** The only Orchestra
+  repository exercised is the FIX Trading Community's `OrchestraFIX44.xml`, a
+  test fixture that is not embedded or published. `FIX.Latest` repositories
+  are rejected (`DictionaryError::UnsupportedVersion`): FIX Latest names no
+  fixed FIX version. So is a repository named `FIXT` whose version is not
+  `FIXT.1.1`, which includes the FIX Trading Community's FIXT session
+  repository (it declares `FIX.5.0SP2_EP247`). Only the `base` scenario is
+  loaded.
 - **Generated code has no consumer.** Nothing in the workspace uses the
   derives or `ironfix-codegen` output (data structs or views) at run time
-  (`ironfix-codegen-check` only compiles the generated views), so field
+  (`ironfix-codegen-check` only compiles generated code: the views of the
+  embedded FIX 4.4, FIX 4.2 and FIXT 1.1 dictionaries, and both outputs for
+  the FIX 4.4 Orchestra repository), so field
   access on the session path is untyped tag lookup
   (`ironfix-codegen/src/lib.rs`). Generated views cover the message body
   only, and are generated from one dictionary: a FIXT.1.1 + FIX 5.0
@@ -233,12 +251,18 @@ under the QuickFIX Software License, Version 1.0
 `ironfix-dictionary/spec/README.md`). This product includes software developed
 by quickfixengine.org (<http://www.quickfixengine.org/>).
 
+The FIX 4.4 Orchestra repository the tests load is the FIX Trading
+Community's, under the Apache License, Version 2.0
+(`ironfix-dictionary/tests/fixtures/orchestra/LICENSE`; provenance and
+checksums in `ironfix-dictionary/tests/fixtures/orchestra/README.md`). It is a
+test fixture only, left out of the published `ironfix-dictionary` package.
+
 ## Crate Organization
 
 | Crate | Description |
 |-------|-------------|
 | `ironfix-core` | Fundamental types, traits, and error definitions; depends on no other IronFix crate |
-| `ironfix-dictionary` | QuickFIX XML loading, schema types, and the opt-in `Validator` |
+| `ironfix-dictionary` | QuickFIX XML and FIX Orchestra loading, schema types, and the opt-in `Validator` |
 | `ironfix-tagvalue` | Zero-copy tag=value decoding and encoding; dictionary-free |
 | `ironfix-session` | Session-layer protocol logic: typestate FSM, sequences, heartbeats. No I/O |
 | `ironfix-store` | The `MessageStore` trait, `MemoryStore`, and the persistent `FileStore` |

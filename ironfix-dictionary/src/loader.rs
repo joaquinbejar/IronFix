@@ -52,12 +52,14 @@
 //! definitions are rejected rather than silently overwriting each other
 //! ([`DictionaryError::DuplicateDefinition`]).
 
+use crate::orchestra::OrchestraKind;
 use crate::schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, Member,
     MessageCategory, MessageDef, Version,
 };
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::OnceLock;
@@ -222,6 +224,121 @@ pub enum DictionaryError {
         /// Version of the dictionary offered as the application.
         application: Version,
     },
+    /// The document is not a FIX Orchestra 1.0 repository: its root element
+    /// is not `repository` in the
+    /// [`ORCHESTRA_NAMESPACE`](crate::orchestra::ORCHESTRA_NAMESPACE).
+    #[error("not a FIX Orchestra 1.0 repository: the root element is {0}")]
+    NotOrchestra(String),
+    /// The document is longer than the loader accepts
+    /// ([`MAX_ORCHESTRA_DOCUMENT_LEN`](crate::orchestra::MAX_ORCHESTRA_DOCUMENT_LEN)).
+    #[error("the document is {len} bytes, over the {limit}-byte limit")]
+    DocumentTooLarge {
+        /// Length of the document, in bytes.
+        len: usize,
+        /// The limit, in bytes.
+        limit: usize,
+    },
+    /// The attributes of one element are longer than the loader accepts
+    /// ([`MAX_ORCHESTRA_ATTRIBUTES_LEN`](crate::orchestra::MAX_ORCHESTRA_ATTRIBUTES_LEN)).
+    #[error("the attributes of <{element}> are {len} bytes, over the {limit}-byte limit")]
+    AttributesTooLong {
+        /// The element, as written in the document.
+        element: String,
+        /// Length of its attributes, in bytes.
+        len: usize,
+        /// The limit, in bytes.
+        limit: usize,
+    },
+    /// An Orchestra `id` is not a positive integer that fits a `u32`.
+    #[error("invalid id `{value}` on <{element}>")]
+    InvalidOrchestraId {
+        /// The element carrying the id.
+        element: String,
+        /// The id, as written in the document.
+        value: String,
+    },
+    /// An Orchestra reference names an id that no definition in the `base`
+    /// scenario has.
+    #[error("{owner} references {kind} id {id}, which is not defined")]
+    UnknownOrchestraReference {
+        /// The kind of definition referenced.
+        kind: OrchestraKind,
+        /// The referenced id.
+        id: u32,
+        /// The definition holding the reference.
+        owner: String,
+    },
+    /// Two Orchestra definitions share an id or a name that must be unique.
+    #[error("duplicate {kind} `{key}`")]
+    DuplicateOrchestraDefinition {
+        /// The kind of the duplicated definitions.
+        kind: OrchestraKind,
+        /// The shared id or name.
+        key: String,
+    },
+    /// A code set names a datatype that is not declared or maps to no FIX
+    /// data type.
+    #[error("{owner} names datatype `{datatype}`, which maps to no FIX data type")]
+    UnknownDatatype {
+        /// The definition naming the datatype.
+        owner: String,
+        /// The datatype name, as written in the document.
+        datatype: String,
+    },
+    /// An Orchestra repeating group has no count field (`numInGroup`).
+    #[error("group `{0}` has no numInGroup count field")]
+    MissingCountField(String),
+    /// An Orchestra repeating group contains itself, directly or through
+    /// other groups.
+    #[error("group `{0}` is part of a reference cycle")]
+    GroupCycle(String),
+    /// Expanding the group references of an Orchestra repository would
+    /// produce more members than the loader accepts
+    /// ([`MAX_ORCHESTRA_MEMBERS`](crate::orchestra::MAX_ORCHESTRA_MEMBERS)).
+    #[error("expanding the groups produces more than {limit} members")]
+    TooManyMembers {
+        /// The limit, in members.
+        limit: usize,
+    },
+    /// An element name, an attribute name, or an attribute value the
+    /// Orchestra loader keeps is longer than
+    /// [`MAX_ORCHESTRA_NAME_LEN`](crate::orchestra::MAX_ORCHESTRA_NAME_LEN).
+    #[error("{what} is {len} bytes, over the {limit}-byte limit")]
+    NameTooLong {
+        /// What is too long, without the text itself (for example "the value
+        /// of attribute `name` of <fixr:field>").
+        what: String,
+        /// Its length, in bytes.
+        len: usize,
+        /// The limit, in bytes.
+        limit: usize,
+    },
+    /// Copying an Orchestra repository's code sets onto the fields that name
+    /// them would produce more enumeration values than the loader accepts
+    /// ([`MAX_ORCHESTRA_FIELD_VALUES`](crate::orchestra::MAX_ORCHESTRA_FIELD_VALUES)).
+    #[error("the fields' enumerations hold more than {limit} values")]
+    TooManyFieldValues {
+        /// The limit, in values over every field.
+        limit: usize,
+    },
+    /// An Orchestra repository holds more constructs the dictionary cannot
+    /// hold than the report accepts
+    /// ([`MAX_ORCHESTRA_REPORT_ENTRIES`](crate::orchestra::MAX_ORCHESTRA_REPORT_ENTRIES)).
+    #[error("more than {limit} unmapped constructs")]
+    TooManyUnmapped {
+        /// The limit, in report entries.
+        limit: usize,
+    },
+    /// The Orchestra standard header or trailer component is referenced from
+    /// a component or a group; only a message's own members may reference
+    /// it, which is where the dictionary's header and trailer apply.
+    #[error("{owner} references the {component} component, which only a message may reference")]
+    EnvelopeReference {
+        /// `StandardHeader` or `StandardTrailer`.
+        component: String,
+        /// The definition holding the reference.
+        owner: String,
+    },
 }
 
 impl Dictionary {
@@ -327,8 +444,12 @@ impl Dictionary {
 
 /// Intermediate representation of a member of a message, component,
 /// group, header, or trailer, preserving document order.
+///
+/// Shared with the Orchestra loader ([`crate::orchestra`]), which resolves
+/// its id references into these name references and hands them to the same
+/// [`assemble`] step.
 #[derive(Debug)]
-enum Item {
+pub(crate) enum Item {
     /// Field reference.
     Field {
         /// Field name.
@@ -355,11 +476,15 @@ enum Item {
 }
 
 /// Intermediate representation of a `<message>` element.
-struct MessageIr {
-    name: String,
-    msg_type: String,
-    category: MessageCategory,
-    items: Vec<Item>,
+pub(crate) struct MessageIr {
+    /// Message name.
+    pub(crate) name: String,
+    /// Message type (tag 35).
+    pub(crate) msg_type: String,
+    /// Admin or application message.
+    pub(crate) category: MessageCategory,
+    /// Members, in document order.
+    pub(crate) items: Vec<Item>,
 }
 
 impl MessageIr {
@@ -382,7 +507,7 @@ impl MessageIr {
 /// Component definitions collected from the `<components>` section, in
 /// declaration order.
 #[derive(Default)]
-struct ComponentIrs {
+pub(crate) struct ComponentIrs {
     /// Members of each component, keyed by name.
     items: HashMap<String, Vec<Item>>,
     /// Component names in declaration order.
@@ -391,7 +516,7 @@ struct ComponentIrs {
 
 impl ComponentIrs {
     /// Registers one component definition, rejecting a duplicate name.
-    fn define(&mut self, name: String, items: Vec<Item>) -> Result<(), DictionaryError> {
+    pub(crate) fn define(&mut self, name: String, items: Vec<Item>) -> Result<(), DictionaryError> {
         if self.items.contains_key(&name) {
             return Err(DictionaryError::DuplicateDefinition {
                 kind: DefinitionKind::Component,
@@ -605,6 +730,10 @@ fn field_def(
 struct Resolver<'a> {
     fields_by_name: &'a HashMap<String, u32>,
     components: &'a HashMap<String, Vec<Item>>,
+    /// The first tag of each component already walked, so a component
+    /// reached many times (every group whose first member it is, every path
+    /// through a chain of components) is walked once.
+    first_tags: RefCell<HashMap<String, Option<u32>>>,
 }
 
 impl Resolver<'_> {
@@ -628,7 +757,10 @@ impl Resolver<'_> {
     ///
     /// Reference cycles are already rejected by [`check_component_graph`]
     /// before any resolution starts; the depth ceiling here is a second,
-    /// independent bound on the recursion.
+    /// independent bound on the recursion. Each component's first tag is
+    /// computed once ([`Self::component_first_tag`]), so the walk is linear
+    /// in the number of component references even where a component without
+    /// fields leads to the same component along many paths.
     fn first_tag(&self, items: &[Item], depth: usize) -> Result<Option<u32>, DictionaryError> {
         for item in items {
             match item {
@@ -636,23 +768,38 @@ impl Resolver<'_> {
                     return self.tag(name).map(Some);
                 }
                 Item::Component { name, .. } => {
-                    if depth >= MAX_COMPONENT_DEPTH {
-                        return Err(DictionaryError::NestingTooDeep {
-                            element: name.clone(),
-                            limit: MAX_COMPONENT_DEPTH,
-                        });
-                    }
-                    let inner = self
-                        .components
-                        .get(name)
-                        .ok_or_else(|| DictionaryError::UnknownComponent(name.clone()))?;
-                    if let Some(tag) = self.first_tag(inner, depth + 1)? {
+                    if let Some(tag) = self.component_first_tag(name, depth)? {
                         return Ok(Some(tag));
                     }
                 }
             }
         }
         Ok(None)
+    }
+
+    /// Returns the first tag of component `name`, computing it once.
+    fn component_first_tag(
+        &self,
+        name: &str,
+        depth: usize,
+    ) -> Result<Option<u32>, DictionaryError> {
+        let cached = self.first_tags.borrow().get(name).copied();
+        if let Some(tag) = cached {
+            return Ok(tag);
+        }
+        if depth >= MAX_COMPONENT_DEPTH {
+            return Err(DictionaryError::NestingTooDeep {
+                element: name.to_owned(),
+                limit: MAX_COMPONENT_DEPTH,
+            });
+        }
+        let inner = self
+            .components
+            .get(name)
+            .ok_or_else(|| DictionaryError::UnknownComponent(name.to_owned()))?;
+        let tag = self.first_tag(inner, depth + 1)?;
+        self.first_tags.borrow_mut().insert(name.to_owned(), tag);
+        Ok(tag)
     }
 
     fn group(
@@ -896,6 +1043,54 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
     let version =
         version.ok_or_else(|| DictionaryError::Xml("missing root <fix> element".to_string()))?;
 
+    assemble(Assembly {
+        version,
+        fields: field_defs,
+        header: header_items,
+        trailer: trailer_items,
+        components: component_defs,
+        messages: message_irs,
+    })
+}
+
+/// A parsed dictionary document, its references still by name, ready for
+/// [`assemble`].
+pub(crate) struct Assembly {
+    /// The version the document declares.
+    pub(crate) version: Version,
+    /// Field definitions, in document order.
+    pub(crate) fields: Vec<FieldDef>,
+    /// Header members.
+    pub(crate) header: Vec<Item>,
+    /// Trailer members.
+    pub(crate) trailer: Vec<Item>,
+    /// Component definitions.
+    pub(crate) components: ComponentIrs,
+    /// Message definitions, in document order.
+    pub(crate) messages: Vec<MessageIr>,
+}
+
+/// Builds a [`Dictionary`] from a parsed document: the step the QuickFIX and
+/// the Orchestra loaders share.
+///
+/// Checks the component graph ([`check_component_graph`]) before resolving
+/// anything, rejects duplicate field names and tags and duplicate message
+/// types, resolves every name reference, and builds each definition with its
+/// members in document order.
+///
+/// # Errors
+/// Returns [`DictionaryError`] for a component cycle, a dangling or over-deep
+/// component reference, a duplicate definition, an unknown field name, or an
+/// empty group.
+pub(crate) fn assemble(assembly: Assembly) -> Result<Dictionary, DictionaryError> {
+    let Assembly {
+        version,
+        fields: field_defs,
+        header: header_items,
+        trailer: trailer_items,
+        components: component_defs,
+        messages: message_irs,
+    } = assembly;
     let ComponentIrs {
         items: component_irs,
         order: component_order,
@@ -925,6 +1120,7 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
     let resolver = Resolver {
         fields_by_name: &dict.fields_by_name,
         components: &component_irs,
+        first_tags: RefCell::new(HashMap::new()),
     };
 
     let (header_fields, header_groups) = resolver.envelope(&header_items)?;
@@ -1944,6 +2140,37 @@ mod tests {
         );
 
         assert!(load(&xml).is_ok());
+    }
+
+    #[test]
+    fn test_component_chain_without_fields_is_walked_once() {
+        // MAX_COMPONENT_DEPTH components, each holding the next twice and
+        // the last nothing, ahead of a group's first field. Finding the
+        // group's delimiter walks every component once: without the cache it
+        // walks 2^31 paths.
+        let mut xml = String::from(
+            "<fix type='FIX' major='4' minor='4'><header></header><trailer></trailer>\
+             <messages><message name='Heartbeat' msgtype='0' msgcat='admin'>\
+             <group name='NoHops' required='N'><component name='C0' required='N'/>\
+             <field name='HopCompID' required='N'/></group></message></messages><components>",
+        );
+        let last = MAX_COMPONENT_DEPTH - 1;
+        for index in 0..last {
+            xml.push_str(&format!("<component name='C{index}'>"));
+            for _ in 0..2 {
+                xml.push_str(&format!("<component name='C{}' required='N'/>", index + 1));
+            }
+            xml.push_str("</component>");
+        }
+        xml.push_str(&format!("<component name='C{last}'/>"));
+        xml.push_str(
+            "</components><fields><field number='627' name='NoHops' type='NUMINGROUP'/>\
+             <field number='628' name='HopCompID' type='STRING'/></fields></fix>",
+        );
+
+        let dict = ok(load(&xml), "the chain loads");
+        let heartbeat = some(dict.get_message("0"), "Heartbeat");
+        assert_eq!(heartbeat.groups()[0].delimiter_tag, 628);
     }
 
     #[test]

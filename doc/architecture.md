@@ -1018,7 +1018,11 @@ rustflags = ["-C", "target-cpu=native"]
 > and 5.0 SP1 require you to supply the QuickFIX XML yourself via
 > `Dictionary::from_quickfix_xml` (for 5.0 and 5.0 SP1, `SessionDictionary`
 > accepts a caller-supplied application dictionary next to the embedded FIXT 1.1
-> transport, but no test loads the QuickFIX `FIX50.xml` / `FIX50SP1.xml`). And the
+> transport, but no test loads the QuickFIX `FIX50.xml` / `FIX50SP1.xml`).
+> `Dictionary::from_orchestra_xml` loads a FIX Orchestra 1.0 repository instead
+> of QuickFIX XML; the only repository tested is the FIX Trading Community's
+> FIX 4.4 one (a test fixture, not embedded), and `FIX.Latest` is rejected
+> (ADR-0013). And the
 > `Validator` is never invoked by the engine or the codec, so no version is
 > schema-validated automatically. The "Key Characteristics" column below is
 > background on the FIX specification, not a statement about IronFix coverage.
