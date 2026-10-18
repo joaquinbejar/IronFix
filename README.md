@@ -27,8 +27,9 @@ separate, opt-in pass.
 **Scope.** IronFix covers the FIX tag=value layer (FIX 4.0 to FIX 5.0 SP2 over
 FIXT.1.1) and FAST. A binary order-entry stack, SOFH framing and a FIXP session
 over SBE (via `ironsbe-core`), is planned inside the workspace
-(`doc/adr/0003-fixp-sofh-in-workspace.md`, tracked in #94 to #97); none of it
-exists yet.
+(`doc/adr/0003-fixp-sofh-in-workspace.md`, tracked in #94 to #97). Of it, only
+the SOFH framing codec exists (`ironfix-sofh`); the FIXP session, its SBE
+messages and the engine wiring do not exist yet.
 
 **What works today**, end to end:
 
@@ -43,6 +44,19 @@ exists yet.
   `ResendRequest`. An optional `garbled_frame_limit` logs out a link that keeps
   garbling. A frame above `max_message_size` still closes the session, after a
   Logout saying "message too large".
+- **SOFH framing** in `ironfix-sofh`: the FIX Simple Open Framing Header v1.0
+  (the Draft Standard of December 2016), the binary counterpart of
+  `FixCodec`. `SofhHeader` encodes and decodes the 6-byte big-endian header
+  (`Message_Length`, header included, then `Encoding_Type`); `EncodingType`
+  names every value the v1.0 table registers (SBE 1.0 big- and
+  little-endian, tag=value, FAST, FIXML and the rest) and preserves any other
+  value rather than rejecting it, so a receiver can skip a message it has no
+  codec for. `SofhCodec` is a Tokio codec that splits frames off the read
+  buffer without copying, refuses a declared length below 7 bytes or above
+  `with_max_message_size` (1 MiB by default) before reserving anything, and
+  treats every framing error as fatal for the stream: SOFH has no
+  resynchronisation anchor. It does not interpret payloads and nothing in
+  the engine uses it yet.
 - **A client engine and a server engine** in `ironfix-engine`. `Initiator`
   dials over TCP and runs the initiator half of the Logon handshake. `Acceptor`
   serves inbound connections for one configured counterparty and runs the
@@ -250,9 +264,17 @@ around it.
   sequence decoding, so `ironfix-fast` decodes the fields of a message only when
   something else supplies their order. There is also no UDP multicast receiver
   and no wiring into the session or engine path (`ironfix-fast/src/lib.rs`).
+- **No FIXP and no SBE.** `ironfix-sofh` frames binary messages but there is
+  no FIXP session (#95), no SBE codec, and no engine wiring for either (#96),
+  so no binary order-entry session can run yet. The SOFH v1.1 Release
+  Candidate is not implemented: the header is read and written big-endian
+  only (v1.1 RC1 allows little-endian by bilateral agreement), and its SBE 2.0
+  encoding types (`0x5BE1`, `0xEB51`) are decoded as unregistered values,
+  preserved as received.
 - **No recorded benchmark baseline.** A criterion harness now exists (see
-  Benchmarks below): `ironfix-tagvalue`, `ironfix-fast` and `ironfix-transport`
-  each carry a `benches/` target run by `make bench`. It ships no saved baseline
+  Benchmarks below): `ironfix-tagvalue`, `ironfix-fast`, `ironfix-transport`,
+  `ironfix-sofh` and `ironfix-store` each carry a `benches/` target run by
+  `make bench`. It ships no saved baseline
   and no published figures, so every latency and throughput target in `doc/`
   remains a design goal, unmeasured until you run it on hardware you name.
 
@@ -301,6 +323,7 @@ test fixture only, left out of the published `ironfix-dictionary` package.
 | `ironfix-session` | Session-layer protocol logic: typestate FSM, sequences, heartbeats. No I/O |
 | `ironfix-store` | The `MessageStore` trait, `MemoryStore`, and the persistent `FileStore` |
 | `ironfix-transport` | `FixCodec`, a Tokio codec that frames FIX messages. No TCP helpers, no TLS |
+| `ironfix-sofh` | `SofhCodec`, a Tokio codec for the Simple Open Framing Header v1.0 that frames SBE and other binary encodings; depends on `ironfix-core` only. Not published yet |
 | `ironfix-fast` | FAST encoding/decoding primitives: stop-bit, presence maps, the operator table. No template layer |
 | `ironfix-codegen` | Build-time Rust generation from a `Dictionary`: data structs, and opt-in views, enumerations and writers (no in-workspace consumer) |
 | `ironfix-codegen-check` | Not published. A CI check: its build script generates the full views of the embedded FIX 4.4, FIX 4.2 and FIXT 1.1 dictionaries and the workspace lints compile them |
@@ -468,7 +491,8 @@ make bench-clean         # Remove benchmark data
 
 Benchmarks cover the hot paths: tag=value decode/encode and checksum
 (`ironfix-tagvalue`), the FAST stop-bit and presence-map primitives
-(`ironfix-fast`), and the `FixCodec` framing loop (`ironfix-transport`).
+(`ironfix-fast`), the `FixCodec` framing loop (`ironfix-transport`), and the
+`SofhCodec` framing loop (`ironfix-sofh`).
 
 ℹ️ The harness ships **no recorded baseline and no published figures**. Every
 performance number in `doc/` is a design target; treat any figure as unmeasured
