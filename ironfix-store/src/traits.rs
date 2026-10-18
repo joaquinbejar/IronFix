@@ -7,6 +7,79 @@
 //! Message store trait definition.
 //!
 //! This module defines the abstract interface for message storage implementations.
+//!
+//! # The persistence contract
+//!
+//! Every write is fallible and asynchronous: [`MessageStore::store`],
+//! [`MessageStore::file_outbound`], [`MessageStore::set_next_sender_seq`] and
+//! [`MessageStore::set_next_target_seq`] return a `Result`, so a store backed by
+//! a disk or a replica can report a write it could not make. Being `async`, a
+//! call does not block the runtime thread, but the session awaits it: a slow
+//! store delays that session's reactor for as long as the call takes.
+//! `ironfix-engine` bounds every call with a store timeout and treats an
+//! overrun as a failed write. `Ok` means the value is as durable as the
+//! implementation promises; [`MemoryStore`](crate::MemoryStore) promises
+//! nothing beyond the process.
+//!
+//! Each call through this `async_trait` interface allocates one boxed future.
+//! [`MessageStore::file_outbound`] exists so the per-message outbound write is
+//! one call (and, for a durable store, can be one atomic write) rather than
+//! two, and [`MessageStore::reset_to`] does the same for a reset that sets
+//! both counters.
+//!
+//! `ironfix-engine` relies on the following ordering, which a durable store
+//! makes meaningful (see `doc/adr/0005-fallible-store-writes.md`):
+//!
+//! - An outbound frame is filed, and then the next sender sequence number is
+//!   persisted, **before** the frame's bytes reach the socket (both through
+//!   [`MessageStore::file_outbound`]). A crash can therefore leave a filed
+//!   frame the peer never saw, or a spent number, but never a frame on the wire
+//!   the store cannot replay.
+//! - The next target sequence number is persisted **before** the inbound
+//!   message that advanced it is acted on: before an administrative message is
+//!   processed, and before an application message is handed to the
+//!   application. The initiator's Logon acknowledgement and a `SequenceReset`
+//!   in Reset mode are the exceptions: they reach `from_admin` first.
+//! - A counter is written only when its value changed.
+//!
+//! These are guarantees only under the engine's fail-closed store policy. Its
+//! default policy logs a failed write and carries on as if it had succeeded,
+//! so after a failure a crash can leave the store behind what the
+//! counterparty has seen.
+//!
+//! # Mutations take effect in call order, even when a call is dropped
+//!
+//! `ironfix-engine` bounds every call with a timeout, and a timeout drops the
+//! call's future; so does a caller that abandons a connect. A store whose call
+//! has already submitted work (a disk write, a replication round trip) may
+//! still complete it afterwards. Every implementation must therefore apply
+//! its **mutations** ([`MessageStore::store`],
+//! [`MessageStore::file_outbound`], the two counter setters,
+//! [`MessageStore::reset`], [`MessageStore::reset_to`]) **in call order, even
+//! when a call's future is dropped before it completes**: a mutation takes
+//! effect before any mutation called after it, or not at all. Serialising
+//! mutations through an internal queue that later calls wait behind, or
+//! completing or aborting the submitted work synchronously when the future is
+//! dropped, both satisfy this.
+//!
+//! [`MemoryStore`](crate::MemoryStore) satisfies it: each of its mutations
+//! runs to completion within a single poll of its future, under its lock and
+//! without awaiting anything, so a dropped future has either applied its
+//! change in full or not started it. (The defaulted composite methods,
+//! [`MessageStore::file_outbound`] and [`MessageStore::reset_to`], run their
+//! steps in order; a composite dropped between steps leaves the earlier steps
+//! applied, still in order.)
+//!
+//! The engine relies on this after a mutation times out: it treats the store
+//! as possibly holding an outstanding write, records that a reset is owed, and
+//! starts the next session with a reset. With a conforming store the late
+//! write lands before that reset, which erases it. A store that does not
+//! conform can apply the late write after the next session's reset and
+//! writes, overwriting a frame or moving a counter of the new stream:
+//! reusing such a store after a timed-out mutation is not safe.
+//!
+//! Error values must never contain frame bytes: an outbound Logon carries
+//! `Password` (554), and the engine logs store errors.
 
 use crate::stored::StoredMessage;
 use async_trait::async_trait;
@@ -28,6 +101,12 @@ pub trait MessageStore: Send + Sync {
     ///
     /// `message` must be the **complete frame**, from `BeginString` (8) through
     /// `CheckSum` (10), because a resend rebuilds from it verbatim.
+    ///
+    /// Filing under a `seq_num` that is already filed **replaces** the frame
+    /// there. The engine relies on this: a crash after a frame is filed but
+    /// before its number is persisted makes the next session reuse that number
+    /// for a message the peer never saw, and the new frame must be the one a
+    /// resend replays.
     ///
     /// # Arguments
     /// * `seq_num` - The `MsgSeqNum` (34) the message was sent under
@@ -120,29 +199,127 @@ pub trait MessageStore: Send + Sync {
         }
     }
 
+    /// Files an outbound frame under `seq_num` and persists `next_sender` as
+    /// the next sender sequence number, in that order.
+    ///
+    /// This is the one call the engine makes per outbound sequenced message,
+    /// before the frame's bytes are written. The default runs
+    /// [`store`](MessageStore::store) and then
+    /// [`set_next_sender_seq`](MessageStore::set_next_sender_seq), stopping at
+    /// the first error. A durable store should override it to make both
+    /// changes in one atomic write: then a crash leaves either both or
+    /// neither, and the engine pays one call instead of two.
+    ///
+    /// # Arguments
+    /// * `seq_num` - The `MsgSeqNum` (34) the message is sent under
+    /// * `msg_type` - The `MsgType` (35) the message is sent as
+    /// * `message` - The complete raw frame bytes
+    /// * `next_sender` - The next `MsgSeqNum` to send, `seq_num + 1`
+    ///
+    /// # Errors
+    /// Returns `StoreError` if either write fails. The error must not contain
+    /// frame bytes.
+    async fn file_outbound(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+        next_sender: u64,
+    ) -> Result<(), StoreError> {
+        self.store(seq_num, msg_type, message).await?;
+        self.set_next_sender_seq(next_sender).await
+    }
+
     /// Returns the next sender sequence number.
     fn next_sender_seq(&self) -> u64;
 
     /// Returns the next expected target sequence number.
     fn next_target_seq(&self) -> u64;
 
-    /// Sets the next sender sequence number.
+    /// Persists the next sender sequence number.
+    ///
+    /// The engine calls this through
+    /// [`file_outbound`](MessageStore::file_outbound) before a frame is
+    /// written, with the number the next outbound message will carry, and on
+    /// its own after other counter changes, only when the value changed.
+    ///
+    /// The value is **not** monotonic, and a store must not reject a lower
+    /// one:
+    ///
+    /// - A sequence reset brings it back down: a Logon or Logon ack with
+    ///   `ResetSeqNumFlag` (141) = Y, the `reset_on_logout` /
+    ///   `reset_on_disconnect` close, and a reset the previous session owed.
+    ///   The engine resets the store first in each case.
+    /// - After a failed [`file_outbound`](MessageStore::file_outbound) the
+    ///   number was not spent, and the engine writes the unspent number when
+    ///   the session closes. That can be one below what the failed call left
+    ///   behind, if it took effect and still reported a failure (a call that
+    ///   overran the engine's store timeout, for instance).
+    /// - An explicit `with_initial_sequences` seed on the initiator can start
+    ///   a session below the stored value (the fail-closed policy refuses
+    ///   that; the default does not).
     ///
     /// # Arguments
-    /// * `seq` - The new sequence number
-    fn set_next_sender_seq(&self, seq: u64);
+    /// * `seq` - The next `MsgSeqNum` (34) to send
+    ///
+    /// # Errors
+    /// Returns `StoreError` if the number cannot be persisted. The error must
+    /// not contain frame bytes.
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError>;
 
-    /// Sets the next expected target sequence number.
+    /// Persists the next expected target sequence number.
+    ///
+    /// The engine calls this when an inbound message has been accepted in
+    /// sequence, before the message is acted on (processed, if administrative;
+    /// handed to the application, if not), and before any other change to the
+    /// expectation (a `SequenceReset`, a gap fill) takes effect, only when the
+    /// value changed. Two messages reach the application's `from_admin`
+    /// before the write: the initiator's Logon acknowledgement and a
+    /// `SequenceReset` in Reset mode (see `doc/adr/0005-fallible-store-writes.md`).
     ///
     /// # Arguments
-    /// * `seq` - The new sequence number
-    fn set_next_target_seq(&self, seq: u64);
+    /// * `seq` - The next inbound `MsgSeqNum` (34) expected
+    ///
+    /// # Errors
+    /// Returns `StoreError` if the number cannot be persisted. The error must
+    /// not contain frame bytes.
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError>;
 
     /// Resets the store, clearing all messages and resetting sequence numbers.
     ///
     /// # Errors
     /// Returns `StoreError` if the reset fails.
     async fn reset(&self) -> Result<(), StoreError>;
+
+    /// Resets the store and then sets both sequence counters, as one change.
+    ///
+    /// The engine calls this when the counterparty resets the sequence on its
+    /// Logon acknowledgement (`ResetSeqNumFlag` (141) = Y) although the Logon
+    /// did not ask for it: the previous stream is cleared, and the counters
+    /// are set for the new one, whose message 1 in each direction (the Logon
+    /// and its acknowledgement) has already been exchanged.
+    ///
+    /// The default runs [`reset`](MessageStore::reset), then
+    /// [`set_next_sender_seq`](MessageStore::set_next_sender_seq), then
+    /// [`set_next_target_seq`](MessageStore::set_next_target_seq), stopping at
+    /// the first error. It is **not** atomic: a crash between the calls leaves
+    /// the store cleared with its initial counters, and the next session's
+    /// Logon then goes out at `MsgSeqNum` 1 without a reset, which the
+    /// counterparty reads as too low. A durable store should override it to
+    /// make the three changes in one atomic write.
+    ///
+    /// # Arguments
+    /// * `next_sender` - The next `MsgSeqNum` (34) to send after the reset
+    /// * `next_target` - The next inbound `MsgSeqNum` (34) expected after it
+    ///
+    /// # Errors
+    /// Returns `StoreError` if any of the changes fails. The error must not
+    /// contain frame bytes.
+    async fn reset_to(&self, next_sender: u64, next_target: u64) -> Result<(), StoreError> {
+        self.reset().await?;
+        self.set_next_sender_seq(next_sender).await?;
+        self.set_next_target_seq(next_target).await
+    }
 
     /// Returns the creation time of the store/session.
     fn creation_time(&self) -> std::time::SystemTime;
@@ -189,9 +366,13 @@ mod tests {
             1
         }
 
-        fn set_next_sender_seq(&self, _seq: u64) {}
+        async fn set_next_sender_seq(&self, _seq: u64) -> Result<(), StoreError> {
+            Ok(())
+        }
 
-        fn set_next_target_seq(&self, _seq: u64) {}
+        async fn set_next_target_seq(&self, _seq: u64) -> Result<(), StoreError> {
+            Ok(())
+        }
 
         async fn reset(&self) -> Result<(), StoreError> {
             Ok(())
@@ -208,6 +389,17 @@ mod tests {
         assert_eq!(store.next_sender_seq(), 1);
         assert_eq!(store.next_target_seq(), 1);
         assert!(store.store(1, &MsgType::Heartbeat, b"test").await.is_ok());
+        assert!(store.set_next_sender_seq(2).await.is_ok());
+        assert!(store.set_next_target_seq(2).await.is_ok());
+        // The default `file_outbound` composes the two writes.
+        assert!(
+            store
+                .file_outbound(2, &MsgType::Heartbeat, b"test", 3)
+                .await
+                .is_ok()
+        );
         assert!(store.reset().await.is_ok());
+        // The default `reset_to` composes the reset and the two setters.
+        assert!(store.reset_to(2, 2).await.is_ok());
     }
 }

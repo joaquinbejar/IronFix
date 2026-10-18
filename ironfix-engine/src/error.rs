@@ -129,6 +129,27 @@ pub enum EngineError {
         counter: SequenceCounter,
     },
 
+    /// A seeded initial sender sequence number is below the next sender
+    /// number the attached store holds, under
+    /// [`StoreFailurePolicy::CloseSession`](crate::StoreFailurePolicy::CloseSession).
+    ///
+    /// The store has frames filed at the numbers in between, so the
+    /// counterparty has seen them; reusing one would send a different message
+    /// under a `MsgSeqNum` it already holds. Checked by
+    /// [`Initiator::connect`](crate::Initiator::connect) after the store is
+    /// refreshed and before anything is written. Set through
+    /// [`Initiator::with_initial_sequences`](crate::Initiator::with_initial_sequences).
+    #[error(
+        "initial sender sequence number {seeded} is below the store's next sender sequence \
+         number {stored}"
+    )]
+    InitialSequenceBelowStore {
+        /// The seeded next sender sequence number.
+        seeded: u64,
+        /// The next sender sequence number the store holds.
+        stored: u64,
+    },
+
     /// The counterparty's identity fields (49/56, and 50/57 when
     /// configured) did not match the session configuration.
     #[error("identity mismatch: {detail}")]
@@ -177,11 +198,25 @@ pub enum EngineError {
     /// A message-store operation the session depends on failed during setup.
     ///
     /// Raised by [`Initiator::connect`](crate::Initiator::connect) when the
-    /// store cannot be reset for a `ResetSeqNumFlag` (141) Logon, or refreshed to
-    /// recover its counters, before the session starts. Continuing anyway would
-    /// either file a new stream on top of a previous one's numbers or reuse a
-    /// `MsgSeqNum` the counterparty has already seen, so the session is refused
-    /// rather than started from a counter the store could not vouch for.
+    /// store cannot be reset for a `ResetSeqNumFlag` (141) Logon, for a reset
+    /// an earlier session owes, or for the `ResetSeqNumFlag` the counterparty
+    /// declared on its Logon ack, or refreshed to recover its counters,
+    /// whatever the policy. Continuing anyway would either run a new stream
+    /// over a previous one's numbers or reuse a `MsgSeqNum` the counterparty
+    /// has already seen, so the session is refused rather than started from a
+    /// counter the store could not vouch for. A failed reset for the ack is
+    /// owed to the next connect, whose Logon then declares the reset itself.
+    ///
+    /// Under [`StoreFailurePolicy::CloseSession`](crate::StoreFailurePolicy::CloseSession)
+    /// it is also raised when a handshake store call fails: filing the Logon
+    /// together with the next sender number, persisting the target number the
+    /// Logon ack consumed, and filing a Reject or Logout that refuses the ack
+    /// (this error then replaces the refusal's own). The frame concerned is
+    /// never written. Once `on_logon` has run, the same failure closes the
+    /// session instead, through `on_logout`.
+    ///
+    /// A store call that overruns the store timeout fails with
+    /// [`StoreError::Timeout`].
     #[error("store error: {0}")]
     Store(#[from] StoreError),
 

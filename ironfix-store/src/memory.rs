@@ -174,12 +174,16 @@ impl MessageStore for MemoryStore {
         self.next_target_seq.load(Ordering::SeqCst)
     }
 
-    fn set_next_sender_seq(&self, seq: u64) {
+    /// Never fails: the counter is an atomic in this process.
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
         self.next_sender_seq.store(seq, Ordering::SeqCst);
+        Ok(())
     }
 
-    fn set_next_target_seq(&self, seq: u64) {
+    /// Never fails: the counter is an atomic in this process.
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
         self.next_target_seq.store(seq, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn reset(&self) -> Result<(), StoreError> {
@@ -440,11 +444,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_memory_store_store_at_an_existing_seq_replaces_the_frame() {
+        let store = MemoryStore::new();
+        put(&store, 7, MsgType::NewOrderSingle, b"first").await;
+        put(&store, 7, MsgType::OrderCancelRequest, b"second").await;
+
+        let range = ok(store.get_range(7, 7).await, "range 7..=7 must resolve");
+        let [message] = range.as_slice() else {
+            panic!("exactly one message must remain, got {}", range.len());
+        };
+        assert_eq!(message.msg_type(), &MsgType::OrderCancelRequest);
+        assert_eq!(&message.payload()[..], b"second");
+    }
+
+    #[tokio::test]
+    async fn test_memory_store_file_outbound_files_then_persists_the_counter() {
+        let store = MemoryStore::new();
+        ok(
+            store
+                .file_outbound(4, &MsgType::NewOrderSingle, b"frame", 5)
+                .await,
+            "file_outbound",
+        );
+        assert!(store.contains(4));
+        assert_eq!(store.next_sender_seq(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_memory_store_reset_to_clears_messages_then_sets_both_counters() {
+        let store = MemoryStore::new();
+        ok(
+            store
+                .file_outbound(41, &MsgType::NewOrderSingle, b"previous stream", 42)
+                .await,
+            "file_outbound",
+        );
+        ok(store.set_next_target_seq(17).await, "target counter");
+
+        ok(store.reset_to(2, 2).await, "reset_to");
+        assert_eq!(store.message_count(), 0, "the previous stream is gone");
+        assert_eq!(store.next_sender_seq(), 2);
+        assert_eq!(store.next_target_seq(), 2);
+    }
+
+    #[tokio::test]
     async fn test_memory_store_sequence_numbers_round_trip() {
         let store = MemoryStore::new();
 
-        store.set_next_sender_seq(10);
-        store.set_next_target_seq(20);
+        ok(store.set_next_sender_seq(10).await, "sender counter");
+        ok(store.set_next_target_seq(20).await, "target counter");
 
         assert_eq!(store.next_sender_seq(), 10);
         assert_eq!(store.next_target_seq(), 20);
@@ -455,8 +503,8 @@ mod tests {
         let store = MemoryStore::new();
 
         put(&store, 1, MsgType::Logon, b"msg1").await;
-        store.set_next_sender_seq(10);
-        store.set_next_target_seq(20);
+        ok(store.set_next_sender_seq(10).await, "sender counter");
+        ok(store.set_next_target_seq(20).await, "target counter");
 
         ok(store.reset().await, "reset must succeed");
 

@@ -316,32 +316,46 @@ pub trait Application: Send + Sync {
 
 ### Message store abstraction
 
-> The `MessageStore` trait and `MemoryStore` exist in `ironfix-store`, but
-> **`ironfix-engine` never calls either**. No outbound message is persisted and
-> no sequence number survives a restart, so resend-from-store is not
-> implemented: an inbound `ResendRequest` is answered with a gap fill. There is
-> no file-backed or memory-mapped store.
+> The `MessageStore` trait and `MemoryStore` exist in `ironfix-store`, and the
+> `Initiator` uses an attached store: it files every sequenced outbound frame,
+> persists both sequence counters in the order ADR-0005
+> (`doc/adr/0005-fallible-store-writes.md`) sets out, and answers an inbound
+> `ResendRequest` from it. `MemoryStore` is the only implementation and is not
+> persistent, so nothing survives a restart yet; the `Acceptor` attaches no
+> store. There is no file-backed or memory-mapped store.
 
 ```rust
-// ironfix-store/src/traits.rs
+// ironfix-store/src/traits.rs (abridged)
 
 #[async_trait]
 pub trait MessageStore: Send + Sync {
-    /// Store outgoing message for potential resend
-    async fn store(&self, seq_num: u64, message: &[u8]) -> Result<(), StoreError>;
-    
-    /// Retrieve messages for resend request
-    async fn get_range(&self, begin: u64, end: u64) 
-        -> Result<Vec<OwnedMessage>, StoreError>;
-    
-    /// Get/set sequence numbers
+    /// Store an outgoing frame for potential resend; filing at an existing
+    /// number replaces the frame there
+    async fn store(&self, seq_num: u64, msg_type: &MsgType, message: &[u8])
+        -> Result<(), StoreError>;
+
+    /// Retrieve messages for a resend request (and `get_page` for bounded reads)
+    async fn get_range(&self, begin: u64, end: u64)
+        -> Result<Vec<StoredMessage>, StoreError>;
+
+    /// File an outbound frame, then persist the next sender number; defaulted
+    /// to `store` + `set_next_sender_seq`, one atomic write in a durable store
+    async fn file_outbound(&self, seq_num: u64, msg_type: &MsgType, message: &[u8],
+        next_sender: u64) -> Result<(), StoreError>;
+
+    /// Get/set sequence numbers; the setters are fallible and asynchronous,
+    /// and the sender counter is not monotonic (a reset brings it down)
     fn next_sender_seq(&self) -> u64;
     fn next_target_seq(&self) -> u64;
-    fn set_next_sender_seq(&self, seq: u64);
-    fn set_next_target_seq(&self, seq: u64);
-    
-    /// Reset sequence numbers (new session)
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError>;
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError>;
+
+    /// Reset messages and sequence numbers (new session)
     async fn reset(&self) -> Result<(), StoreError>;
+
+    /// Reset, then set both counters; defaulted to the three calls, one
+    /// atomic write in a durable store
+    async fn reset_to(&self, next_sender: u64, next_target: u64) -> Result<(), StoreError>;
 }
 
 /// High-performance memory-mapped store for persistence

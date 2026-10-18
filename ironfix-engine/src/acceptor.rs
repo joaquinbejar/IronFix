@@ -103,10 +103,11 @@
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
+use crate::persistence::{PersistedCounters, StoreFailurePolicy};
 use crate::reactor::{
     DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, HandshakeRead,
-    ResendState, SessionParams, lock_heartbeat, read_handshake_frame, send_handshake_admin,
-    session_codec, spawn_session,
+    SessionParams, lock_heartbeat, read_handshake_frame, send_handshake_admin, session_codec,
+    spawn_session,
 };
 use crate::wire::{self, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion};
 use ironfix_core::message::MsgType;
@@ -704,30 +705,13 @@ impl<A: Application + 'static> Acceptor<A> {
         self.application.on_logon(&session_id).await;
         tracing::info!(session = %session_id, "FIX session established (acceptor)");
 
-        // A gap in the inbound Logon means we missed messages: request a resend
-        // now that the session is Active.
-        if let Some((expected, _high_water)) = pending_resend {
-            let request = factory.resend_request(expected, 0);
-            send_handshake_admin(
-                self.application.as_ref(),
-                &session_id,
-                &mut framed,
-                &mut factory,
-                &runtime.sequences,
-                None,
-                DEFAULT_WRITE_TIMEOUT,
-                request,
-            )
-            .await?;
-            lock_heartbeat(&runtime).on_message_sent();
-        }
-
-        let resend = pending_resend
-            .map(|(expected, high_water)| ResendState::first(expected, high_water, &self.config));
         // Hand the framed socket to the shared reactor, the same one the
         // initiator uses. The admission guard rides the reactor task and frees
         // the slot when the session closes. The acceptor attaches no store, so
-        // resends are gap-filled.
+        // resends are gap-filled. A gap in the inbound Logon is requested by
+        // the reactor as its first act, so that once `on_logon` has run, a
+        // failure to send the request closes the session through the
+        // reactor's close path (`on_logout` included) like any other.
         let params = SessionParams {
             framed,
             session,
@@ -739,7 +723,11 @@ impl<A: Application + 'static> Acceptor<A> {
             application: Arc::clone(&self.application),
             session_id: session_id.clone(),
             store: None,
-            resend,
+            store_policy: StoreFailurePolicy::default(),
+            store_timeout: DEFAULT_WRITE_TIMEOUT,
+            persisted: PersistedCounters::default(),
+            reset_owed: Arc::default(),
+            opening_gap: pending_resend,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             outbound_capacity: self.outbound_capacity,
             app_queue_capacity: DEFAULT_APP_QUEUE_CAPACITY,

@@ -404,6 +404,128 @@ is not persistent: it holds messages and sequence numbers in process memory
 only. Replay therefore works within a live process, but no message and no
 sequence number survives a restart. A durable store is separate, tracked work.
 
+**Store write order.** Every store call (`store`, `file_outbound`,
+`set_next_sender_seq`, `set_next_target_seq`, `reset`, `reset_to`, `refresh`,
+`get_page`)
+is asynchronous and can fail, and the session awaits each one inline: a slow
+store delays the session for as long as the call takes. Each call is bounded
+by the store timeout (`Initiator::with_store_timeout`, default: the write
+timeout), and an overrun is `StoreError::Timeout`. With a store attached the
+engine writes in this order, in the Logon handshake and in the session reactor
+alike, through one shared step (`doc/adr/0005-fallible-store-writes.md`):
+
+1. *Outbound:* the frame is filed under its `MsgSeqNum` N and N+1 persisted as
+   the next sender number, in one `file_outbound` call; then N is spent in
+   memory, and only then are the frame's bytes written to the socket. Filing
+   comes first, so a crash between the two writes leaves frame N and counter
+   N: N is reused for a message the peer never saw, and the filed frame is
+   replaced (`store` has replace semantics). A crash after both writes leaves
+   frame N and counter N+1: N is never reused, and a resend of N replays the
+   filed frame, whether or not its bytes reached the peer.
+2. *Inbound:* when a message M is accepted in sequence, M+1 is persisted as the
+   next target number before M is acted on and before the in-memory
+   expectation moves: before an administrative message is processed, before
+   an in-sequence `SequenceReset`-GapFill reaches `from_admin`, and before an
+   application message is handed to the application. An accepted `NewSeqNo`
+   (36) is persisted before the expectation moves to it.
+3. *Exceptions:* the initiator's Logon ack reaches `from_admin` before its
+   number is persisted (the ack is validated, including `from_admin` and its
+   `ResetSeqNumFlag` (141), before its number is consumed; the number is
+   persisted before the session goes Active and before `on_logon`), and a
+   `SequenceReset` in Reset mode reaches `from_admin` before its `NewSeqNo` is
+   persisted (it has no place in the sequence).
+4. A counter is written only when its value changed. The handshake hands the
+   reactor the record of what it wrote, so an idle session makes no counter
+   write at all.
+5. A Logon ack with `ResetSeqNumFlag` (141) = Y, when our Logon did not ask for
+   a reset, resets the store and sets next sender 2 and next target 2 (one
+   `reset_to` call) before `on_logon` runs, so a connect abandoned from there
+   on cannot leave the previous stream for a later session to replay. If that
+   fails, `connect` fails with `EngineError::Store` whatever the policy, and
+   the reset is owed to the next connect (below).
+6. A gap found in the Logon exchange is requested by the session reactor as
+   its first act, so a failure to send that `ResendRequest` after `on_logon`
+   closes the session through the normal close path (`on_logout`, the
+   close-time reset, the last counter writes).
+
+*Inbound delivery is at most once.* Because M+1 is durable before M is handed
+over, a crash after that write and before `from_app` has finished with M
+loses M to the application: on restart the engine expects M+1 and never asks
+the counterparty for M again. The window is every message waiting in the
+application queue, up to its capacity (1024 by default), plus the one
+`from_app` is handling. The same messages are lost without a crash when the
+session closes and the dispatcher does not finish its queue within 5 s: it is
+then aborted, and the engine logs at error level the `MsgSeqNum` range it had
+handed over and `from_app` had not finished. Under `CloseSession` a message
+whose target write failed is never handed over; under `Continue` it is.
+
+The engine does not detect or report, after a restart, the inbound messages
+lost across a crash, so the requirement of #89 that a lost message be reported
+is not met for inbound traffic. Reporting needs a completion signal from the
+dispatcher, a durable application watermark (a new defaulted `MessageStore`
+method) and a typed report at restart; at-least-once delivery additionally
+needs an inbound journal or redelivery through a `ResendRequest`. Both are
+tracked in #105.
+
+**Store failure policy.** `Initiator::with_store_failure_policy` chooses what a
+failed write (or one that overran the store timeout) means:
+
+- `StoreFailurePolicy::Continue` (the default, and the behaviour before writes
+  were fallible): log a warning without frame bytes and carry on as if the
+  write had succeeded. The frame is written anyway and the message acted on
+  anyway; a frame that could not be filed is gap-filled if it is ever
+  requested again. This gives **no** crash guarantee: after a failed write, a
+  crash can leave the store behind what the counterparty has seen.
+- `StoreFailurePolicy::CloseSession`: fail closed. A frame whose filing or
+  sender-counter write fails is not written (the counterparty reads no bytes
+  for it), an inbound message whose target write fails is not acted on (a
+  TestRequest gets no Heartbeat, an application message never reaches
+  `from_app`), and the session closes, not gracefully, without a Logout, which
+  could not be filed either. A Logout reply to the counterparty that the store
+  refuses makes the close non-graceful, so `reset_on_logout` does not run.
+  The failure is logged at error level. During the handshake,
+  `Initiator::connect` returns `EngineError::Store` and the frame concerned is
+  never written; a store failure while a Logon ack is being refused stops the
+  refusal and is the error `connect` returns. A `with_initial_sequences`
+  sender seed below the store's next sender number is refused with
+  `EngineError::InitialSequenceBelowStore`.
+
+Whatever the policy, the resets and the refresh fail the connect with
+`EngineError::Store`: the reset for a `ResetSeqNumFlag` Logon, the reset for
+the counterparty's `ResetSeqNumFlag` on its Logon ack, a reset owed by an
+earlier session, and the refresh that recovers the counters. Carrying on past
+any of them runs one sequence stream over another. A reset is owed when the
+close-time reset of `reset_on_logout` / `reset_on_disconnect` fails (no
+counter is then written) or when the reset for the counterparty's
+`ResetSeqNumFlag` fails. The `Initiator`'s next `connect` then resets the
+store before anything else, and its Logon declares `ResetSeqNumFlag` (141) = Y
+at `MsgSeqNum` 1, so the counterparty restarts the sequence with it. The
+record is cleared once that Logon is acknowledged, and lives in the
+`Initiator`, so a process restart forgets it.
+
+With a store attached, call `Initiator::connect` again only once the previous
+session's `Connection::wait_closed` has returned: until then the closing
+session still writes to the store and may record a reset owed to the next one.
+
+*Cancellation and timeouts.* Every reset is recorded as owed before it is
+awaited and cleared only once it has succeeded, so a connect dropped while a
+reset is pending still leaves it owed. A store write that overruns the store
+timeout may still land later, so it too leaves a reset owed, and the next
+session starts with a reset and `ResetSeqNumFlag` (141) = Y. This relies on
+the store applying its mutations in call order even when a call is dropped,
+which `MessageStore` now requires and `MemoryStore` satisfies; a store that
+does not must not be reused after a timed-out write
+(`doc/adr/0005-fallible-store-writes.md`, "Cancellation and timeouts").
+
+The default `MessageStore::reset_to` is three calls, not one atomic write: a
+crash between them leaves the store cleared with its initial counters, and the
+next Logon goes out at 1 without `ResetSeqNumFlag`. A durable store should
+override it.
+
+The `Acceptor` attaches no store yet, so the policy has nothing to act on
+there. Not done: inbound frames are not filed (only the target counter is
+kept).
+
 **Outbound `EndSeqNo` sentinel — a version caveat.** When the engine detects an
 inbound gap it requests retransmission with `EndSeqNo` (16) = 0, the open-ended
 "to infinity" sentinel. That `16=0` convention was introduced in FIX 4.2; FIX
@@ -1268,7 +1390,11 @@ QuickFIX counterparty.
   answered with a single gap fill; the store can be attached to the
   **initiator only**, since the `Acceptor` attaches none and so answers every
   resend with gap fill; and `MemoryStore` is not persistent, so nothing is
-  replayable after a restart. An *outbound* request the peer never
+  replayable after a restart. Store writes are ordered (frame and next sender
+  number before the bytes, next target number before an inbound message is
+  acted on) and fallible, under a `StoreFailurePolicy` that either warns and
+  continues or fails closed; inbound delivery is at most once across a crash.
+  An *outbound* request the peer never
   satisfies is also bounded — retried every `SessionConfig::resend_timeout` and
   then escalated to Logout after `SessionConfig::max_resend_requests` attempts,
   rather than stalling the session forever. See "Resend Request" above.

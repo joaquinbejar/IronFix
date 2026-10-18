@@ -85,6 +85,12 @@
 //! **Without a store nothing can be replayed** and the whole requested range
 //! is answered with one gap fill.
 //!
+//! Store writes are ordered (frame and next sender number before the bytes;
+//! next target number before an inbound message is acted on) and fallible.
+//! [`Initiator::with_store_failure_policy`] chooses what a failed write means:
+//! carry on with a warning (the default), or fail closed, writing nothing the
+//! store has not accepted. See the [`persistence`](crate::persistence) module.
+//!
 //! All sequence arithmetic goes through the checked
 //! [`SequenceManager::try_allocate_sender_seq`] /
 //! [`SequenceManager::try_increment_target_seq`]; an exhausted counter tears
@@ -110,6 +116,12 @@
 //! `to_admin`, `to_app` and `from_admin` still run inline, because each one's
 //! result decides what the reactor does next. See [`Application`] for the
 //! ordering that buys and the ordering it costs.
+//!
+//! So do the calls to an attached store: whether a frame may be written, or a
+//! message acted on, depends on the store accepting the write first. A slow
+//! store therefore delays the session for as long as each call takes. Every
+//! call is bounded by [`Initiator::with_store_timeout`], and an overrun is a
+//! failed write under the [`StoreFailurePolicy`].
 //!
 //! # Example
 //!
@@ -143,9 +155,12 @@
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime};
 use crate::error::EngineError;
+use crate::persistence::{
+    HandshakeStore, PersistedCounters, SessionStore, StoreFailurePolicy, timed,
+};
 use crate::reactor::{
     DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, HandshakeRead,
-    ResendState, SessionParams, TICK_INTERVAL, lock_heartbeat, read_handshake_frame,
+    SessionParams, TICK_INTERVAL, lock_heartbeat, read_handshake_frame, refuse_handshake,
     send_handshake_admin, session_codec, spawn_session,
 };
 use crate::wire::{self, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion};
@@ -154,10 +169,11 @@ use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
 use ironfix_session::config::SessionConfigError;
 use ironfix_session::heartbeat::negotiate_interval;
-use ironfix_session::sequence::{SequenceCounter, SequenceResult};
+use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
 use ironfix_session::{Disconnected, HeartbeatManager, SequenceManager, Session, SessionConfig};
 use ironfix_store::MessageStore;
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpStream, ToSocketAddrs};
@@ -196,6 +212,13 @@ pub struct Initiator<A: Application = NoOpApplication> {
     /// Optional message store: outbound frames are filed here and replayed
     /// from here when the counterparty asks for a resend.
     store: Option<Arc<dyn MessageStore>>,
+    /// What a failed write to `store` means.
+    store_policy: StoreFailurePolicy,
+    /// Bound on each store call, or `None` for the write timeout.
+    store_timeout: Option<Duration>,
+    /// Set when a session's close-time store reset failed: the next
+    /// [`Initiator::connect`] must reset the store before anything else.
+    reset_owed: Arc<AtomicBool>,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
@@ -212,8 +235,25 @@ impl<A: Application> std::fmt::Debug for Initiator<A> {
             .field("outbound_capacity", &self.outbound_capacity)
             .field("app_queue_capacity", &self.app_queue_capacity)
             .field("store", &self.store.is_some())
+            .field("store_policy", &self.store_policy)
+            .field(
+                "store_timeout",
+                &self.store_timeout.unwrap_or(self.write_timeout),
+            )
+            .field("reset_owed", &self.reset_owed.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
+}
+
+/// What [`Initiator::connect`] starts a session from.
+struct Seeded {
+    /// The sequence counters.
+    sequences: SequenceManager,
+    /// The counter values the store already holds.
+    persisted: PersistedCounters,
+    /// Whether the Logon declares `ResetSeqNumFlag` (141) = Y: configured
+    /// with `reset_on_logon`, or owed by an earlier session.
+    reset_logon: bool,
 }
 
 impl<A: Application + 'static> Initiator<A> {
@@ -255,6 +295,9 @@ impl<A: Application + 'static> Initiator<A> {
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
             app_queue_capacity: DEFAULT_APP_QUEUE_CAPACITY,
             store: None,
+            store_policy: StoreFailurePolicy::Continue,
+            store_timeout: None,
+            reset_owed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -274,14 +317,76 @@ impl<A: Application + 'static> Initiator<A> {
     ///
     /// The store also carries sequence numbers: unless `reset_on_logon` is set
     /// or [`Initiator::with_initial_sequences`] is called, the session starts
-    /// from the counters the store reports, and both counters are mirrored back
-    /// into it as the session runs. Note that
+    /// from the counters the store reports, and both counters are persisted
+    /// back into it as the session runs, in the order described in the
+    /// [`persistence`](crate::persistence) module. Note that
     /// [`MemoryStore`](ironfix_store::MemoryStore) is the only implementation
     /// today and is **not** persistent, so this does not yet survive a restart.
+    ///
+    /// A failed write to the store is handled by
+    /// [`Initiator::with_store_failure_policy`]; the default carries on with a
+    /// warning. Every store call is bounded by
+    /// [`Initiator::with_store_timeout`].
     #[must_use]
     pub fn with_store(mut self, store: Arc<dyn MessageStore>) -> Self {
         self.store = Some(store);
         self
+    }
+
+    /// Sets what a failed write to the attached store means (default
+    /// [`StoreFailurePolicy::Continue`]).
+    ///
+    /// With [`StoreFailurePolicy::CloseSession`] the engine never puts a frame
+    /// on the wire, or acts on an inbound message, that the store has not
+    /// accepted: a failure during the Logon handshake makes
+    /// [`Initiator::connect`] return [`EngineError::Store`], and one during the
+    /// session closes it without writing the frame concerned. Without a store
+    /// this has no effect.
+    ///
+    /// # Arguments
+    /// * `policy` - The policy for store write failures
+    #[must_use]
+    pub const fn with_store_failure_policy(mut self, policy: StoreFailurePolicy) -> Self {
+        self.store_policy = policy;
+        self
+    }
+
+    /// Sets how long a single call to the attached store may take before it
+    /// counts as failed (default: the write timeout, see
+    /// [`Initiator::with_write_timeout`]).
+    ///
+    /// The session awaits every store call inline, so a store that stalls
+    /// stalls the session with it: no socket read, no heartbeat and no timeout
+    /// detection until the call returns. The bound turns a stall into
+    /// [`StoreError::Timeout`](ironfix_core::error::StoreError::Timeout). A
+    /// write that overruns is handled by the [`StoreFailurePolicy`] like any
+    /// other failed write; a reset or refresh that overruns fails the connect
+    /// with [`EngineError::Store`], whatever the policy; and a resend read
+    /// that overruns is answered with a gap fill. Without a store this has no
+    /// effect.
+    ///
+    /// A write that overruns may still land later, so it also leaves a reset
+    /// owed: the next session resets the store and logs on with
+    /// `ResetSeqNumFlag` (141) = Y. Reusing the store is safe only if it
+    /// applies its mutations in call order even when a call is dropped (see
+    /// the [`persistence`](crate::persistence) module).
+    ///
+    /// A zero timeout is raised to one tick, as for the write timeout: a call
+    /// given no time at all can never succeed.
+    ///
+    /// # Arguments
+    /// * `timeout` - Maximum duration of one store call
+    #[must_use]
+    pub fn with_store_timeout(mut self, timeout: Duration) -> Self {
+        self.store_timeout = Some(timeout.max(TICK_INTERVAL));
+        self
+    }
+
+    /// The bound on one store call: the configured store timeout, or the
+    /// write timeout when none was set.
+    #[must_use]
+    fn store_timeout(&self) -> Duration {
+        self.store_timeout.unwrap_or(self.write_timeout)
     }
 
     /// Sets the TCP connect timeout (default 30s).
@@ -349,6 +454,14 @@ impl<A: Application + 'static> Initiator<A> {
     /// [`Initiator::connect`] with [`EngineError::InvalidInitialSequence`],
     /// before the socket is dialled.
     ///
+    /// The seed outranks the counters an attached store reports. Under
+    /// [`StoreFailurePolicy::CloseSession`], though, a sender seed below the
+    /// store's next sender number is refused with
+    /// [`EngineError::InitialSequenceBelowStore`], before anything is written:
+    /// the store has frames filed at those numbers, so the counterparty has
+    /// seen them, and reusing one would send a different message under a
+    /// `MsgSeqNum` it already holds.
+    ///
     /// # Arguments
     /// * `sender_seq` - Next outgoing sequence number, `>= 1`
     /// * `target_seq` - Next expected incoming sequence number, `>= 1`
@@ -365,69 +478,165 @@ impl<A: Application + 'static> Initiator<A> {
         self
     }
 
-    /// Decides the sequence numbers this session starts from.
+    /// Whether an earlier session of this `Initiator` left a store reset owed
+    /// (see the [`persistence`](crate::persistence) module).
+    #[must_use]
+    fn reset_is_owed(&self) -> bool {
+        self.store.is_some() && self.reset_owed.load(Ordering::Acquire)
+    }
+
+    /// Decides the sequence numbers this session starts from, whether its
+    /// Logon declares a reset, and which counters the store already holds.
     ///
-    /// Priority, highest first:
+    /// By priority, highest first:
     ///
-    /// 1. `reset_on_logon` — the Logon declares `ResetSeqNumFlag` (141) = Y, so
-    ///    both counters start at 1 and the store is cleared. Keeping the old
-    ///    messages would leave two different streams filed under the same
-    ///    numbers, and a later `ResendRequest` could not tell them apart.
-    /// 2. [`Initiator::with_initial_sequences`] — an explicit instruction from
-    ///    the consumer outranks whatever the store remembers.
-    /// 3. The store's own counters, refreshed from its backing medium first.
-    /// 4. A fresh session at 1/1.
+    /// 1. A reset owed by an earlier session of this `Initiator` (a close-time
+    ///    reset, or the reset for a counterparty's `ResetSeqNumFlag` (141),
+    ///    that failed): the store is reset and the Logon declares
+    ///    `ResetSeqNumFlag` = Y and starts at 1, so both sides restart the
+    ///    sequence together. The record is cleared once that Logon is
+    ///    acknowledged, not here: a connect that fails before then still owes
+    ///    the reset.
+    /// 2. `reset_on_logon` — the same reset and Logon, by configuration.
+    ///    Keeping the old messages would leave two different streams filed
+    ///    under the same numbers, and a later `ResendRequest` could not tell
+    ///    them apart.
+    /// 3. [`Initiator::with_initial_sequences`] — an explicit instruction from
+    ///    the consumer outranks whatever the store remembers. Under
+    ///    [`StoreFailurePolicy::CloseSession`] the store is refreshed first and
+    ///    a sender seed below its next sender number is refused.
+    /// 4. The store's own counters, refreshed from its backing medium first.
+    ///    Those are values the store already holds, so they are recorded as
+    ///    written and the session does not write them back unchanged.
+    /// 5. A fresh session at 1/1.
+    ///
+    /// Every store call is bounded by the store timeout.
     ///
     /// # Errors
-    /// Returns [`EngineError::Store`] if the store cannot be reset (case 1) or
-    /// refreshed (case 3). Both are fatal for the handshake: starting at 1 with
-    /// the previous stream still filed would let a later `ResendRequest` replay
-    /// it, and starting against un-refreshed counters would reuse a `MsgSeqNum`
-    /// the counterparty has already seen. The session is refused rather than
-    /// silently started from a counter the store could not vouch for.
-    async fn seed_sequences(&self) -> Result<SequenceManager, EngineError> {
-        if self.config.reset_on_logon {
-            if let Some(store) = &self.store
-                && let Err(err) = store.reset().await
+    /// Returns [`EngineError::Store`] if the store cannot be reset (cases 1 and
+    /// 2) or refreshed (case 4, and case 3 under
+    /// [`StoreFailurePolicy::CloseSession`]), whatever the policy: starting at
+    /// 1 with the previous stream still filed would let a later
+    /// `ResendRequest` replay it, and starting against un-refreshed counters
+    /// would reuse a `MsgSeqNum` the counterparty has already seen. The session
+    /// is refused rather than silently started from a counter the store could
+    /// not vouch for. Returns [`EngineError::InitialSequenceBelowStore`] for a
+    /// sender seed below the store's next sender number under
+    /// [`StoreFailurePolicy::CloseSession`].
+    async fn seed_sequences(&self) -> Result<Seeded, EngineError> {
+        let store_timeout = self.store_timeout();
+        let store = self.store.as_deref();
+        let mut persisted = PersistedCounters::default();
+
+        let owed = self.reset_is_owed();
+        if owed || self.config.reset_on_logon {
+            if store.is_some() {
+                // Owed from before the call until the Logon declaring the
+                // reset is acknowledged: a connect dropped while the reset is
+                // pending leaves it owed, and so does one that fails later.
+                self.reset_owed.store(true, Ordering::Release);
+            }
+            if let Some(store) = store
+                && let Err(err) = timed(store_timeout, store.reset()).await
             {
                 tracing::error!(
                     session = %self.session_id,
+                    owed,
                     error = %err,
                     "cannot reset the store for a ResetSeqNumFlag logon: refusing the session \
                      rather than starting at 1 with the previous stream still filed"
                 );
                 return Err(EngineError::Store(err));
             }
-            return Ok(SequenceManager::new());
+            return Ok(Seeded {
+                sequences: SequenceManager::new(),
+                persisted,
+                reset_logon: true,
+            });
         }
 
         if let Some((sender, target)) = self.initial_sequences {
+            if let Some(store) = store
+                && self.store_policy.closes_session()
+            {
+                self.refresh_store(store, store_timeout).await?;
+                let stored = store.next_sender_seq();
+                if sender < stored {
+                    tracing::error!(
+                        session = %self.session_id,
+                        seeded = sender,
+                        stored,
+                        "initial sender sequence number is below the store's next sender number: \
+                         refusing the session rather than reusing a MsgSeqNum already sent"
+                    );
+                    return Err(EngineError::InitialSequenceBelowStore {
+                        seeded: sender,
+                        stored,
+                    });
+                }
+            }
             // A zero seed is refused before dialling, so both are non-zero here;
             // the floor keeps the conversion total.
-            return Ok(SequenceManager::with_initial(
-                NonZeroU64::new(sender).unwrap_or(NonZeroU64::MIN),
-                NonZeroU64::new(target).unwrap_or(NonZeroU64::MIN),
-            ));
+            return Ok(Seeded {
+                sequences: SequenceManager::with_initial(
+                    NonZeroU64::new(sender).unwrap_or(NonZeroU64::MIN),
+                    NonZeroU64::new(target).unwrap_or(NonZeroU64::MIN),
+                ),
+                persisted,
+                reset_logon: false,
+            });
         }
 
-        let Some(store) = &self.store else {
-            return Ok(SequenceManager::new());
+        let Some(store) = store else {
+            return Ok(Seeded {
+                sequences: SequenceManager::new(),
+                persisted,
+                reset_logon: false,
+            });
         };
-        if let Err(err) = store.refresh().await {
+        self.refresh_store(store, store_timeout).await?;
+        let sender = store.next_sender_seq();
+        let target = store.next_target_seq();
+        // MsgSeqNum starts at 1, so a store reporting 0 is reporting a number
+        // that names no message. Floor it rather than number a message 0; a
+        // floored value is not one the store holds, so it is not recorded.
+        if sender >= 1 {
+            persisted.record_sender(sender);
+        }
+        if target >= 1 {
+            persisted.record_target(target);
+        }
+        Ok(Seeded {
+            sequences: SequenceManager::with_initial(
+                NonZeroU64::new(sender).unwrap_or(NonZeroU64::MIN),
+                NonZeroU64::new(target).unwrap_or(NonZeroU64::MIN),
+            ),
+            persisted,
+            reset_logon: false,
+        })
+    }
+
+    /// Refreshes the store from its backing medium, bounded by the store
+    /// timeout.
+    ///
+    /// # Errors
+    /// [`EngineError::Store`] if the refresh fails or overruns, whatever the
+    /// policy: the counters it would have recovered are what the session is
+    /// about to number its messages from.
+    async fn refresh_store(
+        &self,
+        store: &dyn MessageStore,
+        store_timeout: Duration,
+    ) -> Result<(), EngineError> {
+        timed(store_timeout, store.refresh()).await.map_err(|err| {
             tracing::error!(
                 session = %self.session_id,
                 error = %err,
                 "cannot refresh the store: refusing the session rather than starting against \
                  unknown counters and risking a reused MsgSeqNum"
             );
-            return Err(EngineError::Store(err));
-        }
-        // MsgSeqNum starts at 1, so a store reporting 0 is reporting a number
-        // that names no message. Floor it rather than number a message 0.
-        Ok(SequenceManager::with_initial(
-            NonZeroU64::new(store.next_sender_seq().max(1)).unwrap_or(NonZeroU64::MIN),
-            NonZeroU64::new(store.next_target_seq().max(1)).unwrap_or(NonZeroU64::MIN),
-        ))
+            EngineError::Store(err)
+        })
     }
 
     /// Returns the session configuration.
@@ -458,6 +667,16 @@ impl<A: Application + 'static> Initiator<A> {
     /// A consumer that wants the session to outlive its handle must keep one
     /// alive — typically by holding it until [`Connection::wait_closed`]
     /// returns.
+    ///
+    /// # One session at a time, with a store
+    ///
+    /// With a store attached, call `connect` again only once the previous
+    /// session's [`Connection::wait_closed`] has returned. Until then the
+    /// closing session still writes to the store (the close-time reset of
+    /// `reset_on_logout` / `reset_on_disconnect` and the last counter values)
+    /// and may record a reset owed to the next session; a session started
+    /// beside it would share the store with it and could miss that record.
+    /// The engine does not enforce this.
     ///
     /// # Arguments
     /// * `addr` - The counterparty address to dial
@@ -501,12 +720,14 @@ impl<A: Application + 'static> Initiator<A> {
 
         // Refuse before dialling: a seeded sequence number of zero would put
         // MsgSeqNum (34) = 0 on the wire, which every conforming counterparty
-        // rejects. The seed is ignored entirely when reset_on_logon is set, so
-        // a zero is only refused when it would actually be used. The validated
-        // seed is applied by `seed_sequences`, which reads the same field; this
-        // is only the guard.
+        // rejects. The seed is ignored entirely when the Logon declares a reset
+        // (reset_on_logon, or a reset owed by an earlier session), so a zero
+        // is only refused when it would actually be used. The validated seed
+        // is applied by `seed_sequences`, which reads the same fields; this is
+        // only the guard.
         if let Some((sender, target)) = self.initial_sequences
             && !self.config.reset_on_logon
+            && !self.reset_is_owed()
         {
             NonZeroU64::new(sender).ok_or(EngineError::InvalidInitialSequence {
                 counter: SequenceCounter::Sender,
@@ -541,8 +762,12 @@ impl<A: Application + 'static> Initiator<A> {
         // the session unable to vouch for its own counters, so it is refused
         // here rather than started from a number that could collide with a
         // stream still on file.
-        let sequences = match self.seed_sequences().await {
-            Ok(sequences) => sequences,
+        let Seeded {
+            sequences,
+            persisted,
+            reset_logon,
+        } = match self.seed_sequences().await {
+            Ok(seeded) => seeded,
             Err(err) => {
                 let _ = session.disconnect();
                 return Err(err);
@@ -556,23 +781,29 @@ impl<A: Application + 'static> Initiator<A> {
         let identity = PeerIdentity::new(&self.config);
         let sending_time = SendingTimeGuard::new(&self.config);
         let write_timeout = self.write_timeout;
-        let store = self.store.as_ref();
+        let store_timeout = self.store_timeout();
+        // Every handshake write goes through this binding, which also records
+        // the counter values written, for the reactor to start from.
+        let mut store = self.store.as_deref().map(|store| HandshakeStore {
+            store: SessionStore::new(store, self.store_policy, store_timeout, &self.reset_owed),
+            persisted,
+        });
 
         // Typestate: Connecting -> LogonSent.
         //
         // `to_admin` runs on the message before it is framed, so a stamped
         // Username/Password reaches the wire — the callback's whole purpose.
-        let logon = factory.logon(
-            self.config.heartbeat_interval_secs(),
-            self.config.reset_on_logon,
-        );
+        // A reset the store owes is declared like a configured one, so the
+        // counterparty restarts the sequence with us instead of reading our
+        // MsgSeqNum 1 as too low.
+        let logon = factory.logon(self.config.heartbeat_interval_secs(), reset_logon);
         if let Err(err) = send_handshake_admin(
             self.application.as_ref(),
             &session_id,
             &mut framed,
             &mut factory,
             &runtime.sequences,
-            store,
+            store.as_mut(),
             write_timeout,
             logon,
         )
@@ -668,30 +899,21 @@ impl<A: Application + 'static> Initiator<A> {
                 let detail = mismatch.to_string();
                 let reason = RejectReason::new(9, detail.clone()).with_ref_tag(mismatch.tag);
                 let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
-                let _ = send_handshake_admin(
-                    self.application.as_ref(),
-                    &session_id,
-                    &mut framed,
-                    &mut factory,
-                    &runtime.sequences,
-                    store,
-                    write_timeout,
-                    reject,
-                )
-                .await;
                 let logout = factory.logout(Some(&detail));
-                let _ = send_handshake_admin(
+                let refused = refuse_handshake(
                     self.application.as_ref(),
                     &session_id,
                     &mut framed,
                     &mut factory,
                     &runtime.sequences,
-                    store,
+                    store.as_mut(),
                     write_timeout,
-                    logout,
+                    &detail,
+                    [reject, logout],
                 )
                 .await;
                 let _ = session.on_logon_reject();
+                refused?;
                 return Err(EngineError::IdentityMismatch { detail });
             }
 
@@ -703,54 +925,40 @@ impl<A: Application + 'static> Initiator<A> {
                 let detail = problem.to_string();
                 let reason = problem.reject_reason();
                 let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
-                let _ = send_handshake_admin(
-                    self.application.as_ref(),
-                    &session_id,
-                    &mut framed,
-                    &mut factory,
-                    &runtime.sequences,
-                    store,
-                    write_timeout,
-                    reject,
-                )
-                .await;
                 let logout = factory.logout(Some(&detail));
-                let _ = send_handshake_admin(
+                let refused = refuse_handshake(
                     self.application.as_ref(),
                     &session_id,
                     &mut framed,
                     &mut factory,
                     &runtime.sequences,
-                    store,
+                    store.as_mut(),
                     write_timeout,
-                    logout,
+                    &detail,
+                    [reject, logout],
                 )
                 .await;
                 let _ = session.on_logon_reject();
+                refused?;
                 return Err(EngineError::SendingTime { detail });
             }
 
             if let Err(reason) = self.application.from_admin(&raw, &session_id).await {
                 let logout = factory.logout(Some(&reason.text));
-                if let Err(err) = send_handshake_admin(
+                let refused = refuse_handshake(
                     self.application.as_ref(),
                     &session_id,
                     &mut framed,
                     &mut factory,
                     &runtime.sequences,
-                    store,
+                    store.as_mut(),
                     write_timeout,
-                    logout,
+                    &reason.text,
+                    [logout],
                 )
-                .await
-                {
-                    tracing::warn!(
-                        session = %session_id,
-                        error = %err,
-                        "cannot send Logout after from_admin rejection"
-                    );
-                }
+                .await;
                 let _ = session.on_logon_reject();
+                refused?;
                 return Err(EngineError::LogonRejected {
                     reason: reason.text,
                 });
@@ -785,30 +993,21 @@ impl<A: Application + 'static> Initiator<A> {
                     };
                     let reason = RejectReason::new(code, detail.clone()).with_ref_tag(108);
                     let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
-                    let _ = send_handshake_admin(
-                        self.application.as_ref(),
-                        &session_id,
-                        &mut framed,
-                        &mut factory,
-                        &runtime.sequences,
-                        store,
-                        write_timeout,
-                        reject,
-                    )
-                    .await;
                     let logout = factory.logout(Some(&detail));
-                    let _ = send_handshake_admin(
+                    let refused = refuse_handshake(
                         self.application.as_ref(),
                         &session_id,
                         &mut framed,
                         &mut factory,
                         &runtime.sequences,
-                        store,
+                        store.as_mut(),
                         write_timeout,
-                        logout,
+                        &detail,
+                        [reject, logout],
                     )
                     .await;
                     let _ = session.on_logon_reject();
+                    refused?;
                     return Err(EngineError::HeartbeatInterval { detail });
                 }
             };
@@ -818,30 +1017,21 @@ impl<A: Application + 'static> Initiator<A> {
                     let detail = err.to_string();
                     let reason = RejectReason::new(5, detail.clone()).with_ref_tag(108);
                     let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
-                    let _ = send_handshake_admin(
-                        self.application.as_ref(),
-                        &session_id,
-                        &mut framed,
-                        &mut factory,
-                        &runtime.sequences,
-                        store,
-                        write_timeout,
-                        reject,
-                    )
-                    .await;
                     let logout = factory.logout(Some(&detail));
-                    let _ = send_handshake_admin(
+                    let refused = refuse_handshake(
                         self.application.as_ref(),
                         &session_id,
                         &mut framed,
                         &mut factory,
                         &runtime.sequences,
-                        store,
+                        store.as_mut(),
                         write_timeout,
-                        logout,
+                        &detail,
+                        [reject, logout],
                     )
                     .await;
                     let _ = session.on_logon_reject();
+                    refused?;
                     return Err(EngineError::HeartbeatInterval { detail });
                 }
             };
@@ -879,6 +1069,35 @@ impl<A: Application + 'static> Initiator<A> {
                     session = %session_id,
                     "counterparty set ResetSeqNumFlag on the Logon ack: resetting sequence numbers"
                 );
+                // Our Logon did not ask for the reset, so the store still holds
+                // the previous stream and its counters. It is reset now and set
+                // to the new stream's counters (our Logon and this ack are each
+                // side's message 1), in one call, before the session goes
+                // Active and before `on_logon`: a connect that fails from here
+                // on must not leave a store that a later session would replay
+                // the previous stream's frames from into this one.
+                //
+                // A failure refuses the session whatever the policy, as the
+                // other resets do: carrying on would let a resend in the new
+                // stream replay the previous stream's frames under the numbers
+                // the new one uses. The reset is then owed, so the next connect
+                // makes it and declares ResetSeqNumFlag itself.
+                if !reset_logon && let Some(handshake) = store.as_mut() {
+                    // Owed before the call and cleared only once it has
+                    // succeeded: a caller that drops this connect while the
+                    // reset is pending runs no error branch, and the next
+                    // connect must still make the reset and declare it.
+                    self.reset_owed.store(true, Ordering::Release);
+                    if let Err(err) = handshake.store.reset_to(&session_id, 2, 2).await {
+                        let _ = session.on_logon_reject();
+                        return Err(err.into());
+                    }
+                    self.reset_owed.store(false, Ordering::Release);
+                    // The reset replaced whatever was recorded as written.
+                    handshake.persisted = PersistedCounters::default();
+                    handshake.persisted.record_sender(2);
+                    handshake.persisted.record_target(2);
+                }
                 runtime.sequences.set_target_seq(1);
                 // The Logon already on the wire is message 1 of the reset
                 // outbound stream; rewinding the sender counter to 1 would
@@ -888,6 +1107,27 @@ impl<A: Application + 'static> Initiator<A> {
 
             match runtime.sequences.validate_incoming(ack_seq) {
                 SequenceResult::Ok => {
+                    // The receive cursor includes the ack before the session
+                    // goes Active on it and before the in-memory expectation
+                    // moves, as for every later inbound message.
+                    if let Some(handshake) = store.as_mut() {
+                        let Some(next) = ack_seq.checked_add(1) else {
+                            let _ = session.on_logon_reject();
+                            return Err(SequenceExhausted {
+                                counter: SequenceCounter::Target,
+                            }
+                            .into());
+                        };
+                        if handshake.persisted.target_to_write(next).is_some() {
+                            handshake.persisted.record_target(next);
+                            if let Err(err) =
+                                handshake.store.persist_target(&session_id, next).await
+                            {
+                                let _ = session.on_logon_reject();
+                                return Err(err.into());
+                            }
+                        }
+                    }
                     if let Err(err) = runtime.sequences.try_increment_target_seq() {
                         let _ = session.on_logon_reject();
                         return Err(err.into());
@@ -905,32 +1145,23 @@ impl<A: Application + 'static> Initiator<A> {
             }
         }
 
+        // The Logon that declared the reset has been acknowledged: no reset is
+        // owed any more.
+        if reset_logon {
+            self.reset_owed.store(false, Ordering::Release);
+        }
+
         // Typestate: LogonSent -> Active.
         let session = session.on_logon_ack();
         self.application.on_logon(&session_id).await;
         tracing::info!(session = %session_id, "FIX session established");
 
-        // A gap in the Logon ack means we missed messages: request a resend.
-        if let Some((expected, _high_water)) = pending_resend {
-            let request = factory.resend_request(expected, 0);
-            send_handshake_admin(
-                self.application.as_ref(),
-                &session_id,
-                &mut framed,
-                &mut factory,
-                &runtime.sequences,
-                store,
-                write_timeout,
-                request,
-            )
-            .await?;
-            lock_heartbeat(&runtime).on_message_sent();
-        }
-
-        let resend = pending_resend
-            .map(|(expected, high_water)| ResendState::first(expected, high_water, &self.config));
         // Hand the framed socket to the shared reactor. The initiator carries no
-        // admission guard, so the guard is `()`.
+        // admission guard, so the guard is `()`. A gap in the Logon ack is
+        // requested by the reactor as its first act, so that once `on_logon`
+        // has run, a failure to send the request closes the session through
+        // the reactor's close path (`on_logout`, the close-time reset, the
+        // counters) like any other.
         let params = SessionParams {
             framed,
             session,
@@ -942,7 +1173,12 @@ impl<A: Application + 'static> Initiator<A> {
             application: Arc::clone(&self.application),
             session_id: session_id.clone(),
             store: self.store.clone(),
-            resend,
+            store_policy: self.store_policy,
+            store_timeout,
+            persisted: store
+                .map_or_else(PersistedCounters::default, |handshake| handshake.persisted),
+            reset_owed: Arc::clone(&self.reset_owed),
+            opening_gap: pending_resend,
             write_timeout,
             outbound_capacity: self.outbound_capacity,
             app_queue_capacity: self.app_queue_capacity,
