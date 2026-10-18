@@ -19,6 +19,7 @@ use num_derive::{FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
+use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
 /// Maximum length for CompID strings in bytes.
 pub const COMP_ID_MAX_LEN: usize = 32;
@@ -98,6 +99,24 @@ const fn put_digits(mut dst: &mut [u8], mut value: u32) -> Option<()> {
         dst = rest;
     }
     if value == 0 { Some(()) } else { None }
+}
+
+/// Whole seconds from the Unix epoch of the instant `before` ahead of it,
+/// floored like [`DateTime::timestamp`]: half a second before the epoch is
+/// `-1`.
+#[must_use]
+fn seconds_before_epoch(before: Duration) -> i64 {
+    let whole = i64::try_from(before.as_secs())
+        .ok()
+        .and_then(i64::checked_neg);
+    let floored = if before.subsec_nanos() == 0 {
+        whole
+    } else {
+        whole.and_then(|seconds| seconds.checked_sub(1))
+    };
+    // Misses only for a reading more than `i64::MAX` seconds before the
+    // epoch, which no system clock produces; `i64::MIN` labels it.
+    floored.unwrap_or(i64::MIN)
 }
 
 /// FIX message sequence number.
@@ -255,13 +274,48 @@ impl Timestamp {
         }
     }
 
-    /// Converts a calendar instant to a timestamp, clamping an unrepresentable
-    /// instant to [`Timestamp::EPOCH`].
-    fn clamp_datetime(dt: DateTime<Utc>) -> Self {
-        match Self::from_datetime(dt) {
-            Ok(ts) => ts,
-            Err(_) => Self::EPOCH,
+    /// Converts a reading of the system clock, as
+    /// `SystemTime::now().duration_since(UNIX_EPOCH)` returns it, to a
+    /// timestamp.
+    ///
+    /// Takes the reading rather than the clock so that a clock before the
+    /// epoch, which `duration_since` reports as an `Err`, can be tested.
+    ///
+    /// # Errors
+    /// Returns [`TimestampError::InstantOutOfRange`] if the reading lies
+    /// before the Unix epoch, or past [`Timestamp::MAX_NANOS`] (the nanosecond
+    /// count is built with checked arithmetic, so an overflow is reported, not
+    /// wrapped). `seconds` is the reading's whole seconds from the epoch,
+    /// floored like [`DateTime::timestamp`].
+    fn from_system_clock(
+        reading: Result<Duration, SystemTimeError>,
+    ) -> Result<Self, TimestampError> {
+        match reading {
+            Ok(since_epoch) => {
+                let nanos = since_epoch
+                    .as_secs()
+                    .checked_mul(u64::from(NANOS_PER_SECOND))
+                    .and_then(|nanos| nanos.checked_add(u64::from(since_epoch.subsec_nanos())));
+                match nanos.map(Self::from_nanos) {
+                    Some(Ok(ts)) => Ok(ts),
+                    _ => Err(TimestampError::InstantOutOfRange {
+                        // A system clock counts seconds in an `i64`, so this
+                        // fits; `i64::MAX` only labels an impossible reading.
+                        seconds: i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
+                    }),
+                }
+            }
+            Err(before_epoch) => Err(TimestampError::InstantOutOfRange {
+                seconds: seconds_before_epoch(before_epoch.duration()),
+            }),
         }
+    }
+
+    /// Converts a reading of the system clock to a timestamp, clamping an
+    /// unrepresentable reading (before 1970 or after 2262) to
+    /// [`Timestamp::EPOCH`].
+    fn clamp_system_clock(reading: Result<Duration, SystemTimeError>) -> Self {
+        Self::from_system_clock(reading).unwrap_or(Self::EPOCH)
     }
 
     /// Returns the current UTC timestamp.
@@ -275,21 +329,27 @@ impl Timestamp {
     /// obviously wrong SendingTime a counterparty will reject, not a plausible
     /// substitute. Use [`Timestamp::try_now`] to observe that condition as a
     /// typed error instead.
+    ///
+    /// The clock is read through [`SystemTime`] directly, never through
+    /// `chrono::Utc::now`, which panics on a clock before the epoch.
     #[inline]
     #[must_use]
     pub fn now() -> Self {
-        Self::clamp_datetime(Utc::now())
+        Self::clamp_system_clock(SystemTime::now().duration_since(UNIX_EPOCH))
     }
 
     /// Returns the current UTC timestamp, or an error if the system clock is
     /// outside the representable range.
+    ///
+    /// Like [`Timestamp::now`], it reads [`SystemTime`] directly and never
+    /// panics.
     ///
     /// # Errors
     /// Returns [`TimestampError::InstantOutOfRange`] if the system clock reads
     /// before the Unix epoch or past [`Timestamp::MAX_NANOS`].
     #[inline]
     pub fn try_now() -> Result<Self, TimestampError> {
-        Self::from_datetime(Utc::now())
+        Self::from_system_clock(SystemTime::now().duration_since(UNIX_EPOCH))
     }
 
     /// Returns nanoseconds since Unix epoch.
@@ -337,6 +397,7 @@ impl Timestamp {
     /// Format: `YYYYMMDD-HH:MM:SS.sss`, the fraction truncated, not rounded.
     /// The digits are written straight into the returned buffer, so the call
     /// allocates nothing; it runs for every outbound `SendingTime` (52).
+    #[inline]
     #[must_use]
     pub fn format_millis(self) -> ArrayString<21> {
         self.format_fixed()
@@ -347,6 +408,7 @@ impl Timestamp {
     /// Format: `YYYYMMDD-HH:MM:SS.ssssss`, the fraction truncated, not
     /// rounded. The digits are written straight into the returned buffer, so
     /// the call allocates nothing.
+    #[inline]
     #[must_use]
     pub fn format_micros(self) -> ArrayString<24> {
         self.format_fixed()
@@ -395,8 +457,10 @@ impl TryFrom<DateTime<Utc>> for Timestamp {
 }
 
 impl fmt::Display for Timestamp {
+    /// Writes [`Timestamp::format_millis`] as is. Width, fill and alignment
+    /// flags are ignored, as they always were: `f.pad` would honour them.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.format_millis())
+        f.write_str(self.format_millis().as_str())
     }
 }
 
@@ -750,30 +814,133 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_timestamp_clamp_datetime_pre_epoch_yields_epoch() {
-        let Some(dt) = DateTime::from_timestamp(-86_400, 0) else {
-            panic!("1969-12-31T00:00:00Z is a valid chrono instant");
+    /// What `SystemTime::now().duration_since(UNIX_EPOCH)` returns on a clock
+    /// that reads `before` ahead of the epoch: the real clock cannot be moved.
+    #[track_caller]
+    fn reading_before_epoch(before: Duration) -> Result<Duration, SystemTimeError> {
+        let Some(instant) = UNIX_EPOCH.checked_sub(before) else {
+            panic!("{before:?} before the epoch is a valid SystemTime");
         };
-        assert_eq!(Timestamp::clamp_datetime(dt), Timestamp::EPOCH);
+        let reading = instant.duration_since(UNIX_EPOCH);
+        assert!(reading.is_err(), "an instant before the epoch reads as Err");
+        reading
+    }
+
+    #[test]
+    fn test_timestamp_from_system_clock_pre_epoch_is_typed_error() {
+        // Whole multiples of 100 ns, the coarsest `SystemTime` resolution
+        // (Windows), so every instant really lies before the epoch.
+        let cases = [
+            (Duration::from_micros(1), -1),
+            (Duration::from_secs(1), -1),
+            (Duration::from_millis(1_500), -2),
+            (Duration::from_secs(86_400), -86_400),
+        ];
+        for (before, seconds) in cases {
+            assert_eq!(
+                Timestamp::from_system_clock(reading_before_epoch(before)),
+                Err(TimestampError::InstantOutOfRange { seconds }),
+                "{before:?} before the epoch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_timestamp_from_system_clock_pre_epoch_seconds_match_try_from_datetime() {
+        // 1.5 s before the epoch, through the clock and through chrono.
+        let Some(dt) = DateTime::from_timestamp(-2, 500_000_000) else {
+            panic!("1969-12-31T23:59:58.5Z is a valid chrono instant");
+        };
+        assert_eq!(
+            Timestamp::from_system_clock(reading_before_epoch(Duration::from_millis(1_500))),
+            Timestamp::try_from(dt)
+        );
+    }
+
+    #[test]
+    fn test_timestamp_clamp_system_clock_pre_epoch_yields_epoch() {
+        let reading = reading_before_epoch(Duration::from_secs(86_400));
+        assert_eq!(Timestamp::clamp_system_clock(reading), Timestamp::EPOCH);
         assert_eq!(Timestamp::EPOCH.as_nanos(), 0);
     }
 
     #[test]
-    fn test_timestamp_clamp_datetime_in_range_is_exact() {
-        let Some(dt) = DateTime::from_timestamp(1_700_000_000, 123_456_789) else {
-            panic!("2023-11-14T22:13:20Z is a valid chrono instant");
-        };
+    fn test_timestamp_from_system_clock_in_range_is_exact() {
+        let reading = Ok(Duration::new(1_700_000_000, 123_456_789));
+        let ts = ok(Timestamp::from_system_clock(reading), "in range");
+        assert_eq!(ts.as_nanos(), 1_700_000_000_123_456_789);
         assert_eq!(
-            Timestamp::clamp_datetime(dt).as_nanos(),
-            1_700_000_000_123_456_789
+            Timestamp::clamp_system_clock(Ok(Duration::new(1_700_000_000, 123_456_789))),
+            ts
         );
+        assert_eq!(
+            Timestamp::from_system_clock(Ok(Duration::ZERO)),
+            Ok(Timestamp::EPOCH)
+        );
+    }
+
+    #[test]
+    fn test_timestamp_from_system_clock_past_ceiling_is_typed_error() {
+        let ceiling = Duration::from_nanos(Timestamp::MAX_NANOS);
+        let max = ok(Timestamp::from_system_clock(Ok(ceiling)), "MAX_NANOS");
+        assert_eq!(max.as_nanos(), Timestamp::MAX_NANOS);
+
+        let past = Duration::from_nanos(Timestamp::MAX_NANOS + 1);
+        assert_eq!(
+            Timestamp::from_system_clock(Ok(past)),
+            Err(TimestampError::InstantOutOfRange {
+                seconds: 9_223_372_036
+            })
+        );
+        assert_eq!(Timestamp::clamp_system_clock(Ok(past)), Timestamp::EPOCH);
+    }
+
+    #[test]
+    fn test_timestamp_from_system_clock_nanos_overflow_is_typed_error() {
+        // u64::MAX seconds overflows the checked scale to nanoseconds.
+        assert_eq!(
+            Timestamp::from_system_clock(Ok(Duration::MAX)),
+            Err(TimestampError::InstantOutOfRange { seconds: i64::MAX })
+        );
+        assert_eq!(
+            Timestamp::clamp_system_clock(Ok(Duration::MAX)),
+            Timestamp::EPOCH
+        );
+    }
+
+    #[test]
+    fn test_seconds_before_epoch_floors() {
+        let i64_max_secs = Duration::from_secs(9_223_372_036_854_775_807);
+        let cases = [
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(1), -1),
+            (Duration::from_secs(1), -1),
+            (Duration::from_millis(1_500), -2),
+            (i64_max_secs, -i64::MAX),
+            (i64_max_secs + Duration::from_nanos(1), i64::MIN),
+            (Duration::MAX, i64::MIN),
+        ];
+        for (before, seconds) in cases {
+            assert_eq!(seconds_before_epoch(before), seconds, "{before:?}");
+        }
     }
 
     #[test]
     fn test_timestamp_try_now_is_representable() {
         let now = ok(Timestamp::try_now(), "the system clock is in range");
         assert!(now.as_nanos() > 0);
+        assert!(Timestamp::now() >= now);
+    }
+
+    #[test]
+    fn test_timestamp_display_ignores_width_flags() {
+        let ts = ok(
+            Timestamp::from_nanos(1_709_210_096_789_012_345),
+            "instant is representable",
+        );
+        assert_eq!(format!("{ts}"), "20240229-12:34:56.789");
+        assert_eq!(format!("{ts:>30}"), "20240229-12:34:56.789");
+        assert_eq!(format!("{ts:*<30}"), "20240229-12:34:56.789");
     }
 
     #[test]
