@@ -9,6 +9,7 @@ members = [
     "ironfix-store",
     "ironfix-transport",
     "ironfix-sofh",
+    "ironfix-fixp",
     "ironfix-fast",
     "ironfix-codegen",
     "ironfix-codegen-check",
@@ -35,6 +36,7 @@ ironfix-session = { path = "ironfix-session", version = "0.4" }
 ironfix-store = { path = "ironfix-store", version = "0.4" }
 ironfix-transport = { path = "ironfix-transport", version = "0.4" }
 ironfix-sofh = { path = "ironfix-sofh", version = "0.4" }
+ironfix-fixp = { path = "ironfix-fixp", version = "0.4" }
 ironfix-fast = { path = "ironfix-fast", version = "0.4" }
 ironfix-codegen = { path = "ironfix-codegen", version = "0.4" }
 ironfix-derive = { path = "ironfix-derive", version = "0.4" }
@@ -62,6 +64,10 @@ rust_decimal = "1.43"
 chrono = { version = "0.4", features = ["serde"] }
 itoa = "1.0"
 quick-xml = "0.42"
+
+# SBE codec for the FIXP session messages (ironfix-fixp only). Approved by
+# ADR-0003; compatible 0.7 range, same author (joaquinbejar/IronSBE).
+ironsbe-core = "0.7.1"
 
 # Benchmark harness (dev-dependency only; never linked into a published library)
 criterion = { version = "0.8", features = ["html_reports"] }
