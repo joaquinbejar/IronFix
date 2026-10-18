@@ -132,8 +132,8 @@ messages and the engine wiring do not exist yet.
   declared 789 and receives a gapped Logon from a counterparty that declared
   it too sends no `ResendRequest`, which would cross that resend: it holds the
   Logon, consumes its number once the resend fills the gap below it, and
-  falls back to one `ResendRequest` after `resend_timeout` only if the
-  counterparty never resends. Between two IronFix engines a restarted side
+  falls back to one `ResendRequest` when the gap makes no progress for one
+  `resend_timeout`, a resend that stalls partway included. Between two IronFix engines a restarted side
   gets back what it missed with no `ResendRequest` either way. 789 is
   bilateral: enable it on both sides, since a counterparty such as
   QuickFIX/C++ that declares it waits for a resend a session without the flag

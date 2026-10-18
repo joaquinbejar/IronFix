@@ -59,9 +59,16 @@ an inbound 789 whatever its own `SendNextExpectedMsgSeqNum` setting says, and,
 when it declared 789 itself, queues a gapped Logon and records the gap as
 already requested instead of sending a `ResendRequest`, with no resend timer.
 Such a counterparty logging on to an IronFix session with the flag off
-declares 789, gets none back, and waits for a resend IronFix never sends; the
-gap is only recovered once later traffic makes it ask. The flag's
-documentation and `doc/fix_operations.md` say so.
+declares 789, gets none back, and with its defaults never asks for the gap at
+all. `doTargetTooHigh` (`Session.cpp:1213-1222`) sends no request for a number
+at or above the start of the recorded range, since `SendRedundantResendRequests`
+defaults to false (`:56`); the range clears only when an in-order message at or
+above its end arrives (`:1075-1085`), which cannot happen while the gap is
+open; and `lastReceivedTime` is set only past the too-high early return
+(`:1096`), so the gapped traffic does not count as proof of life. The session
+wedges until its heartbeat timeout disconnects it, and on reconnect its 789
+opens the same gap again: a reconnect loop. The flag's documentation and
+`doc/fix_operations.md` say so.
 
 ### What the session declares
 
@@ -156,8 +163,12 @@ above what was sent gets the Logout alone, as FIX prescribes for that error.
 
 789 is the Logon sender's built-in `ResendRequest`: by declaring the next
 number it expects, a side asks the other to resend everything from there, and
-the other does so right after the Logon exchange, below its own Logon (the
-range above stops before it). So when both sides declared 789 and the
+the other does so right after the Logon exchange. IronFix resends below its own
+Logon (the range above stops before it). QuickFIX/C++ resends through it: it
+computes `endSeqNo = getExpectedSenderNum() - 1` (`Session.cpp:294`) after its
+acknowledgement and after calling `onLogon` (`:287`), so its retransmit
+gap-fills its own Logon and replays any live messages its application sent
+from `onLogon`. So when both sides declared 789 and the
 counterparty's Logon or acknowledgement arrives with a gap below it, sending a
 `ResendRequest` as well would cross that resend: the counterparty would answer
 the same range twice, and the second answer, arriving below the receiver's
@@ -175,7 +186,12 @@ a queued Logon or `ResendRequest`):
   a reset is not held (no gap arises after a reset anyway). Without the
   counterparty's 789 the gap is requested at once, as before. QuickFIX/C++
   holds on its own flag alone; requiring the counterparty's 789 as well keeps
-  the immediate request for a counterparty that is not known to resend.
+  the immediate request for a counterparty that is not known to resend. The
+  price: against QuickFIX/C++ with its own flag off (no 789 on its Logon, but
+  acting on ours), IronFix requests the gap at once, and that request crosses
+  the retransmit QuickFIX/C++ sends for our 789, a harmless double replay (the
+  second copy arrives below the expectation and is dropped as a possible
+  duplicate).
 - **The Logon's number is consumed once the gap below it is filled.** The
   reactor (`Reactor::release_held_logon`, after every inbound frame) watches
   the expectation: below the held number it waits; at it, it persists the
@@ -185,15 +201,26 @@ a queued Logon or `ResendRequest`):
   plus one) the hold is simply dropped. The Logon itself was processed at the
   handshake, so only its number is left to take, as QuickFIX/C++ does for a
   queued Logon. Arithmetic is checked: an exhausted counter closes the session.
+  The hold absorbs both resend shapes: IronFix's stops at the Logon, whose
+  number is then consumed; QuickFIX/C++'s runs through it, and either its gap
+  fill jumps the expectation past the Logon (the drop branch) or, when the
+  message before the Logon is an application message, the Logon is consumed
+  first and the gap fill for it arrives below the expectation with
+  `PossDupFlag` = Y and is dropped as a possible duplicate (the too-low drop);
+  the live messages it replays after that are then in sequence.
 - **The gap is armed as an implied recovery** (`ResendState::implied`, with no
   request counted): a gapped frame arriving meanwhile sends no request either,
   and a counterparty that never resends gets exactly one real `ResendRequest`
   from the first missing number once the gap has made no progress for
   `SessionConfig::resend_timeout`, which a limit of one request still allows;
-  partial progress keeps the recovery implied. Frames from beyond the held
-  Logon that arrived while it was held are not covered by the 789 resend, so
-  they are requested as soon as the Logon is consumed, not after the timeout.
-  QuickFIX/C++ has no such timer; this fallback is IronFix's.
+  partial progress keeps the recovery implied. Nothing is requested when the
+  held Logon is consumed, even if frames from beyond it arrived while it was
+  held: QuickFIX/C++ resends those too (they lie below its `endSeqNo`), and a
+  request then would cross that resend, the double replay this decision exists
+  to avoid. The recovery stays implied at the next number with a fresh clock,
+  so a counterparty that does not cover them gets the one request once that
+  gap has made no progress for the resend timeout. QuickFIX/C++ has no such
+  timer; this fallback is IronFix's.
 
 The replay range is unchanged: `plan` still answers `789 .. own_logon_seq`,
 stopping before the session's own Logon, which the counterparty holds and
@@ -234,3 +261,13 @@ past it.
   Logon's number is held, and a general queue of messages received across a
   gap is #71; the joint crash and takeover suite that exercises 789 across
   injected crashes is #89.
+- **Known limit, until #71:** when the fallback request has gone out and
+  administrative messages from beyond the held Logon arrived live during the
+  hold, the answer to that request covers the held Logon and those messages
+  with one gap fill numbered with the Logon's number. That number is consumed
+  as soon as the gap below it fills, so the gap fill arrives below the
+  expectation and is dropped as a possible duplicate, and the messages beyond
+  the Logon stay missing until the request's next retry asks for them. Nothing
+  is lost and no number is reused; recovery takes one more resend timeout. A
+  test pins it
+  (`test_acceptor_fill_from_the_held_logon_after_the_fallback_waits_for_the_retry`).

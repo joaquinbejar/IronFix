@@ -290,8 +290,19 @@ reported by the builder, by `SessionConfig::validate` and by both engines
 with it. QuickFIX/C++ acts on an inbound 789 whatever its own setting says,
 and when it declared 789 itself it holds a gapped Logon and sends no
 `ResendRequest` for the gap, with no resend timer. Such a counterparty logging
-on to an IronFix session with the flag off declares 789, gets none back and
-waits for a resend this session never sends, until later traffic makes it ask.
+on to an IronFix session with the flag off declares 789, gets none back, and
+with its defaults never asks for the gap at all: it sends no request for a
+number at or above the start of the range it recorded
+(`SendRedundantResendRequests` defaults to false), the range clears only when
+an in-order message at or above its end arrives, which cannot happen while the
+gap is open, and the gapped traffic does not count as proof of life. The
+session wedges until its heartbeat timeout disconnects it, and on reconnect its
+789 opens the same gap again: a reconnect loop
+(`doc/adr/0021-next-expected-msg-seq-num.md`). The other way round, against
+QuickFIX/C++ with its own flag off (it sends no 789 but acts on ours), IronFix
+requests the gap at once, and that request crosses the retransmit QuickFIX/C++
+sends for our 789: a harmless double replay, whose second copy is dropped as a
+possible duplicate.
 
 *What is declared.* The session's own next expected inbound `MsgSeqNum`,
 placed after `ResetSeqNumFlag` (141) and before `DefaultApplVerID` (1137):
@@ -321,7 +332,10 @@ The resend is the session reactor's second opening act, right after the
 
 *A gapped Logon or acknowledgement, held.* 789 is the Logon sender's built-in
 `ResendRequest`: the counterparty that reads this session's 789 resends the
-gap on its own, below its own Logon. So when this session declared 789, the
+gap on its own, right after the Logon exchange. IronFix resends below its own
+Logon; QuickFIX/C++ resends through it, gap-filling its Logon and replaying
+any live messages its application sent from `onLogon`. So when this session
+declared 789, the
 counterparty's Logon or acknowledgement carries a well-formed 789 too, and it
 arrives with a gap below it, the session does **not** send a `ResendRequest`,
 which would cross that resend (QuickFIX/C++ behaves the same):
@@ -331,15 +345,27 @@ which would cross that resend (QuickFIX/C++ behaves the same):
   number, the number plus one is persisted as the next target and the
   expectation moves past it, as for any inbound message; if a gap fill jumps
   past it instead (a counterparty that fills through its own Logon), the hold
-  is dropped.
+  is dropped. Both resend shapes are absorbed: when a resend through the
+  Logon reaches the Logon's number with an application message, the Logon is
+  consumed there and the gap fill for it, arriving below the expectation with
+  `PossDupFlag` = Y, is dropped as a possible duplicate.
 - The gap is armed as recovery with nothing requested: a gapped frame arriving
-  meanwhile sends no request either. A counterparty that never resends gets
-  exactly one `ResendRequest`, from the first missing number, once the gap has
-  made no progress for `SessionConfig::resend_timeout`, also with
-  `max_resend_requests` = 1; after that the usual retry and Logout rules
-  apply. Frames from beyond the held Logon that arrived while it was held are
-  not covered by the counterparty's resend and are requested as soon as the
-  Logon is consumed.
+  meanwhile sends no request either. When the gap makes no progress for
+  `SessionConfig::resend_timeout` (no resend at all, or one that stalls
+  partway), exactly one `ResendRequest` goes out, from the first missing
+  number, also with `max_resend_requests` = 1; after that the usual retry and
+  Logout rules apply.
+- Nothing is requested when the held Logon is consumed, even if frames from
+  beyond it arrived while it was held: a counterparty that resends through its
+  Logon covers them, and a request would cross that resend. The recovery stays
+  armed at the next number with a fresh clock, so frames nobody resends are
+  requested once that gap has made no progress for the resend timeout.
+- Known limit, until a queue of messages received across a gap exists (#71):
+  if the fallback request went out and administrative messages from beyond
+  the held Logon arrived during the hold, the answer covers the Logon and those
+  messages with one gap fill numbered with the Logon's number, which is
+  already consumed, so the fill is dropped and those numbers wait for the
+  request's next retry.
 - A counterparty whose Logon or acknowledgement declares no 789, or a session
   with the flag off, gets the immediate `ResendRequest` as before.
 
