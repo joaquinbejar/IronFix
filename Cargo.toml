@@ -10,6 +10,7 @@ members = [
     "ironfix-transport",
     "ironfix-fast",
     "ironfix-codegen",
+    "ironfix-codegen-check",
     "ironfix-derive",
     "ironfix-engine",
 ]

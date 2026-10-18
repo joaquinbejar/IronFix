@@ -20,6 +20,8 @@ PATH_CRATES := ironfix-core ironfix-dictionary ironfix-tagvalue ironfix-session 
 
 # Publication order. A crate must appear after every crate it depends on,
 # because crates.io resolves the version requirements at upload time.
+# ironfix-codegen-check is deliberately absent: it is `publish = false`, a CI
+# check that compiles the generated views of the embedded dictionaries.
 PUBLISH_ORDER := ironfix-core ironfix-derive ironfix-tagvalue ironfix-dictionary \
 	ironfix-store ironfix-session ironfix-transport ironfix-fast ironfix-codegen \
 	ironfix-engine ironfix-example
@@ -233,17 +235,17 @@ check-cargo-tarpaulin:
 .PHONY: coverage
 coverage: check-cargo-tarpaulin
 	@mkdir -p coverage
-	LOGLEVEL=WARN cargo tarpaulin --exclude-files 'benches/**' --all-features --workspace --timeout 120 --out Xml
+	LOGLEVEL=WARN cargo tarpaulin --exclude-files 'benches/**' --exclude ironfix-codegen-check --all-features --workspace --timeout 120 --out Xml
 
 .PHONY: coverage-html
 coverage-html: check-cargo-tarpaulin
 	@mkdir -p coverage
-	LOGLEVEL=WARN cargo tarpaulin --exclude-files 'benches/**' --verbose --all-features --workspace --timeout 120 --out Html --output-dir coverage
+	LOGLEVEL=WARN cargo tarpaulin --exclude-files 'benches/**' --exclude ironfix-codegen-check --verbose --all-features --workspace --timeout 120 --out Html --output-dir coverage
 
 .PHONY: coverage-json
 coverage-json: check-cargo-tarpaulin
 	@mkdir -p coverage
-	LOGLEVEL=WARN cargo tarpaulin --exclude-files 'benches/**' --verbose --all-features --workspace --timeout 120 --out Json --output-dir coverage
+	LOGLEVEL=WARN cargo tarpaulin --exclude-files 'benches/**' --exclude ironfix-codegen-check --verbose --all-features --workspace --timeout 120 --out Json --output-dir coverage
 
 .PHONY: open-coverage
 open-coverage:
