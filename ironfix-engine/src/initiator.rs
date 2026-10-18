@@ -1037,12 +1037,27 @@ impl<A: Application + 'static> Initiator<A> {
                 // knew of the reset, so its 789 is still checked.
                 let declared = match declared {
                     Ok(Some(value)) if reset_logon && !ack_resets => {
-                        tracing::debug!(
-                            session = %session_id,
-                            declared = value.get(),
-                            "ignoring the Logon ack's NextExpectedMsgSeqNum: it does not echo \
-                             the sequence reset this session declared"
-                        );
+                        // 2 is what an acceptor that took our Logon as message
+                        // 1 of a new stream expects. Anything else says it kept
+                        // its old stream: it will read our next message (2) as
+                        // too low.
+                        if value.get() == 2 {
+                            tracing::debug!(
+                                session = %session_id,
+                                declared = value.get(),
+                                "ignoring the Logon ack's NextExpectedMsgSeqNum: it does not \
+                                 echo the sequence reset this session declared"
+                            );
+                        } else {
+                            tracing::warn!(
+                                session = %session_id,
+                                declared = value.get(),
+                                "the Logon ack does not echo the sequence reset this session \
+                                 declared and its NextExpectedMsgSeqNum is not 2: the acceptor \
+                                 likely kept its old stream and will refuse this session's next \
+                                 message (MsgSeqNum 2) as too low"
+                            );
+                        }
                         Ok(None)
                     }
                     other => other,

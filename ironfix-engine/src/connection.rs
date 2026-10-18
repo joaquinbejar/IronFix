@@ -122,6 +122,12 @@ impl Connection {
     /// application message would arrive after the Logout the counterparty has
     /// already seen. Use [`Connection::wait_closed`] to observe the end of the
     /// session and `next_sender_seq` to observe progress.
+    ///
+    /// While the session is resending what the counterparty missed (an
+    /// answer to its `ResendRequest`, or the resend its
+    /// `NextExpectedMsgSeqNum` (789) asked for), queued messages wait behind
+    /// the resend; once the outbound queue (`with_outbound_capacity` on the
+    /// `Initiator` or `Acceptor`) is full, `send` waits for the whole resend.
     pub async fn send(&self, message: OutboundMessage) -> Result<(), EngineError> {
         crate::outbound::check_sendable(&message)?;
         self.commands
