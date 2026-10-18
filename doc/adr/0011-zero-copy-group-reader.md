@@ -40,12 +40,15 @@ visitor turns them into `ValidationError`s (keeping #74's provisional
 per-entry errors and its end-of-entry hook), the reader's records the first
 `GroupError`. The nested-delimiter fix (a delimiter that is itself a nested
 group's count tag) lives in the shared walk, so both have it. The expanded
-schema stores sorted vectors, so membership and group lookup are binary
-searches, and the tags seen in an entry are tracked in a stack bitset indexed
-by the tag's rank among the group's members: no hashing and no allocation for
-any group with at most 1024 entry-level members. The widest group of the
-embedded dictionaries has 412 (FIX 5.0 SP2 `NoMDEntries`); a wider one spills
-that bitset to the heap.
+schema stores sorted vectors (and, for each set of sibling groups, a dense
+sorted array of their count tags), so membership and group lookup are binary
+searches. The tags seen in an entry are tracked in a stack bitset indexed by
+the tag's rank among the group's members, found by the same search that
+answers membership, and only the words a group uses are cleared per entry: no
+hashing and no allocation for any group with at most 512 entry-level members
+(64 bytes of stack per nested walk). The widest group of the embedded
+dictionaries has 412 (FIX 5.0 SP2 `NoMDEntries`); a wider one spills that
+bitset to the heap, one allocation per group instance walked.
 
 **Layout and borrowing model.**
 
@@ -64,7 +67,25 @@ that bitset to the heap.
   list, `'a` the decoded buffer, `'s` the layout. An entry is a sub-slice of
   the field list; `get(tag)` looks at the entry's own level only, `fields()`
   returns the whole entry, and `group(count_tag)` reads a nested group. Each
-  iterator step walks one entry; nothing is collected.
+  iterator step walks one entry; nothing is collected. `get` is linear in the
+  entry's length; reading many tags of one entry is one pass over `fields()`.
+- `GroupSet::iter` returns `impl Iterator + use<'s>`: it borrows the groups,
+  not the (often temporary) set, so `layout.groups().iter()` can be returned
+  from a function under edition 2024 capture rules.
+
+**One pass per read.** `read(&msg, count_tag)` scans the message once. The
+group asked for is walked with the error-recording visitor as soon as its
+count field is met, and that single walk gives the verdict, the run's end and
+the entry count; other top-level groups are skipped with a walk that tracks
+nothing. The scan continues to the end of the message only to report a second
+instance of the count field (`DuplicateGroup`), which the validator reports
+as `DuplicateTag`. A nested group read through `GroupEntry::group` is not
+walked again: it was checked with the instance that encloses it, so its
+entries are taken from the entry's slice and the declared count. A
+single-pass `MessageLayout::index(&msg)` recording the extent of every
+top-level group, for callers that read several groups of one message, is
+future work: the per-read scan is linear and allocation-free, and a fixed
+capacity table would need its own overflow policy.
 
 **Static specs for code generation.** `GroupSpec::new` and `GroupSet::new` are
 `const fn`s over sorted `&'static [u32]` tag lists that check their arguments
@@ -97,12 +118,16 @@ into a compile error. A static set reads exactly like a layout.
   `GroupError` and `SpecError` (both enums `#[non_exhaustive]`), re-exported
   at the crate root; and `RawMessage::field_slice` in `ironfix-core`. No `pub`
   item is renamed or removed. `scope` and `walk` are private.
-- **Validator behaviour.** Unchanged except for the count parse: a signed
-  count such as `453=+1`, which `str::parse` used to accept as 1, is now also
-  `ValidationError::InvalidGroupCount` (it was already an
-  `InvalidFieldFormat`). `MissingRequiredGroup` errors now come out in
-  ascending count-tag order instead of hash order. The validator no longer
-  collects the field list into a `Vec`.
+- **Validator behaviour.** Unchanged except for two points. The count parse:
+  a signed count such as `453=+1`, which `str::parse` used to accept as 1, is
+  now also `ValidationError::InvalidGroupCount` (it was already an
+  `InvalidFieldFormat`). That makes the group instance malformed, so its
+  `GroupCountMismatch` and its per-entry errors are no longer reported, where
+  before the instance was walked as a count of 1 and could report both. And
+  `MissingRequiredGroup` errors now come out in ascending count-tag order
+  instead of hash order, which closes #100; the full error order of
+  `Validator::validate` is documented in the validator module. The validator
+  no longer collects the field list into a `Vec`.
 - **Agreement is tested, not assumed.** Every validator test goes through one
   helper that also reads every top-level group of the same message with the
   reader and asserts the two agree; sabotaging the reader's count check makes
@@ -111,8 +136,12 @@ into a compile error. A static set reads exactly like a layout.
   a dev-dependency of `ironfix-dictionary` only, declared in the workspace
   dependencies. `tests/group_reader_allocations.rs` installs it as the global
   allocator in its own harness-free binary and asserts that reading,
-  iterating, field lookup and nested reads allocate zero blocks, through a
-  layout and through static specs. No timing is claimed.
+  iterating, walking entry fields, field lookup, nested reads, reading a group
+  that sits after another top-level group, iterating the layout's groups, and
+  a read failing with a count mismatch allocate zero blocks, through a layout
+  and through static specs, in debug and release builds. Error paths that
+  carry strings (`MsgTypeMismatch`, `UnknownMsgType`) allocate their error and
+  are not claimed. No timing is claimed.
 - **Unchanged.** No `unsafe`, no feature flag, no new runtime dependency, and
   the crate DAG is as before: `ironfix-dictionary` depends on `ironfix-core`
   only, `ironfix-tagvalue` does not depend on it, and the engine does not call

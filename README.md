@@ -88,9 +88,13 @@ exists yet.
   message's groups as borrowed views: `layout.read(&msg, 453)` checks the
   whole group with the validator's own walk and yields one `GroupEntry` per
   entry, with own-level field lookup and nested groups. A malformed group is
-  a typed `GroupError`, never a partial view, and the read path allocates
-  nothing (proved with a counting allocator in
-  `ironfix-dictionary/tests/group_reader_allocations.rs`). It is opt-in: the
+  a typed `GroupError`, never a partial view. A successful read (iteration
+  and field lookup included) and a read that fails with a structural error
+  allocate nothing, for groups of up to 512 entry-level members (every group
+  of the embedded dictionaries); a wider group allocates one small buffer per
+  walk, and errors that carry strings (`MsgTypeMismatch`) allocate them. The
+  allocation-free paths are proved with a counting allocator in
+  `ironfix-dictionary/tests/group_reader_allocations.rs`. It is opt-in: the
   engine does not call it.
 - **Code generation.** `#[derive(FixMessage)]` and `#[derive(FixField)]` in
   `ironfix-derive` implement the `ironfix-core` traits with typed

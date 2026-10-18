@@ -1325,14 +1325,37 @@ per-entry errors) reports just the count mismatch.
   rejects with `SessionRejectReason` (373) = 1 (required tag missing); IronFix
   reports the group's structural error and suppresses that group's per-entry
   errors.
-- **Schema order.** QuickFIX reports the lowest missing tag first; IronFix
-  reports missing tags in the order described above (own fields, then
-  component members, then nested groups).
+- **Not lowest tag first.** QuickFIX reports the lowest missing tag first.
+  IronFix reports missing fields in schema order (within an entry as described
+  above) and missing top-level groups by ascending count tag, after every
+  missing field.
 
 **Behaviour change.** This check is newer than the structural one, so
 validation is stricter than it was, and stricter than QuickFIX: messages whose
 entries lacked required members used to pass, and some still pass at a
 QuickFIX counterparty.
+
+**Overall error order.** `Validator::validate` (under `Validator::new` and
+`Validator::for_session` alike) reports errors in a fixed order, identical on
+every run and for every load of the same dictionary:
+
+1. `BeginStringMismatch` (session validator only);
+2. `UnknownMsgType`, after which nothing else is checked;
+3. schema errors (`SchemaTooDeep`, `SchemaTooLarge`, `UnknownComponent`), in
+   expansion order;
+4. value errors (`UnknownTag`, `InvalidFieldFormat`, `InvalidEnumValue`), at
+   most one per field, in wire order;
+5. structural errors in the order one walk over the message meets them:
+   `DuplicateTag` and `FieldNotAllowedForMessage` at the message level, and for
+   each group instance its count, delimiter and repeated-tag errors as they
+   appear, with its count mismatch when the instance ends (nested groups before
+   their enclosing group);
+6. `MissingRequiredFieldInGroupEntry` of the well-formed groups, in the
+   per-entry order above;
+7. `MissingRequiredField` in schema order: header, trailer, the message's own
+   fields, then the members of required components, depth first;
+8. `MissingRequiredGroup` by ascending count tag;
+9. `ErrorLimitReached`, last, when the output was capped.
 
 **Reading groups.** `ironfix-dictionary::group` reads a decoded message's
 repeating groups with the same positional walk, so the reader and the
@@ -1345,7 +1368,12 @@ included, and returns `Ok(None)` when the group is absent or a typed
 `GroupError` for a count mismatch, a delimiter mismatch, a tag repeated in an
 entry, a count that is not one or more ASCII digits (`+1` included), a count
 field present twice, or nesting deeper than 32. Entries are borrowed ranges of
-the message's field list: reading and iterating allocate nothing. Required
+the message's field list: a successful read, iteration and field lookup
+allocate nothing, nor does a read that fails with a structural error, for any
+group with at most 512 entry-level members (every group of the embedded
+dictionaries; a wider group allocates one small buffer per walk). A few error
+paths do allocate their error value (`MsgTypeMismatch` carries two strings).
+Required
 members are the validator's concern; the reader does not check them. See
 ADR-0011.
 

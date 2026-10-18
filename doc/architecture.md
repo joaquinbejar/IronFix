@@ -1122,6 +1122,14 @@ impl Encoder<&OwnedMessage> for FixCodec {
 
 ### Repeating group parsing
 
+> **Superseded by ADR-0011.** The sketch below puts a `GroupDecoder` in
+> `ironfix-tagvalue/src/decoder.rs`. That is not what was built, and it would
+> break the rule that the tag=value decoder is dictionary-free. Repeating
+> groups are read by `ironfix_dictionary::group` (`MessageLayout`, `GroupSpec`,
+> `GroupSet`, `GroupEntries`, `GroupEntry`), which shares the validator's
+> positional walk and borrows sub-slices of `RawMessage::field_slice()`
+> without allocating. See `doc/adr/0011-zero-copy-group-reader.md`.
+
 ```rust
 // ironfix-tagvalue/src/decoder.rs
 
