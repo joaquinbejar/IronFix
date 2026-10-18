@@ -338,26 +338,30 @@ pub mod layouts {
         Err(_) => panic!("invalid TypeSamplerNoDocs group table"),
     };
 
-    /// Groups that may open at the top level of Heartbeat (MsgType=0), header and trailer groups included.
-    pub const HEARTBEAT: GroupSet<'static> = match GroupSet::new(&[HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of Heartbeat (MsgType=0), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const HEARTBEAT: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 49, 52, 56, 627]) {
         Ok(set) => set,
         Err(_) => panic!("invalid Heartbeat group table"),
     };
 
-    /// Groups that may open at the top level of ExecutionReport (MsgType=8), header and trailer groups included.
-    pub const EXECUTION_REPORT: GroupSet<'static> = match GroupSet::new(&[PARTIES_NO_PARTY_IDS, HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of ExecutionReport (MsgType=8), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const EXECUTION_REPORT: GroupSet<'static> = match GroupSet::with_level_tags(&[PARTIES_NO_PARTY_IDS, HEADER_NO_HOPS], &[8, 9, 10, 11, 34, 35, 49, 52, 54, 55, 56, 58, 167, 453, 627]) {
         Ok(set) => set,
         Err(_) => panic!("invalid ExecutionReport group table"),
     };
 
-    /// Groups that may open at the top level of NewOrderSingle (MsgType=D), header and trailer groups included.
-    pub const NEW_ORDER_SINGLE: GroupSet<'static> = match GroupSet::new(&[NEW_ORDER_SINGLE_NO_ALLOCS, PARTIES_NO_PARTY_IDS, HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of NewOrderSingle (MsgType=D), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const NEW_ORDER_SINGLE: GroupSet<'static> = match GroupSet::with_level_tags(&[NEW_ORDER_SINGLE_NO_ALLOCS, PARTIES_NO_PARTY_IDS, HEADER_NO_HOPS], &[1, 8, 9, 10, 11, 12, 18, 34, 35, 38, 44, 49, 52, 54, 55, 56, 58, 60, 78, 95, 96, 114, 167, 236, 453, 627, 5000, 5001, 5002]) {
         Ok(set) => set,
         Err(_) => panic!("invalid NewOrderSingle group table"),
     };
 
-    /// Groups that may open at the top level of TypeSampler (MsgType=U1), header and trailer groups included.
-    pub const TYPE_SAMPLER: GroupSet<'static> = match GroupSet::new(&[HEADER_NO_HOPS, TYPE_SAMPLER_NO_DOCS]) {
+    /// Groups that may open at the top level of TypeSampler (MsgType=U1), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const TYPE_SAMPLER: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS, TYPE_SAMPLER_NO_DOCS], &[8, 9, 10, 15, 34, 35, 44, 49, 52, 56, 60, 75, 200, 205, 421, 627, 5010, 5011, 5012, 5013, 5014, 5015, 5020]) {
         Ok(set) => set,
         Err(_) => panic!("invalid TypeSampler group table"),
     };
@@ -945,9 +949,10 @@ pub mod views {
 /// Typed writers of message bodies, to any [`Sink`](writers::Sink): a `FnMut(u32, &[u8])`
 /// closure, or a target that frames LENGTH/DATA pairs itself.
 ///
-/// Fields are written in dictionary order; a repeating group as its count, then each entry with its
-/// delimiter first. Every value is checked before anything is written. Numbers are formatted on
-/// the stack; only a multi-value field allocates, to join its values.
+/// Fields are written in the order the dictionary (XML) lists them, components in place; a repeating
+/// group as its count, then each entry with its delimiter first and its other members in XML order.
+/// Every value is checked before anything is written. Numbers are formatted on the stack; only a
+/// multi-value field allocates, to join its values.
 pub mod writers {
     use ::ironfix_core::error::EncodeError;
     use ::rust_decimal::Decimal;
@@ -1113,8 +1118,8 @@ pub mod writers {
     }
 
     impl HeartbeatFields {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -1150,8 +1155,8 @@ pub mod writers {
     }
 
     impl ExecutionReportFields<'_> {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -1179,7 +1184,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.cl_ord_id { sink.field(11, value.as_bytes()); }
             if let Some(value) = self.side { sink.field(54, value.as_bytes()); }
@@ -1246,8 +1251,8 @@ pub mod writers {
     }
 
     impl NewOrderSingleFields<'_> {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -1289,7 +1294,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.cl_ord_id { sink.field(11, value.as_bytes()); }
             if let Some(value) = self.cl_ord_id_12 { sink.field(12, value.as_bytes()); }
@@ -1364,8 +1369,8 @@ pub mod writers {
     }
 
     impl TypeSamplerFields<'_> {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -1398,7 +1403,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.transact_time { sink.field(60, value.as_bytes()); }
             if let Some(value) = self.sample_time { sink.field(5010, value.as_bytes()); }
@@ -1458,7 +1463,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.party_id { sink.field(448, value.as_bytes()); }
             if let Some(value) = self.party_idsource { sink.field(447, value.as_bytes()); }
@@ -1497,7 +1502,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.party_sub_id { sink.field(523, value.as_bytes()); }
             if let Some(value) = self.party_sub_idtype { put_display(sink, 803, value)?; }
@@ -1528,7 +1533,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.alloc_account { sink.field(79, value.as_bytes()); }
             if let Some(value) = self.alloc_qty { put_display(sink, 80, value)?; }
@@ -1560,7 +1565,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.encoded_text { sink.data(354, 355, value); }
             if let Some(value) = self.doc_name { sink.field(5023, value.as_bytes()); }

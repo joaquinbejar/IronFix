@@ -719,7 +719,7 @@ fn test_closure_sink_receives_a_data_pair_as_length_then_data() {
     assert_eq!(fields.get(length), Some(&(95, b"3".to_vec())));
     assert_eq!(fields.get(length + 1), Some(&(96, b"a\x01b".to_vec())));
     let tags: Vec<u32> = fields.iter().map(|(tag, _)| *tag).collect();
-    assert_eq!(tags.first(), Some(&11), "dictionary order: ClOrdID first");
+    assert_eq!(tags.first(), Some(&11), "XML order: ClOrdID first");
 }
 
 #[test]
@@ -1309,7 +1309,11 @@ fn items(list: &str) -> Vec<&str> {
 
 /// Every group table of a `layouts` module by constant name, and every
 /// message's top-level group constants by MsgType.
-type ParsedLayouts = (HashMap<String, ParsedSpec>, Vec<(String, Vec<String>)>);
+type ParsedLayouts = (HashMap<String, ParsedSpec>, Vec<ParsedSet>);
+
+/// A message's top-level set parsed back: its MsgType, its group constants
+/// and its level tags.
+type ParsedSet = (String, Vec<String>, Vec<u32>);
 
 /// Parses the `layouts` module of generated views.
 fn parse_layouts(code: &str) -> ParsedLayouts {
@@ -1355,16 +1359,18 @@ fn parse_layouts(code: &str) -> ParsedLayouts {
                 },
             );
         } else if let Some(arguments) = rest
-            .split_once("GroupSet::new(&[")
+            .split_once("GroupSet::with_level_tags(&[")
             .and_then(|(_, tail)| tail.rsplit_once("]) {"))
             .map(|(arguments, _)| arguments)
         {
             let msg_type = some(msg_type.take(), "the set's MsgType");
+            let (groups, tags) = some(arguments.split_once("], &["), "a level-tag list");
             messages.push((
                 msg_type,
-                items(arguments)
+                items(groups).into_iter().map(ToString::to_string).collect(),
+                items(tags)
                     .into_iter()
-                    .map(ToString::to_string)
+                    .map(|item| ok(item.parse::<u32>(), "a level tag"))
                     .collect(),
             ));
         }
@@ -1413,8 +1419,13 @@ fn test_every_generated_layout_agrees_with_the_dictionary_layout() {
             dict.messages().count(),
             "{what}: one set per message"
         );
-        for (msg_type, names) in messages {
+        for (msg_type, names, level_tags) in messages {
             let layout = ok(MessageLayout::new(dict, &msg_type), "layout");
+            assert_eq!(
+                level_tags.as_slice(),
+                layout.groups().level_tags(),
+                "{what} {msg_type}: level tags"
+            );
             assert_parsed_set(
                 &specs,
                 &names,
@@ -1423,4 +1434,146 @@ fn test_every_generated_layout_agrees_with_the_dictionary_layout() {
             );
         }
     }
+}
+
+#[test]
+fn test_writer_keeps_the_xml_order_inside_a_group_entry() {
+    // FIX 4.4 PreAllocGrp NoAllocs(78) lists AllocAccount(79),
+    // AllocAcctIDSource(661), AllocSettlCurrency(736), IndividualAllocID(467),
+    // the NestedParties component (NoNestedPartyIDs 539) and AllocQty(80):
+    // the writer follows that order, the component's group in its place.
+    use fix44::enums::{OrdType, Side};
+    use fix44::writers::{
+        NestedPartiesNoNestedPartyIDsFields, NewOrderSingleFields, PreAllocGrpNoAllocsFields,
+    };
+
+    let nested = [NestedPartiesNoNestedPartyIDsFields {
+        nested_party_id: Some("NESTED-1"),
+        nested_party_role: Some(1),
+        ..NestedPartiesNoNestedPartyIDsFields::default()
+    }];
+    let allocs = [PreAllocGrpNoAllocsFields {
+        alloc_account: Some("ACC-1"),
+        alloc_acct_idsource: Some(1),
+        alloc_settl_currency: Some("EUR"),
+        individual_alloc_id: Some("ALLOC-1"),
+        no_nested_party_ids: &nested,
+        alloc_qty: Some(Decimal::new(50, 0)),
+    }];
+    let order = NewOrderSingleFields {
+        cl_ord_id: Some("ORDER-1"),
+        side: Some(Side::Buy),
+        transact_time: Some("20260712-10:00:01"),
+        ord_type: Some(OrdType::Market),
+        no_allocs: &allocs,
+        ..NewOrderSingleFields::default()
+    };
+    let bytes = encode("D", |encoder| order.write(encoder));
+    let mut decoder = Decoder::new(&bytes);
+    let msg = ok(
+        decoder.decode(),
+        "the written frame decodes with its checksum",
+    );
+    assert_eq!(
+        Validator::new(fix44_dictionary()).validate(&msg),
+        Ok(()),
+        "the written NewOrderSingle conforms to the FIX 4.4 dictionary"
+    );
+
+    let tags: Vec<u32> = msg.fields().map(|field| field.tag).collect();
+    let start = some(tags.iter().position(|tag| *tag == 78), "NoAllocs");
+    assert_eq!(
+        tags.get(start..start + 9),
+        Some(&[78, 79, 661, 736, 467, 539, 524, 538, 80][..])
+    );
+
+    let view = some(
+        fix44::views::NewOrderSingleView::from_message(&msg),
+        "a NewOrderSingle view",
+    );
+    let alloc = some(
+        some(ok(view.no_allocs(), "NoAllocs"), "the allocations").next(),
+        "one allocation",
+    );
+    assert_eq!(ok(alloc.alloc_qty(), "AllocQty"), Some(Decimal::new(50, 0)));
+    let nested_party = some(
+        some(
+            ok(alloc.no_nested_party_ids(), "NoNestedPartyIDs"),
+            "nested",
+        )
+        .next(),
+        "one nested party",
+    );
+    assert_eq!(
+        ok(nested_party.nested_party_id(), "NestedPartyID"),
+        "NESTED-1"
+    );
+}
+
+#[test]
+fn test_generated_view_reads_an_empty_top_level_group_like_the_layout() {
+    // NoPartyIDs(453) entries accept Text(58), and so does the
+    // NewOrderSingle message level. With a count of 0 the 58 that follows is
+    // the message's: MessageLayout knows it from the message level's tags,
+    // and the generated static set carries the same tags.
+    let dict = views_common::views_sample_dictionary();
+    let layout = ok(MessageLayout::new(&dict, "D"), "the sample layout");
+    assert_eq!(
+        sample::layouts::NEW_ORDER_SINGLE.level_tags(),
+        layout.groups().level_tags()
+    );
+    for body in [
+        &["11=ORDER-1", "54=1", "453=0", "58=top"][..],
+        &[
+            "11=ORDER-1",
+            "54=1",
+            "453=1",
+            "448=A",
+            "452=1",
+            "58=in",
+            "58=top",
+        ][..],
+        &[
+            "11=ORDER-1",
+            "54=1",
+            "453=1",
+            "448=A",
+            "452=1",
+            "802=0",
+            "58=in",
+        ][..],
+    ] {
+        let bytes = frame("D", body);
+        let msg = decode(&bytes);
+        let view = some(
+            sample::views::NewOrderSingleView::from_message(&msg),
+            "a sample view",
+        );
+        let from_view = view
+            .no_party_ids()
+            .map(|parties| parties.map(|parties| parties.count()));
+        let from_layout = layout
+            .read(&msg, 453)
+            .map(|parties| parties.map(Iterator::count));
+        assert_eq!(from_view, from_layout, "{body:?}");
+        assert_eq!(
+            ok(view.text(), "message-level Text"),
+            layout
+                .groups()
+                .field(&msg, 58)
+                .map(|field| std::str::from_utf8(field.value).unwrap_or_default()),
+            "{body:?}"
+        );
+    }
+    let bytes = frame("D", &["11=ORDER-1", "54=1", "453=0", "58=top"]);
+    let msg = decode(&bytes);
+    let view = some(
+        sample::views::NewOrderSingleView::from_message(&msg),
+        "a sample view",
+    );
+    assert_eq!(
+        ok(view.no_party_ids(), "an empty NoPartyIDs").map(Iterator::count),
+        Some(0)
+    );
+    assert_eq!(ok(view.text(), "message-level Text"), Some("top"));
 }

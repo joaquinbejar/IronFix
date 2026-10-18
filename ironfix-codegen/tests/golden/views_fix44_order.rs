@@ -3769,20 +3769,23 @@ pub mod layouts {
         Err(_) => panic!("invalid StipulationsNoStipulations group table"),
     };
 
-    /// Groups that may open at the top level of Heartbeat (MsgType=0), header and trailer groups included.
-    pub const HEARTBEAT: GroupSet<'static> = match GroupSet::new(&[HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of Heartbeat (MsgType=0), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const HEARTBEAT: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 97, 112, 115, 116, 122, 128, 129, 142, 143, 144, 145, 212, 213, 347, 369, 627]) {
         Ok(set) => set,
         Err(_) => panic!("invalid Heartbeat group table"),
     };
 
-    /// Groups that may open at the top level of Logon (MsgType=A), header and trailer groups included.
-    pub const LOGON: GroupSet<'static> = match GroupSet::new(&[LOGON_NO_MSG_TYPES, HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of Logon (MsgType=A), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const LOGON: GroupSet<'static> = match GroupSet::with_level_tags(&[LOGON_NO_MSG_TYPES, HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 95, 96, 97, 98, 108, 115, 116, 122, 128, 129, 141, 142, 143, 144, 145, 212, 213, 347, 369, 383, 384, 464, 553, 554, 627, 789]) {
         Ok(set) => set,
         Err(_) => panic!("invalid Logon group table"),
     };
 
-    /// Groups that may open at the top level of NewOrderSingle (MsgType=D), header and trailer groups included.
-    pub const NEW_ORDER_SINGLE: GroupSet<'static> = match GroupSet::new(&[PRE_ALLOC_GRP_NO_ALLOCS, STIPULATIONS_NO_STIPULATIONS, TRDG_SES_GRP_NO_TRADING_SESSIONS, PARTIES_NO_PARTY_IDS, SEC_ALT_IDGRP_NO_SECURITY_ALT_ID, HEADER_NO_HOPS, UND_INSTRMT_GRP_NO_UNDERLYINGS, EVNT_GRP_NO_EVENTS]) {
+    /// Groups that may open at the top level of NewOrderSingle (MsgType=D), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const NEW_ORDER_SINGLE: GroupSet<'static> = match GroupSet::with_level_tags(&[PRE_ALLOC_GRP_NO_ALLOCS, STIPULATIONS_NO_STIPULATIONS, TRDG_SES_GRP_NO_TRADING_SESSIONS, PARTIES_NO_PARTY_IDS, SEC_ALT_IDGRP_NO_SECURITY_ALT_ID, HEADER_NO_HOPS, UND_INSTRMT_GRP_NO_UNDERLYINGS, EVNT_GRP_NO_EVENTS], &[1, 8, 9, 10, 11, 12, 13, 15, 18, 21, 22, 23, 34, 35, 38, 40, 43, 44, 48, 49, 50, 52, 54, 55, 56, 57, 58, 59, 60, 63, 64, 65, 70, 75, 77, 78, 81, 89, 90, 91, 93, 97, 99, 100, 106, 107, 110, 111, 114, 115, 116, 117, 120, 121, 122, 126, 128, 129, 140, 142, 143, 144, 145, 152, 167, 168, 192, 193, 200, 201, 202, 203, 206, 207, 210, 211, 212, 213, 218, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 231, 232, 235, 236, 239, 240, 255, 347, 348, 349, 350, 351, 354, 355, 369, 376, 377, 386, 388, 389, 423, 427, 432, 453, 454, 460, 461, 468, 469, 470, 471, 472, 479, 480, 481, 494, 497, 513, 516, 526, 528, 529, 541, 543, 544, 581, 582, 583, 589, 590, 591, 627, 635, 640, 660, 662, 663, 667, 691, 696, 697, 698, 699, 701, 711, 761, 762, 775, 788, 835, 836, 837, 838, 840, 841, 842, 843, 844, 846, 847, 848, 849, 854, 864, 873, 874, 875, 876, 898, 913, 914, 915, 916, 917, 918, 919, 947]) {
         Ok(set) => set,
         Err(_) => panic!("invalid NewOrderSingle group table"),
     };
@@ -3972,6 +3975,11 @@ pub mod views {
             self.get(383).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
+        /// NoMsgTypes (tag 384) repeating group: its entries in wire order, `None` when absent.
+        pub fn no_msg_types(&self) -> Result<Option<Entries<'m, 'a, LogonNoMsgTypesView<'m, 'a>>>, GroupError> {
+            Ok(layouts::LOGON.read(self.msg, 384)?.map(|entries| entries.map(LogonNoMsgTypesView::wrap as fn(_) -> _)))
+        }
+
         /// TestMessageIndicator (tag 464).
         pub fn test_message_indicator(&self) -> Result<Option<bool>, DecodeError> {
             self.get(464).map(|field| boolean(field, FieldType::Boolean)).transpose()
@@ -3985,11 +3993,6 @@ pub mod views {
         /// Password (tag 554).
         pub fn password(&self) -> Result<Option<&'a str>, DecodeError> {
             self.get(554).map(|field| text(field, FieldType::String)).transpose()
-        }
-
-        /// NoMsgTypes (tag 384) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_msg_types(&self) -> Result<Option<Entries<'m, 'a, LogonNoMsgTypesView<'m, 'a>>>, GroupError> {
-            Ok(layouts::LOGON.read(self.msg, 384)?.map(|entries| entries.map(LogonNoMsgTypesView::wrap as fn(_) -> _)))
         }
     }
 
@@ -4042,6 +4045,11 @@ pub mod views {
             self.get(583).map(|field| text(field, FieldType::String)).transpose()
         }
 
+        /// NoPartyIDs (tag 453) repeating group: its entries in wire order, `None` when absent.
+        pub fn no_party_ids(&self) -> Result<Option<Entries<'m, 'a, PartiesNoPartyIDsView<'m, 'a>>>, GroupError> {
+            Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 453)?.map(|entries| entries.map(PartiesNoPartyIDsView::wrap as fn(_) -> _)))
+        }
+
         /// TradeOriginationDate (tag 229).
         pub fn trade_origination_date(&self) -> Result<Option<&'a str>, DecodeError> {
             self.get(229).map(|field| text(field, FieldType::LocalMktDate)).transpose()
@@ -4090,6 +4098,11 @@ pub mod views {
         /// AllocID (tag 70).
         pub fn alloc_id(&self) -> Result<Option<&'a str>, DecodeError> {
             self.get(70).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// NoAllocs (tag 78) repeating group: its entries in wire order, `None` when absent.
+        pub fn no_allocs(&self) -> Result<Option<Entries<'m, 'a, PreAllocGrpNoAllocsView<'m, 'a>>>, GroupError> {
+            Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 78)?.map(|entries| entries.map(PreAllocGrpNoAllocsView::wrap as fn(_) -> _)))
         }
 
         /// SettlType (tag 63).
@@ -4141,243 +4154,15 @@ pub mod views {
             self.get(100).map(|field| text(field, FieldType::Exchange)).transpose()
         }
 
+        /// NoTradingSessions (tag 386) repeating group: its entries in wire order, `None` when absent.
+        pub fn no_trading_sessions(&self) -> Result<Option<Entries<'m, 'a, TrdgSesGrpNoTradingSessionsView<'m, 'a>>>, GroupError> {
+            Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 386)?.map(|entries| entries.map(TrdgSesGrpNoTradingSessionsView::wrap as fn(_) -> _)))
+        }
+
         /// ProcessCode (tag 81).
         #[must_use]
         pub fn process_code(&self) -> Option<enums::ProcessCode<'a>> {
             self.get(81).map(|field| enums::ProcessCode::from_bytes(field.value))
-        }
-
-        /// PrevClosePx (tag 140).
-        pub fn prev_close_px(&self) -> Result<Option<Decimal>, DecodeError> {
-            self.get(140).map(|field| decimal(field, FieldType::Price)).transpose()
-        }
-
-        /// Side (tag 54). Required.
-        pub fn side(&self) -> Result<enums::Side<'a>, DecodeError> {
-            required(self.get(54), 54).map(|field| enums::Side::from_bytes(field.value))
-        }
-
-        /// LocateReqd (tag 114).
-        pub fn locate_reqd(&self) -> Result<Option<bool>, DecodeError> {
-            self.get(114).map(|field| boolean(field, FieldType::Boolean)).transpose()
-        }
-
-        /// TransactTime (tag 60). Required.
-        pub fn transact_time(&self) -> Result<&'a str, DecodeError> {
-            text(required(self.get(60), 60)?, FieldType::UtcTimestamp)
-        }
-
-        /// QtyType (tag 854).
-        #[must_use]
-        pub fn qty_type(&self) -> Option<enums::QtyType<'a>> {
-            self.get(854).map(|field| enums::QtyType::from_bytes(field.value))
-        }
-
-        /// OrdType (tag 40). Required.
-        pub fn ord_type(&self) -> Result<enums::OrdType<'a>, DecodeError> {
-            required(self.get(40), 40).map(|field| enums::OrdType::from_bytes(field.value))
-        }
-
-        /// PriceType (tag 423).
-        #[must_use]
-        pub fn price_type(&self) -> Option<enums::PriceType<'a>> {
-            self.get(423).map(|field| enums::PriceType::from_bytes(field.value))
-        }
-
-        /// Price (tag 44).
-        pub fn price(&self) -> Result<Option<Decimal>, DecodeError> {
-            self.get(44).map(|field| decimal(field, FieldType::Price)).transpose()
-        }
-
-        /// StopPx (tag 99).
-        pub fn stop_px(&self) -> Result<Option<Decimal>, DecodeError> {
-            self.get(99).map(|field| decimal(field, FieldType::Price)).transpose()
-        }
-
-        /// Currency (tag 15).
-        pub fn currency(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(15).map(|field| text(field, FieldType::Currency)).transpose()
-        }
-
-        /// ComplianceID (tag 376).
-        pub fn compliance_id(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(376).map(|field| text(field, FieldType::String)).transpose()
-        }
-
-        /// SolicitedFlag (tag 377).
-        pub fn solicited_flag(&self) -> Result<Option<bool>, DecodeError> {
-            self.get(377).map(|field| boolean(field, FieldType::Boolean)).transpose()
-        }
-
-        /// IOIID (tag 23).
-        pub fn ioiid(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(23).map(|field| text(field, FieldType::String)).transpose()
-        }
-
-        /// QuoteID (tag 117).
-        pub fn quote_id(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(117).map(|field| text(field, FieldType::String)).transpose()
-        }
-
-        /// TimeInForce (tag 59).
-        #[must_use]
-        pub fn time_in_force(&self) -> Option<enums::TimeInForce<'a>> {
-            self.get(59).map(|field| enums::TimeInForce::from_bytes(field.value))
-        }
-
-        /// EffectiveTime (tag 168).
-        pub fn effective_time(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(168).map(|field| text(field, FieldType::UtcTimestamp)).transpose()
-        }
-
-        /// ExpireDate (tag 432).
-        pub fn expire_date(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(432).map(|field| text(field, FieldType::LocalMktDate)).transpose()
-        }
-
-        /// ExpireTime (tag 126).
-        pub fn expire_time(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(126).map(|field| text(field, FieldType::UtcTimestamp)).transpose()
-        }
-
-        /// GTBookingInst (tag 427).
-        #[must_use]
-        pub fn gtbooking_inst(&self) -> Option<enums::GTBookingInst<'a>> {
-            self.get(427).map(|field| enums::GTBookingInst::from_bytes(field.value))
-        }
-
-        /// OrderCapacity (tag 528).
-        #[must_use]
-        pub fn order_capacity(&self) -> Option<enums::OrderCapacity<'a>> {
-            self.get(528).map(|field| enums::OrderCapacity::from_bytes(field.value))
-        }
-
-        /// OrderRestrictions (tag 529).
-        pub fn order_restrictions(&self) -> Result<Option<enums::Tokens<'a, enums::OrderRestrictions<'a>>>, DecodeError> {
-            self.get(529).map(|field| text(field, FieldType::MultipleStringValue).map(|value| enums::OrderRestrictions::tokens(value.as_bytes()))).transpose()
-        }
-
-        /// CustOrderCapacity (tag 582).
-        #[must_use]
-        pub fn cust_order_capacity(&self) -> Option<enums::CustOrderCapacity<'a>> {
-            self.get(582).map(|field| enums::CustOrderCapacity::from_bytes(field.value))
-        }
-
-        /// ForexReq (tag 121).
-        pub fn forex_req(&self) -> Result<Option<bool>, DecodeError> {
-            self.get(121).map(|field| boolean(field, FieldType::Boolean)).transpose()
-        }
-
-        /// SettlCurrency (tag 120).
-        pub fn settl_currency(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(120).map(|field| text(field, FieldType::Currency)).transpose()
-        }
-
-        /// BookingType (tag 775).
-        #[must_use]
-        pub fn booking_type(&self) -> Option<enums::BookingType<'a>> {
-            self.get(775).map(|field| enums::BookingType::from_bytes(field.value))
-        }
-
-        /// Text (tag 58).
-        pub fn text(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(58).map(|field| text(field, FieldType::String)).transpose()
-        }
-
-        /// EncodedTextLen (tag 354).
-        pub fn encoded_text_len(&self) -> Result<Option<u64>, DecodeError> {
-            self.get(354).map(|field| uint(field, FieldType::Length)).transpose()
-        }
-
-        /// EncodedText (tag 355).
-        #[must_use]
-        pub fn encoded_text(&self) -> Option<&'a [u8]> {
-            self.get(355).map(|field| field.value)
-        }
-
-        /// SettlDate2 (tag 193).
-        pub fn settl_date2(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(193).map(|field| text(field, FieldType::LocalMktDate)).transpose()
-        }
-
-        /// OrderQty2 (tag 192).
-        pub fn order_qty2(&self) -> Result<Option<Decimal>, DecodeError> {
-            self.get(192).map(|field| decimal(field, FieldType::Qty)).transpose()
-        }
-
-        /// Price2 (tag 640).
-        pub fn price2(&self) -> Result<Option<Decimal>, DecodeError> {
-            self.get(640).map(|field| decimal(field, FieldType::Price)).transpose()
-        }
-
-        /// PositionEffect (tag 77).
-        #[must_use]
-        pub fn position_effect(&self) -> Option<enums::PositionEffect<'a>> {
-            self.get(77).map(|field| enums::PositionEffect::from_bytes(field.value))
-        }
-
-        /// CoveredOrUncovered (tag 203).
-        #[must_use]
-        pub fn covered_or_uncovered(&self) -> Option<enums::CoveredOrUncovered<'a>> {
-            self.get(203).map(|field| enums::CoveredOrUncovered::from_bytes(field.value))
-        }
-
-        /// MaxShow (tag 210).
-        pub fn max_show(&self) -> Result<Option<Decimal>, DecodeError> {
-            self.get(210).map(|field| decimal(field, FieldType::Qty)).transpose()
-        }
-
-        /// TargetStrategy (tag 847).
-        #[must_use]
-        pub fn target_strategy(&self) -> Option<enums::TargetStrategy<'a>> {
-            self.get(847).map(|field| enums::TargetStrategy::from_bytes(field.value))
-        }
-
-        /// TargetStrategyParameters (tag 848).
-        pub fn target_strategy_parameters(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(848).map(|field| text(field, FieldType::String)).transpose()
-        }
-
-        /// ParticipationRate (tag 849).
-        pub fn participation_rate(&self) -> Result<Option<Decimal>, DecodeError> {
-            self.get(849).map(|field| decimal(field, FieldType::Percentage)).transpose()
-        }
-
-        /// CancellationRights (tag 480).
-        #[must_use]
-        pub fn cancellation_rights(&self) -> Option<enums::CancellationRights<'a>> {
-            self.get(480).map(|field| enums::CancellationRights::from_bytes(field.value))
-        }
-
-        /// MoneyLaunderingStatus (tag 481).
-        #[must_use]
-        pub fn money_laundering_status(&self) -> Option<enums::MoneyLaunderingStatus<'a>> {
-            self.get(481).map(|field| enums::MoneyLaunderingStatus::from_bytes(field.value))
-        }
-
-        /// RegistID (tag 513).
-        pub fn regist_id(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(513).map(|field| text(field, FieldType::String)).transpose()
-        }
-
-        /// Designation (tag 494).
-        pub fn designation(&self) -> Result<Option<&'a str>, DecodeError> {
-            self.get(494).map(|field| text(field, FieldType::String)).transpose()
-        }
-
-        /// NoPartyIDs (tag 453) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_party_ids(&self) -> Result<Option<Entries<'m, 'a, PartiesNoPartyIDsView<'m, 'a>>>, GroupError> {
-            Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 453)?.map(|entries| entries.map(PartiesNoPartyIDsView::wrap as fn(_) -> _)))
-        }
-
-        /// NoAllocs (tag 78) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_allocs(&self) -> Result<Option<Entries<'m, 'a, PreAllocGrpNoAllocsView<'m, 'a>>>, GroupError> {
-            Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 78)?.map(|entries| entries.map(PreAllocGrpNoAllocsView::wrap as fn(_) -> _)))
-        }
-
-        /// NoTradingSessions (tag 386) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_trading_sessions(&self) -> Result<Option<Entries<'m, 'a, TrdgSesGrpNoTradingSessionsView<'m, 'a>>>, GroupError> {
-            Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 386)?.map(|entries| entries.map(TrdgSesGrpNoTradingSessionsView::wrap as fn(_) -> _)))
         }
 
         /// Symbol (tag 55).
@@ -4399,6 +4184,11 @@ pub mod views {
         #[must_use]
         pub fn security_idsource(&self) -> Option<enums::SecurityIDSource<'a>> {
             self.get(22).map(|field| enums::SecurityIDSource::from_bytes(field.value))
+        }
+
+        /// NoSecurityAltID (tag 454) repeating group: its entries in wire order, `None` when absent.
+        pub fn no_security_alt_id(&self) -> Result<Option<Entries<'m, 'a, SecAltIDGrpNoSecurityAltIDView<'m, 'a>>>, GroupError> {
+            Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 454)?.map(|entries| entries.map(SecAltIDGrpNoSecurityAltIDView::wrap as fn(_) -> _)))
         }
 
         /// Product (tag 460).
@@ -4582,6 +4372,11 @@ pub mod views {
             self.get(876).map(|field| text(field, FieldType::String)).transpose()
         }
 
+        /// NoEvents (tag 864) repeating group: its entries in wire order, `None` when absent.
+        pub fn no_events(&self) -> Result<Option<Entries<'m, 'a, EvntGrpNoEventsView<'m, 'a>>>, GroupError> {
+            Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 864)?.map(|entries| entries.map(EvntGrpNoEventsView::wrap as fn(_) -> _)))
+        }
+
         /// DatedDate (tag 873).
         pub fn dated_date(&self) -> Result<Option<&'a str>, DecodeError> {
             self.get(873).map(|field| text(field, FieldType::LocalMktDate)).transpose()
@@ -4590,16 +4385,6 @@ pub mod views {
         /// InterestAccrualDate (tag 874).
         pub fn interest_accrual_date(&self) -> Result<Option<&'a str>, DecodeError> {
             self.get(874).map(|field| text(field, FieldType::LocalMktDate)).transpose()
-        }
-
-        /// NoSecurityAltID (tag 454) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_security_alt_id(&self) -> Result<Option<Entries<'m, 'a, SecAltIDGrpNoSecurityAltIDView<'m, 'a>>>, GroupError> {
-            Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 454)?.map(|entries| entries.map(SecAltIDGrpNoSecurityAltIDView::wrap as fn(_) -> _)))
-        }
-
-        /// NoEvents (tag 864) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_events(&self) -> Result<Option<Entries<'m, 'a, EvntGrpNoEventsView<'m, 'a>>>, GroupError> {
-            Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 864)?.map(|entries| entries.map(EvntGrpNoEventsView::wrap as fn(_) -> _)))
         }
 
         /// AgreementDesc (tag 913).
@@ -4654,9 +4439,35 @@ pub mod views {
             Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 711)?.map(|entries| entries.map(UndInstrmtGrpNoUnderlyingsView::wrap as fn(_) -> _)))
         }
 
+        /// PrevClosePx (tag 140).
+        pub fn prev_close_px(&self) -> Result<Option<Decimal>, DecodeError> {
+            self.get(140).map(|field| decimal(field, FieldType::Price)).transpose()
+        }
+
+        /// Side (tag 54). Required.
+        pub fn side(&self) -> Result<enums::Side<'a>, DecodeError> {
+            required(self.get(54), 54).map(|field| enums::Side::from_bytes(field.value))
+        }
+
+        /// LocateReqd (tag 114).
+        pub fn locate_reqd(&self) -> Result<Option<bool>, DecodeError> {
+            self.get(114).map(|field| boolean(field, FieldType::Boolean)).transpose()
+        }
+
+        /// TransactTime (tag 60). Required.
+        pub fn transact_time(&self) -> Result<&'a str, DecodeError> {
+            text(required(self.get(60), 60)?, FieldType::UtcTimestamp)
+        }
+
         /// NoStipulations (tag 232) repeating group: its entries in wire order, `None` when absent.
         pub fn no_stipulations(&self) -> Result<Option<Entries<'m, 'a, StipulationsNoStipulationsView<'m, 'a>>>, GroupError> {
             Ok(layouts::NEW_ORDER_SINGLE.read(self.msg, 232)?.map(|entries| entries.map(StipulationsNoStipulationsView::wrap as fn(_) -> _)))
+        }
+
+        /// QtyType (tag 854).
+        #[must_use]
+        pub fn qty_type(&self) -> Option<enums::QtyType<'a>> {
+            self.get(854).map(|field| enums::QtyType::from_bytes(field.value))
         }
 
         /// OrderQty (tag 38).
@@ -4683,6 +4494,27 @@ pub mod views {
         /// RoundingModulus (tag 469).
         pub fn rounding_modulus(&self) -> Result<Option<Decimal>, DecodeError> {
             self.get(469).map(|field| decimal(field, FieldType::Float)).transpose()
+        }
+
+        /// OrdType (tag 40). Required.
+        pub fn ord_type(&self) -> Result<enums::OrdType<'a>, DecodeError> {
+            required(self.get(40), 40).map(|field| enums::OrdType::from_bytes(field.value))
+        }
+
+        /// PriceType (tag 423).
+        #[must_use]
+        pub fn price_type(&self) -> Option<enums::PriceType<'a>> {
+            self.get(423).map(|field| enums::PriceType::from_bytes(field.value))
+        }
+
+        /// Price (tag 44).
+        pub fn price(&self) -> Result<Option<Decimal>, DecodeError> {
+            self.get(44).map(|field| decimal(field, FieldType::Price)).transpose()
+        }
+
+        /// StopPx (tag 99).
+        pub fn stop_px(&self) -> Result<Option<Decimal>, DecodeError> {
+            self.get(99).map(|field| decimal(field, FieldType::Price)).transpose()
         }
 
         /// Spread (tag 218).
@@ -4756,6 +4588,58 @@ pub mod views {
             self.get(698).map(|field| int(field, FieldType::Int)).transpose()
         }
 
+        /// Currency (tag 15).
+        pub fn currency(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(15).map(|field| text(field, FieldType::Currency)).transpose()
+        }
+
+        /// ComplianceID (tag 376).
+        pub fn compliance_id(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(376).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// SolicitedFlag (tag 377).
+        pub fn solicited_flag(&self) -> Result<Option<bool>, DecodeError> {
+            self.get(377).map(|field| boolean(field, FieldType::Boolean)).transpose()
+        }
+
+        /// IOIID (tag 23).
+        pub fn ioiid(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(23).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// QuoteID (tag 117).
+        pub fn quote_id(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(117).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// TimeInForce (tag 59).
+        #[must_use]
+        pub fn time_in_force(&self) -> Option<enums::TimeInForce<'a>> {
+            self.get(59).map(|field| enums::TimeInForce::from_bytes(field.value))
+        }
+
+        /// EffectiveTime (tag 168).
+        pub fn effective_time(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(168).map(|field| text(field, FieldType::UtcTimestamp)).transpose()
+        }
+
+        /// ExpireDate (tag 432).
+        pub fn expire_date(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(432).map(|field| text(field, FieldType::LocalMktDate)).transpose()
+        }
+
+        /// ExpireTime (tag 126).
+        pub fn expire_time(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(126).map(|field| text(field, FieldType::UtcTimestamp)).transpose()
+        }
+
+        /// GTBookingInst (tag 427).
+        #[must_use]
+        pub fn gtbooking_inst(&self) -> Option<enums::GTBookingInst<'a>> {
+            self.get(427).map(|field| enums::GTBookingInst::from_bytes(field.value))
+        }
+
         /// Commission (tag 12).
         pub fn commission(&self) -> Result<Option<Decimal>, DecodeError> {
             self.get(12).map(|field| decimal(field, FieldType::Amt)).transpose()
@@ -4776,6 +4660,87 @@ pub mod views {
         #[must_use]
         pub fn fund_renew_waiv(&self) -> Option<enums::FundRenewWaiv<'a>> {
             self.get(497).map(|field| enums::FundRenewWaiv::from_bytes(field.value))
+        }
+
+        /// OrderCapacity (tag 528).
+        #[must_use]
+        pub fn order_capacity(&self) -> Option<enums::OrderCapacity<'a>> {
+            self.get(528).map(|field| enums::OrderCapacity::from_bytes(field.value))
+        }
+
+        /// OrderRestrictions (tag 529).
+        pub fn order_restrictions(&self) -> Result<Option<enums::Tokens<'a, enums::OrderRestrictions<'a>>>, DecodeError> {
+            self.get(529).map(|field| text(field, FieldType::MultipleStringValue).map(|value| enums::OrderRestrictions::tokens(value.as_bytes()))).transpose()
+        }
+
+        /// CustOrderCapacity (tag 582).
+        #[must_use]
+        pub fn cust_order_capacity(&self) -> Option<enums::CustOrderCapacity<'a>> {
+            self.get(582).map(|field| enums::CustOrderCapacity::from_bytes(field.value))
+        }
+
+        /// ForexReq (tag 121).
+        pub fn forex_req(&self) -> Result<Option<bool>, DecodeError> {
+            self.get(121).map(|field| boolean(field, FieldType::Boolean)).transpose()
+        }
+
+        /// SettlCurrency (tag 120).
+        pub fn settl_currency(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(120).map(|field| text(field, FieldType::Currency)).transpose()
+        }
+
+        /// BookingType (tag 775).
+        #[must_use]
+        pub fn booking_type(&self) -> Option<enums::BookingType<'a>> {
+            self.get(775).map(|field| enums::BookingType::from_bytes(field.value))
+        }
+
+        /// Text (tag 58).
+        pub fn text(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(58).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// EncodedTextLen (tag 354).
+        pub fn encoded_text_len(&self) -> Result<Option<u64>, DecodeError> {
+            self.get(354).map(|field| uint(field, FieldType::Length)).transpose()
+        }
+
+        /// EncodedText (tag 355).
+        #[must_use]
+        pub fn encoded_text(&self) -> Option<&'a [u8]> {
+            self.get(355).map(|field| field.value)
+        }
+
+        /// SettlDate2 (tag 193).
+        pub fn settl_date2(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(193).map(|field| text(field, FieldType::LocalMktDate)).transpose()
+        }
+
+        /// OrderQty2 (tag 192).
+        pub fn order_qty2(&self) -> Result<Option<Decimal>, DecodeError> {
+            self.get(192).map(|field| decimal(field, FieldType::Qty)).transpose()
+        }
+
+        /// Price2 (tag 640).
+        pub fn price2(&self) -> Result<Option<Decimal>, DecodeError> {
+            self.get(640).map(|field| decimal(field, FieldType::Price)).transpose()
+        }
+
+        /// PositionEffect (tag 77).
+        #[must_use]
+        pub fn position_effect(&self) -> Option<enums::PositionEffect<'a>> {
+            self.get(77).map(|field| enums::PositionEffect::from_bytes(field.value))
+        }
+
+        /// CoveredOrUncovered (tag 203).
+        #[must_use]
+        pub fn covered_or_uncovered(&self) -> Option<enums::CoveredOrUncovered<'a>> {
+            self.get(203).map(|field| enums::CoveredOrUncovered::from_bytes(field.value))
+        }
+
+        /// MaxShow (tag 210).
+        pub fn max_show(&self) -> Result<Option<Decimal>, DecodeError> {
+            self.get(210).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
 
         /// PegOffsetValue (tag 211).
@@ -4852,6 +4817,44 @@ pub mod views {
         #[must_use]
         pub fn discretion_scope(&self) -> Option<enums::DiscretionScope<'a>> {
             self.get(846).map(|field| enums::DiscretionScope::from_bytes(field.value))
+        }
+
+        /// TargetStrategy (tag 847).
+        #[must_use]
+        pub fn target_strategy(&self) -> Option<enums::TargetStrategy<'a>> {
+            self.get(847).map(|field| enums::TargetStrategy::from_bytes(field.value))
+        }
+
+        /// TargetStrategyParameters (tag 848).
+        pub fn target_strategy_parameters(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(848).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// ParticipationRate (tag 849).
+        pub fn participation_rate(&self) -> Result<Option<Decimal>, DecodeError> {
+            self.get(849).map(|field| decimal(field, FieldType::Percentage)).transpose()
+        }
+
+        /// CancellationRights (tag 480).
+        #[must_use]
+        pub fn cancellation_rights(&self) -> Option<enums::CancellationRights<'a>> {
+            self.get(480).map(|field| enums::CancellationRights::from_bytes(field.value))
+        }
+
+        /// MoneyLaunderingStatus (tag 481).
+        #[must_use]
+        pub fn money_laundering_status(&self) -> Option<enums::MoneyLaunderingStatus<'a>> {
+            self.get(481).map(|field| enums::MoneyLaunderingStatus::from_bytes(field.value))
+        }
+
+        /// RegistID (tag 513).
+        pub fn regist_id(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(513).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// Designation (tag 494).
+        pub fn designation(&self) -> Result<Option<&'a str>, DecodeError> {
+            self.get(494).map(|field| text(field, FieldType::String)).transpose()
         }
     }
 
@@ -5022,14 +5025,14 @@ pub mod views {
             self.entry.get(467).map(|field| text(field, FieldType::String)).transpose()
         }
 
-        /// AllocQty (tag 80).
-        pub fn alloc_qty(&self) -> Result<Option<Decimal>, DecodeError> {
-            self.entry.get(80).map(|field| decimal(field, FieldType::Qty)).transpose()
-        }
-
         /// NoNestedPartyIDs (tag 539) repeating group: its entries in wire order, `None` when absent.
         pub fn no_nested_party_ids(&self) -> Result<Option<Entries<'m, 'a, NestedPartiesNoNestedPartyIDsView<'m, 'a>>>, GroupError> {
             Ok(self.entry.group(539)?.map(|entries| entries.map(NestedPartiesNoNestedPartyIDsView::wrap as fn(_) -> _)))
+        }
+
+        /// AllocQty (tag 80).
+        pub fn alloc_qty(&self) -> Result<Option<Decimal>, DecodeError> {
+            self.entry.get(80).map(|field| decimal(field, FieldType::Qty)).transpose()
         }
     }
 
@@ -5278,6 +5281,11 @@ pub mod views {
             self.entry.get(305).map(|field| text(field, FieldType::String)).transpose()
         }
 
+        /// NoUnderlyingSecurityAltID (tag 457) repeating group: its entries in wire order, `None` when absent.
+        pub fn no_underlying_security_alt_id(&self) -> Result<Option<Entries<'m, 'a, UndSecAltIDGrpNoUnderlyingSecurityAltIDView<'m, 'a>>>, GroupError> {
+            Ok(self.entry.group(457)?.map(|entries| entries.map(UndSecAltIDGrpNoUnderlyingSecurityAltIDView::wrap as fn(_) -> _)))
+        }
+
         /// UnderlyingProduct (tag 462).
         pub fn underlying_product(&self) -> Result<Option<i64>, DecodeError> {
             self.entry.get(462).map(|field| int(field, FieldType::Int)).transpose()
@@ -5485,11 +5493,6 @@ pub mod views {
             self.entry.get(886).map(|field| decimal(field, FieldType::Amt)).transpose()
         }
 
-        /// NoUnderlyingSecurityAltID (tag 457) repeating group: its entries in wire order, `None` when absent.
-        pub fn no_underlying_security_alt_id(&self) -> Result<Option<Entries<'m, 'a, UndSecAltIDGrpNoUnderlyingSecurityAltIDView<'m, 'a>>>, GroupError> {
-            Ok(self.entry.group(457)?.map(|entries| entries.map(UndSecAltIDGrpNoUnderlyingSecurityAltIDView::wrap as fn(_) -> _)))
-        }
-
         /// NoUnderlyingStips (tag 887) repeating group: its entries in wire order, `None` when absent.
         pub fn no_underlying_stips(&self) -> Result<Option<Entries<'m, 'a, UnderlyingStipulationsNoUnderlyingStipsView<'m, 'a>>>, GroupError> {
             Ok(self.entry.group(887)?.map(|entries| entries.map(UnderlyingStipulationsNoUnderlyingStipsView::wrap as fn(_) -> _)))
@@ -5608,9 +5611,10 @@ pub mod views {
 /// Typed writers of message bodies, to any [`Sink`](writers::Sink): a `FnMut(u32, &[u8])`
 /// closure, or a target that frames LENGTH/DATA pairs itself.
 ///
-/// Fields are written in dictionary order; a repeating group as its count, then each entry with its
-/// delimiter first. Every value is checked before anything is written. Numbers are formatted on
-/// the stack; only a multi-value field allocates, to join its values.
+/// Fields are written in the order the dictionary (XML) lists them, components in place; a repeating
+/// group as its count, then each entry with its delimiter first and its other members in XML order.
+/// Every value is checked before anything is written. Numbers are formatted on the stack; only a
+/// multi-value field allocates, to join its values.
 pub mod writers {
     use ::ironfix_core::error::EncodeError;
     use ::rust_decimal::Decimal;
@@ -5779,8 +5783,8 @@ pub mod writers {
     }
 
     impl HeartbeatFields<'_> {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -5798,7 +5802,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.test_req_id { sink.field(112, value.as_bytes()); }
             Ok(())
@@ -5820,14 +5824,14 @@ pub mod writers {
         pub next_expected_msg_seq_num: Option<u64>,
         /// MaxMessageSize (tag 383).
         pub max_message_size: Option<u64>,
+        /// NoMsgTypes (tag 384) repeating group: one item per entry, empty when absent.
+        pub no_msg_types: &'v [LogonNoMsgTypesFields<'v>],
         /// TestMessageIndicator (tag 464).
         pub test_message_indicator: Option<bool>,
         /// Username (tag 553).
         pub username: Option<&'v str>,
         /// Password (tag 554).
         pub password: Option<&'v str>,
-        /// NoMsgTypes (tag 384) repeating group: one item per entry, empty when absent.
-        pub no_msg_types: &'v [LogonNoMsgTypesFields<'v>],
     }
 
     impl ::core::fmt::Debug for LogonFields<'_> {
@@ -5837,8 +5841,8 @@ pub mod writers {
     }
 
     impl LogonFields<'_> {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -5856,15 +5860,15 @@ pub mod writers {
             check_text(self.encrypt_method.map(|value| value.as_bytes()), 98)?;
             present(self.heart_bt_int.is_some(), 108)?;
             check_data(self.raw_data, 96)?;
-            check_text(self.username.map(str::as_bytes), 553)?;
-            check_text(self.password.map(str::as_bytes), 554)?;
             for entry in self.no_msg_types {
                 entry.check()?;
             }
+            check_text(self.username.map(str::as_bytes), 553)?;
+            check_text(self.password.map(str::as_bytes), 554)?;
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.encrypt_method { sink.field(98, value.as_bytes()); }
             if let Some(value) = self.heart_bt_int { put_display(sink, 108, value)?; }
@@ -5872,15 +5876,15 @@ pub mod writers {
             if let Some(value) = self.reset_seq_num_flag { sink.field(141, if value { b"Y" } else { b"N" }); }
             if let Some(value) = self.next_expected_msg_seq_num { put_display(sink, 789, value)?; }
             if let Some(value) = self.max_message_size { put_display(sink, 383, value)?; }
-            if let Some(value) = self.test_message_indicator { sink.field(464, if value { b"Y" } else { b"N" }); }
-            if let Some(value) = self.username { sink.field(553, value.as_bytes()); }
-            if let Some(value) = self.password { sink.field(554, value.as_bytes()); }
             if !self.no_msg_types.is_empty() {
                 put_display(sink, 384, self.no_msg_types.len())?;
                 for entry in self.no_msg_types {
                     entry.emit(sink)?;
                 }
             }
+            if let Some(value) = self.test_message_indicator { sink.field(464, if value { b"Y" } else { b"N" }); }
+            if let Some(value) = self.username { sink.field(553, value.as_bytes()); }
+            if let Some(value) = self.password { sink.field(554, value.as_bytes()); }
             Ok(())
         }
     }
@@ -5894,6 +5898,8 @@ pub mod writers {
         pub secondary_cl_ord_id: Option<&'v str>,
         /// ClOrdLinkID (tag 583).
         pub cl_ord_link_id: Option<&'v str>,
+        /// NoPartyIDs (tag 453) repeating group: one item per entry, empty when absent.
+        pub no_party_ids: &'v [PartiesNoPartyIDsFields<'v>],
         /// TradeOriginationDate (tag 229).
         pub trade_origination_date: Option<&'v str>,
         /// TradeDate (tag 75).
@@ -5912,6 +5918,8 @@ pub mod writers {
         pub prealloc_method: Option<enums::PreallocMethod<'v>>,
         /// AllocID (tag 70).
         pub alloc_id: Option<&'v str>,
+        /// NoAllocs (tag 78) repeating group: one item per entry, empty when absent.
+        pub no_allocs: &'v [PreAllocGrpNoAllocsFields<'v>],
         /// SettlType (tag 63).
         pub settl_type: Option<enums::SettlType<'v>>,
         /// SettlDate (tag 64).
@@ -5930,94 +5938,10 @@ pub mod writers {
         pub max_floor: Option<Decimal>,
         /// ExDestination (tag 100).
         pub ex_destination: Option<&'v str>,
-        /// ProcessCode (tag 81).
-        pub process_code: Option<enums::ProcessCode<'v>>,
-        /// PrevClosePx (tag 140).
-        pub prev_close_px: Option<Decimal>,
-        /// Side (tag 54). Required.
-        pub side: Option<enums::Side<'v>>,
-        /// LocateReqd (tag 114).
-        pub locate_reqd: Option<bool>,
-        /// TransactTime (tag 60). Required.
-        pub transact_time: Option<&'v str>,
-        /// QtyType (tag 854).
-        pub qty_type: Option<enums::QtyType<'v>>,
-        /// OrdType (tag 40). Required.
-        pub ord_type: Option<enums::OrdType<'v>>,
-        /// PriceType (tag 423).
-        pub price_type: Option<enums::PriceType<'v>>,
-        /// Price (tag 44).
-        pub price: Option<Decimal>,
-        /// StopPx (tag 99).
-        pub stop_px: Option<Decimal>,
-        /// Currency (tag 15).
-        pub currency: Option<&'v str>,
-        /// ComplianceID (tag 376).
-        pub compliance_id: Option<&'v str>,
-        /// SolicitedFlag (tag 377).
-        pub solicited_flag: Option<bool>,
-        /// IOIID (tag 23).
-        pub ioiid: Option<&'v str>,
-        /// QuoteID (tag 117).
-        pub quote_id: Option<&'v str>,
-        /// TimeInForce (tag 59).
-        pub time_in_force: Option<enums::TimeInForce<'v>>,
-        /// EffectiveTime (tag 168).
-        pub effective_time: Option<&'v str>,
-        /// ExpireDate (tag 432).
-        pub expire_date: Option<&'v str>,
-        /// ExpireTime (tag 126).
-        pub expire_time: Option<&'v str>,
-        /// GTBookingInst (tag 427).
-        pub gtbooking_inst: Option<enums::GTBookingInst<'v>>,
-        /// OrderCapacity (tag 528).
-        pub order_capacity: Option<enums::OrderCapacity<'v>>,
-        /// OrderRestrictions (tag 529). Empty when absent.
-        pub order_restrictions: &'v [enums::OrderRestrictions<'v>],
-        /// CustOrderCapacity (tag 582).
-        pub cust_order_capacity: Option<enums::CustOrderCapacity<'v>>,
-        /// ForexReq (tag 121).
-        pub forex_req: Option<bool>,
-        /// SettlCurrency (tag 120).
-        pub settl_currency: Option<&'v str>,
-        /// BookingType (tag 775).
-        pub booking_type: Option<enums::BookingType<'v>>,
-        /// Text (tag 58).
-        pub text: Option<&'v str>,
-        /// EncodedText (tag 355). Written with its length (tag 354), which is derived from it.
-        pub encoded_text: Option<&'v [u8]>,
-        /// SettlDate2 (tag 193).
-        pub settl_date2: Option<&'v str>,
-        /// OrderQty2 (tag 192).
-        pub order_qty2: Option<Decimal>,
-        /// Price2 (tag 640).
-        pub price2: Option<Decimal>,
-        /// PositionEffect (tag 77).
-        pub position_effect: Option<enums::PositionEffect<'v>>,
-        /// CoveredOrUncovered (tag 203).
-        pub covered_or_uncovered: Option<enums::CoveredOrUncovered<'v>>,
-        /// MaxShow (tag 210).
-        pub max_show: Option<Decimal>,
-        /// TargetStrategy (tag 847).
-        pub target_strategy: Option<enums::TargetStrategy<'v>>,
-        /// TargetStrategyParameters (tag 848).
-        pub target_strategy_parameters: Option<&'v str>,
-        /// ParticipationRate (tag 849).
-        pub participation_rate: Option<Decimal>,
-        /// CancellationRights (tag 480).
-        pub cancellation_rights: Option<enums::CancellationRights<'v>>,
-        /// MoneyLaunderingStatus (tag 481).
-        pub money_laundering_status: Option<enums::MoneyLaunderingStatus<'v>>,
-        /// RegistID (tag 513).
-        pub regist_id: Option<&'v str>,
-        /// Designation (tag 494).
-        pub designation: Option<&'v str>,
-        /// NoPartyIDs (tag 453) repeating group: one item per entry, empty when absent.
-        pub no_party_ids: &'v [PartiesNoPartyIDsFields<'v>],
-        /// NoAllocs (tag 78) repeating group: one item per entry, empty when absent.
-        pub no_allocs: &'v [PreAllocGrpNoAllocsFields<'v>],
         /// NoTradingSessions (tag 386) repeating group: one item per entry, empty when absent.
         pub no_trading_sessions: &'v [TrdgSesGrpNoTradingSessionsFields<'v>],
+        /// ProcessCode (tag 81).
+        pub process_code: Option<enums::ProcessCode<'v>>,
         /// Symbol (tag 55).
         pub symbol: Option<&'v str>,
         /// SymbolSfx (tag 65).
@@ -6026,6 +5950,8 @@ pub mod writers {
         pub security_id: Option<&'v str>,
         /// SecurityIDSource (tag 22).
         pub security_idsource: Option<enums::SecurityIDSource<'v>>,
+        /// NoSecurityAltID (tag 454) repeating group: one item per entry, empty when absent.
+        pub no_security_alt_id: &'v [SecAltIDGrpNoSecurityAltIDFields<'v>],
         /// Product (tag 460).
         pub product: Option<enums::Product<'v>>,
         /// CFICode (tag 461).
@@ -6092,14 +6018,12 @@ pub mod writers {
         pub cpprogram: Option<enums::CPProgram<'v>>,
         /// CPRegType (tag 876).
         pub cpreg_type: Option<&'v str>,
+        /// NoEvents (tag 864) repeating group: one item per entry, empty when absent.
+        pub no_events: &'v [EvntGrpNoEventsFields<'v>],
         /// DatedDate (tag 873).
         pub dated_date: Option<&'v str>,
         /// InterestAccrualDate (tag 874).
         pub interest_accrual_date: Option<&'v str>,
-        /// NoSecurityAltID (tag 454) repeating group: one item per entry, empty when absent.
-        pub no_security_alt_id: &'v [SecAltIDGrpNoSecurityAltIDFields<'v>],
-        /// NoEvents (tag 864) repeating group: one item per entry, empty when absent.
-        pub no_events: &'v [EvntGrpNoEventsFields<'v>],
         /// AgreementDesc (tag 913).
         pub agreement_desc: Option<&'v str>,
         /// AgreementID (tag 914).
@@ -6120,8 +6044,18 @@ pub mod writers {
         pub margin_ratio: Option<Decimal>,
         /// NoUnderlyings (tag 711) repeating group: one item per entry, empty when absent.
         pub no_underlyings: &'v [UndInstrmtGrpNoUnderlyingsFields<'v>],
+        /// PrevClosePx (tag 140).
+        pub prev_close_px: Option<Decimal>,
+        /// Side (tag 54). Required.
+        pub side: Option<enums::Side<'v>>,
+        /// LocateReqd (tag 114).
+        pub locate_reqd: Option<bool>,
+        /// TransactTime (tag 60). Required.
+        pub transact_time: Option<&'v str>,
         /// NoStipulations (tag 232) repeating group: one item per entry, empty when absent.
         pub no_stipulations: &'v [StipulationsNoStipulationsFields<'v>],
+        /// QtyType (tag 854).
+        pub qty_type: Option<enums::QtyType<'v>>,
         /// OrderQty (tag 38).
         pub order_qty: Option<Decimal>,
         /// CashOrderQty (tag 152).
@@ -6132,6 +6066,14 @@ pub mod writers {
         pub rounding_direction: Option<enums::RoundingDirection<'v>>,
         /// RoundingModulus (tag 469).
         pub rounding_modulus: Option<Decimal>,
+        /// OrdType (tag 40). Required.
+        pub ord_type: Option<enums::OrdType<'v>>,
+        /// PriceType (tag 423).
+        pub price_type: Option<enums::PriceType<'v>>,
+        /// Price (tag 44).
+        pub price: Option<Decimal>,
+        /// StopPx (tag 99).
+        pub stop_px: Option<Decimal>,
         /// Spread (tag 218).
         pub spread: Option<Decimal>,
         /// BenchmarkCurveCurrency (tag 220).
@@ -6160,6 +6102,26 @@ pub mod writers {
         pub yield_redemption_price: Option<Decimal>,
         /// YieldRedemptionPriceType (tag 698).
         pub yield_redemption_price_type: Option<i64>,
+        /// Currency (tag 15).
+        pub currency: Option<&'v str>,
+        /// ComplianceID (tag 376).
+        pub compliance_id: Option<&'v str>,
+        /// SolicitedFlag (tag 377).
+        pub solicited_flag: Option<bool>,
+        /// IOIID (tag 23).
+        pub ioiid: Option<&'v str>,
+        /// QuoteID (tag 117).
+        pub quote_id: Option<&'v str>,
+        /// TimeInForce (tag 59).
+        pub time_in_force: Option<enums::TimeInForce<'v>>,
+        /// EffectiveTime (tag 168).
+        pub effective_time: Option<&'v str>,
+        /// ExpireDate (tag 432).
+        pub expire_date: Option<&'v str>,
+        /// ExpireTime (tag 126).
+        pub expire_time: Option<&'v str>,
+        /// GTBookingInst (tag 427).
+        pub gtbooking_inst: Option<enums::GTBookingInst<'v>>,
         /// Commission (tag 12).
         pub commission: Option<Decimal>,
         /// CommType (tag 13).
@@ -6168,6 +6130,34 @@ pub mod writers {
         pub comm_currency: Option<&'v str>,
         /// FundRenewWaiv (tag 497).
         pub fund_renew_waiv: Option<enums::FundRenewWaiv<'v>>,
+        /// OrderCapacity (tag 528).
+        pub order_capacity: Option<enums::OrderCapacity<'v>>,
+        /// OrderRestrictions (tag 529). Empty when absent.
+        pub order_restrictions: &'v [enums::OrderRestrictions<'v>],
+        /// CustOrderCapacity (tag 582).
+        pub cust_order_capacity: Option<enums::CustOrderCapacity<'v>>,
+        /// ForexReq (tag 121).
+        pub forex_req: Option<bool>,
+        /// SettlCurrency (tag 120).
+        pub settl_currency: Option<&'v str>,
+        /// BookingType (tag 775).
+        pub booking_type: Option<enums::BookingType<'v>>,
+        /// Text (tag 58).
+        pub text: Option<&'v str>,
+        /// EncodedText (tag 355). Written with its length (tag 354), which is derived from it.
+        pub encoded_text: Option<&'v [u8]>,
+        /// SettlDate2 (tag 193).
+        pub settl_date2: Option<&'v str>,
+        /// OrderQty2 (tag 192).
+        pub order_qty2: Option<Decimal>,
+        /// Price2 (tag 640).
+        pub price2: Option<Decimal>,
+        /// PositionEffect (tag 77).
+        pub position_effect: Option<enums::PositionEffect<'v>>,
+        /// CoveredOrUncovered (tag 203).
+        pub covered_or_uncovered: Option<enums::CoveredOrUncovered<'v>>,
+        /// MaxShow (tag 210).
+        pub max_show: Option<Decimal>,
         /// PegOffsetValue (tag 211).
         pub peg_offset_value: Option<Decimal>,
         /// PegMoveType (tag 835).
@@ -6194,6 +6184,20 @@ pub mod writers {
         pub discretion_round_direction: Option<enums::DiscretionRoundDirection<'v>>,
         /// DiscretionScope (tag 846).
         pub discretion_scope: Option<enums::DiscretionScope<'v>>,
+        /// TargetStrategy (tag 847).
+        pub target_strategy: Option<enums::TargetStrategy<'v>>,
+        /// TargetStrategyParameters (tag 848).
+        pub target_strategy_parameters: Option<&'v str>,
+        /// ParticipationRate (tag 849).
+        pub participation_rate: Option<Decimal>,
+        /// CancellationRights (tag 480).
+        pub cancellation_rights: Option<enums::CancellationRights<'v>>,
+        /// MoneyLaunderingStatus (tag 481).
+        pub money_laundering_status: Option<enums::MoneyLaunderingStatus<'v>>,
+        /// RegistID (tag 513).
+        pub regist_id: Option<&'v str>,
+        /// Designation (tag 494).
+        pub designation: Option<&'v str>,
     }
 
     impl ::core::fmt::Debug for NewOrderSingleFields<'_> {
@@ -6203,8 +6207,8 @@ pub mod writers {
     }
 
     impl NewOrderSingleFields<'_> {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -6222,6 +6226,9 @@ pub mod writers {
             check_text(self.cl_ord_id.map(str::as_bytes), 11)?;
             check_text(self.secondary_cl_ord_id.map(str::as_bytes), 526)?;
             check_text(self.cl_ord_link_id.map(str::as_bytes), 583)?;
+            for entry in self.no_party_ids {
+                entry.check()?;
+            }
             check_text(self.trade_origination_date.map(str::as_bytes), 229)?;
             check_text(self.trade_date.map(str::as_bytes), 75)?;
             check_text(self.account.map(str::as_bytes), 1)?;
@@ -6231,6 +6238,9 @@ pub mod writers {
             check_text(self.booking_unit.map(|value| value.as_bytes()), 590)?;
             check_text(self.prealloc_method.map(|value| value.as_bytes()), 591)?;
             check_text(self.alloc_id.map(str::as_bytes), 70)?;
+            for entry in self.no_allocs {
+                entry.check()?;
+            }
             check_text(self.settl_type.map(|value| value.as_bytes()), 63)?;
             check_text(self.settl_date.map(str::as_bytes), 64)?;
             check_text(self.cash_margin.map(|value| value.as_bytes()), 544)?;
@@ -6240,55 +6250,17 @@ pub mod writers {
                 check_token(value.as_bytes(), 18)?;
             }
             check_text(self.ex_destination.map(str::as_bytes), 100)?;
-            check_text(self.process_code.map(|value| value.as_bytes()), 81)?;
-            present(self.side.is_some(), 54)?;
-            check_text(self.side.map(|value| value.as_bytes()), 54)?;
-            present(self.transact_time.is_some(), 60)?;
-            check_text(self.transact_time.map(str::as_bytes), 60)?;
-            check_text(self.qty_type.map(|value| value.as_bytes()), 854)?;
-            present(self.ord_type.is_some(), 40)?;
-            check_text(self.ord_type.map(|value| value.as_bytes()), 40)?;
-            check_text(self.price_type.map(|value| value.as_bytes()), 423)?;
-            check_text(self.currency.map(str::as_bytes), 15)?;
-            check_text(self.compliance_id.map(str::as_bytes), 376)?;
-            check_text(self.ioiid.map(str::as_bytes), 23)?;
-            check_text(self.quote_id.map(str::as_bytes), 117)?;
-            check_text(self.time_in_force.map(|value| value.as_bytes()), 59)?;
-            check_text(self.effective_time.map(str::as_bytes), 168)?;
-            check_text(self.expire_date.map(str::as_bytes), 432)?;
-            check_text(self.expire_time.map(str::as_bytes), 126)?;
-            check_text(self.gtbooking_inst.map(|value| value.as_bytes()), 427)?;
-            check_text(self.order_capacity.map(|value| value.as_bytes()), 528)?;
-            for value in self.order_restrictions {
-                check_token(value.as_bytes(), 529)?;
-            }
-            check_text(self.cust_order_capacity.map(|value| value.as_bytes()), 582)?;
-            check_text(self.settl_currency.map(str::as_bytes), 120)?;
-            check_text(self.booking_type.map(|value| value.as_bytes()), 775)?;
-            check_text(self.text.map(str::as_bytes), 58)?;
-            check_data(self.encoded_text, 355)?;
-            check_text(self.settl_date2.map(str::as_bytes), 193)?;
-            check_text(self.position_effect.map(|value| value.as_bytes()), 77)?;
-            check_text(self.covered_or_uncovered.map(|value| value.as_bytes()), 203)?;
-            check_text(self.target_strategy.map(|value| value.as_bytes()), 847)?;
-            check_text(self.target_strategy_parameters.map(str::as_bytes), 848)?;
-            check_text(self.cancellation_rights.map(|value| value.as_bytes()), 480)?;
-            check_text(self.money_laundering_status.map(|value| value.as_bytes()), 481)?;
-            check_text(self.regist_id.map(str::as_bytes), 513)?;
-            check_text(self.designation.map(str::as_bytes), 494)?;
-            for entry in self.no_party_ids {
-                entry.check()?;
-            }
-            for entry in self.no_allocs {
-                entry.check()?;
-            }
             for entry in self.no_trading_sessions {
                 entry.check()?;
             }
+            check_text(self.process_code.map(|value| value.as_bytes()), 81)?;
             check_text(self.symbol.map(str::as_bytes), 55)?;
             check_text(self.symbol_sfx.map(str::as_bytes), 65)?;
             check_text(self.security_id.map(str::as_bytes), 48)?;
             check_text(self.security_idsource.map(|value| value.as_bytes()), 22)?;
+            for entry in self.no_security_alt_id {
+                entry.check()?;
+            }
             check_text(self.product.map(|value| value.as_bytes()), 460)?;
             check_text(self.cficode.map(str::as_bytes), 461)?;
             check_text(self.security_type.map(|value| value.as_bytes()), 167)?;
@@ -6316,14 +6288,11 @@ pub mod writers {
             check_text(self.contract_settl_month.map(str::as_bytes), 667)?;
             check_text(self.cpprogram.map(|value| value.as_bytes()), 875)?;
             check_text(self.cpreg_type.map(str::as_bytes), 876)?;
-            check_text(self.dated_date.map(str::as_bytes), 873)?;
-            check_text(self.interest_accrual_date.map(str::as_bytes), 874)?;
-            for entry in self.no_security_alt_id {
-                entry.check()?;
-            }
             for entry in self.no_events {
                 entry.check()?;
             }
+            check_text(self.dated_date.map(str::as_bytes), 873)?;
+            check_text(self.interest_accrual_date.map(str::as_bytes), 874)?;
             check_text(self.agreement_desc.map(str::as_bytes), 913)?;
             check_text(self.agreement_id.map(str::as_bytes), 914)?;
             check_text(self.agreement_date.map(str::as_bytes), 915)?;
@@ -6335,10 +6304,18 @@ pub mod writers {
             for entry in self.no_underlyings {
                 entry.check()?;
             }
+            present(self.side.is_some(), 54)?;
+            check_text(self.side.map(|value| value.as_bytes()), 54)?;
+            present(self.transact_time.is_some(), 60)?;
+            check_text(self.transact_time.map(str::as_bytes), 60)?;
             for entry in self.no_stipulations {
                 entry.check()?;
             }
+            check_text(self.qty_type.map(|value| value.as_bytes()), 854)?;
             check_text(self.rounding_direction.map(|value| value.as_bytes()), 468)?;
+            present(self.ord_type.is_some(), 40)?;
+            check_text(self.ord_type.map(|value| value.as_bytes()), 40)?;
+            check_text(self.price_type.map(|value| value.as_bytes()), 423)?;
             check_text(self.benchmark_curve_currency.map(str::as_bytes), 220)?;
             check_text(self.benchmark_curve_name.map(str::as_bytes), 221)?;
             check_text(self.benchmark_curve_point.map(str::as_bytes), 222)?;
@@ -6347,9 +6324,30 @@ pub mod writers {
             check_text(self.yield_type.map(|value| value.as_bytes()), 235)?;
             check_text(self.yield_calc_date.map(str::as_bytes), 701)?;
             check_text(self.yield_redemption_date.map(str::as_bytes), 696)?;
+            check_text(self.currency.map(str::as_bytes), 15)?;
+            check_text(self.compliance_id.map(str::as_bytes), 376)?;
+            check_text(self.ioiid.map(str::as_bytes), 23)?;
+            check_text(self.quote_id.map(str::as_bytes), 117)?;
+            check_text(self.time_in_force.map(|value| value.as_bytes()), 59)?;
+            check_text(self.effective_time.map(str::as_bytes), 168)?;
+            check_text(self.expire_date.map(str::as_bytes), 432)?;
+            check_text(self.expire_time.map(str::as_bytes), 126)?;
+            check_text(self.gtbooking_inst.map(|value| value.as_bytes()), 427)?;
             check_text(self.comm_type.map(|value| value.as_bytes()), 13)?;
             check_text(self.comm_currency.map(str::as_bytes), 479)?;
             check_text(self.fund_renew_waiv.map(|value| value.as_bytes()), 497)?;
+            check_text(self.order_capacity.map(|value| value.as_bytes()), 528)?;
+            for value in self.order_restrictions {
+                check_token(value.as_bytes(), 529)?;
+            }
+            check_text(self.cust_order_capacity.map(|value| value.as_bytes()), 582)?;
+            check_text(self.settl_currency.map(str::as_bytes), 120)?;
+            check_text(self.booking_type.map(|value| value.as_bytes()), 775)?;
+            check_text(self.text.map(str::as_bytes), 58)?;
+            check_data(self.encoded_text, 355)?;
+            check_text(self.settl_date2.map(str::as_bytes), 193)?;
+            check_text(self.position_effect.map(|value| value.as_bytes()), 77)?;
+            check_text(self.covered_or_uncovered.map(|value| value.as_bytes()), 203)?;
             check_text(self.peg_move_type.map(|value| value.as_bytes()), 835)?;
             check_text(self.peg_offset_type.map(|value| value.as_bytes()), 836)?;
             check_text(self.peg_limit_type.map(|value| value.as_bytes()), 837)?;
@@ -6361,14 +6359,26 @@ pub mod writers {
             check_text(self.discretion_limit_type.map(|value| value.as_bytes()), 843)?;
             check_text(self.discretion_round_direction.map(|value| value.as_bytes()), 844)?;
             check_text(self.discretion_scope.map(|value| value.as_bytes()), 846)?;
+            check_text(self.target_strategy.map(|value| value.as_bytes()), 847)?;
+            check_text(self.target_strategy_parameters.map(str::as_bytes), 848)?;
+            check_text(self.cancellation_rights.map(|value| value.as_bytes()), 480)?;
+            check_text(self.money_laundering_status.map(|value| value.as_bytes()), 481)?;
+            check_text(self.regist_id.map(str::as_bytes), 513)?;
+            check_text(self.designation.map(str::as_bytes), 494)?;
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.cl_ord_id { sink.field(11, value.as_bytes()); }
             if let Some(value) = self.secondary_cl_ord_id { sink.field(526, value.as_bytes()); }
             if let Some(value) = self.cl_ord_link_id { sink.field(583, value.as_bytes()); }
+            if !self.no_party_ids.is_empty() {
+                put_display(sink, 453, self.no_party_ids.len())?;
+                for entry in self.no_party_ids {
+                    entry.emit(sink)?;
+                }
+            }
             if let Some(value) = self.trade_origination_date { sink.field(229, value.as_bytes()); }
             if let Some(value) = self.trade_date { sink.field(75, value.as_bytes()); }
             if let Some(value) = self.account { sink.field(1, value.as_bytes()); }
@@ -6378,6 +6388,12 @@ pub mod writers {
             if let Some(value) = self.booking_unit { sink.field(590, value.as_bytes()); }
             if let Some(value) = self.prealloc_method { sink.field(591, value.as_bytes()); }
             if let Some(value) = self.alloc_id { sink.field(70, value.as_bytes()); }
+            if !self.no_allocs.is_empty() {
+                put_display(sink, 78, self.no_allocs.len())?;
+                for entry in self.no_allocs {
+                    entry.emit(sink)?;
+                }
+            }
             if let Some(value) = self.settl_type { sink.field(63, value.as_bytes()); }
             if let Some(value) = self.settl_date { sink.field(64, value.as_bytes()); }
             if let Some(value) = self.cash_margin { sink.field(544, value.as_bytes()); }
@@ -6387,69 +6403,23 @@ pub mod writers {
             if let Some(value) = self.min_qty { put_display(sink, 110, value)?; }
             if let Some(value) = self.max_floor { put_display(sink, 111, value)?; }
             if let Some(value) = self.ex_destination { sink.field(100, value.as_bytes()); }
-            if let Some(value) = self.process_code { sink.field(81, value.as_bytes()); }
-            if let Some(value) = self.prev_close_px { put_display(sink, 140, value)?; }
-            if let Some(value) = self.side { sink.field(54, value.as_bytes()); }
-            if let Some(value) = self.locate_reqd { sink.field(114, if value { b"Y" } else { b"N" }); }
-            if let Some(value) = self.transact_time { sink.field(60, value.as_bytes()); }
-            if let Some(value) = self.qty_type { sink.field(854, value.as_bytes()); }
-            if let Some(value) = self.ord_type { sink.field(40, value.as_bytes()); }
-            if let Some(value) = self.price_type { sink.field(423, value.as_bytes()); }
-            if let Some(value) = self.price { put_display(sink, 44, value)?; }
-            if let Some(value) = self.stop_px { put_display(sink, 99, value)?; }
-            if let Some(value) = self.currency { sink.field(15, value.as_bytes()); }
-            if let Some(value) = self.compliance_id { sink.field(376, value.as_bytes()); }
-            if let Some(value) = self.solicited_flag { sink.field(377, if value { b"Y" } else { b"N" }); }
-            if let Some(value) = self.ioiid { sink.field(23, value.as_bytes()); }
-            if let Some(value) = self.quote_id { sink.field(117, value.as_bytes()); }
-            if let Some(value) = self.time_in_force { sink.field(59, value.as_bytes()); }
-            if let Some(value) = self.effective_time { sink.field(168, value.as_bytes()); }
-            if let Some(value) = self.expire_date { sink.field(432, value.as_bytes()); }
-            if let Some(value) = self.expire_time { sink.field(126, value.as_bytes()); }
-            if let Some(value) = self.gtbooking_inst { sink.field(427, value.as_bytes()); }
-            if let Some(value) = self.order_capacity { sink.field(528, value.as_bytes()); }
-            if !self.order_restrictions.is_empty() { sink.field(529, &enums::OrderRestrictions::join(self.order_restrictions)); }
-            if let Some(value) = self.cust_order_capacity { sink.field(582, value.as_bytes()); }
-            if let Some(value) = self.forex_req { sink.field(121, if value { b"Y" } else { b"N" }); }
-            if let Some(value) = self.settl_currency { sink.field(120, value.as_bytes()); }
-            if let Some(value) = self.booking_type { sink.field(775, value.as_bytes()); }
-            if let Some(value) = self.text { sink.field(58, value.as_bytes()); }
-            if let Some(value) = self.encoded_text { sink.data(354, 355, value); }
-            if let Some(value) = self.settl_date2 { sink.field(193, value.as_bytes()); }
-            if let Some(value) = self.order_qty2 { put_display(sink, 192, value)?; }
-            if let Some(value) = self.price2 { put_display(sink, 640, value)?; }
-            if let Some(value) = self.position_effect { sink.field(77, value.as_bytes()); }
-            if let Some(value) = self.covered_or_uncovered { sink.field(203, value.as_bytes()); }
-            if let Some(value) = self.max_show { put_display(sink, 210, value)?; }
-            if let Some(value) = self.target_strategy { sink.field(847, value.as_bytes()); }
-            if let Some(value) = self.target_strategy_parameters { sink.field(848, value.as_bytes()); }
-            if let Some(value) = self.participation_rate { put_display(sink, 849, value)?; }
-            if let Some(value) = self.cancellation_rights { sink.field(480, value.as_bytes()); }
-            if let Some(value) = self.money_laundering_status { sink.field(481, value.as_bytes()); }
-            if let Some(value) = self.regist_id { sink.field(513, value.as_bytes()); }
-            if let Some(value) = self.designation { sink.field(494, value.as_bytes()); }
-            if !self.no_party_ids.is_empty() {
-                put_display(sink, 453, self.no_party_ids.len())?;
-                for entry in self.no_party_ids {
-                    entry.emit(sink)?;
-                }
-            }
-            if !self.no_allocs.is_empty() {
-                put_display(sink, 78, self.no_allocs.len())?;
-                for entry in self.no_allocs {
-                    entry.emit(sink)?;
-                }
-            }
             if !self.no_trading_sessions.is_empty() {
                 put_display(sink, 386, self.no_trading_sessions.len())?;
                 for entry in self.no_trading_sessions {
                     entry.emit(sink)?;
                 }
             }
+            if let Some(value) = self.process_code { sink.field(81, value.as_bytes()); }
             if let Some(value) = self.symbol { sink.field(55, value.as_bytes()); }
             if let Some(value) = self.symbol_sfx { sink.field(65, value.as_bytes()); }
             if let Some(value) = self.security_id { sink.field(48, value.as_bytes()); }
             if let Some(value) = self.security_idsource { sink.field(22, value.as_bytes()); }
+            if !self.no_security_alt_id.is_empty() {
+                put_display(sink, 454, self.no_security_alt_id.len())?;
+                for entry in self.no_security_alt_id {
+                    entry.emit(sink)?;
+                }
+            }
             if let Some(value) = self.product { sink.field(460, value.as_bytes()); }
             if let Some(value) = self.cficode { sink.field(461, value.as_bytes()); }
             if let Some(value) = self.security_type { sink.field(167, value.as_bytes()); }
@@ -6483,20 +6453,14 @@ pub mod writers {
             if let Some(value) = self.contract_settl_month { sink.field(667, value.as_bytes()); }
             if let Some(value) = self.cpprogram { sink.field(875, value.as_bytes()); }
             if let Some(value) = self.cpreg_type { sink.field(876, value.as_bytes()); }
-            if let Some(value) = self.dated_date { sink.field(873, value.as_bytes()); }
-            if let Some(value) = self.interest_accrual_date { sink.field(874, value.as_bytes()); }
-            if !self.no_security_alt_id.is_empty() {
-                put_display(sink, 454, self.no_security_alt_id.len())?;
-                for entry in self.no_security_alt_id {
-                    entry.emit(sink)?;
-                }
-            }
             if !self.no_events.is_empty() {
                 put_display(sink, 864, self.no_events.len())?;
                 for entry in self.no_events {
                     entry.emit(sink)?;
                 }
             }
+            if let Some(value) = self.dated_date { sink.field(873, value.as_bytes()); }
+            if let Some(value) = self.interest_accrual_date { sink.field(874, value.as_bytes()); }
             if let Some(value) = self.agreement_desc { sink.field(913, value.as_bytes()); }
             if let Some(value) = self.agreement_id { sink.field(914, value.as_bytes()); }
             if let Some(value) = self.agreement_date { sink.field(915, value.as_bytes()); }
@@ -6512,17 +6476,26 @@ pub mod writers {
                     entry.emit(sink)?;
                 }
             }
+            if let Some(value) = self.prev_close_px { put_display(sink, 140, value)?; }
+            if let Some(value) = self.side { sink.field(54, value.as_bytes()); }
+            if let Some(value) = self.locate_reqd { sink.field(114, if value { b"Y" } else { b"N" }); }
+            if let Some(value) = self.transact_time { sink.field(60, value.as_bytes()); }
             if !self.no_stipulations.is_empty() {
                 put_display(sink, 232, self.no_stipulations.len())?;
                 for entry in self.no_stipulations {
                     entry.emit(sink)?;
                 }
             }
+            if let Some(value) = self.qty_type { sink.field(854, value.as_bytes()); }
             if let Some(value) = self.order_qty { put_display(sink, 38, value)?; }
             if let Some(value) = self.cash_order_qty { put_display(sink, 152, value)?; }
             if let Some(value) = self.order_percent { put_display(sink, 516, value)?; }
             if let Some(value) = self.rounding_direction { sink.field(468, value.as_bytes()); }
             if let Some(value) = self.rounding_modulus { put_display(sink, 469, value)?; }
+            if let Some(value) = self.ord_type { sink.field(40, value.as_bytes()); }
+            if let Some(value) = self.price_type { sink.field(423, value.as_bytes()); }
+            if let Some(value) = self.price { put_display(sink, 44, value)?; }
+            if let Some(value) = self.stop_px { put_display(sink, 99, value)?; }
             if let Some(value) = self.spread { put_display(sink, 218, value)?; }
             if let Some(value) = self.benchmark_curve_currency { sink.field(220, value.as_bytes()); }
             if let Some(value) = self.benchmark_curve_name { sink.field(221, value.as_bytes()); }
@@ -6537,10 +6510,34 @@ pub mod writers {
             if let Some(value) = self.yield_redemption_date { sink.field(696, value.as_bytes()); }
             if let Some(value) = self.yield_redemption_price { put_display(sink, 697, value)?; }
             if let Some(value) = self.yield_redemption_price_type { put_display(sink, 698, value)?; }
+            if let Some(value) = self.currency { sink.field(15, value.as_bytes()); }
+            if let Some(value) = self.compliance_id { sink.field(376, value.as_bytes()); }
+            if let Some(value) = self.solicited_flag { sink.field(377, if value { b"Y" } else { b"N" }); }
+            if let Some(value) = self.ioiid { sink.field(23, value.as_bytes()); }
+            if let Some(value) = self.quote_id { sink.field(117, value.as_bytes()); }
+            if let Some(value) = self.time_in_force { sink.field(59, value.as_bytes()); }
+            if let Some(value) = self.effective_time { sink.field(168, value.as_bytes()); }
+            if let Some(value) = self.expire_date { sink.field(432, value.as_bytes()); }
+            if let Some(value) = self.expire_time { sink.field(126, value.as_bytes()); }
+            if let Some(value) = self.gtbooking_inst { sink.field(427, value.as_bytes()); }
             if let Some(value) = self.commission { put_display(sink, 12, value)?; }
             if let Some(value) = self.comm_type { sink.field(13, value.as_bytes()); }
             if let Some(value) = self.comm_currency { sink.field(479, value.as_bytes()); }
             if let Some(value) = self.fund_renew_waiv { sink.field(497, value.as_bytes()); }
+            if let Some(value) = self.order_capacity { sink.field(528, value.as_bytes()); }
+            if !self.order_restrictions.is_empty() { sink.field(529, &enums::OrderRestrictions::join(self.order_restrictions)); }
+            if let Some(value) = self.cust_order_capacity { sink.field(582, value.as_bytes()); }
+            if let Some(value) = self.forex_req { sink.field(121, if value { b"Y" } else { b"N" }); }
+            if let Some(value) = self.settl_currency { sink.field(120, value.as_bytes()); }
+            if let Some(value) = self.booking_type { sink.field(775, value.as_bytes()); }
+            if let Some(value) = self.text { sink.field(58, value.as_bytes()); }
+            if let Some(value) = self.encoded_text { sink.data(354, 355, value); }
+            if let Some(value) = self.settl_date2 { sink.field(193, value.as_bytes()); }
+            if let Some(value) = self.order_qty2 { put_display(sink, 192, value)?; }
+            if let Some(value) = self.price2 { put_display(sink, 640, value)?; }
+            if let Some(value) = self.position_effect { sink.field(77, value.as_bytes()); }
+            if let Some(value) = self.covered_or_uncovered { sink.field(203, value.as_bytes()); }
+            if let Some(value) = self.max_show { put_display(sink, 210, value)?; }
             if let Some(value) = self.peg_offset_value { put_display(sink, 211, value)?; }
             if let Some(value) = self.peg_move_type { sink.field(835, value.as_bytes()); }
             if let Some(value) = self.peg_offset_type { sink.field(836, value.as_bytes()); }
@@ -6554,6 +6551,13 @@ pub mod writers {
             if let Some(value) = self.discretion_limit_type { sink.field(843, value.as_bytes()); }
             if let Some(value) = self.discretion_round_direction { sink.field(844, value.as_bytes()); }
             if let Some(value) = self.discretion_scope { sink.field(846, value.as_bytes()); }
+            if let Some(value) = self.target_strategy { sink.field(847, value.as_bytes()); }
+            if let Some(value) = self.target_strategy_parameters { sink.field(848, value.as_bytes()); }
+            if let Some(value) = self.participation_rate { put_display(sink, 849, value)?; }
+            if let Some(value) = self.cancellation_rights { sink.field(480, value.as_bytes()); }
+            if let Some(value) = self.money_laundering_status { sink.field(481, value.as_bytes()); }
+            if let Some(value) = self.regist_id { sink.field(513, value.as_bytes()); }
+            if let Some(value) = self.designation { sink.field(494, value.as_bytes()); }
             Ok(())
         }
     }
@@ -6582,7 +6586,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.ref_msg_type { sink.field(372, value.as_bytes()); }
             if let Some(value) = self.msg_direction { sink.field(385, value.as_bytes()); }
@@ -6622,7 +6626,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.party_id { sink.field(448, value.as_bytes()); }
             if let Some(value) = self.party_idsource { sink.field(447, value.as_bytes()); }
@@ -6661,7 +6665,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.party_sub_id { sink.field(523, value.as_bytes()); }
             if let Some(value) = self.party_sub_idtype { sink.field(803, value.as_bytes()); }
@@ -6680,10 +6684,10 @@ pub mod writers {
         pub alloc_settl_currency: Option<&'v str>,
         /// IndividualAllocID (tag 467).
         pub individual_alloc_id: Option<&'v str>,
-        /// AllocQty (tag 80).
-        pub alloc_qty: Option<Decimal>,
         /// NoNestedPartyIDs (tag 539) repeating group: one item per entry, empty when absent.
         pub no_nested_party_ids: &'v [NestedPartiesNoNestedPartyIDsFields<'v>],
+        /// AllocQty (tag 80).
+        pub alloc_qty: Option<Decimal>,
     }
 
     impl ::core::fmt::Debug for PreAllocGrpNoAllocsFields<'_> {
@@ -6705,19 +6709,19 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.alloc_account { sink.field(79, value.as_bytes()); }
             if let Some(value) = self.alloc_acct_idsource { put_display(sink, 661, value)?; }
             if let Some(value) = self.alloc_settl_currency { sink.field(736, value.as_bytes()); }
             if let Some(value) = self.individual_alloc_id { sink.field(467, value.as_bytes()); }
-            if let Some(value) = self.alloc_qty { put_display(sink, 80, value)?; }
             if !self.no_nested_party_ids.is_empty() {
                 put_display(sink, 539, self.no_nested_party_ids.len())?;
                 for entry in self.no_nested_party_ids {
                     entry.emit(sink)?;
                 }
             }
+            if let Some(value) = self.alloc_qty { put_display(sink, 80, value)?; }
             Ok(())
         }
     }
@@ -6753,7 +6757,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.nested_party_id { sink.field(524, value.as_bytes()); }
             if let Some(value) = self.nested_party_idsource { sink.field(525, value.encode_utf8(&mut [0; 4]).as_bytes()); }
@@ -6791,7 +6795,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.nested_party_sub_id { sink.field(545, value.as_bytes()); }
             if let Some(value) = self.nested_party_sub_idtype { put_display(sink, 805, value)?; }
@@ -6823,7 +6827,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.trading_session_id { sink.field(336, value.as_bytes()); }
             if let Some(value) = self.trading_session_sub_id { sink.field(625, value.as_bytes()); }
@@ -6855,7 +6859,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.security_alt_id { sink.field(455, value.as_bytes()); }
             if let Some(value) = self.security_alt_idsource { sink.field(456, value.as_bytes()); }
@@ -6892,7 +6896,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.event_type { sink.field(865, value.as_bytes()); }
             if let Some(value) = self.event_date { sink.field(866, value.as_bytes()); }
@@ -6913,6 +6917,8 @@ pub mod writers {
         pub underlying_security_id: Option<&'v str>,
         /// UnderlyingSecurityIDSource (tag 305).
         pub underlying_security_idsource: Option<&'v str>,
+        /// NoUnderlyingSecurityAltID (tag 457) repeating group: one item per entry, empty when absent.
+        pub no_underlying_security_alt_id: &'v [UndSecAltIDGrpNoUnderlyingSecurityAltIDFields<'v>],
         /// UnderlyingProduct (tag 462).
         pub underlying_product: Option<i64>,
         /// UnderlyingCFICode (tag 463).
@@ -6991,8 +6997,6 @@ pub mod writers {
         pub underlying_current_value: Option<Decimal>,
         /// UnderlyingEndValue (tag 886).
         pub underlying_end_value: Option<Decimal>,
-        /// NoUnderlyingSecurityAltID (tag 457) repeating group: one item per entry, empty when absent.
-        pub no_underlying_security_alt_id: &'v [UndSecAltIDGrpNoUnderlyingSecurityAltIDFields<'v>],
         /// NoUnderlyingStips (tag 887) repeating group: one item per entry, empty when absent.
         pub no_underlying_stips: &'v [UnderlyingStipulationsNoUnderlyingStipsFields<'v>],
     }
@@ -7011,6 +7015,9 @@ pub mod writers {
             check_text(self.underlying_symbol_sfx.map(str::as_bytes), 312)?;
             check_text(self.underlying_security_id.map(str::as_bytes), 309)?;
             check_text(self.underlying_security_idsource.map(str::as_bytes), 305)?;
+            for entry in self.no_underlying_security_alt_id {
+                entry.check()?;
+            }
             check_text(self.underlying_cficode.map(str::as_bytes), 463)?;
             check_text(self.underlying_security_type.map(str::as_bytes), 310)?;
             check_text(self.underlying_security_sub_type.map(str::as_bytes), 763)?;
@@ -7035,21 +7042,24 @@ pub mod writers {
             check_text(self.underlying_cpprogram.map(str::as_bytes), 877)?;
             check_text(self.underlying_cpreg_type.map(str::as_bytes), 878)?;
             check_text(self.underlying_currency.map(str::as_bytes), 318)?;
-            for entry in self.no_underlying_security_alt_id {
-                entry.check()?;
-            }
             for entry in self.no_underlying_stips {
                 entry.check()?;
             }
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.underlying_symbol { sink.field(311, value.as_bytes()); }
             if let Some(value) = self.underlying_symbol_sfx { sink.field(312, value.as_bytes()); }
             if let Some(value) = self.underlying_security_id { sink.field(309, value.as_bytes()); }
             if let Some(value) = self.underlying_security_idsource { sink.field(305, value.as_bytes()); }
+            if !self.no_underlying_security_alt_id.is_empty() {
+                put_display(sink, 457, self.no_underlying_security_alt_id.len())?;
+                for entry in self.no_underlying_security_alt_id {
+                    entry.emit(sink)?;
+                }
+            }
             if let Some(value) = self.underlying_product { put_display(sink, 462, value)?; }
             if let Some(value) = self.underlying_cficode { sink.field(463, value.as_bytes()); }
             if let Some(value) = self.underlying_security_type { sink.field(310, value.as_bytes()); }
@@ -7089,12 +7099,6 @@ pub mod writers {
             if let Some(value) = self.underlying_start_value { put_display(sink, 884, value)?; }
             if let Some(value) = self.underlying_current_value { put_display(sink, 885, value)?; }
             if let Some(value) = self.underlying_end_value { put_display(sink, 886, value)?; }
-            if !self.no_underlying_security_alt_id.is_empty() {
-                put_display(sink, 457, self.no_underlying_security_alt_id.len())?;
-                for entry in self.no_underlying_security_alt_id {
-                    entry.emit(sink)?;
-                }
-            }
             if !self.no_underlying_stips.is_empty() {
                 put_display(sink, 887, self.no_underlying_stips.len())?;
                 for entry in self.no_underlying_stips {
@@ -7129,7 +7133,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.underlying_security_alt_id { sink.field(458, value.as_bytes()); }
             if let Some(value) = self.underlying_security_alt_idsource { sink.field(459, value.as_bytes()); }
@@ -7161,7 +7165,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.underlying_stip_type { sink.field(888, value.as_bytes()); }
             if let Some(value) = self.underlying_stip_value { sink.field(889, value.as_bytes()); }
@@ -7193,7 +7197,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.stipulation_type { sink.field(233, value.as_bytes()); }
             if let Some(value) = self.stipulation_value { sink.field(234, value.as_bytes()); }

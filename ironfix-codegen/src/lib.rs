@@ -22,8 +22,8 @@
 //!   `ironfix_dictionary`'s group reader, a borrowed `XxxView<'m, 'a>` per
 //!   message over a decoded `ironfix_core::message::RawMessage` with typed
 //!   accessors that check each value against the validator's grammar, and a
-//!   writer per message that checks every value and then sends its body,
-//!   groups in dictionary order, to a generated `Sink`: a
+//!   writer per message that checks every value and then sends its body in
+//!   XML order (an entry: its delimiter first) to a generated `Sink`: a
 //!   `FnMut(u32, &[u8])` closure, or a target that frames LENGTH/DATA pairs
 //!   itself. The generated code depends on `ironfix-core`, `rust_decimal`
 //!   and an `ironfix-dictionary` release after 0.4.1.
@@ -69,9 +69,10 @@
 //!   dictionary given. For a FIXT.1.1 session over a FIX 5.0 application
 //!   dictionary, which carries no header, the generated layouts know no
 //!   header group.
-//! - **Field order is dictionary order as loaded**: fields, then groups, then
-//!   components. The QuickFIX XML interleaving is not kept by the loader.
-//!   Within a group entry the delimiter is always written first.
+//! - **Members follow the XML order** the dictionary records (`members()`),
+//!   a component's members in its place; within a group entry the delimiter
+//!   is always written first. The default output keeps its own order
+//!   (direct fields, component fields, groups), unchanged.
 
 pub mod generator;
 mod views;

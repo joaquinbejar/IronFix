@@ -58,8 +58,9 @@
 //!
 //! - **Field order is not wire order.** A struct lists its direct fields, then
 //!   the fields contributed by its components, then its repeating groups. The
-//!   QuickFIX XML interleaving is not retained by the loader, so it cannot be
-//!   reproduced here.
+//!   dictionary now records the XML order (`members()`), and the views and
+//!   writers follow it; this output keeps its order so that existing
+//!   generated code does not change.
 //! - **Component-contributed fields are always optional.** This output
 //!   predates `ComponentRef::required` and keeps a field that is required
 //!   inside a component as `Option<T>`, the representable choice that cannot
@@ -335,8 +336,9 @@ impl CodeGenerator {
     ///   accessors that borrow the decoded buffer and check each value
     ///   against its FIX type's grammar, as the validator does.
     /// - `writers`: one `XxxFields<'v>` per message and group definition,
-    ///   whose `write` checks every value and then sends the body, groups in
-    ///   dictionary order, to a generated `writers::Sink`: any
+    ///   whose `write` checks every value and then sends the body in XML
+    ///   order (an entry: its delimiter first) to a generated
+    ///   `writers::Sink`: any
     ///   `FnMut(u32, &[u8])` closure is one, and a target that frames
     ///   LENGTH/DATA pairs itself (`ironfix_tagvalue::Encoder`,
     ///   `ironfix_engine::OutboundMessage`) implements it.

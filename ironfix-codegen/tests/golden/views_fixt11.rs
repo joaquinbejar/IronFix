@@ -239,50 +239,58 @@ pub mod layouts {
         Err(_) => panic!("invalid HeaderNoHops group table"),
     };
 
-    /// Groups that may open at the top level of Heartbeat (MsgType=0), header and trailer groups included.
-    pub const HEARTBEAT: GroupSet<'static> = match GroupSet::new(&[HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of Heartbeat (MsgType=0), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const HEARTBEAT: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 97, 112, 115, 116, 122, 128, 129, 142, 143, 144, 145, 212, 213, 347, 369, 627, 1128, 1129, 1156]) {
         Ok(set) => set,
         Err(_) => panic!("invalid Heartbeat group table"),
     };
 
-    /// Groups that may open at the top level of TestRequest (MsgType=1), header and trailer groups included.
-    pub const TEST_REQUEST: GroupSet<'static> = match GroupSet::new(&[HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of TestRequest (MsgType=1), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const TEST_REQUEST: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 97, 112, 115, 116, 122, 128, 129, 142, 143, 144, 145, 212, 213, 347, 369, 627, 1128, 1129, 1156]) {
         Ok(set) => set,
         Err(_) => panic!("invalid TestRequest group table"),
     };
 
-    /// Groups that may open at the top level of ResendRequest (MsgType=2), header and trailer groups included.
-    pub const RESEND_REQUEST: GroupSet<'static> = match GroupSet::new(&[HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of ResendRequest (MsgType=2), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const RESEND_REQUEST: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[7, 8, 9, 10, 16, 34, 35, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 97, 115, 116, 122, 128, 129, 142, 143, 144, 145, 212, 213, 347, 369, 627, 1128, 1129, 1156]) {
         Ok(set) => set,
         Err(_) => panic!("invalid ResendRequest group table"),
     };
 
-    /// Groups that may open at the top level of Reject (MsgType=3), header and trailer groups included.
-    pub const REJECT: GroupSet<'static> = match GroupSet::new(&[HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of Reject (MsgType=3), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const REJECT: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 45, 49, 50, 52, 56, 57, 58, 89, 90, 91, 93, 97, 115, 116, 122, 128, 129, 142, 143, 144, 145, 212, 213, 347, 354, 355, 369, 371, 372, 373, 627, 1128, 1129, 1130, 1131, 1156, 1406]) {
         Ok(set) => set,
         Err(_) => panic!("invalid Reject group table"),
     };
 
-    /// Groups that may open at the top level of SequenceReset (MsgType=4), header and trailer groups included.
-    pub const SEQUENCE_RESET: GroupSet<'static> = match GroupSet::new(&[HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of SequenceReset (MsgType=4), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const SEQUENCE_RESET: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 36, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 97, 115, 116, 122, 123, 128, 129, 142, 143, 144, 145, 212, 213, 347, 369, 627, 1128, 1129, 1156]) {
         Ok(set) => set,
         Err(_) => panic!("invalid SequenceReset group table"),
     };
 
-    /// Groups that may open at the top level of Logout (MsgType=5), header and trailer groups included.
-    pub const LOGOUT: GroupSet<'static> = match GroupSet::new(&[HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of Logout (MsgType=5), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const LOGOUT: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 58, 89, 90, 91, 93, 97, 115, 116, 122, 128, 129, 142, 143, 144, 145, 212, 213, 347, 354, 355, 369, 627, 1128, 1129, 1156, 1409]) {
         Ok(set) => set,
         Err(_) => panic!("invalid Logout group table"),
     };
 
-    /// Groups that may open at the top level of Logon (MsgType=A), header and trailer groups included.
-    pub const LOGON: GroupSet<'static> = match GroupSet::new(&[HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of Logon (MsgType=A), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const LOGON: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 58, 89, 90, 91, 93, 95, 96, 97, 98, 108, 115, 116, 122, 128, 129, 141, 142, 143, 144, 145, 212, 213, 347, 354, 355, 369, 383, 464, 553, 554, 627, 789, 925, 1128, 1129, 1137, 1156, 1400, 1401, 1402, 1403, 1404, 1407, 1408, 1409]) {
         Ok(set) => set,
         Err(_) => panic!("invalid Logon group table"),
     };
 
-    /// Groups that may open at the top level of XMLnonFIX (MsgType=n), header and trailer groups included.
-    pub const XMLNON_FIX: GroupSet<'static> = match GroupSet::new(&[HEADER_NO_HOPS]) {
+    /// Groups that may open at the top level of XMLnonFIX (MsgType=n), header and trailer groups included,
+    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
+    pub const XMLNON_FIX: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 97, 115, 116, 122, 128, 129, 142, 143, 144, 145, 212, 213, 347, 369, 627, 1128, 1129, 1156]) {
         Ok(set) => set,
         Err(_) => panic!("invalid XMLnonFIX group table"),
     };
@@ -849,9 +857,10 @@ pub mod views {
 /// Typed writers of message bodies, to any [`Sink`](writers::Sink): a `FnMut(u32, &[u8])`
 /// closure, or a target that frames LENGTH/DATA pairs itself.
 ///
-/// Fields are written in dictionary order; a repeating group as its count, then each entry with its
-/// delimiter first. Every value is checked before anything is written. Numbers are formatted on
-/// the stack; only a multi-value field allocates, to join its values.
+/// Fields are written in the order the dictionary (XML) lists them, components in place; a repeating
+/// group as its count, then each entry with its delimiter first and its other members in XML order.
+/// Every value is checked before anything is written. Numbers are formatted on the stack; only a
+/// multi-value field allocates, to join its values.
 pub mod writers {
     use ::ironfix_core::error::EncodeError;
     use super::enums;
@@ -1001,8 +1010,8 @@ pub mod writers {
     }
 
     impl HeartbeatFields<'_> {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -1020,7 +1029,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.test_req_id { sink.field(112, value.as_bytes()); }
             Ok(())
@@ -1041,8 +1050,8 @@ pub mod writers {
     }
 
     impl TestRequestFields<'_> {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -1061,7 +1070,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.test_req_id { sink.field(112, value.as_bytes()); }
             Ok(())
@@ -1084,8 +1093,8 @@ pub mod writers {
     }
 
     impl ResendRequestFields {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -1104,7 +1113,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.begin_seq_no { put_display(sink, 7, value)?; }
             if let Some(value) = self.end_seq_no { put_display(sink, 16, value)?; }
@@ -1142,8 +1151,8 @@ pub mod writers {
     }
 
     impl RejectFields<'_> {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -1167,7 +1176,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.ref_seq_num { put_display(sink, 45, value)?; }
             if let Some(value) = self.ref_tag_id { put_display(sink, 371, value)?; }
@@ -1198,8 +1207,8 @@ pub mod writers {
     }
 
     impl SequenceResetFields {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -1217,7 +1226,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.gap_fill_flag { sink.field(123, if value { b"Y" } else { b"N" }); }
             if let Some(value) = self.new_seq_no { put_display(sink, 36, value)?; }
@@ -1243,8 +1252,8 @@ pub mod writers {
     }
 
     impl LogoutFields<'_> {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -1264,7 +1273,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.session_status { sink.field(1409, value.as_bytes()); }
             if let Some(value) = self.text { sink.field(58, value.as_bytes()); }
@@ -1323,8 +1332,8 @@ pub mod writers {
     }
 
     impl LogonFields<'_> {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry
@@ -1356,7 +1365,7 @@ pub mod writers {
             Ok(())
         }
 
-        /// Writes the fields, in dictionary order.
+        /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {
             if let Some(value) = self.encrypt_method { sink.field(98, value.as_bytes()); }
             if let Some(value) = self.heart_bt_int { put_display(sink, 108, value)?; }
@@ -1392,8 +1401,8 @@ pub mod writers {
     }
 
     impl XMLnonFIXFields {
-        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group
-        /// as its count, then each entry with its delimiter first.
+        /// Writes the body to `sink`, one call per field, in XML order: a repeating group
+        /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
         /// # Errors
         /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry

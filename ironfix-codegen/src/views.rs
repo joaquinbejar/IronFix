@@ -10,13 +10,17 @@
 //! # Model
 //!
 //! Each message body, and each repeating-group entry, is expanded into one
-//! *level* of members the way `ironfix_dictionary`'s group reader and
-//! validator expand it: fields, then groups, then components (recursively, in
-//! that order). A member reached through components is required only when
-//! every component reference on the way to it is required, as in the
-//! validator. A field reached twice is one member, required if any occurrence
-//! is; of two groups sharing a count tag the first wins; a plain field whose
-//! tag is also a group's count tag gives way to the group.
+//! *level* of members in XML order (`members()` of the dictionary's
+//! definitions): a component's members take its place, recursively. That is
+//! the order the views list their accessors in and the writers write in, an
+//! entry's delimiter first; FIX requires it inside a repeating group. A member
+//! reached through components is required only when every component reference
+//! on the way to it is required, as in the validator. A field reached twice is
+//! one member, at its first position, required if any occurrence is; a plain
+//! field whose tag is also a group's count tag gives way to the group. Of two
+//! groups sharing a count tag (a schema defect), the one kept is the one
+//! `MessageLayout` keeps: the first in the order it expands a level (fields,
+//! groups, then components).
 //!
 //! A group *definition* is modelled once, wherever it is reached from: the
 //! group a component declares gets one layout constant, one view and one
@@ -27,7 +31,8 @@
 //! The static layouts mirror `MessageLayout`: a group's members are its
 //! delimiter, its fields and its nested groups' count tags, components
 //! flattened; a message's top-level set is its header, trailer and body
-//! groups.
+//! groups, built with `GroupSet::with_level_tags` and every tag the message
+//! level accepts, so it reads group boundaries as the layout does.
 //!
 //! # Lint-clean output
 //!
@@ -44,11 +49,8 @@ use crate::generator::{
     to_pascal_case, to_screaming_snake_case, to_snake_case, to_type_ident, unique_name,
     unique_type_name,
 };
-// `FieldRef` also names a zero-copy wire field in `ironfix-core`; this is the
-// schema-side one (tag, name, required).
-use ironfix_dictionary::schema::FieldRef as SchemaFieldRef;
 use ironfix_dictionary::schema::{
-    ComponentRef, Dictionary, FieldDef, FieldType, GroupDef, MessageDef,
+    ComponentDef, ComponentRef, Dictionary, FieldDef, FieldType, GroupDef, MemberRef, MessageDef,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -295,9 +297,23 @@ struct LevelBuilder {
     /// Every tag reached at this level, count tags included: the layout's
     /// member list once sorted.
     tags: Vec<u32>,
+    /// The group definition kept for each count tag at this level: the first
+    /// in the order the layout expands the level (fields, groups, then
+    /// components), so that of two groups sharing a count tag (a schema
+    /// defect) the views keep the one `MessageLayout` keeps, though they list
+    /// members in XML order.
+    chosen: HashMap<u32, *const GroupDef>,
 }
 
 impl LevelBuilder {
+    /// Starts a level with the groups chosen for it.
+    fn new(chosen: HashMap<u32, *const GroupDef>) -> Self {
+        Self {
+            chosen,
+            ..Self::default()
+        }
+    }
+
     fn add_field(&mut self, member: FieldMember) {
         self.tags.push(member.tag);
         if let Some(&index) = self.fields.get(&member.tag) {
@@ -419,6 +435,9 @@ struct MessageModel {
     /// The groups that may open at its top level, header and trailer
     /// included, sorted by count tag.
     top_groups: Vec<usize>,
+    /// Every tag the message level accepts, sorted: the static set's level
+    /// tags, so it reads group boundaries like `MessageLayout`.
+    level_tags: Vec<u32>,
 }
 
 /// One enumeration.
@@ -480,12 +499,40 @@ impl Model {
     }
 }
 
-/// The parts of a message, component or group that expand into a level.
-#[derive(Debug, Clone, Copy)]
+/// The members of a message, component or group entry that expand into a
+/// level: in dictionary (XML) order, the order the views and writers follow,
+/// and per kind, the order `ironfix_dictionary`'s layout expands them in.
+#[derive(Debug, Clone)]
 struct Part<'d> {
-    fields: &'d [SchemaFieldRef],
+    members: Vec<MemberRef<'d>>,
     groups: &'d [GroupDef],
     components: &'d [ComponentRef],
+}
+
+impl<'d> Part<'d> {
+    fn message(def: &'d MessageDef) -> Self {
+        Self {
+            members: def.members().collect(),
+            groups: &def.groups,
+            components: &def.components,
+        }
+    }
+
+    fn component(def: &'d ComponentDef) -> Self {
+        Self {
+            members: def.members().collect(),
+            groups: &def.groups,
+            components: &def.components,
+        }
+    }
+
+    fn group(def: &'d GroupDef) -> Self {
+        Self {
+            members: def.members().collect(),
+            groups: &def.groups,
+            components: &def.components,
+        }
+    }
 }
 
 /// Where an expansion is.
@@ -531,46 +578,60 @@ impl<'d> Builder<'d> {
             });
         }
 
-        // The `Length` field listed right before a `data` field frames it; a
-        // `data` field without one cannot be written with its count.
+        // Members in XML order. The `Length` field listed right before a
+        // `data` field frames it; a `data` field without one cannot be
+        // written with its count.
         let mut previous: Option<&FieldDef> = None;
-        for field in part.fields {
-            let def = self.field_def(field.tag, ctx.scope)?;
-            let mut member = field_member(def, &field.name, ctx.required && field.required);
-            if member.kind == Kind::Bytes {
-                match previous {
-                    Some(length) if length.field_type == FieldType::Length => {
-                        member.pair = Pair::Data(length.tag);
-                        level.pair_length(length.tag, def.tag);
+        for member in &part.members {
+            let reference = match *member {
+                MemberRef::Field(field) => {
+                    let def = self.field_def(field.tag, ctx.scope)?;
+                    let mut member = field_member(def, &field.name, ctx.required && field.required);
+                    if member.kind == Kind::Bytes {
+                        match previous {
+                            Some(length) if length.field_type == FieldType::Length => {
+                                member.pair = Pair::Data(length.tag);
+                                level.pair_length(length.tag, def.tag);
+                            }
+                            _ => {
+                                return Err(GeneratorError::UnpairedDataField {
+                                    tag: def.tag,
+                                    scope: ctx.scope.to_string(),
+                                });
+                            }
+                        }
                     }
-                    _ => {
-                        return Err(GeneratorError::UnpairedDataField {
-                            tag: def.tag,
-                            scope: ctx.scope.to_string(),
-                        });
-                    }
+                    level.add_field(member);
+                    previous = Some(def);
+                    continue;
                 }
-            }
-            level.add_field(member);
-            previous = Some(def);
-        }
-
-        for group in part.groups {
-            if level.group_tags.contains(&group.count_tag) {
-                // The same count tag reached twice: the first group wins.
-                level.tags.push(group.count_tag);
-                continue;
-            }
-            let site = self.site(group, ctx, stack)?;
-            level.add_group(GroupMember {
-                count_tag: group.count_tag,
-                name: group.name.clone(),
-                site,
-                required: ctx.required && group.required,
-            });
-        }
-
-        for reference in part.components {
+                MemberRef::Group(group) => {
+                    previous = None;
+                    let chosen = level.chosen.get(&group.count_tag).copied();
+                    if chosen != Some(std::ptr::from_ref(group))
+                        || level.group_tags.contains(&group.count_tag)
+                    {
+                        // Another definition of the count tag is kept.
+                        level.tags.push(group.count_tag);
+                        continue;
+                    }
+                    let site = self.site(group, ctx, stack)?;
+                    level.add_group(GroupMember {
+                        count_tag: group.count_tag,
+                        name: group.name.clone(),
+                        site,
+                        required: ctx.required && group.required,
+                    });
+                    continue;
+                }
+                MemberRef::Component(reference) => {
+                    previous = None;
+                    reference
+                }
+                // `MemberRef` is `#[non_exhaustive]`; the dictionary moves in
+                // lockstep with this crate, and every kind it has is above.
+                _ => continue,
+            };
             let name = &reference.name;
             if stack.iter().any(|visited| visited == name) {
                 let mut path = stack.clone();
@@ -593,11 +654,7 @@ impl<'d> Builder<'d> {
             stack.push(name.clone());
             self.expand(
                 level,
-                Part {
-                    fields: &component.fields,
-                    groups: &component.groups,
-                    components: &component.components,
-                },
+                Part::component(component),
                 &Ctx {
                     scope: &scope,
                     owner: &owner,
@@ -663,14 +720,11 @@ impl<'d> Builder<'d> {
 
         let scope = format!("group {} of {}", group.name, ctx.scope);
         let owner_doc = format!("an entry of the {} group", group.name);
-        let mut level = LevelBuilder::default();
+        let part = Part::group(group);
+        let mut level = LevelBuilder::new(self.chosen_groups(&part, ctx.depth + 1, stack));
         self.expand(
             &mut level,
-            Part {
-                fields: &group.fields,
-                groups: &group.groups,
-                components: &group.components,
-            },
+            part,
             &Ctx {
                 scope: &scope,
                 owner: &base,
@@ -792,14 +846,12 @@ impl<'d> Builder<'d> {
     ) -> Result<MessageModel, GeneratorError> {
         let scope = format!("message {}", def.name);
         let owner_doc = format!("the {} message", def.name);
-        let mut level = LevelBuilder::default();
+        let part = Part::message(def);
+        let mut stack = Vec::new();
+        let mut level = LevelBuilder::new(self.chosen_groups(&part, 0, &mut stack));
         self.expand(
             &mut level,
-            Part {
-                fields: &def.fields,
-                groups: &def.groups,
-                components: &def.components,
-            },
+            part,
             &Ctx {
                 scope: &scope,
                 owner: &base,
@@ -807,10 +859,30 @@ impl<'d> Builder<'d> {
                 required: true,
                 depth: 0,
             },
-            &mut Vec::new(),
+            &mut stack,
         )?;
         let mut body = level.finish(None);
         name_members(&mut body)?;
+
+        // Every tag the message level accepts, as `MessageLayout` collects
+        // them: header and trailer fields and group count tags, and the
+        // body's fields (components included) and count tags.
+        let dict = self.dict;
+        let mut level_tags: Vec<u32> = dict
+            .header
+            .iter()
+            .chain(&dict.trailer)
+            .map(|field| field.tag)
+            .chain(
+                dict.header_groups
+                    .iter()
+                    .chain(&dict.trailer_groups)
+                    .map(|group| group.count_tag),
+            )
+            .chain(body.spec_members.iter().copied())
+            .collect();
+        level_tags.sort_unstable();
+        level_tags.dedup();
 
         // Header and trailer groups first, as the layout expands them: of two
         // groups sharing a count tag, the first expanded wins.
@@ -838,7 +910,58 @@ impl<'d> Builder<'d> {
             konst: String::new(),
             body,
             top_groups: top.into_iter().map(|(_, site)| site).collect(),
+            level_tags,
         })
+    }
+
+    /// The group definition the layout keeps for each count tag at a level:
+    /// the first in the order it expands the level (the level's own groups,
+    /// then each component's, recursively). Problems are left for
+    /// [`Builder::expand`] to report.
+    fn chosen_groups(
+        &self,
+        part: &Part<'d>,
+        depth: usize,
+        stack: &mut Vec<String>,
+    ) -> HashMap<u32, *const GroupDef> {
+        let mut chosen = HashMap::new();
+        self.choose(part.groups, part.components, depth, stack, &mut chosen);
+        chosen
+    }
+
+    fn choose(
+        &self,
+        groups: &'d [GroupDef],
+        components: &'d [ComponentRef],
+        depth: usize,
+        stack: &mut Vec<String>,
+        chosen: &mut HashMap<u32, *const GroupDef>,
+    ) {
+        if depth > MAX_NESTING_DEPTH {
+            return;
+        }
+        for group in groups {
+            chosen
+                .entry(group.count_tag)
+                .or_insert(std::ptr::from_ref(group));
+        }
+        for reference in components {
+            if stack.contains(&reference.name) {
+                continue;
+            }
+            let Some(component) = self.dict.get_component(&reference.name) else {
+                continue;
+            };
+            stack.push(reference.name.clone());
+            self.choose(
+                &component.groups,
+                &component.components,
+                depth + 1,
+                stack,
+                chosen,
+            );
+            stack.pop();
+        }
     }
 
     /// Marks a site, and every group nested in it, as reached from a body.
@@ -1488,16 +1611,21 @@ fn emit_layouts(code: &mut String, model: &Model, visibility: &str) {
         line(
             code,
             &format!(
-                "    /// Groups that may open at the top level of {} (MsgType={}), header and trailer groups included.",
+                "    /// Groups that may open at the top level of {} (MsgType={}), header and trailer groups included,",
                 doc_text(&message.name),
                 doc_text(&message.msg_type)
             ),
         );
         line(
             code,
+            "    /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.",
+        );
+        line(
+            code,
             &format!(
-                "    pub const {}: GroupSet<'static> = match GroupSet::new(&[{groups}]) {{",
-                message.konst
+                "    pub const {}: GroupSet<'static> = match GroupSet::with_level_tags(&[{groups}], &[{}]) {{",
+                message.konst,
+                join_numbers(&message.level_tags)
             ),
         );
         line(code, "        Ok(set) => set,");
@@ -2167,9 +2295,10 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
         "/// Typed writers of message bodies, to any [`Sink`](writers::Sink): a `FnMut(u32, &[u8])`",
         "/// closure, or a target that frames LENGTH/DATA pairs itself.",
         "///",
-        "/// Fields are written in dictionary order; a repeating group as its count, then each entry with its",
-        "/// delimiter first. Every value is checked before anything is written. Numbers are formatted on",
-        "/// the stack; only a multi-value field allocates, to join its values.",
+        "/// Fields are written in the order the dictionary (XML) lists them, components in place; a repeating",
+        "/// group as its count, then each entry with its delimiter first and its other members in XML order.",
+        "/// Every value is checked before anything is written. Numbers are formatted on the stack; only a",
+        "/// multi-value field allocates, to join its values.",
     ] {
         line(code, text);
     }
@@ -2615,8 +2744,8 @@ fn emit_writer(
     let emits = writer_emits(model, level);
     if top_level {
         for text in [
-            "        /// Writes the body to `sink`, one call per field, in dictionary order: a repeating group",
-            "        /// as its count, then each entry with its delimiter first.",
+            "        /// Writes the body to `sink`, one call per field, in XML order: a repeating group",
+            "        /// as its count, then each entry with its delimiter first and its other members in XML order.",
             "        ///",
             "        /// # Errors",
             "        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry",
@@ -2661,7 +2790,10 @@ fn emit_writer(
     }
     if !emits.is_empty() {
         line(code, "");
-        line(code, "        /// Writes the fields, in dictionary order.");
+        line(
+            code,
+            "        /// Writes the fields, in XML order (an entry: its delimiter first).",
+        );
         line(
             code,
             "        fn emit<S: Sink + ?Sized>(&self, sink: &mut S) -> Result<(), EncodeError> {",
@@ -2837,6 +2969,9 @@ mod tests {
 
     use crate::CodeGenerator;
     use crate::generator::GeneratorConfig;
+    // `FieldRef` also names a zero-copy wire field in `ironfix-core`; this is
+    // the schema-side one (tag, name, required).
+    use ironfix_dictionary::schema::FieldRef as SchemaFieldRef;
     use ironfix_dictionary::schema::Member as SchemaMember;
     use ironfix_dictionary::schema::{ComponentDef, MessageCategory, Version};
 
