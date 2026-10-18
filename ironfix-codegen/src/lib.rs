@@ -21,10 +21,12 @@
 //!   wire value reads as `Other(&[u8])`), static repeating-group layouts for
 //!   `ironfix_dictionary`'s group reader, a borrowed `XxxView<'m, 'a>` per
 //!   message over a decoded `ironfix_core::message::RawMessage` with typed
-//!   accessors, and a writer per message that sends its body, groups in
-//!   dictionary order, to a `FnMut(u32, &[u8])` closure or any other
-//!   generated `Sink`. The generated code depends on `ironfix-core`,
-//!   `ironfix-dictionary` and `rust_decimal`.
+//!   accessors that check each value against the validator's grammar, and a
+//!   writer per message that checks every value and then sends its body,
+//!   groups in dictionary order, to a generated `Sink`: a
+//!   `FnMut(u32, &[u8])` closure, or a target that frames LENGTH/DATA pairs
+//!   itself. The generated code depends on `ironfix-core`, `rust_decimal`
+//!   and an `ironfix-dictionary` release after 0.4.1.
 //!
 //! In both, FIX `Price`, `Qty`, `Amt`, `PriceOffset`, `Percentage` and
 //! `Float` fields are `rust_decimal::Decimal`, never `f64`. Adding the views

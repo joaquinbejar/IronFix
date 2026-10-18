@@ -11,7 +11,7 @@
 //!   the view generator has to get right (see its docs).
 //! - `fix44_order_dictionary`: the embedded FIX 4.4 dictionary with only
 //!   Heartbeat (0), Logon (A) and NewOrderSingle (D) kept. The full FIX 4.4
-//!   views are about 3.7 MB, too large to commit; every FIX 4.4 component,
+//!   views are about 4.2 MB, too large to commit; every FIX 4.4 component,
 //!   field and the header are kept, so these three messages generate exactly
 //!   as they do from the full dictionary.
 //! - the embedded FIXT 1.1 dictionary, in full.
@@ -57,7 +57,11 @@ fn values(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 ///   description, the fallback name `OTHER`, the keyword `SELF`, a leading
 ///   digit, a name ending with the enumeration's, two descriptions folding
 ///   onto one name, and wire values needing escapes;
-/// - a message with no fields at all.
+/// - a message with no fields at all;
+/// - a message (TypeSampler, `U1`) with one field per FIX type that has a
+///   grammar, a multi-char multi-value enumeration, an enumeration whose
+///   descriptions spell `NONE` / `SOME` / `OK` / `ERR`, and a required group
+///   whose entries open with the length of a LENGTH/DATA pair.
 #[must_use]
 pub fn views_sample_dictionary() -> Dictionary {
     let mut dict = Dictionary::new(Version::Fix44);
@@ -96,9 +100,39 @@ pub fn views_sample_dictionary() -> Dictionary {
         (5000, "ToVenue", FieldType::String),
         (5001, "Get", FieldType::String),
         (5002, "Flag", FieldType::Char),
+        // The TypeSampler message: one field per FIX type with a grammar.
+        (15, "Currency", FieldType::Currency),
+        (75, "TradeDate", FieldType::LocalMktDate),
+        (200, "MaturityMonthYear", FieldType::MonthYear),
+        (205, "MaturityDay", FieldType::DayOfMonth),
+        (354, "EncodedTextLen", FieldType::Length),
+        (355, "EncodedText", FieldType::Data),
+        (421, "Country", FieldType::Country),
+        (5010, "SampleTime", FieldType::UtcTimeOnly),
+        (5011, "SampleDate", FieldType::UtcDateOnly),
+        (5012, "ExpireSeconds", FieldType::Int),
+        (5013, "Labels", FieldType::MultipleStringValue),
+        (5020, "NoDocs", FieldType::NumInGroup),
+        (5023, "DocName", FieldType::String),
     ] {
         dict.add_field(FieldDef::new(tag, name, field_type));
     }
+    dict.add_field(
+        FieldDef::new(5014, "Flags", FieldType::MultipleCharValue).with_values(values(&[
+            ("A", "ALPHA"),
+            ("B", "BRAVO"),
+            ("C", "CHARLIE"),
+        ])),
+    );
+    // Descriptions spelling the prelude's `Option` / `Result` variants.
+    dict.add_field(
+        FieldDef::new(5015, "Mode", FieldType::Char).with_values(values(&[
+            ("0", "NONE"),
+            ("1", "SOME"),
+            ("2", "OK"),
+            ("3", "ERR"),
+        ])),
+    );
     dict.add_field(
         FieldDef::new(18, "ExecInst", FieldType::MultipleStringValue).with_values(values(&[
             ("1", "NOT_HELD"),
@@ -262,6 +296,43 @@ pub fn views_sample_dictionary() -> Dictionary {
         category: MessageCategory::Admin,
         fields: Vec::new(),
         groups: Vec::new(),
+        components: Vec::new(),
+    });
+    // One field per FIX type with a grammar, and a required group whose
+    // entries open with the length of a LENGTH/DATA pair (as FIX 5.0 SP2
+    // NoPaymentStreamFormulas entries do).
+    dict.add_message(MessageDef {
+        msg_type: "U1".to_string(),
+        name: "TypeSampler".to_string(),
+        category: MessageCategory::App,
+        fields: vec![
+            field_ref(60, "TransactTime", false),
+            field_ref(5010, "SampleTime", false),
+            field_ref(5011, "SampleDate", false),
+            field_ref(75, "TradeDate", false),
+            field_ref(200, "MaturityMonthYear", false),
+            field_ref(205, "MaturityDay", false),
+            field_ref(421, "Country", false),
+            field_ref(15, "Currency", false),
+            field_ref(44, "Price", false),
+            field_ref(5012, "ExpireSeconds", false),
+            field_ref(5013, "Labels", false),
+            field_ref(5014, "Flags", false),
+            field_ref(5015, "Mode", false),
+        ],
+        groups: vec![GroupDef {
+            count_tag: 5020,
+            name: "NoDocs".to_string(),
+            delimiter_tag: 354,
+            fields: vec![
+                field_ref(354, "EncodedTextLen", false),
+                field_ref(355, "EncodedText", false),
+                field_ref(5023, "DocName", false),
+            ],
+            groups: Vec::new(),
+            components: Vec::new(),
+            required: true,
+        }],
         components: Vec::new(),
     });
 

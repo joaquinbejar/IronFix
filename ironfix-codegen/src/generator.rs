@@ -178,6 +178,26 @@ pub enum GeneratorError {
         /// The nesting-depth ceiling.
         limit: usize,
     },
+
+    /// A `data` (or `XMLData`) field has no `Length` field to frame it.
+    ///
+    /// Raised by [`CodeGenerator::generate_views`] only. The dictionary does
+    /// not name LENGTH/DATA pairs; a `data` field is paired with the `Length`
+    /// field listed immediately before it, as every pair of the embedded
+    /// dictionaries is listed. A `data` field with no such field before it,
+    /// or one that opens a repeating-group entry (where its length would have
+    /// to come before the delimiter), cannot be written with its count, so a
+    /// decoder would read any SOH in it as a field terminator. The generator
+    /// refuses it rather than emit a writer that corrupts frames.
+    #[error(
+        "{scope}: data field {tag} is not immediately preceded by the length field that frames it"
+    )]
+    UnpairedDataField {
+        /// The `data` field's tag.
+        tag: u32,
+        /// Where it is listed, for example `component Signature`.
+        scope: String,
+    },
 }
 
 /// Configuration for code generation.
@@ -312,13 +332,18 @@ impl CodeGenerator {
     /// - `views`: one `XxxView<'m, 'a>` per message over a decoded
     ///   `ironfix_core::message::RawMessage`, and one view type per group
     ///   definition (shared by every message that uses it), with typed
-    ///   accessors that borrow the decoded buffer.
+    ///   accessors that borrow the decoded buffer and check each value
+    ///   against its FIX type's grammar, as the validator does.
     /// - `writers`: one `XxxFields<'v>` per message and group definition,
-    ///   whose `write` sends the body, groups in dictionary order, to any
-    ///   `FnMut(u32, &[u8])` sink.
+    ///   whose `write` checks every value and then sends the body, groups in
+    ///   dictionary order, to a generated `writers::Sink`: any
+    ///   `FnMut(u32, &[u8])` closure is one, and a target that frames
+    ///   LENGTH/DATA pairs itself (`ironfix_tagvalue::Encoder`,
+    ///   `ironfix_engine::OutboundMessage`) implements it.
     ///
     /// The generated code depends on the `ironfix-core`,
-    /// `ironfix-dictionary` and `rust_decimal` crates, and contains no
+    /// `ironfix-dictionary` (a release after 0.4.1: it calls
+    /// `GroupSet::field`) and `rust_decimal` crates, and contains no
     /// `#[allow]`. Only [`GeneratorConfig::visibility`] applies: components
     /// are always expanded, because a view must know every group of a
     /// message to tell a message-level field from one inside a group.
@@ -328,7 +353,9 @@ impl CodeGenerator {
     /// [`CodeGenerator::generate`]: an undefined field or component, a
     /// component cycle, nesting past the depth limit, or a name with no Rust
     /// identifier (`what` is then `field`, `message`, `group` or
-    /// `component`).
+    /// `component`); and [`GeneratorError::UnpairedDataField`] for a `data`
+    /// field not listed right after its `Length` field, or opening a group
+    /// entry.
     ///
     /// # Examples
     ///

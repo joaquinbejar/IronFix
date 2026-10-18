@@ -87,6 +87,16 @@ const CONVENTION_PREFIXES: [&str; 3] = ["from_", "into_", "to_"];
 /// Type names the `enums` module keeps for itself.
 const RESERVED_ENUM_NAMES: [&str; 2] = ["Tokens", OTHER];
 
+/// Variant names of the prelude's `Option` and `Result`: an enumeration
+/// variant spelled the same would shadow them under a glob import, so FIX 4.4
+/// EncryptMethod `NONE` (0) is `None0`.
+const PRELUDE_VARIANTS: [&str; 4] = ["None", "Some", "Ok", "Err"];
+
+/// The ironfix-dictionary versions the generated code compiles against, as a
+/// Cargo requirement: `GroupSet::field` is new after 0.4.1. Set it to the
+/// release that ships it when that release is cut.
+const MIN_DICTIONARY_VERSION: &str = ">0.4.1";
+
 /// Size, in bytes, of the stack buffer the writers format numbers into: room
 /// for any `rust_decimal::Decimal`, `i64`, `u64` or `usize`.
 const FORMAT_BUFFER_BYTES: usize = 64;
@@ -118,8 +128,12 @@ impl Kind {
     /// Decides the kind of a field from its type and declared values.
     ///
     /// A field with declared values becomes an enumeration, except a
-    /// `Boolean`, whose two values `bool` already represents exactly.
+    /// `Boolean`, whose two values `bool` already represents exactly, and a
+    /// `data` field, whose value is raw bytes framed by its length.
     fn of(def: &FieldDef) -> Self {
+        if matches!(def.field_type, FieldType::Data | FieldType::XmlData) {
+            return Self::Bytes;
+        }
         let declared = def.values.as_ref().is_some_and(|values| !values.is_empty());
         if declared && def.field_type != FieldType::Boolean {
             return if def.field_type.is_multi_value() {
@@ -181,16 +195,17 @@ impl Kind {
         )
     }
 
-    /// The `ironfix_core::field::FieldRef` conversion and Rust type of a kind
-    /// whose reading can fail, or `None` for an infallible one.
+    /// The generated view helper that reads a kind whose value can be
+    /// malformed, checked against the validator's grammar, and its Rust type;
+    /// `None` for a kind that reads every value.
     const fn conversion(self) -> Option<(&'static str, &'static str)> {
         match self {
-            Self::Str => Some(("as_str", "&'a str")),
-            Self::Char => Some(("as_char", "char")),
-            Self::Bool => Some(("as_bool", "bool")),
-            Self::Int => Some(("as_i64", "i64")),
-            Self::UInt => Some(("as_u64", "u64")),
-            Self::Decimal => Some(("as_decimal", "Decimal")),
+            Self::Str => Some(("text", "&'a str")),
+            Self::Char => Some(("character", "char")),
+            Self::Bool => Some(("boolean", "bool")),
+            Self::Int => Some(("int", "i64")),
+            Self::UInt => Some(("uint", "u64")),
+            Self::Decimal => Some(("decimal", "Decimal")),
             Self::Bytes | Self::Enum(_) | Self::Tokens(_) => None,
         }
     }
@@ -198,11 +213,15 @@ impl Kind {
 
 /// Whether a field is half of a LENGTH/DATA pair.
 ///
-/// The dictionary does not name the pairs; it lists a `data` (or
-/// `XMLData`) field right after the `Length` field that frames it, so a
-/// `data` field (without declared values) that immediately follows a
-/// `Length` field in the same field list is paired with it. Every pair of the
-/// embedded dictionaries is listed that way.
+/// The dictionary does not name the pairs; it lists a `data` (or `XMLData`)
+/// field right after the `Length` field that frames it, so a `data` field is
+/// paired with the `Length` field immediately before it in the same field
+/// list. Every pair of the embedded dictionaries is listed that way, and a
+/// `data` field listed any other way is a
+/// [`GeneratorError::UnpairedDataField`]. The `Length` half may be a group's
+/// delimiter (FIX 5.0 SP2 `NoPaymentStreamFormulas` entries open with
+/// `PaymentStreamFormulaLength`): the pair is kept, its data is required, and
+/// the writer emits the pair first, so the length still opens the entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pair {
     /// Not part of a pair.
@@ -222,6 +241,8 @@ struct FieldMember {
     name: String,
     required: bool,
     kind: Kind,
+    /// The field's FIX type, whose grammar a view checks before converting.
+    field_type: FieldType,
     /// Doc line: name, tag and description.
     doc: String,
     pair: Pair,
@@ -510,17 +531,25 @@ impl<'d> Builder<'d> {
             });
         }
 
-        // The `Length` field listed right before a `data` field frames it.
+        // The `Length` field listed right before a `data` field frames it; a
+        // `data` field without one cannot be written with its count.
         let mut previous: Option<&FieldDef> = None;
         for field in part.fields {
             let def = self.field_def(field.tag, ctx.scope)?;
             let mut member = field_member(def, &field.name, ctx.required && field.required);
-            if let Some(length) = previous
-                && length.field_type == FieldType::Length
-                && member.kind == Kind::Bytes
-            {
-                member.pair = Pair::Data(length.tag);
-                level.pair_length(length.tag, def.tag);
+            if member.kind == Kind::Bytes {
+                match previous {
+                    Some(length) if length.field_type == FieldType::Length => {
+                        member.pair = Pair::Data(length.tag);
+                        level.pair_length(length.tag, def.tag);
+                    }
+                    _ => {
+                        return Err(GeneratorError::UnpairedDataField {
+                            tag: def.tag,
+                            scope: ctx.scope.to_string(),
+                        });
+                    }
+                }
             }
             level.add_field(member);
             previous = Some(def);
@@ -660,7 +689,9 @@ impl<'d> Builder<'d> {
 
     /// Finishes a group entry: its delimiter first and required (it opens
     /// every entry), synthesised from the field definition when no member
-    /// carries it.
+    /// carries it. A delimiter that is the length of a LENGTH/DATA pair keeps
+    /// the pair, with its data right after it and required; a `data`
+    /// delimiter is a [`GeneratorError::UnpairedDataField`].
     fn finish_entry(
         &self,
         builder: LevelBuilder,
@@ -681,25 +712,40 @@ impl<'d> Builder<'d> {
             }
         };
         delimiter.set_required();
-        // A delimiter is written first and on its own, so it is never half of
-        // a LENGTH/DATA pair (no embedded dictionary has such a delimiter).
-        let partner = match &mut delimiter {
-            Member::Field(field) => {
-                field.pair = Pair::None;
-                Some(field.tag)
-            }
-            Member::Group(_) => None,
-        };
         let mut members = Vec::with_capacity(rest.len() + 1);
-        members.push(delimiter);
-        members.extend(rest.into_iter().map(|mut member| {
-            if let Member::Field(field) = &mut member
-                && matches!(field.pair, Pair::Length(tag) | Pair::Data(tag) if Some(tag) == partner)
-            {
-                field.pair = Pair::None;
+        match &delimiter {
+            // The delimiter is the length of a pair (FIX 5.0 SP2
+            // NoPaymentStreamFormulas): the writer derives it from the data
+            // and writes the pair first, so its data comes right after it and
+            // is required, and the length still opens the entry.
+            Member::Field(FieldMember {
+                pair: Pair::Length(data_tag),
+                ..
+            }) => {
+                let data_tag = *data_tag;
+                let (data, others): (Vec<Member>, Vec<Member>) = rest
+                    .into_iter()
+                    .partition(|member| member.tag() == data_tag);
+                members.push(delimiter);
+                for mut member in data {
+                    member.set_required();
+                    members.push(member);
+                }
+                members.extend(others);
             }
-            member
-        }));
+            // A data field cannot open an entry: its length would have to be
+            // written before the delimiter.
+            Member::Field(field) if field.kind == Kind::Bytes => {
+                return Err(GeneratorError::UnpairedDataField {
+                    tag: field.tag,
+                    scope: scope.to_string(),
+                });
+            }
+            _ => {
+                members.push(delimiter);
+                members.extend(rest);
+            }
+        }
         level.members = members;
         name_members(&mut level)?;
         Ok(level)
@@ -1035,6 +1081,7 @@ fn acceptable_variant(enum_name: &str, candidate: &str, used: &HashSet<String>) 
             .next()
             .is_some_and(|c| c.is_ascii_uppercase())
         && candidate != OTHER
+        && !PRELUDE_VARIANTS.contains(&candidate)
         && !is_keyword(candidate)
         && !used.contains(candidate)
         && !is_upper_acronym(candidate)
@@ -1049,9 +1096,11 @@ fn acceptable_variant(enum_name: &str, candidate: &str, used: &HashSet<String>) 
 /// then `Value`, the description and the value, and finally `Value1`,
 /// `Value2`, ... (`Code1`, `Code2`, ... for an enumeration whose name starts
 /// with `V`). An empty description is replaced by `Value` and the wire
-/// value; one that starts with a digit is prefixed with `Value`. A candidate is refused when it is not an
-/// identifier, is the fallback `Other`, a keyword, already taken, an
-/// all-capital acronym, or repeats the enumeration's name.
+/// value; one that starts with a digit is prefixed with `Value`. A candidate
+/// is refused when it is not an identifier, is the fallback `Other` or a
+/// variant of the prelude's `Option` / `Result` (`None`, `Some`, `Ok`,
+/// `Err`), a keyword, already taken, an all-capital acronym, or repeats the
+/// enumeration's name.
 fn variant_names<'v>(
     enum_name: &str,
     values: impl Iterator<Item = (&'v str, &'v str)>,
@@ -1129,6 +1178,7 @@ fn field_member(def: &FieldDef, name: &str, required: bool) -> FieldMember {
         name: name.to_string(),
         required,
         kind: Kind::of(def),
+        field_type: def.field_type,
         doc: field_title(def),
         pair: Pair::None,
     }
@@ -1181,7 +1231,13 @@ pub(crate) fn generate(dict: &Dictionary, visibility: &str) -> Result<String, Ge
     );
     line(
         &mut code,
-        "// It needs the ironfix-core, ironfix-dictionary and rust_decimal crates.",
+        &format!(
+            "// It needs the ironfix-core and rust_decimal crates, and ironfix-dictionary {MIN_DICTIONARY_VERSION}"
+        ),
+    );
+    line(
+        &mut code,
+        "// (it calls GroupSet::field and FieldType::is_valid_value).",
     );
     line(&mut code, "");
     emit_enums(&mut code, &model, visibility);
@@ -1470,10 +1526,13 @@ fn join_numbers(numbers: &[u32]) -> String {
 /// What the views module uses, so it imports and emits nothing unused.
 #[derive(Debug, Default)]
 struct ViewUses {
-    /// `FieldRef` is named: by a message's `get`, the `required` helper, or
-    /// an optional fallible accessor.
+    /// `FieldRef` is named: by a message's `get`, the `required` helper, or a
+    /// conversion helper.
     field_ref: bool,
-    fallible: bool,
+    /// A value is read through the grammar check (`text`).
+    text: bool,
+    /// The conversion helpers built on `text` that something calls.
+    helpers: BTreeSet<&'static str>,
     required: bool,
     decimal: bool,
     enums: bool,
@@ -1503,9 +1562,15 @@ impl ViewUses {
             for member in &level.members {
                 match member {
                     Member::Field(field) => {
-                        let fallible = field.kind.conversion().is_some();
-                        uses.field_ref |= field.required || fallible;
-                        uses.fallible |= fallible;
+                        let checked = field.kind.conversion().is_some()
+                            || matches!(field.kind, Kind::Tokens(_));
+                        uses.field_ref |= field.required || checked;
+                        uses.text |= checked;
+                        if let Some((helper, _)) = field.kind.conversion()
+                            && helper != "text"
+                        {
+                            uses.helpers.insert(helper);
+                        }
                         uses.required |= field.required;
                         uses.decimal |= field.kind == Kind::Decimal;
                         uses.enums |= field.kind.enum_tag().is_some();
@@ -1518,36 +1583,64 @@ impl ViewUses {
     }
 }
 
+/// The view conversion helpers built on `text`: name, Rust type, doc, and
+/// the expression that converts once the grammar check has passed (`value`
+/// is the checked text).
+const VIEW_HELPERS: [(&str, &str, &str, &str); 5] = [
+    (
+        "decimal",
+        "Decimal",
+        "Returns the value of `field` as a decimal, exactly: a value with more digits than a `Decimal` holds is an error, never rounded.",
+        "Decimal::from_str_exact(value).map_err(|_| DecodeError::InvalidFieldValue { tag: field.tag, reason: format!(\"'{value}' does not fit a decimal exactly\") })",
+    ),
+    (
+        "int",
+        "i64",
+        "Returns the value of `field` as a signed integer.",
+        "field.as_i64()",
+    ),
+    (
+        "uint",
+        "u64",
+        "Returns the value of `field` as a non-negative integer.",
+        "field.as_u64()",
+    ),
+    (
+        "character",
+        "char",
+        "Returns the value of `field` as one ASCII character.",
+        "field.as_char()",
+    ),
+    (
+        "boolean",
+        "bool",
+        "Returns the value of `field` as a boolean (`Y` or `N`).",
+        "field.as_bool()",
+    ),
+];
+
 /// Emits the `views` module.
 fn emit_views(code: &mut String, model: &Model, visibility: &str) {
     let uses = ViewUses::of(model);
-    line(
-        code,
+    for text in [
         "/// Borrowed, typed views over decoded messages: nothing is copied out of the buffer.",
-    );
-    line(code, "///");
-    line(
-        code,
+        "///",
         "/// A view reads a message-level field with the message's `layouts` set, so the same tag inside a",
-    );
-    line(
-        code,
-        "/// repeating group is never taken for it. An absent required field is",
-    );
-    line(
-        code,
-        "/// `DecodeError::MissingRequiredField`; a value that does not parse as its type is the `DecodeError`",
-    );
-    line(
-        code,
-        "/// of `ironfix_core`'s field conversions. A group is checked whole before any entry is handed out,",
-    );
-    line(
-        code,
+        "/// repeating group is never taken for it; of a tag repeated at the message level it reads the first",
+        "/// (the validator reports the repetition). A value is checked against its FIX type's grammar, the",
+        "/// one `ironfix_dictionary::Validator` applies, before it is converted: a value that does not match",
+        "/// it, or a decimal that does not fit `rust_decimal::Decimal` exactly, is",
+        "/// `DecodeError::InvalidFieldValue`, never rounded or read leniently. An absent required field is",
+        "/// `DecodeError::MissingRequiredField`. A group is checked whole before any entry is handed out,",
         "/// and is `Ok(None)` when absent: group presence is the validator's concern.",
-    );
+        "///",
+        "/// The views' own `Debug` prints no field value. `message()` and `entry()` return the decoded",
+        "/// message and entry, whose `Debug` prints raw values, credentials included: do not log them.",
+    ] {
+        line(code, text);
+    }
     line(code, &format!("{visibility} mod views {{"));
-    if uses.fallible || uses.required {
+    if uses.text || uses.required {
         line(code, "    use ::ironfix_core::error::DecodeError;");
     }
     if uses.field_ref {
@@ -1556,13 +1649,26 @@ fn emit_views(code: &mut String, model: &Model, visibility: &str) {
     if !model.messages.is_empty() {
         line(code, "    use ::ironfix_core::message::RawMessage;");
     }
-    match (uses.groups, uses.entries) {
-        (true, _) => line(
+    let mut dictionary_items: Vec<&str> = Vec::new();
+    if uses.text {
+        dictionary_items.push("FieldType");
+    }
+    if uses.groups {
+        dictionary_items.push("GroupEntries");
+    }
+    if uses.groups || uses.entries {
+        dictionary_items.push("GroupEntry");
+    }
+    if uses.groups {
+        dictionary_items.push("GroupError");
+    }
+    match dictionary_items.as_slice() {
+        [] => {}
+        [item] => line(code, &format!("    use ::ironfix_dictionary::{item};")),
+        items => line(
             code,
-            "    use ::ironfix_dictionary::{GroupEntries, GroupEntry, GroupError};",
+            &format!("    use ::ironfix_dictionary::{{{}}};", items.join(", ")),
         ),
-        (false, true) => line(code, "    use ::ironfix_dictionary::GroupEntry;"),
-        (false, false) => {}
     }
     if uses.decimal {
         line(code, "    use ::rust_decimal::Decimal;");
@@ -1598,6 +1704,46 @@ fn emit_views(code: &mut String, model: &Model, visibility: &str) {
             code,
             "        field.ok_or(DecodeError::MissingRequiredField { tag })",
         );
+        line(code, "    }");
+    }
+    if uses.text {
+        for text in [
+            "",
+            "    /// Returns the text of `field`, checked against the grammar of `field_type`: the rule the",
+            "    /// validator applies.",
+            "    fn text<'a>(field: &FieldRef<'a>, field_type: FieldType) -> Result<&'a str, DecodeError> {",
+            "        let value = field.as_str()?;",
+            "        if field_type.is_valid_value(value) {",
+            "            Ok(value)",
+            "        } else {",
+            "            Err(DecodeError::InvalidFieldValue {",
+            "                tag: field.tag,",
+            "                reason: format!(\"'{value}' is not a valid {field_type:?} value\"),",
+            "            })",
+            "        }",
+            "    }",
+        ] {
+            line(code, text);
+        }
+    }
+    for (name, ty, doc, body) in VIEW_HELPERS {
+        if !uses.helpers.contains(name) {
+            continue;
+        }
+        line(code, "");
+        line(code, &format!("    /// {doc}"));
+        line(
+            code,
+            &format!(
+                "    fn {name}(field: &FieldRef<'_>, field_type: FieldType) -> Result<{ty}, DecodeError> {{"
+            ),
+        );
+        if body.contains("value") {
+            line(code, "        let value = text(field, field_type)?;");
+        } else {
+            line(code, "        text(field, field_type)?;");
+        }
+        line(code, &format!("        {body}"));
         line(code, "    }");
     }
     for message in &model.messages {
@@ -1682,7 +1828,7 @@ fn emit_message_view(code: &mut String, model: &Model, message: &MessageModel) {
     line(code, "");
     line(
         code,
-        "        /// Returns the decoded message this view reads.",
+        "        /// Returns the decoded message this view reads. Its `Debug` prints raw field values,\n        /// credentials included.",
     );
     line(code, "        #[must_use]");
     line(
@@ -1758,7 +1904,7 @@ fn emit_entry_view(code: &mut String, model: &Model, site: &Site) {
     line(code, "");
     line(
         code,
-        "        /// Returns the entry this view reads: its index and its fields in wire order.",
+        "        /// Returns the entry this view reads: its index and its fields in wire order. Its `Debug`\n        /// prints raw field values.",
     );
     line(code, "        #[must_use]");
     line(
@@ -1829,17 +1975,20 @@ fn emit_accessor(
             };
             let lookup = format!("{get}({tag})");
             let present = format!("required({lookup}, {tag})");
+            let grammar = format!("FieldType::{:?}", field.field_type);
             let (ret, body) = match (field.kind.conversion(), field.kind) {
                 (Some((convert, ty)), _) => {
                     if field.required {
                         (
                             format!("Result<{ty}, DecodeError>"),
-                            format!("{present}?.{convert}()"),
+                            format!("{convert}({present}?, {grammar})"),
                         )
                     } else {
                         (
                             format!("Result<Option<{ty}>, DecodeError>"),
-                            format!("{lookup}.map(FieldRef::{convert}).transpose()"),
+                            format!(
+                                "{lookup}.map(|field| {convert}(field, {grammar})).transpose()"
+                            ),
                         )
                     }
                 }
@@ -1850,10 +1999,26 @@ fn emit_accessor(
                     infallible(field.required, &ty, &lookup, &present, &map)
                 }
                 (None, Kind::Tokens(enum_tag)) => {
+                    // The whole value is checked first, so an empty token
+                    // (a doubled or trailing space) or a multi-character
+                    // value is an error, not an `Other(b"")` token.
                     let enum_name = model.enum_name(enum_tag);
                     let ty = format!("enums::Tokens<'a, enums::{enum_name}<'a>>");
-                    let map = format!("map(|field| enums::{enum_name}::tokens(field.value))");
-                    infallible(field.required, &ty, &lookup, &present, &map)
+                    let tokens =
+                        format!("map(|value| enums::{enum_name}::tokens(value.as_bytes()))");
+                    if field.required {
+                        (
+                            format!("Result<{ty}, DecodeError>"),
+                            format!("text({present}?, {grammar}).{tokens}"),
+                        )
+                    } else {
+                        (
+                            format!("Result<Option<{ty}>, DecodeError>"),
+                            format!(
+                                "{lookup}.map(|field| text(field, {grammar}).{tokens}).transpose()"
+                            ),
+                        )
+                    }
                 }
                 (None, _) => infallible(
                     field.required,
@@ -1896,7 +2061,14 @@ fn infallible(
 #[derive(Debug, Default)]
 struct WriterUses {
     present: bool,
-    ascii: bool,
+    /// Text and enumeration values: not empty, no SOH.
+    text: bool,
+    /// Data values: not empty.
+    data: bool,
+    /// Characters: printable ASCII.
+    character: bool,
+    /// Multi-value tokens: not empty, no space, no SOH.
+    token: bool,
     display: bool,
     decimal: bool,
     enums: bool,
@@ -1910,7 +2082,10 @@ impl WriterUses {
                 match member {
                     Member::Field(field) => {
                         uses.present |= writer_required(level, field);
-                        uses.ascii |= field.kind == Kind::Char;
+                        uses.text |= matches!(field.kind, Kind::Str | Kind::Enum(_));
+                        uses.data |= field.kind == Kind::Bytes;
+                        uses.character |= field.kind == Kind::Char;
+                        uses.token |= matches!(field.kind, Kind::Tokens(_));
                         uses.display |=
                             matches!(field.kind, Kind::Int | Kind::UInt | Kind::Decimal);
                         uses.decimal |= field.kind == Kind::Decimal;
@@ -1947,27 +2122,57 @@ fn writer_required(level: &Level, field: &FieldMember) -> bool {
         }
 }
 
+/// The value checks a writer helper runs: name, doc, parameter type, and
+/// the match arms that refuse a value (the last arm accepts).
+const WRITER_CHECKS: [(&str, &str, &str, &[&str]); 4] = [
+    (
+        "check_text",
+        "Refuses an empty value, or one carrying SOH, which would end the field early.",
+        "Option<&[u8]>",
+        &[
+            "Some([]) => Err(invalid(tag, \"the value is empty\".to_string())),",
+            "Some(value) if value.contains(&0x01) => Err(invalid(tag, \"the value contains SOH\".to_string())),",
+        ],
+    ),
+    (
+        "check_data",
+        "Refuses an empty data value. It may carry SOH: it is written with its length.",
+        "Option<&[u8]>",
+        &["Some([]) => Err(invalid(tag, \"the value is empty\".to_string())),"],
+    ),
+    (
+        "check_char",
+        "Refuses a character that is not printable ASCII (a control character includes SOH).",
+        "Option<char>",
+        &[
+            "Some(value) if !value.is_ascii() || value.is_ascii_control() => Err(invalid(tag, format!(\"{value:?} is not a printable ASCII character\"))),",
+        ],
+    ),
+    (
+        "check_token",
+        "Refuses an empty token, or one carrying a space (the separator) or SOH.",
+        "&[u8]",
+        &[
+            "[] => Err(invalid(tag, \"a token is empty\".to_string())),",
+            "value if value.contains(&b' ') => Err(invalid(tag, \"a token contains a space\".to_string())),",
+            "value if value.contains(&0x01) => Err(invalid(tag, \"a token contains SOH\".to_string())),",
+        ],
+    ),
+];
+
 /// Emits the `writers` module.
 fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
     let uses = WriterUses::of(model);
-    line(
-        code,
+    for text in [
         "/// Typed writers of message bodies, to any [`Sink`](writers::Sink): a `FnMut(u32, &[u8])`",
-    );
-    line(
-        code,
         "/// closure, or a target that frames LENGTH/DATA pairs itself.",
-    );
-    line(code, "///");
-    line(
-        code,
+        "///",
         "/// Fields are written in dictionary order; a repeating group as its count, then each entry with its",
-    );
-    line(
-        code,
-        "/// delimiter first. Numbers are formatted on the stack; only a multi-value field allocates, to join",
-    );
-    line(code, "/// its values.");
+        "/// delimiter first. Every value is checked before anything is written. Numbers are formatted on",
+        "/// the stack; only a multi-value field allocates, to join its values.",
+    ] {
+        line(code, text);
+    }
     line(code, &format!("{visibility} mod writers {{"));
     if model.messages.is_empty() {
         line(code, "}");
@@ -1982,46 +2187,46 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
     }
     emit_sink(code);
     if uses.present {
-        line(code, "");
-        line(
-            code,
+        for text in [
+            "",
             "    /// Returns the missing-field error of `tag` unless the field is present.",
-        );
-        line(
-            code,
             "    fn present(present: bool, tag: u32) -> Result<(), EncodeError> {",
-        );
-        line(code, "        if present {");
-        line(code, "            Ok(())");
-        line(code, "        } else {");
-        line(
-            code,
+            "        if present {",
+            "            Ok(())",
+            "        } else {",
             "            Err(EncodeError::MissingRequiredField { tag })",
-        );
-        line(code, "        }");
-        line(code, "    }");
+            "        }",
+            "    }",
+        ] {
+            line(code, text);
+        }
     }
-    if uses.ascii {
+    let emitted = [uses.text, uses.data, uses.character, uses.token];
+    if emitted.contains(&true) {
+        for text in [
+            "",
+            "    /// Builds the invalid-value error of `tag`.",
+            "    fn invalid(tag: u32, reason: String) -> EncodeError {",
+            "        EncodeError::InvalidFieldValue { tag, reason }",
+            "    }",
+        ] {
+            line(code, text);
+        }
+    }
+    for ((name, doc, parameter, refusals), used) in WRITER_CHECKS.into_iter().zip(emitted) {
+        if !used {
+            continue;
+        }
         line(code, "");
+        line(code, &format!("    /// {doc}"));
         line(
             code,
-            "    /// Returns an invalid-value error of `tag` for a character that is not ASCII.",
-        );
-        line(
-            code,
-            "    fn ascii(value: Option<char>, tag: u32) -> Result<(), EncodeError> {",
+            &format!("    fn {name}(value: {parameter}, tag: u32) -> Result<(), EncodeError> {{"),
         );
         line(code, "        match value {");
-        line(
-            code,
-            "            Some(value) if !value.is_ascii() => Err(EncodeError::InvalidFieldValue {",
-        );
-        line(code, "                tag,");
-        line(
-            code,
-            "                reason: format!(\"'{value}' is not an ASCII character\"),",
-        );
-        line(code, "            }),");
+        for refusal in refusals {
+            line(code, &format!("            {refusal}"));
+        }
         line(code, "            _ => Ok(()),");
         line(code, "        }");
         line(code, "    }");
@@ -2051,33 +2256,59 @@ fn emit_writers(code: &mut String, model: &Model, visibility: &str) {
     line(code, "}");
 }
 
-/// Emits the `Sink` trait, its blanket implementation for closures, and the
-/// digit formatter its default `data` uses.
+/// Emits the `Sink` trait, its implementation for closures, and the digit
+/// formatter that implementation frames a LENGTH/DATA pair with.
 fn emit_sink(code: &mut String) {
     for text in [
         "",
         "    /// Where a writer sends a body, one call per field.",
         "    ///",
         "    /// Every `FnMut(u32, &[u8])` closure is a sink; it receives a LENGTH/DATA pair as its two fields,",
-        "    /// length first. A target that frames such pairs itself, such as `ironfix_tagvalue::Encoder`",
-        "    /// (whose `put_raw` refuses them), implements `data` too: `field` calls `put_raw` and `data`",
-        "    /// calls `put_data`.",
+        "    /// length first. A target that frames such pairs itself implements both methods; `data` has no",
+        "    /// default, so an implementation cannot forget it. Over `ironfix_tagvalue::Encoder`, whose",
+        "    /// `put_raw` refuses the tags of a pair, and over `ironfix_engine::OutboundMessage`:",
+        "    ///",
+        "    /// ```text",
+        "    /// impl writers::Sink for ironfix_tagvalue::Encoder {",
+        "    ///     fn field(&mut self, tag: u32, value: &[u8]) {",
+        "    ///         self.put_raw(tag, value);",
+        "    ///     }",
+        "    ///     fn data(&mut self, length_tag: u32, data_tag: u32, value: &[u8]) {",
+        "    ///         self.put_data(length_tag, data_tag, value);",
+        "    ///     }",
+        "    /// }",
+        "    ///",
+        "    /// impl writers::Sink for ironfix_engine::OutboundMessage {",
+        "    ///     fn field(&mut self, tag: u32, value: &[u8]) {",
+        "    ///         self.push_raw(tag, value);",
+        "    ///     }",
+        "    ///     fn data(&mut self, length_tag: u32, data_tag: u32, value: &[u8]) {",
+        "    ///         self.push_data(length_tag, data_tag, value);",
+        "    ///     }",
+        "    /// }",
+        "    /// ```",
         "    pub trait Sink {",
         "        /// Writes field `tag` with `value`.",
+        "        ///",
+        "        /// The writers have checked, before writing anything, that `value` is not empty and carries",
+        "        /// no SOH, that a character is printable ASCII, and that every multi-value token is non-empty",
+        "        /// with no space. A number or group count is formatted in decimal.",
         "        fn field(&mut self, tag: u32, value: &[u8]);",
         "",
-        "        /// Writes a LENGTH/DATA pair: by default the length field, holding the size of `value` in",
-        "        /// bytes, then the data field.",
-        "        fn data(&mut self, length_tag: u32, data_tag: u32, value: &[u8]) {",
-        "            let mut digits = [0; 20];",
-        "            self.field(length_tag, decimal(value.len(), &mut digits));",
-        "            self.field(data_tag, value);",
-        "        }",
+        "        /// Writes a LENGTH/DATA pair: the length field, holding the size of `value` in bytes, then",
+        "        /// the data field. `value` is not empty and may carry SOH.",
+        "        fn data(&mut self, length_tag: u32, data_tag: u32, value: &[u8]);",
         "    }",
         "",
         "    impl<F: FnMut(u32, &[u8]) + ?Sized> Sink for F {",
         "        fn field(&mut self, tag: u32, value: &[u8]) {",
         "            self(tag, value);",
+        "        }",
+        "",
+        "        fn data(&mut self, length_tag: u32, data_tag: u32, value: &[u8]) {",
+        "            let mut digits = [0; 20];",
+        "            self(length_tag, decimal(value.len(), &mut digits));",
+        "            self(data_tag, value);",
         "        }",
         "    }",
         "",
@@ -2085,9 +2316,11 @@ fn emit_sink(code: &mut String) {
         "    fn decimal(value: usize, digits: &mut [u8; 20]) -> &[u8] {",
         "        let mut rest = value;",
         "        let mut start = digits.len();",
-        "        for slot in digits.iter_mut().rev() {",
-        "            *slot = b\"0123456789\".get(rest % 10).copied().unwrap_or(b'0');",
-        "            start -= 1;",
+        "        while let Some(index) = start.checked_sub(1) {",
+        "            if let Some(slot) = digits.get_mut(index) {",
+        "                *slot = b\"0123456789\".get(rest % 10).copied().unwrap_or(b'0');",
+        "            }",
+        "            start = index;",
         "            rest /= 10;",
         "            if rest == 0 {",
         "                break;",
@@ -2226,8 +2459,22 @@ fn writer_checks(level: &Level) -> Vec<String> {
                     };
                     checks.push(format!("present({present}, {})?;", field.tag));
                 }
-                if field.kind == Kind::Char {
-                    checks.push(format!("ascii(self.{ident}, {})?;", field.tag));
+                let tag = field.tag;
+                match field.kind {
+                    Kind::Str => checks.push(format!(
+                        "check_text(self.{ident}.map(str::as_bytes), {tag})?;"
+                    )),
+                    Kind::Enum(_) => checks.push(format!(
+                        "check_text(self.{ident}.map(|value| value.as_bytes()), {tag})?;"
+                    )),
+                    Kind::Bytes => checks.push(format!("check_data(self.{ident}, {tag})?;")),
+                    Kind::Char => checks.push(format!("check_char(self.{ident}, {tag})?;")),
+                    Kind::Tokens(_) => {
+                        checks.push(format!("for value in self.{ident} {{"));
+                        checks.push(format!("    check_token(value.as_bytes(), {tag})?;"));
+                        checks.push("}".to_string());
+                    }
+                    Kind::Bool | Kind::Int | Kind::UInt | Kind::Decimal => {}
                 }
             }
             Member::Group(group) => {
@@ -2373,8 +2620,9 @@ fn emit_writer(
             "        ///",
             "        /// # Errors",
             "        /// `EncodeError::MissingRequiredField` for an absent required field or group, or an entry",
-            "        /// without its delimiter, and `EncodeError::InvalidFieldValue` for a `char` that is not",
-            "        /// ASCII. Both are checked before anything is written.",
+            "        /// without its delimiter; `EncodeError::InvalidFieldValue` for an empty value, SOH in a",
+            "        /// value other than data, a `char` that is not printable ASCII, or a multi-value token",
+            "        /// that is empty or carries a space. All are checked before anything is written.",
         ] {
             line(code, text);
         }
@@ -2560,6 +2808,7 @@ mod tests {
                     kind: Kind::Str,
                     doc: String::new(),
                     pair: Pair::None,
+                    field_type: FieldType::String,
                 }),
                 Member::Field(FieldMember {
                     tag: 2,
@@ -2568,6 +2817,7 @@ mod tests {
                     kind: Kind::Str,
                     doc: String::new(),
                     pair: Pair::None,
+                    field_type: FieldType::String,
                 }),
                 Member::Field(FieldMember {
                     tag: 3,
@@ -2576,6 +2826,7 @@ mod tests {
                     kind: Kind::Decimal,
                     doc: String::new(),
                     pair: Pair::None,
+                    field_type: FieldType::String,
                 }),
             ],
             ..Level::default()
@@ -2626,7 +2877,7 @@ mod tests {
 
     #[test]
     fn test_generate_views_for_every_embedded_dictionary() {
-        // FIX 4.4 views are about 3.7 MB and FIX 5.0 SP2 views about 23 MB:
+        // FIX 4.4 views are about 4.2 MB and FIX 5.0 SP2 views about 26 MB:
         // generated and inspected here, compiled out of tree (see ADR-0012).
         for dict in [
             embedded(Dictionary::fix44()),
@@ -2659,6 +2910,11 @@ mod tests {
         let fix50sp2 = views(embedded(Dictionary::fix50sp2()));
         assert!(fix50sp2.contains("        NotTriggered0,"));
         assert!(fix50sp2.contains("        Triggered1,"));
+        // NoPaymentStreamFormulas(42683) entries open with the length of
+        // PaymentStreamFormula: the pair is kept and written first.
+        assert!(fix50sp2.contains("            if let Some(value) = self.payment_stream_formula { sink.data(43109, 42684, value); }"));
+        // FIX 4.4 EncryptMethod `NONE` would shadow `Option::None`.
+        assert!(fix44.contains("        None0,"));
     }
 
     #[test]
@@ -2767,6 +3023,87 @@ mod tests {
         // The view reads both.
         assert!(code.contains("pub fn raw_data_length(&self)"));
         assert!(code.contains("pub fn raw_data(&self) -> Result<&'a [u8], DecodeError> {"));
+    }
+
+    /// A NoAllocs group with the given delimiter and fields.
+    fn allocs_with(delimiter_tag: u32, fields: Vec<SchemaFieldRef>) -> GroupDef {
+        GroupDef {
+            fields,
+            ..allocs(false, delimiter_tag)
+        }
+    }
+
+    #[test]
+    fn test_generate_views_keeps_a_pair_whose_length_is_the_delimiter() {
+        // FIX 5.0 SP2 NoPaymentStreamFormulas entries open with
+        // PaymentStreamFormulaLength: the pair is kept and written first.
+        let group = allocs_with(
+            95,
+            vec![
+                reference(95, "RawDataLength", false),
+                reference(96, "RawData", false),
+                reference(79, "AllocAccount", false),
+            ],
+        );
+        let code = views(&dict_with(Vec::new(), vec![group], Vec::new()));
+        let Some(start) = code.find("impl NewOrderSingleNoAllocsFields<'_> {") else {
+            panic!("the entry writer must be generated: {code}");
+        };
+        let entry = code.get(start..).unwrap_or_default();
+        assert!(entry.contains("present(self.raw_data.is_some(), 96)?;"));
+        let pair = entry.find("sink.data(95, 96, value);");
+        let account = entry.find("sink.field(79, value.as_bytes());");
+        assert!(pair.is_some() && pair < account, "the pair opens the entry");
+        // The view reads the delimiter and requires the data.
+        assert!(code.contains("pub fn raw_data_length(&self) -> Result<u64, DecodeError> {"));
+        assert!(code.contains("pub fn raw_data(&self) -> Result<&'a [u8], DecodeError> {"));
+        assert!(!code.contains("pub raw_data_length:"));
+    }
+
+    #[test]
+    fn test_generate_views_unpaired_data_field_is_a_typed_error() {
+        for fields in [
+            vec![reference(96, "RawData", true)],
+            vec![
+                reference(11, "ClOrdID", true),
+                reference(96, "RawData", true),
+            ],
+        ] {
+            assert_eq!(
+                CodeGenerator::new().generate_views(&dict_with(fields, Vec::new(), Vec::new())),
+                Err(GeneratorError::UnpairedDataField {
+                    tag: 96,
+                    scope: "message NewOrderSingle".to_string(),
+                })
+            );
+        }
+        // A data field opening a group entry: its length would have to come
+        // before the delimiter.
+        let group = allocs_with(
+            96,
+            vec![
+                reference(95, "RawDataLength", false),
+                reference(96, "RawData", false),
+            ],
+        );
+        assert_eq!(
+            CodeGenerator::new().generate_views(&dict_with(Vec::new(), vec![group], Vec::new())),
+            Err(GeneratorError::UnpairedDataField {
+                tag: 96,
+                scope: "group NoAllocs of message NewOrderSingle".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_variant_names_never_take_prelude_variants() {
+        assert_eq!(
+            names(
+                "EncryptMethod",
+                &[("0", "NONE"), ("1", "SOME"), ("2", "OK"), ("3", "ERR")]
+            ),
+            vec!["None0", "Some1", "Ok2", "Err3"]
+        );
     }
 
     #[test]

@@ -51,6 +51,7 @@ use ironfix_dictionary::{Dictionary, GroupError, GroupSet, GroupSpec, MessageLay
 use ironfix_tagvalue::{Decoder, Encoder};
 use rust_decimal::Decimal;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt::Debug;
 
 const SOH: char = '\x01';
@@ -250,7 +251,8 @@ fn test_fix44_new_order_single_view_reads_every_field_and_the_nested_group() {
     );
     assert_eq!(ok(order.ord_type(), "OrdType"), OrdType::Limit);
     assert_eq!(ok(order.price(), "Price"), Some(Decimal::new(12345, 4)));
-    let exec_inst: Vec<ExecInst<'_>> = some(order.exec_inst(), "ExecInst").collect();
+    let exec_inst: Vec<ExecInst<'_>> =
+        some(ok(order.exec_inst(), "ExecInst"), "ExecInst").collect();
     assert_eq!(exec_inst, vec![ExecInst::NotHeld, ExecInst::AllOrNone]);
     assert_eq!(order.time_in_force(), Some(TimeInForce::Day));
     assert_eq!(ok(order.text(), "Text"), Some("hello"));
@@ -313,7 +315,7 @@ fn test_unknown_enum_value_reads_as_other_and_round_trips() {
     assert_eq!(side, Side::Other(b"Z"));
     assert_eq!(side.as_bytes(), b"Z");
     assert_eq!(ok(order.ord_type(), "OrdType"), OrdType::Other(b"QQ"));
-    let tokens: Vec<ExecInst<'_>> = some(order.exec_inst(), "ExecInst").collect();
+    let tokens: Vec<ExecInst<'_>> = some(ok(order.exec_inst(), "ExecInst"), "ExecInst").collect();
     assert_eq!(tokens, vec![ExecInst::NotHeld, ExecInst::Other(b"ZZ")]);
 
     // Every declared value round-trips through its wire bytes.
@@ -555,7 +557,7 @@ fn test_fix44_writer_output_decodes_and_validates() {
     assert_eq!(ok(view.cl_ord_id(), "ClOrdID"), "ORDER-1");
     assert_eq!(ok(view.price(), "Price"), Some(Decimal::new(12345, 4)));
     assert_eq!(ok(view.order_qty(), "OrderQty"), Some(Decimal::new(100, 0)));
-    let read: Vec<ExecInst<'_>> = some(view.exec_inst(), "ExecInst").collect();
+    let read: Vec<ExecInst<'_>> = some(ok(view.exec_inst(), "ExecInst"), "ExecInst").collect();
     assert_eq!(read, exec_inst);
     let ids: Vec<&str> = some(ok(view.no_party_ids(), "NoPartyIDs"), "the parties")
         .map(|party| ok(party.party_id(), "PartyID"))
@@ -885,4 +887,540 @@ fn test_fixt11_views_read_a_logon() {
         ok(logon.encrypt_method(), "EncryptMethod"),
         fixt11::enums::EncryptMethod::NoneOther
     );
+}
+
+#[test]
+fn test_length_delimited_group_writes_its_pair_first_and_reads_back() {
+    use sample::writers::{TypeSamplerFields, TypeSamplerNoDocsFields};
+
+    let docs = [
+        TypeSamplerNoDocsFields {
+            encoded_text: Some(&b"a\x01b"[..]),
+            doc_name: Some("first"),
+        },
+        TypeSamplerNoDocsFields {
+            encoded_text: Some(&b"xyz!"[..]),
+            doc_name: None,
+        },
+    ];
+    let sampler = TypeSamplerFields {
+        no_docs: &docs,
+        ..TypeSamplerFields::default()
+    };
+    let bytes = encode("U1", |encoder| sampler.write(encoder));
+    let mut decoder = Decoder::new(&bytes);
+    let msg = ok(decoder.decode(), "the written frame decodes");
+    let dict = views_common::views_sample_dictionary();
+    assert_eq!(Validator::new(&dict).validate(&msg), Ok(()));
+
+    // The length opens each entry: it is the delimiter.
+    let tags: Vec<u32> = msg.fields().map(|field| field.tag).collect();
+    let start = some(tags.iter().position(|tag| *tag == 5020), "NoDocs");
+    assert_eq!(
+        tags.get(start..),
+        Some(&[5020, 354, 355, 5023, 354, 355][..])
+    );
+
+    let view = some(
+        sample::views::TypeSamplerView::from_message(&msg),
+        "a TypeSampler view",
+    );
+    let read: Vec<(u64, &[u8], Option<&str>)> = some(ok(view.no_docs(), "NoDocs"), "the docs")
+        .map(|doc| {
+            (
+                ok(doc.encoded_text_len(), "EncodedTextLen"),
+                ok(doc.encoded_text(), "EncodedText"),
+                ok(doc.doc_name(), "DocName"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        vec![(3, &b"a\x01b"[..], Some("first")), (4, &b"xyz!"[..], None)]
+    );
+
+    // The data opens the entry with its length, so it is required.
+    let missing = [TypeSamplerNoDocsFields {
+        encoded_text: None,
+        doc_name: Some("orphan"),
+    }];
+    let sampler = TypeSamplerFields {
+        no_docs: &missing,
+        ..TypeSamplerFields::default()
+    };
+    let mut ignore = |_tag: u32, _value: &[u8]| {};
+    assert_eq!(
+        sampler.write(&mut ignore),
+        Err(EncodeError::MissingRequiredField { tag: 355 })
+    );
+}
+
+#[test]
+fn test_writer_enforces_a_required_group_at_run_time() {
+    let calls = Cell::new(0usize);
+    let mut counting = |_tag: u32, _value: &[u8]| calls.set(calls.get() + 1);
+    let sampler = sample::writers::TypeSamplerFields {
+        expire_seconds: Some(5),
+        ..sample::writers::TypeSamplerFields::default()
+    };
+    assert_eq!(
+        sampler.write(&mut counting),
+        Err(EncodeError::MissingRequiredField { tag: 5020 })
+    );
+    assert_eq!(calls.get(), 0, "nothing is written when a check fails");
+}
+
+#[test]
+fn test_prelude_variant_names_are_never_taken() {
+    use sample::enums::Mode;
+
+    let cases: [(&[u8], Mode<'_>); 4] = [
+        (b"0", Mode::None0),
+        (b"1", Mode::Some1),
+        (b"2", Mode::Ok2),
+        (b"3", Mode::Err3),
+    ];
+    for (value, expected) in cases {
+        assert_eq!(Mode::from_bytes(value), expected);
+    }
+    let golden = include_str!("golden/views_sample.rs");
+    for name in ["None,", "Some,", "Ok,", "Err,"] {
+        assert!(!golden.contains(&format!("        {name}\n")), "{name}");
+    }
+}
+
+/// Decodes a TypeSampler (`U1`) frame carrying `body`.
+#[track_caller]
+fn sampler_frame(body: &[&str]) -> Vec<u8> {
+    frame("U1", body)
+}
+
+/// Asserts that reading field `tag` of a TypeSampler carrying `field` is an
+/// invalid-value error.
+#[track_caller]
+fn assert_sampler_rejects(field: &str, tag: u32) {
+    let bytes = sampler_frame(&[field]);
+    let msg = decode(&bytes);
+    let view = some(
+        sample::views::TypeSamplerView::from_message(&msg),
+        "a TypeSampler view",
+    );
+    let read: Result<(), DecodeError> = match tag {
+        44 => view.price().map(|_| ()),
+        60 => view.transact_time().map(|_| ()),
+        5010 => view.sample_time().map(|_| ()),
+        5011 => view.sample_date().map(|_| ()),
+        75 => view.trade_date().map(|_| ()),
+        200 => view.maturity_month_year().map(|_| ()),
+        205 => view.maturity_day().map(|_| ()),
+        421 => view.country().map(|_| ()),
+        15 => view.currency().map(|_| ()),
+        5012 => view.expire_seconds().map(|_| ()),
+        5013 => view.labels().map(|_| ()),
+        5014 => view.flags().map(|_| ()),
+        _ => panic!("no accessor for tag {tag}"),
+    };
+    assert!(
+        matches!(read, Err(DecodeError::InvalidFieldValue { tag: found, .. }) if found == tag),
+        "{field}: {read:?}"
+    );
+}
+
+#[test]
+fn test_views_refuse_what_the_validator_refuses() {
+    // Decimals: no exponent, sign or digit separator, and never rounded.
+    for field in [
+        "44=1e5",
+        "44=+1.5",
+        "44=1_000.5",
+        "44=0.00000000000000000000000000001",
+        "44=79228162514264337593543950336",
+    ] {
+        assert_sampler_rejects(field, 44);
+    }
+    // Integers: no plus sign; a day of the month is 1 to 31.
+    assert_sampler_rejects("5012=+5", 5012);
+    for field in ["205=+5", "205=0", "205=32"] {
+        assert_sampler_rejects(field, 205);
+    }
+    // Dates, times, month-years, countries and currencies.
+    for (field, tag) in [
+        ("60=20260712-10:00", 60),
+        ("5010=10:00", 5010),
+        ("5011=2026071", 5011),
+        ("75=2026-07-12", 75),
+        ("200=2026", 200),
+        ("421=USA", 421),
+        ("15=EU", 15),
+    ] {
+        assert_sampler_rejects(field, tag);
+    }
+    // Multi-value fields: no empty token; one character per char token.
+    for (field, tag) in [
+        ("5013=a  b", 5013),
+        ("5013=a ", 5013),
+        ("5014=A  B", 5014),
+        ("5014=AB", 5014),
+    ] {
+        assert_sampler_rejects(field, tag);
+    }
+}
+
+#[test]
+fn test_views_read_well_formed_typed_values() {
+    use sample::enums::Flags;
+
+    let bytes = sampler_frame(&[
+        "60=20260712-10:00:00.123",
+        "5010=10:00:00",
+        "5011=20260712",
+        "75=20260712",
+        "200=202607w2",
+        "205=31",
+        "421=US",
+        "15=EUR",
+        "44=-1.25",
+        "5012=-5",
+        "5013=a b",
+        "5014=A B Z",
+        "5020=0",
+    ]);
+    let msg = decode(&bytes);
+    let view = some(
+        sample::views::TypeSamplerView::from_message(&msg),
+        "a TypeSampler view",
+    );
+    assert_eq!(
+        ok(view.transact_time(), "TransactTime"),
+        Some("20260712-10:00:00.123")
+    );
+    assert_eq!(ok(view.sample_time(), "SampleTime"), Some("10:00:00"));
+    assert_eq!(ok(view.sample_date(), "SampleDate"), Some("20260712"));
+    assert_eq!(ok(view.trade_date(), "TradeDate"), Some("20260712"));
+    assert_eq!(
+        ok(view.maturity_month_year(), "MaturityMonthYear"),
+        Some("202607w2")
+    );
+    assert_eq!(ok(view.maturity_day(), "MaturityDay"), Some(31));
+    assert_eq!(ok(view.country(), "Country"), Some("US"));
+    assert_eq!(ok(view.currency(), "Currency"), Some("EUR"));
+    assert_eq!(ok(view.price(), "Price"), Some(Decimal::new(-125, 2)));
+    assert_eq!(ok(view.expire_seconds(), "ExpireSeconds"), Some(-5));
+    assert_eq!(ok(view.labels(), "Labels"), Some("a b"));
+    let flags: Vec<Flags<'_>> = some(ok(view.flags(), "Flags"), "Flags").collect();
+    assert_eq!(flags, vec![Flags::Alpha, Flags::Bravo, Flags::Other(b"Z")]);
+}
+
+#[test]
+fn test_writer_refuses_malformed_values_before_writing() {
+    use sample::enums::{Flags, Side};
+    use sample::writers::NewOrderSingleFields;
+
+    let calls = Cell::new(0usize);
+    let mut counting = |_tag: u32, _value: &[u8]| calls.set(calls.get() + 1);
+    let complete = NewOrderSingleFields {
+        cl_ord_id: Some("ORDER-1"),
+        side: Some(Side::Buy),
+        transact_time: Some("20260712-10:00:01"),
+        symbol: Some("EURUSD"),
+        ..NewOrderSingleFields::default()
+    };
+    let refused = |fields: NewOrderSingleFields<'_>, tag: u32, what: &str| {
+        let mut sink = |_tag: u32, _value: &[u8]| calls.set(calls.get() + 1);
+        assert!(
+            matches!(
+                fields.write(&mut sink),
+                Err(EncodeError::InvalidFieldValue { tag: found, .. }) if found == tag
+            ),
+            "{what}"
+        );
+    };
+    refused(
+        NewOrderSingleFields {
+            account: Some(""),
+            ..complete
+        },
+        1,
+        "an empty value",
+    );
+    refused(
+        NewOrderSingleFields {
+            text: Some("a\x01b"),
+            ..complete
+        },
+        58,
+        "SOH in a text value",
+    );
+    refused(
+        NewOrderSingleFields {
+            side: Some(Side::Other(b"")),
+            ..complete
+        },
+        54,
+        "an empty enumeration value",
+    );
+    refused(
+        NewOrderSingleFields {
+            side: Some(Side::Other(b"1\x012")),
+            ..complete
+        },
+        54,
+        "SOH in an enumeration value",
+    );
+    refused(
+        NewOrderSingleFields {
+            flag: Some('\u{1}'),
+            ..complete
+        },
+        5002,
+        "a control character",
+    );
+    refused(
+        NewOrderSingleFields {
+            raw_data: Some(&b""[..]),
+            ..complete
+        },
+        96,
+        "empty data",
+    );
+    let sampler = |flags: &[Flags<'_>]| {
+        let docs = [sample::writers::TypeSamplerNoDocsFields {
+            encoded_text: Some(&b"x"[..]),
+            doc_name: None,
+        }];
+        let fields = sample::writers::TypeSamplerFields {
+            flags,
+            no_docs: &docs,
+            ..sample::writers::TypeSamplerFields::default()
+        };
+        let mut sink = |_tag: u32, _value: &[u8]| calls.set(calls.get() + 1);
+        fields.write(&mut sink)
+    };
+    for (flags, what) in [
+        (&[Flags::Alpha, Flags::Other(b"")][..], "an empty token"),
+        (&[Flags::Other(b"A B")][..], "a token with a space"),
+        (&[Flags::Other(b"\x01")][..], "a token with SOH"),
+    ] {
+        assert!(
+            matches!(
+                sampler(flags),
+                Err(EncodeError::InvalidFieldValue { tag: 5014, .. })
+            ),
+            "{what}"
+        );
+    }
+    assert_eq!(calls.get(), 0, "nothing is written when a check fails");
+    // Data may carry SOH: it is written with its length.
+    assert_eq!(
+        NewOrderSingleFields {
+            raw_data: Some(&b"\x01"[..]),
+            ..complete
+        }
+        .write(&mut counting),
+        Ok(())
+    );
+}
+
+/// Every numeric tag written by the statements of `code` that start with
+/// `call` (for example `sink.field(`), and the tag after it when the call
+/// carries two (`sink.data(`).
+fn written_tags(code: &str, call: &str, pairs: bool) -> Vec<(u32, u32)> {
+    let mut found = Vec::new();
+    for (index, _) in code.match_indices(call) {
+        let rest = code.get(index + call.len()..).unwrap_or("");
+        let mut numbers = rest.split([',', ')']).map(str::trim).map(str::parse::<u32>);
+        let Some(Ok(first)) = numbers.next() else {
+            // A helper's own body (`sink.field(tag, ...)`), not a statement.
+            continue;
+        };
+        if pairs {
+            if let Some(Ok(second)) = numbers.next() {
+                found.push((first, second));
+            }
+        } else {
+            found.push((first, 0));
+        }
+    }
+    found
+}
+
+#[test]
+fn test_generated_writers_agree_with_the_encoder_on_every_embedded_dictionary() {
+    // The tag=value encoder frames LENGTH/DATA pairs from its own table
+    // (FIX spec pairs, dictionary-free); the writers pair fields from the
+    // dictionary. Every pair a writer emits must be one `put_data` accepts,
+    // and every other field one `put_raw` accepts.
+    for (what, dict) in [
+        ("FIX 4.2", Dictionary::fix42()),
+        ("FIX 4.4", Dictionary::fix44()),
+        ("FIXT 1.1", Dictionary::fixt11()),
+        ("FIX 5.0 SP2", Dictionary::fix50sp2()),
+    ] {
+        let dict = ok(dict, what);
+        let code = ok(
+            ironfix_codegen::CodeGenerator::new().generate_views(dict),
+            what,
+        );
+        let pairs = written_tags(&code, "sink.data(", true);
+        let plain: Vec<(u32, u32)> = written_tags(&code, "sink.field(", false)
+            .into_iter()
+            .chain(written_tags(&code, "put_display(sink, ", false))
+            .collect();
+        assert!(
+            !pairs.is_empty() || what == "FIXT 1.1",
+            "{what}: pairs found"
+        );
+        assert!(!plain.is_empty(), "{what}: plain fields found");
+        for (length_tag, data_tag) in pairs {
+            let mut encoder = Encoder::new("FIX.4.4");
+            assert_eq!(
+                encoder.try_put_data(length_tag, data_tag, b"x"),
+                Ok(()),
+                "{what}: pair {length_tag}/{data_tag}"
+            );
+        }
+        for (tag, _) in plain {
+            let mut encoder = Encoder::new("FIX.4.4");
+            assert_eq!(
+                encoder.try_put_raw(tag, b"1"),
+                Ok(()),
+                "{what}: plain field {tag}"
+            );
+        }
+    }
+}
+
+/// A group table parsed back from a generated `layouts` module.
+#[derive(Debug)]
+struct ParsedSpec {
+    count_tag: u32,
+    delimiter_tag: u32,
+    members: Vec<u32>,
+    nested: Vec<String>,
+}
+
+/// Splits `a, b, c` into its trimmed, non-empty items.
+fn items(list: &str) -> Vec<&str> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// Every group table of a `layouts` module by constant name, and every
+/// message's top-level group constants by MsgType.
+type ParsedLayouts = (HashMap<String, ParsedSpec>, Vec<(String, Vec<String>)>);
+
+/// Parses the `layouts` module of generated views.
+fn parse_layouts(code: &str) -> ParsedLayouts {
+    let mut specs = HashMap::new();
+    let mut messages = Vec::new();
+    let mut msg_type: Option<String> = None;
+    for text in code.lines() {
+        let text = text.trim();
+        if let Some(rest) = text.strip_prefix("/// Groups that may open at the top level of ") {
+            msg_type = rest
+                .split_once("(MsgType=")
+                .and_then(|(_, tail)| tail.split_once(')'))
+                .map(|(value, _)| value.to_string());
+        }
+        let Some(rest) = text.strip_prefix("pub const ") else {
+            continue;
+        };
+        let Some((name, rest)) = rest.split_once(':') else {
+            continue;
+        };
+        if let Some(arguments) = rest
+            .split_once("GroupSpec::new(")
+            .and_then(|(_, tail)| tail.rsplit_once(") {"))
+            .map(|(arguments, _)| arguments)
+        {
+            let (scalars, lists) = some(arguments.split_once("&["), "a member list");
+            let numbers: Vec<u32> = items(scalars)
+                .into_iter()
+                .map(|item| ok(item.parse::<u32>(), "a tag"))
+                .collect();
+            let (members, nested) = some(lists.split_once("], &["), "a nested list");
+            let nested = nested.trim_end_matches(']');
+            specs.insert(
+                name.to_string(),
+                ParsedSpec {
+                    count_tag: some(numbers.first().copied(), "a count tag"),
+                    delimiter_tag: some(numbers.get(1).copied(), "a delimiter"),
+                    members: items(members)
+                        .into_iter()
+                        .map(|item| ok(item.parse::<u32>(), "a member"))
+                        .collect(),
+                    nested: items(nested).into_iter().map(ToString::to_string).collect(),
+                },
+            );
+        } else if let Some(arguments) = rest
+            .split_once("GroupSet::new(&[")
+            .and_then(|(_, tail)| tail.rsplit_once("]) {"))
+            .map(|(arguments, _)| arguments)
+        {
+            let msg_type = some(msg_type.take(), "the set's MsgType");
+            messages.push((
+                msg_type,
+                items(arguments)
+                    .into_iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ));
+        }
+    }
+    (specs, messages)
+}
+
+/// Asserts the parsed tables named `names` describe `layout`, recursively.
+#[track_caller]
+fn assert_parsed_set(
+    specs: &HashMap<String, ParsedSpec>,
+    names: &[String],
+    layout: GroupSet<'_>,
+    context: &str,
+) {
+    let groups: Vec<GroupSpec<'_>> = layout.iter().collect();
+    assert_eq!(names.len(), groups.len(), "{context}: group count");
+    for (name, group) in names.iter().zip(groups) {
+        let parsed = some(specs.get(name), name);
+        let context = format!("{context} > {}", group.count_tag());
+        assert_eq!(parsed.count_tag, group.count_tag(), "{context}");
+        assert_eq!(parsed.delimiter_tag, group.delimiter_tag(), "{context}");
+        assert_eq!(parsed.members.as_slice(), group.members(), "{context}");
+        assert_parsed_set(specs, &parsed.nested, group.nested_groups(), &context);
+    }
+}
+
+#[test]
+fn test_every_generated_layout_agrees_with_the_dictionary_layout() {
+    // Every message of every embedded dictionary, from the generated text:
+    // the compiled goldens cover only a few messages.
+    for (what, dict) in [
+        ("FIX 4.2", Dictionary::fix42()),
+        ("FIX 4.4", Dictionary::fix44()),
+        ("FIXT 1.1", Dictionary::fixt11()),
+        ("FIX 5.0 SP2", Dictionary::fix50sp2()),
+    ] {
+        let dict = ok(dict, what);
+        let code = ok(
+            ironfix_codegen::CodeGenerator::new().generate_views(dict),
+            what,
+        );
+        let (specs, messages) = parse_layouts(&code);
+        assert_eq!(
+            messages.len(),
+            dict.messages().count(),
+            "{what}: one set per message"
+        );
+        for (msg_type, names) in messages {
+            let layout = ok(MessageLayout::new(dict, &msg_type), "layout");
+            assert_parsed_set(
+                &specs,
+                &names,
+                layout.groups(),
+                &format!("{what} {msg_type}"),
+            );
+        }
+    }
 }
