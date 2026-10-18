@@ -7,19 +7,22 @@
 //! Proves that formatting a [`Timestamp`] allocates nothing.
 //!
 //! `MessageFactory::encode` in `ironfix-engine` stamps `SendingTime` (52) with
-//! `Timestamp::now().format_millis()` on every outbound frame, so a heap block
-//! here is a heap block per message sent.
+//! `Timestamp::now().format_millis()` on every outbound frame, or with
+//! `Timestamp::now().format_seconds()` on a FIX 4.0 or FIX 4.1 session, so a
+//! heap block here is a heap block per message sent.
 //!
 //! `dhat` is installed as this binary's global allocator and counts every
 //! heap block, a reallocation included. The timestamps are built first, and
 //! every variant is called once before the measured windows. Each window then
 //! makes [`CALLS`] calls of one of:
 //!
+//! - [`Timestamp::format_seconds`];
 //! - [`Timestamp::format_millis`];
 //! - [`Timestamp::format_micros`];
 //! - the [`Display`](std::fmt::Display) impl, written into a fixed-capacity
 //!   buffer;
-//! - `Timestamp::now().format_millis()`, the call the engine makes.
+//! - `Timestamp::now().format_millis()` and `Timestamp::now().format_seconds()`,
+//!   the calls the engine makes.
 //!
 //! The number of blocks allocated in every window must be zero.
 //!
@@ -88,12 +91,17 @@ fn main() {
 
     // Each variant once, so nothing set up lazily lands in a window.
     for stamp in stamps {
+        black_box(stamp.format_seconds());
         black_box(stamp.format_millis());
         black_box(stamp.format_micros());
         display_call(stamp);
     }
     black_box(Timestamp::now().format_millis());
+    black_box(Timestamp::now().format_seconds());
 
+    let seconds = window(&stamps, |stamp| {
+        black_box(stamp.format_seconds());
+    });
     let millis = window(&stamps, |stamp| {
         black_box(stamp.format_millis());
     });
@@ -104,12 +112,17 @@ fn main() {
     let now = window(&stamps, |_| {
         black_box(Timestamp::now().format_millis());
     });
+    let now_seconds = window(&stamps, |_| {
+        black_box(Timestamp::now().format_seconds());
+    });
 
     let counts = [
+        ("format_seconds", seconds),
         ("format_millis", millis),
         ("format_micros", micros),
         ("Display", shown),
         ("now().format_millis", now),
+        ("now().format_seconds", now_seconds),
     ];
     let allocating: Vec<(&str, u64)> = counts
         .into_iter()
