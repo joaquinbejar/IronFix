@@ -7,16 +7,17 @@
 //! Code generator for FIX dictionaries.
 //!
 //! Generates Rust source code from a loaded [`Dictionary`]: one `u32` constant
-//! per field tag, and one struct per message ([`CodeGenerator::generate`]);
-//! and, opt-in and in a separate file, borrowed views, enumerations and
-//! writers ([`CodeGenerator::generate_views`]).
+//! per field tag, and one struct per message, per component and per
+//! repeating-group definition ([`CodeGenerator::generate`]); and, opt-in and
+//! in a separate file, borrowed views, enumerations and writers
+//! ([`CodeGenerator::generate_views`]).
 //!
 //! # What the default output contains
 //!
 //! ```text
 //! // Generated FIX.4.4 definitions.
 //!
-//! pub type FixDecimal = rust_decimal::Decimal;
+//! pub type FixDecimal = ::rust_decimal::Decimal;
 //!
 //! /// Field tag constants.
 //! pub mod fields {
@@ -24,7 +25,7 @@
 //!     pub const CL_ORD_ID: u32 = 11;
 //! }
 //!
-//! /// Message type definitions.
+//! /// Message type definitions, ...
 //! pub mod messages {
 //!     use super::FixDecimal;
 //!
@@ -32,18 +33,45 @@
 //!     #[derive(Debug, Clone)]
 //!     pub struct NewOrderSingle {
 //!         /// ClOrdID (tag 11).
-//!         pub cl_ord_id: String,
+//!         pub cl_ord_id: ::std::string::String,
+//!         /// Parties component.
+//!         pub parties: ::core::option::Option<super::components::Parties>,
+//!         /// Instrument component.
+//!         pub instrument: super::components::Instrument,
 //!         /// Price (tag 44).
-//!         pub price: Option<FixDecimal>,
-//!         /// NoPartyIDs (tag 453) repeating group.
-//!         pub no_party_ids: Option<Vec<NewOrderSingleNoPartyIDsEntry>>,
+//!         pub price: ::core::option::Option<FixDecimal>,
+//!     }
+//! }
+//!
+//! /// Component type definitions, ...
+//! pub mod components {
+//!     /// Parties component, one type shared by every message, ...
+//!     #[derive(Debug, Clone)]
+//!     pub struct Parties {
+//!         /// NoPartyIDs (tag 453) repeating group; its length is the count field.
+//!         pub no_party_ids: ::core::option::Option<::std::vec::Vec<PartiesNoPartyIDsEntry>>,
+//!     }
+//!
+//!     /// One entry of the NoPartyIDs (tag 453) repeating group in Parties.
+//!     #[derive(Debug, Clone)]
+//!     pub struct PartiesNoPartyIDsEntry {
+//!         /// PartyID (tag 448).
+//!         pub party_id: ::core::option::Option<::std::string::String>,
+//!         /// PtysSubGrp component.
+//!         pub ptys_sub_grp: ::core::option::Option<PtysSubGrp>,
 //!     }
 //! }
 //! ```
 //!
-//! The file header is written with `//` line comments rather than `//!`, so the
-//! output can be `include!`d inside a module — the usual `build.rs` + `OUT_DIR`
-//! workflow, where an inner attribute would be rejected.
+//! Each definition is generated once and referenced by name (see
+//! `doc/adr/0019-shared-component-and-group-types-in-the-default-output.md`):
+//! a component is one struct in `components`, a repeating group one entry
+//! struct `<DeclaringOwner><GroupName>Entry` next to its declaring message,
+//! component or entry, and a struct lists its members in XML order
+//! (`members()`). The file header is written with `//` line comments rather
+//! than `//!`, so the output can be `include!`d inside a module — the usual
+//! `build.rs` + `OUT_DIR` workflow, where an inner attribute would be
+//! rejected.
 //!
 //! # What it does not contain
 //!
@@ -56,25 +84,19 @@
 //!
 //! # Fidelity limits of the default output, stated rather than hidden
 //!
-//! - **Field order is not wire order.** A struct lists its direct fields, then
-//!   the fields contributed by its components, then its repeating groups. The
-//!   dictionary now records the XML order (`members()`), and the views and
-//!   writers follow it; this output keeps its order so that existing
-//!   generated code does not change.
-//! - **Component-contributed fields are always optional.** This output
-//!   predates `ComponentRef::required` and keeps a field that is required
-//!   inside a component as `Option<T>`, the representable choice that cannot
-//!   be wrong; changing it would silently change consumers' generated code.
-//!   The views follow the reference's requiredness, as the validator does.
-//! - **Group entries are flattened the same way** and are validated by nothing
-//!   here; conformance checking is `ironfix_dictionary::Validator`.
+//! - **Requiredness is per definition.** A field required inside a component
+//!   or a group entry is a bare type in that component's or entry's struct;
+//!   whether the component or group itself is present is the `Option` around
+//!   the field that references it. Nothing enforces a field that FIX makes
+//!   conditionally required.
+//! - **A tag a message reaches twice is two struct fields.** A message that
+//!   lists a field and a component carrying the same tag has one in each
+//!   struct; the data structs do not decide which one a wire value belongs
+//!   to.
+//! - **No validation.** The structs are validated by nothing here;
+//!   conformance checking is `ironfix_dictionary::Validator`.
 
-use ironfix_dictionary::schema::{
-    ComponentRef, Dictionary, FieldDef, FieldType, GroupDef, MessageDef,
-};
-// `FieldRef` also names a zero-copy wire field in `ironfix-core`; this is the
-// schema-side one (tag, name, required).
-use ironfix_dictionary::schema::FieldRef as SchemaFieldRef;
+use ironfix_dictionary::schema::{Dictionary, FieldDef, FieldType};
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -84,7 +106,7 @@ use thiserror::Error;
 /// every FIX `Price` / `Qty` / `Amt` / `Percentage` field resolves to
 /// `rust_decimal::Decimal` through a single declaration — and never to
 /// `f64`.
-const DECIMAL_ALIAS: &str = "FixDecimal";
+pub(crate) const DECIMAL_ALIAS: &str = "FixDecimal";
 
 /// Rust keywords that cannot be written as raw identifiers (`r#...`).
 const NON_RAW_KEYWORDS: [&str; 4] = ["crate", "self", "Self", "super"];
@@ -143,7 +165,8 @@ pub enum GeneratorError {
         scope: String,
     },
 
-    /// A component contains itself, directly or through other components.
+    /// A component contains itself, directly, through other components, or
+    /// through the entries of a repeating group it declares.
     ///
     /// Expanding it would not terminate; the cycle is reported with the path
     /// that closes it.
@@ -206,15 +229,17 @@ pub enum GeneratorError {
 pub struct GeneratorConfig {
     /// Whether to generate the `fields` module of tag constants.
     pub generate_fields: bool,
-    /// Whether to generate the `messages` module of message structs.
+    /// Whether to generate the `messages` module of message structs (and the
+    /// `components` module, which only messages reach).
     pub generate_messages: bool,
-    /// Whether message structs include the fields contributed by components
-    /// and the repeating groups they contain.
+    /// Whether to generate the `components` module, one struct per component
+    /// a message reaches, and a field of that type in every message,
+    /// component and group entry that lists the component.
     ///
-    /// With this off, a generated struct carries only the fields listed
-    /// directly on the message — for FIX 4.4 that leaves `NewOrderSingle`
-    /// without `Symbol` (55), which lives in the `Instrument` component. It is
-    /// on by default.
+    /// With this off, a generated struct carries only the fields and groups
+    /// its definition lists directly — for FIX 4.4 that leaves
+    /// `NewOrderSingle` without `Symbol` (55), which lives in the `Instrument`
+    /// component. It is on by default.
     pub generate_components: bool,
     /// Module visibility (e.g., `"pub"`, `"pub(crate)"`).
     pub visibility: String,
@@ -261,13 +286,23 @@ impl CodeGenerator {
 
     /// Generates Rust source code from a dictionary.
     ///
+    /// The source has a `fields` module of tag constants, a `messages`
+    /// module with one struct per message, and a `components` module with one
+    /// struct per component a message reaches (when one does). Each component
+    /// and each repeating-group definition is generated once and referenced
+    /// by name from every message, component and group entry that uses it; a
+    /// group's entry struct is `<DeclaringOwner><GroupName>Entry`, for
+    /// example `PartiesNoPartyIDsEntry`. Members are listed in XML order.
+    ///
     /// # Arguments
     /// * `dict` - The FIX dictionary to generate code from
     ///
     /// # Errors
     /// Returns [`GeneratorError`] if the dictionary references a field or
-    /// component it does not define, or if a component contains itself. The
-    /// generator never drops such an item silently.
+    /// component it does not define, if a component contains itself, if
+    /// components and groups nest past the depth limit, or if a name has no
+    /// Rust identifier (`what` is then `field`, `message`, `group` or
+    /// `component`). The generator never drops such an item silently.
     pub fn generate(&self, dict: &Dictionary) -> Result<String, GeneratorError> {
         let mut code = String::new();
 
@@ -282,14 +317,12 @@ impl CodeGenerator {
         );
         line(&mut code, "");
 
-        let models = if self.config.generate_messages {
-            self.build_messages(dict)?
+        let model = if self.config.generate_messages {
+            crate::structs::build(dict, self.config.generate_components)?
         } else {
-            Vec::new()
+            crate::structs::DataModel::default()
         };
-        let uses_decimal = models
-            .iter()
-            .any(|model| model.fields.iter().any(|field| field.uses_decimal));
+        let uses_decimal = model.uses_decimal();
 
         if uses_decimal {
             line(
@@ -311,7 +344,7 @@ impl CodeGenerator {
         }
 
         if self.config.generate_messages {
-            self.emit_messages_module(&mut code, &models, uses_decimal);
+            crate::structs::emit(&mut code, &self.config.visibility, &model);
         }
 
         Ok(code)
@@ -408,356 +441,12 @@ impl CodeGenerator {
         line(code, "");
         Ok(())
     }
-
-    /// Emits the `messages` module from already-built models.
-    fn emit_messages_module(&self, code: &mut String, models: &[StructModel], uses_decimal: bool) {
-        line(code, "/// Message type definitions.");
-        line(code, &format!("{} mod messages {{", self.config.visibility));
-        if uses_decimal {
-            line(code, &format!("    use super::{DECIMAL_ALIAS};"));
-            line(code, "");
-        }
-
-        for model in models {
-            line(code, &format!("    /// {}", model.doc));
-            line(code, "    #[derive(Debug, Clone)]");
-            if model.fields.is_empty() {
-                line(code, &format!("    pub struct {} {{}}", model.name));
-                line(code, "");
-                continue;
-            }
-            line(code, &format!("    pub struct {} {{", model.name));
-            for field in &model.fields {
-                line(code, &format!("        /// {}", field.doc));
-                line(code, &format!("        pub {}: {},", field.name, field.ty));
-            }
-            line(code, "    }");
-            line(code, "");
-        }
-
-        line(code, "}");
-    }
-
-    /// Builds a model per message, plus one per repeating-group entry.
-    ///
-    /// Messages are ordered by MsgType so the output is deterministic even
-    /// though the dictionary stores them in a `HashMap`.
-    fn build_messages(&self, dict: &Dictionary) -> Result<Vec<StructModel>, GeneratorError> {
-        let mut messages: Vec<&MessageDef> = dict.messages().collect();
-        messages.sort_by(|a, b| a.msg_type.cmp(&b.msg_type));
-
-        let mut type_names: HashSet<String> = HashSet::with_capacity(messages.len());
-        let mut models: Vec<StructModel> = Vec::with_capacity(messages.len());
-
-        for message in messages {
-            let scope = format!("message {}", message.name);
-            let base = to_pascal_case(&message.name);
-            if !is_valid_ident(&base) {
-                return Err(GeneratorError::UnnameableItem {
-                    what: "message",
-                    name: message.name.clone(),
-                });
-            }
-            let name = unique_type_name(&mut type_names, &to_type_ident(&base));
-
-            let mut stack: Vec<String> = Vec::new();
-            let mut members: Vec<Member<'_>> = Vec::new();
-            self.collect(
-                dict,
-                &scope,
-                message.fields(),
-                message.groups(),
-                message.components(),
-                false,
-                0,
-                &mut stack,
-                &mut members,
-            )?;
-
-            let doc = format!("{} message (MsgType={}).", message.name, message.msg_type);
-            let model = self.build_struct(
-                dict,
-                &scope,
-                name,
-                doc,
-                &members,
-                0,
-                &mut type_names,
-                &mut models,
-            )?;
-            models.push(model);
-        }
-
-        Ok(models)
-    }
-
-    /// Collects the fields and groups a scope contributes, expanding
-    /// components when [`GeneratorConfig::generate_components`] is set.
-    ///
-    /// `from_component` marks members reached through a component reference:
-    /// the dictionary does not record whether such a reference is required, so
-    /// they are emitted as optional.
-    ///
-    /// `depth` is the current component-and-group nesting; it grows across every
-    /// recursive descent (a component here, a group entry in `build_struct`)
-    /// and is checked against [`MAX_NESTING_DEPTH`] so a deep but acyclic
-    /// dictionary cannot overflow the stack.
-    ///
-    /// `stack` is the chain of component names reached so far, threaded so a
-    /// cycle that closes across a group boundary is still caught: each deferred
-    /// [`Member::Group`] captures it, and `build_struct` seeds the group
-    /// body's own `collect` with it rather than starting fresh.
-    #[allow(clippy::too_many_arguments)]
-    fn collect<'d>(
-        &self,
-        dict: &'d Dictionary,
-        scope: &str,
-        fields: &'d [SchemaFieldRef],
-        groups: &'d [GroupDef],
-        components: &'d [ComponentRef],
-        from_component: bool,
-        depth: usize,
-        stack: &mut Vec<String>,
-        out: &mut Vec<Member<'d>>,
-    ) -> Result<(), GeneratorError> {
-        if depth > MAX_NESTING_DEPTH {
-            return Err(GeneratorError::MaxDepthExceeded {
-                scope: scope.to_string(),
-                limit: MAX_NESTING_DEPTH,
-            });
-        }
-
-        for field in fields {
-            out.push(Member::Field {
-                field,
-                required: field.required && !from_component,
-            });
-        }
-
-        if self.config.generate_components {
-            for component_ref in components {
-                let name = &component_ref.name;
-                if stack.iter().any(|visited| visited == name) {
-                    let mut path = stack.clone();
-                    path.push(name.clone());
-                    return Err(GeneratorError::ComponentCycle {
-                        name: name.clone(),
-                        path: path.join(" -> "),
-                    });
-                }
-                let component =
-                    dict.get_component(name)
-                        .ok_or_else(|| GeneratorError::UnknownComponent {
-                            name: name.clone(),
-                            scope: scope.to_string(),
-                        })?;
-                stack.push(name.clone());
-                let nested_scope = format!("component {name}");
-                self.collect(
-                    dict,
-                    &nested_scope,
-                    component.fields(),
-                    component.groups(),
-                    component.components(),
-                    true,
-                    depth + 1,
-                    stack,
-                    out,
-                )?;
-                stack.pop();
-            }
-        }
-
-        for group in groups {
-            out.push(Member::Group {
-                def: group,
-                required: group.required && !from_component,
-                ancestry: stack.clone(),
-            });
-        }
-
-        Ok(())
-    }
-
-    /// Turns collected members into a struct model, emitting one entry struct
-    /// per repeating group into `models`.
-    ///
-    /// `depth` is the current nesting; it is checked against
-    /// [`MAX_NESTING_DEPTH`] and grows by one on descent into each group entry,
-    /// so a deep chain of nested groups cannot overflow the stack.
-    #[allow(clippy::too_many_arguments)]
-    fn build_struct(
-        &self,
-        dict: &Dictionary,
-        scope: &str,
-        name: String,
-        doc: String,
-        members: &[Member<'_>],
-        depth: usize,
-        type_names: &mut HashSet<String>,
-        models: &mut Vec<StructModel>,
-    ) -> Result<StructModel, GeneratorError> {
-        if depth > MAX_NESTING_DEPTH {
-            return Err(GeneratorError::MaxDepthExceeded {
-                scope: scope.to_string(),
-                limit: MAX_NESTING_DEPTH,
-            });
-        }
-
-        let mut fields: Vec<StructFieldModel> = Vec::with_capacity(members.len());
-        // Field tags and group count tags are tracked apart: a dictionary that
-        // lists a count field directly *and* as a group keeps both, one as the
-        // count and one as the entries, rather than losing the group.
-        let mut seen_field_tags: HashSet<u32> = HashSet::with_capacity(members.len());
-        let mut seen_group_tags: HashSet<u32> = HashSet::new();
-        let mut used_names: HashSet<String> = HashSet::with_capacity(members.len());
-
-        for member in members {
-            match member {
-                Member::Field { field, required } => {
-                    if !seen_field_tags.insert(field.tag) {
-                        // The same field reached twice through two components
-                        // is one struct field, not two.
-                        continue;
-                    }
-                    let def =
-                        dict.get_field(field.tag)
-                            .ok_or_else(|| GeneratorError::UnknownField {
-                                tag: field.tag,
-                                scope: scope.to_string(),
-                            })?;
-                    let ident = resolve_field_name(&mut used_names, &field.name, field.tag)?;
-                    let base = field_type_to_rust(def.field_type);
-                    fields.push(StructFieldModel {
-                        doc: field_doc(def),
-                        name: ident,
-                        ty: wrap_optional(base, *required),
-                        uses_decimal: base == DECIMAL_ALIAS,
-                    });
-                }
-                Member::Group {
-                    def,
-                    required,
-                    ancestry,
-                } => {
-                    if !seen_group_tags.insert(def.count_tag) {
-                        // The same group reached twice through two components.
-                        continue;
-                    }
-                    let entry_base = format!("{}{}Entry", name, to_pascal_case(&def.name));
-                    // `name` is already a valid identifier, so a punctuated
-                    // group name is what would break `entry_base`; reject it
-                    // rather than emit a struct whose name will not compile.
-                    if !is_valid_ident(&entry_base) {
-                        return Err(GeneratorError::UnnameableItem {
-                            what: "group",
-                            name: def.name.clone(),
-                        });
-                    }
-                    let entry_name = unique_type_name(type_names, &to_type_ident(&entry_base));
-
-                    let group_scope = format!("group {} of {scope}", def.name);
-                    // Seed the group body with the component chain that reached
-                    // it, not a fresh stack: a cycle that closes through this
-                    // group (component A -> group -> component A) would otherwise
-                    // recurse forever with the guard reset at every boundary.
-                    let mut stack: Vec<String> = ancestry.clone();
-                    let mut nested: Vec<Member<'_>> = Vec::new();
-                    self.collect(
-                        dict,
-                        &group_scope,
-                        def.fields(),
-                        def.groups(),
-                        def.components(),
-                        false,
-                        depth + 1,
-                        &mut stack,
-                        &mut nested,
-                    )?;
-                    let entry_doc = format!(
-                        "One entry of the {} (tag {}) repeating group in {name}.",
-                        def.name, def.count_tag
-                    );
-                    let entry = self.build_struct(
-                        dict,
-                        &group_scope,
-                        entry_name.clone(),
-                        entry_doc,
-                        &nested,
-                        depth + 1,
-                        type_names,
-                        models,
-                    )?;
-                    models.push(entry);
-
-                    let ident = resolve_field_name(&mut used_names, &def.name, def.count_tag)?;
-                    fields.push(StructFieldModel {
-                        doc: format!(
-                            "{} (tag {}) repeating group; its length is the count field.",
-                            def.name, def.count_tag
-                        ),
-                        name: ident,
-                        ty: wrap_optional(&format!("::std::vec::Vec<{entry_name}>"), *required),
-                        uses_decimal: false,
-                    });
-                }
-            }
-        }
-
-        Ok(StructModel { doc, name, fields })
-    }
 }
 
 impl Default for CodeGenerator {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// A field or repeating group contributed to a generated struct.
-#[derive(Debug)]
-enum Member<'d> {
-    /// A plain field reference.
-    Field {
-        /// The schema-side reference (tag, name, required).
-        field: &'d SchemaFieldRef,
-        /// Whether it is required in the scope that contributed it.
-        required: bool,
-    },
-    /// A repeating group, generated as its own entry struct.
-    Group {
-        /// The group definition.
-        def: &'d GroupDef,
-        /// Whether the group is required in the scope that contributed it.
-        required: bool,
-        /// The chain of component names that reached this group, captured when
-        /// the group was deferred so the guard survives the group boundary.
-        ancestry: Vec<String>,
-    },
-}
-
-/// A struct the generator will emit.
-#[derive(Debug)]
-struct StructModel {
-    /// Doc comment for the struct.
-    doc: String,
-    /// Rust type name.
-    name: String,
-    /// Struct fields, in emission order.
-    fields: Vec<StructFieldModel>,
-}
-
-/// A field of a generated struct.
-#[derive(Debug)]
-struct StructFieldModel {
-    /// Doc comment for the field.
-    doc: String,
-    /// Rust identifier, already keyword-escaped.
-    name: String,
-    /// Rendered Rust type.
-    ty: String,
-    /// Whether the type resolves to the decimal alias.
-    uses_decimal: bool,
 }
 
 /// Appends `text` and a newline to `code`.
@@ -767,7 +456,7 @@ pub(crate) fn line(code: &mut String, text: &str) {
 }
 
 /// Wraps `ty` in `Option<...>` unless the field is required.
-fn wrap_optional(ty: &str, required: bool) -> String {
+pub(crate) fn wrap_optional(ty: &str, required: bool) -> String {
     if required {
         ty.to_string()
     } else {
@@ -776,7 +465,7 @@ fn wrap_optional(ty: &str, required: bool) -> String {
 }
 
 /// Builds the doc line for a field definition.
-fn field_doc(field: &FieldDef) -> String {
+pub(crate) fn field_doc(field: &FieldDef) -> String {
     let mut doc = format!("{} (tag {}).", field.name, field.tag);
     if let Some(description) = &field.description {
         let flattened = description.replace(['\n', '\r'], " ");
@@ -795,7 +484,7 @@ fn field_doc(field: &FieldDef) -> String {
 /// `ClOrdId` both snake-case to `cl_ord_id`); the tag disambiguates them, and a
 /// numeric suffix settles the remaining pathological case. Nothing is ever
 /// dropped to avoid a clash.
-fn resolve_field_name(
+pub(crate) fn resolve_field_name(
     used: &mut HashSet<String>,
     name: &str,
     tag: u32,
@@ -945,7 +634,7 @@ pub(crate) fn to_pascal_case(s: &str) -> String {
 ///
 /// Every monetary or quantity type maps to [`DECIMAL_ALIAS`], never to `f64`:
 /// binary floating point cannot represent a price exactly.
-fn field_type_to_rust(field_type: FieldType) -> &'static str {
+pub(crate) fn field_type_to_rust(field_type: FieldType) -> &'static str {
     match field_type {
         FieldType::Int
         | FieldType::Length
@@ -986,8 +675,13 @@ fn field_type_to_rust(field_type: FieldType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `FieldRef` also names a zero-copy wire field in `ironfix-core`; this is
+    // the schema-side one (tag, name, required).
+    use ironfix_dictionary::schema::FieldRef as SchemaFieldRef;
     use ironfix_dictionary::schema::Member as SchemaMember;
-    use ironfix_dictionary::schema::{ComponentDef, ComponentRef, MessageCategory, Version};
+    use ironfix_dictionary::schema::{
+        ComponentDef, ComponentRef, GroupDef, MessageCategory, MessageDef, Version,
+    };
 
     /// The vendored FIX 4.4 dictionary.
     fn fix44() -> &'static Dictionary {
@@ -1050,9 +744,19 @@ mod tests {
     fn test_generate_fix44_maps_price_and_qty_to_decimal() {
         let code = generate(&CodeGenerator::new(), fix44());
         assert!(code.contains("pub type FixDecimal = ::rust_decimal::Decimal;"));
-        // Price (44) and OrderQty (38) both reach NewOrderSingle directly.
-        assert!(code.contains("pub price: ::core::option::Option<FixDecimal>,"));
-        assert!(code.contains("pub order_qty: ::core::option::Option<FixDecimal>,"));
+        // Price (44) is listed on NewOrderSingle, OrderQty (38) in the
+        // OrderQtyData component; both modules import the alias.
+        let order = struct_body(&code, "NewOrderSingle");
+        assert!(
+            order.contains("pub price: ::core::option::Option<FixDecimal>,"),
+            "{order}"
+        );
+        let qty = struct_body(&code, "OrderQtyData");
+        assert!(
+            qty.contains("pub order_qty: ::core::option::Option<FixDecimal>,"),
+            "{qty}"
+        );
+        assert_eq!(code.matches("    use super::FixDecimal;").count(), 2);
         // A price must never be binary floating point.
         assert!(!code.contains("f64"));
         assert!(!code.contains("f32"));
@@ -1076,31 +780,110 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_fix44_new_order_single_carries_its_component_fields() {
+    fn test_generate_fix44_new_order_single_references_its_components_by_type() {
         let code = generate(&CodeGenerator::new(), fix44());
-        let Some(start) = code.find("pub struct NewOrderSingle {") else {
-            panic!("NewOrderSingle must be generated");
-        };
-        let Some(len) = code.get(start..).and_then(|rest| rest.find("\n    }")) else {
-            panic!("NewOrderSingle struct must be terminated");
-        };
-        let Some(body) = code.get(start..start + len) else {
-            panic!("struct body must be sliceable");
-        };
-        // Symbol (55) lives in the Instrument component, OrderQty (38) in the
-        // OrderQtyData component: without expansion the struct has neither.
-        assert!(body.contains("pub symbol:"), "{body}");
-        assert!(body.contains("pub order_qty:"), "{body}");
+        let body = struct_body(&code, "NewOrderSingle");
+        // Instrument and OrderQtyData are required in NewOrderSingle, Parties
+        // and PreAllocGrp are not: the reference decides the Option.
+        assert!(
+            body.contains("pub instrument: super::components::Instrument,"),
+            "{body}"
+        );
+        assert!(
+            body.contains("pub order_qty_data: super::components::OrderQtyData,"),
+            "{body}"
+        );
+        assert!(
+            body.contains("pub parties: ::core::option::Option<super::components::Parties>,"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "pub pre_alloc_grp: ::core::option::Option<super::components::PreAllocGrp>,"
+            ),
+            "{body}"
+        );
         assert!(body.contains("pub price:"), "{body}");
-        // NoAllocs (78) is a repeating group on the message.
-        assert!(body.contains("pub no_allocs:"), "{body}");
+        // Symbol (55) is in the Instrument struct, not copied into the message.
+        assert!(!body.contains("pub symbol:"), "{body}");
+        let instrument = struct_body(&code, "Instrument");
+        assert!(instrument.contains("pub symbol:"), "{instrument}");
     }
 
     #[test]
-    fn test_generate_fix44_emits_a_struct_per_repeating_group_entry() {
+    fn test_generate_fix44_lists_members_in_xml_order() {
         let code = generate(&CodeGenerator::new(), fix44());
-        assert!(code.contains("pub struct NewOrderSingleNoAllocsEntry {"));
-        assert!(code.contains("::std::vec::Vec<NewOrderSingleNoAllocsEntry>"));
+        // ADR-0016's case: the NoAllocs entry of PreAllocGrp lists the
+        // NestedParties component before AllocQty (80).
+        let entry = struct_body(&code, "PreAllocGrpNoAllocsEntry");
+        let names: Vec<&str> = entry
+            .lines()
+            .filter_map(|text| text.trim_start().strip_prefix("pub "))
+            .filter_map(|rest| rest.split_once(':').map(|(name, _)| name))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "alloc_account",
+                "alloc_acct_idsource",
+                "alloc_settl_currency",
+                "individual_alloc_id",
+                "nested_parties",
+                "alloc_qty"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_generate_fix44_emits_one_struct_per_repeating_group_definition() {
+        let code = generate(&CodeGenerator::new(), fix44());
+        // NoAllocs (78) reaches NewOrderSingle through PreAllocGrp: its entry
+        // is named after the component that declares it.
+        assert_eq!(
+            code.matches("pub struct PreAllocGrpNoAllocsEntry {")
+                .count(),
+            1
+        );
+        assert!(code.contains("::std::vec::Vec<PreAllocGrpNoAllocsEntry>"));
+        assert!(!code.contains("NewOrderSingleNoAllocsEntry"));
+    }
+
+    #[test]
+    fn test_generate_fix44_component_used_by_several_messages_is_one_type() {
+        let code = generate(&CodeGenerator::new(), fix44());
+        assert_eq!(code.matches("pub struct Parties {").count(), 1);
+        assert_eq!(
+            code.matches("pub struct PartiesNoPartyIDsEntry {").count(),
+            1
+        );
+        // Every message that lists Parties references the one type.
+        let messages = messages_module(&code);
+        let references = messages
+            .matches("::core::option::Option<super::components::Parties>,")
+            .count();
+        assert!(references > 1, "Parties is referenced {references} times");
+        // And no message carries its own copy of the party group.
+        assert!(!messages.contains("NoPartyIDsEntry"));
+    }
+
+    #[test]
+    fn test_generate_fix44_nests_groups_inside_components() {
+        let code = generate(&CodeGenerator::new(), fix44());
+        // Parties -> NoPartyIDs entry -> PtysSubGrp -> NoPartySubIDs entry.
+        let entry = struct_body(&code, "PartiesNoPartyIDsEntry");
+        assert!(
+            entry.contains("pub ptys_sub_grp: ::core::option::Option<PtysSubGrp>,"),
+            "{entry}"
+        );
+        let sub = struct_body(&code, "PtysSubGrp");
+        assert!(
+            sub.contains(
+                "pub no_party_sub_ids: ::core::option::Option<::std::vec::Vec<PtysSubGrpNoPartySubIDsEntry>>,"
+            ),
+            "{sub}"
+        );
+        let sub_entry = struct_body(&code, "PtysSubGrpNoPartySubIDsEntry");
+        assert!(sub_entry.contains("pub party_sub_id:"), "{sub_entry}");
     }
 
     #[test]
@@ -1110,17 +893,12 @@ mod tests {
             ..GeneratorConfig::default()
         });
         let code = generate(&generator, fix44());
-        let Some(start) = code.find("pub struct NewOrderSingle {") else {
-            panic!("NewOrderSingle must be generated");
-        };
-        let Some(len) = code.get(start..).and_then(|rest| rest.find("\n    }")) else {
-            panic!("NewOrderSingle struct must be terminated");
-        };
-        let Some(body) = code.get(start..start + len) else {
-            panic!("struct body must be sliceable");
-        };
+        let body = struct_body(&code, "NewOrderSingle");
         assert!(!body.contains("pub symbol:"), "{body}");
+        assert!(!body.contains("pub instrument:"), "{body}");
         assert!(body.contains("pub cl_ord_id:"), "{body}");
+        assert!(!code.contains("mod components"));
+        assert!(!code.contains("super::components"));
     }
 
     #[test]
@@ -1144,20 +922,41 @@ mod tests {
         assert_eq!(unique.len(), names.len(), "constant names must not collide");
     }
 
+    /// Returns the names of the structs declared in `code`.
+    fn struct_names(code: &str) -> Vec<&str> {
+        code.lines()
+            .filter_map(|text| text.trim_start().strip_prefix("pub struct "))
+            .filter_map(|rest| rest.split_once(' ').map(|(name, _)| name))
+            .collect()
+    }
+
     #[test]
-    fn test_generate_fix44_struct_names_are_unique() {
+    fn test_generate_fix44_struct_names_are_unique_within_each_module() {
         let code = generate(&CodeGenerator::new(), fix44());
-        let mut names: Vec<&str> = Vec::new();
-        for text in code.lines() {
-            let trimmed = text.trim_start();
-            if let Some(rest) = trimmed.strip_prefix("pub struct ")
-                && let Some((name, _)) = rest.split_once(' ')
-            {
-                names.push(name);
-            }
+        for module in [messages_module(&code), components_module(&code)] {
+            let names = struct_names(module);
+            assert!(!names.is_empty());
+            let unique: HashSet<&&str> = names.iter().collect();
+            assert_eq!(unique.len(), names.len(), "struct names must not collide");
         }
-        let unique: HashSet<&&str> = names.iter().collect();
-        assert_eq!(unique.len(), names.len(), "struct names must not collide");
+    }
+
+    #[test]
+    fn test_generate_fix44_emits_one_struct_per_reached_component() {
+        let code = generate(&CodeGenerator::new(), fix44());
+        let components = components_module(&code);
+        // Every struct of the module is a component or a group entry.
+        let component_structs = struct_names(components)
+            .into_iter()
+            .filter(|name| fix44().get_component(name).is_some())
+            .count();
+        // FIX44.xml defines 104 components; no message lists `ExecsGrp` or
+        // `Hop` (the header declares its NoHops group itself), so the other
+        // 102 are generated, and those two are not.
+        assert_eq!(fix44().components().count(), 104);
+        assert_eq!(component_structs, 102);
+        assert!(!components.contains("pub struct ExecsGrp {"));
+        assert!(!components.contains("pub struct Hop {"));
     }
 
     #[test]
@@ -1197,6 +996,77 @@ mod tests {
         assert_eq!(generate(&generator, fix44()), generate(&generator, fix44()));
     }
 
+    /// A dictionary with many messages and components, built afresh, so two
+    /// calls hash their maps with different keys.
+    fn many_definitions() -> Dictionary {
+        let mut dict = Dictionary::new(Version::Fix44);
+        for index in 0..40u32 {
+            let tag = 5000 + index;
+            dict.add_field(FieldDef::new(
+                tag,
+                format!("Field{index}"),
+                FieldType::Price,
+            ));
+            dict.add_component(ComponentDef::new(
+                format!("Comp{index}"),
+                vec![field(tag, &format!("Field{index}"), index % 2 == 0)],
+            ));
+        }
+        for index in 0..40u32 {
+            dict.add_message(MessageDef::new(
+                format!("U{index}"),
+                format!("Message{index}"),
+                MessageCategory::App,
+                (0..5).map(|offset| {
+                    component(&format!("Comp{}", (index + offset * 7) % 40), offset == 0)
+                }),
+            ));
+        }
+        dict
+    }
+
+    #[test]
+    fn test_generate_is_deterministic_across_dictionary_instances() {
+        // Messages and components live in `HashMap`s; the output must not
+        // follow their iteration order.
+        let generator = CodeGenerator::new();
+        let first = generate(&generator, &many_definitions());
+        let second = generate(&generator, &many_definitions());
+        assert!(first == second, "two instances generate different text");
+        let names = struct_names(components_module(&first));
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "components are ordered by name");
+        assert_eq!(names.len(), 40);
+    }
+
+    #[test]
+    fn test_generate_every_embedded_dictionary_is_deterministic_and_lint_clean() {
+        let generator = CodeGenerator::new();
+        for (loaded, what) in [
+            (Dictionary::fix42(), "FIX 4.2"),
+            (Dictionary::fix44(), "FIX 4.4"),
+            (Dictionary::fixt11(), "FIXT 1.1"),
+            (Dictionary::fix50sp2(), "FIX 5.0 SP2"),
+        ] {
+            let dict = embedded(loaded, what);
+            let code = generate(&generator, dict);
+            assert!(
+                code == generate(&generator, dict),
+                "{what} is deterministic"
+            );
+            assert!(!code.contains("#[allow"), "{what}: no #[allow]");
+            assert!(!code.contains("//!"), "{what}: include!-able");
+            // Token-wise, so a name merely containing the letters passes.
+            assert!(
+                !code
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .any(|token| token == "f64" || token == "f32"),
+                "{what}: no binary floating point type"
+            );
+        }
+    }
+
     #[test]
     fn test_generate_respects_configured_visibility() {
         let generator = CodeGenerator::with_config(GeneratorConfig {
@@ -1206,7 +1076,33 @@ mod tests {
         let code = generate(&generator, fix44());
         assert!(code.contains("pub(crate) mod fields {"));
         assert!(code.contains("pub(crate) mod messages {"));
+        assert!(code.contains("pub(crate) mod components {"));
         assert!(code.contains("pub(crate) type FixDecimal"));
+    }
+
+    /// Returns the text of the generated `messages` module.
+    #[track_caller]
+    fn messages_module(code: &str) -> &str {
+        let Some(start) = code.find("mod messages {") else {
+            panic!("the messages module must be generated");
+        };
+        let end = code.find("mod components {").unwrap_or(code.len());
+        match code.get(start..end) {
+            Some(module) => module,
+            None => panic!("the messages module must be sliceable"),
+        }
+    }
+
+    /// Returns the text of the generated `components` module.
+    #[track_caller]
+    fn components_module(code: &str) -> &str {
+        let Some(start) = code.find("mod components {") else {
+            panic!("the components module must be generated");
+        };
+        match code.get(start..) {
+            Some(module) => module,
+            None => panic!("the components module must be sliceable"),
+        }
     }
 
     /// Loads an embedded dictionary, failing the test with the load error.
@@ -1265,6 +1161,8 @@ mod tests {
             body.contains("pub order_qty: ::core::option::Option<FixDecimal>,"),
             "{body}"
         );
+        // FIX 4.2 defines no component, so there is no components module.
+        assert!(!code.contains("mod components"));
         assert!(!code.contains("f64"));
         assert!(!code.contains("f32"));
     }
@@ -1284,13 +1182,21 @@ mod tests {
             "{logon}"
         );
         assert!(logon.contains("pub heart_bt_int: i64,"), "{logon}");
+        // The vendored FIXT11.xml defines MsgTypeGrp with no members, so its
+        // struct is empty, and Logon references it.
+        assert!(
+            logon.contains(
+                "pub msg_type_grp: ::core::option::Option<super::components::MsgTypeGrp>,"
+            ),
+            "{logon}"
+        );
+        assert!(code.contains("pub struct MsgTypeGrp {}"));
         assert!(!code.contains("f64"));
     }
 
     #[test]
     fn test_generate_embedded_fix50sp2_succeeds_with_decimal_prices() {
-        // The output is about 50 MB, so it is generated and inspected here but
-        // never compiled in-repo.
+        // The output is compiled in full by ironfix-codegen-check.
         let code = generate(
             &CodeGenerator::new(),
             embedded(Dictionary::fix50sp2(), "FIX 5.0 SP2"),
@@ -1306,6 +1212,13 @@ mod tests {
             body.contains("pub price: ::core::option::Option<FixDecimal>,"),
             "{body}"
         );
+        assert!(
+            body.contains("pub instrument: super::components::Instrument,"),
+            "{body}"
+        );
+        // One struct per component, however many messages list it.
+        assert_eq!(code.matches("pub struct Instrument {").count(), 1);
+        assert_eq!(code.matches("pub struct Parties {").count(), 1);
         // XID-typed fields (FIX 5.0 SP2 only) are emitted as String.
         assert!(
             code.contains(
@@ -1404,31 +1317,278 @@ mod tests {
         );
     }
 
+    /// A field reference.
+    fn field(tag: u32, name: &str, required: bool) -> SchemaMember {
+        SchemaMember::Field(SchemaFieldRef {
+            tag,
+            name: name.to_string(),
+            required,
+        })
+    }
+
+    /// A component reference.
+    fn component(name: &str, required: bool) -> SchemaMember {
+        SchemaMember::Component(ComponentRef::new(name, required))
+    }
+
     #[test]
-    fn test_generate_component_field_is_optional_even_when_required_inside() {
+    fn test_generate_component_requiredness_belongs_to_each_reference() {
         let mut dict = Dictionary::new(Version::Fix44);
+        dict.add_field(FieldDef::new(11, "ClOrdID", FieldType::String));
         dict.add_field(FieldDef::new(55, "Symbol", FieldType::String));
         dict.add_component(ComponentDef::new(
             "Instrument",
-            vec![SchemaMember::Field(SchemaFieldRef {
-                tag: 55,
-                name: "Symbol".to_string(),
-                required: true,
-            })],
+            vec![field(55, "Symbol", true)],
         ));
         dict.add_message(MessageDef::new(
             "D",
             "NewOrderSingle",
             MessageCategory::App,
-            vec![SchemaMember::Component(ComponentRef::new(
-                "Instrument",
+            vec![component("Instrument", false)],
+        ));
+        dict.add_message(MessageDef::new(
+            "F",
+            "OrderCancelRequest",
+            MessageCategory::App,
+            vec![field(11, "ClOrdID", true), component("Instrument", true)],
+        ));
+        let code = generate(&CodeGenerator::new(), &dict);
+        // One type, required where the component is present at all.
+        assert_eq!(code.matches("pub struct Instrument {").count(), 1);
+        let instrument = struct_body(&code, "Instrument");
+        assert!(
+            instrument.contains("pub symbol: ::std::string::String,"),
+            "{instrument}"
+        );
+        // Each reference decides whether the component is optional.
+        let order = struct_body(&code, "NewOrderSingle");
+        assert!(
+            order
+                .contains("pub instrument: ::core::option::Option<super::components::Instrument>,"),
+            "{order}"
+        );
+        let cancel = struct_body(&code, "OrderCancelRequest");
+        assert!(
+            cancel.contains("pub instrument: super::components::Instrument,"),
+            "{cancel}"
+        );
+    }
+
+    #[test]
+    fn test_generate_component_reached_only_through_a_group_entry_is_generated() {
+        let mut dict = Dictionary::new(Version::Fix44);
+        dict.add_field(FieldDef::new(78, "NoAllocs", FieldType::NumInGroup));
+        dict.add_field(FieldDef::new(79, "AllocAccount", FieldType::String));
+        dict.add_field(FieldDef::new(80, "AllocQty", FieldType::Qty));
+        dict.add_component(ComponentDef::new(
+            "AllocQtyData",
+            vec![field(80, "AllocQty", false)],
+        ));
+        // Never listed by a message: not generated.
+        dict.add_component(ComponentDef::new(
+            "Unused",
+            vec![field(80, "AllocQty", false)],
+        ));
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![SchemaMember::Group(GroupDef::new(
+                78,
+                "NoAllocs",
+                79,
                 false,
+                vec![
+                    field(79, "AllocAccount", true),
+                    component("AllocQtyData", false),
+                ],
             ))],
         ));
         let code = generate(&CodeGenerator::new(), &dict);
-        // The dictionary does not record whether the component reference is
-        // required, so the safe representation is Option.
-        assert!(code.contains("pub symbol: ::core::option::Option<::std::string::String>,"));
+        // The entry lives in `messages` and names the component's module.
+        let entry = struct_body(&code, "NewOrderSingleNoAllocsEntry");
+        assert!(
+            entry.contains(
+                "pub alloc_qty_data: ::core::option::Option<super::components::AllocQtyData>,"
+            ),
+            "{entry}"
+        );
+        let qty = struct_body(&code, "AllocQtyData");
+        assert!(
+            qty.contains("pub alloc_qty: ::core::option::Option<FixDecimal>,"),
+            "{qty}"
+        );
+        assert!(!code.contains("Unused"), "{code}");
+        assert!(components_module(&code).contains("    use super::FixDecimal;"));
+        assert!(!messages_module(&code).contains("use super::FixDecimal;"));
+    }
+
+    #[test]
+    fn test_generate_component_inside_a_component_is_referenced_by_its_bare_name() {
+        let mut dict = Dictionary::new(Version::Fix44);
+        dict.add_field(FieldDef::new(55, "Symbol", FieldType::String));
+        dict.add_field(FieldDef::new(454, "NoSecurityAltID", FieldType::NumInGroup));
+        dict.add_field(FieldDef::new(455, "SecurityAltID", FieldType::String));
+        dict.add_component(ComponentDef::new(
+            "SecAltIDGrp",
+            vec![SchemaMember::Group(GroupDef::new(
+                454,
+                "NoSecurityAltID",
+                455,
+                false,
+                vec![field(455, "SecurityAltID", true)],
+            ))],
+        ));
+        dict.add_component(ComponentDef::new(
+            "Instrument",
+            vec![field(55, "Symbol", true), component("SecAltIDGrp", false)],
+        ));
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![component("Instrument", true)],
+        ));
+        let code = generate(&CodeGenerator::new(), &dict);
+        let instrument = struct_body(&code, "Instrument");
+        assert!(
+            instrument.contains("pub sec_alt_idgrp: ::core::option::Option<SecAltIDGrp>,"),
+            "{instrument}"
+        );
+        let group = struct_body(&code, "SecAltIDGrp");
+        assert!(
+            group.contains(
+                "::core::option::Option<::std::vec::Vec<SecAltIDGrpNoSecurityAltIDEntry>>,"
+            ),
+            "{group}"
+        );
+        // Components ordered by name, each followed by its entries.
+        let names = struct_names(components_module(&code));
+        assert_eq!(
+            names,
+            [
+                "Instrument",
+                "SecAltIDGrp",
+                "SecAltIDGrpNoSecurityAltIDEntry"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_generate_cycle_through_two_components_is_a_typed_error() {
+        let mut dict = Dictionary::new(Version::Fix44);
+        dict.add_component(ComponentDef::new("A", vec![component("B", false)]));
+        dict.add_component(ComponentDef::new("B", vec![component("A", false)]));
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![component("A", false)],
+        ));
+        assert_eq!(
+            CodeGenerator::new().generate(&dict),
+            Err(GeneratorError::ComponentCycle {
+                name: "A".to_string(),
+                path: "A -> B -> A".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_generate_unknown_component_inside_a_component_group_names_its_scope() {
+        let mut dict = Dictionary::new(Version::Fix44);
+        dict.add_field(FieldDef::new(453, "NoPartyIDs", FieldType::NumInGroup));
+        dict.add_field(FieldDef::new(448, "PartyID", FieldType::String));
+        dict.add_component(ComponentDef::new(
+            "Parties",
+            vec![SchemaMember::Group(GroupDef::new(
+                453,
+                "NoPartyIDs",
+                448,
+                false,
+                vec![field(448, "PartyID", true), component("Nowhere", false)],
+            ))],
+        ));
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![component("Parties", false)],
+        ));
+        assert_eq!(
+            CodeGenerator::new().generate(&dict),
+            Err(GeneratorError::UnknownComponent {
+                name: "Nowhere".to_string(),
+                scope: "group NoPartyIDs of component Parties".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_generate_unknown_field_inside_a_component_names_the_component() {
+        let mut dict = Dictionary::new(Version::Fix44);
+        dict.add_component(ComponentDef::new(
+            "Instrument",
+            vec![field(9999, "Mystery", false)],
+        ));
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![component("Instrument", false)],
+        ));
+        assert_eq!(
+            CodeGenerator::new().generate(&dict),
+            Err(GeneratorError::UnknownField {
+                tag: 9999,
+                scope: "component Instrument".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_generate_component_name_with_a_hyphen_is_a_typed_error() {
+        let mut dict = Dictionary::new(Version::Fix44);
+        dict.add_component(ComponentDef::new("Bad-Name", Vec::new()));
+        dict.add_message(MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![component("Bad-Name", false)],
+        ));
+        assert_eq!(
+            CodeGenerator::new().generate(&dict),
+            Err(GeneratorError::UnnameableItem {
+                what: "component",
+                name: "Bad-Name".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_generate_no_type_takes_the_decimal_alias_name() {
+        // A message and a component named like the alias would clash with
+        // `use super::FixDecimal;`; they take a suffix instead.
+        let mut dict = Dictionary::new(Version::Fix44);
+        dict.add_field(FieldDef::new(44, "Price", FieldType::Price));
+        dict.add_component(ComponentDef::new(
+            "FixDecimal",
+            vec![field(44, "Price", false)],
+        ));
+        dict.add_message(MessageDef::new(
+            "U1",
+            "FixDecimal",
+            MessageCategory::App,
+            vec![field(44, "Price", false), component("FixDecimal", false)],
+        ));
+        let code = generate(&CodeGenerator::new(), &dict);
+        assert_eq!(struct_names(messages_module(&code)), ["FixDecimal2"]);
+        assert_eq!(struct_names(components_module(&code)), ["FixDecimal2"]);
+        assert!(
+            code.contains(
+                "pub fix_decimal: ::core::option::Option<super::components::FixDecimal2>,"
+            )
+        );
     }
 
     #[test]
@@ -1473,34 +1633,46 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_field_reached_twice_appears_once() {
+    fn test_generate_member_listed_twice_in_one_definition_appears_once() {
         let mut dict = Dictionary::new(Version::Fix44);
         dict.add_field(FieldDef::new(55, "Symbol", FieldType::String));
+        dict.add_field(FieldDef::new(54, "Side", FieldType::Char));
         dict.add_component(ComponentDef::new(
             "Instrument",
-            vec![SchemaMember::Field(SchemaFieldRef {
-                tag: 55,
-                name: "Symbol".to_string(),
-                required: true,
-            })],
+            vec![field(55, "Symbol", false)],
         ));
         dict.add_message(MessageDef::new(
             "D",
             "NewOrderSingle",
             MessageCategory::App,
             vec![
-                SchemaMember::Field(SchemaFieldRef {
-                    tag: 55,
-                    name: "Symbol".to_string(),
-                    required: true,
-                }),
-                SchemaMember::Component(ComponentRef::new("Instrument", false)),
+                field(55, "Symbol", true),
+                field(55, "Symbol", false),
+                component("Instrument", false),
+                component("Instrument", true),
+                field(54, "Side", true),
             ],
         ));
         let code = generate(&CodeGenerator::new(), &dict);
-        assert_eq!(code.matches("pub symbol:").count(), 1);
-        // The direct reference wins, so it keeps its required-ness.
-        assert!(code.contains("pub symbol: ::std::string::String,"));
+        let order = struct_body(&code, "NewOrderSingle");
+        // The first listing wins, with its requiredness.
+        assert_eq!(order.matches("pub symbol:").count(), 1, "{order}");
+        assert!(
+            order.contains("pub symbol: ::std::string::String,"),
+            "{order}"
+        );
+        assert_eq!(order.matches("pub instrument:").count(), 1, "{order}");
+        assert!(
+            order
+                .contains("pub instrument: ::core::option::Option<super::components::Instrument>,"),
+            "{order}"
+        );
+        // The same tag inside the component stays a field of the component.
+        let instrument = struct_body(&code, "Instrument");
+        assert!(
+            instrument.contains("pub symbol: ::core::option::Option<::std::string::String>,"),
+            "{instrument}"
+        );
     }
 
     #[test]

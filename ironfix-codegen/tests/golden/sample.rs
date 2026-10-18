@@ -21,43 +21,43 @@ pub mod fields {
     pub const SIDE: u32 = 54;
     /// Symbol (tag 55).
     pub const SYMBOL: u32 = 55;
+    /// NoAllocs (tag 78).
+    pub const NO_ALLOCS: u32 = 78;
+    /// AllocAccount (tag 79).
+    pub const ALLOC_ACCOUNT: u32 = 79;
+    /// AllocQty (tag 80).
+    pub const ALLOC_QTY: u32 = 80;
     /// RawData (tag 96).
     pub const RAW_DATA: u32 = 96;
     /// Yield (tag 236).
     pub const YIELD: u32 = 236;
     /// PartyID (tag 448).
     pub const PARTY_ID: u32 = 448;
+    /// PartyRole (tag 452).
+    pub const PARTY_ROLE: u32 = 452;
     /// NoPartyIDs (tag 453).
     pub const NO_PARTY_IDS: u32 = 453;
+    /// NoSecurityAltID (tag 454).
+    pub const NO_SECURITY_ALT_ID: u32 = 454;
+    /// SecurityAltID (tag 455).
+    pub const SECURITY_ALT_ID: u32 = 455;
     /// PartySubID (tag 523).
     pub const PARTY_SUB_ID: u32 = 523;
+    /// NestedPartyID (tag 524).
+    pub const NESTED_PARTY_ID: u32 = 524;
+    /// NoNestedPartyIDs (tag 539).
+    pub const NO_NESTED_PARTY_IDS: u32 = 539;
     /// NoPartySubIDs (tag 802).
     pub const NO_PARTY_SUB_IDS: u32 = 802;
 }
 
-/// Message type definitions.
+/// Message type definitions, and the entries of the repeating groups messages declare.
 pub mod messages {
     use super::FixDecimal;
 
     /// Heartbeat message (MsgType=0).
     #[derive(Debug, Clone)]
     pub struct Heartbeat {}
-
-    /// One entry of the NoPartySubIDs (tag 802) repeating group in NewOrderSingleNoPartyIDsEntry.
-    #[derive(Debug, Clone)]
-    pub struct NewOrderSingleNoPartyIDsEntryNoPartySubIDsEntry {
-        /// PartySubID (tag 523).
-        pub party_sub_id: ::std::string::String,
-    }
-
-    /// One entry of the NoPartyIDs (tag 453) repeating group in NewOrderSingle.
-    #[derive(Debug, Clone)]
-    pub struct NewOrderSingleNoPartyIDsEntry {
-        /// PartyID (tag 448).
-        pub party_id: ::std::string::String,
-        /// NoPartySubIDs (tag 802) repeating group; its length is the count field.
-        pub no_party_sub_ids: ::core::option::Option<::std::vec::Vec<NewOrderSingleNoPartyIDsEntryNoPartySubIDsEntry>>,
-    }
 
     /// NewOrderSingle message (MsgType=D).
     #[derive(Debug, Clone)]
@@ -66,6 +66,8 @@ pub mod messages {
         pub cl_ord_id: ::std::string::String,
         /// ClOrdId (tag 12).
         pub cl_ord_id_12: ::core::option::Option<::std::string::String>,
+        /// Parties component.
+        pub parties: ::core::option::Option<super::components::Parties>,
         /// MsgSeqNum (tag 34).
         pub msg_seq_num: ::core::option::Option<i64>,
         /// PossDupFlag (tag 43).
@@ -78,10 +80,98 @@ pub mod messages {
         pub raw_data: ::core::option::Option<::std::vec::Vec<u8>>,
         /// Yield (tag 236).
         pub r#yield: ::core::option::Option<FixDecimal>,
+        /// NoAllocs (tag 78) repeating group; its length is the count field.
+        pub no_allocs: ::core::option::Option<::std::vec::Vec<NewOrderSingleNoAllocsEntry>>,
+        /// Instrument component.
+        pub instrument: ::core::option::Option<super::components::Instrument>,
+    }
+
+    /// One entry of the NoAllocs (tag 78) repeating group in NewOrderSingle.
+    #[derive(Debug, Clone)]
+    pub struct NewOrderSingleNoAllocsEntry {
+        /// AllocAccount (tag 79).
+        pub alloc_account: ::std::string::String,
+        /// NoNestedPartyIDs (tag 539) repeating group; its length is the count field.
+        pub no_nested_party_ids: ::core::option::Option<::std::vec::Vec<NewOrderSingleNoAllocsNoNestedPartyIDsEntry>>,
+        /// AllocQty (tag 80).
+        pub alloc_qty: ::core::option::Option<FixDecimal>,
+    }
+
+    /// One entry of the NoNestedPartyIDs (tag 539) repeating group in NewOrderSingleNoAllocsEntry.
+    #[derive(Debug, Clone)]
+    pub struct NewOrderSingleNoAllocsNoNestedPartyIDsEntry {
+        /// NestedPartyID (tag 524).
+        pub nested_party_id: ::std::string::String,
+    }
+
+    /// OrderCancelRequest message (MsgType=F).
+    #[derive(Debug, Clone)]
+    pub struct OrderCancelRequest {
+        /// ClOrdID (tag 11).
+        pub cl_ord_id: ::std::string::String,
+        /// Parties component.
+        pub parties: ::core::option::Option<super::components::Parties>,
+        /// Instrument component.
+        pub instrument: super::components::Instrument,
+    }
+
+}
+
+/// Component type definitions, one per component a message reaches, and the entries of the repeating groups components declare.
+pub mod components {
+    /// Instrument component, one type shared by every message, component and group entry that lists it.
+    #[derive(Debug, Clone)]
+    pub struct Instrument {
         /// Symbol (tag 55).
-        pub symbol: ::core::option::Option<::std::string::String>,
+        pub symbol: ::std::string::String,
+        /// SecAltIDGrp component.
+        pub sec_alt_idgrp: ::core::option::Option<SecAltIDGrp>,
+    }
+
+    /// Parties component, one type shared by every message, component and group entry that lists it.
+    #[derive(Debug, Clone)]
+    pub struct Parties {
         /// NoPartyIDs (tag 453) repeating group; its length is the count field.
-        pub no_party_ids: ::core::option::Option<::std::vec::Vec<NewOrderSingleNoPartyIDsEntry>>,
+        pub no_party_ids: ::core::option::Option<::std::vec::Vec<PartiesNoPartyIDsEntry>>,
+    }
+
+    /// One entry of the NoPartyIDs (tag 453) repeating group in Parties.
+    #[derive(Debug, Clone)]
+    pub struct PartiesNoPartyIDsEntry {
+        /// PartyID (tag 448).
+        pub party_id: ::std::string::String,
+        /// PartyRole (tag 452).
+        pub party_role: ::core::option::Option<i64>,
+        /// PtysSubGrp component.
+        pub ptys_sub_grp: ::core::option::Option<PtysSubGrp>,
+    }
+
+    /// PtysSubGrp component, one type shared by every message, component and group entry that lists it.
+    #[derive(Debug, Clone)]
+    pub struct PtysSubGrp {
+        /// NoPartySubIDs (tag 802) repeating group; its length is the count field.
+        pub no_party_sub_ids: ::core::option::Option<::std::vec::Vec<PtysSubGrpNoPartySubIDsEntry>>,
+    }
+
+    /// One entry of the NoPartySubIDs (tag 802) repeating group in PtysSubGrp.
+    #[derive(Debug, Clone)]
+    pub struct PtysSubGrpNoPartySubIDsEntry {
+        /// PartySubID (tag 523).
+        pub party_sub_id: ::std::string::String,
+    }
+
+    /// SecAltIDGrp component, one type shared by every message, component and group entry that lists it.
+    #[derive(Debug, Clone)]
+    pub struct SecAltIDGrp {
+        /// NoSecurityAltID (tag 454) repeating group; its length is the count field.
+        pub no_security_alt_id: ::core::option::Option<::std::vec::Vec<SecAltIDGrpNoSecurityAltIDEntry>>,
+    }
+
+    /// One entry of the NoSecurityAltID (tag 454) repeating group in SecAltIDGrp.
+    #[derive(Debug, Clone)]
+    pub struct SecAltIDGrpNoSecurityAltIDEntry {
+        /// SecurityAltID (tag 455).
+        pub security_alt_id: ::std::string::String,
     }
 
 }

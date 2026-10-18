@@ -26,15 +26,8 @@ pub mod fields {
     pub const ITEM_NAME: u32 = 5010;
 }
 
-/// Message type definitions.
+/// Message type definitions, and the entries of the repeating groups messages declare.
 pub mod messages {
-    /// One entry of the NoItems (tag 5009) repeating group in Option.
-    #[derive(Debug, Clone)]
-    pub struct OptionNoItemsEntry {
-        /// ItemName (tag 5010).
-        pub item_name: ::std::string::String,
-    }
-
     /// Option message (MsgType=U1).
     #[derive(Debug, Clone)]
     pub struct Option {
@@ -56,6 +49,13 @@ pub mod messages {
         pub raw_data: ::core::option::Option<::std::vec::Vec<u8>>,
         /// NoItems (tag 5009) repeating group; its length is the count field.
         pub no_items: ::core::option::Option<::std::vec::Vec<OptionNoItemsEntry>>,
+    }
+
+    /// One entry of the NoItems (tag 5009) repeating group in Option.
+    #[derive(Debug, Clone)]
+    pub struct OptionNoItemsEntry {
+        /// ItemName (tag 5010).
+        pub item_name: ::std::string::String,
     }
 
     /// Vec message (MsgType=U2).

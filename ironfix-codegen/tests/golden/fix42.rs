@@ -819,7 +819,7 @@ pub mod fields {
     pub const ENCODED_LIST_STATUS_TEXT: u32 = 446;
 }
 
-/// Message type definitions.
+/// Message type definitions, and the entries of the repeating groups messages declare.
 pub mod messages {
     use super::FixDecimal;
 
@@ -885,22 +885,6 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
-    /// One entry of the NoIOIQualifiers (tag 199) repeating group in IOI.
-    #[derive(Debug, Clone)]
-    pub struct IOINoIOIQualifiersEntry {
-        /// IOIQualifier (tag 104).
-        pub ioiqualifier: ::core::option::Option<char>,
-    }
-
-    /// One entry of the NoRoutingIDs (tag 215) repeating group in IOI.
-    #[derive(Debug, Clone)]
-    pub struct IOINoRoutingIDsEntry {
-        /// RoutingType (tag 216).
-        pub routing_type: ::core::option::Option<i64>,
-        /// RoutingID (tag 217).
-        pub routing_id: ::core::option::Option<::std::string::String>,
-    }
-
     /// IOI message (MsgType=6).
     #[derive(Debug, Clone)]
     pub struct IOI {
@@ -962,6 +946,8 @@ pub mod messages {
         pub ioiqlty_ind: ::core::option::Option<char>,
         /// IOINaturalFlag (tag 130).
         pub ioinatural_flag: ::core::option::Option<bool>,
+        /// NoIOIQualifiers (tag 199) repeating group; its length is the count field.
+        pub no_ioiqualifiers: ::core::option::Option<::std::vec::Vec<IOINoIOIQualifiersEntry>>,
         /// Text (tag 58).
         pub text: ::core::option::Option<::std::string::String>,
         /// EncodedTextLen (tag 354).
@@ -972,14 +958,28 @@ pub mod messages {
         pub transact_time: ::core::option::Option<::std::string::String>,
         /// URLLink (tag 149).
         pub urllink: ::core::option::Option<::std::string::String>,
+        /// NoRoutingIDs (tag 215) repeating group; its length is the count field.
+        pub no_routing_ids: ::core::option::Option<::std::vec::Vec<IOINoRoutingIDsEntry>>,
         /// SpreadToBenchmark (tag 218).
         pub spread_to_benchmark: ::core::option::Option<FixDecimal>,
         /// Benchmark (tag 219).
         pub benchmark: ::core::option::Option<char>,
-        /// NoIOIQualifiers (tag 199) repeating group; its length is the count field.
-        pub no_ioiqualifiers: ::core::option::Option<::std::vec::Vec<IOINoIOIQualifiersEntry>>,
-        /// NoRoutingIDs (tag 215) repeating group; its length is the count field.
-        pub no_routing_ids: ::core::option::Option<::std::vec::Vec<IOINoRoutingIDsEntry>>,
+    }
+
+    /// One entry of the NoIOIQualifiers (tag 199) repeating group in IOI.
+    #[derive(Debug, Clone)]
+    pub struct IOINoIOIQualifiersEntry {
+        /// IOIQualifier (tag 104).
+        pub ioiqualifier: ::core::option::Option<char>,
+    }
+
+    /// One entry of the NoRoutingIDs (tag 215) repeating group in IOI.
+    #[derive(Debug, Clone)]
+    pub struct IOINoRoutingIDsEntry {
+        /// RoutingType (tag 216).
+        pub routing_type: ::core::option::Option<i64>,
+        /// RoutingID (tag 217).
+        pub routing_id: ::core::option::Option<::std::string::String>,
     }
 
     /// Advertisement message (MsgType=7).
@@ -1055,19 +1055,6 @@ pub mod messages {
         pub trading_session_id: ::core::option::Option<::std::string::String>,
     }
 
-    /// One entry of the NoContraBrokers (tag 382) repeating group in ExecutionReport.
-    #[derive(Debug, Clone)]
-    pub struct ExecutionReportNoContraBrokersEntry {
-        /// ContraBroker (tag 375).
-        pub contra_broker: ::core::option::Option<::std::string::String>,
-        /// ContraTrader (tag 337).
-        pub contra_trader: ::core::option::Option<::std::string::String>,
-        /// ContraTradeQty (tag 437).
-        pub contra_trade_qty: ::core::option::Option<FixDecimal>,
-        /// ContraTradeTime (tag 438).
-        pub contra_trade_time: ::core::option::Option<::std::string::String>,
-    }
-
     /// ExecutionReport message (MsgType=8).
     #[derive(Debug, Clone)]
     pub struct ExecutionReport {
@@ -1083,6 +1070,8 @@ pub mod messages {
         pub client_id: ::core::option::Option<::std::string::String>,
         /// ExecBroker (tag 76).
         pub exec_broker: ::core::option::Option<::std::string::String>,
+        /// NoContraBrokers (tag 382) repeating group; its length is the count field.
+        pub no_contra_brokers: ::core::option::Option<::std::vec::Vec<ExecutionReportNoContraBrokersEntry>>,
         /// ListID (tag 66).
         pub list_id: ::core::option::Option<::std::string::String>,
         /// ExecID (tag 17).
@@ -1253,8 +1242,19 @@ pub mod messages {
         pub clearing_account: ::core::option::Option<::std::string::String>,
         /// MultiLegReportingType (tag 442).
         pub multi_leg_reporting_type: ::core::option::Option<char>,
-        /// NoContraBrokers (tag 382) repeating group; its length is the count field.
-        pub no_contra_brokers: ::core::option::Option<::std::vec::Vec<ExecutionReportNoContraBrokersEntry>>,
+    }
+
+    /// One entry of the NoContraBrokers (tag 382) repeating group in ExecutionReport.
+    #[derive(Debug, Clone)]
+    pub struct ExecutionReportNoContraBrokersEntry {
+        /// ContraBroker (tag 375).
+        pub contra_broker: ::core::option::Option<::std::string::String>,
+        /// ContraTrader (tag 337).
+        pub contra_trader: ::core::option::Option<::std::string::String>,
+        /// ContraTradeQty (tag 437).
+        pub contra_trade_qty: ::core::option::Option<FixDecimal>,
+        /// ContraTradeTime (tag 438).
+        pub contra_trade_time: ::core::option::Option<::std::string::String>,
     }
 
     /// OrderCancelReject message (MsgType=9).
@@ -1292,15 +1292,6 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
-    /// One entry of the NoMsgTypes (tag 384) repeating group in Logon.
-    #[derive(Debug, Clone)]
-    pub struct LogonNoMsgTypesEntry {
-        /// RefMsgType (tag 372).
-        pub ref_msg_type: ::core::option::Option<::std::string::String>,
-        /// MsgDirection (tag 385).
-        pub msg_direction: ::core::option::Option<char>,
-    }
-
     /// Logon message (MsgType=A).
     #[derive(Debug, Clone)]
     pub struct Logon {
@@ -1318,6 +1309,42 @@ pub mod messages {
         pub max_message_size: ::core::option::Option<i64>,
         /// NoMsgTypes (tag 384) repeating group; its length is the count field.
         pub no_msg_types: ::core::option::Option<::std::vec::Vec<LogonNoMsgTypesEntry>>,
+    }
+
+    /// One entry of the NoMsgTypes (tag 384) repeating group in Logon.
+    #[derive(Debug, Clone)]
+    pub struct LogonNoMsgTypesEntry {
+        /// RefMsgType (tag 372).
+        pub ref_msg_type: ::core::option::Option<::std::string::String>,
+        /// MsgDirection (tag 385).
+        pub msg_direction: ::core::option::Option<char>,
+    }
+
+    /// News message (MsgType=B).
+    #[derive(Debug, Clone)]
+    pub struct News {
+        /// OrigTime (tag 42).
+        pub orig_time: ::core::option::Option<::std::string::String>,
+        /// Urgency (tag 61).
+        pub urgency: ::core::option::Option<char>,
+        /// Headline (tag 148).
+        pub headline: ::std::string::String,
+        /// EncodedHeadlineLen (tag 358).
+        pub encoded_headline_len: ::core::option::Option<i64>,
+        /// EncodedHeadline (tag 359).
+        pub encoded_headline: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// NoRoutingIDs (tag 215) repeating group; its length is the count field.
+        pub no_routing_ids: ::core::option::Option<::std::vec::Vec<NewsNoRoutingIDsEntry>>,
+        /// NoRelatedSym (tag 146) repeating group; its length is the count field.
+        pub no_related_sym: ::core::option::Option<::std::vec::Vec<NewsNoRelatedSymEntry>>,
+        /// LinesOfText (tag 33) repeating group; its length is the count field.
+        pub lines_of_text: ::std::vec::Vec<NewsLinesOfTextEntry>,
+        /// URLLink (tag 149).
+        pub urllink: ::core::option::Option<::std::string::String>,
+        /// RawDataLength (tag 95).
+        pub raw_data_length: ::core::option::Option<i64>,
+        /// RawData (tag 96).
+        pub raw_data: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
     /// One entry of the NoRoutingIDs (tag 215) repeating group in News.
@@ -1383,31 +1410,35 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
-    /// News message (MsgType=B).
+    /// Email message (MsgType=C).
     #[derive(Debug, Clone)]
-    pub struct News {
+    pub struct Email {
+        /// EmailThreadID (tag 164).
+        pub email_thread_id: ::std::string::String,
+        /// EmailType (tag 94).
+        pub email_type: char,
         /// OrigTime (tag 42).
         pub orig_time: ::core::option::Option<::std::string::String>,
-        /// Urgency (tag 61).
-        pub urgency: ::core::option::Option<char>,
-        /// Headline (tag 148).
-        pub headline: ::std::string::String,
-        /// EncodedHeadlineLen (tag 358).
-        pub encoded_headline_len: ::core::option::Option<i64>,
-        /// EncodedHeadline (tag 359).
-        pub encoded_headline: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// URLLink (tag 149).
-        pub urllink: ::core::option::Option<::std::string::String>,
+        /// Subject (tag 147).
+        pub subject: ::std::string::String,
+        /// EncodedSubjectLen (tag 356).
+        pub encoded_subject_len: ::core::option::Option<i64>,
+        /// EncodedSubject (tag 357).
+        pub encoded_subject: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// NoRoutingIDs (tag 215) repeating group; its length is the count field.
+        pub no_routing_ids: ::core::option::Option<::std::vec::Vec<EmailNoRoutingIDsEntry>>,
+        /// NoRelatedSym (tag 146) repeating group; its length is the count field.
+        pub no_related_sym: ::core::option::Option<::std::vec::Vec<EmailNoRelatedSymEntry>>,
+        /// OrderID (tag 37).
+        pub order_id: ::core::option::Option<::std::string::String>,
+        /// ClOrdID (tag 11).
+        pub cl_ord_id: ::core::option::Option<::std::string::String>,
+        /// LinesOfText (tag 33) repeating group; its length is the count field.
+        pub lines_of_text: ::std::vec::Vec<EmailLinesOfTextEntry>,
         /// RawDataLength (tag 95).
         pub raw_data_length: ::core::option::Option<i64>,
         /// RawData (tag 96).
         pub raw_data: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// NoRoutingIDs (tag 215) repeating group; its length is the count field.
-        pub no_routing_ids: ::core::option::Option<::std::vec::Vec<NewsNoRoutingIDsEntry>>,
-        /// NoRelatedSym (tag 146) repeating group; its length is the count field.
-        pub no_related_sym: ::core::option::Option<::std::vec::Vec<NewsNoRelatedSymEntry>>,
-        /// LinesOfText (tag 33) repeating group; its length is the count field.
-        pub lines_of_text: ::std::vec::Vec<NewsLinesOfTextEntry>,
     }
 
     /// One entry of the NoRoutingIDs (tag 215) repeating group in Email.
@@ -1473,53 +1504,6 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
-    /// Email message (MsgType=C).
-    #[derive(Debug, Clone)]
-    pub struct Email {
-        /// EmailThreadID (tag 164).
-        pub email_thread_id: ::std::string::String,
-        /// EmailType (tag 94).
-        pub email_type: char,
-        /// OrigTime (tag 42).
-        pub orig_time: ::core::option::Option<::std::string::String>,
-        /// Subject (tag 147).
-        pub subject: ::std::string::String,
-        /// EncodedSubjectLen (tag 356).
-        pub encoded_subject_len: ::core::option::Option<i64>,
-        /// EncodedSubject (tag 357).
-        pub encoded_subject: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// OrderID (tag 37).
-        pub order_id: ::core::option::Option<::std::string::String>,
-        /// ClOrdID (tag 11).
-        pub cl_ord_id: ::core::option::Option<::std::string::String>,
-        /// RawDataLength (tag 95).
-        pub raw_data_length: ::core::option::Option<i64>,
-        /// RawData (tag 96).
-        pub raw_data: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// NoRoutingIDs (tag 215) repeating group; its length is the count field.
-        pub no_routing_ids: ::core::option::Option<::std::vec::Vec<EmailNoRoutingIDsEntry>>,
-        /// NoRelatedSym (tag 146) repeating group; its length is the count field.
-        pub no_related_sym: ::core::option::Option<::std::vec::Vec<EmailNoRelatedSymEntry>>,
-        /// LinesOfText (tag 33) repeating group; its length is the count field.
-        pub lines_of_text: ::std::vec::Vec<EmailLinesOfTextEntry>,
-    }
-
-    /// One entry of the NoAllocs (tag 78) repeating group in NewOrderSingle.
-    #[derive(Debug, Clone)]
-    pub struct NewOrderSingleNoAllocsEntry {
-        /// AllocAccount (tag 79).
-        pub alloc_account: ::core::option::Option<::std::string::String>,
-        /// AllocShares (tag 80).
-        pub alloc_shares: ::core::option::Option<FixDecimal>,
-    }
-
-    /// One entry of the NoTradingSessions (tag 386) repeating group in NewOrderSingle.
-    #[derive(Debug, Clone)]
-    pub struct NewOrderSingleNoTradingSessionsEntry {
-        /// TradingSessionID (tag 336).
-        pub trading_session_id: ::core::option::Option<::std::string::String>,
-    }
-
     /// NewOrderSingle message (MsgType=D).
     #[derive(Debug, Clone)]
     pub struct NewOrderSingle {
@@ -1531,6 +1515,8 @@ pub mod messages {
         pub exec_broker: ::core::option::Option<::std::string::String>,
         /// Account (tag 1).
         pub account: ::core::option::Option<::std::string::String>,
+        /// NoAllocs (tag 78) repeating group; its length is the count field.
+        pub no_allocs: ::core::option::Option<::std::vec::Vec<NewOrderSingleNoAllocsEntry>>,
         /// SettlmntTyp (tag 63).
         pub settlmnt_typ: ::core::option::Option<char>,
         /// FutSettDate (tag 64).
@@ -1545,6 +1531,8 @@ pub mod messages {
         pub max_floor: ::core::option::Option<FixDecimal>,
         /// ExDestination (tag 100).
         pub ex_destination: ::core::option::Option<::std::string::String>,
+        /// NoTradingSessions (tag 386) repeating group; its length is the count field.
+        pub no_trading_sessions: ::core::option::Option<::std::vec::Vec<NewOrderSingleNoTradingSessionsEntry>>,
         /// ProcessCode (tag 81).
         pub process_code: ::core::option::Option<char>,
         /// Symbol (tag 55).
@@ -1661,26 +1649,51 @@ pub mod messages {
         pub clearing_firm: ::core::option::Option<::std::string::String>,
         /// ClearingAccount (tag 440).
         pub clearing_account: ::core::option::Option<::std::string::String>,
-        /// NoAllocs (tag 78) repeating group; its length is the count field.
-        pub no_allocs: ::core::option::Option<::std::vec::Vec<NewOrderSingleNoAllocsEntry>>,
-        /// NoTradingSessions (tag 386) repeating group; its length is the count field.
-        pub no_trading_sessions: ::core::option::Option<::std::vec::Vec<NewOrderSingleNoTradingSessionsEntry>>,
     }
 
-    /// One entry of the NoAllocs (tag 78) repeating group in NewOrderListNoOrdersEntry.
+    /// One entry of the NoAllocs (tag 78) repeating group in NewOrderSingle.
     #[derive(Debug, Clone)]
-    pub struct NewOrderListNoOrdersEntryNoAllocsEntry {
+    pub struct NewOrderSingleNoAllocsEntry {
         /// AllocAccount (tag 79).
         pub alloc_account: ::core::option::Option<::std::string::String>,
         /// AllocShares (tag 80).
         pub alloc_shares: ::core::option::Option<FixDecimal>,
     }
 
-    /// One entry of the NoTradingSessions (tag 386) repeating group in NewOrderListNoOrdersEntry.
+    /// One entry of the NoTradingSessions (tag 386) repeating group in NewOrderSingle.
     #[derive(Debug, Clone)]
-    pub struct NewOrderListNoOrdersEntryNoTradingSessionsEntry {
+    pub struct NewOrderSingleNoTradingSessionsEntry {
         /// TradingSessionID (tag 336).
         pub trading_session_id: ::core::option::Option<::std::string::String>,
+    }
+
+    /// NewOrderList message (MsgType=E).
+    #[derive(Debug, Clone)]
+    pub struct NewOrderList {
+        /// ListID (tag 66).
+        pub list_id: ::std::string::String,
+        /// BidID (tag 390).
+        pub bid_id: ::core::option::Option<::std::string::String>,
+        /// ClientBidID (tag 391).
+        pub client_bid_id: ::core::option::Option<::std::string::String>,
+        /// ProgRptReqs (tag 414).
+        pub prog_rpt_reqs: ::core::option::Option<i64>,
+        /// BidType (tag 394).
+        pub bid_type: i64,
+        /// ProgPeriodInterval (tag 415).
+        pub prog_period_interval: ::core::option::Option<i64>,
+        /// ListExecInstType (tag 433).
+        pub list_exec_inst_type: ::core::option::Option<char>,
+        /// ListExecInst (tag 69).
+        pub list_exec_inst: ::core::option::Option<::std::string::String>,
+        /// EncodedListExecInstLen (tag 352).
+        pub encoded_list_exec_inst_len: ::core::option::Option<i64>,
+        /// EncodedListExecInst (tag 353).
+        pub encoded_list_exec_inst: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// TotNoOrders (tag 68).
+        pub tot_no_orders: i64,
+        /// NoOrders (tag 73) repeating group; its length is the count field.
+        pub no_orders: ::std::vec::Vec<NewOrderListNoOrdersEntry>,
     }
 
     /// One entry of the NoOrders (tag 73) repeating group in NewOrderList.
@@ -1698,6 +1711,8 @@ pub mod messages {
         pub exec_broker: ::core::option::Option<::std::string::String>,
         /// Account (tag 1).
         pub account: ::core::option::Option<::std::string::String>,
+        /// NoAllocs (tag 78) repeating group; its length is the count field.
+        pub no_allocs: ::core::option::Option<::std::vec::Vec<NewOrderListNoOrdersNoAllocsEntry>>,
         /// SettlmntTyp (tag 63).
         pub settlmnt_typ: ::core::option::Option<char>,
         /// FutSettDate (tag 64).
@@ -1712,6 +1727,8 @@ pub mod messages {
         pub max_floor: ::core::option::Option<FixDecimal>,
         /// ExDestination (tag 100).
         pub ex_destination: ::core::option::Option<::std::string::String>,
+        /// NoTradingSessions (tag 386) repeating group; its length is the count field.
+        pub no_trading_sessions: ::core::option::Option<::std::vec::Vec<NewOrderListNoOrdersNoTradingSessionsEntry>>,
         /// ProcessCode (tag 81).
         pub process_code: ::core::option::Option<char>,
         /// Symbol (tag 55).
@@ -1830,39 +1847,22 @@ pub mod messages {
         pub clearing_firm: ::core::option::Option<::std::string::String>,
         /// ClearingAccount (tag 440).
         pub clearing_account: ::core::option::Option<::std::string::String>,
-        /// NoAllocs (tag 78) repeating group; its length is the count field.
-        pub no_allocs: ::core::option::Option<::std::vec::Vec<NewOrderListNoOrdersEntryNoAllocsEntry>>,
-        /// NoTradingSessions (tag 386) repeating group; its length is the count field.
-        pub no_trading_sessions: ::core::option::Option<::std::vec::Vec<NewOrderListNoOrdersEntryNoTradingSessionsEntry>>,
     }
 
-    /// NewOrderList message (MsgType=E).
+    /// One entry of the NoAllocs (tag 78) repeating group in NewOrderListNoOrdersEntry.
     #[derive(Debug, Clone)]
-    pub struct NewOrderList {
-        /// ListID (tag 66).
-        pub list_id: ::std::string::String,
-        /// BidID (tag 390).
-        pub bid_id: ::core::option::Option<::std::string::String>,
-        /// ClientBidID (tag 391).
-        pub client_bid_id: ::core::option::Option<::std::string::String>,
-        /// ProgRptReqs (tag 414).
-        pub prog_rpt_reqs: ::core::option::Option<i64>,
-        /// BidType (tag 394).
-        pub bid_type: i64,
-        /// ProgPeriodInterval (tag 415).
-        pub prog_period_interval: ::core::option::Option<i64>,
-        /// ListExecInstType (tag 433).
-        pub list_exec_inst_type: ::core::option::Option<char>,
-        /// ListExecInst (tag 69).
-        pub list_exec_inst: ::core::option::Option<::std::string::String>,
-        /// EncodedListExecInstLen (tag 352).
-        pub encoded_list_exec_inst_len: ::core::option::Option<i64>,
-        /// EncodedListExecInst (tag 353).
-        pub encoded_list_exec_inst: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// TotNoOrders (tag 68).
-        pub tot_no_orders: i64,
-        /// NoOrders (tag 73) repeating group; its length is the count field.
-        pub no_orders: ::std::vec::Vec<NewOrderListNoOrdersEntry>,
+    pub struct NewOrderListNoOrdersNoAllocsEntry {
+        /// AllocAccount (tag 79).
+        pub alloc_account: ::core::option::Option<::std::string::String>,
+        /// AllocShares (tag 80).
+        pub alloc_shares: ::core::option::Option<FixDecimal>,
+    }
+
+    /// One entry of the NoTradingSessions (tag 386) repeating group in NewOrderListNoOrdersEntry.
+    #[derive(Debug, Clone)]
+    pub struct NewOrderListNoOrdersNoTradingSessionsEntry {
+        /// TradingSessionID (tag 336).
+        pub trading_session_id: ::core::option::Option<::std::string::String>,
     }
 
     /// OrderCancelRequest message (MsgType=F).
@@ -1940,22 +1940,6 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
-    /// One entry of the NoAllocs (tag 78) repeating group in OrderCancelReplaceRequest.
-    #[derive(Debug, Clone)]
-    pub struct OrderCancelReplaceRequestNoAllocsEntry {
-        /// AllocAccount (tag 79).
-        pub alloc_account: ::core::option::Option<::std::string::String>,
-        /// AllocShares (tag 80).
-        pub alloc_shares: ::core::option::Option<FixDecimal>,
-    }
-
-    /// One entry of the NoTradingSessions (tag 386) repeating group in OrderCancelReplaceRequest.
-    #[derive(Debug, Clone)]
-    pub struct OrderCancelReplaceRequestNoTradingSessionsEntry {
-        /// TradingSessionID (tag 336).
-        pub trading_session_id: ::core::option::Option<::std::string::String>,
-    }
-
     /// OrderCancelReplaceRequest message (MsgType=G).
     #[derive(Debug, Clone)]
     pub struct OrderCancelReplaceRequest {
@@ -1973,6 +1957,8 @@ pub mod messages {
         pub list_id: ::core::option::Option<::std::string::String>,
         /// Account (tag 1).
         pub account: ::core::option::Option<::std::string::String>,
+        /// NoAllocs (tag 78) repeating group; its length is the count field.
+        pub no_allocs: ::core::option::Option<::std::vec::Vec<OrderCancelReplaceRequestNoAllocsEntry>>,
         /// SettlmntTyp (tag 63).
         pub settlmnt_typ: ::core::option::Option<char>,
         /// FutSettDate (tag 64).
@@ -1987,6 +1973,8 @@ pub mod messages {
         pub max_floor: ::core::option::Option<FixDecimal>,
         /// ExDestination (tag 100).
         pub ex_destination: ::core::option::Option<::std::string::String>,
+        /// NoTradingSessions (tag 386) repeating group; its length is the count field.
+        pub no_trading_sessions: ::core::option::Option<::std::vec::Vec<OrderCancelReplaceRequestNoTradingSessionsEntry>>,
         /// Symbol (tag 55).
         pub symbol: ::std::string::String,
         /// SymbolSfx (tag 65).
@@ -2095,10 +2083,22 @@ pub mod messages {
         pub clearing_firm: ::core::option::Option<::std::string::String>,
         /// ClearingAccount (tag 440).
         pub clearing_account: ::core::option::Option<::std::string::String>,
-        /// NoAllocs (tag 78) repeating group; its length is the count field.
-        pub no_allocs: ::core::option::Option<::std::vec::Vec<OrderCancelReplaceRequestNoAllocsEntry>>,
-        /// NoTradingSessions (tag 386) repeating group; its length is the count field.
-        pub no_trading_sessions: ::core::option::Option<::std::vec::Vec<OrderCancelReplaceRequestNoTradingSessionsEntry>>,
+    }
+
+    /// One entry of the NoAllocs (tag 78) repeating group in OrderCancelReplaceRequest.
+    #[derive(Debug, Clone)]
+    pub struct OrderCancelReplaceRequestNoAllocsEntry {
+        /// AllocAccount (tag 79).
+        pub alloc_account: ::core::option::Option<::std::string::String>,
+        /// AllocShares (tag 80).
+        pub alloc_shares: ::core::option::Option<FixDecimal>,
+    }
+
+    /// One entry of the NoTradingSessions (tag 386) repeating group in OrderCancelReplaceRequest.
+    #[derive(Debug, Clone)]
+    pub struct OrderCancelReplaceRequestNoTradingSessionsEntry {
+        /// TradingSessionID (tag 336).
+        pub trading_session_id: ::core::option::Option<::std::string::String>,
     }
 
     /// OrderStatusRequest message (MsgType=H).
@@ -2156,96 +2156,6 @@ pub mod messages {
         pub side: char,
     }
 
-    /// One entry of the NoOrders (tag 73) repeating group in Allocation.
-    #[derive(Debug, Clone)]
-    pub struct AllocationNoOrdersEntry {
-        /// ClOrdID (tag 11).
-        pub cl_ord_id: ::core::option::Option<::std::string::String>,
-        /// OrderID (tag 37).
-        pub order_id: ::core::option::Option<::std::string::String>,
-        /// SecondaryOrderID (tag 198).
-        pub secondary_order_id: ::core::option::Option<::std::string::String>,
-        /// ListID (tag 66).
-        pub list_id: ::core::option::Option<::std::string::String>,
-        /// WaveNo (tag 105).
-        pub wave_no: ::core::option::Option<::std::string::String>,
-    }
-
-    /// One entry of the NoExecs (tag 124) repeating group in Allocation.
-    #[derive(Debug, Clone)]
-    pub struct AllocationNoExecsEntry {
-        /// LastShares (tag 32).
-        pub last_shares: ::core::option::Option<FixDecimal>,
-        /// ExecID (tag 17).
-        pub exec_id: ::core::option::Option<::std::string::String>,
-        /// LastPx (tag 31).
-        pub last_px: ::core::option::Option<FixDecimal>,
-        /// LastCapacity (tag 29).
-        pub last_capacity: ::core::option::Option<char>,
-    }
-
-    /// One entry of the NoMiscFees (tag 136) repeating group in AllocationNoAllocsEntry.
-    #[derive(Debug, Clone)]
-    pub struct AllocationNoAllocsEntryNoMiscFeesEntry {
-        /// MiscFeeAmt (tag 137).
-        pub misc_fee_amt: ::core::option::Option<FixDecimal>,
-        /// MiscFeeCurr (tag 138).
-        pub misc_fee_curr: ::core::option::Option<::std::string::String>,
-        /// MiscFeeType (tag 139).
-        pub misc_fee_type: ::core::option::Option<char>,
-    }
-
-    /// One entry of the NoAllocs (tag 78) repeating group in Allocation.
-    #[derive(Debug, Clone)]
-    pub struct AllocationNoAllocsEntry {
-        /// AllocAccount (tag 79).
-        pub alloc_account: ::core::option::Option<::std::string::String>,
-        /// AllocPrice (tag 366).
-        pub alloc_price: ::core::option::Option<FixDecimal>,
-        /// AllocShares (tag 80).
-        pub alloc_shares: FixDecimal,
-        /// ProcessCode (tag 81).
-        pub process_code: ::core::option::Option<char>,
-        /// BrokerOfCredit (tag 92).
-        pub broker_of_credit: ::core::option::Option<::std::string::String>,
-        /// NotifyBrokerOfCredit (tag 208).
-        pub notify_broker_of_credit: ::core::option::Option<bool>,
-        /// AllocHandlInst (tag 209).
-        pub alloc_handl_inst: ::core::option::Option<i64>,
-        /// AllocText (tag 161).
-        pub alloc_text: ::core::option::Option<::std::string::String>,
-        /// EncodedAllocTextLen (tag 360).
-        pub encoded_alloc_text_len: ::core::option::Option<i64>,
-        /// EncodedAllocText (tag 361).
-        pub encoded_alloc_text: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// ExecBroker (tag 76).
-        pub exec_broker: ::core::option::Option<::std::string::String>,
-        /// ClientID (tag 109).
-        pub client_id: ::core::option::Option<::std::string::String>,
-        /// Commission (tag 12).
-        pub commission: ::core::option::Option<FixDecimal>,
-        /// CommType (tag 13).
-        pub comm_type: ::core::option::Option<char>,
-        /// AllocAvgPx (tag 153).
-        pub alloc_avg_px: ::core::option::Option<FixDecimal>,
-        /// AllocNetMoney (tag 154).
-        pub alloc_net_money: ::core::option::Option<FixDecimal>,
-        /// SettlCurrAmt (tag 119).
-        pub settl_curr_amt: ::core::option::Option<FixDecimal>,
-        /// SettlCurrency (tag 120).
-        pub settl_currency: ::core::option::Option<::std::string::String>,
-        /// SettlCurrFxRate (tag 155).
-        pub settl_curr_fx_rate: ::core::option::Option<FixDecimal>,
-        /// SettlCurrFxRateCalc (tag 156).
-        pub settl_curr_fx_rate_calc: ::core::option::Option<char>,
-        /// AccruedInterestAmt (tag 159).
-        pub accrued_interest_amt: ::core::option::Option<FixDecimal>,
-        /// SettlInstMode (tag 160).
-        pub settl_inst_mode: ::core::option::Option<char>,
-        /// NoMiscFees (tag 136) repeating group; its length is the count field.
-        pub no_misc_fees: ::core::option::Option<::std::vec::Vec<AllocationNoAllocsEntryNoMiscFeesEntry>>,
-    }
-
     /// Allocation message (MsgType=J).
     #[derive(Debug, Clone)]
     pub struct Allocation {
@@ -2259,6 +2169,10 @@ pub mod messages {
         pub alloc_link_id: ::core::option::Option<::std::string::String>,
         /// AllocLinkType (tag 197).
         pub alloc_link_type: ::core::option::Option<i64>,
+        /// NoOrders (tag 73) repeating group; its length is the count field.
+        pub no_orders: ::core::option::Option<::std::vec::Vec<AllocationNoOrdersEntry>>,
+        /// NoExecs (tag 124) repeating group; its length is the count field.
+        pub no_execs: ::core::option::Option<::std::vec::Vec<AllocationNoExecsEntry>>,
         /// Side (tag 54).
         pub side: char,
         /// Symbol (tag 55).
@@ -2335,12 +2249,98 @@ pub mod messages {
         pub num_days_interest: ::core::option::Option<i64>,
         /// AccruedInterestRate (tag 158).
         pub accrued_interest_rate: ::core::option::Option<FixDecimal>,
-        /// NoOrders (tag 73) repeating group; its length is the count field.
-        pub no_orders: ::core::option::Option<::std::vec::Vec<AllocationNoOrdersEntry>>,
-        /// NoExecs (tag 124) repeating group; its length is the count field.
-        pub no_execs: ::core::option::Option<::std::vec::Vec<AllocationNoExecsEntry>>,
         /// NoAllocs (tag 78) repeating group; its length is the count field.
         pub no_allocs: ::core::option::Option<::std::vec::Vec<AllocationNoAllocsEntry>>,
+    }
+
+    /// One entry of the NoOrders (tag 73) repeating group in Allocation.
+    #[derive(Debug, Clone)]
+    pub struct AllocationNoOrdersEntry {
+        /// ClOrdID (tag 11).
+        pub cl_ord_id: ::core::option::Option<::std::string::String>,
+        /// OrderID (tag 37).
+        pub order_id: ::core::option::Option<::std::string::String>,
+        /// SecondaryOrderID (tag 198).
+        pub secondary_order_id: ::core::option::Option<::std::string::String>,
+        /// ListID (tag 66).
+        pub list_id: ::core::option::Option<::std::string::String>,
+        /// WaveNo (tag 105).
+        pub wave_no: ::core::option::Option<::std::string::String>,
+    }
+
+    /// One entry of the NoExecs (tag 124) repeating group in Allocation.
+    #[derive(Debug, Clone)]
+    pub struct AllocationNoExecsEntry {
+        /// LastShares (tag 32).
+        pub last_shares: ::core::option::Option<FixDecimal>,
+        /// ExecID (tag 17).
+        pub exec_id: ::core::option::Option<::std::string::String>,
+        /// LastPx (tag 31).
+        pub last_px: ::core::option::Option<FixDecimal>,
+        /// LastCapacity (tag 29).
+        pub last_capacity: ::core::option::Option<char>,
+    }
+
+    /// One entry of the NoAllocs (tag 78) repeating group in Allocation.
+    #[derive(Debug, Clone)]
+    pub struct AllocationNoAllocsEntry {
+        /// AllocAccount (tag 79).
+        pub alloc_account: ::core::option::Option<::std::string::String>,
+        /// AllocPrice (tag 366).
+        pub alloc_price: ::core::option::Option<FixDecimal>,
+        /// AllocShares (tag 80).
+        pub alloc_shares: FixDecimal,
+        /// ProcessCode (tag 81).
+        pub process_code: ::core::option::Option<char>,
+        /// BrokerOfCredit (tag 92).
+        pub broker_of_credit: ::core::option::Option<::std::string::String>,
+        /// NotifyBrokerOfCredit (tag 208).
+        pub notify_broker_of_credit: ::core::option::Option<bool>,
+        /// AllocHandlInst (tag 209).
+        pub alloc_handl_inst: ::core::option::Option<i64>,
+        /// AllocText (tag 161).
+        pub alloc_text: ::core::option::Option<::std::string::String>,
+        /// EncodedAllocTextLen (tag 360).
+        pub encoded_alloc_text_len: ::core::option::Option<i64>,
+        /// EncodedAllocText (tag 361).
+        pub encoded_alloc_text: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// ExecBroker (tag 76).
+        pub exec_broker: ::core::option::Option<::std::string::String>,
+        /// ClientID (tag 109).
+        pub client_id: ::core::option::Option<::std::string::String>,
+        /// Commission (tag 12).
+        pub commission: ::core::option::Option<FixDecimal>,
+        /// CommType (tag 13).
+        pub comm_type: ::core::option::Option<char>,
+        /// AllocAvgPx (tag 153).
+        pub alloc_avg_px: ::core::option::Option<FixDecimal>,
+        /// AllocNetMoney (tag 154).
+        pub alloc_net_money: ::core::option::Option<FixDecimal>,
+        /// SettlCurrAmt (tag 119).
+        pub settl_curr_amt: ::core::option::Option<FixDecimal>,
+        /// SettlCurrency (tag 120).
+        pub settl_currency: ::core::option::Option<::std::string::String>,
+        /// SettlCurrFxRate (tag 155).
+        pub settl_curr_fx_rate: ::core::option::Option<FixDecimal>,
+        /// SettlCurrFxRateCalc (tag 156).
+        pub settl_curr_fx_rate_calc: ::core::option::Option<char>,
+        /// AccruedInterestAmt (tag 159).
+        pub accrued_interest_amt: ::core::option::Option<FixDecimal>,
+        /// SettlInstMode (tag 160).
+        pub settl_inst_mode: ::core::option::Option<char>,
+        /// NoMiscFees (tag 136) repeating group; its length is the count field.
+        pub no_misc_fees: ::core::option::Option<::std::vec::Vec<AllocationNoAllocsNoMiscFeesEntry>>,
+    }
+
+    /// One entry of the NoMiscFees (tag 136) repeating group in AllocationNoAllocsEntry.
+    #[derive(Debug, Clone)]
+    pub struct AllocationNoAllocsNoMiscFeesEntry {
+        /// MiscFeeAmt (tag 137).
+        pub misc_fee_amt: ::core::option::Option<FixDecimal>,
+        /// MiscFeeCurr (tag 138).
+        pub misc_fee_curr: ::core::option::Option<::std::string::String>,
+        /// MiscFeeType (tag 139).
+        pub misc_fee_type: ::core::option::Option<char>,
     }
 
     /// ListCancelRequest message (MsgType=K).
@@ -2390,31 +2390,6 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
-    /// One entry of the NoOrders (tag 73) repeating group in ListStatus.
-    #[derive(Debug, Clone)]
-    pub struct ListStatusNoOrdersEntry {
-        /// ClOrdID (tag 11).
-        pub cl_ord_id: ::std::string::String,
-        /// CumQty (tag 14).
-        pub cum_qty: FixDecimal,
-        /// OrdStatus (tag 39).
-        pub ord_status: char,
-        /// LeavesQty (tag 151).
-        pub leaves_qty: FixDecimal,
-        /// CxlQty (tag 84).
-        pub cxl_qty: FixDecimal,
-        /// AvgPx (tag 6).
-        pub avg_px: FixDecimal,
-        /// OrdRejReason (tag 103).
-        pub ord_rej_reason: ::core::option::Option<i64>,
-        /// Text (tag 58).
-        pub text: ::core::option::Option<::std::string::String>,
-        /// EncodedTextLen (tag 354).
-        pub encoded_text_len: ::core::option::Option<i64>,
-        /// EncodedText (tag 355).
-        pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
-    }
-
     /// ListStatus message (MsgType=N).
     #[derive(Debug, Clone)]
     pub struct ListStatus {
@@ -2440,6 +2415,31 @@ pub mod messages {
         pub tot_no_orders: i64,
         /// NoOrders (tag 73) repeating group; its length is the count field.
         pub no_orders: ::std::vec::Vec<ListStatusNoOrdersEntry>,
+    }
+
+    /// One entry of the NoOrders (tag 73) repeating group in ListStatus.
+    #[derive(Debug, Clone)]
+    pub struct ListStatusNoOrdersEntry {
+        /// ClOrdID (tag 11).
+        pub cl_ord_id: ::std::string::String,
+        /// CumQty (tag 14).
+        pub cum_qty: FixDecimal,
+        /// OrdStatus (tag 39).
+        pub ord_status: char,
+        /// LeavesQty (tag 151).
+        pub leaves_qty: FixDecimal,
+        /// CxlQty (tag 84).
+        pub cxl_qty: FixDecimal,
+        /// AvgPx (tag 6).
+        pub avg_px: FixDecimal,
+        /// OrdRejReason (tag 103).
+        pub ord_rej_reason: ::core::option::Option<i64>,
+        /// Text (tag 58).
+        pub text: ::core::option::Option<::std::string::String>,
+        /// EncodedTextLen (tag 354).
+        pub encoded_text_len: ::core::option::Option<i64>,
+        /// EncodedText (tag 355).
+        pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
     /// AllocationInstructionAck message (MsgType=P).
@@ -2532,6 +2532,15 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
+    /// QuoteRequest message (MsgType=R).
+    #[derive(Debug, Clone)]
+    pub struct QuoteRequest {
+        /// QuoteReqID (tag 131).
+        pub quote_req_id: ::std::string::String,
+        /// NoRelatedSym (tag 146) repeating group; its length is the count field.
+        pub no_related_sym: ::std::vec::Vec<QuoteRequestNoRelatedSymEntry>,
+    }
+
     /// One entry of the NoRelatedSym (tag 146) repeating group in QuoteRequest.
     #[derive(Debug, Clone)]
     pub struct QuoteRequestNoRelatedSymEntry {
@@ -2597,15 +2606,6 @@ pub mod messages {
         pub transact_time: ::core::option::Option<::std::string::String>,
         /// Currency (tag 15).
         pub currency: ::core::option::Option<::std::string::String>,
-    }
-
-    /// QuoteRequest message (MsgType=R).
-    #[derive(Debug, Clone)]
-    pub struct QuoteRequest {
-        /// QuoteReqID (tag 131).
-        pub quote_req_id: ::std::string::String,
-        /// NoRelatedSym (tag 146) repeating group; its length is the count field.
-        pub no_related_sym: ::std::vec::Vec<QuoteRequestNoRelatedSymEntry>,
     }
 
     /// Quote message (MsgType=S).
@@ -2766,6 +2766,25 @@ pub mod messages {
         pub cash_settl_agent_contact_phone: ::core::option::Option<::std::string::String>,
     }
 
+    /// MarketDataRequest message (MsgType=V).
+    #[derive(Debug, Clone)]
+    pub struct MarketDataRequest {
+        /// MDReqID (tag 262).
+        pub mdreq_id: ::std::string::String,
+        /// SubscriptionRequestType (tag 263).
+        pub subscription_request_type: char,
+        /// MarketDepth (tag 264).
+        pub market_depth: i64,
+        /// MDUpdateType (tag 265).
+        pub mdupdate_type: ::core::option::Option<i64>,
+        /// AggregatedBook (tag 266).
+        pub aggregated_book: ::core::option::Option<bool>,
+        /// NoMDEntryTypes (tag 267) repeating group; its length is the count field.
+        pub no_mdentry_types: ::std::vec::Vec<MarketDataRequestNoMDEntryTypesEntry>,
+        /// NoRelatedSym (tag 146) repeating group; its length is the count field.
+        pub no_related_sym: ::std::vec::Vec<MarketDataRequestNoRelatedSymEntry>,
+    }
+
     /// One entry of the NoMDEntryTypes (tag 267) repeating group in MarketDataRequest.
     #[derive(Debug, Clone)]
     pub struct MarketDataRequestNoMDEntryTypesEntry {
@@ -2818,23 +2837,57 @@ pub mod messages {
         pub trading_session_id: ::core::option::Option<::std::string::String>,
     }
 
-    /// MarketDataRequest message (MsgType=V).
+    /// MarketDataSnapshotFullRefresh message (MsgType=W).
     #[derive(Debug, Clone)]
-    pub struct MarketDataRequest {
+    pub struct MarketDataSnapshotFullRefresh {
         /// MDReqID (tag 262).
-        pub mdreq_id: ::std::string::String,
-        /// SubscriptionRequestType (tag 263).
-        pub subscription_request_type: char,
-        /// MarketDepth (tag 264).
-        pub market_depth: i64,
-        /// MDUpdateType (tag 265).
-        pub mdupdate_type: ::core::option::Option<i64>,
-        /// AggregatedBook (tag 266).
-        pub aggregated_book: ::core::option::Option<bool>,
-        /// NoMDEntryTypes (tag 267) repeating group; its length is the count field.
-        pub no_mdentry_types: ::std::vec::Vec<MarketDataRequestNoMDEntryTypesEntry>,
-        /// NoRelatedSym (tag 146) repeating group; its length is the count field.
-        pub no_related_sym: ::std::vec::Vec<MarketDataRequestNoRelatedSymEntry>,
+        pub mdreq_id: ::core::option::Option<::std::string::String>,
+        /// Symbol (tag 55).
+        pub symbol: ::std::string::String,
+        /// SymbolSfx (tag 65).
+        pub symbol_sfx: ::core::option::Option<::std::string::String>,
+        /// SecurityID (tag 48).
+        pub security_id: ::core::option::Option<::std::string::String>,
+        /// IDSource (tag 22).
+        pub idsource: ::core::option::Option<::std::string::String>,
+        /// SecurityType (tag 167).
+        pub security_type: ::core::option::Option<::std::string::String>,
+        /// MaturityMonthYear (tag 200).
+        pub maturity_month_year: ::core::option::Option<::std::string::String>,
+        /// MaturityDay (tag 205).
+        pub maturity_day: ::core::option::Option<i64>,
+        /// PutOrCall (tag 201).
+        pub put_or_call: ::core::option::Option<i64>,
+        /// StrikePrice (tag 202).
+        pub strike_price: ::core::option::Option<FixDecimal>,
+        /// OptAttribute (tag 206).
+        pub opt_attribute: ::core::option::Option<char>,
+        /// ContractMultiplier (tag 231).
+        pub contract_multiplier: ::core::option::Option<FixDecimal>,
+        /// CouponRate (tag 223).
+        pub coupon_rate: ::core::option::Option<FixDecimal>,
+        /// SecurityExchange (tag 207).
+        pub security_exchange: ::core::option::Option<::std::string::String>,
+        /// Issuer (tag 106).
+        pub issuer: ::core::option::Option<::std::string::String>,
+        /// EncodedIssuerLen (tag 348).
+        pub encoded_issuer_len: ::core::option::Option<i64>,
+        /// EncodedIssuer (tag 349).
+        pub encoded_issuer: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// SecurityDesc (tag 107).
+        pub security_desc: ::core::option::Option<::std::string::String>,
+        /// EncodedSecurityDescLen (tag 350).
+        pub encoded_security_desc_len: ::core::option::Option<i64>,
+        /// EncodedSecurityDesc (tag 351).
+        pub encoded_security_desc: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// FinancialStatus (tag 291).
+        pub financial_status: ::core::option::Option<char>,
+        /// CorporateAction (tag 292).
+        pub corporate_action: ::core::option::Option<char>,
+        /// TotalVolumeTraded (tag 387).
+        pub total_volume_traded: ::core::option::Option<FixDecimal>,
+        /// NoMDEntries (tag 268) repeating group; its length is the count field.
+        pub no_mdentries: ::std::vec::Vec<MarketDataSnapshotFullRefreshNoMDEntriesEntry>,
     }
 
     /// One entry of the NoMDEntries (tag 268) repeating group in MarketDataSnapshotFullRefresh.
@@ -2902,57 +2955,13 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
-    /// MarketDataSnapshotFullRefresh message (MsgType=W).
+    /// MarketDataIncrementalRefresh message (MsgType=X).
     #[derive(Debug, Clone)]
-    pub struct MarketDataSnapshotFullRefresh {
+    pub struct MarketDataIncrementalRefresh {
         /// MDReqID (tag 262).
         pub mdreq_id: ::core::option::Option<::std::string::String>,
-        /// Symbol (tag 55).
-        pub symbol: ::std::string::String,
-        /// SymbolSfx (tag 65).
-        pub symbol_sfx: ::core::option::Option<::std::string::String>,
-        /// SecurityID (tag 48).
-        pub security_id: ::core::option::Option<::std::string::String>,
-        /// IDSource (tag 22).
-        pub idsource: ::core::option::Option<::std::string::String>,
-        /// SecurityType (tag 167).
-        pub security_type: ::core::option::Option<::std::string::String>,
-        /// MaturityMonthYear (tag 200).
-        pub maturity_month_year: ::core::option::Option<::std::string::String>,
-        /// MaturityDay (tag 205).
-        pub maturity_day: ::core::option::Option<i64>,
-        /// PutOrCall (tag 201).
-        pub put_or_call: ::core::option::Option<i64>,
-        /// StrikePrice (tag 202).
-        pub strike_price: ::core::option::Option<FixDecimal>,
-        /// OptAttribute (tag 206).
-        pub opt_attribute: ::core::option::Option<char>,
-        /// ContractMultiplier (tag 231).
-        pub contract_multiplier: ::core::option::Option<FixDecimal>,
-        /// CouponRate (tag 223).
-        pub coupon_rate: ::core::option::Option<FixDecimal>,
-        /// SecurityExchange (tag 207).
-        pub security_exchange: ::core::option::Option<::std::string::String>,
-        /// Issuer (tag 106).
-        pub issuer: ::core::option::Option<::std::string::String>,
-        /// EncodedIssuerLen (tag 348).
-        pub encoded_issuer_len: ::core::option::Option<i64>,
-        /// EncodedIssuer (tag 349).
-        pub encoded_issuer: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// SecurityDesc (tag 107).
-        pub security_desc: ::core::option::Option<::std::string::String>,
-        /// EncodedSecurityDescLen (tag 350).
-        pub encoded_security_desc_len: ::core::option::Option<i64>,
-        /// EncodedSecurityDesc (tag 351).
-        pub encoded_security_desc: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// FinancialStatus (tag 291).
-        pub financial_status: ::core::option::Option<char>,
-        /// CorporateAction (tag 292).
-        pub corporate_action: ::core::option::Option<char>,
-        /// TotalVolumeTraded (tag 387).
-        pub total_volume_traded: ::core::option::Option<FixDecimal>,
         /// NoMDEntries (tag 268) repeating group; its length is the count field.
-        pub no_mdentries: ::std::vec::Vec<MarketDataSnapshotFullRefreshNoMDEntriesEntry>,
+        pub no_mdentries: ::std::vec::Vec<MarketDataIncrementalRefreshNoMDEntriesEntry>,
     }
 
     /// One entry of the NoMDEntries (tag 268) repeating group in MarketDataIncrementalRefresh.
@@ -3072,15 +3081,6 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
-    /// MarketDataIncrementalRefresh message (MsgType=X).
-    #[derive(Debug, Clone)]
-    pub struct MarketDataIncrementalRefresh {
-        /// MDReqID (tag 262).
-        pub mdreq_id: ::core::option::Option<::std::string::String>,
-        /// NoMDEntries (tag 268) repeating group; its length is the count field.
-        pub no_mdentries: ::std::vec::Vec<MarketDataIncrementalRefreshNoMDEntriesEntry>,
-    }
-
     /// MarketDataRequestReject message (MsgType=Y).
     #[derive(Debug, Clone)]
     pub struct MarketDataRequestReject {
@@ -3094,6 +3094,23 @@ pub mod messages {
         pub encoded_text_len: ::core::option::Option<i64>,
         /// EncodedText (tag 355).
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
+    }
+
+    /// QuoteCancel message (MsgType=Z).
+    #[derive(Debug, Clone)]
+    pub struct QuoteCancel {
+        /// QuoteReqID (tag 131).
+        pub quote_req_id: ::core::option::Option<::std::string::String>,
+        /// QuoteID (tag 117).
+        pub quote_id: ::std::string::String,
+        /// QuoteCancelType (tag 298).
+        pub quote_cancel_type: i64,
+        /// QuoteResponseLevel (tag 301).
+        pub quote_response_level: ::core::option::Option<i64>,
+        /// TradingSessionID (tag 336).
+        pub trading_session_id: ::core::option::Option<::std::string::String>,
+        /// NoQuoteEntries (tag 295) repeating group; its length is the count field.
+        pub no_quote_entries: ::std::vec::Vec<QuoteCancelNoQuoteEntriesEntry>,
     }
 
     /// One entry of the NoQuoteEntries (tag 295) repeating group in QuoteCancel.
@@ -3139,23 +3156,6 @@ pub mod messages {
         pub encoded_security_desc: ::core::option::Option<::std::vec::Vec<u8>>,
         /// UnderlyingSymbol (tag 311).
         pub underlying_symbol: ::core::option::Option<::std::string::String>,
-    }
-
-    /// QuoteCancel message (MsgType=Z).
-    #[derive(Debug, Clone)]
-    pub struct QuoteCancel {
-        /// QuoteReqID (tag 131).
-        pub quote_req_id: ::core::option::Option<::std::string::String>,
-        /// QuoteID (tag 117).
-        pub quote_id: ::std::string::String,
-        /// QuoteCancelType (tag 298).
-        pub quote_cancel_type: i64,
-        /// QuoteResponseLevel (tag 301).
-        pub quote_response_level: ::core::option::Option<i64>,
-        /// TradingSessionID (tag 336).
-        pub trading_session_id: ::core::option::Option<::std::string::String>,
-        /// NoQuoteEntries (tag 295) repeating group; its length is the count field.
-        pub no_quote_entries: ::std::vec::Vec<QuoteCancelNoQuoteEntriesEntry>,
     }
 
     /// QuoteStatusRequest message (MsgType=a).
@@ -3207,51 +3207,25 @@ pub mod messages {
         pub trading_session_id: ::core::option::Option<::std::string::String>,
     }
 
-    /// One entry of the NoQuoteEntries (tag 295) repeating group in QuoteAcknowledgementNoQuoteSetsEntry.
+    /// QuoteAcknowledgement message (MsgType=b).
     #[derive(Debug, Clone)]
-    pub struct QuoteAcknowledgementNoQuoteSetsEntryNoQuoteEntriesEntry {
-        /// QuoteEntryID (tag 299).
-        pub quote_entry_id: ::core::option::Option<::std::string::String>,
-        /// Symbol (tag 55).
-        pub symbol: ::core::option::Option<::std::string::String>,
-        /// SymbolSfx (tag 65).
-        pub symbol_sfx: ::core::option::Option<::std::string::String>,
-        /// SecurityID (tag 48).
-        pub security_id: ::core::option::Option<::std::string::String>,
-        /// IDSource (tag 22).
-        pub idsource: ::core::option::Option<::std::string::String>,
-        /// SecurityType (tag 167).
-        pub security_type: ::core::option::Option<::std::string::String>,
-        /// MaturityMonthYear (tag 200).
-        pub maturity_month_year: ::core::option::Option<::std::string::String>,
-        /// MaturityDay (tag 205).
-        pub maturity_day: ::core::option::Option<i64>,
-        /// PutOrCall (tag 201).
-        pub put_or_call: ::core::option::Option<i64>,
-        /// StrikePrice (tag 202).
-        pub strike_price: ::core::option::Option<FixDecimal>,
-        /// OptAttribute (tag 206).
-        pub opt_attribute: ::core::option::Option<char>,
-        /// ContractMultiplier (tag 231).
-        pub contract_multiplier: ::core::option::Option<FixDecimal>,
-        /// CouponRate (tag 223).
-        pub coupon_rate: ::core::option::Option<FixDecimal>,
-        /// SecurityExchange (tag 207).
-        pub security_exchange: ::core::option::Option<::std::string::String>,
-        /// Issuer (tag 106).
-        pub issuer: ::core::option::Option<::std::string::String>,
-        /// EncodedIssuerLen (tag 348).
-        pub encoded_issuer_len: ::core::option::Option<i64>,
-        /// EncodedIssuer (tag 349).
-        pub encoded_issuer: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// SecurityDesc (tag 107).
-        pub security_desc: ::core::option::Option<::std::string::String>,
-        /// EncodedSecurityDescLen (tag 350).
-        pub encoded_security_desc_len: ::core::option::Option<i64>,
-        /// EncodedSecurityDesc (tag 351).
-        pub encoded_security_desc: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// QuoteEntryRejectReason (tag 368).
-        pub quote_entry_reject_reason: ::core::option::Option<i64>,
+    pub struct QuoteAcknowledgement {
+        /// QuoteReqID (tag 131).
+        pub quote_req_id: ::core::option::Option<::std::string::String>,
+        /// QuoteID (tag 117).
+        pub quote_id: ::core::option::Option<::std::string::String>,
+        /// QuoteStatus (tag 297).
+        pub quote_status: i64,
+        /// QuoteRejectReason (tag 300).
+        pub quote_reject_reason: ::core::option::Option<i64>,
+        /// QuoteResponseLevel (tag 301).
+        pub quote_response_level: ::core::option::Option<i64>,
+        /// TradingSessionID (tag 336).
+        pub trading_session_id: ::core::option::Option<::std::string::String>,
+        /// Text (tag 58).
+        pub text: ::core::option::Option<::std::string::String>,
+        /// NoQuoteSets (tag 296) repeating group; its length is the count field.
+        pub no_quote_sets: ::core::option::Option<::std::vec::Vec<QuoteAcknowledgementNoQuoteSetsEntry>>,
     }
 
     /// One entry of the NoQuoteSets (tag 296) repeating group in QuoteAcknowledgement.
@@ -3300,77 +3274,54 @@ pub mod messages {
         /// TotQuoteEntries (tag 304).
         pub tot_quote_entries: ::core::option::Option<i64>,
         /// NoQuoteEntries (tag 295) repeating group; its length is the count field.
-        pub no_quote_entries: ::core::option::Option<::std::vec::Vec<QuoteAcknowledgementNoQuoteSetsEntryNoQuoteEntriesEntry>>,
+        pub no_quote_entries: ::core::option::Option<::std::vec::Vec<QuoteAcknowledgementNoQuoteSetsNoQuoteEntriesEntry>>,
     }
 
-    /// QuoteAcknowledgement message (MsgType=b).
+    /// One entry of the NoQuoteEntries (tag 295) repeating group in QuoteAcknowledgementNoQuoteSetsEntry.
     #[derive(Debug, Clone)]
-    pub struct QuoteAcknowledgement {
-        /// QuoteReqID (tag 131).
-        pub quote_req_id: ::core::option::Option<::std::string::String>,
-        /// QuoteID (tag 117).
-        pub quote_id: ::core::option::Option<::std::string::String>,
-        /// QuoteStatus (tag 297).
-        pub quote_status: i64,
-        /// QuoteRejectReason (tag 300).
-        pub quote_reject_reason: ::core::option::Option<i64>,
-        /// QuoteResponseLevel (tag 301).
-        pub quote_response_level: ::core::option::Option<i64>,
-        /// TradingSessionID (tag 336).
-        pub trading_session_id: ::core::option::Option<::std::string::String>,
-        /// Text (tag 58).
-        pub text: ::core::option::Option<::std::string::String>,
-        /// NoQuoteSets (tag 296) repeating group; its length is the count field.
-        pub no_quote_sets: ::core::option::Option<::std::vec::Vec<QuoteAcknowledgementNoQuoteSetsEntry>>,
-    }
-
-    /// One entry of the NoRelatedSym (tag 146) repeating group in SecurityDefinitionRequest.
-    #[derive(Debug, Clone)]
-    pub struct SecurityDefinitionRequestNoRelatedSymEntry {
-        /// UnderlyingSymbol (tag 311).
-        pub underlying_symbol: ::core::option::Option<::std::string::String>,
-        /// UnderlyingSymbolSfx (tag 312).
-        pub underlying_symbol_sfx: ::core::option::Option<::std::string::String>,
-        /// UnderlyingSecurityID (tag 309).
-        pub underlying_security_id: ::core::option::Option<::std::string::String>,
-        /// UnderlyingIDSource (tag 305).
-        pub underlying_idsource: ::core::option::Option<::std::string::String>,
-        /// UnderlyingSecurityType (tag 310).
-        pub underlying_security_type: ::core::option::Option<::std::string::String>,
-        /// UnderlyingMaturityMonthYear (tag 313).
-        pub underlying_maturity_month_year: ::core::option::Option<::std::string::String>,
-        /// UnderlyingMaturityDay (tag 314).
-        pub underlying_maturity_day: ::core::option::Option<i64>,
-        /// UnderlyingPutOrCall (tag 315).
-        pub underlying_put_or_call: ::core::option::Option<i64>,
-        /// UnderlyingStrikePrice (tag 316).
-        pub underlying_strike_price: ::core::option::Option<FixDecimal>,
-        /// UnderlyingOptAttribute (tag 317).
-        pub underlying_opt_attribute: ::core::option::Option<char>,
-        /// UnderlyingContractMultiplier (tag 436).
-        pub underlying_contract_multiplier: ::core::option::Option<FixDecimal>,
-        /// UnderlyingCouponRate (tag 435).
-        pub underlying_coupon_rate: ::core::option::Option<FixDecimal>,
-        /// UnderlyingSecurityExchange (tag 308).
-        pub underlying_security_exchange: ::core::option::Option<::std::string::String>,
-        /// UnderlyingIssuer (tag 306).
-        pub underlying_issuer: ::core::option::Option<::std::string::String>,
-        /// EncodedUnderlyingIssuerLen (tag 362).
-        pub encoded_underlying_issuer_len: ::core::option::Option<i64>,
-        /// EncodedUnderlyingIssuer (tag 363).
-        pub encoded_underlying_issuer: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// UnderlyingSecurityDesc (tag 307).
-        pub underlying_security_desc: ::core::option::Option<::std::string::String>,
-        /// EncodedUnderlyingSecurityDescLen (tag 364).
-        pub encoded_underlying_security_desc_len: ::core::option::Option<i64>,
-        /// EncodedUnderlyingSecurityDesc (tag 365).
-        pub encoded_underlying_security_desc: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// RatioQty (tag 319).
-        pub ratio_qty: ::core::option::Option<FixDecimal>,
-        /// Side (tag 54).
-        pub side: ::core::option::Option<char>,
-        /// UnderlyingCurrency (tag 318).
-        pub underlying_currency: ::core::option::Option<::std::string::String>,
+    pub struct QuoteAcknowledgementNoQuoteSetsNoQuoteEntriesEntry {
+        /// QuoteEntryID (tag 299).
+        pub quote_entry_id: ::core::option::Option<::std::string::String>,
+        /// Symbol (tag 55).
+        pub symbol: ::core::option::Option<::std::string::String>,
+        /// SymbolSfx (tag 65).
+        pub symbol_sfx: ::core::option::Option<::std::string::String>,
+        /// SecurityID (tag 48).
+        pub security_id: ::core::option::Option<::std::string::String>,
+        /// IDSource (tag 22).
+        pub idsource: ::core::option::Option<::std::string::String>,
+        /// SecurityType (tag 167).
+        pub security_type: ::core::option::Option<::std::string::String>,
+        /// MaturityMonthYear (tag 200).
+        pub maturity_month_year: ::core::option::Option<::std::string::String>,
+        /// MaturityDay (tag 205).
+        pub maturity_day: ::core::option::Option<i64>,
+        /// PutOrCall (tag 201).
+        pub put_or_call: ::core::option::Option<i64>,
+        /// StrikePrice (tag 202).
+        pub strike_price: ::core::option::Option<FixDecimal>,
+        /// OptAttribute (tag 206).
+        pub opt_attribute: ::core::option::Option<char>,
+        /// ContractMultiplier (tag 231).
+        pub contract_multiplier: ::core::option::Option<FixDecimal>,
+        /// CouponRate (tag 223).
+        pub coupon_rate: ::core::option::Option<FixDecimal>,
+        /// SecurityExchange (tag 207).
+        pub security_exchange: ::core::option::Option<::std::string::String>,
+        /// Issuer (tag 106).
+        pub issuer: ::core::option::Option<::std::string::String>,
+        /// EncodedIssuerLen (tag 348).
+        pub encoded_issuer_len: ::core::option::Option<i64>,
+        /// EncodedIssuer (tag 349).
+        pub encoded_issuer: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// SecurityDesc (tag 107).
+        pub security_desc: ::core::option::Option<::std::string::String>,
+        /// EncodedSecurityDescLen (tag 350).
+        pub encoded_security_desc_len: ::core::option::Option<i64>,
+        /// EncodedSecurityDesc (tag 351).
+        pub encoded_security_desc: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// QuoteEntryRejectReason (tag 368).
+        pub quote_entry_reject_reason: ::core::option::Option<i64>,
     }
 
     /// SecurityDefinitionRequest message (MsgType=c).
@@ -3432,9 +3383,9 @@ pub mod messages {
         pub no_related_sym: ::core::option::Option<::std::vec::Vec<SecurityDefinitionRequestNoRelatedSymEntry>>,
     }
 
-    /// One entry of the NoRelatedSym (tag 146) repeating group in SecurityDefinition.
+    /// One entry of the NoRelatedSym (tag 146) repeating group in SecurityDefinitionRequest.
     #[derive(Debug, Clone)]
-    pub struct SecurityDefinitionNoRelatedSymEntry {
+    pub struct SecurityDefinitionRequestNoRelatedSymEntry {
         /// UnderlyingSymbol (tag 311).
         pub underlying_symbol: ::core::option::Option<::std::string::String>,
         /// UnderlyingSymbolSfx (tag 312).
@@ -3542,6 +3493,55 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
         /// NoRelatedSym (tag 146) repeating group; its length is the count field.
         pub no_related_sym: ::core::option::Option<::std::vec::Vec<SecurityDefinitionNoRelatedSymEntry>>,
+    }
+
+    /// One entry of the NoRelatedSym (tag 146) repeating group in SecurityDefinition.
+    #[derive(Debug, Clone)]
+    pub struct SecurityDefinitionNoRelatedSymEntry {
+        /// UnderlyingSymbol (tag 311).
+        pub underlying_symbol: ::core::option::Option<::std::string::String>,
+        /// UnderlyingSymbolSfx (tag 312).
+        pub underlying_symbol_sfx: ::core::option::Option<::std::string::String>,
+        /// UnderlyingSecurityID (tag 309).
+        pub underlying_security_id: ::core::option::Option<::std::string::String>,
+        /// UnderlyingIDSource (tag 305).
+        pub underlying_idsource: ::core::option::Option<::std::string::String>,
+        /// UnderlyingSecurityType (tag 310).
+        pub underlying_security_type: ::core::option::Option<::std::string::String>,
+        /// UnderlyingMaturityMonthYear (tag 313).
+        pub underlying_maturity_month_year: ::core::option::Option<::std::string::String>,
+        /// UnderlyingMaturityDay (tag 314).
+        pub underlying_maturity_day: ::core::option::Option<i64>,
+        /// UnderlyingPutOrCall (tag 315).
+        pub underlying_put_or_call: ::core::option::Option<i64>,
+        /// UnderlyingStrikePrice (tag 316).
+        pub underlying_strike_price: ::core::option::Option<FixDecimal>,
+        /// UnderlyingOptAttribute (tag 317).
+        pub underlying_opt_attribute: ::core::option::Option<char>,
+        /// UnderlyingContractMultiplier (tag 436).
+        pub underlying_contract_multiplier: ::core::option::Option<FixDecimal>,
+        /// UnderlyingCouponRate (tag 435).
+        pub underlying_coupon_rate: ::core::option::Option<FixDecimal>,
+        /// UnderlyingSecurityExchange (tag 308).
+        pub underlying_security_exchange: ::core::option::Option<::std::string::String>,
+        /// UnderlyingIssuer (tag 306).
+        pub underlying_issuer: ::core::option::Option<::std::string::String>,
+        /// EncodedUnderlyingIssuerLen (tag 362).
+        pub encoded_underlying_issuer_len: ::core::option::Option<i64>,
+        /// EncodedUnderlyingIssuer (tag 363).
+        pub encoded_underlying_issuer: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// UnderlyingSecurityDesc (tag 307).
+        pub underlying_security_desc: ::core::option::Option<::std::string::String>,
+        /// EncodedUnderlyingSecurityDescLen (tag 364).
+        pub encoded_underlying_security_desc_len: ::core::option::Option<i64>,
+        /// EncodedUnderlyingSecurityDesc (tag 365).
+        pub encoded_underlying_security_desc: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// RatioQty (tag 319).
+        pub ratio_qty: ::core::option::Option<FixDecimal>,
+        /// Side (tag 54).
+        pub side: ::core::option::Option<char>,
+        /// UnderlyingCurrency (tag 318).
+        pub underlying_currency: ::core::option::Option<::std::string::String>,
     }
 
     /// SecurityStatusRequest message (MsgType=e).
@@ -3722,9 +3722,77 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
+    /// MassQuote message (MsgType=i).
+    #[derive(Debug, Clone)]
+    pub struct MassQuote {
+        /// QuoteReqID (tag 131).
+        pub quote_req_id: ::core::option::Option<::std::string::String>,
+        /// QuoteID (tag 117).
+        pub quote_id: ::std::string::String,
+        /// QuoteResponseLevel (tag 301).
+        pub quote_response_level: ::core::option::Option<i64>,
+        /// DefBidSize (tag 293).
+        pub def_bid_size: ::core::option::Option<FixDecimal>,
+        /// DefOfferSize (tag 294).
+        pub def_offer_size: ::core::option::Option<FixDecimal>,
+        /// NoQuoteSets (tag 296) repeating group; its length is the count field.
+        pub no_quote_sets: ::std::vec::Vec<MassQuoteNoQuoteSetsEntry>,
+    }
+
+    /// One entry of the NoQuoteSets (tag 296) repeating group in MassQuote.
+    #[derive(Debug, Clone)]
+    pub struct MassQuoteNoQuoteSetsEntry {
+        /// QuoteSetID (tag 302).
+        pub quote_set_id: ::std::string::String,
+        /// UnderlyingSymbol (tag 311).
+        pub underlying_symbol: ::std::string::String,
+        /// UnderlyingSymbolSfx (tag 312).
+        pub underlying_symbol_sfx: ::core::option::Option<::std::string::String>,
+        /// UnderlyingSecurityID (tag 309).
+        pub underlying_security_id: ::core::option::Option<::std::string::String>,
+        /// UnderlyingIDSource (tag 305).
+        pub underlying_idsource: ::core::option::Option<::std::string::String>,
+        /// UnderlyingSecurityType (tag 310).
+        pub underlying_security_type: ::core::option::Option<::std::string::String>,
+        /// UnderlyingMaturityMonthYear (tag 313).
+        pub underlying_maturity_month_year: ::core::option::Option<::std::string::String>,
+        /// UnderlyingMaturityDay (tag 314).
+        pub underlying_maturity_day: ::core::option::Option<i64>,
+        /// UnderlyingPutOrCall (tag 315).
+        pub underlying_put_or_call: ::core::option::Option<i64>,
+        /// UnderlyingStrikePrice (tag 316).
+        pub underlying_strike_price: ::core::option::Option<FixDecimal>,
+        /// UnderlyingOptAttribute (tag 317).
+        pub underlying_opt_attribute: ::core::option::Option<char>,
+        /// UnderlyingContractMultiplier (tag 436).
+        pub underlying_contract_multiplier: ::core::option::Option<FixDecimal>,
+        /// UnderlyingCouponRate (tag 435).
+        pub underlying_coupon_rate: ::core::option::Option<FixDecimal>,
+        /// UnderlyingSecurityExchange (tag 308).
+        pub underlying_security_exchange: ::core::option::Option<::std::string::String>,
+        /// UnderlyingIssuer (tag 306).
+        pub underlying_issuer: ::core::option::Option<::std::string::String>,
+        /// EncodedUnderlyingIssuerLen (tag 362).
+        pub encoded_underlying_issuer_len: ::core::option::Option<i64>,
+        /// EncodedUnderlyingIssuer (tag 363).
+        pub encoded_underlying_issuer: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// UnderlyingSecurityDesc (tag 307).
+        pub underlying_security_desc: ::core::option::Option<::std::string::String>,
+        /// EncodedUnderlyingSecurityDescLen (tag 364).
+        pub encoded_underlying_security_desc_len: ::core::option::Option<i64>,
+        /// EncodedUnderlyingSecurityDesc (tag 365).
+        pub encoded_underlying_security_desc: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// QuoteSetValidUntilTime (tag 367).
+        pub quote_set_valid_until_time: ::core::option::Option<::std::string::String>,
+        /// TotQuoteEntries (tag 304).
+        pub tot_quote_entries: i64,
+        /// NoQuoteEntries (tag 295) repeating group; its length is the count field.
+        pub no_quote_entries: ::std::vec::Vec<MassQuoteNoQuoteSetsNoQuoteEntriesEntry>,
+    }
+
     /// One entry of the NoQuoteEntries (tag 295) repeating group in MassQuoteNoQuoteSetsEntry.
     #[derive(Debug, Clone)]
-    pub struct MassQuoteNoQuoteSetsEntryNoQuoteEntriesEntry {
+    pub struct MassQuoteNoQuoteSetsNoQuoteEntriesEntry {
         /// QuoteEntryID (tag 299).
         pub quote_entry_id: ::std::string::String,
         /// Symbol (tag 55).
@@ -3799,74 +3867,6 @@ pub mod messages {
         pub currency: ::core::option::Option<::std::string::String>,
     }
 
-    /// One entry of the NoQuoteSets (tag 296) repeating group in MassQuote.
-    #[derive(Debug, Clone)]
-    pub struct MassQuoteNoQuoteSetsEntry {
-        /// QuoteSetID (tag 302).
-        pub quote_set_id: ::std::string::String,
-        /// UnderlyingSymbol (tag 311).
-        pub underlying_symbol: ::std::string::String,
-        /// UnderlyingSymbolSfx (tag 312).
-        pub underlying_symbol_sfx: ::core::option::Option<::std::string::String>,
-        /// UnderlyingSecurityID (tag 309).
-        pub underlying_security_id: ::core::option::Option<::std::string::String>,
-        /// UnderlyingIDSource (tag 305).
-        pub underlying_idsource: ::core::option::Option<::std::string::String>,
-        /// UnderlyingSecurityType (tag 310).
-        pub underlying_security_type: ::core::option::Option<::std::string::String>,
-        /// UnderlyingMaturityMonthYear (tag 313).
-        pub underlying_maturity_month_year: ::core::option::Option<::std::string::String>,
-        /// UnderlyingMaturityDay (tag 314).
-        pub underlying_maturity_day: ::core::option::Option<i64>,
-        /// UnderlyingPutOrCall (tag 315).
-        pub underlying_put_or_call: ::core::option::Option<i64>,
-        /// UnderlyingStrikePrice (tag 316).
-        pub underlying_strike_price: ::core::option::Option<FixDecimal>,
-        /// UnderlyingOptAttribute (tag 317).
-        pub underlying_opt_attribute: ::core::option::Option<char>,
-        /// UnderlyingContractMultiplier (tag 436).
-        pub underlying_contract_multiplier: ::core::option::Option<FixDecimal>,
-        /// UnderlyingCouponRate (tag 435).
-        pub underlying_coupon_rate: ::core::option::Option<FixDecimal>,
-        /// UnderlyingSecurityExchange (tag 308).
-        pub underlying_security_exchange: ::core::option::Option<::std::string::String>,
-        /// UnderlyingIssuer (tag 306).
-        pub underlying_issuer: ::core::option::Option<::std::string::String>,
-        /// EncodedUnderlyingIssuerLen (tag 362).
-        pub encoded_underlying_issuer_len: ::core::option::Option<i64>,
-        /// EncodedUnderlyingIssuer (tag 363).
-        pub encoded_underlying_issuer: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// UnderlyingSecurityDesc (tag 307).
-        pub underlying_security_desc: ::core::option::Option<::std::string::String>,
-        /// EncodedUnderlyingSecurityDescLen (tag 364).
-        pub encoded_underlying_security_desc_len: ::core::option::Option<i64>,
-        /// EncodedUnderlyingSecurityDesc (tag 365).
-        pub encoded_underlying_security_desc: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// QuoteSetValidUntilTime (tag 367).
-        pub quote_set_valid_until_time: ::core::option::Option<::std::string::String>,
-        /// TotQuoteEntries (tag 304).
-        pub tot_quote_entries: i64,
-        /// NoQuoteEntries (tag 295) repeating group; its length is the count field.
-        pub no_quote_entries: ::std::vec::Vec<MassQuoteNoQuoteSetsEntryNoQuoteEntriesEntry>,
-    }
-
-    /// MassQuote message (MsgType=i).
-    #[derive(Debug, Clone)]
-    pub struct MassQuote {
-        /// QuoteReqID (tag 131).
-        pub quote_req_id: ::core::option::Option<::std::string::String>,
-        /// QuoteID (tag 117).
-        pub quote_id: ::std::string::String,
-        /// QuoteResponseLevel (tag 301).
-        pub quote_response_level: ::core::option::Option<i64>,
-        /// DefBidSize (tag 293).
-        pub def_bid_size: ::core::option::Option<FixDecimal>,
-        /// DefOfferSize (tag 294).
-        pub def_offer_size: ::core::option::Option<FixDecimal>,
-        /// NoQuoteSets (tag 296) repeating group; its length is the count field.
-        pub no_quote_sets: ::std::vec::Vec<MassQuoteNoQuoteSetsEntry>,
-    }
-
     /// BusinessMessageReject message (MsgType=j).
     #[derive(Debug, Clone)]
     pub struct BusinessMessageReject {
@@ -3878,6 +3878,69 @@ pub mod messages {
         pub business_reject_ref_id: ::core::option::Option<::std::string::String>,
         /// BusinessRejectReason (tag 380).
         pub business_reject_reason: i64,
+        /// Text (tag 58).
+        pub text: ::core::option::Option<::std::string::String>,
+        /// EncodedTextLen (tag 354).
+        pub encoded_text_len: ::core::option::Option<i64>,
+        /// EncodedText (tag 355).
+        pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
+    }
+
+    /// BidRequest message (MsgType=k).
+    #[derive(Debug, Clone)]
+    pub struct BidRequest {
+        /// BidID (tag 390).
+        pub bid_id: ::core::option::Option<::std::string::String>,
+        /// ClientBidID (tag 391).
+        pub client_bid_id: ::std::string::String,
+        /// BidRequestTransType (tag 374).
+        pub bid_request_trans_type: char,
+        /// ListName (tag 392).
+        pub list_name: ::core::option::Option<::std::string::String>,
+        /// TotalNumSecurities (tag 393).
+        pub total_num_securities: i64,
+        /// BidType (tag 394).
+        pub bid_type: i64,
+        /// NumTickets (tag 395).
+        pub num_tickets: ::core::option::Option<i64>,
+        /// Currency (tag 15).
+        pub currency: ::core::option::Option<::std::string::String>,
+        /// SideValue1 (tag 396).
+        pub side_value1: ::core::option::Option<FixDecimal>,
+        /// SideValue2 (tag 397).
+        pub side_value2: ::core::option::Option<FixDecimal>,
+        /// NoBidDescriptors (tag 398) repeating group; its length is the count field.
+        pub no_bid_descriptors: ::core::option::Option<::std::vec::Vec<BidRequestNoBidDescriptorsEntry>>,
+        /// NoBidComponents (tag 420) repeating group; its length is the count field.
+        pub no_bid_components: ::core::option::Option<::std::vec::Vec<BidRequestNoBidComponentsEntry>>,
+        /// LiquidityIndType (tag 409).
+        pub liquidity_ind_type: ::core::option::Option<i64>,
+        /// WtAverageLiquidity (tag 410).
+        pub wt_average_liquidity: ::core::option::Option<FixDecimal>,
+        /// ExchangeForPhysical (tag 411).
+        pub exchange_for_physical: ::core::option::Option<bool>,
+        /// OutMainCntryUIndex (tag 412).
+        pub out_main_cntry_uindex: ::core::option::Option<FixDecimal>,
+        /// CrossPercent (tag 413).
+        pub cross_percent: ::core::option::Option<FixDecimal>,
+        /// ProgRptReqs (tag 414).
+        pub prog_rpt_reqs: ::core::option::Option<i64>,
+        /// ProgPeriodInterval (tag 415).
+        pub prog_period_interval: ::core::option::Option<i64>,
+        /// IncTaxInd (tag 416).
+        pub inc_tax_ind: ::core::option::Option<i64>,
+        /// ForexReq (tag 121).
+        pub forex_req: ::core::option::Option<bool>,
+        /// NumBidders (tag 417).
+        pub num_bidders: ::core::option::Option<i64>,
+        /// TradeDate (tag 75).
+        pub trade_date: ::core::option::Option<::std::string::String>,
+        /// TradeType (tag 418).
+        pub trade_type: char,
+        /// BasisPxType (tag 419).
+        pub basis_px_type: char,
+        /// StrikeTime (tag 443).
+        pub strike_time: ::core::option::Option<::std::string::String>,
         /// Text (tag 58).
         pub text: ::core::option::Option<::std::string::String>,
         /// EncodedTextLen (tag 354).
@@ -3932,67 +3995,15 @@ pub mod messages {
         pub account: ::core::option::Option<::std::string::String>,
     }
 
-    /// BidRequest message (MsgType=k).
+    /// BidResponse message (MsgType=l).
     #[derive(Debug, Clone)]
-    pub struct BidRequest {
+    pub struct BidResponse {
         /// BidID (tag 390).
         pub bid_id: ::core::option::Option<::std::string::String>,
         /// ClientBidID (tag 391).
-        pub client_bid_id: ::std::string::String,
-        /// BidRequestTransType (tag 374).
-        pub bid_request_trans_type: char,
-        /// ListName (tag 392).
-        pub list_name: ::core::option::Option<::std::string::String>,
-        /// TotalNumSecurities (tag 393).
-        pub total_num_securities: i64,
-        /// BidType (tag 394).
-        pub bid_type: i64,
-        /// NumTickets (tag 395).
-        pub num_tickets: ::core::option::Option<i64>,
-        /// Currency (tag 15).
-        pub currency: ::core::option::Option<::std::string::String>,
-        /// SideValue1 (tag 396).
-        pub side_value1: ::core::option::Option<FixDecimal>,
-        /// SideValue2 (tag 397).
-        pub side_value2: ::core::option::Option<FixDecimal>,
-        /// LiquidityIndType (tag 409).
-        pub liquidity_ind_type: ::core::option::Option<i64>,
-        /// WtAverageLiquidity (tag 410).
-        pub wt_average_liquidity: ::core::option::Option<FixDecimal>,
-        /// ExchangeForPhysical (tag 411).
-        pub exchange_for_physical: ::core::option::Option<bool>,
-        /// OutMainCntryUIndex (tag 412).
-        pub out_main_cntry_uindex: ::core::option::Option<FixDecimal>,
-        /// CrossPercent (tag 413).
-        pub cross_percent: ::core::option::Option<FixDecimal>,
-        /// ProgRptReqs (tag 414).
-        pub prog_rpt_reqs: ::core::option::Option<i64>,
-        /// ProgPeriodInterval (tag 415).
-        pub prog_period_interval: ::core::option::Option<i64>,
-        /// IncTaxInd (tag 416).
-        pub inc_tax_ind: ::core::option::Option<i64>,
-        /// ForexReq (tag 121).
-        pub forex_req: ::core::option::Option<bool>,
-        /// NumBidders (tag 417).
-        pub num_bidders: ::core::option::Option<i64>,
-        /// TradeDate (tag 75).
-        pub trade_date: ::core::option::Option<::std::string::String>,
-        /// TradeType (tag 418).
-        pub trade_type: char,
-        /// BasisPxType (tag 419).
-        pub basis_px_type: char,
-        /// StrikeTime (tag 443).
-        pub strike_time: ::core::option::Option<::std::string::String>,
-        /// Text (tag 58).
-        pub text: ::core::option::Option<::std::string::String>,
-        /// EncodedTextLen (tag 354).
-        pub encoded_text_len: ::core::option::Option<i64>,
-        /// EncodedText (tag 355).
-        pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
-        /// NoBidDescriptors (tag 398) repeating group; its length is the count field.
-        pub no_bid_descriptors: ::core::option::Option<::std::vec::Vec<BidRequestNoBidDescriptorsEntry>>,
+        pub client_bid_id: ::core::option::Option<::std::string::String>,
         /// NoBidComponents (tag 420) repeating group; its length is the count field.
-        pub no_bid_components: ::core::option::Option<::std::vec::Vec<BidRequestNoBidComponentsEntry>>,
+        pub no_bid_components: ::std::vec::Vec<BidResponseNoBidComponentsEntry>,
     }
 
     /// One entry of the NoBidComponents (tag 420) repeating group in BidResponse.
@@ -4030,15 +4041,15 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
-    /// BidResponse message (MsgType=l).
+    /// ListStrikePrice message (MsgType=m).
     #[derive(Debug, Clone)]
-    pub struct BidResponse {
-        /// BidID (tag 390).
-        pub bid_id: ::core::option::Option<::std::string::String>,
-        /// ClientBidID (tag 391).
-        pub client_bid_id: ::core::option::Option<::std::string::String>,
-        /// NoBidComponents (tag 420) repeating group; its length is the count field.
-        pub no_bid_components: ::std::vec::Vec<BidResponseNoBidComponentsEntry>,
+    pub struct ListStrikePrice {
+        /// ListID (tag 66).
+        pub list_id: ::std::string::String,
+        /// TotNoStrikes (tag 422).
+        pub tot_no_strikes: i64,
+        /// NoStrikes (tag 428) repeating group; its length is the count field.
+        pub no_strikes: ::std::vec::Vec<ListStrikePriceNoStrikesEntry>,
     }
 
     /// One entry of the NoStrikes (tag 428) repeating group in ListStrikePrice.
@@ -4098,17 +4109,6 @@ pub mod messages {
         pub encoded_text_len: ::core::option::Option<i64>,
         /// EncodedText (tag 355).
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
-    }
-
-    /// ListStrikePrice message (MsgType=m).
-    #[derive(Debug, Clone)]
-    pub struct ListStrikePrice {
-        /// ListID (tag 66).
-        pub list_id: ::std::string::String,
-        /// TotNoStrikes (tag 422).
-        pub tot_no_strikes: i64,
-        /// NoStrikes (tag 428) repeating group; its length is the count field.
-        pub no_strikes: ::std::vec::Vec<ListStrikePriceNoStrikesEntry>,
     }
 
 }
