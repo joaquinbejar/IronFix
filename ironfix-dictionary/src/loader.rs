@@ -53,7 +53,7 @@
 //! ([`DictionaryError::DuplicateDefinition`]).
 
 use crate::schema::{
-    ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef,
+    ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, Member,
     MessageCategory, MessageDef, Version,
 };
 use quick_xml::events::{BytesStart, Event};
@@ -665,49 +665,57 @@ impl Resolver<'_> {
         let delimiter_tag = self
             .first_tag(items, 0)?
             .ok_or_else(|| DictionaryError::EmptyGroup(name.to_string()))?;
-        let (fields, groups, components) = self.split(items)?;
-        Ok(GroupDef {
+        Ok(GroupDef::new(
             count_tag,
-            name: name.to_string(),
+            name,
             delimiter_tag,
-            fields,
-            groups,
-            components,
             required,
-        })
+            self.members(items)?,
+        ))
     }
 
-    /// Splits items into field references, resolved groups, and component
-    /// references.
+    /// Resolves items into members, in document order: field references,
+    /// resolved groups, and component references.
     ///
     /// Every component reference is existence-checked here, so a typo'd
     /// `<component name='Nope'/>` fails the load instead of silently
     /// disappearing from the schema at validation time.
-    #[allow(clippy::type_complexity)]
-    fn split(
-        &self,
-        items: &[Item],
-    ) -> Result<(Vec<FieldRef>, Vec<GroupDef>, Vec<ComponentRef>), DictionaryError> {
-        let mut fields = Vec::new();
-        let mut groups = Vec::new();
-        let mut components = Vec::new();
+    fn members(&self, items: &[Item]) -> Result<Vec<Member>, DictionaryError> {
+        let mut members = Vec::with_capacity(items.len());
         for item in items {
-            match item {
-                Item::Field { name, required } => fields.push(self.field_ref(name, *required)?),
+            members.push(match item {
+                Item::Field { name, required } => Member::Field(self.field_ref(name, *required)?),
                 Item::Group {
                     name,
                     required,
                     items,
-                } => groups.push(self.group(name, *required, items)?),
+                } => Member::Group(self.group(name, *required, items)?),
                 Item::Component { name, required } => {
                     if !self.components.contains_key(name) {
                         return Err(DictionaryError::UnknownComponent(name.clone()));
                     }
-                    components.push(ComponentRef::new(name.clone(), *required));
+                    Member::Component(ComponentRef::new(name.clone(), *required))
                 }
+            });
+        }
+        Ok(members)
+    }
+
+    /// Resolves the items of the header or trailer into its fields and
+    /// groups. A component reference there is existence-checked and, as
+    /// before member order was recorded, not kept: [`Dictionary`] has no
+    /// place for it.
+    fn envelope(&self, items: &[Item]) -> Result<(Vec<FieldRef>, Vec<GroupDef>), DictionaryError> {
+        let mut fields = Vec::new();
+        let mut groups = Vec::new();
+        for member in self.members(items)? {
+            match member {
+                Member::Field(field) => fields.push(field),
+                Member::Group(group) => groups.push(group),
+                Member::Component(_) => {}
             }
         }
-        Ok((fields, groups, components))
+        Ok((fields, groups))
     }
 }
 
@@ -919,21 +927,15 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
         components: &component_irs,
     };
 
-    let (header_fields, header_groups, _) = resolver.split(&header_items)?;
-    let (trailer_fields, trailer_groups, _) = resolver.split(&trailer_items)?;
+    let (header_fields, header_groups) = resolver.envelope(&header_items)?;
+    let (trailer_fields, trailer_groups) = resolver.envelope(&trailer_items)?;
 
     let mut components = Vec::with_capacity(component_order.len());
     for name in &component_order {
         let items = component_irs
             .get(name)
             .ok_or_else(|| DictionaryError::UnknownComponent(name.clone()))?;
-        let (fields, groups, nested) = resolver.split(items)?;
-        components.push(ComponentDef {
-            name: name.clone(),
-            fields,
-            groups,
-            components: nested,
-        });
+        components.push(ComponentDef::new(name.clone(), resolver.members(items)?));
     }
 
     let mut messages = Vec::with_capacity(message_irs.len());
@@ -945,15 +947,12 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
                 name: ir.msg_type.clone(),
             });
         }
-        let (fields, groups, comps) = resolver.split(&ir.items)?;
-        messages.push(MessageDef {
-            msg_type: ir.msg_type.clone(),
-            name: ir.name.clone(),
-            category: ir.category,
-            fields,
-            groups,
-            components: comps,
-        });
+        messages.push(MessageDef::new(
+            ir.msg_type.clone(),
+            ir.name.clone(),
+            ir.category,
+            resolver.members(&ir.items)?,
+        ));
     }
 
     dict.header = header_fields;
@@ -973,6 +972,7 @@ fn load(xml: &str) -> Result<Dictionary, DictionaryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::MemberRef;
     use std::fmt::Debug;
 
     /// Unwraps a `Result` with test context instead of `.unwrap()`.
@@ -1378,6 +1378,203 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "PtysSubGrp")
         );
+    }
+
+    /// A member as a definition lists it: `F`ield, `G`roup or `C`omponent,
+    /// and its name.
+    type Listed = (char, String);
+
+    /// Re-reads `xml` without the loader and returns the members of every
+    /// message, component, header, trailer and group definition in document
+    /// order, keyed by `message:<name>`, `component:<name>`, `header`,
+    /// `trailer`, and `<enclosing key>/<group name>` for a group.
+    fn xml_members(xml: &str) -> HashMap<String, Vec<Listed>> {
+        /// An open element: a definition collecting members, or a member
+        /// reference written with an end tag.
+        enum Frame {
+            Definition(String, Vec<Listed>),
+            Reference,
+        }
+        let mut reader = Reader::from_str(xml);
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut found: HashMap<String, Vec<Listed>> = HashMap::new();
+        loop {
+            let (element, open) = match ok(reader.read_event(), "the XML re-reads") {
+                Event::Start(e) => (e, true),
+                Event::Empty(e) => (e, false),
+                Event::End(e) => {
+                    let closes = matches!(
+                        e.name().as_ref(),
+                        "header" | "trailer" | "message" | "component" | "group" | "field"
+                    );
+                    if closes && let Some(Frame::Definition(key, members)) = stack.pop() {
+                        found.insert(key, members);
+                    }
+                    continue;
+                }
+                Event::Eof => break,
+                _ => continue,
+            };
+            let kind = element.name().as_ref().to_string();
+            let attrs = ok(attr_map(&element), "attributes");
+            let name = attrs.get("name").cloned().unwrap_or_default();
+            let enclosing = stack.iter().rev().find_map(|frame| match frame {
+                Frame::Definition(key, _) => Some(key.clone()),
+                Frame::Reference => None,
+            });
+            let frame = match (kind.as_str(), enclosing) {
+                ("header" | "trailer", _) => Frame::Definition(kind.clone(), Vec::new()),
+                ("message", None) => Frame::Definition(format!("message:{name}"), Vec::new()),
+                ("component", None) => Frame::Definition(format!("component:{name}"), Vec::new()),
+                ("group" | "field" | "component", Some(parent)) => {
+                    let listed = match kind.as_str() {
+                        "group" => 'G',
+                        "field" => 'F',
+                        _ => 'C',
+                    };
+                    if let Some(Frame::Definition(_, members)) = stack
+                        .iter_mut()
+                        .rev()
+                        .find(|frame| matches!(frame, Frame::Definition(..)))
+                    {
+                        members.push((listed, name.clone()));
+                    }
+                    if listed == 'G' {
+                        Frame::Definition(format!("{parent}/{name}"), Vec::new())
+                    } else {
+                        Frame::Reference
+                    }
+                }
+                // Field definitions in <fields>, their values, sections.
+                _ => continue,
+            };
+            if open {
+                stack.push(frame);
+            } else if let Frame::Definition(key, members) = frame {
+                found.insert(key, members);
+            }
+        }
+        found
+    }
+
+    /// Lists members as [`xml_members`] does.
+    fn listed<'a>(members: impl Iterator<Item = MemberRef<'a>>) -> Vec<Listed> {
+        members
+            .map(|member| match member {
+                MemberRef::Field(field) => ('F', field.name.clone()),
+                MemberRef::Group(group) => ('G', group.name.clone()),
+                MemberRef::Component(component) => ('C', component.name.clone()),
+            })
+            .collect()
+    }
+
+    /// Records the members of `groups` and of every group nested in them.
+    fn loaded_groups(parent: &str, groups: &[GroupDef], out: &mut HashMap<String, Vec<Listed>>) {
+        for group in groups {
+            let key = format!("{parent}/{}", group.name);
+            out.insert(key.clone(), listed(group.members()));
+            loaded_groups(&key, &group.groups, out);
+        }
+    }
+
+    /// The loaded counterpart of [`xml_members`]. The header and trailer are
+    /// left out: a [`Dictionary`] keeps their fields and groups apart, and
+    /// only their groups' members are compared.
+    fn loaded_members(dict: &Dictionary) -> HashMap<String, Vec<Listed>> {
+        let mut out = HashMap::new();
+        for message in dict.messages() {
+            let key = format!("message:{}", message.name);
+            out.insert(key.clone(), listed(message.members()));
+            loaded_groups(&key, &message.groups, &mut out);
+        }
+        for component in dict.components.values() {
+            let key = format!("component:{}", component.name);
+            out.insert(key.clone(), listed(component.members()));
+            loaded_groups(&key, &component.groups, &mut out);
+        }
+        loaded_groups("header", &dict.header_groups, &mut out);
+        loaded_groups("trailer", &dict.trailer_groups, &mut out);
+        out
+    }
+
+    #[test]
+    fn test_every_definition_keeps_its_xml_member_order() {
+        for (what, xml, dict) in [
+            ("FIX 4.2", FIX42_XML, Dictionary::fix42()),
+            ("FIX 4.4", FIX44_XML, Dictionary::fix44()),
+            ("FIXT 1.1", FIXT11_XML, Dictionary::fixt11()),
+            ("FIX 5.0 SP2", FIX50SP2_XML, Dictionary::fix50sp2()),
+        ] {
+            let dict = ok(dict, what);
+            let mut expected = xml_members(xml);
+            expected.remove("header");
+            expected.remove("trailer");
+            let loaded = loaded_members(dict);
+            let groups = expected.keys().filter(|key| key.contains('/')).count();
+            assert!(groups > 0, "{what}: group definitions found");
+            assert_eq!(loaded.len(), expected.len(), "{what}: definitions");
+            for (key, members) in &expected {
+                assert_eq!(loaded.get(key), Some(members), "{what}: {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_fix44_pre_alloc_grp_keeps_its_component_between_fields() {
+        // PreAllocGrp NoAllocs(78) lists AllocAccount(79), AllocAcctIDSource
+        // (661), AllocSettlCurrency(736), IndividualAllocID(467), the
+        // NestedParties component (NoNestedPartyIDs 539) and AllocQty(80):
+        // the component sits between fields, which the per-kind lists alone
+        // cannot say.
+        let component = some(fix44().get_component("PreAllocGrp"), "PreAllocGrp");
+        let allocs = some(component.groups.first(), "NoAllocs");
+        assert_eq!(allocs.count_tag, 78);
+        let order: Vec<String> = allocs
+            .members()
+            .map(|member| match member {
+                MemberRef::Field(field) => field.tag.to_string(),
+                MemberRef::Component(component) => component.name.clone(),
+                MemberRef::Group(group) => group.count_tag.to_string(),
+            })
+            .collect();
+        assert_eq!(order, ["79", "661", "736", "467", "NestedParties", "80"]);
+        let nested = some(fix44().get_component("NestedParties"), "NestedParties");
+        assert_eq!(
+            nested.groups.first().map(|group| group.count_tag),
+            Some(539)
+        );
+    }
+
+    #[test]
+    fn test_members_reconcile_with_lists_edited_after_construction() {
+        let field = |tag: u32| FieldRef {
+            tag,
+            name: tag.to_string(),
+            required: false,
+        };
+        let mut component = ComponentDef::new(
+            "Edited",
+            [
+                Member::Field(field(1)),
+                Member::Component(ComponentRef::new("Inner", false)),
+                Member::Field(field(2)),
+            ],
+        );
+        let names = |component: &ComponentDef| listed(component.members());
+        assert_eq!(
+            names(&component),
+            [
+                ('F', "1".to_string()),
+                ('C', "Inner".to_string()),
+                ('F', "2".to_string())
+            ]
+        );
+        // Pushed after construction: after the recorded members.
+        component.fields.push(field(3));
+        assert_eq!(names(&component).last(), Some(&('F', "3".to_string())));
+        // Removed after construction: skipped, the rest keep their order.
+        component.fields.clear();
+        assert_eq!(names(&component), [('C', "Inner".to_string())]);
     }
 
     #[test]

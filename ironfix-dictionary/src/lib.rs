@@ -10,7 +10,9 @@
 //!
 //! This crate provides:
 //! - **Schema definitions**: field, message, component and repeating-group
-//!   definitions ([`schema`])
+//!   definitions ([`schema`]). Messages, components and groups keep their
+//!   members per kind and also in the order the XML lists them
+//!   ([`GroupDef::members`]), the order FIX requires inside a repeating group
 //! - **Dictionary parsing**: a QuickFIX XML loader
 //!   ([`Dictionary::from_quickfix_xml`]) with a component-recursion depth guard.
 //!   Loading is treated as untrusted-input parsing: see the [`loader`] module
@@ -100,8 +102,8 @@ pub use group::{
 };
 pub use loader::{DefinitionKind, DictionaryError, MAX_COMPONENT_DEPTH, MAX_NESTING_DEPTH};
 pub use schema::{
-    ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef,
-    MessageCategory, MessageDef, UnknownFieldType, Version,
+    ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, Member,
+    MemberRef, MessageCategory, MessageDef, UnknownFieldType, Version,
 };
 pub use validator::{
     MAX_SCOPE_DEPTH, MAX_SCOPE_NODES, MAX_VALIDATION_ERRORS, ValidationError, Validator,

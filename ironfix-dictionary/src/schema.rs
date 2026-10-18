@@ -12,7 +12,16 @@
 //! - [`ComponentDef`]: Reusable component definitions
 //! - [`ComponentRef`]: A reference to a component, with its own required flag
 //! - [`GroupDef`]: Repeating group definitions
+//! - [`Member`] / [`MemberRef`]: A member of a message, component or group
+//!   entry, owned (to build a definition) or borrowed (to read one in order)
 //! - [`Dictionary`]: Complete FIX version dictionary
+//!
+//! [`MessageDef`], [`ComponentDef`] and [`GroupDef`] keep their members per
+//! kind (`fields`, `groups`, `components`) and also record the order the
+//! dictionary lists them in, read back with their `members()` method: inside
+//! a repeating group FIX requires that order. The three are
+//! `#[non_exhaustive]` and built with their `new` constructors, which take the
+//! members in dictionary order.
 //!
 //! [`FieldType`] carries both the QuickFIX XML spelling of a FIX data type
 //! (via [`FromStr`](std::str::FromStr)) and the on-the-wire form that type
@@ -486,7 +495,14 @@ impl ComponentRef {
 }
 
 /// Definition of a repeating group.
+///
+/// The members of an entry are kept per kind (`fields`, `groups`,
+/// `components`) and, through [`GroupDef::members`], in the order the
+/// dictionary lists them: the order FIX requires inside a group entry
+/// (session reject reason 15, "repeating group fields out of order").
+/// `#[non_exhaustive]`: build one with [`GroupDef::new`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct GroupDef {
     /// Tag of the count field (NumInGroup).
     pub count_tag: u32,
@@ -503,10 +519,89 @@ pub struct GroupDef {
     pub components: Vec<ComponentRef>,
     /// Whether the group is required.
     pub required: bool,
+    /// The kind of each member, in dictionary order.
+    #[serde(default)]
+    order: Vec<MemberKind>,
+}
+
+impl GroupDef {
+    /// Creates a group definition from its members, in dictionary order.
+    ///
+    /// # Arguments
+    /// * `count_tag` - Tag of the count field (NumInGroup)
+    /// * `name` - Name of the group
+    /// * `delimiter_tag` - Tag every entry starts with
+    /// * `required` - Whether the group must appear where it is listed
+    /// * `members` - The members of an entry, in the order the dictionary
+    ///   lists them
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ironfix_dictionary::{FieldRef, GroupDef, Member, MemberRef};
+    ///
+    /// let field = |tag, name: &str| FieldRef {
+    ///     tag,
+    ///     name: name.to_string(),
+    ///     required: false,
+    /// };
+    /// let group = GroupDef::new(
+    ///     453,
+    ///     "NoPartyIDs",
+    ///     448,
+    ///     false,
+    ///     [
+    ///         Member::Field(field(448, "PartyID")),
+    ///         Member::Field(field(452, "PartyRole")),
+    ///     ],
+    /// );
+    /// let tags: Vec<u32> = group
+    ///     .members()
+    ///     .filter_map(|member| match member {
+    ///         MemberRef::Field(field) => Some(field.tag),
+    ///         _ => None,
+    ///     })
+    ///     .collect();
+    /// assert_eq!(tags, [448, 452]);
+    /// ```
+    #[must_use]
+    pub fn new(
+        count_tag: u32,
+        name: impl Into<String>,
+        delimiter_tag: u32,
+        required: bool,
+        members: impl IntoIterator<Item = Member>,
+    ) -> Self {
+        let split = split_members(members);
+        Self {
+            count_tag,
+            name: name.into(),
+            delimiter_tag,
+            fields: split.fields,
+            groups: split.groups,
+            components: split.components,
+            required,
+            order: split.order,
+        }
+    }
+
+    /// Returns the members of an entry in dictionary order, without
+    /// allocating.
+    ///
+    /// See [`MemberRef`] for how members added to the per-kind lists after
+    /// construction are placed.
+    pub fn members(&self) -> impl Iterator<Item = MemberRef<'_>> {
+        Interleave::new(&self.order, &self.fields, &self.groups, &self.components)
+    }
 }
 
 /// Definition of a reusable component.
+///
+/// The members are kept per kind and, through [`ComponentDef::members`], in
+/// dictionary order. `#[non_exhaustive]`: build one with
+/// [`ComponentDef::new`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ComponentDef {
     /// Component name.
     pub name: String,
@@ -516,10 +611,45 @@ pub struct ComponentDef {
     pub groups: Vec<GroupDef>,
     /// Nested components.
     pub components: Vec<ComponentRef>,
+    /// The kind of each member, in dictionary order.
+    #[serde(default)]
+    order: Vec<MemberKind>,
+}
+
+impl ComponentDef {
+    /// Creates a component definition from its members, in dictionary order.
+    ///
+    /// # Arguments
+    /// * `name` - Component name
+    /// * `members` - Its members, in the order the dictionary lists them
+    #[must_use]
+    pub fn new(name: impl Into<String>, members: impl IntoIterator<Item = Member>) -> Self {
+        let split = split_members(members);
+        Self {
+            name: name.into(),
+            fields: split.fields,
+            groups: split.groups,
+            components: split.components,
+            order: split.order,
+        }
+    }
+
+    /// Returns the members in dictionary order, without allocating.
+    ///
+    /// See [`MemberRef`] for how members added to the per-kind lists after
+    /// construction are placed.
+    pub fn members(&self) -> impl Iterator<Item = MemberRef<'_>> {
+        Interleave::new(&self.order, &self.fields, &self.groups, &self.components)
+    }
 }
 
 /// Definition of a FIX message.
+///
+/// The members of the body are kept per kind and, through
+/// [`MessageDef::members`], in dictionary order. `#[non_exhaustive]`: build
+/// one with [`MessageDef::new`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageDef {
     /// Message type value (tag 35).
     pub msg_type: String,
@@ -533,6 +663,176 @@ pub struct MessageDef {
     pub groups: Vec<GroupDef>,
     /// Components used in this message.
     pub components: Vec<ComponentRef>,
+    /// The kind of each member, in dictionary order.
+    #[serde(default)]
+    order: Vec<MemberKind>,
+}
+
+impl MessageDef {
+    /// Creates a message definition from the members of its body, in
+    /// dictionary order.
+    ///
+    /// # Arguments
+    /// * `msg_type` - Message type value (tag 35)
+    /// * `name` - Message name
+    /// * `category` - Admin or application
+    /// * `members` - The body's members, in the order the dictionary lists
+    ///   them
+    #[must_use]
+    pub fn new(
+        msg_type: impl Into<String>,
+        name: impl Into<String>,
+        category: MessageCategory,
+        members: impl IntoIterator<Item = Member>,
+    ) -> Self {
+        let split = split_members(members);
+        Self {
+            msg_type: msg_type.into(),
+            name: name.into(),
+            category,
+            fields: split.fields,
+            groups: split.groups,
+            components: split.components,
+            order: split.order,
+        }
+    }
+
+    /// Returns the members of the body in dictionary order, without
+    /// allocating.
+    ///
+    /// See [`MemberRef`] for how members added to the per-kind lists after
+    /// construction are placed.
+    pub fn members(&self) -> impl Iterator<Item = MemberRef<'_>> {
+        Interleave::new(&self.order, &self.fields, &self.groups, &self.components)
+    }
+}
+
+/// A member of a message, component, or repeating-group entry, to build a
+/// definition from.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum Member {
+    /// A field reference.
+    Field(FieldRef),
+    /// A repeating group.
+    Group(GroupDef),
+    /// A component reference.
+    Component(ComponentRef),
+}
+
+/// A member of a message, component, or repeating-group entry, borrowed from
+/// its definition in dictionary order.
+///
+/// The order is recorded when the definition is built: by the loader, from
+/// the XML, or by a `new` constructor, from its member list. The per-kind
+/// lists stay public. A member pushed onto one of them afterwards has no
+/// recorded position and is yielded after the recorded members (fields
+/// first, then groups, then components); a member removed from one of them
+/// is skipped. A definition deserialized without a recorded order yields its
+/// fields, then its groups, then its components.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum MemberRef<'a> {
+    /// A field reference.
+    Field(&'a FieldRef),
+    /// A repeating group.
+    Group(&'a GroupDef),
+    /// A component reference.
+    Component(&'a ComponentRef),
+}
+
+/// The kind of a member, recorded in dictionary order next to the per-kind
+/// lists: within one kind the lists already keep their relative order, so
+/// the sequence of kinds is enough to interleave them again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum MemberKind {
+    Field,
+    Group,
+    Component,
+}
+
+/// Members split into per-kind lists, and the order of their kinds.
+struct Split {
+    fields: Vec<FieldRef>,
+    groups: Vec<GroupDef>,
+    components: Vec<ComponentRef>,
+    order: Vec<MemberKind>,
+}
+
+/// Splits members into per-kind lists and records the order of their kinds.
+fn split_members(members: impl IntoIterator<Item = Member>) -> Split {
+    let mut split = Split {
+        fields: Vec::new(),
+        groups: Vec::new(),
+        components: Vec::new(),
+        order: Vec::new(),
+    };
+    for member in members {
+        match member {
+            Member::Field(field) => {
+                split.fields.push(field);
+                split.order.push(MemberKind::Field);
+            }
+            Member::Group(group) => {
+                split.groups.push(group);
+                split.order.push(MemberKind::Group);
+            }
+            Member::Component(component) => {
+                split.components.push(component);
+                split.order.push(MemberKind::Component);
+            }
+        }
+    }
+    split
+}
+
+/// Interleaves per-kind lists by the recorded order of kinds, without
+/// allocating: each recorded kind takes the next member of that kind. See
+/// [`MemberRef`] for members the order does not cover.
+#[derive(Debug, Clone)]
+struct Interleave<'a> {
+    order: std::slice::Iter<'a, MemberKind>,
+    fields: std::slice::Iter<'a, FieldRef>,
+    groups: std::slice::Iter<'a, GroupDef>,
+    components: std::slice::Iter<'a, ComponentRef>,
+}
+
+impl<'a> Interleave<'a> {
+    fn new(
+        order: &'a [MemberKind],
+        fields: &'a [FieldRef],
+        groups: &'a [GroupDef],
+        components: &'a [ComponentRef],
+    ) -> Self {
+        Self {
+            order: order.iter(),
+            fields: fields.iter(),
+            groups: groups.iter(),
+            components: components.iter(),
+        }
+    }
+}
+
+impl<'a> Iterator for Interleave<'a> {
+    type Item = MemberRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for kind in self.order.by_ref() {
+            let member = match kind {
+                MemberKind::Field => self.fields.next().map(MemberRef::Field),
+                MemberKind::Group => self.groups.next().map(MemberRef::Group),
+                MemberKind::Component => self.components.next().map(MemberRef::Component),
+            };
+            if member.is_some() {
+                return member;
+            }
+        }
+        self.fields
+            .next()
+            .map(MemberRef::Field)
+            .or_else(|| self.groups.next().map(MemberRef::Group))
+            .or_else(|| self.components.next().map(MemberRef::Component))
+    }
 }
 
 /// Message category.
