@@ -102,6 +102,17 @@
 //! queue, so an application handler never delays a socket read, a heartbeat, or
 //! timeout detection.
 //!
+//! A resend (the answer to a `ResendRequest`, or the resend a counterparty's
+//! `NextExpectedMsgSeqNum` (789) asks for) does not park it either. It is
+//! queued and written one frame per pass of the loop, and a frame the
+//! counterparty has already sent is read before the next resend frame is
+//! written. Two sides resending large backlogs to each other at once
+//! therefore keep draining each other instead of both blocking on full socket
+//! buffers until the write timeout. Until a resend is done, live outbound
+//! application messages (and a Logout the consumer asks for) wait in the
+//! command queue, so a resend always stays ahead of them; administrative
+//! replies to inbound messages are still written as they arise.
+//!
 //! The attached [`MessageStore`] **does** run on the reactor: every store call
 //! is awaited inline, because its result decides whether a frame may be written
 //! or a message acted on. A slow store therefore delays this session's reads,
@@ -129,7 +140,7 @@ use crate::wire::{
     SendingTimeGuard, SendingTimeProblem,
 };
 use bytes::{Bytes, BytesMut};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use ironfix_core::error::{DecodeError, EncodeError, StoreError};
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::version::FixVersion;
@@ -139,8 +150,9 @@ use ironfix_session::{
     Active, HeartbeatManager, LogoutPending, SequenceManager, Session, SessionConfig,
     TestRequestOutcome,
 };
-use ironfix_store::MessageStore;
+use ironfix_store::{MessageStore, StoredMessage};
 use ironfix_transport::{CodecError, FixCodec};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -215,6 +227,18 @@ pub(crate) const TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// replay reads in bounded batches and yields between them rather than
 /// allocating and locking over the entire history at once.
 const RESEND_PAGE_LIMIT: usize = 256;
+
+/// Most resends a session queues for its counterparty, the one under way
+/// included.
+///
+/// Resends are answered one frame per pass of the reactor loop, so requests
+/// that keep arriving faster than they are answered would otherwise grow the
+/// queue without bound. Past this many, a new request is merged into the last
+/// queued one, which is not under way yet: its range widens to cover both, so
+/// every number either request asked for is still answered (a number asked
+/// for by neither reaches the counterparty as a possible duplicate, which it
+/// drops).
+const MAX_QUEUED_RESENDS: usize = 64;
 
 /// Runs `to_admin`, checks the body, and writes one administrative frame
 /// during the handshake, before the reactor exists.
@@ -769,6 +793,69 @@ impl ResendState {
     }
 }
 
+/// One resend this session owes the counterparty: what is left of
+/// `begin_seq..new_seq`, written one frame at a time.
+#[derive(Debug)]
+struct ResendJob {
+    /// The first number not covered by the reply (exclusive end).
+    new_seq: u64,
+    /// The last number the reply may replay: `new_seq - 1`.
+    end_seq: u64,
+    /// The next number the reply still owes the counterparty.
+    reply_cursor: u64,
+    /// The next store key to read a page from.
+    read_from: u64,
+    /// Stored messages read and not yet written or skipped, in order.
+    page: VecDeque<StoredMessage>,
+    /// Whether the store has nothing more to give for this range (or there
+    /// is no store, or a read failed): what is left is gap-filled.
+    store_done: bool,
+    /// A rebuilt replay frame, with its number, written on the call after
+    /// the gap fill that precedes it.
+    pending: Option<(u64, BytesMut)>,
+}
+
+impl ResendJob {
+    /// The resend of `begin_seq..new_seq`, or `None` for an empty range. With
+    /// `no_store` the store is done from the start: the whole range is one
+    /// gap fill.
+    #[must_use]
+    fn new(begin_seq: u64, new_seq: u64, no_store: bool) -> Option<Self> {
+        if begin_seq == 0 || begin_seq >= new_seq {
+            return None;
+        }
+        let end_seq = new_seq.checked_sub(1)?;
+        Some(Self {
+            new_seq,
+            end_seq,
+            reply_cursor: begin_seq,
+            read_from: begin_seq,
+            page: VecDeque::new(),
+            store_done: no_store,
+            pending: None,
+        })
+    }
+
+    /// Widens a resend that has written nothing yet to also cover `other`'s
+    /// range: from the lower start to the higher end.
+    fn widen(&mut self, other: &Self) {
+        let begin_seq = self.reply_cursor.min(other.reply_cursor);
+        self.reply_cursor = begin_seq;
+        self.read_from = begin_seq;
+        self.new_seq = self.new_seq.max(other.new_seq);
+        self.end_seq = self.end_seq.max(other.end_seq);
+    }
+}
+
+/// What one step of a resend did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResendProgress {
+    /// It wrote one frame; there may be more.
+    Wrote,
+    /// The resend is complete.
+    Done,
+}
+
 /// Reactor state shared across event handlers.
 struct Reactor<A: Application> {
     /// Outbound frame factory, holding the encoder reused for every message.
@@ -811,6 +898,9 @@ struct Reactor<A: Application> {
     /// `NextExpectedMsgSeqNum` (789) resend fills the gap below it, then
     /// consumed ([`Reactor::release_held_logon`]).
     held_logon: Option<u64>,
+    /// Resends this session owes the counterparty, answered in order, one
+    /// frame per pass of the reactor loop ([`Reactor::resend_step`]).
+    resends: VecDeque<ResendJob>,
     /// Bound on a single socket write.
     write_timeout: Duration,
     /// Hand-off queue to the application dispatcher.
@@ -908,31 +998,22 @@ async fn run_reactor<A: Application + 'static>(
             Ok(()) => current,
             Err(err) => break ctx.close_on_store_failure(current, &err),
         };
+        // A resend in progress (the answer to a ResendRequest, or the 789
+        // resend) is written one frame per pass, between inbound reads; until
+        // it is done, live outbound application messages wait in the command
+        // queue, so they never overtake it.
+        let resending = ctx.resend_in_progress();
         let result = tokio::select! {
-            inbound = framed.next() => match inbound {
-                // The garbled frames the codec skipped on the way to this one
-                // are accounted for first, so a limit reached by them closes
-                // the session before the frame behind them is acted on. The
-                // common case is one integer read and nothing else: no clock,
-                // no allocation.
-                Some(Ok(frame)) => match framed.codec_mut().take_garbled_count() {
-                    0 => ctx.on_inbound(&mut framed, current, frame).await,
-                    skipped => match ctx.on_garbled(&mut framed, current, skipped, GARBLED_FRAMING).await {
-                        Ok(current) => ctx.on_inbound(&mut framed, current, frame).await,
-                        Err(outcome) => Err(outcome),
-                    },
-                },
-                // With recovery on, only a fatal error reaches here: an I/O
-                // failure or a frame above `max_message_size`. `Framed` ends
-                // the stream after any decoder error, so there is nothing to
-                // resume either way.
-                Some(Err(err)) => Err(ctx.close_on_fatal_codec_error(&mut framed, current, err).await),
-                None => {
-                    teardown(current);
-                    Err(closed("transport closed by peer", false))
-                }
+            inbound = framed.next() => ctx.on_inbound_event(&mut framed, current, inbound).await,
+            // Always ready while resending. A frame the peer has already sent
+            // is read before the next resend frame is written: each side keeps
+            // draining the other while it resends, so two sides resending at
+            // once never both block writing into full socket buffers.
+            () = std::future::ready(()), if resending => match framed.next().now_or_never() {
+                Some(inbound) => ctx.on_inbound_event(&mut framed, current, inbound).await,
+                None => ctx.resend_step(&mut framed, current).await,
             },
-            command = commands.recv(), if commands_open => match command {
+            command = commands.recv(), if commands_open && !resending => match command {
                 Some(command) => ctx.on_command(&mut framed, current, command).await,
                 None => {
                     // All handles dropped: log out gracefully.
@@ -1458,7 +1539,11 @@ impl<A: Application> Reactor<A> {
             Ok(Sent::Yes) => {
                 // Recovery is over: a session on its way out will not process a
                 // replay, and leaving the gap armed would keep asking for one.
+                // Nor does it finish a resend of its own: frames written after
+                // the Logout would land behind it.
                 self.resend = None;
+                self.held_logon = None;
+                self.resends.clear();
                 // Typestate: Active -> LogoutPending. The new state records when
                 // the Logout went out, which is what `on_tick` times through
                 // `Session::sent_at`.
@@ -2146,6 +2231,10 @@ impl<A: Application> Reactor<A> {
     /// re-occupies the number it was first sent under, and a gap fill occupies
     /// the range it replaces, so the session's own outbound numbering is
     /// unchanged by answering a resend.
+    ///
+    /// A valid request is queued ([`Reactor::queue_resend`]) and answered by
+    /// the reactor loop one frame per pass, between inbound reads, so two
+    /// sides answering large requests at once keep draining each other.
     async fn on_resend_request(
         &mut self,
         framed: &mut FixFramed,
@@ -2201,46 +2290,254 @@ impl<A: Application> Reactor<A> {
                 .map_or(next_sender, |bound| bound.min(next_sender)),
         };
 
-        self.resend_range(framed, phase, begin_seq, new_seq).await
+        self.queue_resend(begin_seq, new_seq);
+        Ok(phase)
     }
 
-    /// Resends `begin_seq..new_seq` (`new_seq` exclusive): the stored
-    /// application messages are replayed, and everything else is gap-filled,
-    /// so the counterparty's expectation lands exactly on `new_seq`.
+    /// Whether a resend is queued or under way: until it is done, live
+    /// outbound application messages wait.
+    #[must_use]
+    fn resend_in_progress(&self) -> bool {
+        !self.resends.is_empty()
+    }
+
+    /// Queues the resend of `begin_seq..new_seq` (`new_seq` exclusive): the
+    /// stored application messages are replayed and everything else is
+    /// gap-filled, so the counterparty's expectation lands exactly on
+    /// `new_seq`.
     ///
     /// The answer to an inbound `ResendRequest` (2), and the resend a
     /// counterparty's `NextExpectedMsgSeqNum` (789) on the Logon exchange asks
-    /// for. Nothing here allocates a sender sequence number.
+    /// for. Resends are answered in the order they were queued, each written
+    /// by [`Reactor::resend_step`] one frame at a time. An empty range queues
+    /// nothing, and past [`MAX_QUEUED_RESENDS`] a request is merged into the
+    /// last queued one.
+    fn queue_resend(&mut self, begin_seq: u64, new_seq: u64) {
+        let Some(job) = ResendJob::new(begin_seq, new_seq, self.store.is_none()) else {
+            return;
+        };
+        // The last job of a full queue is never the one under way (the head),
+        // so it has written nothing yet and can be widened.
+        if self.resends.len() >= MAX_QUEUED_RESENDS
+            && let Some(last) = self.resends.back_mut()
+        {
+            last.widen(&job);
+            return;
+        }
+        self.resends.push_back(job);
+    }
+
+    /// Writes the next frame of the resend at the head of the queue (a
+    /// replayed message or a gap fill), reading the store a page at a time
+    /// as it goes, and drops the resend once it is complete.
+    ///
+    /// One frame per call keeps the reactor reading between frames: the loop
+    /// that calls this reads any frame the counterparty has already sent
+    /// before it writes the next one.
     ///
     /// # Errors
-    /// The session is closed when the replay fails ([`Reactor::replay_range`]:
-    /// a write that fails, a store that reports itself corrupted) or the
-    /// trailing gap fill cannot be written.
-    async fn resend_range(
+    /// The session is closed when a write fails, or when the store reports
+    /// itself corrupted ([`StoreError::Corrupted`]): a store that finds its
+    /// own records damaged cannot say which messages it still holds intact,
+    /// so the rest of the range is not gap-filled. Every other read failure
+    /// (a store that cannot be read, a read that overruns the store timeout,
+    /// a frame that does not rebuild) degrades to a gap fill.
+    async fn resend_step(
         &mut self,
         framed: &mut FixFramed,
         phase: Phase,
-        begin_seq: u64,
-        new_seq: u64,
     ) -> Result<Phase, SessionClosed> {
-        let cursor = match self.replay_range(framed, begin_seq, new_seq).await {
-            Ok(cursor) => cursor,
+        let Some(mut job) = self.resends.pop_front() else {
+            return Ok(phase);
+        };
+        match self.advance_resend(framed, &mut job).await {
+            Ok(ResendProgress::Wrote) => {
+                self.resends.push_front(job);
+                Ok(phase)
+            }
+            Ok(ResendProgress::Done) => Ok(phase),
             Err(err) => {
                 teardown(phase);
-                return Err(closed(format!("resend failed: {err}"), false));
+                Err(closed(format!("resend failed: {err}"), false))
+            }
+        }
+    }
+
+    /// Writes at most one frame of `job`.
+    ///
+    /// `reply_cursor` is the next number the reply still owes the peer; it
+    /// advances only past what has been written, so holes, administrative
+    /// messages and unrebuildable frames are covered by the gap fill written
+    /// before the next replayed message, or by the trailing one.
+    async fn advance_resend(
+        &mut self,
+        framed: &mut FixFramed,
+        job: &mut ResendJob,
+    ) -> Result<ResendProgress, EngineError> {
+        loop {
+            // A replayed message whose gap fill went out on the previous call.
+            if let Some((seq, frame)) = job.pending.take() {
+                self.send_replay(framed, frame).await?;
+                job.reply_cursor = seq.checked_add(1).unwrap_or(job.new_seq);
+                return Ok(ResendProgress::Wrote);
+            }
+            if let Some(message) = job.page.pop_front() {
+                let seq = message.seq_num();
+                // A store handing back something outside the asked-for range
+                // must not be allowed to move the reply.
+                if seq < job.reply_cursor || seq > job.end_seq {
+                    continue;
+                }
+                // Administrative messages are gap-filled, not replayed
+                // (`doc/fix_operations.md`, "Resend Request", item 3):
+                // resending a stale Heartbeat or Logon says nothing true about
+                // the session now.
+                if message.msg_type().is_admin() {
+                    continue;
+                }
+                let frame = match wire::resend_frame(message.payload()) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::warn!(
+                            session = %self.session_id,
+                            seq,
+                            error = %err,
+                            "cannot rebuild a stored message as a resend: gap-filling it instead"
+                        );
+                        continue;
+                    }
+                };
+                // Everything between the cursor and this message (holes,
+                // admin messages, frames that would not rebuild) is one fill,
+                // written first; the message follows on the next call.
+                if seq > job.reply_cursor {
+                    self.send_gap_fill(framed, job.reply_cursor, seq).await?;
+                    job.reply_cursor = seq;
+                    job.pending = Some((seq, frame));
+                    return Ok(ResendProgress::Wrote);
+                }
+                self.send_replay(framed, frame).await?;
+                // `seq <= end_seq < new_seq <= u64::MAX`, so this cannot
+                // overflow; it is checked rather than assumed because a
+                // wrapped sequence number would corrupt the session it is
+                // meant to repair.
+                job.reply_cursor = seq.checked_add(1).unwrap_or(job.new_seq);
+                return Ok(ResendProgress::Wrote);
+            }
+            if !job.store_done {
+                self.read_resend_page(job).await?;
+                continue;
+            }
+            // Whatever the replay did not cover (a trailing run of admin
+            // messages, holes, or the entire range when there is no store) is
+            // gap-filled, so the counterparty's expectation always lands
+            // exactly on `new_seq`.
+            if job.reply_cursor < job.new_seq {
+                self.send_gap_fill(framed, job.reply_cursor, job.new_seq)
+                    .await?;
+                job.reply_cursor = job.new_seq;
+            }
+            return Ok(ResendProgress::Done);
+        }
+    }
+
+    /// Reads the next page of `job`'s range from the store into its page
+    /// buffer, or marks the store done for it.
+    ///
+    /// The store is read in bounded pages of [`RESEND_PAGE_LIMIT`] rather than
+    /// all at once: a `ResendRequest` with `EndSeqNo` (16) = 0 asks for the
+    /// whole session, and materialising an arbitrarily long history in one
+    /// read would allocate it all up front. A short page means the range is
+    /// exhausted; a full one means there may be more, read from past its
+    /// furthest key on a later call.
+    ///
+    /// # Errors
+    /// [`EngineError::Store`] when the store reports itself corrupted. Every
+    /// other failure marks the store done, so the rest of the range is
+    /// gap-filled.
+    async fn read_resend_page(&self, job: &mut ResendJob) -> Result<(), EngineError> {
+        let Some(store) = self.store.as_deref() else {
+            job.store_done = true;
+            return Ok(());
+        };
+        if job.read_from > job.end_seq {
+            job.store_done = true;
+            return Ok(());
+        }
+        // Bounded like every store call; a read that overruns degrades to a
+        // gap fill like any other failed read.
+        let read = store.get_page(job.read_from, job.end_seq, RESEND_PAGE_LIMIT);
+        let page = match timed(self.store_timeout, read).await {
+            Ok(page) => page,
+            Err(err @ StoreError::Corrupted { .. }) => {
+                tracing::error!(
+                    session = %self.session_id,
+                    read_from = job.read_from,
+                    end_seq = job.end_seq,
+                    error = %err,
+                    "the store holding the resend range is corrupted: closing the session \
+                     rather than gap-filling messages it may still hold"
+                );
+                return Err(EngineError::Store(err));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    read_from = job.read_from,
+                    end_seq = job.end_seq,
+                    error = %err,
+                    "cannot read the resend range from the store: gap-filling the rest"
+                );
+                job.store_done = true;
+                return Ok(());
             }
         };
-
-        // Whatever the replay did not cover — a trailing run of admin messages,
-        // holes, or the entire range when there is no store — is gap-filled, so
-        // the counterparty's expectation always lands exactly on `new_seq`.
-        if cursor < new_seq
-            && let Err(err) = self.send_gap_fill(framed, cursor, new_seq).await
-        {
-            teardown(phase);
-            return Err(closed(format!("send failed: {err}"), false));
+        // Ascending and bounded to `end_seq`: the last key is the furthest
+        // this page reached, so the next page reads from just past it.
+        match page.last().map(StoredMessage::seq_num) {
+            None => job.store_done = true,
+            Some(_) if page.len() < RESEND_PAGE_LIMIT => job.store_done = true,
+            Some(furthest) => match furthest.checked_add(1) {
+                Some(next) if next <= job.end_seq => job.read_from = next,
+                _ => job.store_done = true,
+            },
         }
-        Ok(phase)
+        job.page.extend(page);
+        Ok(())
+    }
+
+    /// Handles what one read of the socket produced: a frame, a fatal codec
+    /// error, or the end of the stream.
+    ///
+    /// The garbled frames the codec skipped on the way to a frame are
+    /// accounted for first, so a limit reached by them closes the session
+    /// before the frame behind them is acted on. The common case is one
+    /// integer read and nothing else: no clock, no allocation. With recovery
+    /// on, the only error that reaches here is fatal (an I/O failure or a
+    /// frame above `max_message_size`), and `Framed` ends the stream after
+    /// any decoder error, so there is nothing to resume either way.
+    async fn on_inbound_event(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        inbound: Option<Result<BytesMut, CodecError>>,
+    ) -> Result<Phase, SessionClosed> {
+        match inbound {
+            Some(Ok(frame)) => match framed.codec_mut().take_garbled_count() {
+                0 => self.on_inbound(framed, phase, frame).await,
+                skipped => {
+                    let phase = self
+                        .on_garbled(framed, phase, skipped, GARBLED_FRAMING)
+                        .await?;
+                    self.on_inbound(framed, phase, frame).await
+                }
+            },
+            Some(Err(err)) => Err(self.close_on_fatal_codec_error(framed, phase, err).await),
+            None => {
+                teardown(phase);
+                Err(closed("transport closed by peer", false))
+            }
+        }
     }
 
     /// Handles one inbound frame ([`Reactor::on_frame`]), then consumes a held
@@ -2341,11 +2638,13 @@ impl<A: Application> Reactor<A> {
     /// is consumed by [`Reactor::release_held_logon`].
     ///
     /// The resend is the one a `ResendRequest` for exactly that range would
-    /// get ([`Reactor::resend_range`]). Its range was decided by the handshake
-    /// against the counters of the Logon exchange and lies below this
-    /// session's own Logon or acknowledgement, so it is within what this
-    /// session has sent; it is checked again here, and a range that is empty
-    /// or reaches past the next sender number is not sent.
+    /// get, queued here ([`Reactor::queue_resend`]) and written by the reactor
+    /// loop one frame per pass, between inbound reads, ahead of any live
+    /// application message. Its range was decided by the handshake against
+    /// the counters of the Logon exchange and lies below this session's own
+    /// Logon or acknowledgement, so it is within what this session has sent;
+    /// it is checked again here, and a range that is empty or reaches past
+    /// the next sender number is not sent.
     ///
     /// # Errors
     /// Whatever closes the session while requesting the gap or resending.
@@ -2390,164 +2689,9 @@ impl<A: Application> Reactor<A> {
                 up_to_before = new_seq,
                 "resending what the counterparty's NextExpectedMsgSeqNum (789) says it missed"
             );
-            phase = self.resend_range(framed, phase, begin_seq, new_seq).await?;
+            self.queue_resend(begin_seq, new_seq);
         }
         Ok(phase)
-    }
-
-    /// Replays the stored application messages in `begin_seq..new_seq`.
-    ///
-    /// Returns the first sequence number the reply has **not** yet covered, so
-    /// the caller can gap-fill from there to `new_seq`. With no store, or a
-    /// store that cannot answer, that is `begin_seq` and the whole range is
-    /// gap-filled — the degradation is always a gap fill, never a silent skip,
-    /// because a skipped number leaves the counterparty expecting a message
-    /// that will never arrive.
-    ///
-    /// The store is read in bounded pages of [`RESEND_PAGE_LIMIT`] rather than
-    /// all at once: a `ResendRequest` with `EndSeqNo` (16) = 0 asks for the whole
-    /// session, and materialising an arbitrarily long history in one read would
-    /// allocate it all up front and stall the reactor for the duration of a
-    /// single peer request. The reactor yields between pages so other sessions
-    /// and this session's own inbound traffic keep making progress.
-    ///
-    /// # Errors
-    /// Returns [`EngineError`] if writing to the socket fails, or
-    /// [`EngineError::Store`] if the store reports itself corrupted
-    /// ([`StoreError::Corrupted`]); the session is then closed by the caller.
-    /// Every other failure (a store that cannot be read, a read that overruns
-    /// the store timeout, a frame that does not rebuild) degrades to a gap
-    /// fill.
-    async fn replay_range(
-        &mut self,
-        framed: &mut FixFramed,
-        begin_seq: u64,
-        new_seq: u64,
-    ) -> Result<u64, EngineError> {
-        // Cloned so the loop does not hold a borrow of `self.store` across the
-        // `&mut self` replay/gap-fill calls below; an `Arc` clone is a
-        // reference-count bump.
-        let Some(store) = self.store.clone() else {
-            return Ok(begin_seq);
-        };
-        // `new_seq` is the exclusive upper bound of the reply, so the last
-        // replayable number is one below it. A `new_seq` of 0 is unreachable
-        // (it is at least `begin_seq` >= 1), and an empty range needs no read.
-        let Some(end_seq) = new_seq.checked_sub(1) else {
-            return Ok(begin_seq);
-        };
-        if end_seq < begin_seq {
-            return Ok(begin_seq);
-        }
-
-        // `reply_cursor` is the next number the reply still owes the peer; it
-        // advances only past messages actually replayed, so holes, admin
-        // messages and unrebuildable frames stay for the leading or trailing gap
-        // fill. `read_from` is the next store key to page from, and advances
-        // past everything a page yields so no message is read twice.
-        let mut reply_cursor = begin_seq;
-        let mut read_from = begin_seq;
-        loop {
-            // Bounded like every store call; a read that overruns degrades to
-            // a gap fill like any other failed read.
-            let read = store.get_page(read_from, end_seq, RESEND_PAGE_LIMIT);
-            let page = match timed(self.store_timeout, read).await {
-                Ok(page) => page,
-                // A store that finds its own records damaged cannot say which
-                // of the messages it holds are intact. Gap-filling the rest of
-                // the range would tell the counterparty that application
-                // messages it may never have received do not exist, so the
-                // session is closed instead and the request is left for the
-                // next session to make again.
-                Err(err @ StoreError::Corrupted { .. }) => {
-                    tracing::error!(
-                        session = %self.session_id,
-                        read_from,
-                        end_seq,
-                        error = %err,
-                        "the store holding the resend range is corrupted: closing the session \
-                         rather than gap-filling messages it may still hold"
-                    );
-                    return Err(EngineError::Store(err));
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        session = %self.session_id,
-                        read_from,
-                        end_seq,
-                        error = %err,
-                        "cannot read the resend range from the store: gap-filling the rest"
-                    );
-                    return Ok(reply_cursor);
-                }
-            };
-            let page_len = page.len();
-            // Ascending and bounded to `end_seq`: the last key is the furthest
-            // this page reached, so the next page pages from just past it.
-            let Some(furthest) = page.last().map(|message| message.seq_num()) else {
-                break;
-            };
-
-            for message in page {
-                let seq = message.seq_num();
-                // A store handing back something outside the asked-for range
-                // must not be allowed to move the reply.
-                if seq < reply_cursor || seq > end_seq {
-                    continue;
-                }
-                // Administrative messages are gap-filled, not replayed
-                // (`doc/fix_operations.md`, "Resend Request", item 3): resending
-                // a stale Heartbeat or Logon says nothing true about the session
-                // now.
-                if message.msg_type().is_admin() {
-                    continue;
-                }
-                let frame = match wire::resend_frame(message.payload()) {
-                    Ok(frame) => frame,
-                    Err(err) => {
-                        tracing::warn!(
-                            session = %self.session_id,
-                            seq,
-                            error = %err,
-                            "cannot rebuild a stored message as a resend: gap-filling it instead"
-                        );
-                        continue;
-                    }
-                };
-
-                // Everything between the cursor and this message — holes, admin
-                // messages, frames that would not rebuild — is one fill.
-                if seq > reply_cursor {
-                    self.send_gap_fill(framed, reply_cursor, seq).await?;
-                }
-                self.send_replay(framed, frame).await?;
-
-                // `seq <= end_seq < new_seq <= next_sender <= u64::MAX`, so this
-                // cannot overflow; it is checked rather than assumed because a
-                // wrapped sequence number would corrupt the session it is meant
-                // to repair.
-                let Some(next) = seq.checked_add(1) else {
-                    return Ok(new_seq);
-                };
-                reply_cursor = next;
-            }
-
-            // A short page means the range is exhausted; a full one means there
-            // may be more, so page again from past the furthest key and yield
-            // first so one resend cannot monopolise the reactor.
-            if page_len < RESEND_PAGE_LIMIT {
-                break;
-            }
-            let Some(next_read) = furthest.checked_add(1) else {
-                break;
-            };
-            read_from = next_read;
-            if read_from > end_seq {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        Ok(reply_cursor)
     }
 
     /// Handles one inbound frame: identity validation, sequence validation,
@@ -3098,6 +3242,7 @@ where
         app_handed: None,
         resend: None,
         held_logon: None,
+        resends: VecDeque::new(),
         write_timeout,
         app_tx,
         garbled,
@@ -3196,6 +3341,40 @@ mod tests {
         state.record_retry();
         assert_eq!(state.attempts, 1);
         assert!(!state.can_retry(), "the one real request is spent");
+    }
+
+    #[test]
+    fn test_resend_job_refuses_an_empty_range() {
+        assert!(ResendJob::new(5, 5, false).is_none());
+        assert!(ResendJob::new(6, 5, false).is_none());
+        assert!(ResendJob::new(0, 5, false).is_none());
+        let Some(job) = ResendJob::new(3, 6, true) else {
+            panic!("3..6 is a range")
+        };
+        assert_eq!((job.reply_cursor, job.read_from), (3, 3));
+        assert_eq!((job.end_seq, job.new_seq), (5, 6));
+        assert!(job.store_done, "without a store the range is one gap fill");
+    }
+
+    #[test]
+    fn test_resend_job_widen_covers_both_ranges() {
+        let (Some(mut job), Some(other)) =
+            (ResendJob::new(10, 20, false), ResendJob::new(4, 30, false))
+        else {
+            panic!("both are ranges")
+        };
+        job.widen(&other);
+        assert_eq!((job.reply_cursor, job.read_from), (4, 4));
+        assert_eq!((job.end_seq, job.new_seq), (29, 30));
+        let Some(inner) = ResendJob::new(12, 15, false) else {
+            panic!("12..15 is a range")
+        };
+        job.widen(&inner);
+        assert_eq!(
+            (job.reply_cursor, job.new_seq),
+            (4, 30),
+            "a covered range changes nothing"
+        );
     }
 
     #[test]

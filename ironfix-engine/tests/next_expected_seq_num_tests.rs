@@ -2537,6 +2537,259 @@ async fn test_initiator_reset_logon_still_checks_an_echoing_or_malformed_789() {
 }
 
 // ---------------------------------------------------------------------------
+// Bilateral recovery with backlogs larger than the socket buffers
+// ---------------------------------------------------------------------------
+
+/// Messages in each side's backlog. With [`BACKLOG_PADDING`] that is about
+/// 9 MB per side, above what the loopback socket buffers hold in flight
+/// (4 MB send plus 4 MB receive at most on macOS; less on Linux): if each side
+/// wrote its whole resend before reading, both would block writing.
+const BACKLOG_MESSAGES: u64 = 6_000;
+
+/// Bytes of `Text` (58) padding in each backlog message.
+const BACKLOG_PADDING: usize = 1_500;
+
+/// A store holding one side's previous stream: its Logon (1) and
+/// [`BACKLOG_MESSAGES`] application messages (2 onwards) that the other side
+/// never received; the other side's Logon (1) was received, so 2 is expected
+/// next.
+async fn backlog_store(client: bool) -> Arc<MemoryStore> {
+    let padding = "x".repeat(BACKLOG_PADDING);
+    let store = Arc::new(MemoryStore::new());
+    let (sender, target, logon, msg_type, wire_type) = if client {
+        (
+            "CLIENT",
+            "VENUE",
+            client_logon(1, &[]),
+            MsgType::NewOrderSingle,
+            "D",
+        )
+    } else {
+        (
+            "VENUE",
+            "CLIENT",
+            venue_ack(1, &[]),
+            MsgType::ExecutionReport,
+            "8",
+        )
+    };
+    ok(
+        store.store(1, &MsgType::Logon, &logon).await,
+        "seed the Logon",
+    );
+    for seq in 2..BACKLOG_MESSAGES + 2 {
+        let id = seq.to_string();
+        let frame = peer_frame(
+            "FIX.4.4",
+            sender,
+            target,
+            wire_type,
+            seq,
+            &[(11, id.as_str()), (58, padding.as_str())],
+        );
+        ok(
+            store.store(seq, &msg_type, &frame).await,
+            "seed the backlog",
+        );
+    }
+    ok(
+        store.set_next_sender_seq(BACKLOG_MESSAGES + 2).await,
+        "seed the sender counter",
+    );
+    ok(
+        store.set_next_target_seq(2).await,
+        "seed the target counter",
+    );
+    store
+}
+
+/// Receives the other side's whole backlog, in sequence and flagged as
+/// resends.
+async fn receive_backlog(rx: &mut mpsc::UnboundedReceiver<AppMessage>) {
+    for seq in 2..BACKLOG_MESSAGES + 2 {
+        let message = some(rx.recv().await, "the application channel stays open");
+        assert_eq!(message.1, seq.to_string(), "in sequence");
+        assert_eq!(message.2.as_deref(), Some("Y"), "a resend");
+    }
+}
+
+/// Runs a real `Initiator` against a real `Acceptor`, each with a backlog the
+/// other missed, and checks that each side receives the other's whole backlog
+/// as resends and that live messages then flow in both directions.
+///
+/// `with_789` turns 789 on for both sides: each resends what the other's 789
+/// names while holding the other's gapped Logon. Without it, each requests the
+/// gap at its Logon and answers the other's `ResendRequest`. Either way both
+/// sides resend at once, and each keeps reading while it resends, so neither
+/// blocks writing into a full socket.
+async fn bilateral_recovery(with_789: bool) {
+    let configure = |config: SessionConfig| {
+        config
+            .with_send_next_expected_msg_seq_num(with_789)
+            .with_resend_timeout(Duration::from_secs(30))
+    };
+    let client_store = backlog_store(true).await;
+    let venue_store = backlog_store(false).await;
+    let capacity = 2 * usize::try_from(BACKLOG_MESSAGES).unwrap_or(usize::MAX / 4);
+
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, mut venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(configure(venue_config("FIX.4.4")), Arc::clone(&venue_app))
+        .with_store(Arc::clone(&venue_store) as Arc<dyn MessageStore>)
+        .with_write_timeout(Duration::from_secs(3))
+        .with_app_queue_capacity(capacity);
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+    let (client_app, mut client_rx) = RecordingApp::new();
+    let client = ok(
+        Initiator::new(configure(client_config("FIX.4.4")), Arc::clone(&client_app))
+            .with_store(Arc::clone(&client_store) as Arc<dyn MessageStore>)
+            .with_write_timeout(Duration::from_secs(3))
+            .with_app_queue_capacity(capacity)
+            .connect(addr)
+            .await,
+        "the initiator logs on",
+    );
+    let venue_connection = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), venue).await,
+                "handshake within 5s",
+            ),
+            "venue task joins",
+        ),
+        "the acceptor establishes the session",
+    );
+
+    ok(
+        timeout(Duration::from_secs(60), async {
+            tokio::join!(
+                receive_backlog(&mut client_rx),
+                receive_backlog(&mut venue_rx)
+            )
+        })
+        .await,
+        "both backlogs are resent within 60s",
+    );
+
+    let live_seq = (BACKLOG_MESSAGES + 4).to_string();
+    let mut report = OutboundMessage::new(MsgType::ExecutionReport);
+    report
+        .push_str(37, "EX-LIVE")
+        .push_str(17, "E-LIVE")
+        .push_char(150, '0')
+        .push_char(39, '0');
+    ok(venue_connection.send(report).await, "a live report");
+    let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+    order.push_str(11, "ORDER-LIVE");
+    ok(client.send(order).await, "a live order");
+    let live_report = next_app_message(&mut client_rx).await;
+    let live_order = next_app_message(&mut venue_rx).await;
+    assert_eq!(live_report.2, None, "an original send");
+    assert_eq!(live_order.2, None, "an original send");
+    if with_789 {
+        // Logon, then the live message: nothing was spent on a request.
+        assert_eq!(live_report.1, (BACKLOG_MESSAGES + 3).to_string());
+        assert_eq!(live_order.1, (BACKLOG_MESSAGES + 3).to_string());
+        for (side, events) in [
+            ("client", client_app.events()),
+            ("venue", venue_app.events()),
+        ] {
+            assert!(
+                !events.iter().any(|event| event == "resend request"),
+                "no ResendRequest reached the {side}: {events:?}"
+            );
+        }
+    } else {
+        // Logon, the ResendRequest, then the live message.
+        assert_eq!(live_report.1, live_seq);
+        assert_eq!(live_order.1, live_seq);
+    }
+    ok(client.logout().await, "the client logs out");
+    ok(
+        timeout(Duration::from_secs(5), client.wait_closed()).await,
+        "the client session closes within 5s",
+    );
+    ok(
+        timeout(Duration::from_secs(5), venue_connection.wait_closed()).await,
+        "the venue session closes within 5s",
+    );
+}
+
+/// Both sides missed the other's backlog and both declared 789: each resends
+/// its backlog to the other at once, reading while it does, so the recovery
+/// completes in both directions without a `ResendRequest`.
+#[tokio::test]
+async fn test_bilateral_789_resend_larger_than_the_socket_buffers() {
+    bilateral_recovery(true).await;
+}
+
+/// The same backlogs without 789: each side requests the gap at its Logon and
+/// answers the other's `ResendRequest` while reading the other's answer.
+#[tokio::test]
+async fn test_bilateral_resend_requests_larger_than_the_socket_buffers() {
+    bilateral_recovery(false).await;
+}
+
+/// The resend stays ahead of live application messages: the acceptor owes
+/// 300 messages (two store pages) and its application sends a live report as
+/// soon as the session is Active. The scripted initiator receives every
+/// resent message, in order, before the live report, which carries the next
+/// number after the acknowledgement.
+#[tokio::test]
+async fn test_resend_stays_ahead_of_live_application_messages() {
+    let store = Arc::new(MemoryStore::new());
+    ok(
+        store.store(1, &MsgType::Logon, &venue_ack(1, &[])).await,
+        "seed the Logon",
+    );
+    for seq in 2..=301u64 {
+        ok(
+            store
+                .store(
+                    seq,
+                    &MsgType::ExecutionReport,
+                    &venue_msg("8", seq, &REPORT_BODY),
+                )
+                .await,
+            "seed a report",
+        );
+    }
+    ok(
+        store.set_next_sender_seq(302).await,
+        "seed the sender counter",
+    );
+    ok(
+        store.set_next_target_seq(3).await,
+        "seed the target counter",
+    );
+    let (venue_app, _rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(venue_789(), Arc::clone(&venue_app))
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    let (mut framed, connection, ack) = establish(acceptor, client_logon(3, &[(789, "2")])).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("302"));
+
+    let mut report = OutboundMessage::new(MsgType::ExecutionReport);
+    report
+        .push_str(37, "EX-LIVE")
+        .push_str(17, "E-LIVE")
+        .push_char(150, '0')
+        .push_char(39, '0');
+    ok(connection.send(report).await, "a live report");
+
+    for seq in 2..=301u64 {
+        let frame = next_frame(&mut framed).await;
+        assert_eq!(field(&frame, 34), Some(seq.to_string()), "resent in order");
+        assert_eq!(field(&frame, 43).as_deref(), Some("Y"), "a resend");
+    }
+    let live = next_frame(&mut framed).await;
+    assert_eq!(field(&live, 37).as_deref(), Some("EX-LIVE"));
+    assert_eq!(field(&live, 34).as_deref(), Some("303"));
+    assert_eq!(field(&live, 43), None, "an original send");
+}
+
+// ---------------------------------------------------------------------------
 // End to end: a real Initiator reconnecting to a real Acceptor over FileStores
 // ---------------------------------------------------------------------------
 
