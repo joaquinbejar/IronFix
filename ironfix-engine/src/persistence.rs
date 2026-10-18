@@ -101,13 +101,13 @@
 //! the session with [`EngineError::Store`] if it still cannot, whatever the
 //! policy, and its Logon then declares `ResetSeqNumFlag` (141) = Y and starts
 //! at 1, so both sides restart the sequence together rather than the retry
-//! being refused as too low. The record is cleared once that Logon is
+//! being refused as too low. That reset is paid once that Logon is
 //! acknowledged.
 //!
 //! The [`Acceptor`](crate::Acceptor) keeps the same record: a failed
 //! close-time reset, or a failed reset for a session that resets, is owed to
 //! its next accepted Logon, whose acknowledgement then declares the reset at
-//! 1; the record is cleared once that acknowledgement is sent. The acceptor
+//! 1; that reset is paid once that acknowledgement is sent. The acceptor
 //! resets its store only for a Logon that passes every check, so a refused
 //! Logon cannot clear it, whatever it declares.
 //!
@@ -123,12 +123,20 @@
 //!
 //! # Cancellation and timeouts
 //!
-//! A reset is recorded as owed **before** the engine awaits it, and the
-//! record is cleared only once the reset has succeeded (for a reset declared
-//! on a Logon, once that Logon is acknowledged). A caller that drops a connect
-//! while a reset is pending, or a runtime that drops a closing session, runs no
-//! error branch; the record still says the reset is owed, and the next session
-//! makes it and declares it.
+//! A reset is recorded as owed **before** the engine awaits it, and it is
+//! paid only once it has succeeded (for a reset declared on a Logon, once that
+//! Logon is acknowledged). A caller that drops a connect while a reset is
+//! pending, or a runtime that drops a closing session, runs no error branch;
+//! the record still says the reset is owed, and the next session makes it and
+//! declares it.
+//!
+//! The record is kept by generation: every obligation is numbered when it is
+//! recorded, and paying a reset settles the obligation it was started for and
+//! every earlier one, never a later one. The reset erased whatever an earlier
+//! failed write left, but not what a write made after it started, so a store
+//! write that fails during the handshake paying an owed reset, before or
+//! after the acknowledgement, stays owed once that reset is paid, and the
+//! next session resets again.
 //!
 //! A timeout drops the store call's future, not necessarily the work the store
 //! has already submitted: a disk or replication write can still land later.
@@ -163,7 +171,7 @@ use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_store::MessageStore;
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// What the engine does when a write to the attached [`MessageStore`] fails.
@@ -286,9 +294,9 @@ pub(crate) struct SessionStore<'s> {
     policy: StoreFailurePolicy,
     /// Bound on each store call; an overrun is a failed write.
     timeout: Duration,
-    /// The engine's record of a reset owed to the next session, set when a
-    /// mutation fails or overruns the timeout.
-    owed: &'s AtomicBool,
+    /// The engine's record of resets owed to the next session; a mutation
+    /// that fails or overruns the timeout adds one.
+    owed: &'s OwedReset,
 }
 
 impl<'s> SessionStore<'s> {
@@ -299,7 +307,7 @@ impl<'s> SessionStore<'s> {
         store: &'s dyn MessageStore,
         policy: StoreFailurePolicy,
         timeout: Duration,
-        owed: &'s AtomicBool,
+        owed: &'s OwedReset,
     ) -> Self {
         Self {
             store,
@@ -334,7 +342,7 @@ impl<'s> SessionStore<'s> {
     ) -> Result<(), StoreError> {
         let result = timed(self.timeout, call).await;
         if result.is_err() {
-            self.owed.store(true, Ordering::Release);
+            let _ = self.owed.owe();
         }
         result
     }
@@ -476,6 +484,70 @@ impl<'s> SessionStore<'s> {
     }
 }
 
+/// The record of the resets an engine owes its next session, kept by
+/// generation.
+///
+/// Every obligation gets a number, in the order it is recorded: a reset the
+/// engine is about to make (recorded before it is awaited, so a dropped call
+/// still leaves it owed), a reset that could not be made, and a store mutation
+/// that failed or overran the store timeout. Paying a reset settles the
+/// obligation it was started for and every earlier one, and no later one: the
+/// reset erased what the store held before it, including whatever an earlier
+/// failed write left (a store applies its mutations in call order), but not
+/// what a write made after it started. A store write that fails during the
+/// Logon handshake that pays an owed reset, before or after the
+/// acknowledgement, therefore stays owed once that reset is paid.
+///
+/// In memory only: a process restart forgets it (#111).
+#[derive(Debug, Default)]
+pub(crate) struct OwedReset {
+    /// Number of the last obligation recorded.
+    recorded: AtomicU64,
+    /// Number of the last obligation settled.
+    settled: AtomicU64,
+}
+
+/// The number of the obligation a reset was started for. Paying it settles
+/// that obligation and every earlier one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a reset ticket is how the reset is later paid"]
+pub(crate) struct ResetTicket(u64);
+
+impl OwedReset {
+    /// Records an obligation and returns its number.
+    pub(crate) fn owe(&self) -> ResetTicket {
+        let mut current = self.recorded.load(Ordering::Acquire);
+        loop {
+            // Exhausting u64 obligations is not reachable; if it were, the
+            // record would stay at its maximum, which still reads as owed
+            // until a reset started at that number is paid.
+            let Some(next) = current.checked_add(1) else {
+                return ResetTicket(current);
+            };
+            match self.recorded.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return ResetTicket(next),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Whether an obligation is still unsettled.
+    #[must_use]
+    pub(crate) fn is_owed(&self) -> bool {
+        self.recorded.load(Ordering::Acquire) > self.settled.load(Ordering::Acquire)
+    }
+
+    /// Settles the obligation `ticket` names and every earlier one.
+    pub(crate) fn pay(&self, ticket: ResetTicket) {
+        self.settled.fetch_max(ticket.0, Ordering::AcqRel);
+    }
+}
+
 /// A store attached to an engine, with its failure policy, the bound on each
 /// call and the owed-reset record.
 ///
@@ -490,8 +562,8 @@ pub(crate) struct StoreAttachment {
     policy: StoreFailurePolicy,
     /// Bound on each store call, or `None` for the engine's write timeout.
     timeout: Option<Duration>,
-    /// Set when a reset could not be made; the next session makes it first.
-    reset_owed: Arc<AtomicBool>,
+    /// The resets owed to the next session, by generation.
+    reset_owed: Arc<OwedReset>,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`.
@@ -541,28 +613,29 @@ impl StoreAttachment {
         self.timeout.unwrap_or(write_timeout)
     }
 
-    /// Whether a store is attached and an earlier session left a reset owed.
+    /// Whether a store is attached and a reset is owed.
     #[must_use]
     pub(crate) fn reset_is_owed(&self) -> bool {
-        self.store.is_some() && self.reset_owed.load(Ordering::Acquire)
+        self.store.is_some() && self.reset_owed.is_owed()
     }
 
-    /// Records that a reset could not be made and is owed to the next
-    /// session.
-    pub(crate) fn owe_reset(&self) {
-        self.reset_owed.store(true, Ordering::Release);
+    /// Records that a reset is owed, before it is attempted, and returns the
+    /// ticket that pays it.
+    pub(crate) fn owe_reset(&self) -> ResetTicket {
+        self.reset_owed.owe()
     }
 
-    /// Records that the owed reset has been made and declared to the
-    /// counterparty.
-    pub(crate) fn reset_paid(&self) {
-        self.reset_owed.store(false, Ordering::Release);
+    /// Records that the reset `ticket` was taken for has been made and
+    /// declared to the counterparty. Anything owed since the ticket was taken
+    /// stays owed.
+    pub(crate) fn reset_paid(&self, ticket: ResetTicket) {
+        self.reset_owed.pay(ticket);
     }
 
     /// The owed-reset record, shared with a session's reactor so its
-    /// close-time reset can owe one.
+    /// close-time reset and its failed writes can owe one.
     #[must_use]
-    pub(crate) fn owed_record(&self) -> Arc<AtomicBool> {
+    pub(crate) fn owed_record(&self) -> Arc<OwedReset> {
         Arc::clone(&self.reset_owed)
     }
 
@@ -951,5 +1024,48 @@ mod tests {
         assert_eq!(counters.sender_to_write(3), Some(3));
         // A reset moves a counter down; that is a change too.
         assert_eq!(counters.target_to_write(1), Some(1));
+    }
+
+    #[test]
+    fn test_owed_reset_starts_clear_and_is_settled_by_its_ticket() {
+        let owed = OwedReset::default();
+        assert!(!owed.is_owed());
+        let ticket = owed.owe();
+        assert!(owed.is_owed());
+        owed.pay(ticket);
+        assert!(!owed.is_owed());
+    }
+
+    #[test]
+    fn test_owed_reset_paying_a_reset_settles_what_was_owed_before_it() {
+        let owed = OwedReset::default();
+        // A failed write, then the reset that erases its effect.
+        let _ = owed.owe();
+        let reset = owed.owe();
+        owed.pay(reset);
+        assert!(!owed.is_owed());
+    }
+
+    #[test]
+    fn test_owed_reset_a_failure_after_the_ticket_stays_owed_once_it_is_paid() {
+        let owed = OwedReset::default();
+        let reset = owed.owe();
+        // A store write fails during the handshake that pays the reset.
+        let failure = owed.owe();
+        owed.pay(reset);
+        assert!(owed.is_owed(), "the failure was recorded after the reset");
+        // The next reset settles it.
+        owed.pay(failure);
+        assert!(!owed.is_owed());
+    }
+
+    #[test]
+    fn test_owed_reset_paying_an_older_ticket_never_reopens_a_settled_one() {
+        let owed = OwedReset::default();
+        let first = owed.owe();
+        let second = owed.owe();
+        owed.pay(second);
+        owed.pay(first);
+        assert!(!owed.is_owed());
     }
 }

@@ -462,9 +462,9 @@ impl<A: Application + 'static> Initiator<A> {
     /// this `Initiator` owes (a close-time reset, or the reset for a
     /// counterparty's `ResetSeqNumFlag` (141), that failed). Either way the
     /// Logon declares `ResetSeqNumFlag` = Y and starts at 1, so both sides
-    /// restart the sequence together. The owed record is cleared once that
-    /// Logon is acknowledged, not here: a connect that fails before then still
-    /// owes the reset.
+    /// restart the sequence together. The reset is paid once that Logon is
+    /// acknowledged, not here: a connect that fails before then still owes
+    /// it, and a store write that fails during the handshake owes another.
     #[must_use]
     fn seed_plan(&self, reset: bool) -> SeedPlan<'_> {
         self.store.seed_plan(
@@ -599,12 +599,12 @@ impl<A: Application + 'static> Initiator<A> {
         // here rather than started from a number that could collide with a
         // stream still on file.
         let reset_logon = self.config.reset_on_logon || self.store.reset_is_owed();
-        if reset_logon && self.store.store().is_some() {
-            // Owed from before the reset until the Logon declaring it is
-            // acknowledged: a connect dropped while the reset is pending leaves
-            // it owed, and so does one that fails later.
-            self.store.owe_reset();
-        }
+        // Owed from before the reset until the Logon declaring it is
+        // acknowledged: a connect dropped while the reset is pending leaves it
+        // owed, and so does one that fails later. The ticket pays only this
+        // reset: a store write that fails during the handshake owes another.
+        let reset_ticket =
+            (reset_logon && self.store.store().is_some()).then(|| self.store.owe_reset());
         let Seeded {
             sequences,
             persisted,
@@ -922,16 +922,16 @@ impl<A: Application + 'static> Initiator<A> {
                 // the new one uses. The reset is then owed, so the next connect
                 // makes it and declares ResetSeqNumFlag itself.
                 if !reset_logon && let Some(handshake) = store.as_mut() {
-                    // Owed before the call and cleared only once it has
+                    // Owed before the call and paid only once it has
                     // succeeded: a caller that drops this connect while the
                     // reset is pending runs no error branch, and the next
                     // connect must still make the reset and declare it.
-                    self.store.owe_reset();
+                    let ticket = self.store.owe_reset();
                     if let Err(err) = handshake.reset_to(&session_id, 2, 2).await {
                         let _ = session.on_logon_reject();
                         return Err(err.into());
                     }
-                    self.store.reset_paid();
+                    self.store.reset_paid(ticket);
                 }
                 runtime.sequences.set_target_seq(1);
                 // The Logon already on the wire is message 1 of the reset
@@ -988,10 +988,11 @@ impl<A: Application + 'static> Initiator<A> {
             }
         }
 
-        // The Logon that declared the reset has been acknowledged: no reset is
-        // owed any more.
-        if reset_logon {
-            self.store.reset_paid();
+        // The Logon that declared the reset has been acknowledged: that reset
+        // is paid. A store write that failed during this handshake was owed
+        // after the ticket was taken, and stays owed.
+        if let Some(ticket) = reset_ticket {
+            self.store.reset_paid(ticket);
         }
 
         // Typestate: LogonSent -> Active.

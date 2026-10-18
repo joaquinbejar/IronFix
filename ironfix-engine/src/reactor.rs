@@ -107,7 +107,8 @@ use crate::error::EngineError;
 use crate::garbled::{GarbledFrameWindow, GarbledVerdict};
 use crate::outbound;
 use crate::persistence::{
-    HandshakeStore, PersistedCounters, SessionStore, StoreFailurePolicy, file_and_spend, timed,
+    HandshakeStore, OwedReset, PersistedCounters, SessionStore, StoreFailurePolicy, file_and_spend,
+    timed,
 };
 use crate::wire::{
     self, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard, SendingTimeProblem,
@@ -126,7 +127,7 @@ use ironfix_session::{
 use ironfix_store::MessageStore;
 use ironfix_transport::{CodecError, FixCodec};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -717,7 +718,7 @@ struct Reactor<A: Application> {
     persisted: PersistedCounters,
     /// Set when the close-time store reset fails, for the engine that owns
     /// the store to perform on its next session.
-    reset_owed: Arc<AtomicBool>,
+    reset_owed: Arc<OwedReset>,
     /// The first and last `MsgSeqNum` handed to the application dispatcher.
     app_handed: Option<(u64, u64)>,
     /// The outstanding ResendRequest, if a gap is being recovered.
@@ -884,13 +885,13 @@ async fn run_reactor<A: Application + 'static>(
         // file the next session's messages on top of this one's, and a resend
         // request in that session could answer with traffic from this one.
         if let Some(store) = ctx.store.as_deref() {
-            // Owed from before the call and cleared only once it has
+            // Owed from before the call and paid only once it has
             // succeeded: a reactor dropped while the reset is pending (a
             // runtime shutting down) runs no error branch, and the next
             // session must still make the reset.
-            ctx.reset_owed.store(true, Ordering::Release);
+            let ticket = ctx.reset_owed.owe();
             match timed(ctx.store_timeout, store.reset()).await {
-                Ok(()) => ctx.reset_owed.store(false, Ordering::Release),
+                Ok(()) => ctx.reset_owed.pay(ticket),
                 Err(err) => {
                     // The reset counters written over a store that still
                     // holds this session's stream would describe neither, so
@@ -971,7 +972,7 @@ fn bind_store<'s>(
     store: Option<&'s Arc<dyn MessageStore>>,
     policy: StoreFailurePolicy,
     timeout: Duration,
-    owed: &'s AtomicBool,
+    owed: &'s OwedReset,
 ) -> Option<SessionStore<'s>> {
     store.map(|store| SessionStore::new(store.as_ref(), policy, timeout, owed))
 }
@@ -2599,7 +2600,7 @@ pub(crate) struct SessionParams<A: Application> {
     pub(crate) persisted: PersistedCounters,
     /// Set by the reactor when its close-time store reset fails; the engine
     /// that owns the store performs the reset on its next session.
-    pub(crate) reset_owed: Arc<AtomicBool>,
+    pub(crate) reset_owed: Arc<OwedReset>,
     /// A gap detected in the Logon exchange, as (first missing number, highest
     /// number seen). The reactor's first act is to request it, so a failure to
     /// send that request closes the session through the normal close path.

@@ -279,14 +279,23 @@ replaces the journal, flushed, and clears everything pending.
 
 ### The engine side
 
-Two engine changes come with the store (`ironfix-engine/src/persistence.rs`,
-`reactor.rs`):
+Three engine changes come with the store (`ironfix-engine/src/persistence.rs`,
+`reactor.rs`, and the two handshakes):
 
 - **Every failed mutation owes a reset**, not only one that overruns the store
   timeout, under both policies. The `MessageStore` contract gives a store no
   way to say a failed write changed nothing, so the store's state after a
   failure is unknown. Under `Continue` the session carries on and the next one
   starts with a reset and `ResetSeqNumFlag` = Y.
+- **The owed-reset record is kept by generation.** Each obligation is
+  numbered when it is recorded, and paying a reset settles the obligation it
+  was started for and every earlier one, never a later one: the reset erased
+  what an earlier failed write left, but not what a write made after it
+  started. Before, paying the reset declared on a Logon cleared the whole
+  record, so a store write that failed during that same handshake (filing
+  the Logon or its acknowledgement, or persisting the acknowledgement's
+  number) lost its owed reset. Both roles share the record through
+  `StoreAttachment`.
 - **A corrupted resend read closes the session.** When `get_page` reports
   `StoreError::Corrupted` (a `FileStore` record failing its checks on read,
   which fails the whole page), the engine closes the session instead of
@@ -362,8 +371,8 @@ dependency, `FileStore::sync`, `FileStore::close`, `FileStore::repair`, and
   re-exported at the crate root. `SyncPolicy`, `FileStoreConfigError` and
   `TruncationCause` are `#[non_exhaustive]`. No existing item changes.
 - **Behaviour (engine):** a failed store mutation now owes a reset under both
-  policies; a corrupted resend read closes the session instead of
-  gap-filling.
+  policies, and stays owed when a reset started before it is paid; a
+  corrupted resend read closes the session instead of gap-filling.
 - **Dependencies:** no runtime dependency added. `ironfix-store` still
   depends on `ironfix-core` only; it gains `criterion` as a dev-dependency
   (the workspace one, ADR-0001) for its benchmark.

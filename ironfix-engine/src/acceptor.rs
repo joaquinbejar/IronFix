@@ -780,6 +780,7 @@ impl<A: Application + 'static> Acceptor<A> {
         let runtime;
         let mut store;
         let reset;
+        let reset_ticket;
         {
             let raw = match wire::decode_frame(&logon_frame) {
                 Ok(raw) => raw,
@@ -1003,9 +1004,9 @@ impl<A: Application + 'static> Acceptor<A> {
             // is awaited until the acknowledgement declaring it is sent, so a
             // serve dropped or failed in between leaves it owed.
             reset = inbound_reset || self.config.reset_on_logon || self.store.reset_is_owed();
-            if reset && self.store.store().is_some() {
-                self.store.owe_reset();
-            }
+            // The ticket pays only this reset: a store write that fails while
+            // the acknowledgement is filed owes another.
+            reset_ticket = (reset && self.store.store().is_some()).then(|| self.store.owe_reset());
             let Seeded {
                 sequences,
                 persisted,
@@ -1133,10 +1134,11 @@ impl<A: Application + 'static> Acceptor<A> {
             lock_heartbeat(&runtime).on_message_sent();
         }
 
-        // The acknowledgement that declared the reset is on the wire: no reset
-        // is owed any more.
-        if reset {
-            self.store.reset_paid();
+        // The acknowledgement that declared the reset is on the wire: that
+        // reset is paid. A store write that failed during this handshake was
+        // owed after the ticket was taken, and stays owed.
+        if let Some(ticket) = reset_ticket {
+            self.store.reset_paid(ticket);
         }
 
         // Typestate: LogonReceived -> Active.

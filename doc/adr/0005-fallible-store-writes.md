@@ -227,7 +227,7 @@ then declares `ResetSeqNumFlag` = Y and starts at 1. Without the flag the
 retry would be stuck: after a failed ack reset the store still holds the old
 counters (Logon at 7 against a counterparty expecting 2, and a `ResendRequest`
 replaying old orders), and after a successful owed reset our Logon at 1 is
-too low for a counterparty that did not reset. The record is cleared once that
+too low for a counterparty that did not reset. That reset is paid once that
 Logon is acknowledged, so a connect that fails before then still owes it. It
 lives in the `Initiator`, not in the store: a process restart forgets it, and
 the next session starts from the counters the store still holds.
@@ -240,10 +240,13 @@ the store having finished:
 - **A dropped future.** A caller that drops a connect while a reset is
   pending, or a runtime that drops a closing session, runs no error branch.
   Every reset is therefore recorded as owed **before** the engine awaits it,
-  and the record is cleared only once the reset has succeeded (for a reset
-  declared on a Logon, once that Logon is acknowledged). This covers the
-  reset for a counterparty's `ResetSeqNumFlag` on the ack, the close-time
-  reset, and the reset at the start of a session that declares one.
+  and paid only once the reset has succeeded (for a reset declared on a
+  Logon, once that Logon is acknowledged). This covers the reset for a
+  counterparty's `ResetSeqNumFlag` on the ack, the close-time reset, and the
+  reset at the start of a session that declares one. Since #78 (ADR-0006)
+  the record is kept by generation: paying a reset settles what was owed
+  before it started and never what was owed after, so a store write that
+  fails during the handshake paying a reset stays owed.
 - **A timeout.** A timeout drops the call's future, not necessarily the work
   the store has already submitted: a disk or replication write can land
   later. After any **mutation** overruns the store timeout, the engine treats

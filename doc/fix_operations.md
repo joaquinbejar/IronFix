@@ -566,11 +566,11 @@ close-time reset of `reset_on_logout` / `reset_on_disconnect` fails (no
 counter is then written) or when the reset for the counterparty's
 `ResetSeqNumFlag` fails. The `Initiator`'s next `connect` then resets the
 store before anything else, and its Logon declares `ResetSeqNumFlag` (141) = Y
-at `MsgSeqNum` 1, so the counterparty restarts the sequence with it; the
-record is cleared once that Logon is acknowledged. On the `Acceptor` (whose
+at `MsgSeqNum` 1, so the counterparty restarts the sequence with it; that
+reset is paid once that Logon is acknowledged. On the `Acceptor` (whose
 reset fails closed the same way for a session that resets), the next accepted
-Logon resets the store and its acknowledgement declares `141=Y` at 1; the
-record is cleared once that acknowledgement is sent. The record lives in the
+Logon resets the store and its acknowledgement declares `141=Y` at 1; that
+reset is paid once that acknowledgement is sent. The record lives in the
 engine, in memory, so a process restart forgets it whichever store is
 attached; `FileStore` does not persist it. A crash after the counterparty
 acknowledged a `ResetSeqNumFlag` reset and before the store made it durable
@@ -589,8 +589,11 @@ with a closing session; one that arrives before then is refused as a duplicate,
 without a reply.
 
 *Cancellation and timeouts.* Every reset is recorded as owed before it is
-awaited and cleared only once it has succeeded, so a connect dropped while a
-reset is pending still leaves it owed. A store write that overruns the store
+awaited and paid only once it has succeeded, so a connect dropped while a
+reset is pending still leaves it owed. The record is kept by generation:
+paying a reset settles what was owed before it started, never what was owed
+after, so a store write that fails during the handshake paying an owed reset
+(before or after the acknowledgement) still owes the next session a reset. A store write that overruns the store
 timeout may still land later, and one that fails may have changed the store
 before failing (the `MessageStore` contract cannot say otherwise), so either
 leaves a reset owed, under both policies, and the next session starts with a

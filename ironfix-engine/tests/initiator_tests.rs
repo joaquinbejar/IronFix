@@ -8032,3 +8032,134 @@ async fn test_initiator_refuses_an_ack_numbered_zero_after_its_reset() {
         "the ack's number was never persisted"
     );
 }
+
+/// Which store write fails while an owed reset is being paid.
+#[derive(Debug, Clone, Copy)]
+enum HandshakeFailure {
+    /// Filing the Logon that declares the reset, before the acknowledgement.
+    LogonFiling,
+    /// Persisting the acknowledgement's number, after it arrived.
+    AckTarget,
+}
+
+impl HandshakeFailure {
+    fn toggle(self, store: &FailingStore) -> &AtomicBool {
+        match self {
+            Self::LogonFiling => &store.fail_store,
+            Self::AckTarget => &store.fail_target,
+        }
+    }
+}
+
+/// Three connects on one store. The first leaves a reset owed (a store write
+/// fails under `Continue`). The second pays it: the store is reset and the
+/// Logon declares `ResetSeqNumFlag` (141) at 1, but one store write of that
+/// handshake fails. Paying the reset must not settle that later failure, so
+/// the third Logon must again start at 1 and declare the reset.
+async fn owed_reset_survives_a_write_failing_while_it_is_paid(failure: HandshakeFailure) {
+    let (listener, addr) = bind_listener().await;
+    let (hang_up_tx, hang_up_rx) = tokio::sync::oneshot::channel::<()>();
+    let store = Arc::new(FailingStore::working());
+    let stub_store = Arc::clone(&store);
+
+    let acceptor = tokio::spawn(async move {
+        // First connection: one order, then the venue hangs up.
+        let (socket, _) = ok(listener.accept().await, "accept the first connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let _logon = next_frame(&mut framed).await;
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30")]))
+                .await,
+            "ack the first logon",
+        );
+        let _order = next_frame(&mut framed).await;
+        drop(framed);
+
+        // Second connection: the owed reset is declared and acknowledged.
+        let (socket, _) = ok(listener.accept().await, "accept the second connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(field(&logon, 34).as_deref(), Some("1"));
+        assert_eq!(field(&logon, 141).as_deref(), Some("Y"));
+        // The store reset and the Logon's filing are done by now, so arming
+        // here fails only the write that persists the ack's number.
+        if let HandshakeFailure::AckTarget = failure {
+            failure.toggle(&stub_store).store(true, Ordering::SeqCst);
+        }
+        ok(
+            framed
+                .send(venue_msg("A", 1, &[(98, "0"), (108, "30"), (141, "Y")]))
+                .await,
+            "ack the resetting logon",
+        );
+        let _ = hang_up_rx.await;
+        drop(framed);
+
+        // Third connection: only its Logon matters.
+        let (socket, _) = ok(listener.accept().await, "accept the third connection");
+        let mut framed = Framed::new(socket, FixCodec::new());
+        let logon = next_frame(&mut framed).await;
+        (field(&logon, 34), field(&logon, 141), framed)
+    });
+
+    let (app, _app_rx) = RecordingApp::new();
+    let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+
+    let first = ok(initiator.connect(addr).await, "first connect");
+    store.fail_store.store(true, Ordering::SeqCst);
+    send_orders(&first, 1).await;
+    ok(
+        timeout(Duration::from_secs(5), first.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+    store.fail_store.store(false, Ordering::SeqCst);
+
+    // A failed filing leaves the store reset untouched (`reset_to` files no
+    // frame), so it can be armed before the connect; the ack's write is armed
+    // by the stub.
+    if let HandshakeFailure::LogonFiling = failure {
+        failure.toggle(&store).store(true, Ordering::SeqCst);
+    }
+    let second = ok(initiator.connect(addr).await, "second connect");
+    // Off before anything else is written: only the handshake's write fails.
+    failure.toggle(&store).store(false, Ordering::SeqCst);
+    let _ = hang_up_tx.send(());
+    ok(
+        timeout(Duration::from_secs(5), second.wait_closed()).await,
+        "the second session closes within 5s",
+    );
+
+    // The reconnect stops at the Logon; the stub reads it and keeps the socket.
+    let _ = timeout(Duration::from_secs(2), initiator.connect(addr)).await;
+    let (seq, reset, _framed) = ok(
+        ok(
+            timeout(Duration::from_secs(10), acceptor).await,
+            "acceptor done within 10s",
+        ),
+        "acceptor task",
+    );
+    assert_eq!(
+        seq.as_deref(),
+        Some("1"),
+        "{failure:?}: the reset paid in the second session does not settle the write that \
+         failed during it"
+    );
+    assert_eq!(reset.as_deref(), Some("Y"), "{failure:?}: and is declared");
+}
+
+/// The Logon that pays an owed reset cannot be filed: the reset is paid when
+/// it is acknowledged, but the failed filing still owes the next connect one.
+#[tokio::test]
+async fn test_a_write_failing_before_the_ack_still_owes_a_reset_after_one_is_paid() {
+    owed_reset_survives_a_write_failing_while_it_is_paid(HandshakeFailure::LogonFiling).await;
+}
+
+/// The acknowledgement of the Logon that pays an owed reset cannot be
+/// persisted: the reset is paid, but the failed write still owes the next
+/// connect one.
+#[tokio::test]
+async fn test_a_write_failing_after_the_ack_still_owes_a_reset_after_one_is_paid() {
+    owed_reset_survives_a_write_failing_while_it_is_paid(HandshakeFailure::AckTarget).await;
+}
