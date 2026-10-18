@@ -13,6 +13,10 @@
 //! its first Logon, and [`Acceptor::serve`] reads that Logon itself.
 //! [`AcceptorRegistry`] reads it once, resolves the session from the
 //! identity it claims, and runs that session's handshake on it, unchanged.
+//! [`AcceptorRegistry::serve`] takes an accepted `TcpStream`;
+//! [`AcceptorRegistry::serve_stream`] takes a stream of any other type the
+//! caller has accepted (a TLS stream, a Unix socket, an in-memory pipe), and
+//! one registry can route connections of different stream types.
 //!
 //! # Routing
 //!
@@ -148,6 +152,7 @@ use crate::application::{Application, NoOpApplication, SessionId};
 use crate::connection::Connection;
 use crate::error::EngineError;
 use crate::reactor::{HandshakeRead, read_handshake_frame_until};
+use crate::stream::{self, BoxedStream};
 use crate::wire::{self, FieldOccurrence};
 use async_trait::async_trait;
 use ironfix_core::message::{MsgType, RawMessage};
@@ -161,6 +166,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 use tokio_util::codec::Framed;
@@ -1027,6 +1033,48 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     /// [`EngineError::LogonRejected`] for a second Logon for a session already
     /// live.
     pub async fn serve(&self, stream: TcpStream) -> Result<Connection, EngineError> {
+        // TCP_NODELAY is set here, on the TCP path only.
+        self.serve_boxed(stream::tcp(stream)).await
+    }
+
+    /// Reads the Logon on a byte stream the caller has already accepted,
+    /// routes it to its session and completes that session's handshake,
+    /// exactly as [`AcceptorRegistry::serve`] does on a [`TcpStream`].
+    ///
+    /// This is the seam for any transport the engine does not accept itself:
+    /// a TLS stream built with the TLS stack of your choice, a Unix socket, a
+    /// proxied connection, or an in-memory [`tokio::io::duplex`] pipe. Routing
+    /// is unchanged: the same deadline, the same ceiling on the Logon frame,
+    /// the same identity bounds and refusals without a reply, and the routed
+    /// session's handshake runs as [`Acceptor::serve_stream`] would run it.
+    /// Connections over different stream types can be routed to the same
+    /// registry. Only `TCP_NODELAY`, which [`AcceptorRegistry::serve`] sets,
+    /// is not set: that is the caller's.
+    ///
+    /// The routed session owns the stream from here on; on an error the
+    /// stream is dropped, which closes it.
+    ///
+    /// # Arguments
+    /// * `stream` - An accepted byte stream from a counterparty
+    ///
+    /// # Errors
+    /// Every error [`AcceptorRegistry::serve`] documents. A stream that closes
+    /// before an intact Logon arrives is [`EngineError::Closed`], or
+    /// [`EngineError::Codec`] carrying the I/O error when it closes partway
+    /// through a frame or fails.
+    pub async fn serve_stream<S>(&self, stream: S) -> Result<Connection, EngineError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_boxed(stream::boxed(stream)).await
+    }
+
+    /// [`AcceptorRegistry::serve`] and [`AcceptorRegistry::serve_stream`] on
+    /// an erased stream.
+    ///
+    /// # Errors
+    /// Every error [`AcceptorRegistry::serve`] documents.
+    async fn serve_boxed(&self, stream: BoxedStream) -> Result<Connection, EngineError> {
         self.settings_check()?;
         // One deadline for the read and the lookup together. The bound is
         // checked to be at most `MAX_TIMEOUT`, so the sum cannot overflow; it
@@ -1040,7 +1088,6 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
                 ))
             })?;
 
-        let _ = stream.set_nodelay(true);
         let mut framed = Framed::new(stream, routing_codec(self.max_message_size));
 
         let logon_frame = match read_handshake_frame_until(&mut framed, deadline, UNROUTED).await {

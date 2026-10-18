@@ -15,7 +15,11 @@
 //! [`Connection`] handle is the outbound message sink and exposes
 //! `wait_closed()` / `is_timed_out()`. [`Acceptor::accept`] is the convenience
 //! wrapper that pulls the next connection off a [`TcpListener`] and hands it to
-//! `serve`.
+//! `serve`. [`Acceptor::serve_stream`] runs the same handshake on a stream the
+//! caller has already accepted, of any type that is `AsyncRead + AsyncWrite +
+//! Unpin + Send + 'static` (a TLS stream, a Unix socket, an in-memory
+//! [`tokio::io::duplex`] pipe); `serve` is `TCP_NODELAY` followed by exactly
+//! that handshake.
 //!
 //! The accept loop and its supervision are the consumer's, exactly as
 //! reconnection is the consumer's for the initiator: an `Acceptor` is a single
@@ -186,6 +190,7 @@ use crate::reactor::{
     HandshakeRead, SessionParams, TICK_INTERVAL, lock_heartbeat, read_handshake_frame,
     refuse_handshake, send_handshake_admin, session_codec, spawn_session,
 };
+use crate::stream::{self, BoxedStream};
 use crate::wire::{
     self, ApplVersionGuard, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard,
     UnsupportedVersion,
@@ -204,6 +209,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::Framed;
 
@@ -239,10 +245,11 @@ impl Drop for AdmissionGuard {
 /// Server-side FIX engine.
 ///
 /// Owns the session configuration and the [`Application`] callbacks. Each
-/// accepted connection ([`Acceptor::accept`] / [`Acceptor::serve`]) establishes
-/// one live session and returns a [`Connection`] handle for it. Cloning the
-/// application is cheap, so an `Acceptor` is typically wrapped in an [`Arc`]
-/// and shared across the tasks serving each connection.
+/// accepted connection ([`Acceptor::accept`] / [`Acceptor::serve`] /
+/// [`Acceptor::serve_stream`]) establishes one live session and returns a
+/// [`Connection`] handle for it. Cloning the application is cheap, so an
+/// `Acceptor` is typically wrapped in an [`Arc`] and shared across the tasks
+/// serving each connection.
 ///
 /// The configuration is stated from the acceptor's point of view: its
 /// `sender_comp_id` is the acceptor's own CompID and its `target_comp_id` is
@@ -806,6 +813,58 @@ impl<A: Application + 'static> Acceptor<A> {
     /// [`EngineError::InitialSequenceBelowStore`] for a sender seed below the
     /// store under [`StoreFailurePolicy::CloseSession`].
     pub async fn serve(&self, stream: TcpStream) -> Result<Connection, EngineError> {
+        // TCP_NODELAY is set here, on the TCP path only.
+        self.serve_boxed(stream::tcp(stream)).await
+    }
+
+    /// Establishes a session on a byte stream the caller has already
+    /// accepted, completing the acceptor-side Logon handshake and spawning the
+    /// session reactor, exactly as [`Acceptor::serve`] does on a
+    /// [`TcpStream`].
+    ///
+    /// This is the seam for any transport the engine does not accept itself:
+    /// a TLS stream built with the TLS stack of your choice on top of an
+    /// accepted socket, a Unix socket, a connection through a proxy, or an
+    /// in-memory [`tokio::io::duplex`] pipe for tests. The handshake is the
+    /// one [`Acceptor::serve`] runs, unchanged: the same checks in the same
+    /// order, the same logon timeout, the same refusal groups, the same rule
+    /// that nothing reaches an attached store before the peer is
+    /// authenticated, the same `NextExpectedMsgSeqNum` (789) handling, and the
+    /// same reactor and write timeout once Active. Only `TCP_NODELAY`, which
+    /// [`Acceptor::serve`] sets, is not set: the engine cannot reach a socket
+    /// option through an arbitrary stream, so that is the caller's.
+    ///
+    /// The session owns the stream from here on and closes it when the
+    /// session ends; on an error the stream is dropped, which closes it.
+    ///
+    /// The stream is boxed once, here: every later read and write is a call
+    /// through its vtable, a cost paid per poll of the transport rather than
+    /// per message field. It has not been benchmarked.
+    ///
+    /// See [`Initiator::establish`](crate::Initiator::establish) for an
+    /// example running both roles over [`tokio::io::duplex`].
+    ///
+    /// # Arguments
+    /// * `stream` - An accepted byte stream from the counterparty
+    ///
+    /// # Errors
+    /// Every error [`Acceptor::serve`] documents. A stream that closes before
+    /// an intact Logon arrives is [`EngineError::Closed`], or
+    /// [`EngineError::Codec`] carrying the I/O error when it closes partway
+    /// through a frame or fails.
+    pub async fn serve_stream<S>(&self, stream: S) -> Result<Connection, EngineError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_boxed(stream::boxed(stream)).await
+    }
+
+    /// [`Acceptor::serve`] and [`Acceptor::serve_stream`] on an erased
+    /// stream: reads the inbound Logon and runs the handshake on it.
+    ///
+    /// # Errors
+    /// Every error [`Acceptor::serve`] documents.
+    async fn serve_boxed(&self, stream: BoxedStream) -> Result<Connection, EngineError> {
         let version = self.preflight()?;
 
         let session_id = self.session_id.clone();
@@ -814,7 +873,6 @@ impl<A: Application + 'static> Acceptor<A> {
         // Typestate: Disconnected -> Connecting (acceptor side).
         let session = Session::<Disconnected>::new(session_id.to_string()).accept();
 
-        let _ = stream.set_nodelay(true);
         let mut framed = Framed::new(stream, session_codec(&self.config, version));
 
         // Await the inbound Logon. Garbled frames are skipped, and the logon

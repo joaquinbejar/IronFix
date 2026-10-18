@@ -20,7 +20,10 @@
 >   `dictionary/versions/`).
 > - **Several "decisions" below are unbuilt.** There is no synchronous or
 >   kernel-bypass mode, no arena allocator (`bumpalo` is not a dependency), no
->   compiled FAST templates, no code generation in use, and no TLS.
+>   compiled FAST templates, no code generation in use, and no TLS. (A caller
+>   can bring its own TLS stream: the engines run over any `AsyncRead +
+>   AsyncWrite` stream handed to `Initiator::establish`,
+>   `Acceptor::serve_stream` or `AcceptorRegistry::serve_stream`.)
 > - **Code blocks are illustrative sketches, not extracts from the codebase.**
 >   Most do not compile against the current crates.
 >
@@ -386,9 +389,12 @@ pub struct MmapStore {
 > `OutboundMessage`, `Connection::send` queues it on a tokio mpsc, the
 > `Initiator`'s background reactor stamps the header/`MsgSeqNum`/trailer via the
 > private `wire::MessageFactory`, encodes with `ironfix-tagvalue`, and writes
-> through `FixCodec` on a `TcpStream`. There is no io_uring, no `SO_BUSY_POLL`,
-> no hardware timestamping, and no store write. The target latency below is a
-> goal, not a measurement.
+> through `FixCodec` on the session's byte stream: a `TcpStream` with
+> `TCP_NODELAY` set (`Initiator::connect`), or whatever stream the caller
+> handed to `Initiator::establish`, boxed once per session so each poll of it
+> is a dynamic call. There is no io_uring, no `SO_BUSY_POLL`, no hardware
+> timestamping, and no store write. The target latency below is a goal, not a
+> measurement.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -1270,9 +1276,11 @@ impl HeartbeatManager {
 
 > **Aspirational.** The workspace currently tests with inline `#[cfg(test)]`
 > modules (the house convention) plus cross-crate end-to-end tests in
-> `ironfix-engine/tests/initiator_tests.rs`, which drive a real `TcpListener`
-> and `Framed<TcpStream, FixCodec>` against `Initiator`. There is no conformance
-> test framework and no certification suite of the shape described below.
+> `ironfix-engine/tests/`: `initiator_tests.rs` and its siblings drive a real
+> `TcpListener` and `Framed<TcpStream, FixCodec>` against the engines, and
+> `stream_tests.rs` runs both engines against each other over
+> `tokio::io::duplex`, with no socket. There is no conformance test framework
+> and no certification suite of the shape described below.
 
 ### Conformance test framework
 
@@ -1500,7 +1508,8 @@ fn configure_thread_affinity() {
 > land; do not quote them as commitments. Work has not followed this order —
 > for example, `ironfix-engine`'s `Initiator` and `Acceptor` (listed under
 > Phase 6) exist while file-based stores (Phase 2), TLS and a transport-level
-> TCP connector/acceptor (Phase 3; the engines open TCP themselves), the FAST
+> TCP connector/acceptor (Phase 3; the engines open TCP themselves, or run
+> over any stream the caller opened), the FAST
 > template parser and multicast (Phase 4) and the code generation consumers
 > (Phase 5) do not.
 >

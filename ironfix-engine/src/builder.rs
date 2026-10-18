@@ -15,10 +15,12 @@
 //!
 //! Every setter on this builder configures something an engine actually honors.
 //! The builder does **not** carry TLS or reconnection knobs: there is no TLS in
-//! the workspace, and reconnection is the consumer's responsibility (the
-//! [`Initiator`] establishes a single session per `connect`, and a supervisor
-//! calls it again). The connect timeout applies to the initiator only; an
-//! acceptor waits for inbound connections and bounds the Logon handshake with
+//! the workspace (a caller that needs it hands its own TLS stream to
+//! [`Initiator::establish`] or [`Acceptor::serve_stream`]), and reconnection is
+//! the consumer's responsibility (the [`Initiator`] establishes a single
+//! session per `connect` or `establish`, and a supervisor calls it again). The
+//! connect timeout applies to [`Initiator::connect`] only; an acceptor waits
+//! for inbound connections and bounds the Logon handshake with
 //! [`SessionConfig::logon_timeout`] instead. A [`MessageStore`] set with
 //! [`EngineBuilder::with_store`] is attached by every terminal method; since a
 //! store belongs to exactly one session, a registry of several sessions takes

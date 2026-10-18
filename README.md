@@ -79,6 +79,16 @@ messages and the engine wiring do not exist yet.
   location IDs on every inbound message. `EngineBuilder` terminates in any
   of them via `into_initiator()`, `into_acceptor()` or
   `into_acceptor_registry()`.
+- **Any byte stream, not only TCP.** `Initiator::establish`,
+  `Acceptor::serve_stream` and `AcceptorRegistry::serve_stream` run the same
+  handshake and reactor over a stream the caller has already connected or
+  accepted: anything `AsyncRead + AsyncWrite + Unpin + Send + 'static`, such
+  as a TLS stream built with the TLS crate of your choice, a Unix socket, or
+  a `tokio::io::duplex` pipe for tests without sockets. `connect`, `serve`
+  and `accept` are the TCP dial or accept (with `TCP_NODELAY` set) followed by
+  that same path. The stream is boxed once per session, so no public type
+  gains a type parameter; the cost is a call through a vtable on each poll of
+  the stream, which has not been benchmarked.
 - **One session reactor shared by both roles.** Once Logon completes, the
   engine owns the socket: heartbeats and TestRequests at the negotiated
   interval, CompID and `SendingTime` validation, sequence-gap detection with
@@ -251,9 +261,12 @@ around it.
   connections still in their Logon handshake is the consumer's job, in its
   accept loop.
 - **No TLS.** There is no `rustls` dependency anywhere. `ironfix-transport`
-  contains `FixCodec` only; the engines open plain TCP themselves (`Initiator`
-  calls `TcpStream::connect`, `Acceptor` serves a `TcpStream`). See "Current
-  limitations" in `ironfix-engine/src/lib.rs`.
+  contains `FixCodec` only, and the engines open plain TCP themselves
+  (`Initiator::connect` calls `TcpStream::connect`, `Acceptor::serve` serves a
+  `TcpStream`). To run FIX over TLS, build the TLS stream yourself and hand it
+  to `Initiator::establish` or `Acceptor::serve_stream`: IronFix chooses no
+  TLS stack and no crypto provider. See "Current limitations" in
+  `ironfix-engine/src/lib.rs`.
 - **Async only.** Everything that touches a socket runs on Tokio. There is no
   synchronous mode, no kernel-bypass path, and no busy-polling transport. A
   sans-IO session core with Tokio as one driver is the accepted direction
@@ -433,7 +446,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 `EngineBuilder` terminates in either engine: `into_initiator()` produces the
 client above, and `into_acceptor()` produces an `Acceptor` that establishes
 sessions on inbound connections. Both engines hand the socket to the same
-session reactor once the Logon handshake completes.
+session reactor once the Logon handshake completes. To run either over a
+stream you opened yourself (TLS, a Unix socket, an in-memory pipe), use
+`Initiator::establish` or `Acceptor::serve_stream` in place of `connect` or
+`accept`.
 
 ```rust,no_run
 use ironfix_core::types::CompId;

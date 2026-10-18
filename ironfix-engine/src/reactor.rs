@@ -139,6 +139,7 @@ use crate::persistence::{
     HandshakeStore, OwedReset, PersistedCounters, SessionStore, StoreFailurePolicy, file_and_spend,
     timed,
 };
+use crate::stream::BoxedStream;
 use crate::wire::{
     self, ApplVersionGuard, ApplVersionProblem, MessageFactory, PeerIdentity, PendingMessage,
     SendingTimeGuard, SendingTimeProblem,
@@ -160,14 +161,14 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_util::codec::Framed;
 
-/// Framed TCP stream carrying FIX messages.
-pub(crate) type FixFramed = Framed<TcpStream, FixCodec>;
+/// The session's byte stream, whatever it is (TCP, or any stream a caller
+/// provided; see [`crate::stream`]), framed as FIX messages.
+pub(crate) type FixFramed = Framed<BoxedStream, FixCodec>;
 
 /// Builds the codec both engines frame their socket with.
 ///
