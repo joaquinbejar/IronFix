@@ -29,16 +29,19 @@
 use async_trait::async_trait;
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
+use ironfix_core::error::StoreError;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::{CompId, Timestamp};
+use ironfix_core::version::FixVersion;
 use ironfix_engine::application::{Application, RejectReason, SessionId};
 use ironfix_engine::{
     Acceptor, AcceptorRegistry, Connection, EngineError, Initiator, OutboundMessage,
 };
 use ironfix_session::{SessionConfig, SessionConfigError};
-use ironfix_store::{FileStore, FileStoreConfig, MemoryStore, MessageStore};
+use ironfix_store::{FileStore, FileStoreConfig, MemoryStore, MessageStore, StoredMessage};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -174,6 +177,9 @@ impl Application for RecordingApp {
                 "logon 789={}",
                 message.get_field_str(789).unwrap_or("-")
             ));
+        }
+        if message.msg_type() == &MsgType::ResendRequest {
+            self.record("resend request".to_string());
         }
         Ok(())
     }
@@ -692,25 +698,160 @@ async fn test_acceptor_refuses_a_malformed_next_expected_without_panic() {
 }
 
 // ---------------------------------------------------------------------------
-// Acceptor: what 789 does not change
+// Acceptor: a gapped Logon, held or requested
 // ---------------------------------------------------------------------------
 
-/// A gap in the Logon's own `MsgSeqNum` still draws a `ResendRequest`, and
-/// the acknowledgement declares the first missing number: a gapped Logon is
-/// not consumed.
+/// Both sides declared 789 and the Logon is gapped (3 expected, 6 received):
+/// the acknowledgement declares 789 = 3, and no `ResendRequest` goes out,
+/// since the initiator resends 3..=5 on its own because of that 789. The
+/// Logon is held and its number consumed once the gap below it is filled:
+/// the next number expected is then 7, persisted, and a message at 7 is
+/// delivered.
 #[tokio::test]
-async fn test_acceptor_gap_in_the_logon_still_requests_a_resend() {
+async fn test_acceptor_holds_a_gapped_logon_when_both_sides_declared_789() {
+    let store = Arc::new(MemoryStore::new());
+    ok(
+        store.set_next_target_seq(3).await,
+        "seed the target counter",
+    );
+    let (venue_app, mut venue_rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(venue_789(), Arc::clone(&venue_app))
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    let (mut framed, connection, ack) = establish(acceptor, client_logon(6, &[(789, "1")])).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("1"));
+    assert_eq!(field(&ack, 789).as_deref(), Some("3"));
+    assert_silent(&mut framed, "no ResendRequest crosses the 789 resend").await;
+    assert_eq!(connection.next_target_seq(), 3, "the Logon is held");
+
+    // The initiator's 789 resend: 3 and 4 filled, 5 replayed.
+    ok(
+        framed
+            .send(client_msg("4", 3, &[(123, "Y"), (36, "5")]))
+            .await,
+        "the client fills 3..=4",
+    );
+    ok(
+        framed.send(client_msg("D", 5, &ORDER_BODY)).await,
+        "the client resends 5",
+    );
+    assert_eq!(next_app_message(&mut venue_rx).await.1, "5");
+    assert_eq!(
+        connection.next_target_seq(),
+        7,
+        "the held Logon (6) is consumed"
+    );
+    assert_eq!(store.next_target_seq(), 7, "and its number persisted");
+
+    ok(
+        framed.send(client_msg("D", 7, &ORDER_BODY)).await,
+        "the client sends a live order",
+    );
+    assert_eq!(next_app_message(&mut venue_rx).await.1, "7");
+    assert_silent(&mut framed, "no ResendRequest at any point").await;
+}
+
+/// A counterparty that fills the gap through its own Logon (one gap fill from
+/// the expected number to the Logon's plus one) releases the hold: the
+/// expectation jumps past the held Logon, which is not consumed a second
+/// time.
+#[tokio::test]
+async fn test_acceptor_gap_fill_past_the_held_logon_clears_the_hold() {
+    let (venue_app, mut venue_rx) = RecordingApp::new();
+    let acceptor =
+        Arc::new(Acceptor::new(venue_789(), Arc::clone(&venue_app)).with_initial_sequences(1, 3));
+    let (mut framed, connection, _ack) = establish(acceptor, client_logon(6, &[(789, "1")])).await;
+    ok(
+        framed
+            .send(client_msg("4", 3, &[(123, "Y"), (36, "7")]))
+            .await,
+        "the client fills 3..=6",
+    );
+    ok(
+        framed.send(client_msg("D", 7, &ORDER_BODY)).await,
+        "the client sends a live order",
+    );
+    assert_eq!(next_app_message(&mut venue_rx).await.1, "7");
+    assert_eq!(connection.next_target_seq(), 8);
+    assert_silent(&mut framed, "no ResendRequest").await;
+}
+
+/// The fallback: the initiator declared 789 but never resends. Nothing goes
+/// out before the resend timeout; then exactly one `ResendRequest` (from the
+/// first missing number, open-ended) does, even with a limit of one request,
+/// and once it too goes unanswered the session is logged out.
+#[tokio::test]
+async fn test_acceptor_held_logon_falls_back_to_one_resend_request() {
+    let resend_timeout = Duration::from_millis(400);
+    let (venue_app, _rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(
+            venue_789()
+                .with_resend_timeout(resend_timeout)
+                .with_max_resend_requests(1),
+            Arc::clone(&venue_app),
+        )
+        .with_initial_sequences(1, 3),
+    );
+    let (mut framed, _connection, _ack) = establish(acceptor, client_logon(6, &[(789, "1")])).await;
+    let held_at = std::time::Instant::now();
+    let request = next_frame(&mut framed).await;
+    assert!(
+        held_at.elapsed() >= resend_timeout / 2,
+        "nothing before the resend timeout"
+    );
+    assert_eq!(msg_type_of(&request), "2");
+    assert_eq!(field(&request, 7).as_deref(), Some("3"));
+    assert_eq!(field(&request, 16).as_deref(), Some("0"));
+    let logout = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&logout), "5", "one request only, then a Logout");
+}
+
+/// Frames from beyond the held Logon that arrive before the gap below it is
+/// filled are not covered by the 789 resend: they are requested as soon as
+/// the held Logon is consumed, not after the resend timeout.
+#[tokio::test]
+async fn test_acceptor_requests_what_arrived_past_the_held_logon_once_released() {
+    let (venue_app, mut venue_rx) = RecordingApp::new();
+    let acceptor =
+        Arc::new(Acceptor::new(venue_789(), Arc::clone(&venue_app)).with_initial_sequences(1, 3));
+    let (mut framed, _connection, _ack) = establish(acceptor, client_logon(6, &[(789, "1")])).await;
+    ok(
+        framed.send(client_msg("D", 7, &ORDER_BODY)).await,
+        "a live order overtakes the resend",
+    );
+    assert_silent(&mut framed, "no request crosses the 789 resend").await;
+    ok(
+        framed
+            .send(client_msg("4", 3, &[(123, "Y"), (36, "6")]))
+            .await,
+        "the client fills 3..=5",
+    );
+    let request = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&request), "2");
+    assert_eq!(field(&request, 7).as_deref(), Some("7"));
+    assert_eq!(field(&request, 16).as_deref(), Some("0"));
+    ok(
+        framed.send(client_msg("D", 7, &ORDER_BODY)).await,
+        "the client resends 7",
+    );
+    assert_eq!(next_app_message(&mut venue_rx).await.1, "7");
+}
+
+/// A gapped Logon that declares no 789 is not held: the counterparty is not
+/// known to resend anything on its own, so the gap is requested at once.
+#[tokio::test]
+async fn test_acceptor_gapped_logon_without_789_still_requests_a_resend() {
     let (venue_app, _rx) = RecordingApp::new();
     let acceptor =
         Arc::new(Acceptor::new(venue_789(), Arc::clone(&venue_app)).with_initial_sequences(1, 3));
-    let (mut framed, _connection, ack) = establish(acceptor, client_logon(6, &[(789, "1")])).await;
-    assert_eq!(field(&ack, 34).as_deref(), Some("1"));
+    let (mut framed, _connection, ack) = establish(acceptor, client_logon(6, &[])).await;
     assert_eq!(field(&ack, 789).as_deref(), Some("3"));
     let request = next_frame(&mut framed).await;
     assert_eq!(msg_type_of(&request), "2");
     assert_eq!(field(&request, 7).as_deref(), Some("3"));
     assert_eq!(field(&request, 16).as_deref(), Some("0"));
-    assert_silent(&mut framed, "789 = 1 asks for nothing").await;
 }
 
 /// A reset this side drives (`reset_on_logon`) discards the stream the
@@ -1203,13 +1344,16 @@ async fn test_initiator_refuses_a_malformed_next_expected_with_a_reject() {
 }
 
 // ---------------------------------------------------------------------------
-// Initiator: what 789 does not change
+// Initiator: a gapped acknowledgement, held or requested
 // ---------------------------------------------------------------------------
 
-/// A gap in the acknowledgement's own `MsgSeqNum` still draws a
-/// `ResendRequest` as the session's first act.
+/// Both sides declared 789 and the acknowledgement is gapped (1 expected, 4
+/// received): no `ResendRequest` goes out, since the acceptor resends 1..=3 on
+/// its own because of the Logon's 789. The ack is held and its number
+/// consumed once the gap below it is filled, and a live message at 5 is then
+/// delivered in sequence.
 #[tokio::test]
-async fn test_initiator_gap_in_the_ack_still_requests_a_resend() {
+async fn test_initiator_holds_a_gapped_ack_when_both_sides_declared_789() {
     let (listener, addr) = bind_listener().await;
     let venue = tokio::spawn(async move {
         let (mut framed, logon) = read_client_logon(listener).await;
@@ -1218,12 +1362,146 @@ async fn test_initiator_gap_in_the_ack_still_requests_a_resend() {
             framed.send(venue_ack(4, &[(789, "2")])).await,
             "the venue acknowledges at 4",
         );
+        assert_silent(&mut framed, "no ResendRequest crosses the 789 resend").await;
+        ok(
+            framed
+                .send(venue_msg("4", 1, &[(123, "Y"), (36, "4")]))
+                .await,
+            "the venue fills 1..=3",
+        );
+        ok(
+            framed.send(venue_msg("8", 5, &REPORT_BODY)).await,
+            "the venue sends a live report",
+        );
+        assert_silent(&mut framed, "no ResendRequest at any point").await;
+        framed
+    });
+    let (client_app, mut client_rx) = RecordingApp::new();
+    let connection = ok(
+        Initiator::new(client_789(), Arc::clone(&client_app))
+            .connect(addr)
+            .await,
+        "a gapped ack still establishes the session",
+    );
+    assert_eq!(next_app_message(&mut client_rx).await.1, "5");
+    assert_eq!(
+        connection.next_target_seq(),
+        6,
+        "the held ack (4) was consumed"
+    );
+    let _framed = ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+}
+
+/// On the initiator side too, one gap fill from the expected number past the
+/// held acknowledgement clears the hold.
+#[tokio::test]
+async fn test_initiator_gap_fill_past_the_held_ack_clears_the_hold() {
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let (mut framed, _logon) = read_client_logon(listener).await;
+        ok(
+            framed.send(venue_ack(4, &[(789, "2")])).await,
+            "the venue acknowledges at 4",
+        );
+        ok(
+            framed
+                .send(venue_msg("4", 1, &[(123, "Y"), (36, "5")]))
+                .await,
+            "the venue fills 1..=4",
+        );
+        ok(
+            framed.send(venue_msg("8", 5, &REPORT_BODY)).await,
+            "the venue sends a live report",
+        );
+        assert_silent(&mut framed, "no ResendRequest").await;
+        framed
+    });
+    let (client_app, mut client_rx) = RecordingApp::new();
+    let connection = ok(
+        Initiator::new(client_789(), Arc::clone(&client_app))
+            .connect(addr)
+            .await,
+        "the session is established",
+    );
+    assert_eq!(next_app_message(&mut client_rx).await.1, "5");
+    assert_eq!(connection.next_target_seq(), 6);
+    let _framed = ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+}
+
+/// The fallback on the initiator side: the acceptor declared 789 but never
+/// resends. Exactly one `ResendRequest` goes out after the resend timeout,
+/// even with a limit of one request, and then the session is logged out.
+#[tokio::test]
+async fn test_initiator_held_ack_falls_back_to_one_resend_request() {
+    let resend_timeout = Duration::from_millis(400);
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let (mut framed, _logon) = read_client_logon(listener).await;
+        ok(
+            framed.send(venue_ack(4, &[(789, "2")])).await,
+            "the venue acknowledges at 4",
+        );
+        let held_at = std::time::Instant::now();
         let request = next_frame(&mut framed).await;
+        assert!(
+            held_at.elapsed() >= resend_timeout / 2,
+            "nothing before the resend timeout"
+        );
         assert_eq!(msg_type_of(&request), "2");
         assert_eq!(field(&request, 34).as_deref(), Some("2"));
         assert_eq!(field(&request, 7).as_deref(), Some("1"));
         assert_eq!(field(&request, 16).as_deref(), Some("0"));
-        assert_silent(&mut framed, "789 = 2 asks for nothing").await;
+        let logout = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&logout), "5", "one request only, then a Logout");
+    });
+    let (client_app, _rx) = RecordingApp::new();
+    let _connection = ok(
+        Initiator::new(
+            client_789()
+                .with_resend_timeout(resend_timeout)
+                .with_max_resend_requests(1),
+            Arc::clone(&client_app),
+        )
+        .connect(addr)
+        .await,
+        "the session is established",
+    );
+    ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+}
+
+/// A gapped acknowledgement that declares no 789 is not held: the gap is
+/// requested as the session's first act.
+#[tokio::test]
+async fn test_initiator_gapped_ack_without_789_still_requests_a_resend() {
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let (mut framed, _logon) = read_client_logon(listener).await;
+        ok(
+            framed.send(venue_ack(4, &[])).await,
+            "the venue acknowledges at 4 without 789",
+        );
+        let request = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&request), "2");
+        assert_eq!(field(&request, 7).as_deref(), Some("1"));
+        assert_eq!(field(&request, 16).as_deref(), Some("0"));
         framed
     });
     let (client_app, _rx) = RecordingApp::new();
@@ -1336,6 +1614,283 @@ async fn test_initiator_with_the_flag_off_ignores_the_acks_next_expected() {
 }
 
 // ---------------------------------------------------------------------------
+// Owed resets, a store behind a refusal, and FIXT.1.1 end to end
+// ---------------------------------------------------------------------------
+
+/// A store whose `reset` can be made to fail, to leave a reset owed.
+#[derive(Debug)]
+struct FlakyResetStore {
+    inner: MemoryStore,
+    fail_reset: AtomicBool,
+}
+
+impl FlakyResetStore {
+    fn new() -> Self {
+        Self {
+            inner: MemoryStore::new(),
+            fail_reset: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl MessageStore for FlakyResetStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), StoreError> {
+        self.inner.store(seq_num, msg_type, message).await
+    }
+
+    async fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        self.inner.get_range(begin, end).await
+    }
+
+    fn next_sender_seq(&self) -> u64 {
+        self.inner.next_sender_seq()
+    }
+
+    fn next_target_seq(&self) -> u64 {
+        self.inner.next_target_seq()
+    }
+
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.inner.set_next_sender_seq(seq).await
+    }
+
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.inner.set_next_target_seq(seq).await
+    }
+
+    async fn reset(&self) -> Result<(), StoreError> {
+        if self.fail_reset.load(Ordering::SeqCst) {
+            return Err(StoreError::Io(
+                "reset refused by the test store".to_string(),
+            ));
+        }
+        self.inner.reset().await
+    }
+
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.inner.creation_time()
+    }
+}
+
+/// A reset an earlier session owes (its close-time reset failed) is one this
+/// side drives: the next Logon, which did not ask for it, has its 789 ignored,
+/// since that 789 describes the stream the reset discards. The acknowledgement
+/// is message 1 of the new stream, with 141 = Y and 789 = 2, and nothing is
+/// replayed or refused.
+#[tokio::test]
+async fn test_acceptor_owed_reset_ignores_the_initiators_next_expected() {
+    let store = Arc::new(FlakyResetStore::new());
+    let (venue_app, _rx) = RecordingApp::new();
+    let mut config = venue_789();
+    config.reset_on_disconnect = true;
+    let acceptor = Arc::new(
+        Acceptor::new(config, Arc::clone(&venue_app))
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+
+    // First session: the close-time reset fails, so the reset is owed.
+    let (framed, connection, _ack) =
+        establish(Arc::clone(&acceptor), client_logon(1, &[(789, "1")])).await;
+    store.fail_reset.store(true, Ordering::SeqCst);
+    drop(framed);
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+    store.fail_reset.store(false, Ordering::SeqCst);
+
+    // Second session: 789 = 9 would be above anything sent, but the stream it
+    // describes is discarded by the owed reset.
+    let (mut framed, connection, ack) =
+        establish(Arc::clone(&acceptor), client_logon(5, &[(789, "9")])).await;
+    assert_eq!(field(&ack, 34).as_deref(), Some("1"));
+    assert_eq!(field(&ack, 141).as_deref(), Some("Y"));
+    assert_eq!(field(&ack, 789).as_deref(), Some("2"));
+    assert_eq!(connection.next_target_seq(), 2);
+    assert_silent(&mut framed, "nothing is replayed or refused").await;
+}
+
+/// An initiator that owes a reset (its close-time reset failed) declares it on
+/// its next Logon, at 1 with 141 = Y, and that Logon declares 789 = 1: the
+/// acknowledgement of a reset is message 1.
+#[tokio::test]
+async fn test_initiator_owed_reset_logon_declares_next_expected_1() {
+    let store = Arc::new(FlakyResetStore::new());
+    let (client_app, _rx) = RecordingApp::new();
+    let mut config = client_789();
+    config.reset_on_disconnect = true;
+    let initiator = Initiator::new(config, Arc::clone(&client_app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+
+    // First session: acknowledged, then the venue hangs up while the store
+    // refuses the close-time reset.
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let (mut framed, logon) = read_client_logon(listener).await;
+        assert_eq!(field(&logon, 789).as_deref(), Some("1"));
+        ok(
+            framed.send(venue_ack(1, &[(789, "2")])).await,
+            "the venue acknowledges",
+        );
+        framed
+    });
+    let connection = ok(initiator.connect(addr).await, "first connect");
+    let framed = ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+    store.fail_reset.store(true, Ordering::SeqCst);
+    drop(framed);
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "the first session closes within 5s",
+    );
+    store.fail_reset.store(false, Ordering::SeqCst);
+
+    // Second session: the owed reset is declared, with 789 = 1.
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move {
+        let (mut framed, logon) = read_client_logon(listener).await;
+        assert_eq!(field(&logon, 34).as_deref(), Some("1"));
+        assert_eq!(field(&logon, 141).as_deref(), Some("Y"));
+        assert_eq!(field(&logon, 789).as_deref(), Some("1"));
+        ok(
+            framed.send(venue_ack(1, &[(141, "Y"), (789, "2")])).await,
+            "the venue acknowledges the reset",
+        );
+        assert_silent(&mut framed, "nothing replayed after a reset").await;
+        framed
+    });
+    let connection = ok(initiator.connect(addr).await, "second connect");
+    assert_eq!(connection.next_sender_seq(), 2);
+    assert_eq!(connection.next_target_seq(), 2);
+    let _framed = ok(
+        ok(
+            timeout(Duration::from_secs(5), venue).await,
+            "venue done within 5s",
+        ),
+        "venue task",
+    );
+}
+
+/// A malformed 789 on a `ResetSeqNumFlag` Logon, against an acceptor with a
+/// store: refused before the store is reset. The previous stream stays filed,
+/// the Logon is not consumed, and the only write is the refusal's own Logout,
+/// numbered from the store and filed like every authenticated refusal
+/// (ADR-0017).
+#[tokio::test]
+async fn test_acceptor_malformed_next_expected_with_a_store_never_resets_it() {
+    let (store, _, _) = seeded_venue_store().await;
+    let (venue_app, _rx) = RecordingApp::new();
+    let acceptor = Arc::new(
+        Acceptor::new(venue_789(), Arc::clone(&venue_app))
+            .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    );
+    let (result, frames) =
+        refused_logon(acceptor, client_logon(1, &[(141, "Y"), (789, "abc")])).await;
+
+    assert_next_expected_refusal(&result, &["789", "'abc' is not a sequence number"]);
+    assert_eq!(frames.len(), 1, "one Logout");
+    assert_eq!(msg_type_of(&frames[0]), "5");
+    assert_eq!(field(&frames[0], 34).as_deref(), Some("5"));
+    assert!(!venue_app.logged_on());
+    for seq in 1..=4u64 {
+        assert!(store.contains(seq), "the store was not reset (frame {seq})");
+    }
+    assert!(store.contains(5), "the Logout is filed");
+    assert_eq!(store.next_sender_seq(), 6);
+    assert_eq!(store.next_target_seq(), 3, "the Logon is not consumed");
+}
+
+/// A real FIX.5.0SP2 `Initiator` against a real FIX.5.0SP2 `Acceptor`, both
+/// with 789 on, over FIXT.1.1. The initiator's Logon (5) declares 789 = 1
+/// besides `DefaultApplVerID` (1137) = 9; the acceptor, whose ack goes out
+/// at 3, fills 1..=2; the initiator holds the gapped ack and consumes it once
+/// that fill arrives, without a `ResendRequest` either way; then application
+/// messages flow in both directions in sequence.
+#[tokio::test]
+async fn test_fixt_initiator_against_acceptor_with_next_expected() {
+    let (listener, addr) = bind_listener().await;
+    let (venue_app, mut venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config("FIX.5.0SP2").with_send_next_expected_msg_seq_num(true),
+        Arc::clone(&venue_app),
+    )
+    .with_initial_sequences(3, 5);
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+    let (client_app, mut client_rx) = RecordingApp::new();
+    let client = ok(
+        Initiator::new(
+            client_config("FIX.5.0SP2").with_send_next_expected_msg_seq_num(true),
+            Arc::clone(&client_app),
+        )
+        .with_initial_sequences(5, 1)
+        .connect(addr)
+        .await,
+        "the FIXT initiator logs on",
+    );
+    let venue_connection = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), venue).await,
+                "handshake within 5s",
+            ),
+            "venue task joins",
+        ),
+        "the FIXT acceptor establishes the session",
+    );
+    assert!(venue_app.events().contains(&"logon 789=1".to_string()));
+    assert!(client_app.events().contains(&"logon 789=6".to_string()));
+    assert_eq!(
+        client.counterparty_default_appl_version(),
+        Some(FixVersion::Fix50Sp2)
+    );
+
+    let mut report = OutboundMessage::new(MsgType::ExecutionReport);
+    report
+        .push_str(37, "EX-1")
+        .push_str(17, "E-1")
+        .push_char(150, '0')
+        .push_char(39, '0');
+    ok(
+        venue_connection.send(report).await,
+        "the venue sends a report",
+    );
+    let received = next_app_message(&mut client_rx).await;
+    assert_eq!(received.1, "4", "in sequence after the held ack (3)");
+    assert_eq!(client.next_target_seq(), 5);
+
+    let mut order = OutboundMessage::new(MsgType::NewOrderSingle);
+    order.push_str(11, "ORDER-1");
+    ok(client.send(order).await, "the client sends an order");
+    assert_eq!(next_app_message(&mut venue_rx).await.1, "6");
+
+    for (side, events) in [
+        ("client", client_app.events()),
+        ("venue", venue_app.events()),
+    ] {
+        assert!(
+            !events.iter().any(|event| event == "resend request"),
+            "no ResendRequest reached the {side}: {events:?}"
+        );
+    }
+    ok(client.logout().await, "the client logs out");
+    ok(
+        timeout(Duration::from_secs(5), client.wait_closed()).await,
+        "the client session closes within 5s",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // End to end: a real Initiator reconnecting to a real Acceptor over FileStores
 // ---------------------------------------------------------------------------
 
@@ -1377,7 +1932,11 @@ async fn released(store: &Arc<FileStore>) {
 /// their numbers durable leaves it. Its next Logon declares 789 = 2, and the
 /// venue, restarted from its own journal, resends the three reports
 /// (`PossDupFlag` = Y, original `SendingTime` in `OrigSendingTime`) and
-/// gap-fills its Logout, all below its acknowledgement.
+/// gap-fills its Logout, all below its acknowledgement. The client holds the
+/// gapped acknowledgement and consumes it once the resend fills the gap, so
+/// no `ResendRequest` goes either way, and a report the venue sends after the
+/// resend is delivered in sequence, well within the resend timeout both sides
+/// are configured with: nothing waits on a retry.
 #[tokio::test]
 async fn test_initiator_against_acceptor_replays_what_the_restarted_side_missed() {
     let dir = TestDir::new("restart");
@@ -1482,18 +2041,26 @@ async fn test_initiator_against_acceptor_replays_what_the_restarted_side_missed(
     );
     assert_eq!(venue_store.next_sender_seq(), 6);
 
-    // Second session.
+    // Second session, with a short resend timeout on both sides: a gap left
+    // to a retry would show up as a delay of at least this much.
+    let resend_timeout = Duration::from_secs(2);
     let (listener, addr) = bind_listener().await;
     let (venue_app, _venue_rx) = RecordingApp::new();
-    let acceptor = Acceptor::new(venue_789(), Arc::clone(&venue_app))
-        .with_store(Arc::new(venue_store) as Arc<dyn MessageStore>);
+    let acceptor = Acceptor::new(
+        venue_789().with_resend_timeout(resend_timeout),
+        Arc::clone(&venue_app),
+    )
+    .with_store(Arc::new(venue_store) as Arc<dyn MessageStore>);
     let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
     let (client_app, mut client_rx) = RecordingApp::new();
     let client = ok(
-        Initiator::new(client_789(), Arc::clone(&client_app))
-            .with_store(Arc::new(client_store) as Arc<dyn MessageStore>)
-            .connect(addr)
-            .await,
+        Initiator::new(
+            client_789().with_resend_timeout(resend_timeout),
+            Arc::clone(&client_app),
+        )
+        .with_store(Arc::new(client_store) as Arc<dyn MessageStore>)
+        .connect(addr)
+        .await,
         "second connect",
     );
     let venue_connection = ok(
@@ -1521,6 +2088,39 @@ async fn test_initiator_against_acceptor_replays_what_the_restarted_side_missed(
         assert_eq!(first.2, None, "the first delivery was no duplicate");
     }
 
+    // A live report after the resend: the held acknowledgement (6) was
+    // consumed once the resend filled 2..=5, so the report (7) is in sequence
+    // and arrives well within the resend timeout.
+    let mut report = OutboundMessage::new(MsgType::ExecutionReport);
+    report
+        .push_str(37, "EX-LIVE")
+        .push_str(17, "E-LIVE")
+        .push_char(150, '0')
+        .push_char(39, '0');
+    let sent_at = std::time::Instant::now();
+    ok(
+        venue_connection.send(report).await,
+        "the venue sends a live report",
+    );
+    let live = ok(
+        timeout(resend_timeout / 2, client_rx.recv()).await,
+        "the live report arrives within half the resend timeout",
+    );
+    let live = some(live, "the application channel stays open");
+    assert!(sent_at.elapsed() < resend_timeout / 2);
+    assert_eq!(live.1, "7");
+    assert_eq!(live.2, None, "an original send, not a resend");
+    assert_eq!(client.next_target_seq(), 8);
+    for (side, events) in [
+        ("client", client_app.events()),
+        ("venue", venue_app.events()),
+    ] {
+        assert!(
+            !events.iter().any(|event| event == "resend request"),
+            "no ResendRequest reached the {side}: {events:?}"
+        );
+    }
+
     ok(client.logout().await, "the client logs out");
     ok(
         timeout(Duration::from_secs(5), client.wait_closed()).await,
@@ -1530,4 +2130,13 @@ async fn test_initiator_against_acceptor_replays_what_the_restarted_side_missed(
         timeout(Duration::from_secs(5), venue_connection.wait_closed()).await,
         "the venue session closes within 5s",
     );
+    for (side, events) in [
+        ("client", client_app.events()),
+        ("venue", venue_app.events()),
+    ] {
+        assert!(
+            !events.iter().any(|event| event == "resend request"),
+            "no ResendRequest reached the {side} up to the Logout: {events:?}"
+        );
+    }
 }
