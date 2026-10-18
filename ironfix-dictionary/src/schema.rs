@@ -31,6 +31,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::iter::FusedIterator;
 
 /// FIX protocol version.
 ///
@@ -578,8 +579,8 @@ impl GroupDef {
     }
 
     /// Returns the members of an entry in dictionary order, without
-    /// allocating.
-    pub fn members(&self) -> impl ExactSizeIterator<Item = MemberRef<'_>> {
+    /// allocating. The iterator knows its exact length and is fused.
+    pub fn members(&self) -> impl ExactSizeIterator<Item = MemberRef<'_>> + FusedIterator {
         self.members.iter()
     }
 
@@ -637,8 +638,9 @@ impl ComponentDef {
         }
     }
 
-    /// Returns the members in dictionary order, without allocating.
-    pub fn members(&self) -> impl ExactSizeIterator<Item = MemberRef<'_>> {
+    /// Returns the members in dictionary order, without allocating. The
+    /// iterator knows its exact length and is fused.
+    pub fn members(&self) -> impl ExactSizeIterator<Item = MemberRef<'_>> + FusedIterator {
         self.members.iter()
     }
 
@@ -712,8 +714,8 @@ impl MessageDef {
     }
 
     /// Returns the members of the body in dictionary order, without
-    /// allocating.
-    pub fn members(&self) -> impl ExactSizeIterator<Item = MemberRef<'_>> {
+    /// allocating. The iterator knows its exact length and is fused.
+    pub fn members(&self) -> impl ExactSizeIterator<Item = MemberRef<'_>> + FusedIterator {
         self.members.iter()
     }
 
@@ -915,7 +917,7 @@ impl<'a> Iterator for Interleave<'a> {
 
 impl ExactSizeIterator for Interleave<'_> {}
 
-impl std::iter::FusedIterator for Interleave<'_> {}
+impl FusedIterator for Interleave<'_> {}
 
 /// Message category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1253,5 +1255,38 @@ mod tests {
             assert_eq!(kinds(&members), [Field, Field, Component]);
             assert_eq!(members.iter().len(), 3);
         }
+    }
+
+    /// Accepts only an exact-size, fused iterator: the bounds `members()`
+    /// promises.
+    fn exact_and_fused<I: ExactSizeIterator + FusedIterator>(members: I) -> usize {
+        members.len()
+    }
+
+    #[test]
+    fn test_members_are_exact_size_and_fused() {
+        let field = || {
+            Member::Field(FieldRef {
+                tag: 11,
+                name: "ClOrdID".to_owned(),
+                required: true,
+            })
+        };
+        let group = GroupDef::new(453, "NoPartyIDs", 448, false, vec![field()]);
+        let component = ComponentDef::new("Instrument", vec![field(), field()]);
+        let message = MessageDef::new(
+            "D",
+            "NewOrderSingle",
+            MessageCategory::App,
+            vec![field(), Member::Group(group.clone())],
+        );
+        assert_eq!(exact_and_fused(group.members()), 1);
+        assert_eq!(exact_and_fused(component.members()), 2);
+        assert_eq!(exact_and_fused(message.members()), 2);
+        // Fused: once exhausted, it stays exhausted.
+        let mut members = message.members();
+        assert!(members.by_ref().nth(1).is_some());
+        assert!(members.next().is_none());
+        assert!(members.next().is_none());
     }
 }
