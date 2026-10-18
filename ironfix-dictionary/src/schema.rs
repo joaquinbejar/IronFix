@@ -151,6 +151,20 @@ impl std::str::FromStr for FieldType {
     /// Creates a FieldType from a string name.
     ///
     /// The accepted spellings are those used by QuickFIX XML dictionaries.
+    /// Three of them are older or derived spellings mapped onto an existing
+    /// variant rather than given one of their own, because their wire form is
+    /// exactly that variant's:
+    ///
+    /// - `UTCDATE` (FIX 4.2, e.g. `MDEntryDate(272)`) is the FIX 4.2 name of
+    ///   what FIX 4.3 renamed `UTCDateOnly`: a `YYYYMMDD` date, so it maps to
+    ///   [`FieldType::UtcDateOnly`].
+    /// - `XID` and `XIDREF` (FIX 5.0 SP2) are an element identifier and a
+    ///   reference to one. On the wire they have the same form as `String`,
+    ///   so they map to [`FieldType::String`]. This is a documented loosening:
+    ///   what makes them more than a string is **not** validated, namely that
+    ///   an `XID` is unique within the message, that an `XIDREF` refers to an
+    ///   `XID` that is present (reference integrity), and the `xs:ID` /
+    ///   `NCName` lexical rules (for example, no leading digit).
     ///
     /// # Arguments
     /// * `s` - The type name from the FIX dictionary
@@ -173,7 +187,11 @@ impl std::str::FromStr for FieldType {
             "PERCENTAGE" => Self::Percentage,
             "CHAR" => Self::Char,
             "BOOLEAN" => Self::Boolean,
-            "STRING" => Self::String,
+            // `XID` / `XIDREF` are the FIX 5.0 SP2 identifier and
+            // identifier-reference types. Same wire form as String; their
+            // uniqueness, reference integrity, and xs:ID / NCName lexical
+            // rules are not validated (a documented loosening).
+            "STRING" | "XID" | "XIDREF" => Self::String,
             "MULTIPLECHARVALUE" => Self::MultipleCharValue,
             // `MULTIPLEVALUESTRING` is the spelling the vendored FIX 4.4
             // QuickFIX dictionary uses for its eight multi-value string
@@ -187,7 +205,10 @@ impl std::str::FromStr for FieldType {
             "MONTHYEAR" => Self::MonthYear,
             "UTCTIMESTAMP" => Self::UtcTimestamp,
             "UTCTIMEONLY" => Self::UtcTimeOnly,
-            "UTCDATEONLY" => Self::UtcDateOnly,
+            // `UTCDATE` is the FIX 4.2 spelling (MDEntryDate(272) in the
+            // vendored FIX 4.2 dictionary) of what FIX 4.3 renamed
+            // `UTCDateOnly`; both are a `YYYYMMDD` date.
+            "UTCDATEONLY" | "UTCDATE" => Self::UtcDateOnly,
             "LOCALMKTDATE" => Self::LocalMktDate,
             "LOCALMKTTIME" => Self::LocalMktTime,
             "TZTIMEONLY" => Self::TzTimeOnly,
@@ -682,6 +703,23 @@ mod tests {
             Ok(FieldType::MultipleStringValue)
         );
         assert!(FieldType::MultipleStringValue.is_multi_value());
+    }
+
+    #[test]
+    fn test_field_type_from_str_fix42_utcdate_maps_to_utc_date_only() {
+        // FIX 4.2 spells the YYYYMMDD date `UTCDATE`; FIX 4.3 renamed it.
+        assert_eq!("UTCDATE".parse::<FieldType>(), Ok(FieldType::UtcDateOnly));
+        assert_eq!(
+            "UTCDATEONLY".parse::<FieldType>(),
+            Ok(FieldType::UtcDateOnly)
+        );
+    }
+
+    #[test]
+    fn test_field_type_from_str_xid_and_xidref_map_to_string() {
+        // FIX 5.0 SP2 derives both identifier types from String.
+        assert_eq!("XID".parse::<FieldType>(), Ok(FieldType::String));
+        assert_eq!("XIDREF".parse::<FieldType>(), Ok(FieldType::String));
     }
 
     #[test]

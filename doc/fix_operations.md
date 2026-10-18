@@ -35,6 +35,7 @@ These messages are required for establishing and maintaining FIX sessions.
 | 52 | SendingTime | Timestamp (UTC) |
 | 98 | EncryptMethod | Encryption method (0 = None) |
 | 108 | HeartBtInt | Heartbeat interval in seconds |
+| 1137 | DefaultApplVerID | Default application version. **Required when `8=FIXT.1.1`**; not part of FIX 4.x |
 | 10 | CheckSum | Message checksum |
 
 **Optional Fields**:
@@ -43,7 +44,7 @@ These messages are required for establishing and maintaining FIX sessions.
 | 141 | ResetSeqNumFlag | Reset sequence numbers (Y/N) |
 | 553 | Username | Authentication username |
 | 554 | Password | Authentication password |
-| 1137 | DefaultApplVerID | Default application version (FIX 5.0+) |
+| 384 | NoMsgTypes | FIXT.1.1 only: repeating group of supported message types (372, 385, 1130, 1406, 1131, 1410). The embedded QuickFIX `FIXT11.xml` does not define it; see "Dictionary side, standalone" below |
 
 **Server Behavior**:
 1. Validate SenderCompID and TargetCompID
@@ -1145,6 +1146,43 @@ distinction the type draws: `FixVersion::as_str` is the version's own name
 **Not implemented for 5.0:** no application-version-driven validation of any
 kind. The `ApplVerID` values are stamped, not enforced, and the engine never
 consults a dictionary.
+
+**Dictionary side, standalone.** `ironfix-dictionary` embeds the QuickFIX
+FIXT 1.1 transport dictionary (`Dictionary::fixt11()`) and the FIX 5.0 SP2
+application dictionary (`Dictionary::fix50sp2()`), alongside FIX 4.2 and FIX
+4.4. `SessionDictionary` composes the FIXT 1.1 transport with an application
+dictionary of any version FIXT.1.1 carries (FIX 4.0 through 5.0 SP2, ApplVerID
+2 to 9), and `Validator::for_session` validates a message against the pair
+with QuickFIX-like semantics: `BeginString` (8) must be `FIXT.1.1`; an admin
+message the transport defines (Logon, Heartbeat, ...) is checked against FIXT
+1.1 alone, so a Logon must carry `DefaultApplVerID` (1137); an application
+message takes its header and trailer from FIXT 1.1 and its body from the
+application dictionary. Neither the engine nor the codec calls it. See
+ADR-0010.
+
+Where it differs from QuickFIX:
+
+- **No `ApplVerID`-based selection.** QuickFIX picks the application dictionary
+  per message from `ApplVerID` (1128), falling back to the counterparty's
+  `DefaultApplVerID` (1137). Here the pair names one application dictionary
+  and neither tag is consulted.
+- **Admin routing by `msgcat`.** Any message type the transport defines with
+  `msgcat='admin'` is admin, so `XMLnonFIX` (35=n) is validated against FIXT
+  1.1. QuickFIX's `Message::isAdminMsgType` covers only `0`, `A` and `1` to `5`,
+  so it treats 35=n as an application message.
+- **All errors, no ordering check.** Every error is returned rather than the
+  first, and header/body/trailer field order is not enforced.
+- **`DefaultApplVerID` (1137) values are not checked.** `FIXT11.xml` declares it
+  as a STRING with no enumeration, so any value passes.
+
+**Known upstream deviation.** FIXT 1.1 defines the Logon `MsgTypeGrp` component
+as the `NoMsgTypes` (384) group (`RefMsgType` 372, `MsgDirection` 385,
+`RefApplVerID` 1130, `RefApplExtID` 1406, `RefCstmApplVerID` 1131,
+`DefaultVerIndicator` 1410). The vendored QuickFIX `FIXT11.xml` defines
+`MsgTypeGrp` with no members and does not define 384 or 385, so a Logon carrying
+the group is reported as invalid against `Dictionary::fixt11()`. The file stays
+unpatched; to accept the group, load a FIXT 1.1 dictionary that defines it with
+`Dictionary::from_quickfix_xml` and compose that instead.
 
 ---
 

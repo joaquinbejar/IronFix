@@ -1124,6 +1124,100 @@ mod tests {
         assert!(code.contains("pub(crate) type FixDecimal"));
     }
 
+    /// Loads an embedded dictionary, failing the test with the load error.
+    #[track_caller]
+    fn embedded(
+        loaded: Result<&'static Dictionary, ironfix_dictionary::DictionaryError>,
+        what: &str,
+    ) -> &'static Dictionary {
+        match loaded {
+            Ok(dict) => dict,
+            Err(err) => panic!("the embedded {what} dictionary must load: {err}"),
+        }
+    }
+
+    /// Returns the body of the generated struct `name`.
+    #[track_caller]
+    fn struct_body<'c>(code: &'c str, name: &str) -> &'c str {
+        let header = format!("pub struct {name} {{");
+        let Some(start) = code.find(&header) else {
+            panic!("{name} must be generated");
+        };
+        let Some(len) = code.get(start..).and_then(|rest| rest.find("\n    }")) else {
+            panic!("{name} struct must be terminated");
+        };
+        match code.get(start..start + len) {
+            Some(body) => body,
+            None => panic!("{name} struct body must be sliceable"),
+        }
+    }
+
+    #[test]
+    fn test_generate_fix44_emits_the_self_closing_xml_non_fix_message() {
+        // FIX44.xml defines `<message name='XMLnonFIX' msgtype='n' ... />`;
+        // the loader keeps it, so it is generated as a field-less struct.
+        let code = generate(&CodeGenerator::new(), fix44());
+        assert!(code.contains("/// XMLnonFIX message (MsgType=n)."));
+        assert!(code.contains("pub struct XMLnonFIX {}"));
+    }
+
+    #[test]
+    fn test_generate_embedded_fix42_succeeds_with_decimal_prices() {
+        let code = generate(
+            &CodeGenerator::new(),
+            embedded(Dictionary::fix42(), "FIX 4.2"),
+        );
+        assert!(code.starts_with("// Generated FIX.4.2 definitions."));
+        assert!(code.contains("pub type FixDecimal = rust_decimal::Decimal;"));
+        let body = struct_body(&code, "NewOrderSingle");
+        // HandlInst(21) is required in FIX 4.2 NewOrderSingle.
+        assert!(body.contains("pub handl_inst: char,"), "{body}");
+        assert!(body.contains("pub price: Option<FixDecimal>,"), "{body}");
+        assert!(
+            body.contains("pub order_qty: Option<FixDecimal>,"),
+            "{body}"
+        );
+        assert!(!code.contains("f64"));
+        assert!(!code.contains("f32"));
+    }
+
+    #[test]
+    fn test_generate_embedded_fixt11_succeeds_without_a_decimal_alias() {
+        let code = generate(
+            &CodeGenerator::new(),
+            embedded(Dictionary::fixt11(), "FIXT 1.1"),
+        );
+        assert!(code.starts_with("// Generated FIXT.1.1 definitions."));
+        // No FIXT 1.1 field is a price, quantity, or amount.
+        assert!(!code.contains("FixDecimal"));
+        let logon = struct_body(&code, "Logon");
+        assert!(
+            logon.contains("pub default_appl_ver_id: String,"),
+            "{logon}"
+        );
+        assert!(logon.contains("pub heart_bt_int: i64,"), "{logon}");
+        assert!(!code.contains("f64"));
+    }
+
+    #[test]
+    fn test_generate_embedded_fix50sp2_succeeds_with_decimal_prices() {
+        // The output is about 50 MB, so it is generated and inspected here but
+        // never compiled in-repo.
+        let code = generate(
+            &CodeGenerator::new(),
+            embedded(Dictionary::fix50sp2(), "FIX 5.0 SP2"),
+        );
+        assert!(code.starts_with("// Generated FIX.5.0SP2 definitions."));
+        assert!(code.contains("pub type FixDecimal = rust_decimal::Decimal;"));
+        let body = struct_body(&code, "NewOrderSingle");
+        assert!(body.contains("pub cl_ord_id: String,"), "{body}");
+        assert!(body.contains("pub price: Option<FixDecimal>,"), "{body}");
+        // XID-typed fields (FIX 5.0 SP2 only) are emitted as String.
+        assert!(code.contains("pub cash_settl_term_xid: Option<String>,"));
+        assert!(!code.contains("f64"));
+        assert!(!code.contains("f32"));
+    }
+
     #[test]
     fn test_generate_without_messages_emits_no_decimal_alias() {
         let generator = CodeGenerator::with_config(GeneratorConfig {

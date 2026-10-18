@@ -66,7 +66,9 @@ The architecture prioritizes three often-competing goals through careful design 
 > `reactor.rs` / `wire.rs`; `ironfix-session` has no
 > `recovery.rs` and its FSM lives in `state.rs`; `ironfix-fast` has no
 > `template.rs` or `dictionary.rs`; `ironfix-dictionary` has `loader.rs` /
-> `schema.rs` / `validator.rs` and a single vendored `spec/FIX44.xml`.
+> `schema.rs` / `validator.rs` / `composition.rs` and four QuickFIX
+> dictionaries vendored verbatim under `spec/` (`FIX42.xml`, `FIX44.xml`,
+> `FIXT11.xml`, `FIX50SP2.xml`), not a `versions/` directory.
 
 ```
 ironfix/
@@ -984,13 +986,20 @@ rustflags = ["-C", "target-cpu=native"]
 
 > **What "support" means today.** The session layer is parameterised by
 > `BeginString` and each version below has a runnable client/server example
-> pair, so the session handshake is exercised for all of them. But **only FIX
-> 4.4 ships an embedded dictionary** (`ironfix-dictionary/spec/FIX44.xml`,
-> vendored from QuickFIX); every other version requires you to supply the
-> QuickFIX XML yourself via `Dictionary::from_quickfix_xml`. And the `Validator`
-> is never invoked by the engine or the codec, so no version is schema-validated
-> automatically. The "Key Characteristics" column below is background on the FIX
-> specification, not a statement about IronFix coverage.
+> pair, so the session handshake is exercised for all of them. But **only four
+> dictionaries are embedded** (`ironfix-dictionary/spec/`, vendored verbatim
+> from QuickFIX): FIX 4.2 (`Dictionary::fix42()`), FIX 4.4
+> (`Dictionary::fix44()`), the FIXT 1.1 transport dictionary
+> (`Dictionary::fixt11()`) and the FIX 5.0 SP2 application dictionary
+> (`Dictionary::fix50sp2()`). FIX 5.0 SP2 is validated by composing the last two
+> with `SessionDictionary` and `Validator::for_session`. FIX 4.0, 4.1, 4.3, 5.0
+> and 5.0 SP1 require you to supply the QuickFIX XML yourself via
+> `Dictionary::from_quickfix_xml` (for 5.0 and 5.0 SP1, `SessionDictionary`
+> accepts a caller-supplied application dictionary next to the embedded FIXT 1.1
+> transport, but no test loads the QuickFIX `FIX50.xml` / `FIX50SP1.xml`). And the
+> `Validator` is never invoked by the engine or the codec, so no version is
+> schema-validated automatically. The "Key Characteristics" column below is
+> background on the FIX specification, not a statement about IronFix coverage.
 
 | Version | BeginString | Transport | Key Characteristics |
 |---------|-------------|-----------|---------------------|
@@ -1004,6 +1013,8 @@ rustflags = ["-C", "target-cpu=native"]
 | FIX 5.0 SP2 | `FIXT.1.1` | Separate | Extension packs applied |
 
 **FIXT 1.1 handling**: For FIX 5.0+, the session layer uses `FIXT.1.1` BeginString while application messages carry an `ApplVerID` tag indicating the application version (`7`=5.0, `8`=5.0SP1, `9`=5.0SP2).
+
+*Status (dictionary side): built for validation, see ADR-0010.* `SessionDictionary::new(transport, application)` pairs a FIXT.1.1 dictionary with an application dictionary of any version FIXT.1.1 carries, FIX 4.0 through 5.0 SP2 (a non-FIXT transport, or FIXT.1.1 as the application, is `DictionaryError::IncompatibleComposition`). `Validator::for_session` then applies QuickFIX-like rules: `BeginString` must be `FIXT.1.1`; admin messages the transport defines are validated against it alone; for application messages, header and trailer tags resolve against the transport and body tags against the application dictionary. Unlike QuickFIX, `ApplVerID` is not read to pick the application dictionary, and admin routing follows the transport's `msgcat` (so 35=n is admin). The embedded QuickFIX `FIXT11.xml` does not define the Logon `NoMsgTypes(384)` group, an upstream deviation documented in `ironfix-dictionary/spec/README.md`.
 
 ---
 
@@ -1460,7 +1471,8 @@ fn configure_thread_affinity() {
 
 **Phase 1 - Core Foundation (Weeks 1-4)**
 - `ironfix-core`: Base types, error handling, field definitions
-- `ironfix-dictionary`: XML parser, embedded FIX 4.2/4.4 dictionaries
+- `ironfix-dictionary`: XML parser, embedded FIX 4.2/4.4 dictionaries (built:
+  FIX 4.2, FIX 4.4, FIXT 1.1 and FIX 5.0 SP2 are embedded)
 - `ironfix-tagvalue`: Zero-copy decoder with SIMD checksum
 - Basic encoder with pre-allocated buffers
 
