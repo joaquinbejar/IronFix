@@ -278,17 +278,39 @@ keeping the sender number that said it was filed, so a resend gap-filled an
 acknowledged frame. #78 refused the same damage, because the counter record
 appended after the frame made it non-tail damage; the boundary restores that.
 `FileStore::repair` (and `Never`, which cuts damage wherever it is) still cut
-below the boundary; the store then writes both slots again, with the cut
-journal's end as their boundary, so the journal is consistent for any policy
-afterwards. A reset starts the boundary at the first record; a compaction
-sets it to the end of the records it copied, all flushed before its rename;
-the cut back after a failed flush leaves the slots on disk as the last
-successful flush left them, whose boundaries are no higher than the cut.
+below the boundary; the store then writes one new slot (the same counters, a
+generation above every other, the cut journal's end as its boundary) into the
+position that does not hold the newest slot, so the journal is consistent for
+any policy afterwards. One slot is enough, since loading reads the newest
+slot's boundary only, and writing only the other position keeps it
+crash-safe: a torn write leaves the newest slot, and the journal as it was,
+for the next repair to cut and restamp again. The new boundary is true:
+everything below the cut lay below the old boundary, which vouched for it. A
+reset starts the boundary at the first record; a compaction sets it to the
+end of the records it copied, all flushed before its rename; the cut back
+after a failed flush leaves the slots on disk as the last successful flush
+left them, whose boundaries are no higher than the cut.
+
+**A slot never vouches for more than is known durable.** The boundary a
+counter write records is the end of the last successful flush. When the store
+opens or refreshes under a flushing policy it flushes what it loaded, so all
+of it is durable. Under `Never` it does not flush (its documented behaviour),
+so the journal counts as durable only as far as the boundary of the newest
+slot it loaded; the records it read past that may still be only in the page
+cache. Before this rule, a store reopened under `Never` took the end of what
+it read as durable: a counter write then vouched for frames a power loss
+could still lose, and a later open under a flushing policy refused a journal
+that had only lost its unflushed tail. Flushing at open under every policy
+would also have fixed it, but would change what `Never` promises; a test
+simulates the sequence (two runs under `Never`, a power loss that keeps the
+slot and loses the frames, a third run under `EveryWrite`).
 
 **Failures.** A slot write that fails puts the slot's previous bytes back (or
 leaves that pending). A failed flush, as in ADR-0006, cuts the records back to
-the last successful flush and also writes back the slots as that flush left
-them; both stay pending, and the store refuses every call but a reset until a
+the last successful flush and also puts back the slot written since that
+flush, as the flush left it (only that slot differs; the one holding the
+durable checkpoint is never written, here or when the refresh completes the
+undo); both stay pending, and the store refuses every call but a reset until a
 refresh has made them durable **and reloaded the journal**. Before this
 change a refresh cleared what was pending as soon as the undo was on disk,
 before the reload; a reload that then failed left the store usable with an

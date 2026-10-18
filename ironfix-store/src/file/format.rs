@@ -106,8 +106,14 @@
 //! (as #78 refused damage followed by a later counter record), and only
 //! damage past the boundary may be cut. Under `Never` and in a repair, which
 //! cut damage wherever it is, a cut below the boundary leaves the slots
-//! claiming more than the file holds, so the store writes them again with the
-//! new end as their boundary.
+//! claiming more than the file holds, so the store writes one new slot (the
+//! same counters, the next generation, the new end as its boundary) into the
+//! position that does not hold the newest slot, which it leaves as it is.
+//!
+//! The boundary written into a slot is never more than the store knows to be
+//! on stable storage. Under `Never`, which does not flush when it opens, that
+//! is the boundary of the newest slot it loaded, not the end of what it read:
+//! the rest may still be only in the page cache.
 //!
 //! # Other versions
 //!
@@ -350,6 +356,9 @@ pub(crate) struct Scan {
     /// slot: a cut a `Never` or repair scan made below it. The slots must be
     /// written again before they are trusted.
     pub(crate) slots_stale: bool,
+    /// The durable boundary of the newest valid slot: how far the journal is
+    /// known to be on stable storage, whatever the scan read past it.
+    pub(crate) boundary: u64,
 }
 
 /// One decoded record body.
@@ -1000,6 +1009,7 @@ pub(crate) fn scan<R: Read>(
         truncation,
         dead_bytes: replay.dead_bytes,
         slots_stale,
+        boundary,
     })
 }
 
