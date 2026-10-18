@@ -788,10 +788,11 @@ async fn test_disallowed_appl_ver_id_is_rejected_and_its_number_consumed() {
     assert_eq!(field(&heartbeat, 112).as_deref(), Some("STILL-THERE"));
 }
 
-/// A message whose `ApplVerID` is no code at all, or repeated, is rejected
-/// the same way (18 and 13 respectively), each consuming its number.
+/// A message whose `ApplVerID` names a FIX 4.x version (FIX 4.4 carried over
+/// FIXT.1.1), or is repeated, is rejected too (18 and 13 respectively), each
+/// consuming its number.
 #[tokio::test]
-async fn test_unknown_or_repeated_appl_ver_id_is_rejected() {
+async fn test_fix4_or_repeated_appl_ver_id_is_rejected() {
     let (venue_app, mut venue_rx) = RecordingApp::new();
     let acceptor = Arc::new(Acceptor::new(
         venue_config("FIX.5.0SP2"),
@@ -809,6 +810,11 @@ async fn test_unknown_or_repeated_appl_ver_id_is_rejected() {
     let reject = next_frame(&mut framed).await;
     assert_eq!(field(&reject, 373).as_deref(), Some("18"));
     assert_eq!(field(&reject, 371).as_deref(), Some("1128"));
+    let text = some(field(&reject, 58), "the Reject says why");
+    assert!(
+        text.contains("ApplVerID (1128) 6 (FIX.4.4) is not an application version"),
+        "{text}"
+    );
 
     ok(
         framed

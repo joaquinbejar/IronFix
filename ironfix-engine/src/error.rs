@@ -106,8 +106,8 @@ pub enum EngineError {
     /// `DefaultApplVerID` (1137) on its Logon is not one this session accepts.
     ///
     /// Raised by the acceptor for a Logon whose 1137 is missing, repeated,
-    /// not an application-version code this engine frames (`7`, `8` or `9`),
-    /// or a version outside
+    /// names no version (anything but the `ApplVerID` codes `2` to `9`), or
+    /// names a version outside
     /// [`SessionConfig::accepts_appl_version`](ironfix_session::SessionConfig::accepts_appl_version);
     /// and by the initiator for an acknowledgement whose 1137, when present,
     /// fails the same rule. Only FIX 5.0 sessions (framed as FIXT.1.1) raise

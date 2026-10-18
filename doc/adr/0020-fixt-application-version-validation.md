@@ -30,16 +30,27 @@ Constraints any answer keeps:
 
 ## Decision
 
-### Vocabulary: one table, both directions
+### Vocabulary: one table, decoding apart from acceptance
 
-`FixVersion::from_appl_ver_id(&str) -> Option<FixVersion>` is the exact
-inverse of `FixVersion::appl_ver_id`: `7`, `8` and `9` name FIX.5.0, 5.0 SP1
-and 5.0 SP2, and nothing else names a version. The `ApplVerID` enumeration
-also defines `0` to `6` (FIX 2.7 to FIX 4.4), used to carry FIX 4.x messages
-over FIXT.1.1; they map to nothing, for the reason `appl_ver_id` does not
-return them: a 4.x `FixVersion` is a pre-FIXT session with its own
-`BeginString` in this workspace, not an application version of a FIXT one. A
-peer sending them is refused (below) rather than misread.
+`FixVersion::from_appl_ver_id(&str) -> Option<FixVersion>` decodes the whole
+`ApplVerID` enumeration as far as `FixVersion` has variants: `2` to `6` name
+FIX 4.0 to FIX 4.4, `7`, `8` and `9` name FIX.5.0, 5.0 SP1 and 5.0 SP2. `0`
+(FIX 2.7) and `1` (FIX 3.0) name versions the type does not model, and `10`
+(FIX_LATEST in later editions of the enumeration) names no fixed version; all
+three, and anything else, are `None` and refused as unknown. The inverse of
+`FixVersion::appl_ver_id` holds one way only: every code it stamps decodes back
+to its version, but a FIX 4.x version decodes from its code and stamps none,
+because this workspace frames FIX 4.x as its own pre-FIXT session.
+
+Decoding is not acceptance. Whether a decoded version is accepted is the
+session's rule (below), which takes only versions with an `ApplVerID` code
+this workspace stamps, so a peer declaring FIX 4.x over FIXT.1.1 (`6`) is
+refused as "6 (FIX.4.4) is not an application version this session accepts"
+(reason 18) rather than as unknown. The decoder covers the full list so that
+`core`'s table stays the single authority for it, and so that selecting a
+dictionary by `ApplVerID` later does not have to change what a published
+`const fn` returns. (An earlier revision decoded only `7` to `9`; review
+asked for the whole list.)
 
 ### Configuration: what a session accepts
 
@@ -188,8 +199,9 @@ calling `deliver_app` directly; the method's documentation says so.
   another version, or none, is now refused. FIX 4.x sessions are unchanged.
 - **Not done:** no dictionary is selected by `ApplVerID`; the peer's default
   is not adopted for outbound messages; FIX 4.x over FIXT.1.1 (`ApplVerID` 2 to
-  6) is refused; `CstmApplVerID` (1129), `ApplExtID` (1156) and
-  `DefaultApplExtID` (1407) are not checked.
+  6) is refused; `CstmApplVerID` (1129), `ApplExtID` (1156),
+  `DefaultApplExtID` (1407) and `DefaultCstmApplVerID` (1408) are not
+  checked.
 - The crate DAG is unchanged: `core` gains a function, `session` a field and a
   pure rule over `core` types, `engine` the checks. No dependency was added.
 - No performance claim (ADR-0001). The in-session check adds one scan of the

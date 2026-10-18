@@ -635,8 +635,9 @@ pub(crate) enum ApplVersionProblem {
         /// The repeated tag.
         tag: u32,
     },
-    /// The value is not an application-version code this engine frames
-    /// (anything but `7`, `8` or `9`, including a FIX 4.x code).
+    /// The value names no version: it is not one of the `ApplVerID` codes
+    /// `2` to `9` that [`FixVersion::from_appl_ver_id`] decodes (`0`, `1` and
+    /// `10` included).
     Unknown {
         /// The offending tag.
         tag: u32,
@@ -646,11 +647,14 @@ pub(crate) enum ApplVersionProblem {
         /// The versions the session accepts, for the text.
         accepted: String,
     },
-    /// The value names a version this session does not accept.
+    /// The value names a version this session does not accept: a FIX 4.x
+    /// code (`2` to `6`), or a FIX 5.0 one outside the accepted set.
     NotAccepted {
         /// The offending tag.
         tag: u32,
-        /// The version the value names.
+        /// The code received: one of `2` to `9`, so a single digit.
+        code: String,
+        /// The version the code names.
         version: FixVersion,
         /// The versions the session accepts, for the text.
         accepted: String,
@@ -719,16 +723,14 @@ impl std::fmt::Display for ApplVersionProblem {
             ),
             Self::NotAccepted {
                 tag,
+                code,
                 version,
                 accepted,
-            } => {
-                let code = version.appl_ver_id().unwrap_or_default();
-                write!(
-                    f,
-                    "{name} ({tag}) {code} ({version}) is not an application version this \
-                     session accepts; it accepts {accepted}"
-                )
-            }
+            } => write!(
+                f,
+                "{name} ({tag}) {code} ({version}) is not an application version this \
+                 session accepts; it accepts {accepted}"
+            ),
         }
     }
 }
@@ -806,13 +808,14 @@ impl ApplVersionGuard {
 
     /// Checks one occurrence of an application-version tag.
     fn check_value(&self, tag: u32, value: &[u8]) -> Result<FixVersion, ApplVersionProblem> {
-        let named = std::str::from_utf8(value)
-            .ok()
-            .and_then(FixVersion::from_appl_ver_id);
-        match named {
+        // Decoding is `FixVersion`'s; acceptance is the session's. A FIX 4.x
+        // code decodes to a version no FIX 5.0 session accepts.
+        let text = std::str::from_utf8(value).ok();
+        match text.and_then(FixVersion::from_appl_ver_id) {
             Some(version) if self.accepted.contains(&version) => Ok(version),
             Some(version) => Err(ApplVersionProblem::NotAccepted {
                 tag,
+                code: text.unwrap_or_default().to_owned(),
                 version,
                 accepted: self.accepted_text.clone(),
             }),
@@ -839,9 +842,9 @@ impl ApplVersionGuard {
     /// # Errors
     /// [`ApplVersionProblem::Missing`] when `required` and 1137 is absent,
     /// [`ApplVersionProblem::Repeated`] when it occurs more than once,
-    /// [`ApplVersionProblem::Unknown`] when its value names no application
-    /// version this engine frames, and [`ApplVersionProblem::NotAccepted`]
-    /// when it names one the session does not accept.
+    /// [`ApplVersionProblem::Unknown`] when its value names no version, and
+    /// [`ApplVersionProblem::NotAccepted`] when it names one the session does
+    /// not accept.
     pub(crate) fn check_logon(
         &self,
         raw: &RawMessage<'_>,
@@ -872,9 +875,9 @@ impl ApplVersionGuard {
     ///
     /// # Errors
     /// [`ApplVersionProblem::Repeated`] when 1128 occurs more than once,
-    /// [`ApplVersionProblem::Unknown`] when its value names no application
-    /// version this engine frames, and [`ApplVersionProblem::NotAccepted`]
-    /// when it names one the session does not accept.
+    /// [`ApplVersionProblem::Unknown`] when its value names no version, and
+    /// [`ApplVersionProblem::NotAccepted`] when it names one the session does
+    /// not accept.
     pub(crate) fn check_application(&self, raw: &RawMessage<'_>) -> Result<(), ApplVersionProblem> {
         if !self.fixt {
             return Ok(());
@@ -2768,9 +2771,35 @@ mod tests {
     }
 
     #[test]
-    fn test_appl_guard_refuses_unknown_and_pre_fixt_codes() {
+    fn test_appl_guard_refuses_a_fix4_code_as_not_accepted() {
+        // 2 to 6 decode to FIX 4.x versions, which no FIX 5.0 session
+        // accepts: the refusal names the version.
         let guard = appl_guard("FIX.5.0SP2", &[]);
-        for value in ["X", "6", "2", "10", "09"] {
+        for (code, version) in [("2", FixVersion::Fix40), ("6", FixVersion::Fix44)] {
+            match guard.check_logon(&decode(&logon_with(&[(1137, code)])), true) {
+                Err(problem @ ApplVersionProblem::NotAccepted { .. }) => {
+                    assert_eq!(
+                        problem,
+                        ApplVersionProblem::NotAccepted {
+                            tag: 1137,
+                            code: code.to_string(),
+                            version,
+                            accepted: "9 (FIX.5.0SP2)".to_string(),
+                        }
+                    );
+                    let text = problem.to_string();
+                    assert!(text.contains(&format!("{code} ({version})")), "{text}");
+                    assert_eq!(problem.reject_reason().code, 18);
+                }
+                other => panic!("1137={code} must not be accepted, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_appl_guard_refuses_values_that_name_no_version() {
+        let guard = appl_guard("FIX.5.0SP2", &[]);
+        for value in ["X", "0", "1", "10", "09"] {
             match guard.check_logon(&decode(&logon_with(&[(1137, value)])), true) {
                 Err(ApplVersionProblem::Unknown {
                     tag, value: shown, ..

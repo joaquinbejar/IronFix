@@ -82,8 +82,9 @@ and stops at the first failure:
    that carries 1137 must carry it once, naming an application version the
    session accepts: its own configured version or one in
    `SessionConfig::allowed_appl_versions` (`SessionConfig::accepts_appl_version`).
-   A value that is not `7`, `8` or `9`, or names a version outside that set,
-   draws a session Reject with reason 18 (Invalid/Unsupported Application
+   A value that names no version (anything but the `ApplVerID` codes `2` to
+   `9`) or names one outside that set (every FIX 4.x code does) draws a
+   session Reject with reason 18 (Invalid/Unsupported Application
    Version), a repeated 1137 one with reason 13, `RefTagID` = 1137 in both
    cases, followed by a Logout; the handshake fails with
    `EngineError::ApplVersion`. An ack **without** 1137 is accepted: the
@@ -166,8 +167,8 @@ differences from the initiator are role-symmetric:
   Logon, so on a FIX 5.0 session the acceptor requires it, exactly once, naming
   an application version the session accepts (its own configured version or
   one in `SessionConfig::allowed_appl_versions`). A Logon without it, with it
-  twice, with a value that is not `7`, `8` or `9` (a FIX 4.x code included), or
-  naming a version outside the set is refused with a Logout whose `Text` says
+  twice, with a value that names no version, or naming a version outside the
+  set (a FIX 4.x code `2` to `6` always is) is refused with a Logout whose `Text` says
   why and lists the accepted versions (`EngineError::ApplVersion`). The check
   runs after `from_admin`, so the refusal belongs to the authenticated group
   below. The acknowledgement declares the acceptor's own version in 1137
@@ -813,7 +814,7 @@ FIX 4.x session (which carries no `ApplVerID` to reject).
 | 9 | Inbound `SenderCompID`/`TargetCompID` (and `SenderSubID`/`TargetSubID` when configured) do not match the session configuration, **or** appear outside the standard header |
 | 10 | Inbound `SendingTime` (52) differs from the local clock by more than the configured tolerance |
 | 13 | FIX 5.0 only: `ApplVerID` (1128) more than once in an inbound application message, or `DefaultApplVerID` (1137) more than once on the Logon acknowledgement (initiator); `RefTagID` = the repeated tag |
-| 18 | FIX 5.0 only: an inbound application message whose `ApplVerID` (1128) is not `7`, `8` or `9` or names a version the session does not accept (`RefTagID` = 1128; the message's number is consumed and it never reaches `from_app`), or a Logon acknowledgement whose `DefaultApplVerID` (1137) fails the same rule (`RefTagID` = 1137, followed by a Logout; initiator) |
+| 18 | FIX 5.0 only: an inbound application message whose `ApplVerID` (1128) names no version or a version the session does not accept (`RefTagID` = 1128; the message's number is consumed and it never reaches `from_app`), or a Logon acknowledgement whose `DefaultApplVerID` (1137) fails the same rule (`RefTagID` = 1137, followed by a Logout; initiator) |
 | any | Whatever an `Application::from_admin` / `from_app` implementation returns in its `RejectReason` |
 
 **Reason 10 (SendingTime accuracy) is implemented.** Every inbound frame's
@@ -1744,9 +1745,14 @@ is the rule, and the default (an empty set) accepts the configured version
 only. The set may name only FIX.5.0, FIX.5.0SP1 and FIX.5.0SP2, and only on a
 FIX 5.0 session: anything else is `SessionConfigError::UnusableApplVersion`,
 reported by the builder, by `SessionConfig::validate` and by both engines before
-a connection is taken or dialled. Values are read through
-`FixVersion::from_appl_ver_id`, the inverse of `FixVersion::appl_ver_id`, so
-only `7`, `8` and `9` name a version.
+a connection is taken or dialled. Values are decoded by
+`FixVersion::from_appl_ver_id`, which reads the whole `ApplVerID` list as far
+as `FixVersion` has variants (`2` to `6` = FIX 4.0 to 4.4, `7` to `9` = FIX
+5.0 to 5.0 SP2); decoding is not acceptance. A code that decodes to a version
+the session does not accept (any FIX 4.x code, or a 5.0 one outside the set)
+is refused as "not an application version this session accepts"; `0`
+(FIX 2.7), `1` (FIX 3.0), `10` (FIX_LATEST) and anything else name no version
+and are refused as unknown. Both are reason 18.
 
 | Where | Rule | Refusal |
 |---|---|---|
@@ -1768,8 +1774,8 @@ not checked.
   the session always declares and stamps its own configured version.
 - FIX 4.x messages carried over FIXT.1.1 (`ApplVerID` `2` to `6`) are refused:
   the engine frames a FIX 4.x version only as a FIX 4.x session.
-- `CstmApplVerID` (1129), `ApplExtID` (1156) and `DefaultApplExtID` (1407)
-  are not checked.
+- `CstmApplVerID` (1129), `ApplExtID` (1156), `DefaultApplExtID` (1407) and
+  `DefaultCstmApplVerID` (1408) are not checked.
 
 **Dictionary side, standalone.** `ironfix-dictionary` embeds the QuickFIX
 FIXT 1.1 transport dictionary (`Dictionary::fixt11()`) and the FIX 5.0 SP2
