@@ -300,6 +300,27 @@ pub enum DictionaryError {
         /// The limit, in members.
         limit: usize,
     },
+    /// An element name, an attribute name, or an attribute value the
+    /// Orchestra loader keeps is longer than
+    /// [`MAX_ORCHESTRA_NAME_LEN`](crate::orchestra::MAX_ORCHESTRA_NAME_LEN).
+    #[error("{what} is {len} bytes, over the {limit}-byte limit")]
+    NameTooLong {
+        /// What is too long, without the text itself (for example "the value
+        /// of attribute `name` of <fixr:field>").
+        what: String,
+        /// Its length, in bytes.
+        len: usize,
+        /// The limit, in bytes.
+        limit: usize,
+    },
+    /// An Orchestra repository holds more constructs the dictionary cannot
+    /// hold than the report accepts
+    /// ([`MAX_ORCHESTRA_REPORT_ENTRIES`](crate::orchestra::MAX_ORCHESTRA_REPORT_ENTRIES)).
+    #[error("more than {limit} unmapped constructs")]
+    TooManyUnmapped {
+        /// The limit, in report entries.
+        limit: usize,
+    },
     /// The Orchestra standard header or trailer component is referenced from
     /// a component or a group; only a message's own members may reference
     /// it, which is where the dictionary's header and trailer apply.

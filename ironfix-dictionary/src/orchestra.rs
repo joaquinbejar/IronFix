@@ -40,8 +40,12 @@
 //! or trailer references is expanded in place, because the dictionary keeps
 //! the envelope as fields and groups.
 //!
-//! Only the `base` scenario is loaded. `FIX.Latest`, which names no fixed FIX
-//! version, is [`DictionaryError::UnsupportedVersion`].
+//! Only the `base` scenario is loaded. Two versions are
+//! [`DictionaryError::UnsupportedVersion`]: `FIX.Latest`, which names no
+//! fixed FIX version, and a repository named `FIXT` whose version is not
+//! `FIXT.1.1`. The FIX Trading Community's FIXT session repository is one:
+//! it declares `FIX.5.0SP2_EP247`, an application version, where it describes
+//! the FIXT.1.1 session layer, so the version cannot be taken from it.
 //!
 //! # Reported, not mapped
 //!
@@ -56,12 +60,15 @@
 //!   reference to one (the member is left out);
 //! - a member whose presence is `forbidden` (left out), `ignored` or
 //!   `constant` (kept, optional);
-//! - a conditional presence `rule` (not evaluated: the member keeps its
-//!   static presence);
+//! - a conditional presence `rule`, with its presence and `when` condition
+//!   (not evaluated: the member keeps its static presence);
 //! - an attribute that constrains values the model cannot hold, such as
 //!   `minInclusive`, `implMaxLength`, `implMaxOccurs`, `lengthId`,
 //!   `discriminatorId` or `unionDataType`, and any attribute Orchestra 1.0
-//!   does not define.
+//!   does not define;
+//! - a group or code set nothing references: the dictionary holds a group
+//!   only where it is referenced, and a code set only on its fields. It is
+//!   still checked like the others.
 //!
 //! Descriptive content is ignored without a report entry: `annotation`
 //! (documentation and appinfo), `metadata`, `categories`, `sections`,
@@ -72,16 +79,23 @@
 //!
 //! A repository is parser input, held to the same standard as the QuickFIX
 //! loader: every malformed document maps to a typed [`DictionaryError`],
-//! never to a panic, an unbounded recursion, or an allocation sized from the
-//! document beyond its own length. The ceilings:
+//! never to a panic, an unbounded recursion, or an allocation that grows
+//! faster than the limits below allow. The ceilings:
 //!
 //! - [`MAX_ORCHESTRA_DOCUMENT_LEN`] bounds the document;
 //! - [`MAX_ORCHESTRA_ATTRIBUTES_LEN`] bounds the attributes of one element;
+//! - [`MAX_ORCHESTRA_NAME_LEN`] bounds every element name, attribute name
+//!   and attribute value the loader keeps, in the dictionary or the report,
+//!   so a name copied into every member or report entry that mentions it
+//!   stays short;
+//! - [`MAX_ORCHESTRA_REPORT_ENTRIES`] bounds the report, so a flood of
+//!   unmapped elements or attributes is an error rather than a report as
+//!   large as the document allows;
 //! - [`MAX_NESTING_DEPTH`] bounds both XML element nesting and
 //!   repeating-group nesting, exactly as in the QuickFIX loader;
-//! - [`MAX_COMPONENT_DEPTH`] bounds component
-//!   reference chains, and component cycles are rejected before resolution,
-//!   by the step both loaders share;
+//! - [`MAX_COMPONENT_DEPTH`] bounds component reference chains, and
+//!   component cycles are rejected before resolution, by the step both
+//!   loaders share;
 //! - [`MAX_ORCHESTRA_MEMBERS`] bounds the members group expansion produces.
 //!   Orchestra groups are definitions referenced by id, and the dictionary
 //!   holds a group inline at each reference, so a few hundred bytes of nested
@@ -89,7 +103,9 @@
 //!
 //! Dangling and duplicate ids, group cycles, unknown datatypes and code sets,
 //! groups without a count field, empty groups, ids that do not fit a `u32`,
-//! oversized attributes and truncated XML are each a typed error.
+//! oversized names and attributes and truncated XML are each a typed error.
+//! Every `base` group is checked (its count field and every id it
+//! references resolve), referenced or not.
 
 use crate::loader::{
     Assembly, ComponentIrs, DefinitionKind, DictionaryError, Item, MAX_COMPONENT_DEPTH,
@@ -115,10 +131,24 @@ pub const MAX_ORCHESTRA_DOCUMENT_LEN: usize = 64 * 1024 * 1024;
 
 /// Maximum length, in bytes, of the attributes of one element: 16 KiB.
 ///
-/// Orchestra names are at most 255 characters; the longest start tag of the
-/// FIX 4.4 standard repository is under 300 bytes. The limit also bounds the
-/// number of attributes on one element and the strings copied from them.
+/// The longest start tag of the FIX 4.4 standard repository is under 300
+/// bytes. The limit also bounds the number of attributes on one element.
 pub const MAX_ORCHESTRA_ATTRIBUTES_LEN: usize = 16 * 1024;
+
+/// Maximum length, in bytes, of an element name, an attribute name, or an
+/// attribute value the loader keeps: 255.
+///
+/// Orchestra 1.0 limits names and scenario names to 255 characters. The
+/// longest value the loader keeps from the FIX 4.4 standard repository is 43
+/// bytes, and from FIX Latest (Extension Pack 312) 65. The values it does
+/// not keep (documentation links, pedigree) are bounded by
+/// [`MAX_ORCHESTRA_ATTRIBUTES_LEN`] only.
+pub const MAX_ORCHESTRA_NAME_LEN: usize = 255;
+
+/// Maximum number of entries in an [`OrchestraReport`]: 65 536.
+///
+/// The FIX 4.4 standard repository needs 41.
+pub const MAX_ORCHESTRA_REPORT_ENTRIES: usize = 1 << 16;
 
 /// Maximum number of members group expansion may produce: 262 144.
 ///
@@ -263,6 +293,11 @@ pub enum UnmappedConstruct {
         location: String,
         /// The rule's name, if it has one.
         name: Option<String>,
+        /// The presence the rule gives when its condition holds, as written.
+        presence: Option<String>,
+        /// The rule's `when` condition, with character and entity
+        /// references resolved.
+        condition: Option<String>,
     },
     /// An attribute whose constraint the dictionary has no place for, or
     /// one Orchestra 1.0 does not define.
@@ -274,6 +309,16 @@ pub enum UnmappedConstruct {
         name: String,
         /// The attribute value.
         value: String,
+    },
+    /// A `base` group or code set nothing references. The dictionary holds a
+    /// group only where it is referenced and a code set only on its fields;
+    /// the definition was checked all the same.
+    #[non_exhaustive]
+    Unreferenced {
+        /// The kind of the definition.
+        kind: OrchestraKind,
+        /// Its name.
+        name: String,
     },
 }
 
@@ -297,29 +342,72 @@ impl fmt::Display for UnmappedConstruct {
                 Some(value) => write!(f, "{location}: presence `{presence}` (value `{value}`)"),
                 None => write!(f, "{location}: presence `{presence}`"),
             },
-            Self::Rule { location, name } => match name {
-                Some(name) => write!(f, "{location}: rule `{name}` not evaluated"),
-                None => write!(f, "{location}: rule not evaluated"),
-            },
+            Self::Rule {
+                location,
+                name,
+                presence,
+                condition,
+            } => {
+                write!(f, "{location}: rule")?;
+                if let Some(name) = name {
+                    write!(f, " `{name}`")?;
+                }
+                if let Some(presence) = presence {
+                    write!(f, " (presence `{presence}`)")?;
+                }
+                if let Some(condition) = condition {
+                    write!(f, " when `{condition}`")?;
+                }
+                write!(f, " not evaluated")
+            }
             Self::Attribute {
                 location,
                 name,
                 value,
             } => write!(f, "{location}: attribute {name}=\"{value}\" not mapped"),
+            Self::Unreferenced { kind, name } => {
+                write!(f, "{kind} {name}: not referenced, not in the dictionary")
+            }
         }
     }
 }
 
-/// What a loaded Orchestra repository holds that the [`Dictionary`] does not,
-/// in document order.
+/// The report under construction, bounded by
+/// [`MAX_ORCHESTRA_REPORT_ENTRIES`].
+#[derive(Debug, Default)]
+struct Report {
+    entries: Vec<UnmappedConstruct>,
+}
+
+impl Report {
+    /// Adds `entry`.
+    ///
+    /// # Errors
+    /// [`DictionaryError::TooManyUnmapped`] past
+    /// [`MAX_ORCHESTRA_REPORT_ENTRIES`].
+    fn push(&mut self, entry: UnmappedConstruct) -> Result<(), DictionaryError> {
+        if self.entries.len() >= MAX_ORCHESTRA_REPORT_ENTRIES {
+            return Err(DictionaryError::TooManyUnmapped {
+                limit: MAX_ORCHESTRA_REPORT_ENTRIES,
+            });
+        }
+        self.entries.push(entry);
+        Ok(())
+    }
+}
+
+/// What a loaded Orchestra repository holds that the [`Dictionary`] does not:
+/// what the document holds in document order, then the unreferenced groups
+/// and code sets. At most [`MAX_ORCHESTRA_REPORT_ENTRIES`] entries.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OrchestraReport {
-    /// The entries, in document order.
+    /// The entries.
     entries: Vec<UnmappedConstruct>,
 }
 
 impl OrchestraReport {
-    /// Returns the entries, in document order.
+    /// Returns the entries: document order, then the unreferenced
+    /// definitions.
     #[must_use]
     pub fn entries(&self) -> &[UnmappedConstruct] {
         &self.entries
@@ -382,10 +470,11 @@ impl Dictionary {
     /// # Errors
     /// Returns [`DictionaryError`] if the document is not a well-formed
     /// Orchestra 1.0 repository, declares a version the loader cannot map
-    /// (`FIX.Latest` included), holds a dangling, duplicate or invalid id, a
-    /// group or component cycle, a datatype or code set that maps to no FIX
-    /// data type, a group without a count field or without members, or
-    /// exceeds one of the size and depth limits.
+    /// (`FIX.Latest`, or a repository named `FIXT` whose version is not
+    /// `FIXT.1.1`), holds a dangling, duplicate or invalid id, a group or
+    /// component cycle, a datatype or code set that maps to no FIX data type,
+    /// a group without a count field or without members, or exceeds one of
+    /// the size, length, report and depth limits.
     pub fn from_orchestra_xml(xml: &str) -> Result<OrchestraImport, DictionaryError> {
         if xml.len() > MAX_ORCHESTRA_DOCUMENT_LEN {
             return Err(DictionaryError::DocumentTooLarge {
@@ -395,11 +484,12 @@ impl Dictionary {
         }
         let mut parser = Parser::new(xml);
         let raw = parser.repository()?;
-        let dictionary = build(&raw)?;
+        let mut report = parser.report;
+        let dictionary = build(&raw, &mut report)?;
         Ok(OrchestraImport {
             dictionary,
             report: OrchestraReport {
-                entries: parser.report,
+                entries: report.entries,
             },
         })
     }
@@ -540,17 +630,21 @@ struct Attrs {
 
 impl Attrs {
     /// Reads the attributes of `start`, leaving out namespace declarations
-    /// and the `xml:` attributes.
+    /// and the `xml:` attributes. The element's name has been checked
+    /// ([`check_name`]) by whoever read `start`.
     ///
     /// # Errors
     /// [`DictionaryError::AttributesTooLong`] past
-    /// [`MAX_ORCHESTRA_ATTRIBUTES_LEN`], [`DictionaryError::Xml`] for a
-    /// malformed attribute.
+    /// [`MAX_ORCHESTRA_ATTRIBUTES_LEN`], [`DictionaryError::NameTooLong`]
+    /// for an attribute name, or a value the loader keeps (any but a
+    /// descriptive one), past [`MAX_ORCHESTRA_NAME_LEN`], and
+    /// [`DictionaryError::Xml`] for a malformed attribute.
     fn read(start: &BytesStart<'_>) -> Result<Self, DictionaryError> {
+        let element = start.name().0;
         let len = start.attributes_raw().len();
         if len > MAX_ORCHESTRA_ATTRIBUTES_LEN {
             return Err(DictionaryError::AttributesTooLong {
-                element: start.name().0.to_owned(),
+                element: element.to_owned(),
                 len,
                 limit: MAX_ORCHESTRA_ATTRIBUTES_LEN,
             });
@@ -562,10 +656,16 @@ impl Attrs {
             if key == "xmlns" || key.starts_with("xmlns:") || key.starts_with("xml:") {
                 continue;
             }
+            check_name(key.len(), || format!("an attribute name of <{element}>"))?;
             let value = attr
                 .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(xml_err)?
                 .into_owned();
+            if !DESCRIPTIVE_ATTRIBUTES.contains(&key) {
+                check_name(value.len(), || {
+                    format!("the value of attribute `{key}` of <{element}>")
+                })?;
+            }
             list.push((key.to_owned(), value));
         }
         Ok(Self { list })
@@ -593,7 +693,7 @@ impl Attrs {
     }
 
     /// Reports every attribute left that constrains rather than describes.
-    fn report_rest(self, location: &str, report: &mut Vec<UnmappedConstruct>) {
+    fn report_rest(self, location: &str, report: &mut Report) -> Result<(), DictionaryError> {
         for (name, value) in self.list {
             let descriptive = DESCRIPTIVE_ATTRIBUTES.contains(&name.as_str())
                 || (name == "supported" && value == "supported");
@@ -602,10 +702,30 @@ impl Attrs {
                     location: location.to_owned(),
                     name,
                     value,
-                });
+                })?;
             }
         }
+        Ok(())
     }
+}
+
+/// Refuses a name or value of `len` bytes past [`MAX_ORCHESTRA_NAME_LEN`];
+/// `what` describes it, without repeating it.
+fn check_name(len: usize, what: impl FnOnce() -> String) -> Result<(), DictionaryError> {
+    if len > MAX_ORCHESTRA_NAME_LEN {
+        return Err(DictionaryError::NameTooLong {
+            what: what(),
+            len,
+            limit: MAX_ORCHESTRA_NAME_LEN,
+        });
+    }
+    Ok(())
+}
+
+/// Refuses an element whose name, as written, is longer than
+/// [`MAX_ORCHESTRA_NAME_LEN`].
+fn check_element(start: &BytesStart<'_>) -> Result<(), DictionaryError> {
+    check_name(start.name().0.len(), || "an element name".to_owned())
 }
 
 /// Parses an Orchestra id: a positive integer that fits a `u32`.
@@ -660,7 +780,7 @@ struct Parser<'i> {
     reader: NsReader<&'i [u8]>,
     /// Depth of the element the reader is inside; the root is 1.
     depth: usize,
-    report: Vec<UnmappedConstruct>,
+    report: Report,
 }
 
 impl<'i> Parser<'i> {
@@ -668,20 +788,22 @@ impl<'i> Parser<'i> {
         Self {
             reader: NsReader::from_str(xml),
             depth: 0,
-            report: Vec::new(),
+            report: Report::default(),
         }
     }
 
     /// Records entering an element, refusing nesting past
     /// [`MAX_NESTING_DEPTH`].
     fn enter(&mut self, start: &BytesStart<'_>) -> Result<(), DictionaryError> {
-        self.depth += 1;
-        if self.depth > MAX_NESTING_DEPTH {
-            return Err(DictionaryError::NestingTooDeep {
-                element: start.local_name().into_inner().to_owned(),
-                limit: MAX_NESTING_DEPTH,
-            });
-        }
+        let too_deep = || DictionaryError::NestingTooDeep {
+            element: start.local_name().into_inner().to_owned(),
+            limit: MAX_NESTING_DEPTH,
+        };
+        self.depth = self
+            .depth
+            .checked_add(1)
+            .filter(|depth| *depth <= MAX_NESTING_DEPTH)
+            .ok_or_else(too_deep)?;
         Ok(())
     }
 
@@ -706,6 +828,7 @@ impl<'i> Parser<'i> {
             );
             match event {
                 Event::Start(start) => {
+                    check_element(&start)?;
                     self.enter(&start)?;
                     return Ok(Some(Child {
                         start,
@@ -714,6 +837,7 @@ impl<'i> Parser<'i> {
                     }));
                 }
                 Event::Empty(start) => {
+                    check_element(&start)?;
                     return Ok(Some(Child {
                         start,
                         empty: true,
@@ -764,7 +888,7 @@ impl<'i> Parser<'i> {
         if !child.is("annotation") {
             self.report.push(UnmappedConstruct::Element {
                 location: format!("{location}/{}", child.qualified()),
-            });
+            })?;
         }
         self.skip(child)
     }
@@ -785,12 +909,7 @@ impl<'i> Parser<'i> {
             if child.ours && silent.contains(&child.local()) {
                 self.skip(&child)?;
             } else if child.is("rule") {
-                let name = Attrs::read(&child.start)?.take("name");
-                self.report.push(UnmappedConstruct::Rule {
-                    location: location.to_owned(),
-                    name,
-                });
-                self.skip(&child)?;
+                self.rule(&child, location)?;
             } else {
                 self.other(&child, location)?;
             }
@@ -798,15 +917,91 @@ impl<'i> Parser<'i> {
         Ok(())
     }
 
+    /// Reports a conditional presence `rule` with its name, presence and
+    /// `when` condition; its other content (`assign`, `unique`) goes with it.
+    fn rule(&mut self, child: &Child<'_>, location: &str) -> Result<(), DictionaryError> {
+        let mut attrs = Attrs::read(&child.start)?;
+        let name = attrs.take("name");
+        let presence = attrs.take("presence");
+        let mut condition = None;
+        if !child.empty {
+            while let Some(part) = self.next_child()? {
+                if part.is("when") && condition.is_none() {
+                    condition = Some(self.text(&part)?);
+                } else {
+                    self.skip(&part)?;
+                }
+            }
+        }
+        self.report.push(UnmappedConstruct::Rule {
+            location: location.to_owned(),
+            name,
+            presence,
+            condition,
+        })
+    }
+
+    /// Reads the text of `child` (an expression), resolving character and
+    /// predefined entity references; markup inside it is skipped.
+    ///
+    /// The text is copied once, from the document, so the condition of every
+    /// rule together is at most as long as the document.
+    fn text(&mut self, child: &Child<'_>) -> Result<String, DictionaryError> {
+        let mut text = String::new();
+        if child.empty {
+            return Ok(text);
+        }
+        let outside = self.depth.checked_sub(1).ok_or_else(eof)?;
+        loop {
+            match self.reader.read_event().map_err(xml_err)? {
+                Event::Text(part) if self.depth == outside + 1 => {
+                    text.push_str(&part.xml10_content());
+                }
+                Event::CData(part) if self.depth == outside + 1 => {
+                    text.push_str(&part.xml10_content());
+                }
+                Event::GeneralRef(reference) if self.depth == outside + 1 => {
+                    match reference.resolve_char_ref().map_err(xml_err)? {
+                        Some(ch) => text.push(ch),
+                        None => {
+                            let name = reference.xml10_content();
+                            let resolved = quick_xml::escape::resolve_predefined_entity(&name)
+                                .ok_or_else(|| {
+                                    DictionaryError::Xml(format!("unknown entity `&{name};`"))
+                                })?;
+                            text.push_str(resolved);
+                        }
+                    }
+                }
+                Event::Start(start) => self.enter(&start)?,
+                Event::End(_) => {
+                    self.leave()?;
+                    if self.depth == outside {
+                        return Ok(text);
+                    }
+                }
+                Event::Eof => return Err(eof()),
+                _ => {}
+            }
+        }
+    }
+
     /// Reads the whole document.
     fn repository(&mut self) -> Result<Raw, DictionaryError> {
         let root = self.root()?;
         let mut attrs = Attrs::read(&root.start)?;
-        let version = parse_version(&attrs.required("repository", "version")?)?;
-        // The stable name (`FIX.4.4`, `FIXT`) is descriptive; the version is
-        // what the dictionary records.
-        attrs.take("name");
-        attrs.report_rest("repository", &mut self.report);
+        let declared = attrs.required("repository", "version")?;
+        let version = parse_version(&declared)?;
+        // The stable name (`FIX.4.4`, `FIXT`) is descriptive, except that a
+        // FIXT repository can only describe FIXT.1.1: one that declares
+        // another version (the FIX Trading Community's session repository
+        // declares `FIX.5.0SP2_EP247`) names no version the loader can map.
+        if attrs.take("name").as_deref() == Some("FIXT") && version != Version::Fixt11 {
+            return Err(DictionaryError::UnsupportedVersion(format!(
+                "{declared} (repository FIXT)"
+            )));
+        }
+        attrs.report_rest("repository", &mut self.report)?;
         let mut raw = Raw::new(version);
         if !root.empty {
             while let Some(child) = self.next_child()? {
@@ -846,6 +1041,7 @@ impl<'i> Parser<'i> {
                 Event::Eof => return Err(eof()),
                 _ => continue,
             };
+            check_element(&start)?;
             let ours = found.as_deref() == Some(ORCHESTRA_NAMESPACE);
             if !ours || start.local_name().into_inner() != "repository" {
                 let element = start.name().0;
@@ -891,7 +1087,7 @@ impl<'i> Parser<'i> {
             let name = attrs.required("datatype", "name")?;
             let base = attrs.take("baseType");
             let location = format!("datatype {name}");
-            attrs.report_rest(&location, &mut self.report);
+            attrs.report_rest(&location, &mut self.report)?;
             // How the datatype is encoded in XML, SBE, ...: descriptive.
             self.leaf_children(&child, &location, &["mappedDatatype"])?;
             raw.datatypes.push(RawDatatype { name, base });
@@ -915,13 +1111,13 @@ impl<'i> Parser<'i> {
             let type_name = attrs.required("codeSet", "type")?;
             let scenario = attrs.take("scenario");
             let location = format!("code set {name}");
-            attrs.report_rest(&location, &mut self.report);
+            attrs.report_rest(&location, &mut self.report)?;
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
                 self.report.push(UnmappedConstruct::Scenario {
                     kind: OrchestraKind::CodeSet,
                     name,
                     scenario,
-                });
+                })?;
                 self.skip(&child)?;
                 continue;
             }
@@ -958,14 +1154,14 @@ impl<'i> Parser<'i> {
             let value = attrs.required("code", "value")?;
             let scenario = attrs.take("scenario");
             let location = format!("{set_location}/code {name}");
-            attrs.report_rest(&location, &mut self.report);
+            attrs.report_rest(&location, &mut self.report)?;
             self.leaf_children(&child, &location, &[])?;
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
                 self.report.push(UnmappedConstruct::Scenario {
                     kind: OrchestraKind::Code,
                     name: format!("{set}.{name}"),
                     scenario,
-                });
+                })?;
                 continue;
             }
             codes.push((value, name));
@@ -989,13 +1185,13 @@ impl<'i> Parser<'i> {
             let type_name = attrs.required("field", "type")?;
             let scenario = attrs.take("scenario");
             let location = format!("field {name}");
-            attrs.report_rest(&location, &mut self.report);
+            attrs.report_rest(&location, &mut self.report)?;
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
                 self.report.push(UnmappedConstruct::Scenario {
                     kind: OrchestraKind::Field,
                     name,
                     scenario,
-                });
+                })?;
                 self.skip(&child)?;
                 continue;
             }
@@ -1024,13 +1220,13 @@ impl<'i> Parser<'i> {
             let name = attrs.required("component", "name")?;
             let scenario = attrs.take("scenario");
             let location = format!("component {name}");
-            attrs.report_rest(&location, &mut self.report);
+            attrs.report_rest(&location, &mut self.report)?;
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
                 self.report.push(UnmappedConstruct::Scenario {
                     kind: OrchestraKind::Component,
                     name,
                     scenario,
-                });
+                })?;
                 self.skip(&child)?;
                 continue;
             }
@@ -1055,13 +1251,13 @@ impl<'i> Parser<'i> {
             let name = attrs.required("group", "name")?;
             let scenario = attrs.take("scenario");
             let location = format!("group {name}");
-            attrs.report_rest(&location, &mut self.report);
+            attrs.report_rest(&location, &mut self.report)?;
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
                 self.report.push(UnmappedConstruct::Scenario {
                     kind: OrchestraKind::Group,
                     name,
                     scenario,
-                });
+                })?;
                 self.skip(&child)?;
                 continue;
             }
@@ -1097,13 +1293,13 @@ impl<'i> Parser<'i> {
                 MessageCategory::App
             };
             let location = format!("message {name}");
-            attrs.report_rest(&location, &mut self.report);
+            attrs.report_rest(&location, &mut self.report)?;
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
                 self.report.push(UnmappedConstruct::Scenario {
                     kind: OrchestraKind::Message,
                     name,
                     scenario,
-                });
+                })?;
                 self.skip(&child)?;
                 continue;
             }
@@ -1136,7 +1332,7 @@ impl<'i> Parser<'i> {
                 // selection), is a constraint, so it is reported.
                 let attrs = Attrs::read(&child.start)?;
                 let structure_location = format!("{location}/structure");
-                attrs.report_rest(&structure_location, &mut self.report);
+                attrs.report_rest(&structure_location, &mut self.report)?;
                 members = Some(self.members(&child, location, false)?.1);
             } else {
                 self.other(&child, location)?;
@@ -1189,13 +1385,13 @@ impl<'i> Parser<'i> {
         let id = attrs.id("numInGroup")?;
         let scenario = attrs.take("scenario");
         let member_location = format!("{location}/numInGroup {id}");
-        attrs.report_rest(&member_location, &mut self.report);
+        attrs.report_rest(&member_location, &mut self.report)?;
         self.leaf_children(child, &member_location, &[])?;
         if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
             self.report.push(UnmappedConstruct::ScenarioReference {
                 location: member_location,
                 scenario,
-            });
+            })?;
             return Ok(None);
         }
         Ok(Some(id))
@@ -1217,38 +1413,46 @@ impl<'i> Parser<'i> {
         let presence = attrs.take("presence");
         let value = attrs.take("value");
         let mut keep = true;
-        let required = match presence.as_deref() {
-            None | Some("optional") => false,
-            Some("required") => true,
-            Some(other) => {
+        let mapped = match presence.as_deref() {
+            None | Some("optional") => Some(false),
+            Some("required") => Some(true),
+            Some(_) => None,
+        };
+        let required = match (mapped, presence) {
+            (Some(required), _) => {
+                // A value next to a presence the dictionary maps is a
+                // constraint it has no place for.
+                if let Some(value) = value {
+                    self.report.push(UnmappedConstruct::Attribute {
+                        location: member_location.clone(),
+                        name: "value".to_owned(),
+                        value,
+                    })?;
+                }
+                required
+            }
+            (None, None) => false,
+            (None, Some(presence)) => {
                 // `forbidden`: the member must not appear, so the
                 // definition leaves it out. `ignored`, `constant` and any
-                // undefined value keep it, optional.
-                keep = other != "forbidden";
+                // undefined value keep it, optional. The value, if any, is
+                // reported with the presence.
+                keep = presence != "forbidden";
                 self.report.push(UnmappedConstruct::Presence {
                     location: member_location.clone(),
-                    presence: other.to_owned(),
-                    value: value.clone(),
-                });
+                    presence,
+                    value,
+                })?;
                 false
             }
         };
-        if presence.as_deref() != Some("constant")
-            && let Some(value) = value
-        {
-            self.report.push(UnmappedConstruct::Attribute {
-                location: member_location.clone(),
-                name: "value".to_owned(),
-                value,
-            });
-        }
-        attrs.report_rest(&member_location, &mut self.report);
+        attrs.report_rest(&member_location, &mut self.report)?;
         self.leaf_children(child, &member_location, &[])?;
         if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
             self.report.push(UnmappedConstruct::ScenarioReference {
                 location: member_location,
                 scenario,
-            });
+            })?;
             return Ok(None);
         }
         Ok(keep.then_some(RawRef { kind, id, required }))
@@ -1475,25 +1679,57 @@ impl Expander<'_> {
         if self.open_groups.contains(&group.id) {
             return Err(DictionaryError::GroupCycle(group.name.clone()));
         }
-        if depth + 1 > MAX_NESTING_DEPTH {
-            return Err(DictionaryError::NestingTooDeep {
+        let inner = depth
+            .checked_add(1)
+            .filter(|inner| *inner <= MAX_NESTING_DEPTH)
+            .ok_or_else(|| DictionaryError::NestingTooDeep {
                 element: group.name.clone(),
                 limit: MAX_NESTING_DEPTH,
-            });
-        }
+            })?;
         let location = format!("group {}", group.name);
         let count = group
             .count
             .ok_or_else(|| DictionaryError::MissingCountField(group.name.clone()))?;
         let name = self.field(count, &location)?.to_owned();
         self.open_groups.push(group.id);
-        let items = self.items(&group.members, &location, Scope::Definition, depth + 1)?;
+        let items = self.items(&group.members, &location, Scope::Definition, inner)?;
         self.open_groups.pop();
         Ok(Item::Group {
             name,
             required: member.required,
             items,
         })
+    }
+
+    /// Checks a group without expanding it: its count field and every id
+    /// it references resolve, and it has a member.
+    fn check_group(&self, group: &RawGroup) -> Result<(), DictionaryError> {
+        let location = format!("group {}", group.name);
+        let count = group
+            .count
+            .ok_or_else(|| DictionaryError::MissingCountField(group.name.clone()))?;
+        let count_name = self.field(count, &location)?;
+        if group.members.is_empty() {
+            return Err(DictionaryError::EmptyGroup(count_name.to_owned()));
+        }
+        for member in &group.members {
+            let (kind, found) = match member.kind {
+                RefKind::Field => (OrchestraKind::Field, self.fields.contains_key(&member.id)),
+                RefKind::Component => (
+                    OrchestraKind::Component,
+                    self.components.contains_key(&member.id),
+                ),
+                RefKind::Group => (OrchestraKind::Group, self.groups.contains_key(&member.id)),
+            };
+            if !found {
+                return Err(DictionaryError::UnknownOrchestraReference {
+                    kind,
+                    id: member.id,
+                    owner: location,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Expands a component referenced from the standard header or trailer
@@ -1537,8 +1773,64 @@ fn by_id<T>(
     Ok(map)
 }
 
-/// Builds the dictionary from the parsed definitions.
-fn build(raw: &Raw) -> Result<Dictionary, DictionaryError> {
+/// Reports the `base` groups no message or component reaches, and the code
+/// sets no field names, in document order: the dictionary does not hold
+/// them.
+fn report_unreferenced(
+    raw: &Raw,
+    groups: &HashMap<u32, &RawGroup>,
+    report: &mut Report,
+) -> Result<(), DictionaryError> {
+    let mut reached: HashSet<u32> = HashSet::with_capacity(raw.groups.len());
+    let mut pending: Vec<u32> = raw
+        .components
+        .iter()
+        .flat_map(|component| &component.members)
+        .chain(raw.messages.iter().flat_map(|message| &message.members))
+        .filter(|member| member.kind == RefKind::Group)
+        .map(|member| member.id)
+        .collect();
+    while let Some(id) = pending.pop() {
+        if !reached.insert(id) {
+            continue;
+        }
+        if let Some(group) = groups.get(&id) {
+            pending.extend(
+                group
+                    .members
+                    .iter()
+                    .filter(|member| member.kind == RefKind::Group)
+                    .map(|member| member.id),
+            );
+        }
+    }
+    for group in raw
+        .groups
+        .iter()
+        .filter(|group| !reached.contains(&group.id))
+    {
+        report.push(UnmappedConstruct::Unreferenced {
+            kind: OrchestraKind::Group,
+            name: group.name.clone(),
+        })?;
+    }
+    let named: HashSet<&str> = raw.fields.iter().map(|f| f.type_name.as_str()).collect();
+    for set in raw
+        .code_sets
+        .iter()
+        .filter(|set| !named.contains(set.name.as_str()))
+    {
+        report.push(UnmappedConstruct::Unreferenced {
+            kind: OrchestraKind::CodeSet,
+            name: set.name.clone(),
+        })?;
+    }
+    Ok(())
+}
+
+/// Builds the dictionary from the parsed definitions, adding the
+/// unreferenced definitions to `report`.
+fn build(raw: &Raw, report: &mut Report) -> Result<Dictionary, DictionaryError> {
     let types = Types::new(raw)?;
 
     let mut fields = HashMap::with_capacity(raw.fields.len());
@@ -1598,6 +1890,11 @@ fn build(raw: &Raw) -> Result<Dictionary, DictionaryError> {
         open_groups: Vec::new(),
         open_components: Vec::new(),
     };
+    // Every group, referenced or not, before any is expanded.
+    for group in &raw.groups {
+        expander.check_group(group)?;
+    }
+    report_unreferenced(raw, &expander.groups, report)?;
     let mut envelopes = [Vec::new(), Vec::new()];
     for (items, id) in envelopes.iter_mut().zip([header, trailer]) {
         if let Some(component) = id.and_then(|id| expander.components.get(&id).copied()) {
@@ -2407,6 +2704,11 @@ mod tests {
     /// last holding a field, with their count fields; a message holds the
     /// first.
     fn group_chain(count: u32, refs: usize) -> Doc {
+        group_chain_to(count, refs, 55)
+    }
+
+    /// [`group_chain`], with field `leaf` in the last group.
+    fn group_chain_to(count: u32, refs: usize, leaf: u32) -> Doc {
         let mut doc = Doc::default();
         for level in 0..count {
             let id = 2100 + level;
@@ -2415,7 +2717,7 @@ mod tests {
                 r#"<fixr:field id="{count_id}" name="NoLevel{level}" type="NumInGroup"/>"#
             ));
             let members = if level + 1 == count {
-                r#"<fixr:fieldRef id="55"/>"#.to_owned()
+                format!(r#"<fixr:fieldRef id="{leaf}"/>"#)
             } else {
                 format!(r#"<fixr:groupRef id="{}"/>"#, id + 1).repeat(refs)
             };
@@ -2547,7 +2849,7 @@ mod tests {
         doc.fields.push_str(
             r#"<fixr:field id="40" name="OrdType" type="OrdTypeCodeSet"/>
                <fixr:field id="60" name="TransactTime" type="UTCTimestamp">
-                 <fixr:rule name="WhenOpen"><fixr:when>x</fixr:when></fixr:rule>
+                 <fixr:rule name="WhenOpen"><fixr:when>OrdType == ^Limit &amp;&amp; OrderQty &gt; 0<!-- note --></fixr:when></fixr:rule>
                  <fixr:annotation><fixr:documentation>Time.</fixr:documentation></fixr:annotation>
                </fixr:field>
                <fixr:field id="38" name="OrderQty" type="float" minInclusive="0" custom="x"/>
@@ -2565,7 +2867,7 @@ mod tests {
             r#"<fixr:fieldRef id="44"/>"#,
             r#"<fixr:fieldRef id="44" presence="forbidden"/>
                <fixr:fieldRef id="40" presence="constant" value="2"/>
-               <fixr:fieldRef id="60" presence="ignored">
+               <fixr:fieldRef id="60" presence="ignored" value="later">
                  <fixr:rule name="Late" presence="required"><fixr:when>y</fixr:when></fixr:rule>
                  <fixr:assign>z</fixr:assign>
                </fixr:fieldRef>
@@ -2605,6 +2907,8 @@ mod tests {
             UnmappedConstruct::Rule {
                 location: "field TransactTime".to_owned(),
                 name: Some("WhenOpen".to_owned()),
+                presence: None,
+                condition: Some("OrdType == ^Limit && OrderQty > 0".to_owned()),
             },
             attribute("field OrderQty", "minInclusive", "0"),
             attribute("field OrderQty", "custom", "x"),
@@ -2623,14 +2927,17 @@ mod tests {
                 presence: "constant".to_owned(),
                 value: Some("2".to_owned()),
             },
+            // The value is reported once, with the presence.
             UnmappedConstruct::Presence {
                 location: "message NewOrderSingle/fieldRef 60".to_owned(),
                 presence: "ignored".to_owned(),
-                value: None,
+                value: Some("later".to_owned()),
             },
             UnmappedConstruct::Rule {
                 location: "message NewOrderSingle/fieldRef 60".to_owned(),
                 name: Some("Late".to_owned()),
+                presence: Some("required".to_owned()),
+                condition: Some("y".to_owned()),
             },
             element("message NewOrderSingle/fieldRef 60/fixr:assign"),
             UnmappedConstruct::ScenarioReference {
@@ -2680,5 +2987,274 @@ mod tests {
         let mut keys: Vec<&str> = values.keys().map(String::as_str).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["1", "3"]);
+    }
+
+    #[test]
+    fn test_names_longer_than_the_limit_are_rejected() {
+        let long = "A".repeat(MAX_ORCHESTRA_NAME_LEN + 1);
+        let doc = Doc::with_fields(&format!(
+            r#"<fixr:field id="5000" name="{long}" type="String"/>"#
+        ));
+        assert_eq!(
+            load_err(&doc.xml()),
+            DictionaryError::NameTooLong {
+                what: "the value of attribute `name` of <fixr:field>".to_owned(),
+                len: MAX_ORCHESTRA_NAME_LEN + 1,
+                limit: MAX_ORCHESTRA_NAME_LEN,
+            }
+        );
+        // An unmapped attribute's value is kept in the report: bounded too.
+        let doc = Doc::with_fields(&format!(
+            r#"<fixr:field id="5000" name="Odd" type="String" minInclusive="{long}"/>"#
+        ));
+        assert!(matches!(
+            load_err(&doc.xml()),
+            DictionaryError::NameTooLong { .. }
+        ));
+        let doc = Doc::with_fields(&format!(
+            r#"<fixr:field id="5000" name="Odd" type="String" {long}="x"/>"#
+        ));
+        assert_eq!(
+            load_err(&doc.xml()),
+            DictionaryError::NameTooLong {
+                what: "an attribute name of <fixr:field>".to_owned(),
+                len: MAX_ORCHESTRA_NAME_LEN + 1,
+                limit: MAX_ORCHESTRA_NAME_LEN,
+            }
+        );
+        let doc = Doc::with_fields(&format!(r#"<x:{long} xmlns:x="urn:example"/>"#));
+        assert_eq!(
+            load_err(&doc.xml()),
+            DictionaryError::NameTooLong {
+                what: "an element name".to_owned(),
+                len: MAX_ORCHESTRA_NAME_LEN + 3,
+                limit: MAX_ORCHESTRA_NAME_LEN,
+            }
+        );
+        // At the limit, a name loads; a descriptive attribute the loader
+        // does not keep is bounded only by MAX_ORCHESTRA_ATTRIBUTES_LEN.
+        let name = "A".repeat(MAX_ORCHESTRA_NAME_LEN);
+        let doc = Doc::with_fields(&format!(
+            r#"<fixr:field id="5000" name="{name}" type="String" abbrName="{long}{long}"/>"#
+        ));
+        let import = load(&doc.xml());
+        assert_eq!(
+            some(import.dictionary().get_field(5000), "the long field").name,
+            name
+        );
+        assert!(import.report().is_empty());
+    }
+
+    #[test]
+    fn test_report_is_bounded() {
+        // One report entry per unmapped element, up to the limit.
+        let at_limit = Doc::with_fields(&"<fixr:x/>".repeat(MAX_ORCHESTRA_REPORT_ENTRIES));
+        assert_eq!(
+            load(&at_limit.xml()).report().len(),
+            MAX_ORCHESTRA_REPORT_ENTRIES
+        );
+        let past = Doc::with_fields(&"<fixr:x/>".repeat(MAX_ORCHESTRA_REPORT_ENTRIES + 1));
+        assert_eq!(
+            load_err(&past.xml()),
+            DictionaryError::TooManyUnmapped {
+                limit: MAX_ORCHESTRA_REPORT_ENTRIES,
+            }
+        );
+        // Unmapped attributes count the same.
+        let attributes: String = (0..1_000).map(|i| format!(" a{i}=\"x\"")).collect();
+        let fields: String = (0..66)
+            .map(|i| {
+                format!(
+                    r#"<fixr:field id="{}" name="F{i}" type="String"{attributes}/>"#,
+                    7000 + i
+                )
+            })
+            .collect();
+        assert_eq!(
+            load_err(&Doc::with_fields(&fields).xml()),
+            DictionaryError::TooManyUnmapped {
+                limit: MAX_ORCHESTRA_REPORT_ENTRIES,
+            }
+        );
+    }
+
+    #[test]
+    fn test_fixt_repository_must_declare_fixt11() {
+        let session = Doc {
+            version: "FIX.5.0SP2_EP247".to_owned(),
+            ..Doc::default()
+        }
+        .xml()
+        .replace(r#"name="FIX.4.4""#, r#"name="FIXT""#);
+        assert_eq!(
+            load_err(&session),
+            DictionaryError::UnsupportedVersion("FIX.5.0SP2_EP247 (repository FIXT)".to_owned())
+        );
+        let transport = Doc {
+            version: "FIXT.1.1".to_owned(),
+            ..Doc::default()
+        }
+        .xml()
+        .replace(r#"name="FIX.4.4""#, r#"name="FIXT""#);
+        assert_eq!(load(&transport).dictionary().version, Version::Fixt11);
+    }
+
+    #[test]
+    fn test_unreferenced_groups_are_checked_and_reported() {
+        let unreferenced = |group: &str| {
+            let mut doc = Doc::default();
+            doc.groups.push_str(group);
+            doc.xml()
+        };
+        assert_eq!(
+            load_err(&unreferenced(
+                r#"<fixr:group id="2200" name="Loose"><fixr:fieldRef id="448"/></fixr:group>"#
+            )),
+            DictionaryError::MissingCountField("Loose".to_owned())
+        );
+        assert_eq!(
+            load_err(&unreferenced(
+                r#"<fixr:group id="2200" name="Loose"><fixr:numInGroup id="453"/><fixr:fieldRef id="999"/></fixr:group>"#
+            )),
+            DictionaryError::UnknownOrchestraReference {
+                kind: OrchestraKind::Field,
+                id: 999,
+                owner: "group Loose".to_owned(),
+            }
+        );
+        assert_eq!(
+            load_err(&unreferenced(
+                r#"<fixr:group id="2200" name="Loose"><fixr:numInGroup id="999"/><fixr:fieldRef id="448"/></fixr:group>"#
+            )),
+            DictionaryError::UnknownOrchestraReference {
+                kind: OrchestraKind::Field,
+                id: 999,
+                owner: "group Loose".to_owned(),
+            }
+        );
+        assert_eq!(
+            load_err(&unreferenced(
+                r#"<fixr:group id="2200" name="Loose"><fixr:numInGroup id="453"/><fixr:componentRef id="1999"/></fixr:group>"#
+            )),
+            DictionaryError::UnknownOrchestraReference {
+                kind: OrchestraKind::Component,
+                id: 1999,
+                owner: "group Loose".to_owned(),
+            }
+        );
+        assert_eq!(
+            load_err(&unreferenced(
+                r#"<fixr:group id="2200" name="Loose"><fixr:numInGroup id="453"/></fixr:group>"#
+            )),
+            DictionaryError::EmptyGroup("NoPartyIDs".to_owned())
+        );
+
+        // A valid group nothing reaches, and one reached only through it,
+        // load and are reported; so is a code set no field names.
+        let mut doc = Doc::default();
+        doc.groups.push_str(
+            r#"<fixr:group id="2200" name="Loose"><fixr:numInGroup id="453"/><fixr:groupRef id="2201"/></fixr:group>
+               <fixr:group id="2201" name="Inner"><fixr:numInGroup id="453"/><fixr:fieldRef id="448"/></fixr:group>"#,
+        );
+        doc.code_sets
+            .push_str(r#"<fixr:codeSet id="77" name="SpareCodeSet" type="char"/>"#);
+        let import = load(&doc.xml());
+        assert_eq!(
+            import.report().entries(),
+            [
+                UnmappedConstruct::Unreferenced {
+                    kind: OrchestraKind::Group,
+                    name: "Loose".to_owned(),
+                },
+                UnmappedConstruct::Unreferenced {
+                    kind: OrchestraKind::Group,
+                    name: "Inner".to_owned(),
+                },
+                UnmappedConstruct::Unreferenced {
+                    kind: OrchestraKind::CodeSet,
+                    name: "SpareCodeSet".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_member_value_is_reported_once() {
+        let mut doc = Doc::default();
+        doc.messages = doc.messages.replace(
+            r#"<fixr:fieldRef id="44"/>"#,
+            r#"<fixr:fieldRef id="44" value="1"/><fixr:fieldRef id="55" presence="forbidden" value="2"/>"#,
+        );
+        let import = load(&doc.xml());
+        assert_eq!(
+            import.report().entries(),
+            [
+                UnmappedConstruct::Attribute {
+                    location: "message NewOrderSingle/fieldRef 44".to_owned(),
+                    name: "value".to_owned(),
+                    value: "1".to_owned(),
+                },
+                UnmappedConstruct::Presence {
+                    location: "message NewOrderSingle/fieldRef 55".to_owned(),
+                    presence: "forbidden".to_owned(),
+                    value: Some("2".to_owned()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_component_chain_without_fields_is_walked_once() {
+        // 32 components, each holding the next twice and the last nothing,
+        // ahead of a group's first field: without a cache, finding the
+        // group's delimiter walks 2^31 paths.
+        let mut doc = Doc::default();
+        for level in 0..32u32 {
+            let members = if level == 31 {
+                String::new()
+            } else {
+                format!(r#"<fixr:componentRef id="{}"/>"#, 1201 + level).repeat(2)
+            };
+            doc.components.push_str(&format!(
+                r#"<fixr:component id="{}" name="Hollow{level}">{members}</fixr:component>"#,
+                1200 + level
+            ));
+        }
+        doc.groups = doc.groups.replace(
+            r#"<fixr:fieldRef id="448"/>"#,
+            r#"<fixr:componentRef id="1200"/><fixr:fieldRef id="448"/>"#,
+        );
+        let import = load(&doc.xml());
+        let order = some(import.dictionary().get_message("D"), "NewOrderSingle");
+        assert_eq!(order.groups()[0].delimiter_tag, 448);
+    }
+
+    #[test]
+    fn test_member_budget_holds_with_names_at_the_limit() {
+        // The longest name the loader keeps, copied into every member that
+        // expansion produces: 17 levels of doubled group references make
+        // 196 607 members, under MAX_ORCHESTRA_MEMBERS; 18 levels pass it.
+        // tests/orchestra_memory.rs measures the heap this takes.
+        let leaf = "L".repeat(MAX_ORCHESTRA_NAME_LEN);
+        let field = format!(r#"<fixr:field id="7000" name="{leaf}" type="String"/>"#);
+        let mut doc = group_chain_to(17, 2, 7000);
+        doc.fields.push_str(&field);
+        let import = load(&doc.xml());
+        let deep = some(import.dictionary().get_message("U9"), "Deep");
+        let mut group = &deep.groups()[0];
+        for _ in 1..17 {
+            group = &group.groups()[0];
+        }
+        assert_eq!(group.fields()[0].name, leaf);
+
+        let mut doc = group_chain_to(18, 2, 7000);
+        doc.fields.push_str(&field);
+        assert!(doc.xml().len() < 16 * 1024);
+        assert_eq!(
+            load_err(&doc.xml()),
+            DictionaryError::TooManyMembers {
+                limit: MAX_ORCHESTRA_MEMBERS,
+            }
+        );
     }
 }

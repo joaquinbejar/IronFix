@@ -106,8 +106,11 @@ mod tests {
         "/../ironfix-dictionary/tests/fixtures/orchestra/OrchestraFIX44.xml"
     ));
 
+    /// Generation is deterministic: run again at test time, both generators
+    /// produce, byte for byte, the text build.rs wrote and this crate
+    /// compiled.
     #[test]
-    fn test_orchestra_fix44_generates_the_compiled_output() {
+    fn test_orchestra_fix44_generation_is_deterministic() {
         let import = ok(
             ironfix_dictionary::Dictionary::from_orchestra_xml(ORCHESTRA_FIX44),
             "the FIX 4.4 Orchestra repository loads",

@@ -20,7 +20,7 @@
 //! - **FIX Orchestra loading**: [`Dictionary::from_orchestra_xml`] reads the
 //!   `base` scenario of a FIX Orchestra 1.0 repository into the same model,
 //!   and returns an [`OrchestraReport`] of what the model cannot hold; see the
-//!   [`orchestra`] module docs for the mapping and the limits
+//!   [`orchestra`] module docs for the mapping and the limits.
 //! - **Runtime validation**: message validation against dictionary rules
 //!   ([`Validator`]): known message type, defined and allowed tags, required
 //!   fields, enum values, repeating-group count and delimiter, and the
@@ -70,7 +70,9 @@
 //! repository the tests load is the FIX Trading Community's FIX 4.4 one, a
 //! test fixture that is neither embedded nor published. `FIX.Latest`
 //! repositories are rejected with [`DictionaryError::UnsupportedVersion`],
-//! because FIX Latest names no fixed FIX version.
+//! because FIX Latest names no fixed FIX version, and so is a repository named
+//! `FIXT` whose version is not `FIXT.1.1`, such as the FIX Trading
+//! Community's FIXT session repository (which declares `FIX.5.0SP2_EP247`).
 //!
 //! **[`SessionDictionary`] does not read `ApplVerID(1128)`.** The caller picks
 //! the application dictionary when building the pair; a message whose
@@ -115,7 +117,8 @@ pub use group::{
 pub use loader::{DefinitionKind, DictionaryError, MAX_COMPONENT_DEPTH, MAX_NESTING_DEPTH};
 pub use orchestra::{
     MAX_ORCHESTRA_ATTRIBUTES_LEN, MAX_ORCHESTRA_DOCUMENT_LEN, MAX_ORCHESTRA_MEMBERS,
-    ORCHESTRA_NAMESPACE, OrchestraImport, OrchestraKind, OrchestraReport, UnmappedConstruct,
+    MAX_ORCHESTRA_NAME_LEN, MAX_ORCHESTRA_REPORT_ENTRIES, ORCHESTRA_NAMESPACE, OrchestraImport,
+    OrchestraKind, OrchestraReport, UnmappedConstruct,
 };
 pub use schema::{
     ComponentDef, ComponentRef, Dictionary, FieldDef, FieldRef, FieldType, GroupDef, Member,

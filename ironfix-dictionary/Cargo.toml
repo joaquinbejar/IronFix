@@ -30,3 +30,9 @@ dhat.workspace = true
 [[test]]
 name = "group_reader_allocations"
 harness = false
+
+# Measures the Orchestra loader's peak heap at its limits, with dhat as the
+# global allocator, so it too runs as its own binary without the harness.
+[[test]]
+name = "orchestra_memory"
+harness = false

@@ -12,8 +12,9 @@
 //! group in a component (`Parties` is a group in Orchestra, a component
 //! holding the `NoPartyIDs` group in QuickFIX), so the two are compared
 //! flattened: per message, every tag a message can carry, the tags it must
-//! carry, and each group's count and delimiter tags. Every difference is
-//! listed below with its cause.
+//! carry, each group's count and delimiter tags, and, per group at every
+//! nesting level, the tags each entry must carry. Every difference is listed
+//! below with its cause.
 
 use ironfix_dictionary::{
     Dictionary, FieldType, MemberRef, MessageCategory, OrchestraImport, UnmappedConstruct,
@@ -54,11 +55,27 @@ struct Flat {
     required: BTreeSet<u32>,
     /// `(count tag, delimiter tag)` of every group, at any depth.
     groups: BTreeSet<(u32, u32)>,
+    /// Per group, keyed by its path of count tags (`453/802`): the tags an
+    /// entry must carry, reached through required members only, outside the
+    /// groups nested in it.
+    entries: BTreeMap<String, BTreeSet<u32>>,
+}
+
+impl Flat {
+    /// The required set of the message level (`path` empty) or of a group.
+    fn required_at(&mut self, path: &str) -> &mut BTreeSet<u32> {
+        if path.is_empty() {
+            &mut self.required
+        } else {
+            self.entries.entry(path.to_owned()).or_default()
+        }
+    }
 }
 
 fn flatten<'d>(
     dict: &'d Dictionary,
     members: impl Iterator<Item = MemberRef<'d>>,
+    path: &str,
     required_path: bool,
     flat: &mut Flat,
 ) {
@@ -67,18 +84,24 @@ fn flatten<'d>(
             MemberRef::Field(field) => {
                 flat.tags.insert(field.tag);
                 if required_path && field.required {
-                    flat.required.insert(field.tag);
+                    flat.required_at(path).insert(field.tag);
                 }
             }
             MemberRef::Group(group) => {
                 flat.tags.insert(group.count_tag);
                 if required_path && group.required {
-                    flat.required.insert(group.count_tag);
+                    flat.required_at(path).insert(group.count_tag);
                 }
                 flat.groups.insert((group.count_tag, group.delimiter_tag));
-                // Inside a group, a member is required per entry, not per
-                // message.
-                flatten(dict, group.members(), false, flat);
+                // Inside a group, a member is required per entry: its own
+                // set, under the group's path.
+                let inner = if path.is_empty() {
+                    group.count_tag.to_string()
+                } else {
+                    format!("{path}/{}", group.count_tag)
+                };
+                flat.required_at(&inner);
+                flatten(dict, group.members(), &inner, true, flat);
             }
             MemberRef::Component(component) => {
                 let Some(def) = dict.get_component(&component.name) else {
@@ -87,6 +110,7 @@ fn flatten<'d>(
                 flatten(
                     dict,
                     def.members(),
+                    path,
                     required_path && component.required,
                     flat,
                 );
@@ -100,7 +124,7 @@ fn flat_messages(dict: &Dictionary) -> BTreeMap<String, Flat> {
     dict.messages()
         .map(|message| {
             let mut flat = Flat::default();
-            flatten(dict, message.members(), true, &mut flat);
+            flatten(dict, message.members(), "", true, &mut flat);
             (message.msg_type.clone(), flat)
         })
         .collect()
@@ -114,8 +138,20 @@ fn flat_envelope(dict: &Dictionary, header: bool) -> Flat {
         (&dict.trailer, &dict.trailer_groups)
     };
     let mut flat = Flat::default();
-    flatten(dict, fields.iter().map(MemberRef::Field), true, &mut flat);
-    flatten(dict, groups.iter().map(MemberRef::Group), true, &mut flat);
+    flatten(
+        dict,
+        fields.iter().map(MemberRef::Field),
+        "",
+        true,
+        &mut flat,
+    );
+    flatten(
+        dict,
+        groups.iter().map(MemberRef::Group),
+        "",
+        true,
+        &mut flat,
+    );
     flat
 }
 
@@ -179,17 +215,24 @@ fn test_orchestra_fix44_names_groups_after_their_count_field() {
 }
 
 #[test]
-fn test_orchestra_fix44_report_lists_the_attributes_the_model_cannot_hold() {
+fn test_orchestra_fix44_report_lists_what_the_model_cannot_hold() {
     let import = orchestra();
     let mut by_attribute: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unreferenced = Vec::new();
     for entry in import.report().entries() {
         match entry {
             UnmappedConstruct::Attribute { name, .. } => {
                 *by_attribute.entry(name.clone()).or_default() += 1;
             }
-            other => panic!("only attributes go unmapped in FIX 4.4, not {other}"),
+            UnmappedConstruct::Unreferenced { kind, name, .. } => {
+                unreferenced.push(format!("{kind} {name}"));
+            }
+            other => panic!("only attributes and unreferenced definitions, not {other}"),
         }
     }
+    // ExecsGrp (NoExecs, 124) is defined, and checked, but no message or
+    // component of the repository references it.
+    assert_eq!(unreferenced, ["group ExecsGrp"]);
     let expected: BTreeMap<String, usize> = [
         // The LENGTH field of each data field (Signature(89) -> 93, ...).
         ("lengthId", 16),
@@ -204,7 +247,7 @@ fn test_orchestra_fix44_report_lists_the_attributes_the_model_cannot_hold() {
     .map(|(name, count)| (name.to_owned(), count))
     .collect();
     assert_eq!(by_attribute, expected);
-    assert_eq!(import.report().len(), 40);
+    assert_eq!(import.report().len(), 41);
 }
 
 #[test]
@@ -295,6 +338,7 @@ fn test_orchestra_fix44_messages_match_quickfix_flattened() {
     );
 
     let mut differences = Vec::new();
+    let mut group_paths = 0;
     for (msg_type, o) in &o_messages {
         let q = &q_messages[msg_type];
         let (Some(o_def), Some(q_def)) = (
@@ -323,7 +367,26 @@ fn test_orchestra_fix44_messages_match_quickfix_flattened() {
         if !only_o.is_empty() || !only_q.is_empty() {
             differences.push(format!("{msg_type} groups: +{only_o:?} -{only_q:?}"));
         }
+        group_paths += o.entries.len();
+        let paths: BTreeSet<&String> = o.entries.keys().chain(q.entries.keys()).collect();
+        for path in paths {
+            let empty = BTreeSet::new();
+            let o_entry = o.entries.get(path).unwrap_or(&empty);
+            let q_entry = q.entries.get(path).unwrap_or(&empty);
+            let only_o = sorted(o_entry.difference(q_entry).copied());
+            let only_q = sorted(q_entry.difference(o_entry).copied());
+            if !o.entries.contains_key(path) || !q.entries.contains_key(path) {
+                differences.push(format!("{msg_type} group {path}: in one dictionary only"));
+            } else if !only_o.is_empty() || !only_q.is_empty() {
+                differences.push(format!(
+                    "{msg_type} group {path} required: +{only_o:?} -{only_q:?}"
+                ));
+            }
+        }
     }
+    // Every group of every message, at every nesting level, by its path of
+    // count tags: the per-entry required sets agree on all of them.
+    assert_eq!(group_paths, 730, "group paths compared");
     // `+` is Orchestra only, `-` QuickFIX only.
     let expected = [
         // Orchestra lists ClearingFeeIndicator(635) in TrdCapRptSideGrp;
