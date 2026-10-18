@@ -143,6 +143,14 @@
 //! the next session's own writes, erasing a filed frame or moving a counter of
 //! the new stream; such a store must not be reused after a timed-out mutation.
 //!
+//! A mutation that fails with any other error is treated the same way, under
+//! both policies: the [`MessageStore`] contract gives a store no way to say
+//! that a failed write changed nothing (a disk write can fail after part of it
+//! reached the file, a flush can fail after the write it covers), so the
+//! store's state after it is unknown, and a reset is owed. Under
+//! [`StoreFailurePolicy::Continue`] that means the session carries on and the
+//! next one starts with a reset and `ResetSeqNumFlag` (141) = Y.
+//!
 //! A store failure never logs frame bytes: an outbound Logon carries
 //! `Password` (554).
 
@@ -279,13 +287,13 @@ pub(crate) struct SessionStore<'s> {
     /// Bound on each store call; an overrun is a failed write.
     timeout: Duration,
     /// The engine's record of a reset owed to the next session, set when a
-    /// mutation overruns the timeout.
+    /// mutation fails or overruns the timeout.
     owed: &'s AtomicBool,
 }
 
 impl<'s> SessionStore<'s> {
     /// Binds `store` to `policy`, bounding each call by `timeout`; a mutation
-    /// that overruns it leaves a reset owed in `owed`.
+    /// that fails or overruns it leaves a reset owed in `owed`.
     #[must_use]
     pub(crate) const fn new(
         store: &'s dyn MessageStore,
@@ -313,6 +321,11 @@ impl<'s> SessionStore<'s> {
     /// future is dropped (see [`MessageStore`]): the late write then lands
     /// before the reset, which erases it.
     ///
+    /// A mutation that fails with any other error owes a reset too, under
+    /// every policy: the store cannot say that a failed write changed nothing
+    /// (part of a disk write can reach the file before it fails, and a failed
+    /// flush can drop what earlier writes left), so its state is unknown.
+    ///
     /// # Errors
     /// The store's error, or [`StoreError::Timeout`].
     async fn mutate(
@@ -320,7 +333,7 @@ impl<'s> SessionStore<'s> {
         call: impl Future<Output = Result<(), StoreError>>,
     ) -> Result<(), StoreError> {
         let result = timed(self.timeout, call).await;
-        if matches!(result, Err(StoreError::Timeout { .. })) {
+        if result.is_err() {
             self.owed.store(true, Ordering::Release);
         }
         result

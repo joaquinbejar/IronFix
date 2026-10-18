@@ -2110,10 +2110,12 @@ impl<A: Application> Reactor<A> {
     /// and this session's own inbound traffic keep making progress.
     ///
     /// # Errors
-    /// Returns [`EngineError`] only if writing to the socket fails; the session
-    /// is then closed by the caller. Every other failure — an unreadable store,
-    /// a read that overruns the store timeout, an unrebuildable frame —
-    /// degrades to a gap fill.
+    /// Returns [`EngineError`] if writing to the socket fails, or
+    /// [`EngineError::Store`] if the store reports itself corrupted
+    /// ([`StoreError::Corrupted`]); the session is then closed by the caller.
+    /// Every other failure (a store that cannot be read, a read that overruns
+    /// the store timeout, a frame that does not rebuild) degrades to a gap
+    /// fill.
     async fn replay_range(
         &mut self,
         framed: &mut FixFramed,
@@ -2149,6 +2151,23 @@ impl<A: Application> Reactor<A> {
             let read = store.get_page(read_from, end_seq, RESEND_PAGE_LIMIT);
             let page = match timed(self.store_timeout, read).await {
                 Ok(page) => page,
+                // A store that finds its own records damaged cannot say which
+                // of the messages it holds are intact. Gap-filling the rest of
+                // the range would tell the counterparty that application
+                // messages it may never have received do not exist, so the
+                // session is closed instead and the request is left for the
+                // next session to make again.
+                Err(err @ StoreError::Corrupted { .. }) => {
+                    tracing::error!(
+                        session = %self.session_id,
+                        read_from,
+                        end_seq,
+                        error = %err,
+                        "the store holding the resend range is corrupted: closing the session \
+                         rather than gap-filling messages it may still hold"
+                    );
+                    return Err(EngineError::Store(err));
+                }
                 Err(err) => {
                     tracing::warn!(
                         session = %self.session_id,
