@@ -1,4 +1,4 @@
-# ADR-0020: Validating the application version on FIXT.1.1 sessions
+# ADR-0020 — Validating the application version on FIXT.1.1 sessions
 
 - **Status:** Accepted (issue #67, in the plan the owner approved, revised in
   the #67 review round; the initiator's default leniency on an ack without
