@@ -77,9 +77,9 @@
 //!   problems it rejects with `SessionRejectReason(373)=1` (required tag
 //!   missing); this validator reports the group's structural error and
 //!   suppresses that group's per-entry errors.
-//! - **Missing tags are reported in dictionary order.** QuickFIX reports the
+//! - **Missing tags are reported in schema order.** QuickFIX reports the
 //!   lowest missing tag number first; this validator reports them in the
-//!   order the dictionary declares them (see the error order below).
+//!   order its expanded schema lists them (see the error order below).
 //!
 //! # How groups are checked
 //!
@@ -123,10 +123,18 @@
 //! own per-entry errors, not those of the entry that encloses it. A count of
 //! `0` with no entries checks nothing.
 //!
-//! Error order: within an entry, missing fields in dictionary order, then
-//! missing nested groups by count tag; across entries, in the order entries
-//! close, so a nested group's entries come before the entry that encloses
-//! them. All per-entry errors follow the message's structural errors.
+//! Error order. Within an entry: first the group's own required fields, in
+//! declaration order; then the required members contributed by components
+//! referenced as required, component by component in declaration order (a
+//! component's own fields, then the components it references, depth first);
+//! then missing required nested groups by ascending count tag. Each tag is
+//! reported once, at its first position. A field declared *after* a component
+//! is therefore reported before that component's members: [`GroupDef`] keeps a
+//! group's fields, groups and components in separate lists, so their
+//! interleaving in the XML is not available to the validator. Across entries,
+//! errors come in the order entries close, so a nested group's entries come
+//! before the entry that encloses them. All per-entry errors follow the
+//! message's structural errors.
 //!
 //! **Behaviour change.** Before per-entry checking existed, a message whose
 //! group entries lacked required members validated; it is now rejected, so
@@ -136,10 +144,17 @@
 //!
 //! # Bounded output
 //!
-//! A single call collects at most [`MAX_VALIDATION_ERRORS`] errors. When the
+//! A single call returns at most [`MAX_VALIDATION_ERRORS`] errors. When the
 //! limit is reached, collection stops and a final
 //! [`ValidationError::ErrorLimitReached`] is appended, so a hostile message
 //! cannot turn validation into an allocation proportional to its size.
+//!
+//! Per-entry errors are provisional until their group is known to be
+//! well-formed, and they never take room from the result while provisional.
+//! A structural error that replaces them (a count or delimiter mismatch) is
+//! therefore always recorded while the result has room: a group whose
+//! provisional per-entry errors alone would exceed the limit, and which then
+//! turns out malformed, reports its structural error and no limit marker.
 //!
 //! Notes:
 //! - `CheckSum(10)` presence is not re-checked: the tag-value decoder
@@ -804,10 +819,10 @@ impl<'d> Validator<'d> {
         }
 
         // Structural walk over the message level. Per-entry errors of every
-        // well-formed group instance collect in `entry_errors` and follow the
-        // structural ones.
+        // well-formed group instance stay provisional in `entry_errors` until
+        // the walk ends, and then follow the structural ones.
         let mut seen: HashSet<u32> = HashSet::new();
-        let mut entry_errors: Vec<ValidationError> = Vec::new();
+        let mut entry_errors = Pending::default();
         let mut index = 0;
         while let Some(field) = fields.get(index) {
             let tag = field.tag;
@@ -823,7 +838,11 @@ impl<'d> Validator<'d> {
                 });
             }
             if let Some(group) = level.groups.get(&tag) {
-                index = walk_group(&tags, &fields, index, group, &mut sink, &mut entry_errors);
+                let (next, accepted) = walk_group(&tags, &fields, index, group, &mut sink);
+                if let Some(accepted) = accepted {
+                    ErrorSink::adopt(&mut entry_errors, accepted);
+                }
+                index = next;
                 continue;
             }
             if !level.allowed.contains(&tag) {
@@ -834,7 +853,7 @@ impl<'d> Validator<'d> {
             }
             index += 1;
         }
-        sink.accept(&mut entry_errors);
+        sink.commit(entry_errors);
 
         // Required fields. CheckSum(10) is consumed by the decoder and never
         // appears among the parsed fields, so it is skipped here.
@@ -863,57 +882,97 @@ impl<'d> Validator<'d> {
 /// Collects the errors of one [`Validator::validate`] call, up to
 /// [`MAX_VALIDATION_ERRORS`].
 ///
-/// Per-entry errors wait in pending buffers until their group instance is
-/// known to be well-formed. They count against the limit while they wait, and
-/// give their room back if their group turns out malformed and they are
-/// dropped. Once an error has been refused, collection stops for good, so the
-/// result is a prefix of what an unbounded run would report.
+/// Two kinds of error are kept apart:
+///
+/// - **Committed** errors are in the result: structural and message-level
+///   errors go straight there, and per-entry errors once their group instance
+///   is known to be well-formed. At most [`MAX_VALIDATION_ERRORS`] are kept;
+///   the first one refused marks the result as truncated.
+/// - **Provisional** errors are per-entry errors waiting in a [`Pending`]
+///   buffer for their group instance to finish. They never take committed
+///   room, so a structural error that replaces them (a count mismatch, a
+///   delimiter mismatch) is always recorded while committed room remains.
+///   Their own number is bounded by the committed room left, which is all
+///   that could ever be committed; a provisional error refused for that reason
+///   only truncates the result if its buffer is eventually committed.
+///
+/// Memory stays bounded: committed plus provisional errors never exceed twice
+/// [`MAX_VALIDATION_ERRORS`].
 #[derive(Debug, Default)]
 struct ErrorSink {
-    /// Errors accepted into the result.
+    /// Committed errors: the result.
     errors: Vec<ValidationError>,
-    /// Errors counted against the limit: accepted ones plus pending ones not
-    /// yet accepted or dropped.
-    held: usize,
-    /// Whether an error has been refused because the limit was reached.
+    /// Provisional errors outstanding across every pending buffer.
+    provisional: usize,
+    /// Whether an error that belonged in the result was refused.
     truncated: bool,
 }
 
+/// Provisional per-entry errors of one group instance, and of the
+/// well-formed groups nested in it.
+#[derive(Debug, Default)]
+struct Pending {
+    /// The errors, in the order they were produced.
+    errors: Vec<ValidationError>,
+    /// Whether an error was refused for lack of room while held here.
+    overflowed: bool,
+}
+
 impl ErrorSink {
-    /// Takes room for one more error, or records that the limit is reached.
-    fn reserve(&mut self) -> bool {
-        if self.truncated || self.held >= MAX_VALIDATION_ERRORS {
-            self.truncated = true;
-            return false;
-        }
-        self.held += 1;
-        true
-    }
-
-    /// Records an error directly in the result.
+    /// Commits an error to the result, or records that the result is full.
     fn push(&mut self, error: ValidationError) {
-        if self.reserve() {
+        if self.errors.len() < MAX_VALIDATION_ERRORS {
             self.errors.push(error);
+        } else {
+            self.truncated = true;
         }
     }
 
-    /// Records a per-entry error in a pending buffer.
-    fn hold(&mut self, pending: &mut Vec<ValidationError>, error: ValidationError) {
-        if self.reserve() {
-            pending.push(error);
+    /// Holds a per-entry error provisionally in `pending`.
+    ///
+    /// Refused, and `pending` marked as overflowed, once committed and
+    /// provisional errors together fill [`MAX_VALIDATION_ERRORS`]: no more
+    /// than that could ever reach the result.
+    fn hold(&mut self, pending: &mut Pending, error: ValidationError) {
+        let in_use = self.errors.len().checked_add(self.provisional);
+        if in_use.is_some_and(|in_use| in_use < MAX_VALIDATION_ERRORS) {
+            self.provisional += 1;
+            pending.errors.push(error);
+        } else {
+            pending.overflowed = true;
         }
     }
 
-    /// Moves pending errors into the result; they already hold their room.
-    fn accept(&mut self, pending: &mut Vec<ValidationError>) {
-        self.errors.append(pending);
+    /// Moves a finished, well-formed nested group's provisional errors into
+    /// the enclosing group's buffer; they stay provisional.
+    fn adopt(parent: &mut Pending, mut child: Pending) {
+        parent.errors.append(&mut child.errors);
+        parent.overflowed |= child.overflowed;
     }
 
-    /// Drops pending errors and gives their room back.
-    fn release(&mut self, pending: Vec<ValidationError>) {
-        debug_assert!(self.held >= pending.len(), "pending errors were counted");
-        if let Some(held) = self.held.checked_sub(pending.len()) {
-            self.held = held;
+    /// Commits a well-formed top-level group's provisional errors, as many as
+    /// committed room allows.
+    fn commit(&mut self, pending: Pending) {
+        self.forget(pending.errors.len());
+        if pending.overflowed {
+            self.truncated = true;
+        }
+        for error in pending.errors {
+            self.push(error);
+        }
+    }
+
+    /// Drops a malformed group's provisional errors; its structural error
+    /// stands in for them.
+    fn release(&mut self, pending: Pending) {
+        self.forget(pending.errors.len());
+    }
+
+    /// Stops counting `count` provisional errors.
+    fn forget(&mut self, count: usize) {
+        debug_assert!(self.provisional >= count, "provisional errors were counted");
+        if let Some(provisional) = self.provisional.checked_sub(count) {
+            self.provisional = provisional;
         }
     }
 
@@ -976,30 +1035,32 @@ fn check_value(
 
 /// Walks one group instance, starting at its count field.
 ///
-/// Structural errors (count, delimiter, a tag repeated inside an entry) go
-/// straight to `sink`. Per-entry errors, the required members missing from an
-/// entry of this group or of any group nested in it, are produced by
-/// [`check_entry_required`] at every entry boundary and held back: they are
-/// appended to `entry_errors` only if this group instance turns out
-/// well-formed (every entry delimiter-led, no tag repeated within an entry,
-/// and the declared count equal to the entries found). Otherwise they are
-/// dropped, because the group already carries a structural error.
+/// Structural errors (count, delimiter, a tag repeated inside an entry) are
+/// committed to `sink` straight away. Per-entry errors, the required members
+/// missing from an entry of this group or of any group nested in it, are
+/// produced by [`check_entry_required`] at every entry boundary and held
+/// provisionally: they are handed back to the caller only if this group
+/// instance turns out well-formed (every entry delimiter-led, no tag repeated
+/// within an entry, and the declared count equal to the entries found).
+/// Otherwise they are dropped, because the group already carries a
+/// structural error.
 ///
 /// Nothing here is sized from the declared count: entries are counted as
 /// they are found, so a count of `99999999999` costs no more than the fields
 /// actually present.
 ///
-/// Returns the index of the first field after the group.
+/// Returns the index of the first field after the group, and the group's
+/// provisional per-entry errors when it is well-formed (`None` when they were
+/// dropped).
 fn walk_group(
     tags: &TagResolver<'_, '_>,
     fields: &[&ironfix_core::field::FieldRef<'_>],
     index: usize,
     group: &GroupNode,
     sink: &mut ErrorSink,
-    entry_errors: &mut Vec<ValidationError>,
-) -> usize {
+) -> (usize, Option<Pending>) {
     let Some(count_field) = fields.get(index) else {
-        return index;
+        return (index, None);
     };
     let count_value = String::from_utf8_lossy(count_field.value);
     let declared = match count_value.parse::<u64>() {
@@ -1018,7 +1079,7 @@ fn walk_group(
     let mut entries: u64 = 0;
     let mut unparseable = false;
     let mut seen_in_entry: HashSet<u32> = HashSet::new();
-    let mut pending: Vec<ValidationError> = Vec::new();
+    let mut pending = Pending::default();
 
     while let Some(field) = fields.get(cursor) {
         let tag = field.tag;
@@ -1044,7 +1105,7 @@ fn walk_group(
             // as seen above, so a required nested group that is the delimiter
             // counts as present in the entry it opens.
             cursor = match group.entry.groups.get(&tag) {
-                Some(nested) => walk_group(tags, fields, cursor, nested, sink, &mut pending),
+                Some(nested) => walk_nested(tags, fields, cursor, nested, sink, &mut pending),
                 None => cursor + 1,
             };
             continue;
@@ -1083,7 +1144,7 @@ fn walk_group(
             // A nested group's per-entry errors join this group's pending
             // ones, so they are dropped too if this group is malformed. A
             // malformed nested group drops only its own.
-            Some(nested) => walk_group(tags, fields, cursor, nested, sink, &mut pending),
+            Some(nested) => walk_nested(tags, fields, cursor, nested, sink, &mut pending),
             None => cursor + 1,
         };
     }
@@ -1109,12 +1170,29 @@ fn walk_group(
     }
 
     if !unparseable && declared == Some(entries) {
-        entry_errors.append(&mut pending);
+        (cursor, Some(pending))
     } else {
         sink.release(pending);
+        (cursor, None)
     }
+}
 
-    cursor
+/// Walks a group nested in an entry of an enclosing group, moving its
+/// provisional per-entry errors, when it is well-formed, into the enclosing
+/// group's `pending` buffer. Returns the index of the first field after it.
+fn walk_nested(
+    tags: &TagResolver<'_, '_>,
+    fields: &[&ironfix_core::field::FieldRef<'_>],
+    index: usize,
+    nested: &GroupNode,
+    sink: &mut ErrorSink,
+    pending: &mut Pending,
+) -> usize {
+    let (next, accepted) = walk_group(tags, fields, index, nested, sink);
+    if let Some(accepted) = accepted {
+        ErrorSink::adopt(pending, accepted);
+    }
+    next
 }
 
 /// End-of-entry hook: reports, through `report`, the required members
@@ -1123,10 +1201,11 @@ fn walk_group(
 /// `entry` is the closed entry's 0-based index and `seen` the tags that
 /// appeared in it at its own level (a nested group's count tag included, its
 /// members not). Reported, in this order: every required field of the entry
-/// level in dictionary order (fields of the group itself and of components
-/// referenced as required, each tag once, the delimiter excluded when the
-/// scope was built), then every nested group marked required whose count tag
-/// is absent, by ascending count tag.
+/// level in schema order (the group's own fields in declaration order, then
+/// those of components referenced as required, component by component and
+/// depth first; each tag once, the delimiter excluded when the scope was
+/// built), then every nested group marked required whose count tag is
+/// absent, by ascending count tag.
 ///
 /// [`walk_group`] calls this at every entry boundary. It is kept apart from
 /// the walk, and reports through a callback rather than into a collector of
@@ -3449,8 +3528,8 @@ mod tests {
     #[test]
     fn test_validate_tag_required_directly_and_through_a_component_is_reported_once() {
         // OuterReq(201) is required by NoOuter itself and again by ReqBlock;
-        // an entry lacking it reports it once, in dictionary order before
-        // ReqField(300).
+        // an entry lacking it reports it once, at its first position: as one
+        // of the group's own fields, before ReqBlock's ReqField(300).
         assert_eq!(
             validate_u5(&["100=1", "200=A", "120=1", "220=k"]),
             Err(vec![
@@ -3552,6 +3631,147 @@ mod tests {
             !found
                 .iter()
                 .any(|error| matches!(error, ValidationError::ErrorLimitReached { .. }))
+        );
+    }
+
+    /// A FIX 4.4 ListStatus (35=N) declaring `declared` NoOrders(73) entries
+    /// and carrying `entries` of them, each only the delimiter `11=a`: every
+    /// entry lacks five required members (14, 39, 151, 84, 6).
+    fn delimiter_only_list_status(declared: &str, entries: usize) -> Vec<&str> {
+        let mut body: Vec<&str> = vec![
+            "66=LIST-1",
+            "429=1",
+            "82=1",
+            "431=1",
+            "83=1",
+            "68=1",
+            declared,
+        ];
+        body.extend(std::iter::repeat_n("11=a", entries));
+        fix44_message("35=N", &body)
+    }
+
+    #[test]
+    fn test_validate_structural_error_replaces_provisional_errors_past_the_limit() {
+        // 205 entries x 5 missing members = 1025 provisional per-entry
+        // errors, one more than the limit, but the count says 206: the group
+        // is malformed, so its per-entry errors are dropped and the count
+        // mismatch alone is reported. Provisional errors never take room from
+        // the result, so the mismatch cannot be crowded out.
+        let found = errors(validate(&delimiter_only_list_status("73=206", 205)));
+        assert_eq!(
+            found,
+            vec![ValidationError::GroupCountMismatch {
+                count_tag: 73,
+                name: "NoOrders".to_string(),
+                declared: 206,
+                actual: 205,
+                delimiter_tag: 11,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_validate_committed_errors_past_the_limit_end_with_the_marker() {
+        // The same 205 entries with a matching count: the group is
+        // well-formed, its 1025 per-entry errors are committed, and the
+        // result stops at the limit with the marker last.
+        let found = errors(validate(&delimiter_only_list_status("73=205", 205)));
+        assert_eq!(found.len(), MAX_VALIDATION_ERRORS + 1);
+        assert_eq!(
+            found.last(),
+            Some(&ValidationError::ErrorLimitReached {
+                limit: MAX_VALIDATION_ERRORS,
+            })
+        );
+        assert_eq!(found.first(), Some(&no_orders_missing(0, 14, "CumQty")));
+    }
+
+    #[test]
+    fn test_validate_committed_structural_errors_past_the_limit_end_with_the_marker() {
+        // Structural errors alone can fill the result too: 1100 undefined
+        // tags give 1024 UnknownTag errors and the marker.
+        let tags: Vec<String> = (0..1100)
+            .map(|index| format!("{}=x", 20_000 + index))
+            .collect();
+        let mut body: Vec<&str> = vec![
+            "11=ORDER-1",
+            "55=EURUSD",
+            "54=1",
+            "60=20260712-10:00:00",
+            "40=1",
+        ];
+        body.extend(tags.iter().map(String::as_str));
+        let found = errors(validate(&with_header(&body)));
+        assert_eq!(found.len(), MAX_VALIDATION_ERRORS + 1);
+        assert_eq!(
+            found.last(),
+            Some(&ValidationError::ErrorLimitReached {
+                limit: MAX_VALIDATION_ERRORS,
+            })
+        );
+        assert_eq!(
+            found.first(),
+            Some(&ValidationError::UnknownTag { tag: 20_000 })
+        );
+    }
+
+    /// A dialect whose NoX(100) entries interleave a direct field with a
+    /// component: `Key` (delimiter), then the required component `Block`
+    /// (with required `Inside`), then the required field `After`.
+    const INTERLEAVED_XML: &str = r"<fix type='FIX' major='4' minor='4'>
+        <header>
+            <field name='BeginString' required='Y'/>
+            <field name='BodyLength' required='Y'/>
+            <field name='MsgType' required='Y'/>
+        </header>
+        <trailer><field name='CheckSum' required='Y'/></trailer>
+        <messages>
+            <message name='Interleaved' msgtype='U9' msgcat='app'>
+                <group name='NoX' required='N'>
+                    <field name='Key' required='Y'/>
+                    <component name='Block' required='Y'/>
+                    <field name='After' required='Y'/>
+                </group>
+            </message>
+        </messages>
+        <components>
+            <component name='Block'>
+                <field name='Inside' required='Y'/>
+            </component>
+        </components>
+        <fields>
+            <field number='8' name='BeginString' type='STRING'/>
+            <field number='9' name='BodyLength' type='LENGTH'/>
+            <field number='10' name='CheckSum' type='STRING'/>
+            <field number='35' name='MsgType' type='STRING'/>
+            <field number='100' name='NoX' type='NUMINGROUP'/>
+            <field number='200' name='Key' type='STRING'/>
+            <field number='300' name='Inside' type='STRING'/>
+            <field number='400' name='After' type='STRING'/>
+        </fields>
+    </fix>";
+
+    #[test]
+    fn test_validate_group_entry_reports_direct_fields_before_component_members() {
+        // In the XML, Block (and its Inside(300)) comes before After(400).
+        // The schema keeps a group's fields and components in separate lists,
+        // so the group's own field After is reported first, then Block's
+        // Inside: the documented order, not the XML interleaving.
+        let dict = ok(
+            Dictionary::from_quickfix_xml(INTERLEAVED_XML),
+            "interleaved dialect loads",
+        );
+        let found = errors(validate_with(
+            &dict,
+            &["8=FIX.4.4", "9=100", "35=U9", "100=1", "200=k", "10=000"],
+        ));
+        assert_eq!(
+            found,
+            vec![
+                entry_missing(100, "NoX", 0, 400, "After"),
+                entry_missing(100, "NoX", 0, 300, "Inside"),
+            ]
         );
     }
 }

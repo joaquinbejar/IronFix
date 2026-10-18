@@ -1156,9 +1156,17 @@ A tag required twice (directly and through a component) is reported once. The
 delimiter is never reported missing; when it is a nested group's count tag,
 that nested group counts as present. A group that already carries a structural
 error gets no per-entry errors, nested groups included; a malformed nested
-group suppresses only its own. Errors come in dictionary order within an entry,
-then missing nested groups by count tag, with entries in the order they close
-(a nested group's entries before the entry that encloses them). Example from
+group suppresses only its own.
+
+Error order within an entry: first the group's own required fields in
+declaration order, then the required members of components referenced as
+required (component by component in declaration order, each component's own
+fields before the components it references), then missing required nested
+groups by ascending count tag; each tag once, at its first position. A field
+declared after a component in the XML is still reported before that
+component's members, because the schema keeps a group's fields and components
+in separate lists. Entries are reported in the order they close (a nested
+group's entries before the entry that encloses them). Example from
 the vendored FIX 4.4 dictionary: each `NoOrders` (73) entry of a NewOrderList
 (35=E) requires `ClOrdID` (11), `ListSeqNo` (67) and `Side` (54); an entry
 without 67 is reported with its index.
@@ -1168,11 +1176,15 @@ and `PartyRole` (452) are "Required if NoPartyIDs > 0", but QuickFIX XML cannot
 express a condition, and the vendored dictionary marks both `required='N'`;
 with the dictionary as the authority, they are not enforced.
 
-One validation call collects at most `MAX_VALIDATION_ERRORS` (1024) errors;
+One validation call returns at most `MAX_VALIDATION_ERRORS` (1024) errors;
 past that it stops and appends `ValidationError::ErrorLimitReached`, so a
 hostile message (for example a ListStatus of 200,000 one-field entries, which
 fits the codec's 1 MiB frame limit) cannot make the report grow with the
-message.
+message. Per-entry errors stay provisional until their group is known to be
+well-formed and never take room from the result while provisional, so a
+structural error that replaces them is always recorded: a ListStatus declaring
+206 `NoOrders` entries but carrying 205 delimiter-only ones (1025 provisional
+per-entry errors) reports just the count mismatch.
 
 **Differences from QuickFIX.**
 
@@ -1191,8 +1203,9 @@ message.
   rejects with `SessionRejectReason` (373) = 1 (required tag missing); IronFix
   reports the group's structural error and suppresses that group's per-entry
   errors.
-- **Dictionary order.** QuickFIX reports the lowest missing tag first; IronFix
-  reports missing tags in the order the dictionary declares them.
+- **Schema order.** QuickFIX reports the lowest missing tag first; IronFix
+  reports missing tags in the order described above (own fields, then
+  component members, then nested groups).
 
 **Behaviour change.** This check is newer than the structural one, so
 validation is stricter than it was, and stricter than QuickFIX: messages whose
