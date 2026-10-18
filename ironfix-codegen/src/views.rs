@@ -513,24 +513,24 @@ impl<'d> Part<'d> {
     fn message(def: &'d MessageDef) -> Self {
         Self {
             members: def.members().collect(),
-            groups: &def.groups,
-            components: &def.components,
+            groups: def.groups(),
+            components: def.components(),
         }
     }
 
     fn component(def: &'d ComponentDef) -> Self {
         Self {
             members: def.members().collect(),
-            groups: &def.groups,
-            components: &def.components,
+            groups: def.groups(),
+            components: def.components(),
         }
     }
 
     fn group(def: &'d GroupDef) -> Self {
         Self {
             members: def.members().collect(),
-            groups: &def.groups,
-            components: &def.components,
+            groups: def.groups(),
+            components: def.components(),
         }
     }
 }
@@ -628,9 +628,6 @@ impl<'d> Builder<'d> {
                     previous = None;
                     reference
                 }
-                // `MemberRef` is `#[non_exhaustive]`; the dictionary moves in
-                // lockstep with this crate, and every kind it has is above.
-                _ => continue,
             };
             let name = &reference.name;
             if stack.iter().any(|visited| visited == name) {
@@ -954,8 +951,8 @@ impl<'d> Builder<'d> {
             };
             stack.push(reference.name.clone());
             self.choose(
-                &component.groups,
-                &component.components,
+                component.groups(),
+                component.components(),
                 depth + 1,
                 stack,
                 chosen,
@@ -3309,7 +3306,7 @@ mod tests {
             vec![ComponentRef::new("Allocs", false)],
         );
         let mut group = allocs(false, 79);
-        group.components = vec![ComponentRef::new("Allocs", false)];
+        group.push(SchemaMember::Component(ComponentRef::new("Allocs", false)));
         dict.add_component(ComponentDef::new(
             "Allocs".to_string(),
             vec![SchemaMember::Group(group)],
