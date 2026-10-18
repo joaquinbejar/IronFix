@@ -42,6 +42,7 @@ These messages are required for establishing and maintaining FIX sessions.
 | Tag | Field Name | Description |
 |-----|------------|-------------|
 | 141 | ResetSeqNumFlag | Reset sequence numbers (Y/N) |
+| 789 | NextExpectedMsgSeqNum | FIX.4.4 and FIXT.1.1 only: the next `MsgSeqNum` the sender expects to receive. Sent and honoured only with `SessionConfig::send_next_expected_msg_seq_num`; see "NextExpectedMsgSeqNum (789), both roles" below |
 | 553 | Username | Authentication username |
 | 554 | Password | Authentication password |
 | 384 | NoMsgTypes | FIXT.1.1 only: repeating group of supported message types (372, 385, 1130, 1406, 1131, 1410). The embedded QuickFIX `FIXT11.xml` does not define it; see "Dictionary side, standalone" below |
@@ -123,7 +124,17 @@ and stops at the first failure:
    halves disagree here — its initiator would set 1, its acceptor 2 — and
    IronFix matches the acceptor. The mismatch self-heals: the peer sees a gap
    at 2, requests a resend of 1, and receives a GapFill that resynchronises it.
-8. **`MsgSeqNum` (34).** The header 34 is read positionally, *before* identity —
+8. **`NextExpectedMsgSeqNum` (789)**, only with
+   `SessionConfig::send_next_expected_msg_seq_num` set. Decided after the
+   "`141=Y` under `MsgSeqNum = 1`" check of step 7 and before its reset reaches
+   the store, against the counters that reset sets (our Logon is then 1 and 2
+   goes next), so a refused ack never resets the store. A 789 above the next
+   number we send fails the handshake with a Logout alone; a 789 that is 0, not
+   a number or repeated with a session Reject (reason 5, 6 or 13, `RefTagID` =
+   789) and a Logout; both as `EngineError::NextExpectedMsgSeqNum`. A 789 below
+   our Logon makes the session resend the missed range once Active. See
+   "NextExpectedMsgSeqNum (789), both roles" below.
+9. **`MsgSeqNum` (34).** The header 34 is read positionally, *before* identity —
    the same standard-header contract step 2 applies to the CompIDs — so a 34 that
    occurs only after the body is treated as missing and fails the handshake. The
    value read there is then validated at this step: too low fails the handshake,
@@ -141,7 +152,7 @@ the old stream; a message that declares `141=Y` itself must still carry 1.
 
 The same identity and `SendingTime` checks (steps 2 and 3) run on every inbound
 frame once the session is established; there a failure produces the Reject and
-Logout and then tears the session down. An unsatisfied ResendRequest from step 8
+Logout and then tears the session down. An unsatisfied ResendRequest from step 9
 does not stall forever — it is retried and then escalated to Logout; see "Resend
 Request".
 
@@ -161,9 +172,12 @@ slot;
 then `SendingTime` (52), and the `from_admin` authentication hook (where
 `Username` (553) / `Password` (554) are inspected); then, on a FIX 5.0 session,
 `DefaultApplVerID` (1137); then a `ResetSeqNumFlag` (141) Logon must carry
-`MsgSeqNum = 1`; then `HeartBtInt` (108); only then is an attached store reset
-or refreshed; then `MsgSeqNum` is validated and the acknowledgement sent. The
-differences from the initiator are role-symmetric:
+`MsgSeqNum = 1`; then `HeartBtInt` (108); then, with
+`send_next_expected_msg_seq_num` set, `NextExpectedMsgSeqNum` (789) is read
+and, on a Logon that asked for the reset, must be 1; only then is an attached
+store reset or refreshed; then 789 is compared with the next number the
+acceptor sends; then `MsgSeqNum` is validated and the acknowledgement sent.
+The differences from the initiator are role-symmetric:
 
 - **`DefaultApplVerID` (1137).** 1137 is a required field of the FIXT.1.1
   Logon, so on a FIX 5.0 session the acceptor requires it, exactly once, naming
@@ -193,6 +207,16 @@ differences from the initiator are role-symmetric:
   Logon is its message 1 whatever its number: a Logon at `34=N`, `N > 1`,
   without 141 opens no gap and draws no `ResendRequest`, and 2 is expected
   next.
+- **`NextExpectedMsgSeqNum` (789)**, only with
+  `send_next_expected_msg_seq_num` set. A malformed 789 (0, not a number,
+  repeated), a `141=Y` Logon whose 789 is not 1, and a 789 above the number
+  the acknowledgement would take are refused with a Logout alone
+  (`EngineError::NextExpectedMsgSeqNum`), the first two before the store is
+  touched, the last before the Logon's `MsgSeqNum` is consumed. A 789 below the
+  acknowledgement's number makes the session resend the missed range once
+  Active. When the acceptor drives a reset the peer did not ask for, the peer's
+  789 describes the discarded stream and is ignored. The acknowledgement
+  declares the acceptor's own next expected number.
 - **Duplicate connections.** An `Acceptor` is one configured session, so it
   admits one live session at a time for its counterparty. A second concurrent
   Logon while a session is established is refused **without a reply**, with or
@@ -235,7 +259,8 @@ the Logon:
 3. **A duplicate Logon** — nothing, in either mode (above).
 4. **An authenticated peer** (`from_admin` accepted it) — refused by its
    `DefaultApplVerID` (FIX 5.0), by a `141=Y` Logon not numbered 1, by its
-   `HeartBtInt`, or by a `MsgSeqNum` too low: a
+   `HeartBtInt`, by its `NextExpectedMsgSeqNum` (789, when used), or by a
+   `MsgSeqNum` too low: a
    Logout saying why, sent like every session frame, numbered from the store's
    refreshed counters (or the seed), never from a reset, and filed when a store
    is attached.
@@ -243,6 +268,64 @@ the Logon:
 A gap in the inbound Logon completes the handshake and immediately issues a
 `ResendRequest` (2). Once Active, the session runs the same reactor as the
 initiator, so every inbound-frame rule below applies identically to both roles.
+
+**NextExpectedMsgSeqNum (789), both roles**
+
+FIX.4.4 and FIXT.1.1 define `NextExpectedMsgSeqNum` (789) on the Logon: the
+next `MsgSeqNum` the sender expects to receive, so each side learns at Logon
+which of its messages the other missed, and can tell a counterparty that
+claims to expect a number never sent. IronFix uses it only when
+`SessionConfig::send_next_expected_msg_seq_num` is set (default `false`), and
+then in both directions; with it unset no 789 is sent and a counterparty's is
+ignored. Setting it on a session below FIX.4.4 (FIX.4.0 to FIX.4.3, which do
+not define the field) is `SessionConfigError::NextExpectedMsgSeqNumUnsupported`,
+reported by the builder, by `SessionConfig::validate` and by both engines
+(`EngineError::Config`) before a connection is taken or dialled
+(`doc/adr/0021-next-expected-msg-seq-num.md`).
+
+*What is declared.* The session's own next expected inbound `MsgSeqNum`,
+placed after `ResetSeqNumFlag` (141) and before `DefaultApplVerID` (1137):
+
+| Logon | 789 |
+|---|---|
+| Initiator Logon | the next number expected from the acceptor (the seeded target counter) |
+| Initiator Logon with `141=Y` | 1: the acknowledgement of a reset is message 1 |
+| Acceptor acknowledgement, the Logon in sequence | the Logon's `MsgSeqNum` + 1 |
+| Acceptor acknowledgement with `141=Y` | 2: the Logon it answers is message 1 of the new stream |
+| Acceptor acknowledgement, the Logon gapped | the first missing number: a gapped Logon is not consumed |
+
+*What the counterparty's 789 does.* It is compared with the `MsgSeqNum` of the
+session's own Logon (initiator) or acknowledgement (acceptor) and with the next
+number the session sends, both taken after any reset of the exchange. It never
+moves a counter.
+
+| Counterparty's 789 | Result |
+|---|---|
+| above the next number the session sends | the counterparty claims messages never sent: Logout with a `Text` saying so, no `on_logon`, `EngineError::NextExpectedMsgSeqNum` |
+| below the session's own Logon or acknowledgement | once Active, the session resends exactly 789 up to, **not including**, its own Logon, as the answer to a `ResendRequest` for that range (see "Resend Request") |
+| 0, not a number (a sign included), above `u64::MAX`, or repeated | refused without a panic: a Logout (the initiator first sends a session Reject, reason 5, 6 or 13, `RefTagID` = 789) and `EngineError::NextExpectedMsgSeqNum` |
+| from the session's own Logon up to the next number it sends | nothing to resend |
+
+The resend is the session reactor's second opening act, right after the
+`ResendRequest` for a gap the Logon exchange found. A gap in the Logon's own
+`MsgSeqNum` is still requested as before: 789 changes nothing about the
+inbound side.
+
+*Interaction with a receiver that does not hold a gapped Logon.* The resend
+stops before the session's own Logon, which a receiver that holds a gapped
+Logon until the gap before it is filled then consumes. IronFix's own receiver
+does not hold it yet (a gap queue is #71): it processes the gapped Logon
+without consuming it, and recovers its number through the `ResendRequest` it
+sends. When the answer to that request covers the Logon with a gap fill that
+starts below the number the receiver then expects (the message before the
+Logon is administrative, typically the previous session's Logout), that fill
+is ignored as a possible duplicate, and the Logon's number is recovered by the
+request's retry after `SessionConfig::resend_timeout` (10 s by default).
+Nothing is lost and no number is reused, but between two IronFix engines the
+receiver's expectation waits for up to one resend timeout after the 789
+resend. Whether the resend should also gap-fill the session's own Logon is an
+open protocol question (`doc/adr/0021-next-expected-msg-seq-num.md`, "Open
+questions").
 
 **Routing a Logon to its session (several counterparties on one listener)**
 
@@ -564,6 +647,16 @@ single `SequenceReset`-GapFill with `MsgSeqNum` = BeginSeqNo and `NewSeqNo` as
 above. A counterparty asking for business traffic then receives a gap fill
 rather than the traffic.
 
+**A resend asked for at Logon.** With
+`SessionConfig::send_next_expected_msg_seq_num` set, a counterparty whose
+`NextExpectedMsgSeqNum` (789) on its Logon or acknowledgement is below this
+session's own Logon or acknowledgement gets, once the session is Active,
+exactly the answer a `ResendRequest` with `BeginSeqNo` = 789 and `EndSeqNo` =
+the number before that Logon would get: the same replay from the store, the
+same gap fills, one gap fill without a store, and the same close when the store
+reports itself corrupted. Nothing at or past the session's own Logon is resent.
+See "NextExpectedMsgSeqNum (789), both roles" under "Logon".
+
 **Across a restart.** `MemoryStore` holds messages and sequence numbers in
 process memory only, so with it replay works within a live process and
 nothing survives a restart. `FileStore` keeps the filed frames and both
@@ -812,11 +905,11 @@ FIX 4.x session (which carries no `ApplVerID` to reject).
 | Code | Emitted when |
 |---|---|
 | 1 | `SequenceReset` without `NewSeqNo` (36); `ResendRequest` without `BeginSeqNo` (7) or `EndSeqNo` (16); inbound `SendingTime` (52) absent; FIX 5.0, initiator in strict mode only: a Logon acknowledgement without `DefaultApplVerID` (1137), `RefTagID` = 1137, followed by a Logout |
-| 5 | `SequenceReset` whose `NewSeqNo` would rewind or fails to advance; `ResendRequest` whose range is outside what we have sent |
-| 6 | `SequenceReset` with a malformed `GapFillFlag` (123) that is present but neither `Y` nor `N`; inbound `SendingTime` (52) present but not a `UTCTimestamp` |
+| 5 | `SequenceReset` whose `NewSeqNo` would rewind or fails to advance; `ResendRequest` whose range is outside what we have sent; initiator, with `send_next_expected_msg_seq_num`: a Logon acknowledgement whose `NextExpectedMsgSeqNum` (789) is 0, `RefTagID` = 789, followed by a Logout |
+| 6 | `SequenceReset` with a malformed `GapFillFlag` (123) that is present but neither `Y` nor `N`; inbound `SendingTime` (52) present but not a `UTCTimestamp`; initiator, with `send_next_expected_msg_seq_num`: a Logon acknowledgement whose `NextExpectedMsgSeqNum` (789) is not a number, `RefTagID` = 789, followed by a Logout |
 | 9 | Inbound `SenderCompID`/`TargetCompID` (and `SenderSubID`/`TargetSubID` when configured) do not match the session configuration, **or** appear outside the standard header |
 | 10 | Inbound `SendingTime` (52) differs from the local clock by more than the configured tolerance |
-| 13 | FIX 5.0 only: `ApplVerID` (1128) more than once in the standard header of an inbound application message, or `DefaultApplVerID` (1137) more than once on the Logon acknowledgement (initiator); `RefTagID` = the repeated tag |
+| 13 | FIX 5.0 only: `ApplVerID` (1128) more than once in the standard header of an inbound application message, or `DefaultApplVerID` (1137) more than once on the Logon acknowledgement (initiator); with `send_next_expected_msg_seq_num`, `NextExpectedMsgSeqNum` (789) more than once on the Logon acknowledgement (initiator, followed by a Logout); `RefTagID` = the repeated tag |
 | 14 | FIX 5.0 only: `ApplVerID` (1128), a standard-header field, after the header of an inbound application message has ended; `RefTagID` = 1128, the number is consumed and the message never reaches `from_app` |
 | 18 | FIX 5.0 only: an inbound application message whose `ApplVerID` (1128) names no version or a version the session does not accept (`RefTagID` = 1128, and `RefApplVerID` (1130) = the refused code when it names a version, `2` to `9`; the message's number is consumed and it never reaches `from_app`), or a Logon acknowledgement whose `DefaultApplVerID` (1137) fails the same rule (`RefTagID` = 1137, followed by a Logout; initiator) |
 | any | Whatever an `Application::from_admin` / `from_app` implementation returns in its `RejectReason` |
@@ -1671,6 +1764,13 @@ ADR-0011.
   satisfies is also bounded — retried every `SessionConfig::resend_timeout` and
   then escalated to Logout after `SessionConfig::max_resend_requests` attempts,
   rather than stalling the session forever. See "Resend Request" above.
+- [x] `NextExpectedMsgSeqNum` (789) on Logon, opt-in
+  (`SessionConfig::send_next_expected_msg_seq_num`, FIX.4.4 and FIXT.1.1 only)
+  in both roles: declared on the Logon and its acknowledgement; a
+  counterparty's 789 below this session's own Logon resends the missed range
+  once Active, one above what was sent refuses the Logon with a Logout. See
+  "NextExpectedMsgSeqNum (789), both roles" under "Logon", and its open
+  question on the range.
 
 ### Phase 2: Order Entry (High Priority)
 - [ ] New Order Single

@@ -41,10 +41,15 @@
 //! once, in `DefaultApplVerID` (1137), an application version the session
 //! accepts ([`SessionConfig::accepts_appl_version`]);
 //! then a `ResetSeqNumFlag` (141) Logon must carry `MsgSeqNum` 1; then the
-//! `HeartBtInt` (108) the initiator requested is bounded; only then is an
-//! attached store reset (for 141, the local `reset_on_logon`, or an owed
-//! reset) or refreshed; and finally `MsgSeqNum` is validated and the ack,
-//! mirroring 141 and echoing 108, is sent. Waiting for the inbound Logon is
+//! `HeartBtInt` (108) the initiator requested is bounded; then, with
+//! [`SessionConfig::send_next_expected_msg_seq_num`] set, the Logon's
+//! `NextExpectedMsgSeqNum` (789) is read, and must be 1 on a 141 Logon; only
+//! then is an attached store reset (for 141, the local `reset_on_logon`, or an
+//! owed reset) or refreshed; then 789 is compared with the number the ack will
+//! take (above it, the initiator claims messages never sent; below it, the
+//! missed range is resent, up to but not including the ack, once Active); and
+//! finally `MsgSeqNum` is validated and the ack, mirroring 141, echoing 108 and
+//! declaring its own 789 when the flag is set, is sent. Waiting for the inbound Logon is
 //! bounded by [`SessionConfig::logon_timeout`]; a garbled frame that arrives
 //! first (a bad CheckSum or BodyLength, bytes before `8=`, or a frame whose
 //! MsgType (35) is not third) is skipped and the wait goes on against the same
@@ -73,7 +78,9 @@
 //!   mode. The live session owns the sequence stream.
 //! - **An authenticated peer** (`from_admin` accepted it) refused by its
 //!   `DefaultApplVerID` (1137: missing, repeated, not a code, or not accepted),
-//!   a 141 Logon not numbered 1, its `HeartBtInt`, or a `MsgSeqNum` too low: a
+//!   a 141 Logon not numbered 1, its `HeartBtInt`, its
+//!   `NextExpectedMsgSeqNum` (789, when used: malformed, or above what was
+//!   sent), or a `MsgSeqNum` too low: a
 //!   Logout carrying the reason, sent like every session frame, numbered from
 //!   the store's refreshed counters (or the seed) and filed when a store is
 //!   attached. Such a refusal never resets the store.
@@ -661,7 +668,8 @@ impl<A: Application + 'static> Acceptor<A> {
     }
 
     /// Refuses a Logon that `from_admin` has accepted: its `DefaultApplVerID`,
-    /// `ResetSeqNumFlag` or `HeartBtInt` check failed.
+    /// `ResetSeqNumFlag`, `HeartBtInt` or `NextExpectedMsgSeqNum` check failed
+    /// before the store was touched.
     ///
     /// The peer is authenticated, so it gets the refusal (the Logout's text),
     /// sent like every frame of the session: numbered from a seed that never
@@ -751,8 +759,11 @@ impl<A: Application + 'static> Acceptor<A> {
     ///   FIX 5.0 session, by a `DefaultApplVerID` (1137) that is missing,
     ///   repeated, not an application-version code, or not a version the
     ///   session accepts; by a `ResetSeqNumFlag` (141) Logon not numbered 1; a
-    ///   missing or out of range `HeartBtInt` (108); or a `MsgSeqNum` below the
-    ///   expected one: the Logout is sent like every session frame, numbered
+    ///   missing or out of range `HeartBtInt` (108); a `NextExpectedMsgSeqNum`
+    ///   (789) that is malformed or above the number the ack would take, when
+    ///   [`SessionConfig::send_next_expected_msg_seq_num`] is set; or a
+    ///   `MsgSeqNum` below the expected one: the Logout is sent like every
+    ///   session frame, numbered
     ///   from the store's refreshed counters (or the seed) and filed when a
     ///   store is attached. Such a refusal never resets the store.
     ///
@@ -778,7 +789,8 @@ impl<A: Application + 'static> Acceptor<A> {
     /// (98), a `HeartBtInt` (108) that is missing, non-numeric, or out of range,
     /// and a second concurrent Logon for a session already established.
     /// [`EngineError::ApplVersion`] is a FIX 5.0 Logon's `DefaultApplVerID`
-    /// (1137) refused as above. A
+    /// (1137) refused as above, and [`EngineError::NextExpectedMsgSeqNum`] its
+    /// `NextExpectedMsgSeqNum` (789). A
     /// `BeginString` this engine cannot frame *at all* is refused up front with
     /// [`EngineError::UnsupportedVersion`], an unusable configuration with
     /// [`EngineError::Config`], and a zero initial seed that would be used with

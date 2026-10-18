@@ -56,6 +56,14 @@
 //! application message whose `ApplVerID` (1128) names any other version is
 //! rejected (`SessionRejectReason` 18) without reaching `from_app`.
 //!
+//! With [`SessionConfig::send_next_expected_msg_seq_num`] set (FIX.4.4 and
+//! FIXT.1.1 sessions only), both roles use `NextExpectedMsgSeqNum` (789) on the
+//! Logon exchange: each declares the next `MsgSeqNum` it expects, resends once
+//! Active what the counterparty's 789 says it missed (the range below its own
+//! Logon, through the same replay a `ResendRequest` gets), and refuses a Logon
+//! whose 789 claims messages never sent with
+//! [`EngineError::NextExpectedMsgSeqNum`], before `on_logon`.
+//!
 //! Both also frame their socket with garbled-frame recovery on
 //! ([`ironfix_transport::FixCodec::with_garbled_recovery`], anchored on the
 //! session's own BeginString). A garbled inbound frame, including one whose

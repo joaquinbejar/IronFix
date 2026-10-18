@@ -119,6 +119,17 @@ messages and the engine wiring do not exist yet.
   credentials) gets no reply; a second Logon for a session already live gets
   no reply in every case; an authenticated peer refused after that
   (`HeartBtInt`, `MsgSeqNum`) gets a filed Logout saying why.
+- **`NextExpectedMsgSeqNum` (789) on Logon**, opt-in with
+  `SessionConfig::send_next_expected_msg_seq_num` on FIX.4.4 and FIXT.1.1
+  sessions (refused below FIX.4.4), in both roles. The Logon and its
+  acknowledgement declare the next `MsgSeqNum` each side expects (1 on a
+  `ResetSeqNumFlag` Logon). A counterparty's 789 below the session's own Logon
+  makes it resend exactly the missed range once Active, through the resend
+  path above; one above what was sent refuses the Logon with a Logout, before
+  `on_logon`. The resend stops before the session's own Logon; between two
+  IronFix engines the receiver then recovers that Logon's number through its
+  own `ResendRequest`, which can take one `resend_timeout`
+  (`doc/adr/0021-next-expected-msg-seq-num.md`).
 - **A typestate session FSM** and checked sequence arithmetic in
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in

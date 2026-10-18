@@ -84,6 +84,21 @@
 //! 1128), its number consumed, and never reaches `from_app`. FIX 4.x
 //! sessions carry neither field and check neither.
 //!
+//! # `NextExpectedMsgSeqNum` (789)
+//!
+//! With [`SessionConfig::send_next_expected_msg_seq_num`] set (FIX.4.4 and
+//! FIXT.1.1 only), the Logon declares in 789 the next `MsgSeqNum` expected from
+//! the acceptor (1 when it declares `ResetSeqNumFlag` (141)), and the
+//! acknowledgement's 789 is held against this session's counters, those of a
+//! reset the acknowledgement declares included, before that reset reaches the
+//! store: a value above the next number this session sends fails the handshake
+//! with a Logout and [`EngineError::NextExpectedMsgSeqNum`]; a value that is
+//! 0, not a number or repeated with a Reject (`RefTagID` 789) and a Logout; a
+//! value below this session's Logon makes the session resend that range, up to
+//! but not including the Logon, once Active, as it would answer a
+//! `ResendRequest`. Without the flag no 789 is sent and the acknowledgement's
+//! is ignored.
+//!
 //! # Resend and the message store
 //!
 //! [`Initiator::with_store`] attaches a [`MessageStore`]. Every sequenced
@@ -544,7 +559,11 @@ impl<A: Application + 'static> Initiator<A> {
     /// sequence counter has reached `u64::MAX` and the session must be reset
     /// before it can number another message; and, on a FIX 5.0 session,
     /// [`EngineError::ApplVersion`], when the ack carries a `DefaultApplVerID`
-    /// (1137) the session does not accept. A `BeginString` this engine
+    /// (1137) the session does not accept; and, with
+    /// [`SessionConfig::send_next_expected_msg_seq_num`] set,
+    /// [`EngineError::NextExpectedMsgSeqNum`], when the ack's
+    /// `NextExpectedMsgSeqNum` (789) is malformed or above the next number
+    /// this session sends. A `BeginString` this engine
     /// cannot frame conformantly is refused up front with
     /// [`EngineError::UnsupportedVersion`], an unusable configuration with
     /// [`EngineError::Config`], and a zero initial sequence seed with
