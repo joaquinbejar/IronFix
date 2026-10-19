@@ -398,13 +398,10 @@ pub trait Application: Send + Sync {
     /// }
     /// ```
     ///
-    /// **A replay is not gated.** The answer to a `ResendRequest` (2) and the
-    /// resend a `NextExpectedMsgSeqNum` (789) asks for write each filed frame
-    /// as it was filed, with `PossDupFlag` (43) = Y, without calling this:
-    /// the message already went out under its number. This differs from
-    /// QuickFIX, which calls `toApp` on each resent application message and
-    /// gap-fills one that throws `DoNotSend`. A gate that must also stop
-    /// stale orders from being resent cannot rely on this callback today.
+    /// **A replay does not come here.** The answer to a `ResendRequest` (2)
+    /// and the resend a `NextExpectedMsgSeqNum` (789) asks for go through
+    /// [`Application::to_app_resend`] instead, which sees the rebuilt frame
+    /// read-only and can veto it, so it is gap-filled rather than resent.
     ///
     /// - A verdict resolving `Ok(())` sends the message as this callback
     ///   leaves it: the body is mutable and the mutation is effective, as for
@@ -450,6 +447,53 @@ pub trait Application: Send + Sync {
         session_id: &'a SessionId,
     ) -> SendVerdict<'a> {
         SendVerdict::forward(self.to_app(message, session_id))
+    }
+
+    /// Called before a filed application message is **resent**, with the
+    /// power to refuse it: the replay gate, the equivalent of QuickFIX
+    /// calling `toApp` on a resent message and gap-filling it on
+    /// `DoNotSend` (ADR-0023, "Replay gate").
+    ///
+    /// The engine calls this for each stored application message it is
+    /// about to replay, both in the answer to a `ResendRequest` (2) and in
+    /// the resend a `NextExpectedMsgSeqNum` (789) on Logon asks for.
+    /// `message` is the frame exactly as it will go on the wire: the filed
+    /// body under its original `MsgSeqNum` (34), with `PossDupFlag` (43) = Y,
+    /// a fresh `SendingTime` (52) and `OrigSendingTime` (122). It is
+    /// read-only: a replay must say what was first sent under its number.
+    ///
+    /// - A verdict resolving `Ok(())` resends the message unchanged.
+    /// - A verdict resolving `Err(reason)` gap-fills it: its number is
+    ///   covered by a SequenceReset-GapFill (123 = Y) instead. Consecutive
+    ///   vetoed messages, together with any administrative messages and
+    ///   holes next to them, are covered by **one** gap fill, which runs up
+    ///   to the next message that is resent or to the end of the range. The
+    ///   veto is logged at debug level with the sequence number and the
+    ///   reason's `code` only.
+    ///
+    /// The default allows every replay, so an implementor that does not
+    /// override this sees every filed application message resent as filed.
+    /// [`Application::to_app_checked`] is never called for a replay, and
+    /// administrative messages never reach this method: they are gap-filled
+    /// on a resend whatever it would say.
+    ///
+    /// The verdict is awaited while the resend holds every new message back,
+    /// so a slow gate delays the session's new traffic; build it with
+    /// [`SendVerdict::ready`] when the decision can be taken at once.
+    ///
+    /// A wrapper that delegates to an inner application must forward this
+    /// method too, or the inner gate is skipped for replays.
+    ///
+    /// # Arguments
+    /// * `message` - The rebuilt replay frame (read-only)
+    /// * `session_id` - The session identifier
+    fn to_app_resend<'a>(
+        &'a self,
+        message: &'a RawMessage<'_>,
+        session_id: &'a SessionId,
+    ) -> SendVerdict<'a> {
+        let _ = (message, session_id);
+        SendVerdict::ready(Ok(()))
     }
 
     /// Called when an application message is received.
@@ -733,6 +777,28 @@ mod tests {
             order.fields().len(),
             0,
             "the no-op application adds nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_default_to_app_resend_allows_every_replay() {
+        let session_id = SessionId::new("FIX.4.4", "SENDER", "TARGET");
+        let frame = b"8=FIX.4.4\x019=5\x0135=8\x0110=000\x01";
+        let raw = match ironfix_tagvalue::Decoder::new(frame)
+            .with_checksum_validation(false)
+            .decode()
+        {
+            Ok(raw) => raw,
+            Err(err) => panic!("fixture must decode: {err:?}"),
+        };
+        assert_eq!(
+            StampsAccount.to_app_resend(&raw, &session_id).await,
+            Ok(()),
+            "an override of to_app alone does not gate replays"
+        );
+        assert_eq!(
+            NoOpApplication.to_app_resend(&raw, &session_id).await,
+            Ok(())
         );
     }
 }

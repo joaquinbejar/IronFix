@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (issue #68, in the plan the owner approved; revised in
   the #68 architecture and protocol review round, and for the buffered writer
-  of #126)
+  of #126); amended for the replay gate (issue #133)
 - **Date:** 2026-10-18
 
 ## Context
@@ -123,14 +123,56 @@ Administrative messages (Logon, Logout, Heartbeat, TestRequest,
 ResendRequest, SequenceReset, Reject, XmlMessage) go through `to_admin`,
 which can mutate but not refuse them.
 
-**Replays are not gated.** The answer to a `ResendRequest` and the
-`NextExpectedMsgSeqNum` (789) resend write each filed frame as it was filed,
-with `PossDupFlag` (43) = Y, without calling the gate. QuickFIX calls `toApp`
-on each resent application message and gap-fills one that throws
-`DoNotSend`. Gating replays needs the stored frame decoded back into an
-`OutboundMessage` for the callback, and a veto turned into a gap fill inside
-the resend writer; it is left to a follow-up issue and stated as a gap in the
-README.
+Replays are not seen by `to_app_checked`; they have their own gate, below.
+
+### Replay gate (amendment, issue #133)
+
+QuickFIX calls `toApp` on each resent application message, with
+`PossDupFlag` set, and gap-fills one that throws `DoNotSend`. Without the
+same, a risk gate closed after a send (a kill switch engaged after an
+`Unknown` outcome, say) cannot stop that order's possible-duplicate replay.
+
+- **Hook.** A new, defaulted trait method,
+  `Application::to_app_resend(&RawMessage<'_>, &SessionId) -> SendVerdict`,
+  rather than reusing `to_app_checked`. `to_app_checked` takes a mutable
+  `OutboundMessage` and its default runs `to_app`: reusing it would make
+  every existing implementor's `to_app` start running on replays (a change
+  of behaviour), would need the stored frame decoded back into an
+  `OutboundMessage`, and would invite mutating a message that must say what
+  was first sent under its number. The new hook is read-only and sees the
+  rebuilt frame exactly as it would go on the wire: the filed body under its
+  original `MsgSeqNum` (34), with 43 = Y, a fresh `SendingTime` (52) and
+  `OrigSendingTime` (122). It returns the same `SendVerdict` as the new
+  message gate, so a decision taken at once allocates nothing.
+- **Default.** The default returns `SendVerdict::ready(Ok(()))`: every filed
+  application message is resent as filed, so an implementor that does not
+  override it sees no change, and the default costs no allocation.
+- **Veto.** A vetoed message is not written; its number is left to the gap
+  fill the resend writer already emits for holes, administrative messages
+  and frames that will not rebuild: one SequenceReset-GapFill (123 = Y) from
+  the reply cursor to the next message that is resent, or to the end of the
+  range. Consecutive vetoes therefore coalesce into **one** gap fill, merged
+  with any administrative messages and holes next to them. The veto is
+  logged at debug level with the sequence number and the reason's code;
+  never the frame, which may carry credentials (554, 925, RawData).
+- **Scope.** The gate runs in the shared resend writer, so it covers both
+  roles and both resend paths: the answer to a `ResendRequest` (2) and the
+  `NextExpectedMsgSeqNum` (789) opening replay of ADR-0021.
+  Administrative messages are never gated: they are gap-filled on a resend
+  before the hook would run. `to_app_checked` is never called for a replay.
+- **Unchanged.** A message that is resent keeps exactly the `PossDupFlag`
+  (43) and `OrigSendingTime` (122) handling `wire::resend_frame` gave it
+  before; replay order is unchanged; and the resend still runs ahead of new
+  numbers: the gate is awaited inside the resend, while every new message is
+  held behind it (#79, #128), so a slow gate delays new traffic rather than
+  letting it overtake the resend.
+- **Semver.** One defaulted trait method: additive, a minor bump.
+- **Tests.** `ironfix-engine/tests/replay_gate_tests.rs`: both roles, both
+  resend paths, a veto at the start, in the middle and at the end of a
+  range, runs of vetoes as one gap fill, what the hook sees (43 = Y, 122,
+  never an admin message, never `to_app_checked`), the next new message
+  taking the next number after the resend, and the default hook resending
+  everything as filed.
 
 ### Three outcome classes
 
@@ -287,5 +329,5 @@ spends no number and touches no store.
   `next_sender_seq` counting exactly them. `ironfix-engine/src/wire.rs`
   checks that the reported `SendingTime` is the one on the wire in both
   precisions.
-- **Not done:** gating replays (a follow-up issue); durability of the owed
+- **Not done:** gating replays (since done, #133, "Replay gate" above); durability of the owed
   reset across a restart (#111, since done in ADR-0029); a typed close reason (#69).

@@ -78,8 +78,9 @@
 //!   (the equivalent of QuickFIX's `DoNotSend`) through the [`SendVerdict`]
 //!   it returns, before a `MsgSeqNum` is spent or the store is touched; a
 //!   verdict decided at once ([`SendVerdict::ready`]) allocates nothing. A
-//!   replay of a filed frame (the answer to a `ResendRequest`, the 789
-//!   resend) is resent as filed and is not gated, unlike QuickFIX.
+//!   replay of a filed application frame (the answer to a `ResendRequest`,
+//!   the 789 resend) goes through [`Application::to_app_resend`] instead,
+//!   whose default allows it and whose veto gap-fills it, as QuickFIX does.
 //!   Administrative messages (Logon, Logout, Heartbeat, TestRequest,
 //!   ResendRequest, SequenceReset, Reject, XmlMessage) go through
 //!   `to_admin` and cannot be vetoed. See
