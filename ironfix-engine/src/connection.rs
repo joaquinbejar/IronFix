@@ -14,8 +14,9 @@
 use crate::application::SessionId;
 use crate::close::{CloseReason, LogoutCause};
 use crate::error::EngineError;
-use crate::outbound::OutboundMessage;
+use crate::outbound::{OutboundMessage, OutboundPool};
 use crate::outcome::{NotSentReason, Receipt, SendOutcome};
+use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
 use ironfix_session::{HeartbeatManager, SequenceManager};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -147,6 +148,8 @@ pub struct Connection {
     pub(crate) closed: watch::Receiver<bool>,
     /// Shared session runtime state.
     pub(crate) runtime: Arc<SessionRuntime>,
+    /// Idle messages [`Connection::acquire`] hands out, shared by every clone.
+    pub(crate) pool: Arc<OutboundPool>,
 }
 
 impl Connection {
@@ -154,6 +157,58 @@ impl Connection {
     #[must_use]
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// Returns an empty [`OutboundMessage`] of `msg_type` from the session's
+    /// pool of reusable messages.
+    ///
+    /// It is an ordinary `OutboundMessage`: fill it and hand it to
+    /// [`Connection::send`] or [`Connection::send_tracked`], which treat it
+    /// exactly as one built with [`OutboundMessage::new`]. The difference is
+    /// what happens when it is dropped: wherever that is (in the session,
+    /// once its frame is written or it is refused, vetoed or discarded, or in
+    /// the caller's hands, never sent), it goes back to the pool with its
+    /// fields cleared and its storage kept, and the next `acquire` reuses
+    /// it. A body built with the copying push methods
+    /// ([`OutboundMessage::push_str`], [`OutboundMessage::push_bytes`],
+    /// [`OutboundMessage::push_int`], [`OutboundMessage::push_uint`],
+    /// [`OutboundMessage::push_char`], [`OutboundMessage::push_bool`])
+    /// then allocates nothing; [`OutboundMessage::push_raw`] and
+    /// [`OutboundMessage::push_data`] take a value already allocated.
+    ///
+    /// # What a send still allocates
+    ///
+    /// The pool removes the message's own allocations, not the session's:
+    /// through the default [`Application::to_app_checked`](crate::Application::to_app_checked),
+    /// each send still boxes one future, that of the `#[async_trait]`
+    /// [`Application::to_app`](crate::Application::to_app) call. An
+    /// application whose `to_app_checked` decides at once
+    /// ([`SendVerdict::ready`](crate::SendVerdict::ready)) and calls no
+    /// `to_app` avoids it. The command queue the message travels
+    /// (`tokio::sync::mpsc`) still allocates about one block per 128 sends as
+    /// it grows, so a send is not yet allocation-free. A store adds its own (see
+    /// `doc/adr/0008-pooled-outbound-messages.md`).
+    ///
+    /// # Bounds
+    ///
+    /// The pool never blocks and never fails. It keeps at most as many idle
+    /// messages as the session's outbound queue holds
+    /// (`with_outbound_capacity`, default 1024); when none is idle, a fresh
+    /// message is built, and one dropped into a full pool is freed. A message
+    /// held indefinitely only keeps itself out of the pool. Each pooled
+    /// message keeps room for at most
+    /// [`POOLED_MAX_FIELDS`](crate::outbound::POOLED_MAX_FIELDS) fields and
+    /// [`POOLED_MAX_SPARE`](crate::outbound::POOLED_MAX_SPARE) value buffers
+    /// of at most [`POOLED_MAX_VALUE_BYTES`](crate::outbound::POOLED_MAX_VALUE_BYTES)
+    /// bytes each; anything larger is freed. A clone of a pooled message is
+    /// not pooled. A pooled message sent on another session's `Connection`
+    /// still returns to the pool it came from.
+    ///
+    /// # Arguments
+    /// * `msg_type` - The message type (tag 35)
+    #[must_use]
+    pub fn acquire(&self, msg_type: MsgType) -> OutboundMessage {
+        self.pool.acquire(msg_type)
     }
 
     /// Sends an application message on the session.

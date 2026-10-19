@@ -253,6 +253,21 @@ engine wiring (#96) does not exist.
   and must not panic, receives credentials raw (redaction is the observer's
   job), and allocates nothing per valid frame in steady state
   (`doc/adr/0026-frame-observer.md`).
+- **Pooled outbound messages** (issue #76). `Connection::acquire` hands
+  out an `OutboundMessage` from a bounded per-session pool; when it is
+  dropped (after its frame is written or it is refused, or unsent in the
+  caller's hands) it returns with its field list and value buffers emptied
+  but kept. A body built with the copying push methods (`push_str`,
+  `push_bytes`, `push_int`, `push_uint`, `push_char`, `push_bool`) then
+  allocates nothing, and `send` / `send_tracked` are unchanged. What a send
+  still allocates is stated, not hidden: one boxed future per message for
+  the `#[async_trait]` `to_app` call made by the default `to_app_checked`
+  (an application whose `to_app_checked` decides at once with
+  `SendVerdict::ready` avoids it), about one block per 128 sends as the
+  `tokio::sync::mpsc` command queue grows (so a send is not yet zero
+  allocation), and a store's own allocations. These are
+  block counts from `ironfix-engine/tests/allocations.rs` (dhat), not
+  timings (`doc/adr/0008-pooled-outbound-messages.md`).
 - **`NextExpectedMsgSeqNum` (789) on Logon**, opt-in with
   `SessionConfig::send_next_expected_msg_seq_num` on FIX.4.4 and FIXT.1.1
   sessions (refused below FIX.4.4), in both roles. The Logon and its

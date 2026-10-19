@@ -182,6 +182,7 @@ use crate::connection::{Connection, SessionRuntime, report_handshake};
 use crate::error::EngineError;
 use crate::next_expected;
 use crate::observer::{Capture, FrameKind, FrameObserver};
+use crate::outbound::OutboundPool;
 use crate::persistence::{
     PersistedCounters, SeedPlan, Seeded, StoreAttachment, StoreFailurePolicy, seed_session,
     seeded_counters,
@@ -1725,6 +1726,7 @@ impl<A: Application + 'static> Acceptor<A> {
             commands: command_tx,
             closed: closed_rx,
             runtime,
+            pool: OutboundPool::new(self.outbound_capacity),
         })
     }
 }

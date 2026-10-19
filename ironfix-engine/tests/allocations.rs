@@ -40,6 +40,32 @@
 //!   message, as without it: the observer gets borrowed slices, and the
 //!   queue of frames awaiting their write result keeps the capacity it was
 //!   given.
+//! - **Pooled live sends** (issue #76): the same as the live sends, but each
+//!   order is built inside the window, on a message taken from
+//!   `Connection::acquire` and filled with the copying push methods; the
+//!   session hands it back to the pool once it is framed. One block per
+//!   message, the `to_app` future, exactly as for orders built before the
+//!   window: the message itself allocates nothing. For the record, the same
+//!   orders built inside the window with `OutboundMessage::new` cost
+//!   [`UNPOOLED_BLOCKS`] blocks each (that window is measured too).
+//! - **Pooled live sends through a ready gate**: the same, for an
+//!   application whose `to_app_checked` decides at once with
+//!   `SendVerdict::ready` and calls no `to_app`. No block per message from
+//!   the message, the gate or the frame; what is left is the command queue:
+//!   `tokio::sync::mpsc` grows its slot list by one block about every
+//!   [`QUEUE_SENDS_PER_BLOCK`] sends, so the send path is not yet zero
+//!   allocation. The window asserts that rate, with a fixed allowance of
+//!   [`GATED_FIXED`] blocks, not the general [`SLACK`] that would hide it.
+//! - **Pooled throttled and observed live sends**: the pooled live sends
+//!   with the throttle, then with the frame observer, of the windows above.
+//!   One block per message each. The throttle holds the whole window at
+//!   once, so that session's outbound queue, which sizes its pool, has room
+//!   for it: a pool smaller than the messages in flight builds the missing
+//!   ones fresh.
+//!
+//! Each pooled window first fills the pool by holding twice a window's
+//! orders at once and dropping them unsent, then warms up with a window's
+//! worth of sends.
 //! - **Replies**: the acceptor sends [`MESSAGES`] TestRequests and the
 //!   initiator answers each with a Heartbeat echoing its `TestReqID` (112).
 //!   [`REPLY_BLOCKS`] blocks per reply: the `from_admin` and `to_admin`
@@ -79,14 +105,15 @@
 //! asserts counts and sizes, and no timing but the throttled window's lower
 //! bound, and holds in debug and release builds.
 
+use async_trait::async_trait;
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
-use ironfix_core::message::MsgType;
+use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::{CompId, Timestamp};
 use ironfix_engine::throttle::{ThrottleBudget, ThrottleConfig, ThrottlePolicy};
 use ironfix_engine::{
-    Connection, FrameObserver, Initiator, NoOpApplication, Observation, OutboundMessage,
-    OutboundResult,
+    Application, Connection, FrameObserver, Initiator, NoOpApplication, Observation,
+    OutboundMessage, OutboundResult, RejectReason, SendVerdict, SessionId,
 };
 use ironfix_session::SessionConfig;
 use ironfix_store::{MemoryStore, MessageStore};
@@ -131,6 +158,19 @@ const PILE_UP_HELD: i128 = 256 * 1024;
 /// Most heap that may stay allocated once the pile-up has drained, in bytes:
 /// the flush gives the grown capacity back.
 const RETAINED_AFTER_DRAIN: i128 = 16 * 1024;
+
+/// Blocks a live send costs when the order is built inside the window with
+/// `OutboundMessage::new`: the field list, the four values and the `to_app`
+/// future.
+const UNPOOLED_BLOCKS: u64 = 6;
+
+/// Sends per block the command queue (`tokio::sync::mpsc`) allocates as it
+/// grows its slot list: measured, about one block every 128 sends.
+const QUEUE_SENDS_PER_BLOCK: u64 = 128;
+
+/// Non-recurring blocks the ready-gate window may allocate beyond the command
+/// queue's rate.
+const GATED_FIXED: u64 = 4;
 
 /// Blocks answering a TestRequest costs.
 const REPLY_BLOCKS: u64 = 4;
@@ -339,6 +379,44 @@ fn order(index: u64) -> OutboundMessage {
     order
 }
 
+/// Fills `message` as the order numbered `index`, with the copying push
+/// methods only: on a warm pooled message this allocates nothing.
+fn fill_order(mut message: OutboundMessage, index: u64) -> OutboundMessage {
+    message
+        .push_uint(11, index)
+        .push_str(55, "EUR/USD")
+        .push_char(54, '1')
+        .push_str(38, "100");
+    message
+}
+
+/// An application whose outbound gate decides at once and calls no
+/// `to_app`: it boxes no future per message.
+#[derive(Debug, Default)]
+struct ReadyGate;
+
+#[async_trait]
+impl Application for ReadyGate {
+    async fn on_create(&self, _: &SessionId) {}
+    async fn on_logon(&self, _: &SessionId) {}
+    async fn on_logout(&self, _: &SessionId) {}
+    async fn to_admin(&self, _: &mut OutboundMessage, _: &SessionId) {}
+    async fn from_admin(&self, _: &RawMessage<'_>, _: &SessionId) -> Result<(), RejectReason> {
+        Ok(())
+    }
+    async fn to_app(&self, _: &mut OutboundMessage, _: &SessionId) {}
+    async fn from_app(&self, _: &RawMessage<'_>, _: &SessionId) -> Result<(), RejectReason> {
+        Ok(())
+    }
+    fn to_app_checked<'a>(
+        &'a self,
+        _message: &'a mut OutboundMessage,
+        _session_id: &'a SessionId,
+    ) -> SendVerdict<'a> {
+        SendVerdict::ready(Ok(()))
+    }
+}
+
 /// A `ResendRequest` from the acceptor, numbered `seq`, for `begin..=end`.
 fn resend_request(seq: u64, begin: u64, end: u64) -> BytesMut {
     let (begin, end) = (begin.to_string(), end.to_string());
@@ -365,10 +443,19 @@ fn test_requests(first: u64, count: u64) -> BytesMut {
 /// An initiator from CLIENT to VENUE in FIX.4.4, with `store` attached if
 /// any.
 fn initiator(store: Option<Arc<MemoryStore>>) -> Initiator<NoOpApplication> {
+    initiator_with(store, NoOpApplication)
+}
+
+/// An initiator from CLIENT to VENUE in FIX.4.4 driving `application`, with
+/// `store` attached if any.
+fn initiator_with<A: Application + 'static>(
+    store: Option<Arc<MemoryStore>>,
+    application: A,
+) -> Initiator<A> {
     let comp = |value: &str| ok(CompId::new(value), "CompId");
     let config = SessionConfig::new(comp("CLIENT"), comp("VENUE"), "FIX.4.4")
         .with_heartbeat_interval(Duration::from_secs(30));
-    let initiator = Initiator::new(config, Arc::new(NoOpApplication));
+    let initiator = Initiator::new(config, Arc::new(application));
     match store {
         Some(store) => initiator.with_store(store as Arc<dyn MessageStore>),
         None => initiator,
@@ -391,7 +478,7 @@ struct Session {
 
 /// Logs `initiator` on to a scripted acceptor that acknowledges with
 /// `MsgSeqNum` 1 and then only counts frames.
-async fn log_on(initiator: Initiator<NoOpApplication>) -> Session {
+async fn log_on<A: Application + 'static>(initiator: Initiator<A>) -> Session {
     let (client_io, venue_io) = tokio::io::duplex(PIPE_BYTES);
     let counts = Arc::new(IoCounts::default());
     let client_io = CountingStream {
@@ -502,6 +589,79 @@ async fn measure_live(
     (window, elapsed)
 }
 
+/// Sends `MESSAGES` orders on `session`, each built inside the window by
+/// `build` from the connection and its index, after as many warm-up orders,
+/// and measures the window and how long it took.
+async fn measure_built(
+    session: &Session,
+    build: impl Fn(&Connection, u64) -> OutboundMessage,
+) -> (Window, std::time::Duration) {
+    // Fill the pool first: as many orders held at once as the window can
+    // have in flight (all of it, when the throttle holds them), dropped
+    // unsent. Then a warm-up as long as the window.
+    let held: Vec<OutboundMessage> = (0..2 * MESSAGES)
+        .map(|index| build(&session.connection, index))
+        .collect();
+    drop(held);
+    for index in 0..MESSAGES {
+        let message = build(&session.connection, index);
+        ok(session.connection.send(message).await, "a warm-up order");
+    }
+    wait_for_frames(&session.frames, MESSAGES).await;
+    let (writes, refused) = session.counts.snapshot();
+    let started = std::time::Instant::now();
+    let before = blocks();
+    for index in MESSAGES..2 * MESSAGES {
+        let message = build(&session.connection, index);
+        ok(session.connection.send(message).await, "an order");
+    }
+    wait_for_frames(&session.frames, 2 * MESSAGES).await;
+    let blocks = blocks() - before;
+    let elapsed = started.elapsed();
+    let (writes_after, refused_after) = session.counts.snapshot();
+    let window = Window {
+        blocks,
+        writes: writes_after - writes,
+        refused: refused_after - refused,
+    };
+    (window, elapsed)
+}
+
+/// An order on a message from the session's pool.
+fn pooled(connection: &Connection, index: u64) -> OutboundMessage {
+    fill_order(connection.acquire(MsgType::NewOrderSingle), index)
+}
+
+/// An order on a message built with `OutboundMessage::new`.
+fn unpooled(_connection: &Connection, index: u64) -> OutboundMessage {
+    fill_order(OutboundMessage::new(MsgType::NewOrderSingle), index)
+}
+
+/// The least time a throttled window takes, in nanoseconds: at most
+/// `THROTTLE_BURST` tokens were waiting when it began, and every other order
+/// waited for one, earned every 1 s / `THROTTLE_RATE`.
+fn throttled_floor_nanos() -> u128 {
+    let spacing = Duration::from_secs(1)
+        .as_nanos()
+        .div_ceil(u128::from(THROTTLE_RATE));
+    spacing * u128::from(MESSAGES - u64::from(THROTTLE_BURST))
+}
+
+/// Reports each window's block count per message on stderr, for the record:
+/// the binary runs without the libtest harness, so this is the measurement's
+/// only output.
+fn eprint_counts(windows: &[(&str, &Window)]) {
+    use std::io::Write as _;
+    let mut stderr = io::stderr().lock();
+    for (name, window) in windows {
+        let _ = writeln!(
+            stderr,
+            "allocations: {name}: {} blocks for {MESSAGES} messages",
+            window.blocks
+        );
+    }
+}
+
 fn main() {
     let runtime = ok(
         tokio::runtime::Builder::new_current_thread()
@@ -551,6 +711,17 @@ fn main() {
     let observing =
         initiator(None).with_frame_observer(Arc::clone(&observer) as Arc<dyn FrameObserver>);
     let resending = initiator(Some(store));
+    let pooling = initiator(None);
+    let unpooling = initiator(None);
+    let gating = initiator_with(None, ReadyGate);
+    // The pool keeps as many idle messages as the outbound queue holds: room
+    // for the whole window, which the throttle holds at once.
+    let pooled_throttling = initiator(None)
+        .with_throttle(throttle())
+        .with_outbound_capacity(usize::try_from(2 * MESSAGES).unwrap_or(usize::MAX));
+    let pooled_observer = Arc::new(CountingObserver::default());
+    let pooled_observing =
+        initiator(None).with_frame_observer(Arc::clone(&pooled_observer) as Arc<dyn FrameObserver>);
 
     let _profiler = dhat::Profiler::builder().testing().build();
     let measured = runtime.block_on(async move {
@@ -616,6 +787,29 @@ fn main() {
         session.counter.abort();
         drop(session);
 
+        // Orders built inside the window: on pooled messages, on fresh
+        // ones, through a ready gate, through the throttle and observed.
+        let session = log_on(pooling).await;
+        let (pooled_window, _) = measure_built(&session, pooled).await;
+        session.counter.abort();
+        drop(session);
+        let session = log_on(unpooling).await;
+        let (unpooled_window, _) = measure_built(&session, unpooled).await;
+        session.counter.abort();
+        drop(session);
+        let session = log_on(gating).await;
+        let (gated_window, _) = measure_built(&session, pooled).await;
+        session.counter.abort();
+        drop(session);
+        let session = log_on(pooled_throttling).await;
+        let pooled_throttled = measure_built(&session, pooled).await;
+        session.counter.abort();
+        drop(session);
+        let session = log_on(pooled_observing).await;
+        let (pooled_observed, _) = measure_built(&session, pooled).await;
+        session.counter.abort();
+        drop(session);
+
         // Resent frames: the warm-up asks for the first WARM_UP stored
         // orders, the window for the next MESSAGES.
         let mut session = log_on(resending).await;
@@ -645,6 +839,13 @@ fn main() {
             stored_live_window,
             throttled_window,
             observed_window,
+            (
+                pooled_window,
+                unpooled_window,
+                gated_window,
+                pooled_throttled,
+                pooled_observed,
+            ),
             resend_window,
             largest,
             piled_up,
@@ -657,6 +858,7 @@ fn main() {
         stored_live,
         (throttled, throttled_for),
         observed,
+        (pooled, unpooled, gated, (pooled_throttled, pooled_throttled_for), pooled_observed),
         resend,
         largest,
         piled_up,
@@ -714,6 +916,49 @@ fn main() {
          more",
         observed.blocks
     );
+    eprint_counts(&[
+        ("live", &live),
+        ("pooled live", &pooled),
+        ("unpooled built in the window", &unpooled),
+        ("pooled through a ready gate", &gated),
+        ("pooled throttled", &pooled_throttled),
+        ("pooled observed", &pooled_observed),
+    ]);
+    for (name, window) in [
+        ("pooled live sends", &pooled),
+        ("pooled throttled live sends", &pooled_throttled),
+        ("pooled observed live sends", &pooled_observed),
+    ] {
+        assert!(
+            (MESSAGES..=MESSAGES + SLACK).contains(&window.blocks),
+            "{MESSAGES} {name} allocated {} blocks; each must allocate one (the async_trait \
+             future of to_app), the pooled message none, and the window at most {SLACK} more",
+            window.blocks
+        );
+    }
+    let gated_ceiling = MESSAGES / QUEUE_SENDS_PER_BLOCK + GATED_FIXED;
+    assert!(
+        gated.blocks <= gated_ceiling,
+        "{MESSAGES} pooled live sends through a ready gate allocated {} blocks; only the \
+         command queue may allocate, one block per {QUEUE_SENDS_PER_BLOCK} sends, plus at most \
+         {GATED_FIXED}: at most {gated_ceiling}",
+        gated.blocks
+    );
+    let unpooled_floor = UNPOOLED_BLOCKS * MESSAGES;
+    assert!(
+        (unpooled_floor..=unpooled_floor + SLACK).contains(&unpooled.blocks),
+        "{MESSAGES} live sends built with OutboundMessage::new allocated {} blocks; each must \
+         allocate {UNPOOLED_BLOCKS}",
+        unpooled.blocks
+    );
+    assert!(
+        pooled_throttled_for.as_nanos() >= throttled_floor_nanos(),
+        "the pooled throttled window took {pooled_throttled_for:?}: the orders were not throttled"
+    );
+    assert!(
+        pooled_observer.outbound.load(Ordering::Relaxed) > 2 * MESSAGES,
+        "the observer saw every pooled order"
+    );
     let outbound = observer.outbound.load(Ordering::Relaxed);
     assert!(
         outbound > WARM_UP + MESSAGES,
@@ -729,10 +974,7 @@ fn main() {
     );
     // At most THROTTLE_BURST tokens were waiting when the window began; every
     // other order waited for one, earned every 1 s / THROTTLE_RATE.
-    let spacing = Duration::from_secs(1)
-        .as_nanos()
-        .div_ceil(u128::from(THROTTLE_RATE));
-    let throttled_floor = spacing * u128::from(MESSAGES - u64::from(THROTTLE_BURST));
+    let throttled_floor = throttled_floor_nanos();
     assert!(
         throttled_for.as_nanos() >= throttled_floor,
         "the throttled window took {throttled_for:?}, less than the {throttled_floor} ns its \
