@@ -1396,7 +1396,9 @@ pub(crate) fn malformed_reject(error: &DecodeError, frame: &[u8]) -> MalformedRe
 /// Length/Data pairs are framed by count exactly as during the decode (a
 /// DATA payload that happens to contain `<SOH>95=<SOH>` is skipped, not
 /// matched) and tags are parsed numerically (a zero-padded `095=` is tag
-/// 95). Every successful step advances the walk, so it ends; no allocation.
+/// 95). Every successful step advances the walk, so it ends. The decoder may
+/// allocate the reason string of the error it returns; this runs only on the
+/// malformed path.
 fn field_is_empty(frame: &[u8], tag: u32) -> bool {
     let mut decoder = Decoder::new(frame);
     loop {
