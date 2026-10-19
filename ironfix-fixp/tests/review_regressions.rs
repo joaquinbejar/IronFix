@@ -151,3 +151,82 @@ fn gap_within_capacity_stays_recoverable_after_reestablishment() {
     let requests = requests(drain(&mut client));
     assert!(requests.iter().any(|r| r.from_seq_no == 3), "{requests:?}");
 }
+
+#[test]
+fn realtime_after_replay_requires_a_sequence() {
+    let now = Instant::now();
+    let mut client = client(now, FixpConfig::default());
+    seq(&mut client, now, 2);
+    let request = requests(drain(&mut client))
+        .into_iter()
+        .next()
+        .expect("request");
+    replay_one(&mut client, now, request);
+    drain(&mut client);
+    assert_eq!(
+        client.on_application_message(now),
+        Delivery::Discard,
+        "an application message after the batch without Sequence must not become live traffic"
+    );
+}
+
+#[test]
+fn explicit_sequence_after_replay_accepts_live_message() {
+    let now = Instant::now();
+    let mut client = client(now, FixpConfig::default());
+    seq(&mut client, now, 2);
+    let request = requests(drain(&mut client))
+        .into_iter()
+        .next()
+        .expect("request");
+    replay_one(&mut client, now, request);
+    drain(&mut client);
+    seq(&mut client, now, 2);
+    assert_eq!(
+        client.on_application_message(now),
+        Delivery::Accept {
+            seq: Some(SeqNum::new(2)),
+            retransmitted: false,
+        }
+    );
+}
+
+#[test]
+fn duplicate_negotiate_does_not_keep_sending_after_reject() {
+    let now = Instant::now();
+    let mut server = FixpServer::new(
+        FixpConfig::default(),
+        ClockAnchor::new(now, Timestamp::EPOCH),
+        now,
+    );
+    let negotiate = SessionMessage::Negotiate(Negotiate {
+        session_id: ID,
+        timestamp: Nanotime::from_nanos(1),
+        client_flow: FlowType::Recoverable,
+        credentials: None,
+    });
+    server.handle_message(&negotiate, now);
+    server
+        .accept_negotiation(FlowType::Recoverable, None, now)
+        .expect("accept negotiation");
+    while server.poll_output().is_some() {}
+    server.handle_message(
+        &SessionMessage::Establish(Establish {
+            session_id: ID,
+            timestamp: Nanotime::from_nanos(2),
+            keepalive_interval: 5000,
+            next_seq_no: Some(1),
+            credentials: None,
+        }),
+        now,
+    );
+    server.accept_establishment(now).expect("accept establish");
+    while server.poll_output().is_some() {}
+    server.handle_message(&negotiate, now);
+    let outputs: Vec<_> = std::iter::from_fn(|| server.poll_output()).collect();
+    assert!(
+        outputs.iter().any(|o| matches!(o, Output::CloseTransport)),
+        "after NegotiationReject transport stays open: {outputs:?}, send_application={:?}",
+        server.send_application(now)
+    );
+}

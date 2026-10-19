@@ -792,7 +792,14 @@ impl FixpServer {
             }
             ServerState::Bound { session, binding } => {
                 if binding.status() == SessionStatus::Established {
+                    // Section 4.2.3: a Negotiate on an established session is
+                    // refused, and the session is terminated and its
+                    // transport closed; it is not left usable.
                     self.refuse_renegotiation(&session, m);
+                    return self.violation(
+                        ServerState::Bound { session, binding },
+                        "Negotiate on an established session",
+                    );
                 } else {
                     // The binding is ending: nothing more may be sent on it.
                     self.core
@@ -1342,21 +1349,35 @@ mod tests {
         let (_client, mut server) =
             established_pair(origin, FlowType::Recoverable, FlowType::Recoverable);
         server.handle_message(&negotiate(SESSION, FlowType::Recoverable), origin);
-        match sent(&drain(&mut server)).as_slice() {
-            [SessionMessage::NegotiationReject(reject)] => {
+        // Section 4.2.3: refused, then the session is terminated and the
+        // transport closed; it is not left usable.
+        let outputs = drain(&mut server);
+        match sent(&outputs).as_slice() {
+            [
+                SessionMessage::NegotiationReject(reject),
+                SessionMessage::Terminate(_),
+            ] => {
                 assert_eq!(reject.code, NegotiationRejectCode::DuplicateId);
             }
-            other => panic!("expected a NegotiationReject, got {other:?}"),
+            other => panic!("expected a NegotiationReject and a Terminate, got {other:?}"),
         }
+        assert!(outputs.iter().any(|o| matches!(o, Output::CloseTransport)));
+        assert_eq!(server.status(), SessionStatus::Negotiated);
+        assert!(server.send_application(origin).is_err());
+        let (_client, mut server) =
+            established_pair(origin, FlowType::Recoverable, FlowType::Recoverable);
         server.handle_message(&negotiate(OTHER_SESSION, FlowType::Recoverable), origin);
         match sent(&drain(&mut server)).as_slice() {
-            [SessionMessage::NegotiationReject(reject)] => {
+            [
+                SessionMessage::NegotiationReject(reject),
+                SessionMessage::Terminate(_),
+            ] => {
                 assert_eq!(reject.code, NegotiationRejectCode::Unspecified);
                 assert_eq!(reject.session_id, OTHER_SESSION);
             }
-            other => panic!("expected a NegotiationReject, got {other:?}"),
+            other => panic!("expected a NegotiationReject and a Terminate, got {other:?}"),
         }
-        assert_eq!(server.status(), SessionStatus::Established);
+        assert_eq!(server.status(), SessionStatus::Negotiated);
     }
 
     #[test]

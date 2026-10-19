@@ -346,6 +346,12 @@ pub(crate) struct Session {
     missing: VecDeque<Gap>,
     outstanding: Option<Outstanding>,
     replay: Option<Replay>,
+    /// A Retransmission has switched the context to retransmitted messages
+    /// on this transport and no `NextSeqNo` has switched it back: a bare
+    /// application message now is neither retransmitted (the batch is over)
+    /// nor real time (no Sequence resumed it), so it is a violation
+    /// (section 4.6.2.2).
+    awaiting_resume: bool,
     provider: Option<Provider>,
     peer_finished: Option<PeerFinished>,
 }
@@ -369,6 +375,7 @@ impl Session {
             missing: VecDeque::new(),
             outstanding: None,
             replay: None,
+            awaiting_resume: false,
             provider: None,
             peer_finished: None,
         }
@@ -480,6 +487,7 @@ impl Session {
             self.consume_missing(u64::from(outstanding.delivered));
         }
         self.replay = None;
+        self.awaiting_resume = false;
         self.provider = None;
     }
 
@@ -657,6 +665,18 @@ impl Session {
                 Bound::Stay,
             ),
             FlowType::Recoverable | FlowType::Idempotent => {
+                // Section 4.6.2.2: real-time traffic resumes after a
+                // retransmission only with a Sequence.
+                if self.awaiting_resume {
+                    return (
+                        Delivery::Discard,
+                        self.violation(
+                            core,
+                            binding,
+                            "application message after a retransmission without a Sequence",
+                        ),
+                    );
+                }
                 // An application message before any NextSeqNo: the fallback
                 // start of 1 now stands.
                 self.start_pending = false;
@@ -715,6 +735,7 @@ impl Session {
         // still short of its Count was cut off: the provider stopped it. A
         // stall already reported is waited out again from the cut, now as an
         // interrupted batch, so the stall policy can act on it.
+        self.awaiting_resume = false;
         if self.replay.take().is_some()
             && let Some(outstanding) = self.outstanding.as_mut()
         {
@@ -937,6 +958,7 @@ impl Session {
             next: message.next_seq_no,
             remaining: batch,
         });
+        self.awaiting_resume = true;
         if let Some(outstanding) = self.outstanding.as_mut() {
             outstanding.last_progress = now;
             outstanding.interrupted = false;
