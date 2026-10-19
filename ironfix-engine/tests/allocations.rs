@@ -113,23 +113,25 @@
 //! | `to_app` future (`async_trait`), per order | 1 |
 //! | `FileStore` filing, per order | 1 |
 //! | delivery of a valid message: the `from_app` future (`async_trait`); the dispatcher's `mpsc` amortised | 1 |
-//! | `FileStore`, per message delivered (the receive cursor) | 1 |
+//! | `FileStore`, per message delivered: the receive cursor, and the inbound application watermark once `from_app` returns (ADR-0030) | 2 |
 //! | session Reject of an invalid message, never delivered | 16 |
 //! | of which: the Reject body, its field list and 6 values (45, 371, 372, 1130, 373, 58), measured by building it | 8 |
 //! | of which: the `to_admin` future (`async_trait`) | 1 |
 //! | of which: the `ApplVerID` problem's two owned strings (the code, the accepted versions) | 2 |
 //! | of which, by difference: the reason text formatted from the problem | 5 |
-//! | `FileStore`, per Reject: the target number persisted, the Reject filed | 2 |
+//! | `FileStore`, per Reject: the target number persisted, the Reject filed, the watermark moved past it (ADR-0030) | 3 |
 //! | `RawMessage` spill (at most 12 fields, 32 held inline) | 0 |
 //! | frame observer | 0 |
 //! | rustls, both endpoints, per order | about 2 |
 //! | rustls, both endpoints, per invalid message and its Reject | about 2.1 |
 //!
 //! The profile without TLS (1024 sent, 1024 received, 512 rejected) costs
-//! about 12330 blocks, 4.81 per frame, and the components predict it within
+//! about 13360 blocks, 5.21 per frame, and the components predict it within
 //! a few blocks; the test asserts that they agree within 4 x [`SLACK`]. With
-//! TLS it costs about 15445, 6.03 per frame: the rustls share is about 3115
-//! blocks, 1.21 per frame.
+//! TLS it costs about 16450, 6.42 per frame: the rustls share is about 3090
+//! blocks, 1.20 per frame. (Before the inbound application watermark of
+//! ADR-0030 the profile cost about 12330 blocks without TLS: the watermark
+//! write is one boxed store future per inbound message acted on.)
 //!
 //! What cannot be measured in a meaningful way: the engine's own half of
 //! the rustls share. dhat counts every thread of the process, and the
@@ -1202,7 +1204,7 @@ fn check_matrix(matrix: &Matrix<'_>) {
             SESSION_REJECT_BLOCKS - i128::from(matrix.reject_body) - 3
         ),
         format!(
-            "  FileStore, per Reject (its number and the Reject filed): {}",
+            "  FileStore, per Reject (its number, the Reject filed, the watermark): {}",
             per(store_reject, m)
         ),
         "  RawMessage spill: none (at most 12 fields, 32 inline)".to_string(),
@@ -1261,12 +1263,12 @@ fn check_matrix(matrix: &Matrix<'_>) {
         ("the to_app future", to_app, 1),
         ("FileStore filing per order", store_order, 1),
         ("delivery of a valid message", delivery, 1),
-        ("FileStore per message delivered", store_delivered, 1),
+        ("FileStore per message delivered", store_delivered, 2),
         ("the session Reject", reject, SESSION_REJECT_BLOCKS),
         (
-            "FileStore per Reject (the target number persisted, the Reject filed)",
+            "FileStore per Reject (the target number persisted, the Reject filed, the watermark)",
             store_reject,
-            2,
+            3,
         ),
     ] {
         let expected = expected * full_m;

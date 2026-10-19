@@ -56,6 +56,11 @@
 //!   `reset_on_logout` follows. [`Connection::logout_with_text`] sends a
 //!   Logout carrying a checked `Text` (58). See
 //!   `doc/adr/0025-typed-close-reason.md`.
+//! - **[`loss`]**: the inbound loss report. Inbound application delivery is
+//!   at most once; what a crash or an aborted dispatcher may have kept from
+//!   `from_app` is reported as an [`InboundLoss`] span through
+//!   [`Application::on_inbound_lost`], never redelivered. See
+//!   `doc/adr/0030-inbound-loss-report.md`.
 //! - **[`OutboundMessage`]**: the body you hand to [`Connection::send`]; the
 //!   engine stamps the header, `MsgSeqNum` and trailer.
 //!   [`Connection::acquire`] takes one from the session's bounded pool, to
@@ -229,7 +234,7 @@
 //!   while a resend is read closes the session instead of gap-filling the
 //!   request. Inbound application messages are delivered at most once: a
 //!   crash, or a close whose application queue does not drain in time, loses
-//!   the messages still queued.
+//!   the messages still queued, and the loss is reported (see [`loss`]).
 
 pub mod acceptor;
 pub mod application;
@@ -240,6 +245,7 @@ pub mod error;
 mod gap_queue;
 mod garbled;
 pub mod initiator;
+pub mod loss;
 mod next_expected;
 pub mod observer;
 pub mod outbound;
@@ -259,6 +265,7 @@ pub use close::{CloseReason, LogoutCause, LogoutInitiator};
 pub use connection::Connection;
 pub use error::EngineError;
 pub use initiator::Initiator;
+pub use loss::{InboundLoss, InboundLossCause};
 pub use observer::{Direction, FrameKind, FrameObserver, Observation, OutboundResult};
 pub use outbound::{OutboundField, OutboundMessage};
 pub use outcome::{NotSentReason, SendOutcome, UnknownReason};

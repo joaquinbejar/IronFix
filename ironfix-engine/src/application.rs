@@ -10,6 +10,7 @@
 //! following the QuickFIX pattern with async support.
 
 use crate::close::CloseReason;
+use crate::loss::InboundLoss;
 use crate::outbound::OutboundMessage;
 use crate::tls::PeerInfo;
 use async_trait::async_trait;
@@ -235,6 +236,50 @@ pub trait Application: Send + Sync {
         if reason.was_active() {
             self.on_logout(session_id).await;
         }
+    }
+
+    /// Called when inbound messages may not have reached
+    /// [`Application::from_app`], with the `MsgSeqNum` span (issue #105,
+    /// ADR-0030).
+    ///
+    /// Inbound application delivery is at most once: a message is accepted,
+    /// and its number persisted, before `from_app` sees it, and the engine
+    /// does not redeliver it. It reports what it cannot vouch for instead:
+    ///
+    /// - at the start of a session with a store attached, before the Logon
+    ///   is sent (initiator) or acknowledged (acceptor), the span the
+    ///   previous session accepted above the store's application watermark
+    ///   ([`InboundLossCause::FoundAtStart`](crate::InboundLossCause::FoundAtStart));
+    /// - at the close of a session whose application dispatcher was aborted
+    ///   after its drain timeout, or stopped after a failed watermark write,
+    ///   before [`Application::on_session_closed`]
+    ///   ([`InboundLossCause::DispatcherStopped`](crate::InboundLossCause::DispatcherStopped)).
+    ///
+    /// The engine records the span as reported only once this returns: a
+    /// crash before that reports it again at the next start. A span reported
+    /// at close is not reported again at the next start.
+    ///
+    /// The span can include administrative messages and messages whose
+    /// `from_app` had returned just before a crash; see [`crate::loss`]. To
+    /// recover the content, ask the counterparty for the span out of band,
+    /// or reconcile with it (an order status request, for instance): a
+    /// `ResendRequest` for numbers already accepted is not part of this
+    /// engine's session behaviour.
+    ///
+    /// The default logs the span at error level, numbers only.
+    ///
+    /// # Arguments
+    /// * `session_id` - The session identifier
+    /// * `loss` - The span, and when it was found
+    async fn on_inbound_lost(&self, session_id: &SessionId, loss: &InboundLoss) {
+        tracing::error!(
+            session = %session_id,
+            first = loss.first(),
+            last = loss.last(),
+            cause = %loss.cause(),
+            "inbound messages in MsgSeqNum range first..=last were accepted but may not have \
+             reached from_app; they are not redelivered"
+        );
     }
 
     /// Called before an administrative message (Logon, Heartbeat, Logout, …)

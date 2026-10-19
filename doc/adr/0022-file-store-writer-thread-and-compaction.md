@@ -415,7 +415,8 @@ used with this build.
   journal; version-1 journals are refused; builds from before this change
   refuse version-2 journals. (ADR-0029 later moved the format to version 3,
   adding the owed-reset flag to each counter slot; version 2 is refused in
-  turn.)
+  turn. ADR-0030 then moved it to version 4, adding the inbound application
+  watermark; version 3 is refused in turn.)
 - **Threads:** one OS thread per open store, with a 256 KiB stack.
 - **Dependencies:** `ironfix-store` gains `crossbeam-channel` (a workspace
   dependency) and, as a dev-dependency, `dhat` for the allocation test. The

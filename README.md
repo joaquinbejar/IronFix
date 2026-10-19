@@ -414,7 +414,7 @@ around it.
   loss; `EveryN` and `Never` survive a process crash only. Its guarantees reach the wire only under
   `StoreFailurePolicy::CloseSession`, and are stated for Unix only
   (`doc/adr/0006-file-store.md`). The record of a reset owed to the next
-  session is mirrored by a durable marker in the store (format version 3 of
+  session is mirrored by a durable marker in the store (format version 4 of
   the `FileStore` journal), set before the reset is acted on and cleared once
   it has been declared, so a crash or restart over the same store still resets
   and declares `ResetSeqNumFlag` (141) = Y at 1 (#111,
@@ -422,8 +422,13 @@ around it.
   arrives and before the marker is durable is not covered. Inbound
   application messages are delivered at most once: a crash, or a session
   close whose application queue does not drain in time, loses the messages
-  still queued. The close logs the lost range; nothing reports a loss across
-  a restart yet (#105). Inbound frames are not filed.
+  still queued. The loss is reported, not redelivered: a durable inbound
+  application watermark (format version 4 of the `FileStore` journal) lets
+  the next session report the lost `MsgSeqNum` span through
+  `Application::on_inbound_lost`, and an aborted dispatcher reports at close
+  (#105, `doc/adr/0030-inbound-loss-report.md`). The span can include
+  administrative numbers and a message `from_app` saw just before the crash.
+  Inbound frames are not filed.
 - **One session per `Initiator` or `Acceptor`.** `into_initiator()` and
   `into_acceptor()` return `EngineError::Configuration` unless exactly one
   `SessionConfig` was added (`ironfix-engine/src/builder.rs`). Several

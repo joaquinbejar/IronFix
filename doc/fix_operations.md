@@ -866,17 +866,39 @@ the counterparty for M again. The window is every message waiting in the
 application queue, up to its capacity (1024 by default), plus the one
 `from_app` is handling. The same messages are lost without a crash when the
 session closes and the dispatcher does not finish its queue within 5 s: it is
-then aborted, and the engine logs at error level the `MsgSeqNum` range it had
-handed over and `from_app` had not finished. Under `CloseSession` a message
-whose target write failed is never handed over; under `Continue` it is.
+then aborted. Under `CloseSession` a message whose target write failed is
+never handed over; under `Continue` it is.
 
-The engine does not detect or report, after a restart, the inbound messages
-lost across a crash, so the requirement of #89 that a lost message be reported
-is not met for inbound traffic. Reporting needs a completion signal from the
-dispatcher, a durable application watermark (a new defaulted `MessageStore`
-method) and a typed report at restart; at-least-once delivery additionally
-needs an inbound journal or redelivery through a `ResendRequest`. Both are
-tracked in #105.
+*The loss is reported, not redelivered* (#105, ADR-0030). The application
+dispatcher persists an inbound application watermark W
+(`MessageStore::set_app_watermark`) after `from_app` returns, and after the
+reactor has processed the administrative messages accepted since: W is the
+highest `MsgSeqNum` up to which every accepted inbound message was acted on.
+The engine reports through `Application::on_inbound_lost` (default: an
+error-level log, numbers only):
+
+| When | Span reported | Cause |
+|---|---|---|
+| Session start with a store, before the Logon (initiator) or its acknowledgement (acceptor), before any reset | stored W + 1 ..= stored next target - 1 | `FoundAtStart` |
+| Close, dispatcher aborted after 5 s or stopped by a failed watermark write | W + 1 ..= next target - 1, before `on_session_closed` | `DispatcherStopped` |
+
+After the callback returns, W is written up to the span's end, so a span is
+reported once (twice only if the process dies in between). A store reset
+clears W. The span names numbers: it can include administrative messages, and
+a message whose `from_app` returned just before a crash whose watermark write
+had not landed. Against the #89 inbound crash table, with `CloseSession`:
+
+| Crash after | Result |
+|---|---|
+| inbound M read, before the target write | M is resent by the counterparty and delivered. |
+| target write (M+1), before `from_app` returned for M | M is lost, and reported at the next start. |
+| `from_app` returned for M, before the watermark write | M was seen, and is reported as possibly lost. |
+| watermark write for M | Nothing is reported for M. |
+
+Under `CloseSession` a failed watermark write closes the session
+(`CloseReason::StoreFailure`) and the dispatcher delivers nothing more; what
+it did not deliver is reported at close. Nothing is ever redelivered: the
+engine keeps no inbound journal and does not request numbers it accepted.
 
 **Store failure policy.** `with_store_failure_policy` (on the `Initiator` or
 the `Acceptor`) chooses what a failed write (or one that overran the store
@@ -2215,7 +2237,8 @@ ADR-0011.
   as durably as its `SyncPolicy` promises. Store writes are ordered (frame and next sender
   number before the bytes, next target number before an inbound message is
   acted on) and fallible, under a `StoreFailurePolicy` that either warns and
-  continues or fails closed; inbound delivery is at most once across a crash.
+  continues or fails closed; inbound delivery is at most once across a crash,
+  and a loss is reported through `Application::on_inbound_lost` (#105).
   An *outbound* request the peer never
   satisfies is also bounded — retried every `SessionConfig::resend_timeout` and
   then escalated to Logout after `SessionConfig::max_resend_requests` attempts,

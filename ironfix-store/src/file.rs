@@ -17,7 +17,7 @@
 //! # Layout
 //!
 //! One journal file, `<directory>/<name>.journal` (see [`FileStoreConfig`]),
-//! in format version 3: a header recording the creation time, two **counter
+//! in format version 4: a header recording the creation time, two **counter
 //! slots** holding both sequence counters, then a sequence of
 //! length-prefixed, CRC-checked records, each a filed frame, or a filed frame
 //! together with the next sender number (one
@@ -35,11 +35,17 @@
 //! flushed whatever the [`SyncPolicy`]; a reset and a compaction carry it into
 //! the new journal.
 //!
+//! The slots also carry the **inbound application watermark**
+//! ([`MessageStore::set_app_watermark`], ADR-0030): the highest inbound
+//! `MsgSeqNum` up to which the engine acted on every message it accepted.
+//! It is written like a counter, into one slot under the [`SyncPolicy`]; a
+//! reset clears it and a compaction carries it.
+//!
 //! A journal in any other format version is refused with
 //! [`StoreError::Corrupted`] naming the version. That includes version 1, a
-//! development format (counters as appended records), and version 2, the
-//! slots without the marker; neither was ever released, and neither is
-//! migrated.
+//! development format (counters as appended records), version 2, the slots
+//! without the marker, and version 3, the slots without the watermark; none
+//! was ever released, and none is migrated.
 //!
 //! # Memory
 //!
@@ -122,7 +128,7 @@
 //!   their damage is never a torn tail); a well-formed record header
 //!   declaring a body larger than the configured limit; a record that passes
 //!   its CRC but does not decode; both counter slots failing their check; a
-//!   header that is not a version-3 journal header. Under
+//!   header that is not a version-4 journal header. Under
 //!   [`SyncPolicy::Never`] and in a repair, a cut below the boundary writes
 //!   one new counter slot with the new end as its boundary, beside the newest
 //!   one, which is left as it is.
@@ -309,6 +315,8 @@ struct Shared {
     next_target: AtomicU64,
     /// The owed-reset marker (ADR-0029).
     reset_owed: AtomicBool,
+    /// The inbound application watermark (ADR-0030).
+    app_watermark: AtomicU64,
     /// Creation time of the journal.
     creation_time: RwLock<SystemTime>,
     /// The last cut made since the store was opened, if any.
@@ -322,6 +330,7 @@ impl Shared {
             next_sender: AtomicU64::new(1),
             next_target: AtomicU64::new(1),
             reset_owed: AtomicBool::new(false),
+            app_watermark: AtomicU64::new(0),
             creation_time: RwLock::new(SystemTime::UNIX_EPOCH),
             truncation: SyncMutex::new(None),
         }
@@ -338,6 +347,8 @@ impl Shared {
     /// its recovery made. A clean load keeps the last cut on record.
     fn install(&self, scan: &format::Scan) {
         self.reset_owed.store(scan.reset_owed, Ordering::SeqCst);
+        self.app_watermark
+            .store(scan.app_watermark, Ordering::SeqCst);
         self.publish(
             scan.header.creation_time,
             scan.next_sender,
@@ -464,6 +475,8 @@ enum Command {
     SetNextTarget(u64),
     /// `set_reset_owed`.
     SetResetOwed(bool),
+    /// `set_app_watermark`.
+    SetAppWatermark(u64),
     /// `reset_to` (and `reset`).
     ResetTo {
         /// The next sender number after the reset.
@@ -556,6 +569,9 @@ struct Journal {
     next_target: u64,
     /// The owed-reset marker every slot written carries (ADR-0029).
     reset_owed: bool,
+    /// The inbound application watermark every slot written carries
+    /// (ADR-0030).
+    app_watermark: u64,
     /// The generation the next counter write takes.
     next_generation: u64,
     /// Both counter slots, as written.
@@ -749,6 +765,7 @@ impl Journal {
             next_sender: scan.next_sender,
             next_target: scan.next_target,
             reset_owed: scan.reset_owed,
+            app_watermark: scan.app_watermark,
             next_generation: scan.next_generation,
             slots: scan.slots,
             active_slot: scan.active,
@@ -863,6 +880,7 @@ impl Journal {
             next_sender,
             next_target,
             durable_end: self.durable_end,
+            app_watermark: self.app_watermark,
             reset_owed: self.reset_owed,
         });
         if let Err(err) = write_at(&mut self.file, &image, offset) {
@@ -937,6 +955,29 @@ impl Journal {
             }
         }
         self.shared.reset_owed.store(owed, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Writes the inbound application watermark (ADR-0030) like a counter:
+    /// into the slot the next counter write goes to, flushed as the sync
+    /// policy requires, and publishes it. Nothing is written when the value
+    /// is already the one carried.
+    ///
+    /// A failed write leaves the previous value in memory: the slots may
+    /// carry either, and a lower watermark reports more as possibly lost,
+    /// which is the safe direction.
+    fn set_app_watermark(&mut self, watermark: u64) -> Result<(), StoreError> {
+        self.usable()?;
+        if self.app_watermark == watermark {
+            return Ok(());
+        }
+        let previous = self.app_watermark;
+        self.app_watermark = watermark;
+        if let Err(err) = self.write_counters(self.next_sender, self.next_target) {
+            self.app_watermark = previous;
+            return Err(err);
+        }
+        self.shared.app_watermark.store(watermark, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1044,7 +1085,7 @@ impl Journal {
             next_target,
         };
         let (slots, next_generation) =
-            format::fresh_slots(0, next_sender, next_target, DATA_START, self.reset_owed)?;
+            format::fresh_slots(0, next_sender, next_target, DATA_START, 0, self.reset_owed)?;
         write_replacement(&self.config, &header, &slots, &mut self.probe)?;
         // The rename is the commit point: past it, the journal on disk is the
         // new one whether or not what follows works.
@@ -1057,9 +1098,13 @@ impl Journal {
         self.next_sender = next_sender;
         self.next_target = next_target;
         self.next_generation = next_generation;
+        // A reset clears the inbound application watermark (ADR-0030): it
+        // described the replaced stream.
+        self.app_watermark = 0;
         self.install_slots(slots);
         self.dead_bytes = 0;
         self.failed_compaction_at = None;
+        self.shared.app_watermark.store(0, Ordering::SeqCst);
         self.shared
             .publish(header.creation_time, next_sender, next_target);
         self.after_rename()
@@ -1137,6 +1182,7 @@ impl Journal {
             self.next_sender,
             self.next_target,
             live,
+            self.app_watermark,
             self.reset_owed,
         )?;
         let mut replacement = Replacement::create(&self.config, &header, &slots)?;
@@ -1268,6 +1314,7 @@ impl Journal {
         self.next_sender = scan.next_sender;
         self.next_target = scan.next_target;
         self.reset_owed = scan.reset_owed;
+        self.app_watermark = scan.app_watermark;
         self.next_generation = self.next_generation.max(scan.next_generation);
         self.slots = scan.slots;
         self.active_slot = scan.active;
@@ -1329,6 +1376,10 @@ impl Journal {
             }
             Command::SetResetOwed(owed) => {
                 self.set_reset_owed(owed)?;
+                Ok(Answer::Done)
+            }
+            Command::SetAppWatermark(watermark) => {
+                self.set_app_watermark(watermark)?;
                 Ok(Answer::Done)
             }
             Command::ResetTo {
@@ -1520,6 +1571,7 @@ fn restamp_slots(
         next_sender: scan.next_sender,
         next_target: scan.next_target,
         durable_end: scan.end,
+        app_watermark: scan.app_watermark,
         reset_owed: scan.reset_owed,
     });
     write_at(file, &image, slot_offset(position)?)
@@ -1846,7 +1898,7 @@ fn open_journal(
             next_sender: 1,
             next_target: 1,
         };
-        let (slots, _) = format::fresh_slots(0, 1, 1, DATA_START, false)?;
+        let (slots, _) = format::fresh_slots(0, 1, 1, DATA_START, 0, false)?;
         write_replacement(&config, &header, &slots, &mut probe)?;
         flush_directory(config.directory())?;
         probe.dir_flush();
@@ -1925,7 +1977,7 @@ impl FileStore {
     /// # Errors
     /// [`StoreError::Io`] if the journal is missing or cannot be opened, cut,
     /// flushed or locked, and outside a Tokio runtime;
-    /// [`StoreError::Corrupted`] if its header is not a version-3 journal
+    /// [`StoreError::Corrupted`] if its header is not a version-4 journal
     /// header, or both of its counter slots are unreadable.
     pub async fn repair(config: FileStoreConfig) -> Result<Option<Truncation>, StoreError> {
         let store = Self::open_with(config, DamageRule::Salvage, false).await?;
@@ -2254,6 +2306,19 @@ impl MessageStore for FileStore {
     /// first. A reset and a compaction carry the marker into the new journal.
     async fn set_reset_owed(&self, owed: bool) -> Result<(), StoreError> {
         self.done(Command::SetResetOwed(owed)).await
+    }
+
+    /// The watermark as the newest valid counter slot carries it, as loaded
+    /// at open or by the last refresh, and as last set since.
+    fn app_watermark(&self) -> u64 {
+        self.shared.app_watermark.load(Ordering::SeqCst)
+    }
+
+    /// Overwrites the counter slot that does not hold the last durable
+    /// checkpoint, like a counter write, flushed as the [`SyncPolicy`] says;
+    /// the file does not grow. A reset writes 0; a compaction carries it.
+    async fn set_app_watermark(&self, watermark: u64) -> Result<(), StoreError> {
+        self.done(Command::SetAppWatermark(watermark)).await
     }
 
     /// Overwrites the counter slot that does not hold the last durable
@@ -4050,9 +4115,10 @@ mod v2_tests {
 
     #[tokio::test]
     async fn test_file_store_unsupported_format_version_is_corrupted() {
-        // Version 2 (#112, no owed-reset flag) was never released and is not
-        // migrated; version 4 does not exist yet.
-        for version in [2u16, 4] {
+        // Versions 2 (#112, no owed-reset flag) and 3 (#111, no inbound
+        // watermark) were never released and are not migrated; version 5
+        // does not exist yet.
+        for version in [2u16, 3, 5] {
             let dir = TempDir::new(&format!("version-{version}"));
             let config = dir.config();
             drop(open(config.clone()).await);
@@ -4585,6 +4651,59 @@ mod v2_tests {
     }
 
     #[tokio::test]
+    async fn test_file_store_app_watermark_survives_reopen_and_compaction_and_a_reset_clears_it() {
+        let dir = TempDir::new("app-watermark");
+        let config = dir.config();
+        {
+            let store = open(config.clone()).await;
+            assert_eq!(store.app_watermark(), 0, "a new journal has no watermark");
+            file(&store, 1).await;
+            ok(store.set_next_target_seq(8).await, "counter write");
+            ok(store.set_app_watermark(6).await, "set the watermark");
+            assert_eq!(store.app_watermark(), 6);
+            ok(
+                store.set_next_target_seq(9).await,
+                "a counter write carries it",
+            );
+        }
+        {
+            let store = open(config.clone()).await;
+            assert_eq!(store.app_watermark(), 6, "the watermark survives a reopen");
+            assert_eq!(store.next_target_seq(), 9, "the counters are untouched");
+            file(&store, 2).await;
+            ok(store.compact().await, "compact");
+            assert_eq!(store.app_watermark(), 6, "a compaction keeps it");
+        }
+        {
+            let store = open(config.clone()).await;
+            assert_eq!(store.app_watermark(), 6, "kept across the compaction");
+            ok(store.reset_to(2, 2).await, "reset");
+            assert_eq!(store.app_watermark(), 0, "a reset clears it");
+        }
+        let store = open(config).await;
+        assert_eq!(store.app_watermark(), 0, "the clear survives a reopen");
+    }
+
+    #[tokio::test]
+    async fn test_file_store_app_watermark_costs_one_slot_write_under_the_sync_policy() {
+        for (policy, flushes) in [(SyncPolicy::Never, 0), (SyncPolicy::EveryWrite, 1)] {
+            let dir = TempDir::new("app-watermark-cost");
+            let config = dir.config().with_sync_policy(policy);
+            let store = open(config.clone()).await;
+            let (journal, _) = store.flushes().await;
+            ok(store.set_app_watermark(3).await, "set the watermark");
+            let (after, _) = store.flushes().await;
+            assert_eq!(after - journal, flushes, "{policy:?}: the policy decides");
+            // The same value again writes nothing.
+            ok(store.set_app_watermark(3).await, "set it again");
+            assert_eq!(store.flushes().await.0, after, "{policy:?}: unchanged");
+            drop(store);
+            let store = open(config).await;
+            assert_eq!(store.app_watermark(), 3, "{policy:?}: on disk once closed");
+        }
+    }
+
+    #[tokio::test]
     async fn test_file_store_reset_owed_marker_is_flushed_under_every_policy() {
         for policy in [SyncPolicy::Never, SyncPolicy::EveryWrite] {
             let dir = TempDir::new("marker-flush");
@@ -4687,9 +4806,9 @@ mod v2_tests {
         let mut unknown = marked.clone();
         let newest = newest_on_disk_of(&marked);
         let range = slot_bytes(newest);
-        unknown[range.start + 32] = 0x03;
-        let crc = crc32::crc32(&unknown[range.start..range.start + 40]);
-        unknown[range.start + 40..range.end].copy_from_slice(&crc.to_le_bytes());
+        unknown[range.start + 40] = 0x03;
+        let crc = crc32::crc32(&unknown[range.start..range.start + 48]);
+        unknown[range.start + 48..range.end].copy_from_slice(&crc.to_le_bytes());
         write_journal(&config, &unknown);
         {
             let store = open(config.clone()).await;

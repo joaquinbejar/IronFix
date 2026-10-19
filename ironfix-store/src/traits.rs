@@ -55,7 +55,8 @@
 //! still complete it afterwards. Every implementation must therefore apply
 //! its **mutations** ([`MessageStore::store`],
 //! [`MessageStore::file_outbound`], the two counter setters,
-//! [`MessageStore::set_reset_owed`], [`MessageStore::reset`],
+//! [`MessageStore::set_reset_owed`], [`MessageStore::set_app_watermark`],
+//! [`MessageStore::reset`],
 //! [`MessageStore::reset_to`]) **in call order, even
 //! when a call's future is dropped before it completes**: a mutation takes
 //! effect before any mutation called after it, or not at all. Serialising
@@ -367,6 +368,54 @@ pub trait MessageStore: Send + Sync {
         Ok(())
     }
 
+    /// Returns the durable inbound application watermark, or 0 for none.
+    ///
+    /// The watermark is the highest inbound `MsgSeqNum` (34) up to which the
+    /// engine has finished acting on every message it accepted: each
+    /// application message at or below it has returned from the
+    /// application's `from_app`, and each administrative one has been
+    /// processed. At the start of a session the engine reports the inbound
+    /// messages above it and below the stored next target number as
+    /// possibly lost to the application, since inbound delivery is at most
+    /// once (see `doc/adr/0030-inbound-loss-report.md`).
+    ///
+    /// The default reports 0: a store that does not override
+    /// [`set_app_watermark`](MessageStore::set_app_watermark) keeps no
+    /// watermark, and the engine reports nothing at start, as before the
+    /// watermark existed.
+    fn app_watermark(&self) -> u64 {
+        0
+    }
+
+    /// Persists the inbound application watermark.
+    ///
+    /// The engine calls this after `from_app` returns for an inbound
+    /// application message, after it has processed the administrative
+    /// messages accepted since, and at session start once it has reported a
+    /// loss. The value is not monotonic: a store must accept a lower one.
+    ///
+    /// [`reset`](MessageStore::reset) and [`reset_to`](MessageStore::reset_to)
+    /// must **clear** it to 0: it describes the stream a reset replaces. A
+    /// store that overrides this method and keeps a stale watermark across a
+    /// reset hides losses in the new stream until the engine overwrites it.
+    ///
+    /// `Ok` means the watermark is as durable as the store's counters
+    /// (unlike [`set_reset_owed`](MessageStore::set_reset_owed), it is not
+    /// forced to stable storage: it is written on the per-message path).
+    ///
+    /// This is a mutation, and takes effect in call order like the others.
+    ///
+    /// The default does nothing and returns `Ok`: the store keeps no
+    /// watermark (see [`app_watermark`](MessageStore::app_watermark)).
+    ///
+    /// # Errors
+    /// Returns `StoreError` if the watermark cannot be persisted. The error
+    /// must not contain frame bytes.
+    async fn set_app_watermark(&self, watermark: u64) -> Result<(), StoreError> {
+        let _ = watermark;
+        Ok(())
+    }
+
     /// Returns the creation time of the store/session.
     fn creation_time(&self) -> std::time::SystemTime;
 
@@ -450,5 +499,8 @@ mod tests {
         // Without an override the store keeps no owed-reset marker.
         assert!(store.set_reset_owed(true).await.is_ok());
         assert!(!store.reset_owed());
+        // Without an override the store keeps no inbound watermark.
+        assert!(store.set_app_watermark(5).await.is_ok());
+        assert_eq!(store.app_watermark(), 0);
     }
 }
