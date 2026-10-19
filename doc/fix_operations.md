@@ -2315,9 +2315,12 @@ every later version. Inbound, a FIX 4.0 or 4.1 session reads both `999999` and
 rejected when a peer uses the later convention. A FIX 4.2 or later session
 reads only `0` as infinity and keeps `999999` a literal bound; the reply is
 capped at our next outbound number regardless, so it is answered in full
-unless more than 999999 messages have been sent. QuickFIX is more lenient (it
-treats any `EndSeqNo` at or above its next outbound number as infinity); the
-cap gives the same reply range.
+unless more than 999999 messages have been sent. This literal policy is
+deliberate and differs from QuickFIX, which treats `999999` as infinity on
+FIX 4.2 too (QuickFIX/C++ `src/C++/Session.cpp` lines 357 to 360; QuickFIX/J
+`quickfixj-core/src/main/java/quickfix/Session.java` lines 1269 to 1275). The
+reply range is the same unless more than 999999 messages were sent; past that,
+IronFix answers only up to 999999 where QuickFIX answers to its next number.
 
 The engine-independent demo session (`ironfix-example`, `DemoSession`) also
 writes `SendingTime` (52) in whole seconds on FIX 4.0 and 4.1 and in
