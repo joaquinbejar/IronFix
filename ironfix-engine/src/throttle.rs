@@ -650,7 +650,17 @@ impl<T> Bucket<T> {
 
     /// Tokens free to reserve: held and not reserved.
     fn available(&self) -> u32 {
-        self.tokens.saturating_sub(self.reserved)
+        // A token is reserved only while it is in the bucket, and the bucket
+        // never loses a token it holds until the reservation is charged, so
+        // `tokens >= reserved` always. Were it broken, no token would be free:
+        // the safe side, which can only delay a message, never send one early.
+        match self.tokens.checked_sub(self.reserved) {
+            Some(free) => free,
+            None => {
+                debug_assert!(false, "a reserved token is always held");
+                0
+            }
+        }
     }
 
     /// Reserves a token at `now`, if one is free. The token stays in the
