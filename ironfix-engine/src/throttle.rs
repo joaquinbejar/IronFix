@@ -18,7 +18,7 @@
 //!   back every [`ThrottleBudget::per`] / [`ThrottleBudget::rate`] (rounded
 //!   up to whole nanoseconds), up to `burst`;
 //! - a message takes one token when it is about to be framed. Over any
-//!   interval of length `per` a budget lets at most `burst + rate - 1`
+//!   half-open interval `[t, t + per)` a budget lets at most `burst + rate - 1`
 //!   messages through, so `burst = 1` (the default) keeps a session within a
 //!   venue limit of `rate` messages per `per`, measured over any window;
 //! - a message that finds no token is handled by the budget's
@@ -26,7 +26,10 @@
 //!   a token is earned, up to `max_depth` messages, and refuses one beyond
 //!   that; [`ThrottlePolicy::Refuse`] refuses it at once. A refusal reports
 //!   [`NotSentReason::Throttled`](crate::NotSentReason::Throttled) through
-//!   [`Connection::send_tracked`](crate::Connection::send_tracked).
+//!   [`Connection::send_tracked`](crate::Connection::send_tracked). With a
+//!   throttle attached, prefer `send_tracked`: a plain
+//!   [`Connection::send`](crate::Connection::send) the throttle refuses is
+//!   only logged (a warning, counted per budget).
 //!
 //! An optional classifier ([`ThrottleConfigBuilder::classifier`]) puts each
 //! message in one budget, so separate budgets can keep, for example, order
@@ -49,7 +52,10 @@
 //! message never overtakes one held before it in the same budget, even when
 //! a token is free. Across budgets a message whose budget has a token goes
 //! ahead of one held in another budget: that is what separate budgets are
-//! for. With a single budget (no classifier) the order is the order of
+//! for. A consequence to plan for: a cancel in a budget of its own can
+//! overtake the very order it cancels while that order is still held in the
+//! order budget, and the venue then rejects the cancel for an unknown order.
+//! With a single budget (no classifier) the order is the order of
 //! [`Connection::send`](crate::Connection::send) calls. Messages released at
 //! the same moment from several budgets leave in the order they were handed
 //! in. The `MsgSeqNum` (34) is assigned when a message is framed, so the
@@ -107,6 +113,10 @@ pub const MAX_THROTTLE_WINDOW: Duration = Duration::from_secs(86_400);
 /// The `max_depth` of the [`ThrottlePolicy::Queue`] a [`ThrottleBudget`]
 /// starts with, in messages: the default capacity of the outbound queue.
 pub const DEFAULT_THROTTLE_QUEUE_DEPTH: usize = 1_024;
+
+/// Capacity a budget's queue keeps once it drains: a larger one, grown by a
+/// burst, is given back.
+const QUEUE_RETAINED: usize = 64;
 
 /// The resolution of the timer a held message waits on: Tokio's.
 const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
@@ -172,8 +182,8 @@ pub enum ThrottlePolicy {
 /// message that finds it empty.
 ///
 /// It starts with `burst` tokens and earns one every `per / rate`, rounded
-/// up to whole nanoseconds, up to `burst`. Over any interval of length `per`
-/// at most `burst + rate - 1` messages go through it; with the default
+/// up to whole nanoseconds, up to `burst`. Over any half-open interval
+/// `[t, t + per)` at most `burst + rate - 1` messages go through it; with the default
 /// `burst` of 1 that is `rate`, which keeps a session within a venue limit of
 /// `rate` messages per `per`, however the venue places its window.
 ///
@@ -750,6 +760,9 @@ impl<T> Throttle<T> {
             return None;
         }
         let (_, item) = bucket.queue.pop_front()?;
+        if bucket.queue.is_empty() && bucket.queue.capacity() > QUEUE_RETAINED {
+            bucket.queue.shrink_to(QUEUE_RETAINED);
+        }
         // The message just taken out was counted, so `held` is at least 1.
         debug_assert!(self.held > 0, "a held message was counted");
         if let Some(held) = self.held.checked_sub(1) {
@@ -1191,6 +1204,31 @@ mod tests {
         assert_eq!(throttle.release(t1), Some((a, 4)));
         assert!(throttle.release(t1).is_none());
         assert_eq!(throttle.release(t0 + 2 * SECOND), Some((b, 5)));
+    }
+
+    #[test]
+    fn test_throttle_refund_at_a_full_bucket_grants_nothing() {
+        let t0 = Instant::now();
+        let mut throttle = single(ThrottleBudget::new(1, SECOND), t0);
+        throttle.refund(BudgetId::DEFAULT);
+        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
+        assert_held(throttle.admit(BudgetId::DEFAULT, 2, t0));
+    }
+
+    #[test]
+    fn test_throttle_refund_during_partial_progress_keeps_the_progress() {
+        let t0 = Instant::now();
+        let mut throttle = single(ThrottleBudget::new(1, SECOND).with_burst(2), t0);
+        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
+        assert_now(throttle.admit(BudgetId::DEFAULT, 2, t0), 2);
+        // Half a token earned, then one given back.
+        let half = t0 + Duration::from_millis(500);
+        assert_held(throttle.admit(BudgetId::DEFAULT, 3, half));
+        throttle.refund(BudgetId::DEFAULT);
+        assert_eq!(throttle.release(half), Some((BudgetId::DEFAULT, 3)));
+        // The half token still counts: the next one is due at t0 + 1 s.
+        assert_held(throttle.admit(BudgetId::DEFAULT, 4, half));
+        assert_eq!(throttle.next_release(half), Some(t0 + SECOND));
     }
 
     #[test]

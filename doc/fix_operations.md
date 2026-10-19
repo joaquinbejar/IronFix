@@ -1208,21 +1208,23 @@ value and names the budget at fault.
 
 **The bucket.** A budget starts full when the session becomes Active and earns
 one token every `per / rate`, rounded up to whole nanoseconds, up to `burst`.
-Over any interval of length `per`, at most `burst + rate - 1` messages go
+Over any half-open interval `[t, t + per)`, at most `burst + rate - 1` messages go
 through a budget: the default burst of 1 keeps a session within a venue limit
 of `rate` per `per`, wherever the venue places its window. A message takes a
 token when it is about to be framed; one that finds none is held, in order
 behind the messages its budget already holds, up to `max_depth`, or refused
 (`Refuse`, or a full queue). A refusal reports `NotSent` with `Throttled`
 through `Connection::send_tracked` (a plain `send` is dropped with a debug
-log), before `to_app_checked` runs, before a `MsgSeqNum` (34) is peeked and
+log, a warning counted per budget: prefer `send_tracked` whenever a
+throttle is attached), before `to_app_checked` runs, before a `MsgSeqNum` (34) is peeked and
 before the store is touched: it leaves no gap. A held message goes through
 `to_app_checked`, takes its number and is filed only when it is released, and
 gives its token back if the gate vetoes it.
 
 **Order.** Within a budget, messages leave in the order they were handed in.
 Across budgets, a message whose budget has a token goes ahead of one held in
-another. Messages released at the same moment leave in the order they were
+another: a cancel in its own budget can overtake the order it cancels while
+that order is still held, and the venue then rejects it as unknown. Messages released at the same moment leave in the order they were
 handed in. `MsgSeqNum` is assigned when a message is framed, so the numbers on
 the wire stay unique and in order.
 

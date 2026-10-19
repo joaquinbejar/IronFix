@@ -1561,6 +1561,10 @@ struct OutboundThrottle {
     /// define: logged once per session, the message going to the default
     /// budget.
     unknown_budget_logged: bool,
+    /// Untracked sends refused so far, per budget: a plain send has no
+    /// receipt, so its refusal is a warning, logged at the 1st, 2nd, 4th,
+    /// 8th... refusal of each budget so a flood of sends cannot flood the log.
+    untracked_refused: Vec<u64>,
 }
 
 /// When the outbound throttle may release the next message it holds
@@ -2697,15 +2701,38 @@ impl<A: Application> Reactor<A> {
                 None
             }
             Admission::Refused(HeldSend { message, receipt }) => {
-                tracing::debug!(
-                    session = %self.session_id,
-                    budget = %budget,
-                    msg_type = %message.msg_type(),
-                    "outbound application message refused by the throttle; no sequence number spent"
-                );
-                outcome::resolve(receipt, || {
-                    SendOutcome::not_sent(NotSentReason::Throttled { budget })
-                });
+                match receipt {
+                    Some(receipt) => {
+                        tracing::debug!(
+                            session = %self.session_id,
+                            budget = %budget,
+                            msg_type = %message.msg_type(),
+                            "tracked outbound application message refused by the throttle; no \
+                             sequence number spent"
+                        );
+                        receipt.resolve(SendOutcome::not_sent(NotSentReason::Throttled { budget }));
+                    }
+                    None => {
+                        let slot = usize::from(budget.index());
+                        if let Some(count) = throttle.untracked_refused.get_mut(slot)
+                            && let Some(next) = count.checked_add(1)
+                        {
+                            *count = next;
+                            if next.is_power_of_two() {
+                                tracing::warn!(
+                                    session = %self.session_id,
+                                    budget = %budget,
+                                    msg_type = %message.msg_type(),
+                                    refused = next,
+                                    "outbound application message sent with Connection::send \
+                                     refused by the throttle and dropped; no sequence number \
+                                     spent (use send_tracked to learn each outcome; logged at \
+                                     powers of two)"
+                                );
+                            }
+                        }
+                    }
+                }
                 None
             }
         }
@@ -4687,6 +4714,8 @@ impl<A: Application> Reactor<A> {
             frame: frame.clone(),
             seq,
         });
+        // The reactor is the only writer of this count, which is why the
+        // record is a plain load and store rather than an atomic add.
         self.runtime.record_inbound_app_message();
         self.app_handed = Some(match self.app_handed {
             Some((first, _)) => (first, seq),
@@ -4935,6 +4964,7 @@ where
     // The budgets start full as the session becomes Active.
     let throttle = throttle.map(|config| OutboundThrottle {
         state: Throttle::new(&config, driver_now()),
+        untracked_refused: vec![0; config.budgets().len()],
         config,
         unknown_budget_logged: false,
     });

@@ -111,7 +111,7 @@ that once. `ThrottlePolicy`, `ThrottleConfigError` and the new
 A budget starts full (`burst` tokens) when the session becomes Active and
 earns one token every `per / rate`, **rounded up** to whole nanoseconds (so
 `rate` tokens never take less than `per`), up to `burst`; time spent full is
-not banked. Over any half-open interval of length `per`, at most
+not banked. Over any half-open interval `[t, t + per)`, at most
 `burst + rate - 1` messages go through a budget, so the default burst of 1
 keeps a session within a venue limit of `rate` per `per` however the venue
 places its window. A unit test checks that bound for a greedy sender.
@@ -186,8 +186,12 @@ message whose write is partial, or fails, is `Unknown`, as ADR-0023 defines.
   claimed.
 - **Plain sends:** with a throttle the reactor goes on draining the outbound
   queue into the budgets, so `Connection::send` is no longer held back by the
-  throttle; a plain send the throttle refuses is dropped with a debug log,
-  and `send_tracked` reports it.
+  throttle; a plain send the throttle refuses is dropped with a warning
+  (counted per budget, logged at the 1st, 2nd, 4th, 8th... refusal so it
+  cannot flood), and `send_tracked` reports it. The documentation
+  recommends `send_tracked` whenever a throttle is attached.
+- **Cancels:** a cancel in its own budget can overtake the order it cancels
+  while that order is still held, and the venue then rejects the cancel.
 - **Tests:** unit tests of the bucket with synthetic instants (validation of
   every value, rounding, burst, refuse, over-depth, FIFO within a budget,
   independence and arrival order across budgets, refund, a clock that steps

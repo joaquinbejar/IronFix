@@ -190,9 +190,10 @@ impl Connection {
     /// their budget's rate (see [`crate::throttle`]): a message its budget
     /// cannot take now is held, in order, or refused, by the budget's
     /// policy, so the queue does not fill because of the throttle. A refused
-    /// plain `send` is dropped with a debug log, having spent no `MsgSeqNum`;
-    /// [`Connection::send_tracked`] reports it as
-    /// [`NotSentReason::Throttled`]. A Logout, whether asked for with
+    /// plain `send` is dropped with a warning (counted per budget), having
+    /// spent no `MsgSeqNum`; [`Connection::send_tracked`] reports it as
+    /// [`NotSentReason::Throttled`], so prefer `send_tracked` whenever a
+    /// throttle is attached. A Logout, whether asked for with
     /// [`Connection::logout`] or caused by dropping every handle, goes out
     /// at once, and the messages still held by the throttle are discarded
     /// rather than written after it.
