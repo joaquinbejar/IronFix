@@ -26,6 +26,9 @@
 //! overrides only `to_app` behaves as before; a full queue at a kill, at this
 //! session's Logout and at the counterparty's; and tracked sends held behind
 //! a resend or a 789 resend, including one a gate closed meanwhile stops.
+//! Issue #139, in both roles: a message above `max_message_size` is refused
+//! before it is filed and spends no number; `Sent` resolves for a frame once
+//! its last byte is written, while later output is still buffered.
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -1764,4 +1767,200 @@ async fn test_application_overriding_only_to_app_behaves_as_before() {
     );
 
     log_out(&member, &venue).await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #139: size checked before filing; `Sent` resolved per frame.
+// ---------------------------------------------------------------------------
+
+/// The `max_message_size` the sender is configured with in the oversized
+/// tests: a Logon and an ordinary order fit, [`OVERSIZED_TEXT`] does not.
+const SMALL_MAX_MESSAGE: usize = 4 * 1024;
+
+/// Text (58) bytes that take an order past [`SMALL_MAX_MESSAGE`].
+const OVERSIZED_TEXT: usize = 8 * 1024;
+
+/// Text (58) bytes of the frames that fill the [`SMALL_PIPE`] in the
+/// per-frame `Sent` tests: far more than the pipe holds.
+const FILLER_TEXT: usize = 16 * 1024;
+
+/// An order above `max_message_size` is refused before it is filed: tracked,
+/// it is `NotSent` with `Invalid`, no `MsgSeqNum` is spent, the store holds
+/// nothing new and its counter is not written; a plain send of one is
+/// dropped the same way. The session carries on and the next order takes
+/// the number the oversized ones would have had, so the peer sees no gap.
+async fn assert_oversized_spends_nothing(
+    sender: &Connection,
+    store: &MemoryStore,
+    receiver: &Connection,
+    receiver_rx: &mut mpsc::UnboundedReceiver<Received>,
+) {
+    let first = sender.send_tracked(order("OK-1")).await;
+    assert_eq!(sent(&first).0, 2);
+    assert_eq!(received(receiver_rx).await.seq, Some(2));
+    let filed = store.message_count();
+    assert_eq!((sender.next_sender_seq(), store.next_sender_seq()), (3, 3));
+
+    let oversized = sender
+        .send_tracked(large_order("HUGE-1", OVERSIZED_TEXT))
+        .await;
+    match not_sent(&oversized) {
+        NotSentReason::Invalid { detail, .. } => {
+            assert!(detail.contains("too large"), "{detail}");
+            assert!(!detail.contains("XXXX"), "the value is never quoted");
+        }
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(
+        oversized.seq(),
+        None,
+        "an oversized message spends no number"
+    );
+    assert_eq!(sender.next_sender_seq(), 3, "no number spent");
+    assert_eq!(store.message_count(), filed, "nothing filed");
+    assert_eq!(store.next_sender_seq(), 3, "no counter written");
+    ok(
+        sender.send(large_order("HUGE-2", OVERSIZED_TEXT)).await,
+        "a plain send is queued",
+    );
+
+    let next = sender.send_tracked(order("OK-2")).await;
+    assert_eq!(sent(&next).0, 3, "the next order takes the unspent number");
+    let seen = received(receiver_rx).await;
+    assert_eq!(
+        (seen.id.as_deref(), seen.seq),
+        (Some("OK-2"), Some(3)),
+        "no oversized message reached the peer"
+    );
+    assert_eq!(store.message_count(), filed + 1, "only OK-2 was filed");
+    assert!(!holds(store, 4).await, "nothing filed past OK-2");
+    assert_eq!(store.next_sender_seq(), 4);
+    assert_eq!(receiver.next_target_seq(), 4, "the peer saw no gap");
+    assert!(!sender.is_closed() && !receiver.is_closed());
+}
+
+#[tokio::test]
+async fn test_oversized_message_spends_no_seq_and_files_nothing_on_the_initiator() {
+    let store = Arc::new(MemoryStore::new());
+    let (member_app, _member_rx) = GateApp::new();
+    let (venue_app, mut venue_rx) = GateApp::new();
+    let (member, venue) = engines(
+        Initiator::new(
+            member_config().with_max_message_size(SMALL_MAX_MESSAGE),
+            member_app,
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+        Acceptor::new(venue_config(), venue_app),
+    )
+    .await;
+    assert_oversized_spends_nothing(&member, &store, &venue, &mut venue_rx).await;
+    log_out(&member, &venue).await;
+}
+
+#[tokio::test]
+async fn test_oversized_message_spends_no_seq_and_files_nothing_on_the_acceptor() {
+    let store = Arc::new(MemoryStore::new());
+    let (member_app, mut member_rx) = GateApp::new();
+    let (venue_app, _venue_rx) = GateApp::new();
+    let (member, venue) = engines(
+        Initiator::new(member_config(), member_app),
+        Acceptor::new(
+            venue_config().with_max_message_size(SMALL_MAX_MESSAGE),
+            venue_app,
+        )
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>),
+    )
+    .await;
+    assert_oversized_spends_nothing(&venue, &store, &member, &mut member_rx).await;
+    log_out(&member, &venue).await;
+}
+
+/// Starts `acceptor` over a pipe of `capacity` bytes against a scripted
+/// member that logs on at 1. Returns the session and the member's end, just
+/// past the acceptor's Logon acknowledgement.
+async fn scripted_member<A: Application + 'static>(
+    acceptor: Acceptor<A>,
+    capacity: usize,
+) -> (Connection, VenueFramed) {
+    let (client_io, venue_io) = tokio::io::duplex(capacity);
+    let served = tokio::spawn(async move { acceptor.serve_stream(venue_io).await });
+    let mut framed = Framed::new(client_io, FixCodec::new());
+    venue_send(&mut framed, frame_from("CLIENT", "VENUE", "A", 1, ACK)).await;
+    let ack = next_frame(&mut framed).await;
+    assert_eq!(field(&ack, 35).as_deref(), Some("A"));
+    let venue = ok(
+        joined(served, "the acceptor handshake ends").await,
+        "the acceptor logs on over the pipe",
+    );
+    (venue, framed)
+}
+
+/// `Sent` resolves for a frame as soon as the stream has accepted its last
+/// byte, while later output is still buffered behind a slow reader: the
+/// peer reads a filler frame and the tracked EARLY-1, then stops, with the
+/// tracked LATE-1 (larger than the pipe) still in the write buffer.
+/// EARLY-1 is `Sent`; LATE-1 is not, until the peer reads it too.
+async fn assert_sent_per_frame(sender: &Connection, peer: &mut VenueFramed) {
+    ok(
+        sender.send(large_order("FILLER-1", FILLER_TEXT)).await,
+        "the filler is queued",
+    );
+    let early = track(sender, "EARLY-1");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let late = {
+        let sender = sender.clone();
+        tokio::spawn(async move {
+            sender
+                .send_tracked(large_order("LATE-1", FILLER_TEXT))
+                .await
+        })
+    };
+    tokio::time::sleep(QUIET).await;
+    assert!(
+        !early.is_finished() && !late.is_finished(),
+        "nothing is written whole while the peer does not read"
+    );
+
+    let filler = next_frame(peer).await;
+    assert_eq!(field(&filler, 11).as_deref(), Some("FILLER-1"));
+    let frame = next_frame(peer).await;
+    assert_eq!(field(&frame, 11).as_deref(), Some("EARLY-1"));
+    let outcome = joined(
+        early,
+        "EARLY-1 is Sent while LATE-1 is still buffered behind it",
+    )
+    .await;
+    assert_eq!(header(&frame), ("D".to_string(), sent(&outcome).0));
+    assert_eq!(sent(&outcome).0, 3);
+
+    tokio::time::sleep(QUIET).await;
+    assert!(
+        !late.is_finished(),
+        "LATE-1 is not Sent while the peer has not read it"
+    );
+    let frame = next_frame(peer).await;
+    assert_eq!(field(&frame, 11).as_deref(), Some("LATE-1"));
+    let outcome = joined(late, "LATE-1 is Sent once the peer reads it").await;
+    assert_eq!(header(&frame), ("D".to_string(), sent(&outcome).0));
+    assert_eq!(sent(&outcome).0, 4);
+    assert!(!sender.is_closed(), "a slow reader is not cut off");
+}
+
+#[tokio::test]
+async fn test_sent_resolves_per_frame_behind_a_slow_reader_on_the_initiator() {
+    let (app, _rx) = GateApp::new();
+    let initiator = Initiator::new(member_config(), app);
+    let (member, mut venue, _logon) = scripted(&initiator, SMALL_PIPE, ACK).await;
+    assert_sent_per_frame(&member, &mut venue).await;
+    drop(venue);
+    closed(&member, "the session closes once the venue is gone").await;
+}
+
+#[tokio::test]
+async fn test_sent_resolves_per_frame_behind_a_slow_reader_on_the_acceptor() {
+    let (app, _rx) = GateApp::new();
+    let (venue, mut member) = scripted_member(Acceptor::new(venue_config(), app), SMALL_PIPE).await;
+    assert_sent_per_frame(&venue, &mut member).await;
+    drop(member);
+    closed(&venue, "the session closes once the member is gone").await;
 }
