@@ -915,14 +915,19 @@ at `MsgSeqNum` 1, so the counterparty restarts the sequence with it; that
 reset is paid once that Logon is acknowledged. On the `Acceptor` (whose
 reset fails closed the same way for a session that resets), the next accepted
 Logon resets the store and its acknowledgement declares `141=Y` at 1; that
-reset is paid once that acknowledgement is sent. The record lives in the
-engine, in memory, so a process restart forgets it whichever store is
-attached; `FileStore` does not persist it. A crash after the counterparty
-acknowledged a `ResetSeqNumFlag` reset and before the store made it durable
-therefore restarts from the previous stream's counters; making the intent
-durable is #111. For the same reason a store
-must belong to exactly one engine instance; `FileStore` enforces this with a
-lock file.
+reset is paid once that acknowledgement is sent. The record is mirrored by a
+durable marker in the store (`MessageStore::set_reset_owed`, issue #111,
+ADR-0029): the engine sets it before it acts on any reset, and clears it once
+the reset has been made and the Logon or acknowledgement declaring it has been
+exchanged. A session that starts on a store whose marker is set resets the
+store and declares `ResetSeqNumFlag` (141) = Y at 1, in either role, so a
+crash at any point from the marker on never replays a frame of the previous
+stream. `FileStore` keeps the marker in its counter slots, flushed whatever
+the sync policy; `MemoryStore` keeps it for the life of the process. One
+window remains: a crash after a resetting Logon acknowledgement has arrived
+and before the marker is durable restarts from the previous stream's
+counters. A store must belong to exactly one engine instance; `FileStore`
+enforces this with a lock file.
 
 With a store attached, call `Initiator::connect` again only once the previous
 session's `Connection::wait_closed` has returned: until then the closing
@@ -1222,9 +1227,11 @@ framed or the session ended).
 A `StoreRefused` frame is not sent within the process, but a failed or
 timed-out store write leaves the store's state unknown: the frame may have been
 filed after all. The engine owes the next session a sequence reset, which
-erases it; that record is in memory only (issue #111), so after a restart a
-store that did file the frame can replay it under the number this session
-never spent.
+erases it. That record is mirrored by the store's durable owed-reset marker
+(issue #111, ADR-0029), written right after the failure, so a restart resets
+too. If the store fails the marker write as well (logged as a warning), the
+record is in memory only, and after a restart a store that did file the frame
+can replay it under the number this session never spent.
 
 **`Unknown` means the order may be live.** Do not resubmit it blindly.
 Reconcile it by `ClOrdID` (11) after the next Logon, through the

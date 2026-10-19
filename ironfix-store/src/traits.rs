@@ -55,7 +55,8 @@
 //! still complete it afterwards. Every implementation must therefore apply
 //! its **mutations** ([`MessageStore::store`],
 //! [`MessageStore::file_outbound`], the two counter setters,
-//! [`MessageStore::reset`], [`MessageStore::reset_to`]) **in call order, even
+//! [`MessageStore::set_reset_owed`], [`MessageStore::reset`],
+//! [`MessageStore::reset_to`]) **in call order, even
 //! when a call's future is dropped before it completes**: a mutation takes
 //! effect before any mutation called after it, or not at all. Serialising
 //! mutations through an internal queue that later calls wait behind, or
@@ -321,6 +322,51 @@ pub trait MessageStore: Send + Sync {
         self.set_next_target_seq(next_target).await
     }
 
+    /// Returns whether the store holds the durable owed-reset marker.
+    ///
+    /// The marker is the engine's intent to reset the sequence, recorded
+    /// before the engine acts on it, so that a crash or a restart cannot lose
+    /// it: a session that starts on a store reporting `true` resets the store
+    /// and logs on with `ResetSeqNumFlag` (141) = Y at `MsgSeqNum` 1 (see
+    /// `doc/adr/0029-durable-owed-reset.md`).
+    ///
+    /// The default reports `false`: a store that does not override
+    /// [`set_reset_owed`](MessageStore::set_reset_owed) keeps no marker, and
+    /// the intent lives only in the engine's memory, as before the marker
+    /// existed.
+    fn reset_owed(&self) -> bool {
+        false
+    }
+
+    /// Records (`true`) or clears (`false`) the durable owed-reset marker.
+    ///
+    /// The engine sets the marker before it resets the store for a reset it
+    /// has decided (a Logon or Logon acknowledgement with `ResetSeqNumFlag`
+    /// (141) = Y, a `reset_on_logout` / `reset_on_disconnect` close, a reset
+    /// an earlier session owed), and after a store mutation that failed; it
+    /// clears it only once the reset has been made and the Logon or
+    /// acknowledgement declaring it has been exchanged, or right after a
+    /// successful close-time reset when nothing else is owed. `Ok` must mean the
+    /// marker is as durable as the store's counters can be made: a durable
+    /// store flushes it before it returns, whatever its own sync policy.
+    ///
+    /// [`reset`](MessageStore::reset) and [`reset_to`](MessageStore::reset_to)
+    /// must **keep** the marker: a reset made under it is not yet declared to
+    /// the counterparty, and a crash before that must still find it.
+    ///
+    /// This is a mutation, and takes effect in call order like the others.
+    ///
+    /// The default does nothing and returns `Ok`: the store keeps no marker
+    /// (see [`reset_owed`](MessageStore::reset_owed)).
+    ///
+    /// # Errors
+    /// Returns `StoreError` if the marker cannot be made durable. The error
+    /// must not contain frame bytes.
+    async fn set_reset_owed(&self, owed: bool) -> Result<(), StoreError> {
+        let _ = owed;
+        Ok(())
+    }
+
     /// Returns the creation time of the store/session.
     fn creation_time(&self) -> std::time::SystemTime;
 
@@ -401,5 +447,8 @@ mod tests {
         assert!(store.reset().await.is_ok());
         // The default `reset_to` composes the reset and the two setters.
         assert!(store.reset_to(2, 2).await.is_ok());
+        // Without an override the store keeps no owed-reset marker.
+        assert!(store.set_reset_owed(true).await.is_ok());
+        assert!(!store.reset_owed());
     }
 }

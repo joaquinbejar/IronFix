@@ -17,7 +17,7 @@ use ironfix_core::error::StoreError;
 use ironfix_core::message::MsgType;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 /// In-memory message store.
@@ -33,6 +33,8 @@ pub struct MemoryStore {
     next_sender_seq: AtomicU64,
     /// Next expected target sequence number.
     next_target_seq: AtomicU64,
+    /// The owed-reset marker; a reset keeps it.
+    reset_owed: AtomicBool,
     /// Store creation time.
     creation_time: SystemTime,
 }
@@ -45,6 +47,7 @@ impl MemoryStore {
             messages: RwLock::new(BTreeMap::new()),
             next_sender_seq: AtomicU64::new(1),
             next_target_seq: AtomicU64::new(1),
+            reset_owed: AtomicBool::new(false),
             creation_time: SystemTime::now(),
         }
     }
@@ -60,6 +63,7 @@ impl MemoryStore {
             messages: RwLock::new(BTreeMap::new()),
             next_sender_seq: AtomicU64::new(sender_seq),
             next_target_seq: AtomicU64::new(target_seq),
+            reset_owed: AtomicBool::new(false),
             creation_time: SystemTime::now(),
         }
     }
@@ -193,6 +197,18 @@ impl MessageStore for MemoryStore {
         Ok(())
     }
 
+    /// Reports the marker as last set in this process: it survives an engine
+    /// restart over the same store, not a process restart.
+    fn reset_owed(&self) -> bool {
+        self.reset_owed.load(Ordering::SeqCst)
+    }
+
+    /// Never fails: the marker is an atomic in this process. A reset keeps it.
+    async fn set_reset_owed(&self, owed: bool) -> Result<(), StoreError> {
+        self.reset_owed.store(owed, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn creation_time(&self) -> SystemTime {
         self.creation_time
     }
@@ -217,6 +233,20 @@ mod tests {
             store.store(seq, &msg_type, payload).await,
             "store must accept the message",
         );
+    }
+
+    #[tokio::test]
+    async fn test_memory_store_reset_owed_marker_survives_a_reset_until_cleared() {
+        let store = MemoryStore::new();
+        assert!(!store.reset_owed());
+        ok(store.set_reset_owed(true).await, "set the marker");
+        assert!(store.reset_owed());
+        ok(store.reset().await, "reset");
+        assert!(store.reset_owed(), "a reset keeps the marker");
+        ok(store.reset_to(2, 2).await, "reset_to");
+        assert!(store.reset_owed(), "reset_to keeps the marker");
+        ok(store.set_reset_owed(false).await, "clear the marker");
+        assert!(!store.reset_owed());
     }
 
     #[tokio::test]

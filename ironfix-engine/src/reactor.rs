@@ -274,7 +274,7 @@ use crate::outbound;
 use crate::outcome::{self, NotSentReason, Receipt, SendOutcome, UnknownReason};
 use crate::persistence::{
     HandshakeStore, OwedReset, PersistedCounters, SessionStore, StoreFailurePolicy, file_and_spend,
-    timed,
+    sync_marker, timed,
 };
 use crate::stream::SessionStream;
 use crate::throttle::{Admission, BudgetId, Throttle, ThrottleConfig};
@@ -2253,9 +2253,36 @@ async fn run_reactor<A: Application + 'static>(
             // succeeded: a reactor dropped while the reset is pending (a
             // runtime shutting down) runs no error branch, and the next
             // session must still make the reset.
+            //
+            // The intent is recorded in the store's durable marker first
+            // (ADR-0029), so a crash before the reset lands, or before the
+            // marker is cleared, makes the next session reset and declare
+            // it. If the marker cannot be written the reset is still made:
+            // not making it would leave the previous stream in a store the
+            // counterparty no longer continues, which is worse.
             let ticket = ctx.reset_owed.owe();
+            if let Err(err) = sync_marker(&ctx.reset_owed, store, ctx.store_timeout).await {
+                tracing::error!(
+                    session = %ctx.session_id,
+                    error = %err,
+                    "cannot record the close-time sequence reset in the store: resetting \
+                     anyway; a crash before the next session forgets that it is owed"
+                );
+            }
             match timed(ctx.store_timeout, store.reset()).await {
-                Ok(()) => ctx.reset_owed.pay(ticket),
+                Ok(()) => {
+                    ctx.reset_owed.pay(ticket);
+                    // The reset is made; the next session starts at 1 as
+                    // the counterparty expects, so nothing is owed any more.
+                    if let Err(err) = sync_marker(&ctx.reset_owed, store, ctx.store_timeout).await {
+                        tracing::warn!(
+                            session = %ctx.session_id,
+                            error = %err,
+                            "cannot clear the owed-reset marker after the close-time reset: \
+                             the next session resets again"
+                        );
+                    }
+                }
                 Err(err) => {
                     // The reset counters written over a store that still
                     // holds this session's stream would describe neither, so

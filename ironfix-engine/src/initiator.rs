@@ -371,8 +371,9 @@ impl<A: Application + 'static> Initiator<A> {
     /// **One store, one engine.** The store must belong to this initiator
     /// alone: two engines, or two processes, writing to one store would
     /// interleave two sequence streams in it. The record of a reset owed to the
-    /// next session is held in memory by the initiator, not in the store, so a
-    /// restart forgets it (#111). Call [`Initiator::connect`] again only
+    /// next session is held by the initiator and mirrored by a durable marker
+    /// in the store ([`MessageStore::set_reset_owed`]), so a restart over the
+    /// same store still makes and declares it (#111, ADR-0029). Call [`Initiator::connect`] again only
     /// once the previous session's [`Connection::wait_closed`] has returned.
     ///
     /// A failed write to the store is handled by
@@ -1075,8 +1076,26 @@ impl<A: Application + 'static> Initiator<A> {
         // acknowledged: a connect dropped while the reset is pending leaves it
         // owed, and so does one that fails later. The ticket pays only this
         // reset: a store write that fails during the handshake owes another.
-        let reset_ticket =
-            (reset_logon && self.store.store().is_some()).then(|| self.store.owe_reset());
+        //
+        // The intent is made durable in the store before the reset is acted
+        // on (ADR-0029): a crash from here until the Logon is acknowledged
+        // leaves the store's marker set, and the next session, in this
+        // process or a restarted one, resets and declares the reset again.
+        let reset_ticket = if reset_logon && self.store.store().is_some() {
+            match self
+                .store
+                .owe_durably(&session_id, self.write_timeout)
+                .await
+            {
+                Ok(ticket) => Some(ticket),
+                Err(err) => {
+                    let _ = session.disconnect();
+                    return Err(err.into());
+                }
+            }
+        } else {
+            None
+        };
         let Seeded {
             sequences,
             persisted,
@@ -1589,7 +1608,16 @@ impl<A: Application + 'static> Initiator<A> {
                     // succeeded: a caller that drops this connect while the
                     // reset is pending runs no error branch, and the next
                     // connect must still make the reset and declare it.
-                    let ticket = self.store.owe_reset();
+                    // The intent is durable before the reset is made: a crash
+                    // before the reset lands, or before the marker is cleared,
+                    // makes the next session reset and declare it.
+                    let ticket = match self.store.owe_durably(&session_id, write_timeout).await {
+                        Ok(ticket) => ticket,
+                        Err(err) => {
+                            let _ = session.on_logon_reject();
+                            return Err(err.into());
+                        }
+                    };
                     if let Err(err) = handshake.reset_to(&session_id, 2, 2).await {
                         let _ = session.on_logon_reject();
                         return Err(err.into());
@@ -1662,10 +1690,16 @@ impl<A: Application + 'static> Initiator<A> {
         }
 
         // The Logon that declared the reset has been acknowledged: that reset
-        // is paid. A store write that failed during this handshake was owed
-        // after the ticket was taken, and stays owed.
-        if let Some(ticket) = reset_ticket {
-            self.store.reset_paid(ticket);
+        // is paid, and the store's durable marker is cleared unless something
+        // is still owed. A store write that failed during this handshake was
+        // owed after the ticket was taken, and stays owed.
+        if let Err(err) = self
+            .store
+            .settle(&session_id, reset_ticket, write_timeout)
+            .await
+        {
+            let _ = session.on_logon_reject();
+            return Err(err.into());
         }
 
         // Typestate: LogonSent -> Active.

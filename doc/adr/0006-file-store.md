@@ -227,7 +227,7 @@ inbound message numbered M, with `CloseSession`:
 | an administrative or locally rejected inbound message | Its M+1 is written like any other, so the receive cursor after a restart includes it. |
 | reset (`reset_to`), before the rename | The previous stream, complete; the leftover `.tmp` is removed at open. The engine recorded the reset as owed before awaiting it, but that record is in memory (see the unmet row). |
 | reset, after the rename | The new stream, complete, under every policy. |
-| `ResetSeqNumFlag` (141) = Y acknowledged by the counterparty, before the store reset made it durable | **Unmet.** The engine's intent to reset (its owed-reset record) is held in memory, not in the store, so a crash here forgets it, and the next process starts from the previous stream's counters while the counterparty has reset. Making the intent durable is engine work, tracked in #111. |
+| `ResetSeqNumFlag` (141) = Y acknowledged by the counterparty, before the store reset made it durable | **Met from the marker on** (ADR-0029, #111). The engine writes its intent to reset into the store's durable marker before it resets the store, and clears it after `on_logon`'s handshake step; a crash in between restarts with a reset and 141=Y at 1. A crash after the ack arrives and before the marker is durable still restarts from the previous stream's counters. |
 
 ### Recovery
 
@@ -408,5 +408,6 @@ dependency, `FileStore::sync`, `FileStore::close`, `FileStore::repair`, and
   call, a failed journal flush, a failed directory flush, flush counters) are
   private to the crate's own tests; the fsync interception #89 asks for,
   usable from `ironfix-engine` tests, is not provided here. The durable
-  owed-reset intent is #111.
+  owed-reset intent is ADR-0029 (#111): a flag in the counter slots, format
+  version 3.
 - No performance claim is made (ADR-0001).

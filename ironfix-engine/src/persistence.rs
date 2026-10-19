@@ -111,10 +111,41 @@
 //! resets its store only for a Logon that passes every check, so a refused
 //! Logon cannot clear it, whatever it declares.
 //!
-//! The record lives in the engine, in memory, not in the store: a process
-//! restart forgets it, and the next session starts from the counters the store
-//! still holds. For the same reason a store must belong to exactly one engine
-//! instance.
+//! # The owed reset is durable
+//!
+//! The record lives in the engine, and is mirrored by a durable marker in the
+//! store ([`MessageStore::set_reset_owed`], issue #111,
+//! `doc/adr/0029-durable-owed-reset.md`):
+//!
+//! - **Set before acting.** Before any reset is made (a Logon or Logon
+//!   acknowledgement that declares one, the initiator's reset for a resetting
+//!   acknowledgement, the close-time reset), the engine records the
+//!   obligation and writes the marker. For a reset made in a handshake, a
+//!   marker write that fails refuses the session whatever the policy: the
+//!   reset must not be acted on unless its intent survives a crash. The
+//!   close-time reset is made even if the marker cannot be written, since
+//!   leaving the previous stream in place is worse; the failure is logged.
+//! - **Set after a failed mutation**, as a best effort: the store just failed
+//!   and may fail this too, which is logged.
+//! - **Read at the start of every session.** A store whose marker is set
+//!   makes the session reset the store and declare `ResetSeqNumFlag` (141) =
+//!   Y at 1, in either role, exactly like a reset this engine owes.
+//! - **Cleared only once paid**: after the Logon declaring the reset is
+//!   acknowledged (initiator) or the acknowledgement declaring it is sent
+//!   (acceptor), before `on_logon`; after a close-time reset has succeeded.
+//!   It is cleared only if nothing else is owed by then. A clear that fails
+//!   leaves the reset owed, so the next session resets again: the safe
+//!   direction. In a handshake it follows the policy, closing the session
+//!   under [`StoreFailurePolicy::CloseSession`].
+//!
+//! A crash at any point from the marker write on therefore restarts with a
+//! reset. One window is left: between a resetting Logon acknowledgement
+//! arriving and the marker being durable, a crash restarts from the previous
+//! stream's counters, as if the acknowledgement had never arrived.
+//!
+//! A store that does not override the marker methods keeps no marker, and the
+//! record is then in memory only, as before #111. A store must belong to
+//! exactly one engine instance.
 //!
 //! The default [`MessageStore::reset_to`] is three calls, not one atomic
 //! write: a crash between them leaves the store cleared with its initial
@@ -344,6 +375,16 @@ impl<'s> SessionStore<'s> {
         let result = timed(self.timeout, call).await;
         if result.is_err() {
             let _ = self.owed.owe();
+            // Best effort: the store just failed, and may fail this too. The
+            // reset stays owed in memory either way, and the next session
+            // makes it.
+            if let Err(err) = sync_marker(self.owed, self.store, self.timeout).await {
+                tracing::warn!(
+                    error = %err,
+                    "cannot record the owed sequence reset in the store after a failed write: \
+                     it is owed in memory only, and a restart before the next session forgets it"
+                );
+            }
         }
         result
     }
@@ -504,13 +545,20 @@ impl<'s> SessionStore<'s> {
 /// Logon handshake that pays an owed reset, before or after the
 /// acknowledgement, therefore stays owed once that reset is paid.
 ///
-/// In memory only: a process restart forgets it (#111).
+/// The generations live in memory; what survives a restart is the store's
+/// durable marker ([`MessageStore::reset_owed`]), which [`sync_marker`] keeps
+/// in line with [`OwedReset::is_owed`] and
+/// [`StoreAttachment::reset_is_owed`] reads back (#111, ADR-0029).
 #[derive(Debug, Default)]
 pub(crate) struct OwedReset {
     /// Number of the last obligation recorded.
     recorded: AtomicU64,
     /// Number of the last obligation settled.
     settled: AtomicU64,
+    /// Serialises the marker writes, so that a clear computed before an
+    /// obligation was recorded can never land after the write recording it.
+    /// A `tokio` mutex: it is held across the store call.
+    marker: tokio::sync::Mutex<()>,
 }
 
 /// The number of the obligation a reset was started for. Paying it settles
@@ -552,14 +600,53 @@ impl OwedReset {
     pub(crate) fn pay(&self, ticket: ResetTicket) {
         self.settled.fetch_max(ticket.0, Ordering::AcqRel);
     }
+
+    /// Records an obligation unless one is already unsettled: a reset the
+    /// store's durable marker says an earlier process owed.
+    fn recover(&self) {
+        if !self.is_owed() {
+            let _ = self.owe();
+        }
+    }
+}
+
+/// Brings the store's durable owed-reset marker in line with `owed`: sets it
+/// while a reset is owed, clears it once every obligation is settled, and
+/// writes nothing when the store already says so.
+///
+/// Called before every reset the engine makes (the marker must be durable
+/// before the reset is acted on), after a reset is paid, and after a store
+/// mutation fails. The writes are serialised, and each one writes the state
+/// of the record when it runs, so the last one to land always reflects the
+/// latest obligation. A failed clear records an obligation again: the marker
+/// may still be set, and the record must never say less than the store.
+///
+/// # Errors
+/// The store's error, or [`StoreError::Timeout`].
+pub(crate) async fn sync_marker(
+    owed: &OwedReset,
+    store: &dyn MessageStore,
+    timeout: Duration,
+) -> Result<(), StoreError> {
+    let _serial = owed.marker.lock().await;
+    let desired = owed.is_owed();
+    if store.reset_owed() == desired {
+        return Ok(());
+    }
+    let result = timed(timeout, store.set_reset_owed(desired)).await;
+    if result.is_err() && !desired {
+        let _ = owed.owe();
+    }
+    result
 }
 
 /// A store attached to an engine, with its failure policy, the bound on each
 /// call and the owed-reset record.
 ///
 /// Both engines hold one, so the store settings and the inputs to
-/// [`seed_session`] cannot drift between the roles. The owed-reset record is in
-/// memory only: a process restart forgets it (see the module documentation).
+/// [`seed_session`] cannot drift between the roles. The owed-reset record is
+/// mirrored by the store's durable marker, so a restart over the same store
+/// still finds it (see the module documentation).
 #[derive(Default)]
 pub(crate) struct StoreAttachment {
     /// The attached store, if any.
@@ -619,10 +706,97 @@ impl StoreAttachment {
         self.timeout.unwrap_or(write_timeout)
     }
 
-    /// Whether a store is attached and a reset is owed.
+    /// Whether a store is attached and a reset is owed: by this engine, or
+    /// by an earlier one whose intent the store's durable marker carries. A
+    /// marker found set is taken into the in-memory record, so it is cleared
+    /// only once a reset made after it is paid.
     #[must_use]
     pub(crate) fn reset_is_owed(&self) -> bool {
-        self.store.is_some() && self.reset_owed.is_owed()
+        let Some(store) = self.store.as_deref() else {
+            return false;
+        };
+        if store.reset_owed() {
+            self.reset_owed.recover();
+        }
+        self.reset_owed.is_owed()
+    }
+
+    /// Makes the store's durable marker match the owed-reset record (see
+    /// [`sync_marker`]); nothing to do without a store.
+    ///
+    /// # Errors
+    /// The store's error, or [`StoreError::Timeout`].
+    pub(crate) async fn sync_marker(&self, write_timeout: Duration) -> Result<(), StoreError> {
+        match self.store.as_deref() {
+            Some(store) => sync_marker(&self.reset_owed, store, self.timeout(write_timeout)).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Records the reset `ticket` was taken for as made and declared, then
+    /// clears the store's durable marker if nothing else is owed.
+    ///
+    /// A clear that fails leaves the reset owed (the marker may still be
+    /// set), so the next session resets again: the safe direction. Under
+    /// [`StoreFailurePolicy::CloseSession`] the failure is returned, as for
+    /// every failed write; under [`StoreFailurePolicy::Continue`] it is
+    /// logged.
+    ///
+    /// # Errors
+    /// The store's error under [`StoreFailurePolicy::CloseSession`].
+    pub(crate) async fn settle(
+        &self,
+        session_id: &SessionId,
+        ticket: Option<ResetTicket>,
+        write_timeout: Duration,
+    ) -> Result<(), StoreError> {
+        if let Some(ticket) = ticket {
+            self.reset_paid(ticket);
+        }
+        match self.sync_marker(write_timeout).await {
+            Ok(()) => Ok(()),
+            Err(err) if self.policy.closes_session() => {
+                tracing::error!(
+                    session = %session_id,
+                    error = %err,
+                    "cannot clear the owed-reset marker under the fail-closed policy: the \
+                     session is refused, and the next one resets again"
+                );
+                Err(err)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    session = %session_id,
+                    error = %err,
+                    "cannot clear the owed-reset marker: the next session resets again"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Records that a reset is owed and makes the store's durable marker say
+    /// so, before the reset is attempted. Returns the ticket that pays it.
+    ///
+    /// # Errors
+    /// The store's error, or [`StoreError::Timeout`], whatever the policy:
+    /// the reset must not be acted on unless its intent survives a crash.
+    /// The reset stays owed in memory.
+    pub(crate) async fn owe_durably(
+        &self,
+        session_id: &SessionId,
+        write_timeout: Duration,
+    ) -> Result<ResetTicket, StoreError> {
+        let ticket = self.owe_reset();
+        self.sync_marker(write_timeout).await.inspect_err(|err| {
+            tracing::error!(
+                session = %session_id,
+                error = %err,
+                "cannot record the owed sequence reset in the store: refusing the session \
+                 rather than resetting with an intent a crash could lose"
+            );
+        })?;
+        Ok(ticket)
     }
 
     /// Records that a reset is owed, before it is attempted, and returns the
