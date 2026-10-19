@@ -679,8 +679,13 @@ impl OutboundMessage {
                 OutboundField::Raw { .. } | OutboundField::Data { .. } => return true,
             };
             keep_spare(spare, std::mem::take(value));
-            // At most `usize::MAX` fields exist, so this never stops counting.
-            removed = removed.saturating_add(1);
+            // A Vec holds fewer than `usize::MAX` fields, so the count of
+            // those removed cannot overflow. Were it ever to, it stays at
+            // the last value it reached rather than wrap.
+            match removed.checked_add(1) {
+                Some(next) => removed = next,
+                None => debug_assert!(false, "removed more fields than a Vec can hold"),
+            }
             false
         });
         removed
