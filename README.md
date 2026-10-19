@@ -221,8 +221,10 @@ engine wiring (#96) does not exist.
   `to_app` is unchanged, and costs no allocation beyond `to_app`'s own. An
   override returns a `SendVerdict`: `SendVerdict::ready` for a decision
   taken at once (no allocation), `SendVerdict::new` for one that must wait.
-  A replay of a filed frame is resent as filed and is
-  not gated (see below). Administrative messages (Logon, Logout, Heartbeat,
+  A replay of a filed application frame goes through
+  `Application::to_app_resend` instead: the default resends it as filed, and
+  a veto gap-fills it, consecutive vetoes in one gap fill, as QuickFIX does
+  with `DoNotSend` on a resend. Administrative messages (Logon, Logout, Heartbeat,
   TestRequest, ResendRequest, SequenceReset, Reject, XmlMessage) go through
   `to_admin` and cannot be vetoed. `Connection::send_tracked` reports each
   message's fate as a `SendOutcome`: `Sent` with the `MsgSeqNum` and
@@ -388,13 +390,6 @@ This list is deliberately explicit. If a capability is not named under "What
 works today" and appears below, it does not exist in the code — do not plan
 around it.
 
-- **Replays are not gated by `to_app_checked`.** The answer to a
-  `ResendRequest`, and the resend a counterparty's `NextExpectedMsgSeqNum`
-  (789) asks for, write each filed application frame as it was filed, with
-  `PossDupFlag = Y`, without calling the outbound gate. QuickFIX calls
-  `toApp` on each resent application message and gap-fills one that throws
-  `DoNotSend`; IronFix does not yet, so a gate cannot stop a stale order from
-  being resent.
 - **Throttle limits.** Replays and administrative messages take no token, so
   a venue that counts them against its limit can see a large resend, or the
   heartbeats, on top of the budget. A budget's state does not outlive its

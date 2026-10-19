@@ -209,19 +209,20 @@
 //! heartbeats and timeout detection for as long as the call takes. Each call is
 //! bounded by the store timeout, and an overrun is a failed write under the
 //! [`StoreFailurePolicy`]. `to_admin`, `to_app_checked` (and through it
-//! `to_app`) and `from_admin` also run inline.
+//! `to_app`), `to_app_resend` and `from_admin` also run inline.
 //!
 //! # The outbound gate and send outcomes
 //!
 //! Every **new** outbound application message goes through
 //! [`Application::to_app_checked`] when it is about to be framed, before a
 //! sequence number is peeked and before the store is touched, so a veto
-//! spends nothing and files nothing. A replay is not gated: the answer to a
-//! `ResendRequest` and the `NextExpectedMsgSeqNum` (789) resend write the
-//! filed frame as it was filed, without the callback, where QuickFIX calls
-//! `toApp` on each resent application message and gap-fills one that throws
-//! `DoNotSend`. Administrative messages go through `to_admin`, which cannot
-//! refuse them.
+//! spends nothing and files nothing. A replay goes through
+//! [`Application::to_app_resend`] instead: the answer to a `ResendRequest`
+//! and the `NextExpectedMsgSeqNum` (789) resend ask it about each rebuilt
+//! application frame, resend it unchanged when allowed, and gap-fill it when
+//! vetoed, a run of vetoes and the admin messages and holes next to it being
+//! one gap fill (ADR-0023, "Replay gate"). Administrative messages go
+//! through `to_admin`, which cannot refuse them, and are never gated.
 //!
 //! A message handed in with
 //! [`Connection::send_tracked`](crate::Connection::send_tracked) carries a
@@ -5436,6 +5437,13 @@ impl<A: Application> Reactor<A> {
                         continue;
                     }
                 };
+                // The replay gate (ADR-0023): a vetoed message is not
+                // resent, and its number joins the gap fill fed before the
+                // next replayed message, or the trailing one, so a run of
+                // vetoes is one fill.
+                if !self.replay_allowed(seq, &frame).await {
+                    continue;
+                }
                 // Everything between the cursor and this message (holes,
                 // admin messages, frames that would not rebuild) is one fill,
                 // fed first; the message follows on the next call.
@@ -5469,6 +5477,39 @@ impl<A: Application> Reactor<A> {
                 job.reply_cursor = job.new_seq;
             }
             return Ok(ResendProgress::Done);
+        }
+    }
+
+    /// Asks [`Application::to_app_resend`] whether the rebuilt replay
+    /// `frame` of `seq` may be resent. A rebuilt frame that does not decode
+    /// (which `wire::resend_frame` should never produce) cannot be shown to
+    /// the gate, so it is gap-filled rather than let past it. A veto is
+    /// logged with the reason's code only, never the frame, which may carry
+    /// credentials.
+    async fn replay_allowed(&self, seq: u64, frame: &[u8]) -> bool {
+        let raw = match wire::decode_frame(frame) {
+            Ok(raw) => raw,
+            Err(err) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    seq,
+                    error = %err,
+                    "rebuilt resend frame does not decode for the replay gate: gap-filling it"
+                );
+                return false;
+            }
+        };
+        match self.application.to_app_resend(&raw, &self.session_id).await {
+            Ok(()) => true,
+            Err(reason) => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    seq,
+                    code = reason.code,
+                    "replayed application message vetoed by to_app_resend; gap-filling it"
+                );
+                false
+            }
         }
     }
 

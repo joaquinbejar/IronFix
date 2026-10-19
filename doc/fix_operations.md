@@ -1199,13 +1199,16 @@ is never filed, and leaves no gap, so the next message takes the number it
 would have had. The session carries on. Because the gate runs at write time,
 a message waiting behind a resend is checked once the resend is done.
 
-**Replays are not gated.** The answer to a `ResendRequest` and the
-`NextExpectedMsgSeqNum` (789) resend write each filed application frame as it
-was filed, with `PossDupFlag` (43) = Y and its original `SendingTime` in
-`OrigSendingTime` (122), without calling `to_app_checked`. QuickFIX calls
-`toApp` on each resent application message and gap-fills one that throws
-`DoNotSend`; IronFix does not yet, so a gate cannot stop a stale order from
-being resent. This is a known gap, tracked as a follow-up.
+**Replays have their own gate.** The answer to a `ResendRequest` and the
+`NextExpectedMsgSeqNum` (789) resend rebuild each filed application frame
+with `PossDupFlag` (43) = Y and its original `SendingTime` in
+`OrigSendingTime` (122), then ask `Application::to_app_resend` about it,
+read-only. Allowed (the default), it is resent unchanged. Vetoed, it is
+gap-filled with a SequenceReset-GapFill (123 = Y) instead, as QuickFIX does
+for a resent message whose `toApp` throws `DoNotSend`; consecutive vetoes,
+with the administrative messages and holes next to them, are one gap fill.
+`to_app_checked` is never called for a replay, and administrative messages
+are gap-filled on a resend without being gated (issue #133).
 
 **Administrative messages cannot be vetoed.** Logon, Logout, Heartbeat
 (including the reply to a TestRequest), TestRequest, ResendRequest,
@@ -2242,8 +2245,9 @@ ADR-0011.
   rather than stalling the session forever. See "Resend Request" above.
 - [x] Outbound veto and send outcomes (engine, both roles):
   `Application::to_app_checked` can refuse a new outbound application
-  message before a `MsgSeqNum` is spent or the store is touched; a replay is
-  not gated (unlike QuickFIX); administrative messages cannot be vetoed;
+  message before a `MsgSeqNum` is spent or the store is touched; a replay
+  goes through `Application::to_app_resend`, whose veto gap-fills it (as in
+  QuickFIX); administrative messages cannot be vetoed;
   `Connection::send_tracked` reports `Sent`, `NotSent` or `Unknown` per
   message. See "Outbound application messages: veto and send outcomes"
   above.
