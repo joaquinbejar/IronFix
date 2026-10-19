@@ -230,3 +230,146 @@ fn duplicate_negotiate_does_not_keep_sending_after_reject() {
         server.send_application(now)
     );
 }
+
+/// Replays a whole request, numbering each message, and returns the numbers.
+fn replay_all(client: &mut FixpClient, now: Instant, request: &RetransmitRequest) -> Vec<u64> {
+    client.handle_message(
+        &SessionMessage::Retransmission(Retransmission {
+            session_id: ID,
+            request_timestamp: request.timestamp,
+            next_seq_no: request.from_seq_no,
+            count: request.count,
+        }),
+        now,
+    );
+    (0..request.count)
+        .map(|_| match client.on_application_message(now) {
+            Delivery::Accept {
+                seq: Some(seq),
+                retransmitted: true,
+            } => seq.value(),
+            other => panic!("a retransmitted message, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn reconnects_keep_one_overflow_gap_and_lose_no_number() {
+    let now = Instant::now();
+    let cfg = FixpConfig::builder()
+        .max_pending_gaps(NonZeroUsize::new(1).expect("one"))
+        .build()
+        .expect("config");
+    let mut client = client(now, cfg);
+    // 32 cycles: one number missed, the next received, a reconnect whenever
+    // the refused gap terminated the binding.
+    for missing in (1..64).step_by(2) {
+        let next = missing + 1;
+        seq(&mut client, now, next);
+        drain(&mut client);
+        if client.status() == SessionStatus::Negotiated {
+            client.on_transport_closed();
+            drain(&mut client);
+            establish(&mut client, now, next);
+            drain(&mut client);
+        }
+        assert_eq!(client.status(), SessionStatus::Established);
+        assert_eq!(
+            client.on_application_message(now),
+            Delivery::Accept {
+                seq: Some(SeqNum::new(next)),
+                retransmitted: false,
+            }
+        );
+        drain(&mut client);
+    }
+    client.on_transport_closed();
+    drain(&mut client);
+    establish(&mut client, now, 65);
+    let mut pending = requests(drain(&mut client)).into_iter().next();
+    let mut gaps = Vec::new();
+    let mut recovered = std::collections::BTreeSet::new();
+    while let Some(request) = pending {
+        gaps.push(request.from_seq_no);
+        recovered.extend(replay_all(&mut client, now, &request));
+        pending = requests(drain(&mut client)).into_iter().next();
+    }
+    assert!(!client.has_pending_recovery());
+    assert!(
+        gaps.len() <= 2,
+        "max_pending_gaps=1 plus one overflow slot, got {} gaps: {gaps:?}",
+        gaps.len()
+    );
+    for missing in (1..64).step_by(2) {
+        assert!(recovered.contains(&missing), "sequence {missing} was lost");
+    }
+}
+
+fn repeated_negotiate_before_bound_closes(pending_establish: bool) {
+    let now = Instant::now();
+    let mut server = FixpServer::new(
+        FixpConfig::default(),
+        ClockAnchor::new(now, Timestamp::EPOCH),
+        now,
+    );
+    let negotiate = SessionMessage::Negotiate(Negotiate {
+        session_id: ID,
+        timestamp: Nanotime::from_nanos(1),
+        client_flow: FlowType::Recoverable,
+        credentials: None,
+    });
+    server.handle_message(&negotiate, now);
+    server
+        .accept_negotiation(FlowType::Recoverable, None, now)
+        .expect("accept negotiation");
+    while server.poll_output().is_some() {}
+    let establish = SessionMessage::Establish(Establish {
+        session_id: ID,
+        timestamp: Nanotime::from_nanos(2),
+        keepalive_interval: 5000,
+        next_seq_no: Some(1),
+        credentials: None,
+    });
+    if pending_establish {
+        server.handle_message(&establish, now);
+        assert_eq!(server.status(), SessionStatus::EstablishPending);
+    } else {
+        assert_eq!(server.status(), SessionStatus::Negotiated);
+    }
+    while server.poll_output().is_some() {}
+    server.handle_message(&negotiate, now);
+    let outputs: Vec<_> = std::iter::from_fn(|| server.poll_output()).collect();
+    assert!(
+        outputs
+            .iter()
+            .any(|o| matches!(o, Output::Send(SessionMessage::NegotiationReject(_)))),
+        "pending_establish={pending_establish}: {outputs:?}"
+    );
+    assert!(
+        outputs.iter().any(|o| matches!(o, Output::CloseTransport)),
+        "pending_establish={pending_establish}: {outputs:?}"
+    );
+    // The closed transport carries nothing more: no EstablishmentAck.
+    if !pending_establish {
+        server.handle_message(&establish, now);
+    }
+    let _ = server.accept_establishment(now);
+    let later: Vec<_> = std::iter::from_fn(|| server.poll_output()).collect();
+    assert!(
+        !later
+            .iter()
+            .any(|o| matches!(o, Output::Send(SessionMessage::EstablishmentAck(_)))),
+        "pending_establish={pending_establish}: {later:?}"
+    );
+    assert_ne!(server.status(), SessionStatus::Established);
+}
+
+#[test]
+fn repeated_negotiate_in_negotiated_closes() {
+    repeated_negotiate_before_bound_closes(false);
+}
+
+#[test]
+fn repeated_negotiate_in_establish_pending_closes() {
+    repeated_negotiate_before_bound_closes(true);
+}

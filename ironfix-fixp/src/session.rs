@@ -793,10 +793,7 @@ impl Session {
                     // queue is over its bound), and after re-establishment
                     // it is requested once the gaps before it are recovered.
                     // Dropping it would lose `expected..next` for good.
-                    self.missing.push_back(Gap {
-                        from: expected,
-                        end: next,
-                    });
+                    self.hold_refused_gap(core.config(), expected, next);
                     return self.violation(core, binding, "too many unrecovered sequence gaps");
                 }
                 self.request_missing(core, binding, now)
@@ -831,6 +828,21 @@ impl Session {
         }
         self.missing.push_back(Gap { from, end });
         true
+    }
+
+    /// Keeps a gap `record_gap` refused, so it is still recovered later,
+    /// in at most one slot above `max_pending_gaps` in total. The first
+    /// refused gap takes that slot; a later one widens it to reach `end`.
+    /// Widening covers numbers already received between the two gaps too,
+    /// which then arrive again as retransmitted messages: more than was
+    /// missing is requested, never less, and the gap list stays bounded
+    /// across any number of reconnects.
+    fn hold_refused_gap(&mut self, config: &FixpConfig, from: u64, end: u64) {
+        let overflowing = self.missing.len() > config.max_pending_gaps().get();
+        match self.missing.back_mut() {
+            Some(last) if overflowing => last.end = last.end.max(end),
+            _ => self.missing.push_back(Gap { from, end }),
+        }
     }
 
     /// Marks the first `count` sequence numbers of the first gap recovered

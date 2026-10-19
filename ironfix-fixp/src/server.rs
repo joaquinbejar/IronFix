@@ -770,9 +770,14 @@ impl FixpServer {
             ServerState::NegotiationPending { .. } => {
                 self.violation(state, "Negotiate while a Negotiate is pending")
             }
+            // Section 4.2.3: a Negotiate after the first, in any state, is
+            // refused, and the transport is closed: it is not left usable.
             ServerState::Negotiated { session, deadline } => {
                 self.refuse_renegotiation(&session, m);
-                ServerState::Negotiated { session, deadline }
+                self.violation(
+                    ServerState::Negotiated { session, deadline },
+                    "Negotiate on a negotiated session",
+                )
             }
             ServerState::EstablishPending {
                 session,
@@ -782,13 +787,16 @@ impl FixpServer {
                 deadline,
             } => {
                 self.refuse_renegotiation(&session, m);
-                ServerState::EstablishPending {
-                    session,
-                    request,
-                    keepalive,
-                    next_seq_no,
-                    deadline,
-                }
+                self.violation(
+                    ServerState::EstablishPending {
+                        session,
+                        request,
+                        keepalive,
+                        next_seq_no,
+                        deadline,
+                    },
+                    "Negotiate on a negotiated session",
+                )
             }
             ServerState::Bound { session, binding } => {
                 if binding.status() == SessionStatus::Established {
