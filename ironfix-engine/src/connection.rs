@@ -184,7 +184,9 @@ impl Connection {
     /// [`Application::to_app`](crate::Application::to_app) call. An
     /// application whose `to_app_checked` decides at once
     /// ([`SendVerdict::ready`](crate::SendVerdict::ready)) and calls no
-    /// `to_app` avoids it. A store adds its own (see
+    /// `to_app` avoids it. The command queue the message travels
+    /// (`tokio::sync::mpsc`) still allocates about one block per 128 sends as
+    /// it grows, so a send is not yet allocation-free. A store adds its own (see
     /// `doc/adr/0008-pooled-outbound-messages.md`).
     ///
     /// # Bounds

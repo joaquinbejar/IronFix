@@ -57,9 +57,12 @@ for 20 bytes, so no intermediate `String`. On a message with no spare buffer
 before. `push_raw` and `push_data` take an owned `Vec` the caller allocated,
 so they keep their cost. `clear` hands the buffers back last field first, so
 a body refilled with the same layout takes each field's own buffer back and
-never regrows one; the first version kept them in field order and a throttled
-window showed buffers rotating across fields and regrowing. `remove` keeps the
-removed buffers too.
+never regrows one (the first version handed them back in field order, and a
+throttled window showed buffers rotating across fields and regrowing). A
+reused buffer grows with `reserve_exact`, to exactly the value's size:
+doubling could take a buffer past `POOLED_MAX_VALUE_BYTES` for a value under
+it, and the buffer would then be freed and allocated again on every reuse.
+`remove` is one linear pass (`retain_mut`) that keeps the removed buffers.
 
 **Bounds.** The pool keeps at most as many idle messages as the session's
 outbound queue holds (`with_outbound_capacity`, default 1024): with a plain
@@ -85,21 +88,30 @@ timing is claimed):
 | pooled orders, default `to_app_checked` | 1032 | 1 |
 | pooled orders through the throttle | 1032 | 1 |
 | pooled orders with a frame observer | 1032 | 1 |
-| pooled orders, `to_app_checked` returning `SendVerdict::ready` | 8 | 0 |
+| pooled orders, `to_app_checked` returning `SendVerdict::ready` | 8 | about 1/128 |
 
-The windows allow up to 64 non-recurring blocks.
+The windows allow up to 64 non-recurring blocks, except the ready-gate
+window, which allows the command queue's rate plus 4: 64 would hide a cost
+that recurs every 128 sends.
 
 - **The `to_app` future.** `Application` is an `#[async_trait]` trait, so
   every `to_app` call boxes its future. The default `to_app_checked` forwards
   to `to_app` through `SendVerdict::forward`, which keeps the default path at
   that one allocation and adds none (ADR-0023). An application whose
   `to_app_checked` decides at once with `SendVerdict::ready` and calls no
-  `to_app` allocates nothing per send, message included. Removing the box
+  `to_app` avoids that block. Removing the box
   for everyone means changing the trait's shape, a breaking change, and is
   not done here.
+- **The command queue.** Every send crosses the `tokio::sync::mpsc`
+  command channel, which grows its slot list by one block about every 128
+  sends (scaled to 4096 messages, the ready-gate window costs 32 blocks, all
+  from that channel's block growth). It is tokio's internals; this change
+  does not alter them. So even through a ready gate the send path is **not
+  yet zero allocation**: it is about one block per 128 sends, and a fully
+  allocation-free send stays open.
 - **A store.** With a `MemoryStore` attached a send costs five blocks
-  (`STORED_LIVE_BLOCKS` in the test): the `file_outbound` future, the
-  `store` and `set_next_sender_seq` futures of the `#[async_trait]`
+  (`STORED_LIVE_BLOCKS` in the test): the `to_app` future above, the
+  `file_outbound` future, the `store` and `set_next_sender_seq` futures of the `#[async_trait]`
   `MessageStore`, and the store's own copy of the frame (`MemoryStore` copies
   the frame into `Bytes`; it is a copy, not a reference counted slice of the
   write buffer, since that buffer is reused), plus its B-tree nodes. The pool

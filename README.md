@@ -263,7 +263,9 @@ engine wiring (#96) does not exist.
   still allocates is stated, not hidden: one boxed future per message for
   the `#[async_trait]` `to_app` call made by the default `to_app_checked`
   (an application whose `to_app_checked` decides at once with
-  `SendVerdict::ready` avoids it), and a store's own allocations. These are
+  `SendVerdict::ready` avoids it), about one block per 128 sends as the
+  `tokio::sync::mpsc` command queue grows (so a send is not yet zero
+  allocation), and a store's own allocations. These are
   block counts from `ironfix-engine/tests/allocations.rs` (dhat), not
   timings (`doc/adr/0008-pooled-outbound-messages.md`).
 - **`NextExpectedMsgSeqNum` (789) on Logon**, opt-in with

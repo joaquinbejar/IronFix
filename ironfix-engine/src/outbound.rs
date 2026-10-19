@@ -323,6 +323,15 @@ impl Drop for OutboundMessage {
     }
 }
 
+/// Keeps an emptied value buffer in `spare` for reuse, within the pooled
+/// bounds, and frees it otherwise.
+fn keep_spare(spare: &mut Vec<Vec<u8>>, mut value: Vec<u8>) {
+    if spare.len() < POOLED_MAX_SPARE && value.capacity() <= POOLED_MAX_VALUE_BYTES {
+        value.clear();
+        spare.push(value);
+    }
+}
+
 /// A session's bounded pool of idle [`OutboundMessage`]s, behind
 /// [`Connection::acquire`](crate::Connection::acquire).
 ///
@@ -464,10 +473,14 @@ impl OutboundMessage {
 
     /// A value buffer with room for `len` bytes: an emptied spare one when
     /// there is one, a new one otherwise.
+    ///
+    /// A spare buffer grows to exactly `len`, never by doubling: a doubled
+    /// buffer could pass [`POOLED_MAX_VALUE_BYTES`] for a value that fits it,
+    /// be freed when recycled, and be allocated again on every reuse.
     fn buffer(&mut self, len: usize) -> Vec<u8> {
         match self.spare.pop() {
             Some(mut buffer) => {
-                buffer.reserve(len);
+                buffer.reserve_exact(len);
                 buffer
             }
             None => Vec::with_capacity(len),
@@ -477,11 +490,8 @@ impl OutboundMessage {
     /// Keeps the emptied value buffer of a field taken out of the body, within
     /// the pooled bounds, and frees it otherwise.
     fn recycle(&mut self, field: OutboundField) {
-        let (OutboundField::Raw { mut value, .. } | OutboundField::Data { mut value, .. }) = field;
-        if self.spare.len() < POOLED_MAX_SPARE && value.capacity() <= POOLED_MAX_VALUE_BYTES {
-            value.clear();
-            self.spare.push(value);
-        }
+        let (OutboundField::Raw { value, .. } | OutboundField::Data { value, .. }) = field;
+        keep_spare(&mut self.spare, value);
     }
 
     /// Removes every body field, keeping the field list's room and, within
@@ -650,27 +660,29 @@ impl OutboundMessage {
     /// # Arguments
     /// * `tag` - The field tag number
     pub fn remove(&mut self, tag: u32) -> usize {
-        let mut fields = std::mem::take(&mut self.fields);
-        let mut removed = 0;
-        let mut index = 0;
-        while index < fields.len() {
-            let matches = fields.get(index).is_some_and(|field| match field {
-                OutboundField::Raw { tag: field_tag, .. } => *field_tag == tag,
+        // One linear pass that keeps the order of the fields left; a removed
+        // field's buffer is moved out (leaving an empty, unallocated `Vec`)
+        // and kept for the next push.
+        let spare = &mut self.spare;
+        let mut removed: usize = 0;
+        self.fields.retain_mut(|field| {
+            let value = match field {
+                OutboundField::Raw {
+                    tag: field_tag,
+                    value,
+                } if *field_tag == tag => value,
                 OutboundField::Data {
                     length_tag,
                     data_tag,
-                    ..
-                } => *length_tag == tag || *data_tag == tag,
-            });
-            if matches {
-                let field = fields.remove(index);
-                self.recycle(field);
-                removed += 1;
-            } else {
-                index += 1;
-            }
-        }
-        self.fields = fields;
+                    value,
+                } if *length_tag == tag || *data_tag == tag => value,
+                OutboundField::Raw { .. } | OutboundField::Data { .. } => return true,
+            };
+            keep_spare(spare, std::mem::take(value));
+            // At most `usize::MAX` fields exist, so this never stops counting.
+            removed = removed.saturating_add(1);
+            false
+        });
         removed
     }
 
@@ -1080,6 +1092,67 @@ mod tests {
         message.push_str(58, "again");
         assert_eq!(value_ptr(&message, 0), ptr);
         assert_eq!(message.get(58), Some(&b"again"[..]));
+    }
+
+    #[test]
+    fn test_pool_alternating_value_sizes_reach_a_steady_state() {
+        // A buffer grown by doubling from 600 to 1200 bytes would pass the
+        // 1024-byte cap for a 1000-byte value and be freed on every cycle.
+        let pool = OutboundPool::new(1);
+        let small = vec![b's'; 600];
+        let large = vec![b'l'; 1000];
+        let mut steady = None;
+        for cycle in 0..200 {
+            let value = if cycle % 2 == 0 { &small } else { &large };
+            let mut message = pool.acquire(MsgType::NewOrderSingle);
+            message.push_bytes(58, value);
+            assert_eq!(message.get(58), Some(value.as_slice()));
+            let ptr = value_ptr(&message, 0);
+            drop(message);
+            assert_eq!(pool.idle(), 1);
+            let kept = pool.acquire(MsgType::NewOrderSingle);
+            assert_eq!(kept.spare.len(), 1, "cycle {cycle}: the buffer was freed");
+            drop(kept);
+            if cycle >= 2 {
+                // Once a 1000-byte value has been seen, the same buffer serves
+                // every cycle: no allocation.
+                assert_eq!(*steady.get_or_insert(ptr), ptr, "cycle {cycle} reallocated");
+            }
+        }
+    }
+
+    #[test]
+    fn test_remove_many_matches_keeps_order_and_buffers() {
+        let mut message = OutboundMessage::new(MsgType::NewOrderSingle);
+        for index in 0..10_000_u64 {
+            if index % 2 == 0 {
+                message.push_str(58, "drop");
+            } else {
+                message.push_uint(9000, index);
+            }
+        }
+        message.push_data(95, 96, b"a\x01b".to_vec());
+        assert_eq!(message.remove(58), 5_000);
+        assert_eq!(message.fields().len(), 5_001);
+        for (position, field) in message.fields().iter().take(5_000).enumerate() {
+            let expected = (2 * position + 1).to_string();
+            assert_eq!(
+                field,
+                &OutboundField::Raw {
+                    tag: 9000,
+                    value: expected.into_bytes()
+                }
+            );
+        }
+        assert_eq!(
+            message.spare.len(),
+            POOLED_MAX_SPARE,
+            "removed buffers are kept, bounded"
+        );
+        // Either half of a counted pair removes the pair.
+        assert_eq!(message.remove(95), 1);
+        assert_eq!(message.get(96), None);
+        assert_eq!(message.remove(58), 0);
     }
 
     #[test]
