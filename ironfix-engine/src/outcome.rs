@@ -450,52 +450,64 @@ impl Receipt {
     /// store is touched, a refusal, or a number spent out of turn) and what
     /// the write raises.
     pub(crate) fn fail(self, error: &EngineError) {
-        let seq = self.stage.seq();
-        let outcome = match error {
-            // Checked before the store is touched: nothing filed or spent.
-            EngineError::SequenceExhausted(_) => {
-                SendOutcome::not_sent(NotSentReason::SequenceExhausted)
-            }
-            // The store refused under the fail-closed policy: nothing was
-            // written or spent, whatever the store now holds.
-            EngineError::Store(_) => SendOutcome::not_sent(NotSentReason::StoreRefused {
-                state_unknown: true,
-            }),
-            // Raised after the frame was filed and a number spent.
-            EngineError::Sequence(_) => stopped(seq, UnknownReason::Interrupted),
-            // Raised by the write.
-            EngineError::WriteTimeout(_) => stopped(seq, UnknownReason::WriteTimeout),
-            EngineError::Codec(_) | EngineError::Io(_) => stopped(seq, UnknownReason::Transport),
-            // Never raised between numbering a frame and writing it: they
-            // belong to the handshakes, the builders and the caller's checks.
-            EngineError::Decode(_)
-            | EngineError::Encode(_)
-            | EngineError::Config(_)
-            | EngineError::ConnectTimeout(_)
-            | EngineError::LogonTimeout(_)
-            | EngineError::LogonRejected { .. }
-            | EngineError::HeartbeatInterval { .. }
-            | EngineError::ApplVersion { .. }
-            | EngineError::NextExpectedMsgSeqNum { .. }
-            | EngineError::UnexpectedMessage { .. }
-            | EngineError::InvalidInitialSequence { .. }
-            | EngineError::InitialSequenceBelowStore { .. }
-            | EngineError::IdentityMismatch { .. }
-            | EngineError::UnroutableLogon { .. }
-            | EngineError::UnknownSession { .. }
-            | EngineError::SessionLimit { .. }
-            | EngineError::Lookup(_)
-            | EngineError::BeginStringMismatch { .. }
-            | EngineError::SendingTime { .. }
-            | EngineError::UnsupportedVersion { .. }
-            | EngineError::ReservedMsgType { .. }
-            | EngineError::ReservedTag { .. }
-            | EngineError::InvalidField { .. }
-            | EngineError::MissingRequiredField { .. }
-            | EngineError::Closed
-            | EngineError::Configuration(_) => stopped(seq, UnknownReason::Interrupted),
-        };
+        let outcome = failed(self.stage.seq(), error);
         self.resolve(outcome);
+    }
+}
+
+/// The outcome of a frame that `error` stopped on its way to the stream,
+/// numbered `seq` once it was being filed or written: what
+/// [`Receipt::fail`] resolves, and what a frame observer is told for a send
+/// with no receipt.
+///
+/// Every variant is named, so a new one has to be placed here. Only the
+/// first group can stop a frame: what the store step raises (before the
+/// store is touched, a refusal, or a number spent out of turn) and what the
+/// write raises.
+pub(crate) fn failed(seq: Option<u64>, error: &EngineError) -> SendOutcome {
+    match error {
+        // Checked before the store is touched: nothing filed or spent.
+        EngineError::SequenceExhausted(_) => {
+            SendOutcome::not_sent(NotSentReason::SequenceExhausted)
+        }
+        // The store refused under the fail-closed policy: nothing was
+        // written or spent, whatever the store now holds.
+        EngineError::Store(_) => SendOutcome::not_sent(NotSentReason::StoreRefused {
+            state_unknown: true,
+        }),
+        // Raised after the frame was filed and a number spent.
+        EngineError::Sequence(_) => stopped(seq, UnknownReason::Interrupted),
+        // Raised by the write.
+        EngineError::WriteTimeout(_) => stopped(seq, UnknownReason::WriteTimeout),
+        EngineError::Codec(_) | EngineError::Io(_) => stopped(seq, UnknownReason::Transport),
+        // Never raised between numbering a frame and writing it: they
+        // belong to the handshakes, the builders and the caller's checks.
+        EngineError::Decode(_)
+        | EngineError::Encode(_)
+        | EngineError::Config(_)
+        | EngineError::ConnectTimeout(_)
+        | EngineError::LogonTimeout(_)
+        | EngineError::LogonRejected { .. }
+        | EngineError::HeartbeatInterval { .. }
+        | EngineError::ApplVersion { .. }
+        | EngineError::NextExpectedMsgSeqNum { .. }
+        | EngineError::UnexpectedMessage { .. }
+        | EngineError::InvalidInitialSequence { .. }
+        | EngineError::InitialSequenceBelowStore { .. }
+        | EngineError::IdentityMismatch { .. }
+        | EngineError::UnroutableLogon { .. }
+        | EngineError::UnknownSession { .. }
+        | EngineError::SessionLimit { .. }
+        | EngineError::Lookup(_)
+        | EngineError::BeginStringMismatch { .. }
+        | EngineError::SendingTime { .. }
+        | EngineError::UnsupportedVersion { .. }
+        | EngineError::ReservedMsgType { .. }
+        | EngineError::ReservedTag { .. }
+        | EngineError::InvalidField { .. }
+        | EngineError::MissingRequiredField { .. }
+        | EngineError::Closed
+        | EngineError::Configuration(_) => stopped(seq, UnknownReason::Interrupted),
     }
 }
 

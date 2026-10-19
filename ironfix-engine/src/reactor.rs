@@ -241,6 +241,7 @@ use crate::close::{CloseReason, LogoutCause, bounded_peer_text};
 use crate::connection::{Command, SessionRuntime};
 use crate::error::EngineError;
 use crate::garbled::{GarbledFrameWindow, GarbledVerdict};
+use crate::observer::{Capture, FrameKind, OutboundResult};
 use crate::outbound;
 use crate::outcome::{self, NotSentReason, Receipt, SendOutcome, UnknownReason};
 use crate::persistence::{
@@ -437,12 +438,21 @@ pub(crate) async fn send_handshake_admin<A: Application>(
     sequences: &SequenceManager,
     store: Option<&mut HandshakeStore<'_>>,
     write_timeout: Duration,
+    capture: Option<&Capture>,
     mut pending: PendingMessage,
 ) -> Result<(), EngineError> {
     application
         .to_admin(pending.message_mut(), session_id)
         .await;
-    outbound::check_body(pending.message())?;
+    if let Err(err) = outbound::check_body(pending.message()) {
+        if let Some(capture) = capture {
+            capture.unsent(
+                &SendOutcome::not_sent(NotSentReason::invalid(&err)),
+                FrameKind::Handshake,
+            );
+        }
+        return Err(err);
+    }
     send_handshake(
         session_id,
         framed,
@@ -450,6 +460,7 @@ pub(crate) async fn send_handshake_admin<A: Application>(
         sequences,
         store,
         write_timeout,
+        capture,
         &pending,
     )
     .await
@@ -474,6 +485,13 @@ pub(crate) async fn send_handshake_admin<A: Application>(
 /// `u64::MAX`, [`EngineError::Store`] when a store write fails under the
 /// fail-closed policy, [`EngineError::WriteTimeout`] when the peer is not
 /// reading, and the transport's own error otherwise.
+///
+/// With a frame observer attached, the frame is observed after it is filed
+/// and spent and before the write, and its write result is reported once the
+/// write ends: [`OutboundResult::Written`] when it completed,
+/// [`OutboundResult::Unknown`] when it failed or timed out. A frame stopped
+/// before the write reports what it would as a tracked send.
+#[allow(clippy::too_many_arguments)]
 async fn send_handshake(
     session_id: &SessionId,
     framed: &mut FixFramed,
@@ -481,17 +499,53 @@ async fn send_handshake(
     sequences: &SequenceManager,
     store: Option<&mut HandshakeStore<'_>>,
     write_timeout: Duration,
+    capture: Option<&Capture>,
     pending: &PendingMessage,
 ) -> Result<(), EngineError> {
     let seq = sequences.next_sender_seq().value();
-    let frame = factory.encode(seq, pending)?;
+    let frame = match factory.encode(seq, pending) {
+        Ok(frame) => frame,
+        Err(err) => {
+            if let Some(capture) = capture {
+                capture.unsent(
+                    &SendOutcome::not_sent(NotSentReason::unencodable(&err)),
+                    FrameKind::Handshake,
+                );
+            }
+            return Err(err.into());
+        }
+    };
     let store = store.map(|store| (store.store, &mut store.persisted));
-    file_and_spend(store, sequences, session_id, seq, pending.msg_type(), frame).await?;
-    match timeout(write_timeout, framed.send(frame)).await {
-        Err(_) => Err(EngineError::WriteTimeout(write_timeout)),
-        Ok(Err(err)) => Err(err.into()),
-        Ok(Ok(())) => Ok(()),
+    if let Err(err) =
+        file_and_spend(store, sequences, session_id, seq, pending.msg_type(), frame).await
+    {
+        if let Some(capture) = capture {
+            capture.unsent(&outcome::failed(Some(seq), &err), FrameKind::Handshake);
+        }
+        return Err(err);
     }
+    if let Some(capture) = capture {
+        capture.outbound(frame, FrameKind::Handshake, seq);
+    }
+    let (result, written) = match timeout(write_timeout, framed.send(frame)).await {
+        Err(_) => (
+            Err(EngineError::WriteTimeout(write_timeout)),
+            OutboundResult::Unknown {
+                reason: UnknownReason::WriteTimeout,
+            },
+        ),
+        Ok(Err(err)) => (
+            Err(err.into()),
+            OutboundResult::Unknown {
+                reason: UnknownReason::Transport,
+            },
+        ),
+        Ok(Ok(())) => (Ok(()), OutboundResult::Written),
+    };
+    if let Some(capture) = capture {
+        capture.result(&written, FrameKind::Handshake, Some(seq));
+    }
+    result
 }
 
 /// Sends the messages that refuse a Logon handshake (a Reject, then a Logout),
@@ -516,6 +570,7 @@ pub(crate) async fn refuse_handshake<A: Application, const N: usize>(
     sequences: &SequenceManager,
     mut store: Option<&mut HandshakeStore<'_>>,
     write_timeout: Duration,
+    capture: Option<&Capture>,
     refusal: &str,
     messages: [PendingMessage; N],
 ) -> Result<(), StoreError> {
@@ -529,6 +584,7 @@ pub(crate) async fn refuse_handshake<A: Application, const N: usize>(
             sequences,
             store.as_deref_mut(),
             write_timeout,
+            capture,
             pending,
         )
         .await
@@ -595,14 +651,18 @@ pub(crate) async fn read_handshake_frame<S>(
     framed: &mut FixFramed,
     logon_timeout: Duration,
     session_id: &S,
+    capture: Option<&Capture>,
 ) -> HandshakeRead
 where
     S: std::fmt::Display + Sync + ?Sized,
 {
     let mut skips = HandshakeSkips::default();
-    let outcome = timeout(logon_timeout, next_decodable_frame(framed, &mut skips))
-        .await
-        .unwrap_or(HandshakeRead::TimedOut);
+    let outcome = timeout(
+        logon_timeout,
+        next_decodable_frame(framed, &mut skips, capture),
+    )
+    .await
+    .unwrap_or(HandshakeRead::TimedOut);
     report_handshake_skips(framed, &skips, &outcome, session_id);
     outcome
 }
@@ -620,7 +680,7 @@ where
     S: std::fmt::Display + Sync + ?Sized,
 {
     let mut skips = HandshakeSkips::default();
-    let outcome = tokio::time::timeout_at(deadline, next_decodable_frame(framed, &mut skips))
+    let outcome = tokio::time::timeout_at(deadline, next_decodable_frame(framed, &mut skips, None))
         .await
         .unwrap_or(HandshakeRead::TimedOut);
     report_handshake_skips(framed, &skips, &outcome, session_id);
@@ -683,12 +743,22 @@ impl HandshakeSkips {
 /// The loop inside [`read_handshake_frame`], without its timeout: returns the
 /// first frame that decodes, or why the stream ended, and counts the frames
 /// that framed but did not decode.
-async fn next_decodable_frame(framed: &mut FixFramed, skips: &mut HandshakeSkips) -> HandshakeRead {
+///
+/// Every frame that framed is observed, when an observer is attached, before
+/// it is decoded: a frame skipped here is in the capture too.
+async fn next_decodable_frame(
+    framed: &mut FixFramed,
+    skips: &mut HandshakeSkips,
+    capture: Option<&Capture>,
+) -> HandshakeRead {
     loop {
         match framed.next().await {
             None => return HandshakeRead::Closed,
             Some(Err(err)) => return HandshakeRead::Codec(err),
             Some(Ok(frame)) => {
+                if let Some(capture) = capture {
+                    capture.inbound(&frame, FrameKind::Handshake);
+                }
                 // Owned error, so the borrow of `frame` ends before it moves.
                 match wire::decode_frame(&frame).err() {
                     None => return HandshakeRead::Frame(frame),
@@ -1159,6 +1229,13 @@ struct Writer {
     /// [`WRITE_BUFFER_HIGH_WATER`] or past: the base of the read ceiling
     /// while the buffer stays there ([`Writer::reads_paused`]).
     crossed_at: Option<usize>,
+    /// The frame observer, when one is attached (issue #70).
+    capture: Option<Capture>,
+    /// The observed frames fed and not yet resolved, in the order they were
+    /// fed, as (`MsgSeqNum`, kind): each gets one write result, from the
+    /// flush that covers it or the failure that ends the session. Empty and
+    /// unallocated without an observer.
+    observed: VecDeque<(u64, FrameKind)>,
 }
 
 /// Watches one frame fed to the write buffer until the stream has accepted
@@ -1241,6 +1318,12 @@ enum WriteCheck {
 /// frame, does not leave its peak allocated for the rest of the session.
 const SHRINK_ABOVE: usize = 2 * WRITE_BUFFER_HIGH_WATER;
 
+/// Observed frames the writer makes room for up front when an observer is
+/// attached: a resend step feeds at most [`MAX_FRAMES_PER_RESEND_STEP`] at a
+/// time, so the queue rarely grows past this, and when it does it keeps the
+/// capacity it grew to.
+const OBSERVED_CAPACITY: usize = 4 * MAX_FRAMES_PER_RESEND_STEP;
+
 impl Writer {
     /// A writer framing outbound bytes under `max_message_size`, with no
     /// output waiting.
@@ -1257,7 +1340,59 @@ impl Writer {
             test_request: WriteMark::new(),
             resend_request: WriteMark::new(),
             crossed_at: None,
+            capture: None,
+            observed: VecDeque::new(),
         }
+    }
+
+    /// The same writer, reporting every frame it feeds, and its write
+    /// result, to `capture`.
+    #[must_use]
+    fn with_capture(mut self, capture: Option<Capture>) -> Self {
+        if capture.is_some() {
+            self.observed = VecDeque::with_capacity(OBSERVED_CAPACITY);
+        }
+        self.capture = capture;
+        self
+    }
+
+    /// [`Writer::feed`], then hands the frame to the observer, if one is
+    /// attached, as `kind` numbered `seq`: after it is in the buffer, before
+    /// any byte of it goes to the stream. A frame the codec refuses is not
+    /// observed.
+    ///
+    /// # Errors
+    /// As for [`Writer::feed`].
+    fn feed_frame(
+        &mut self,
+        framed: &mut FixFramed,
+        frame: &[u8],
+        seq: u64,
+        kind: FrameKind,
+    ) -> Result<(), CodecError> {
+        self.feed(framed, frame)?;
+        if let Some(capture) = &self.capture {
+            capture.outbound(frame, kind, seq);
+            self.observed.push_back((seq, kind));
+        }
+        Ok(())
+    }
+
+    /// Reports every observed frame not yet resolved with `result`, in the
+    /// order they were fed.
+    fn resolve_observed(&mut self, result: &OutboundResult) {
+        if let Some(capture) = &self.capture {
+            for (seq, kind) in self.observed.drain(..) {
+                capture.result(result, kind, Some(seq));
+            }
+        }
+    }
+
+    /// Reports every observed frame not yet resolved as
+    /// [`OutboundResult::Unknown`] with `reason`: the write that would have
+    /// carried them failed or will not happen.
+    fn fail_observed(&mut self, reason: UnknownReason) {
+        self.resolve_observed(&OutboundResult::Unknown { reason });
     }
 
     /// Appends `frame` to the write buffer of `framed`. No byte reaches the
@@ -1331,6 +1466,7 @@ impl Writer {
         if framed.write_buffer().is_empty() && framed.write_buffer().capacity() > SHRINK_ABOVE {
             *framed.write_buffer_mut() = BytesMut::with_capacity(WRITE_BUFFER_HIGH_WATER);
         }
+        self.resolve_observed(&OutboundResult::Written);
         self.fed_new.take()
     }
 
@@ -1402,6 +1538,30 @@ impl Writer {
             .and_then(|since| now.checked_duration_since(since))
             .unwrap_or_default();
         write_timeout.checked_sub(waited).unwrap_or_default()
+    }
+}
+
+/// Resolves `receipt`, if there is one, with the outcome `outcome` builds,
+/// and reports it to the frame observer, if one is attached, as a message of
+/// `kind` that was never observed as a frame.
+///
+/// The outcome is built only when one of them needs it, so a plain `send`
+/// with no observer pays nothing for it.
+fn settle(
+    capture: Option<&Capture>,
+    kind: FrameKind,
+    receipt: Option<Receipt>,
+    outcome: impl FnOnce() -> SendOutcome,
+) {
+    match capture {
+        None => outcome::resolve(receipt, outcome),
+        Some(capture) => {
+            let outcome = outcome();
+            capture.unsent(&outcome, kind);
+            if let Some(receipt) = receipt {
+                receipt.resolve(outcome);
+            }
+        }
     }
 }
 
@@ -2391,6 +2551,7 @@ impl<A: Application> Reactor<A> {
     /// would have carried them failed or will not happen. Each keeps the
     /// number spent on it.
     fn fail_receipts(&mut self, reason: UnknownReason) {
+        self.writer.fail_observed(reason);
         for pending in self.receipts.drain(..) {
             pending.receipt.resolve(SendOutcome::Unknown {
                 seq: pending.seq,
@@ -2512,10 +2673,15 @@ impl<A: Application> Reactor<A> {
         mut receipt: Option<Receipt>,
     ) -> Result<(), WriteFailure> {
         let precision = self.factory.sending_time_precision();
+        let kind = if spend {
+            FrameKind::Session
+        } else {
+            FrameKind::GapFill
+        };
         let (frame, stamped) = match self.factory.encode_stamped(seq, pending) {
             Ok(encoded) => encoded,
             Err(err) => {
-                outcome::resolve(receipt, || {
+                settle(self.writer.capture.as_ref(), kind, receipt, || {
                     SendOutcome::not_sent(NotSentReason::unencodable(&err))
                 });
                 return Err(WriteFailure::Encode(err));
@@ -2551,20 +2717,17 @@ impl<A: Application> Reactor<A> {
             {
                 Ok(filed) => filed,
                 Err(err) => {
-                    if let Some(receipt) = receipt {
-                        receipt.fail(&err);
-                    }
+                    self.fail_unobserved(kind, Some(seq), receipt, &err);
                     return Err(WriteFailure::Fatal(err));
                 }
             };
         }
         // Appended, not written: the reactor loop writes it out while it
-        // goes on reading, and the write timeout watches that.
-        if let Err(err) = self.writer.feed(framed, frame) {
+        // goes on reading, and the write timeout watches that. The observer
+        // sees it here, before any byte of it reaches the stream.
+        if let Err(err) = self.writer.feed_frame(framed, frame, seq, kind) {
             let err = EngineError::from(err);
-            if let Some(receipt) = receipt {
-                receipt.fail(&err);
-            }
+            self.fail_unobserved(kind, spend.then_some(seq), receipt, &err);
             return Err(WriteFailure::Fatal(err));
         }
         if spend {
@@ -2580,6 +2743,24 @@ impl<A: Application> Reactor<A> {
             }
         }
         Ok(())
+    }
+
+    /// Resolves a frame that `err` stopped before it was fed, numbered `seq`
+    /// once it was being filed, and reports it to the frame observer: its
+    /// receipt's [`Receipt::fail`], for a send that has one or not.
+    fn fail_unobserved(
+        &self,
+        kind: FrameKind,
+        seq: Option<u64>,
+        receipt: Option<Receipt>,
+        err: &EngineError,
+    ) {
+        if let Some(capture) = &self.writer.capture {
+            capture.unsent(&outcome::failed(seq, err), kind);
+        }
+        if let Some(receipt) = receipt {
+            receipt.fail(err);
+        }
     }
 
     /// Runs the outbound application callback, checks the body, files the
@@ -2673,7 +2854,12 @@ impl<A: Application> Reactor<A> {
         receipt: Option<Receipt>,
     ) -> Result<Sent, EngineError> {
         if let Err(refusal) = self.prepare(&mut pending).await {
-            outcome::resolve(receipt, || SendOutcome::not_sent(refusal.into_reason()));
+            settle(
+                self.writer.capture.as_ref(),
+                FrameKind::Session,
+                receipt,
+                || SendOutcome::not_sent(refusal.into_reason()),
+            );
             return Ok(Sent::Dropped);
         }
         let seq = self.runtime.sequences.next_sender_seq().value();
@@ -2755,8 +2941,15 @@ impl<A: Application> Reactor<A> {
     /// # Errors
     /// [`EngineError::Codec`] when the rebuilt frame exceeds
     /// `max_message_size`, which is terminal for the session.
-    fn send_replay(&mut self, framed: &mut FixFramed, frame: &[u8]) -> Result<(), EngineError> {
-        self.writer.feed(framed, frame).map_err(EngineError::from)
+    fn send_replay(
+        &mut self,
+        framed: &mut FixFramed,
+        seq: u64,
+        frame: &[u8],
+    ) -> Result<(), EngineError> {
+        self.writer
+            .feed_frame(framed, frame, seq, FrameKind::Replay)
+            .map_err(EngineError::from)
     }
 
     /// Feeds a SequenceReset-GapFill covering `at_seq..new_seq`, numbered with
@@ -2825,9 +3018,12 @@ impl<A: Application> Reactor<A> {
                         msg_type = %message.msg_type(),
                         "dropping outbound message: logout pending"
                     );
-                    outcome::resolve(receipt, || {
-                        SendOutcome::not_sent(NotSentReason::LogoutPending)
-                    });
+                    settle(
+                        self.writer.capture.as_ref(),
+                        FrameKind::Session,
+                        receipt,
+                        || SendOutcome::not_sent(NotSentReason::LogoutPending),
+                    );
                     return Ok(phase);
                 }
                 let Some((budget, message, receipt)) =
@@ -2894,6 +3090,12 @@ impl<A: Application> Reactor<A> {
                 None
             }
             Admission::Refused(HeldSend { message, receipt }) => {
+                if let Some(capture) = &self.writer.capture {
+                    capture.unsent(
+                        &SendOutcome::not_sent(NotSentReason::Throttled { budget }),
+                        FrameKind::Session,
+                    );
+                }
                 match receipt {
                     Some(receipt) => {
                         tracing::debug!(
@@ -3039,11 +3241,12 @@ impl<A: Application> Reactor<A> {
         if throttle.state.held() == 0 {
             return;
         }
+        let capture = self.writer.capture.as_ref();
         let discarded = throttle
             .state
             .drain()
             .map(|(budget, held)| {
-                outcome::resolve(held.receipt, || {
+                settle(capture, FrameKind::Session, held.receipt, || {
                     SendOutcome::not_sent(NotSentReason::DiscardedByThrottle { budget })
                 });
             })
@@ -4250,9 +4453,12 @@ impl<A: Application> Reactor<A> {
     /// Drops the messages held back behind a resend, resolving any tracked
     /// one with `reason`.
     fn discard_deferred(&mut self, reason: &NotSentReason) {
+        let capture = self.writer.capture.as_ref();
         for held in self.deferred.drain(..) {
             if let DeferredSend::Message(_, receipt) = held {
-                outcome::resolve(receipt, || SendOutcome::not_sent(reason.clone()));
+                settle(capture, FrameKind::Session, receipt, || {
+                    SendOutcome::not_sent(reason.clone())
+                });
             }
         }
     }
@@ -4291,7 +4497,14 @@ impl<A: Application> Reactor<A> {
                 Command::Send { receipt, .. } => Some(receipt),
                 Command::Logout(_) => None,
             })
-            .map(|receipt| outcome::resolve(receipt, || SendOutcome::not_sent(reason.clone())))
+            .map(|receipt| {
+                settle(
+                    self.writer.capture.as_ref(),
+                    FrameKind::Session,
+                    receipt,
+                    || SendOutcome::not_sent(reason.clone()),
+                );
+            })
             .count();
         if discarded > 0 {
             tracing::warn!(
@@ -4319,7 +4532,7 @@ impl<A: Application> Reactor<A> {
         loop {
             // A replayed message whose gap fill was fed on the previous call.
             if let Some((seq, frame)) = job.pending.take() {
-                self.send_replay(framed, &frame)?;
+                self.send_replay(framed, seq, &frame)?;
                 job.reply_cursor = seq.checked_add(1).unwrap_or(job.new_seq);
                 return Ok(ResendProgress::Wrote);
             }
@@ -4361,7 +4574,7 @@ impl<A: Application> Reactor<A> {
                     job.pending = Some((seq, frame));
                     return Ok(ResendProgress::Wrote);
                 }
-                self.send_replay(framed, &frame)?;
+                self.send_replay(framed, seq, &frame)?;
                 // `seq <= end_seq < new_seq <= u64::MAX`, so this cannot
                 // overflow; it is checked rather than assumed because a
                 // wrapped sequence number would corrupt the session it is
@@ -4498,6 +4711,11 @@ impl<A: Application> Reactor<A> {
         phase: Phase,
         frame: BytesMut,
     ) -> Result<Phase, SessionClosed> {
+        // Observed once framed, before anything is decided about it: a frame
+        // the session rejects, drops or closes over is in the capture too.
+        if let Some(capture) = &self.writer.capture {
+            capture.inbound(&frame, FrameKind::Session);
+        }
         let phase = self.on_frame(framed, phase, frame).await?;
         self.release_held_logon(phase).await
     }
@@ -5129,6 +5347,8 @@ pub(crate) struct SessionParams<A: Application> {
     /// The outbound throttle, when the engine has one: the session gets its
     /// own budgets, full, from it.
     pub(crate) throttle: Option<ThrottleConfig>,
+    /// The frame observer bound to this session, when the engine has one.
+    pub(crate) capture: Option<Capture>,
 }
 
 /// Wires the channels, spawns the application dispatcher and the reactor task,
@@ -5176,6 +5396,7 @@ where
         outbound_capacity,
         app_queue_capacity,
         throttle,
+        capture,
     } = params;
 
     let (command_tx, command_rx) = mpsc::channel(outbound_capacity);
@@ -5183,7 +5404,7 @@ where
     let (app_tx, app_rx) = mpsc::channel(app_queue_capacity);
     let (reject_tx, reject_rx) = mpsc::channel(app_queue_capacity);
     let garbled = config.garbled_frame_limit.map(GarbledFrameWindow::new);
-    let writer = Writer::new(config.max_message_size);
+    let writer = Writer::new(config.max_message_size).with_capture(capture);
     // A budget whose tokens come faster than the release timer's resolution
     // keeps its rate only with a burst of a millisecond's worth of tokens.
     if let Some(config) = &throttle {

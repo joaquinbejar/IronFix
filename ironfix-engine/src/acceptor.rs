@@ -181,6 +181,7 @@ use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime, report_handshake};
 use crate::error::EngineError;
 use crate::next_expected;
+use crate::observer::{Capture, FrameKind, FrameObserver};
 use crate::persistence::{
     PersistedCounters, SeedPlan, Seeded, StoreAttachment, StoreFailurePolicy, seed_session,
     seeded_counters,
@@ -291,6 +292,8 @@ pub struct Acceptor<A: Application = NoOpApplication> {
     /// The outbound throttle each admitted session gets its own budgets
     /// from, if any.
     throttle: Option<ThrottleConfig>,
+    /// The frame observer every session of this engine reports to, if any.
+    observer: Option<Arc<dyn FrameObserver>>,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
@@ -309,6 +312,7 @@ impl<A: Application> std::fmt::Debug for Acceptor<A> {
             .field("store", &self.store)
             .field("store_timeout", &self.store.timeout(self.write_timeout))
             .field("throttle", &self.throttle)
+            .field("frame_observer", &self.observer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -345,6 +349,7 @@ impl<A: Application + 'static> Acceptor<A> {
             store: StoreAttachment::default(),
             admitted: Arc::new(Mutex::new(HashSet::new())),
             throttle: None,
+            observer: None,
         }
     }
 
@@ -617,6 +622,39 @@ impl<A: Application + 'static> Acceptor<A> {
         self.throttle.as_ref()
     }
 
+    /// Attaches a capture hook that sees every frame each session of this
+    /// engine reads and writes, handshake included, with its write result
+    /// (issue #70).
+    ///
+    /// The observer runs synchronously on the session's task: it must be
+    /// cheap, must not block and must not panic (the release profile aborts
+    /// on a panic). It receives **raw bytes, credentials included**
+    /// (`Password` (554), `NewPassword` (925), `RawData` (96)); redacting
+    /// them is the observer's responsibility. See [`crate::observer`] for
+    /// what is observed and when.
+    ///
+    /// Without an observer (the default) a frame costs one branch.
+    ///
+    /// # Arguments
+    /// * `observer` - The capture hook
+    #[must_use]
+    pub fn with_frame_observer(mut self, observer: Arc<dyn FrameObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Returns whether a frame observer is attached.
+    #[must_use]
+    pub const fn has_frame_observer(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    /// The attached frame observer bound to `session_id`, if any.
+    #[must_use]
+    fn capture(&self, session_id: &SessionId) -> Option<Capture> {
+        Capture::bind(self.observer.as_ref(), session_id)
+    }
+
     /// Returns the session configuration.
     #[must_use]
     pub fn config(&self) -> &SessionConfig {
@@ -731,6 +769,7 @@ impl<A: Application + 'static> Acceptor<A> {
             &provisional,
             None,
             self.write_timeout,
+            self.capture(session_id).as_ref(),
             refusal,
             messages,
         )
@@ -773,6 +812,7 @@ impl<A: Application + 'static> Acceptor<A> {
             &sequences,
             store.as_mut(),
             self.write_timeout,
+            self.capture(session_id).as_ref(),
             refusal,
             messages,
         )
@@ -958,25 +998,31 @@ impl<A: Application + 'static> Acceptor<A> {
         // is a LogonTimeout.
         // `on_create` has run: a failure from here is reported to the
         // application as well as returned.
-        let result =
-            match read_handshake_frame(&mut framed, self.config.logon_timeout, &session_id).await {
-                HandshakeRead::Frame(logon_frame) => {
-                    self.complete_handshake(version, session, framed, logon_frame, None)
-                        .await
-                }
-                HandshakeRead::TimedOut => {
-                    let _ = session.disconnect();
-                    Err(EngineError::LogonTimeout(self.config.logon_timeout))
-                }
-                HandshakeRead::Closed => {
-                    let _ = session.disconnect();
-                    Err(EngineError::Closed)
-                }
-                HandshakeRead::Codec(err) => {
-                    let _ = session.disconnect();
-                    Err(err.into())
-                }
-            };
+        let result = match read_handshake_frame(
+            &mut framed,
+            self.config.logon_timeout,
+            &session_id,
+            self.capture(&session_id).as_ref(),
+        )
+        .await
+        {
+            HandshakeRead::Frame(logon_frame) => {
+                self.complete_handshake(version, session, framed, logon_frame, None)
+                    .await
+            }
+            HandshakeRead::TimedOut => {
+                let _ = session.disconnect();
+                Err(EngineError::LogonTimeout(self.config.logon_timeout))
+            }
+            HandshakeRead::Closed => {
+                let _ = session.disconnect();
+                Err(EngineError::Closed)
+            }
+            HandshakeRead::Codec(err) => {
+                let _ = session.disconnect();
+                Err(err.into())
+            }
+        };
         report_handshake(&*self.application, &session_id, result).await
     }
 
@@ -1021,6 +1067,11 @@ impl<A: Application + 'static> Acceptor<A> {
         // holds no partial frame (it settles whenever it returns one), and any
         // bytes already read stay in the `Framed` buffer for the new codec.
         *framed.codec_mut() = session_codec(&self.config, version);
+        // The registry read the Logon before it knew the session: it is
+        // observed now, by the session it was routed to.
+        if let Some(capture) = self.capture(&session_id) {
+            capture.inbound(&logon_frame, FrameKind::Handshake);
+        }
         let max_size = self.config.max_message_size;
         let result = if logon_frame.len() > max_size {
             let _ = session.disconnect();
@@ -1498,6 +1549,7 @@ impl<A: Application + 'static> Acceptor<A> {
                             &runtime.sequences,
                             store.as_mut(),
                             write_timeout,
+                            self.capture(&session_id).as_ref(),
                             &detail,
                             [logout],
                         )
@@ -1558,6 +1610,7 @@ impl<A: Application + 'static> Acceptor<A> {
                         &runtime.sequences,
                         store.as_mut(),
                         write_timeout,
+                        self.capture(&session_id).as_ref(),
                         &detail,
                         [logout],
                     )
@@ -1608,6 +1661,7 @@ impl<A: Application + 'static> Acceptor<A> {
                 &runtime.sequences,
                 store.as_mut(),
                 write_timeout,
+                self.capture(&session_id).as_ref(),
                 logon_ack,
             )
             .await
@@ -1662,6 +1716,7 @@ impl<A: Application + 'static> Acceptor<A> {
             outbound_capacity: self.outbound_capacity,
             app_queue_capacity: self.app_queue_capacity,
             throttle: self.throttle.clone(),
+            capture: self.capture(&session_id),
         };
         let (command_tx, closed_rx) = spawn_session(params, admission);
 

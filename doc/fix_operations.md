@@ -1295,6 +1295,39 @@ twice it gives the counterparty's rate over any window, so an acceptor can
 refuse over-rate messages in `from_app` (the engine then sends a session-level
 Reject). The engine itself does not limit inbound traffic.
 
+### Frame capture
+
+This is engine behaviour, not a FIX message (issue #70,
+`doc/adr/0026-frame-observer.md`). `with_frame_observer(Arc<dyn
+FrameObserver>)` on the `Initiator`, the `Acceptor` or the `EngineBuilder`
+attaches a capture hook that receives the exact bytes of every frame, in
+wire order, with an `Observation`: direction, `FrameKind` (`Handshake`,
+`Session`, `Replay`, `GapFill`), `MsgSeqNum` (34) when known, a monotonic
+`Instant` and the `SessionId`.
+
+**Inbound.** Every frame that passes framing, handshake frames of both roles
+included, is observed before the session acts on it, so a frame later
+rejected, dropped or closed over (the wrong CompID, a `SendingTime` out of
+tolerance) is in the capture. Bytes the codec skips as garbled never become a
+frame and are not observed.
+
+**Outbound.** Every frame (Logons, application and administrative messages,
+replays, gap fills, Rejects and Logouts on failure paths) is observed once
+built and before any byte of it goes to the stream: in an established session
+that is when it is appended to the write buffer. Each is then followed by one
+write result: `Written` once a flush covering it completed, `Unknown` when a
+write started and did not complete. A message that never reached the stream
+(vetoed, unframeable, throttled, refused by the store, discarded at a Logout
+or a close) is never observed as a frame and reports `NotSent` alone. The
+classes are those of `SendOutcome`; Unknown never collapses into NotSent.
+
+**Contract.** The observer runs synchronously on the session's task: it must
+be cheap, must not block and must not panic (`panic = "abort"` in release).
+It receives raw bytes, **credentials included** (`Password` (554),
+`NewPassword` (925), `RawData` (96)); redaction is the observer's
+responsibility. Without an observer a frame costs one branch, and the hook
+allocates nothing per frame.
+
 ## Pre-Trade Messages
 
 ### Security Definition Request (MsgType = c)
