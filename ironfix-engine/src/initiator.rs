@@ -158,8 +158,9 @@
 //!   ([`Initiator::with_app_queue_capacity`]), so an application handler never
 //!   delays a socket read, a heartbeat, or timeout detection.
 //!
-//! `to_admin`, `to_app` and `from_admin` still run inline, because each one's
-//! result decides what the reactor does next. See [`Application`] for the
+//! `to_admin`, `to_app_checked` (and through it `to_app`) and `from_admin`
+//! still run inline, because each one's result decides what the reactor does
+//! next. See [`Application`] for the
 //! ordering that buys and the ordering it costs.
 //!
 //! So do the calls to an attached store: whether a frame may be written, or a

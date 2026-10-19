@@ -740,7 +740,11 @@ any gap first): the reply goes out once the resend and the messages held
 behind it are written, or when `SessionConfig::logout_timeout` runs out,
 dropping the rest. A resend the counterparty asks for after this session's
 own Logout is still answered. `Connection::send` waits for the whole resend
-once the outbound queue is full. Requests are answered in the order they
+once the outbound queue is full. A message sent with
+`Connection::send_tracked` that waits behind a resend reports `Sent` once it
+is written after it, or `NotSent` with `NotSentReason::DiscardedBehindResend` if
+the session ends first (see "Outbound application messages: veto and send
+outcomes"). Requests are answered in the order they
 arrive; past 64 queued, a new request is merged into the last one not yet
 under way, widening it to cover both, so every number asked for is still
 answered (a number neither asked for reaches the counterparty as a possible
@@ -1083,6 +1087,100 @@ arbitrary limit is invented here.
 | `123=N` or 123 absent (Reset mode), `NewSeqNo` ≥ expected | applied regardless of MsgSeqNum. An outstanding ResendRequest is only cleared when the reset actually advances the expectation; a reset landing on the number already expected changes nothing, and clearing for it would let a peer replay it to trigger a fresh ResendRequest every round |
 
 ---
+
+### Outbound application messages: veto and send outcomes
+
+This is engine behaviour, not a FIX message: the FIX session layer says
+nothing about how an application refuses its own outbound message or learns
+what became of it. IronFix follows QuickFIX's `DoNotSend` for the first and
+adds a per-message outcome for the second (issue #68).
+
+**The gate.** Every new outbound application message goes through
+`Application::to_app_checked` when the session reactor is about to write it,
+whether it was handed in with `Connection::send` or `Connection::send_tracked`.
+The default runs `to_app` and sends, at the cost of `to_app`'s own future
+and nothing more. An override returns a `SendVerdict`: `SendVerdict::ready`
+for a decision taken at once (no allocation), `SendVerdict::new` for one that
+must wait. A verdict resolving `Err(RejectReason)` vetoes the message
+**before** a `MsgSeqNum` (34) is peeked
+or spent and before the store is touched: a vetoed message spends no number,
+is never filed, and leaves no gap, so the next message takes the number it
+would have had. The session carries on. Because the gate runs at write time,
+a message waiting behind a resend is checked once the resend is done.
+
+**Replays are not gated.** The answer to a `ResendRequest` and the
+`NextExpectedMsgSeqNum` (789) resend write each filed application frame as it
+was filed, with `PossDupFlag` (43) = Y and its original `SendingTime` in
+`OrigSendingTime` (122), without calling `to_app_checked`. QuickFIX calls
+`toApp` on each resent application message and gap-fills one that throws
+`DoNotSend`; IronFix does not yet, so a gate cannot stop a stale order from
+being resent. This is a known gap, tracked as a follow-up.
+
+**Administrative messages cannot be vetoed.** Logon, Logout, Heartbeat
+(including the reply to a TestRequest), TestRequest, ResendRequest,
+SequenceReset (and every gap fill), Reject and XmlMessage (n) go through
+`to_admin`, which can mutate them but not refuse them: they are
+session-layer messages, and all but XmlMessage are what keeps the session
+legal.
+`Connection::send` and `send_tracked` refuse an administrative MsgType
+outright.
+
+**Outcomes.** `Connection::send` stays fire-and-forget: `Ok` means queued.
+`Connection::send_tracked` returns one `SendOutcome`, in one of three classes
+that never collapse into one another:
+
+| Outcome | Meaning | `MsgSeqNum` |
+|---|---|---|
+| `Sent { seq, sending_time, filed }` | A flush of the write buffer covering the frame completed; `sending_time` is the `SendingTime` (52) on the wire, whole seconds on FIX 4.0 and 4.1; `filed` says whether the store accepted it | spent, the one the counterparty reads |
+| `NotSent { reason }` | No byte of the frame reached the stream | not spent |
+| `Unknown { seq, reason }` | The frame was buffered (or being filed) and the session ended before a flush covering it completed (a failed write, the write timeout, a closing flush that did not drain, the reactor stopped); the session closes | spent when the frame was buffered; replayed only under the conditions below |
+
+`NotSentReason`: `Vetoed` (the gate refused it, with the `RejectReason`),
+`Invalid` (an administrative MsgType, a reserved tag or a value with no wire
+form, as handed in or as the callback left it; the detail names the tag and
+never quotes a field value), `StoreRefused` (filing failed or timed out under
+`StoreFailurePolicy::CloseSession`, which then closes the session; under
+`Continue` the frame is written anyway and reports `Sent` with `filed` false),
+`SequenceExhausted`, `SessionClosed` (never queued), `LogoutPending` (behind
+this session's own Logout), `Discarded` (still in the outbound queue when the
+session ended) and `DiscardedBehindResend` (waiting behind a resend when the
+session ended).
+
+A `StoreRefused` frame is not sent within the process, but a failed or
+timed-out store write leaves the store's state unknown: the frame may have been
+filed after all. The engine owes the next session a sequence reset, which
+erases it; that record is in memory only (issue #111), so after a restart a
+store that did file the frame can replay it under the number this session
+never spent.
+
+**`Unknown` means the order may be live.** Do not resubmit it blindly.
+Reconcile it by `ClOrdID` (11) after the next Logon, through the
+`ExecutionReport` (8) the counterparty sends for it or an `OrderStatusRequest`
+(H). If it must be resubmitted, reuse the `ClOrdID` and set `PossResend` (97)
+= Y. Its number stays spent, and its frame is replayed with `PossDupFlag` = Y
+only when all of these hold: the frame was filed; the store was not reset on
+the close (`reset_on_disconnect`, or `reset_on_logout` on a graceful close);
+the next Logon carries no `ResetSeqNumFlag` (141) = Y (`reset_on_logon`, a
+daily reset, or a reset the engine owes); the store still holds it
+(`MemoryStore` does not survive a restart, and a `FileStore` that does not
+sync every write may lose it to an operating-system crash); and the
+counterparty asks for it. Otherwise a resend covering it is a gap fill, or
+never asked for.
+
+**Ordering guarantee.** `Sent` resolves only after the frame went through the
+store step of the write order above and a flush that covers it completed;
+`filed` says whether that step filed it. The session writes through a buffer
+(see "How a resend is written"): a frame is appended to it and the buffer is
+written out while the session goes on reading, so one completed flush resolves
+every tracked frame it wrote, in the order they were sent. A frame that was
+not filed cannot be replayed: a `ResendRequest` covering it is answered with a
+`SequenceReset`-GapFill. Flushed means handed to the stream in full: the bytes
+may still be in an operating-system or TLS buffer, and nothing at the FIX
+layer says the counterparty processed them. A frame still buffered when the
+session closes is written by the closing flush and reports `Sent` if that
+flush drains the buffer, `Unknown` otherwise. Every tracked message resolves,
+at the latest as its session closes and before `Connection::wait_closed`
+returns, and `send_tracked` cannot outlive the session.
 
 ## Pre-Trade Messages
 
@@ -1864,6 +1962,13 @@ ADR-0011.
   satisfies is also bounded — retried every `SessionConfig::resend_timeout` and
   then escalated to Logout after `SessionConfig::max_resend_requests` attempts,
   rather than stalling the session forever. See "Resend Request" above.
+- [x] Outbound veto and send outcomes (engine, both roles):
+  `Application::to_app_checked` can refuse a new outbound application
+  message before a `MsgSeqNum` is spent or the store is touched; a replay is
+  not gated (unlike QuickFIX); administrative messages cannot be vetoed;
+  `Connection::send_tracked` reports `Sent`, `NotSent` or `Unknown` per
+  message. See "Outbound application messages: veto and send outcomes"
+  above.
 - [x] `NextExpectedMsgSeqNum` (789) on Logon, opt-in
   (`SessionConfig::send_next_expected_msg_seq_num`, FIX.4.4 and FIXT.1.1 only)
   in both roles: declared on the Logon and its acknowledgement; a

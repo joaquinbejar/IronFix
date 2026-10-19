@@ -174,6 +174,40 @@ engine wiring (#96) does not exist.
   (`DefaultApplVerID` on a FIX 5.0 session, a `ResetSeqNumFlag` Logon not
   numbered 1, `HeartBtInt`, `NextExpectedMsgSeqNum` when it is used,
   `MsgSeqNum`) gets a filed Logout saying why.
+- **An outbound gate and per-message send outcomes** in both roles.
+  `Application::to_app_checked` runs on every new outbound application
+  message, whether it came through `Connection::send` or
+  `Connection::send_tracked`, when it is about to be written, and can veto
+  it (the equivalent of QuickFIX's `DoNotSend`): a vetoed message spends no
+  `MsgSeqNum` and is never filed, so the next message takes its number. The
+  default forwards to `to_app`, so an application that overrides only
+  `to_app` is unchanged, and costs no allocation beyond `to_app`'s own. An
+  override returns a `SendVerdict`: `SendVerdict::ready` for a decision
+  taken at once (no allocation), `SendVerdict::new` for one that must wait.
+  A replay of a filed frame is resent as filed and is
+  not gated (see below). Administrative messages (Logon, Logout, Heartbeat,
+  TestRequest, ResendRequest, SequenceReset, Reject, XmlMessage) go through
+  `to_admin` and cannot be vetoed. `Connection::send_tracked` reports each
+  message's fate as a `SendOutcome`: `Sent` with the `MsgSeqNum` and
+  `SendingTime` (in the session's precision) the counterparty reads, once a
+  flush of the session's write buffer covering the frame completes, and
+  `filed`, which says whether the store accepted it (false without a store,
+  and under `StoreFailurePolicy::Continue` after a failed filing, when a
+  resend of it is gap-filled); `NotSent` with a `NotSentReason` when no byte
+  reached the stream and no number was spent (vetoed, invalid, refused by
+  the store under `CloseSession`, sequence exhausted, session closed, Logout
+  pending, or discarded when the session ended, in the queue or behind a
+  resend); `Unknown` with the spent number when the frame was buffered (or
+  being filed) and the session ended before a flush covering it completed:
+  a number is spent when the frame is buffered. An `Unknown` order may be
+  live: do
+  not resubmit it blindly, reconcile it by `ClOrdID` after the next Logon
+  (an `ExecutionReport`, or an `OrderStatusRequest`), and if it must be
+  resubmitted reuse the `ClOrdID` with `PossResend` (97) = Y. Its frame is
+  replayed only if it was filed, no reset erased it (`reset_on_disconnect`,
+  or `ResetSeqNumFlag` on the next Logon), the store still holds it, and the
+  counterparty asks. `Connection::send` stays fire-and-forget and allocates
+  nothing for tracking (`doc/adr/0023-outbound-veto-and-send-outcomes.md`).
 - **`NextExpectedMsgSeqNum` (789) on Logon**, opt-in with
   `SessionConfig::send_next_expected_msg_seq_num` on FIX.4.4 and FIXT.1.1
   sessions (refused below FIX.4.4), in both roles. The Logon and its
@@ -268,6 +302,13 @@ This list is deliberately explicit. If a capability is not named under "What
 works today" and appears below, it does not exist in the code — do not plan
 around it.
 
+- **Replays are not gated by `to_app_checked`.** The answer to a
+  `ResendRequest`, and the resend a counterparty's `NextExpectedMsgSeqNum`
+  (789) asks for, write each filed application frame as it was filed, with
+  `PossDupFlag = Y`, without calling the outbound gate. QuickFIX calls
+  `toApp` on each resent application message and gap-fills one that throws
+  `DoNotSend`; IronFix does not yet, so a gate cannot stop a stale order from
+  being resent.
 - **Store limits.** There is no memory-mapped store. `FileStore`'s journal
   grows with every outbound frame until the sequence is reset: its counters
   sit in two fixed slots, so inbound traffic does not grow it, and compaction

@@ -10,7 +10,8 @@
 //! sends** — application messages handed to
 //! [`Connection::send`](crate::Connection::send) and the administrative
 //! messages the session layer builds for itself. It is what
-//! [`Application::to_app`](crate::Application::to_app) and
+//! [`Application::to_app_checked`](crate::Application::to_app_checked) (by
+//! default, [`Application::to_app`](crate::Application::to_app)) and
 //! [`Application::to_admin`](crate::Application::to_admin) receive, and it is
 //! what the engine encodes, so a mutation made in a callback reaches the wire.
 //!
@@ -214,9 +215,11 @@ fn check_body_tag(tag: u32) -> Result<(), EngineError> {
 /// # Mutating one in a callback
 ///
 /// [`Application::to_admin`](crate::Application::to_admin) and
-/// [`Application::to_app`](crate::Application::to_app) receive this type by
-/// `&mut` **before** the header is stamped and before a sequence number is
-/// spent, so a field added there is encoded into the frame that goes out. The
+/// [`Application::to_app_checked`](crate::Application::to_app_checked) (by
+/// default, [`Application::to_app`](crate::Application::to_app)) receive this
+/// type by `&mut` **before** the header is stamped and before a sequence
+/// number is spent, so a field added there is encoded into the frame that
+/// goes out, and a message `to_app_checked` vetoes costs nothing. The
 /// canonical use is stamping `Username` (553) and `Password` (554) onto the
 /// outbound Logon.
 ///
