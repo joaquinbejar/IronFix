@@ -22,6 +22,9 @@
 //!   `ArrayString`, not a `String`), and [`Side`]
 //! - **Protocol versions**: [`FixVersion`], the single mapping from a FIX
 //!   version to its `BeginString` (8) and `ApplVerID` (1128 / 1137)
+//! - **Inbound validation seam**: [`InboundValidator`], [`InboundRejection`]
+//!   and [`InboundDefect`], which `ironfix-dictionary` implements and
+//!   `ironfix-engine` calls, so neither depends on the other (ADR-0031)
 //!
 //! ## Zero-Copy Design
 //!
@@ -32,6 +35,7 @@ pub mod error;
 pub mod field;
 pub mod message;
 pub mod types;
+pub mod validation;
 pub mod version;
 
 pub use error::{
@@ -44,4 +48,5 @@ pub use field::{
 };
 pub use message::{CustomMsgType, FixMessage, MSG_TYPE_MAX_LEN, MsgType, OwnedMessage, RawMessage};
 pub use types::{COMP_ID_MAX_LEN, CompId, SeqNum, Side, Timestamp};
+pub use validation::{InboundDefect, InboundRejection, InboundValidator};
 pub use version::FixVersion;

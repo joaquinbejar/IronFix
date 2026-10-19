@@ -36,6 +36,7 @@ use ironfix_core::error::{DecodeError, EncodeError};
 use ironfix_core::field::FieldRef;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::Timestamp;
+use ironfix_core::validation::{InboundDefect, InboundRejection};
 use ironfix_core::version::FixVersion;
 use ironfix_session::SessionConfig;
 use ironfix_tagvalue::{Decoder, Encoder, FieldIndex};
@@ -2079,6 +2080,27 @@ impl MessageFactory {
         reason: &RejectReason,
         ref_appl_ver_id: Option<&str>,
     ) -> PendingMessage {
+        self.reject_frame(
+            ref_seq,
+            ref_msg_type,
+            reason.ref_tag,
+            Some(reason.code),
+            ref_appl_ver_id,
+            &reason.text,
+        )
+    }
+
+    /// Builds a session-level Reject (35=3) from its parts; `code` is the
+    /// `SessionRejectReason` (373), omitted when `None`.
+    fn reject_frame(
+        &self,
+        ref_seq: u64,
+        ref_msg_type: &str,
+        ref_tag: Option<u32>,
+        code: Option<u32>,
+        ref_appl_ver_id: Option<&str>,
+        text: &str,
+    ) -> PendingMessage {
         let mut message = OutboundMessage::new(MsgType::Reject);
         message.push_uint(45, ref_seq);
         // FIX 4.0 and FIX 4.1 define the Reject as RefSeqNum (45) and Text
@@ -2087,7 +2109,7 @@ impl MessageFactory {
         // a strict counterparty of those versions would refuse them. The
         // reason travels in Text there.
         if self.reject_has_reason_fields() {
-            if let Some(ref_tag) = reason.ref_tag {
+            if let Some(ref_tag) = ref_tag {
                 message.push_uint(371, u64::from(ref_tag));
             }
             if !ref_msg_type.is_empty() {
@@ -2096,12 +2118,77 @@ impl MessageFactory {
             if let Some(code) = ref_appl_ver_id {
                 message.push_str(REF_APPL_VER_ID, code);
             }
-            message.push_uint(373, u64::from(reason.code));
+            if let Some(code) = code {
+                message.push_uint(373, u64::from(code));
+            }
         }
-        if !reason.text.is_empty() {
-            message.push_str(58, &reason.text);
+        if !text.is_empty() {
+            message.push_str(58, text);
         }
         PendingMessage::plain(message)
+    }
+
+    /// Builds the answer to an inbound application message that failed
+    /// dictionary validation (issue #84, ADR-0031).
+    ///
+    /// With `business` set, a missing required tag or an unsupported message
+    /// type is answered with a BusinessMessageReject (35=j) on FIX 4.2 and
+    /// later ([`MessageFactory::business_message_reject`]); everything else
+    /// with a session-level Reject (35=3) whose `SessionRejectReason` (373)
+    /// is the defect's code on this version ([`validation_reject_code`]),
+    /// omitted when the version defines none. The `Text` (58) is the
+    /// rejection's value-free text.
+    #[must_use]
+    pub(crate) fn validation_reject(
+        &self,
+        ref_seq: u64,
+        ref_msg_type: &str,
+        rejection: &InboundRejection,
+        business: bool,
+    ) -> PendingMessage {
+        if business
+            && self.has_business_message_reject()
+            && let Some(reason) = business_reject_reason(rejection.defect())
+        {
+            return self.business_message_reject(ref_seq, ref_msg_type, reason, rejection.text());
+        }
+        self.reject_frame(
+            ref_seq,
+            ref_msg_type,
+            rejection.ref_tag(),
+            validation_reject_code(self.version, rejection.defect()),
+            None,
+            rejection.text(),
+        )
+    }
+
+    /// Builds a BusinessMessageReject (35=j): `RefSeqNum` (45), `RefMsgType`
+    /// (372), `BusinessRejectReason` (380) and `Text` (58), the layout FIX
+    /// 4.2 and FIX 4.4 define (`spec/FIX42.xml`, `spec/FIX44.xml`).
+    #[must_use]
+    pub(crate) fn business_message_reject(
+        &self,
+        ref_seq: u64,
+        ref_msg_type: &str,
+        reason: u32,
+        text: &str,
+    ) -> PendingMessage {
+        let mut message = OutboundMessage::new(MsgType::BusinessMessageReject);
+        message
+            .push_uint(45, ref_seq)
+            .push_str(372, ref_msg_type)
+            .push_uint(380, u64::from(reason));
+        if !text.is_empty() {
+            message.push_str(58, text);
+        }
+        PendingMessage::plain(message)
+    }
+
+    /// Whether this session's version defines the BusinessMessageReject
+    /// (35=j): FIX 4.2 and later, the versions whose Reject carries 373.
+    #[must_use]
+    const fn has_business_message_reject(&self) -> bool {
+        self.reject_has_reason_fields()
     }
 
     /// Whether this session's Reject (35=3) carries RefTagID (371),
@@ -2140,6 +2227,71 @@ impl MessageFactory {
             reason = reason.with_ref_tag(tag);
         }
         self.session_reject(ref_seq, ref_msg_type.unwrap_or(""), &reason)
+    }
+}
+
+/// The `SessionRejectReason` (373) a validation defect is reported with on
+/// `version`, or `None` when the version defines no code for it.
+///
+/// FIX 4.3 and later (FIXT.1.1 included) define every code a defect maps to.
+/// FIX 4.2 defines 0 to 11 only (`spec/FIX42.xml`), so 13, 15, 16 and 99 have
+/// no code there: the Reject goes out without 373, and `RefTagID` (371) and
+/// `Text` (58) name the problem. FIX 4.0 and 4.1 carry no 373 at all, which
+/// [`MessageFactory`] already enforces; `None` is returned for them too.
+///
+/// The match names every version, so a new [`FixVersion`] does not compile
+/// until its codes are decided. A defect added to [`InboundDefect`] after
+/// this was written maps to *Other* (99).
+#[must_use]
+pub(crate) const fn validation_reject_code(
+    version: FixVersion,
+    defect: InboundDefect,
+) -> Option<u32> {
+    let code = match defect {
+        InboundDefect::InvalidTagNumber => 0,
+        InboundDefect::RequiredTagMissing => 1,
+        InboundDefect::TagNotDefinedForMessageType => 2,
+        InboundDefect::ValueIncorrect => 5,
+        InboundDefect::IncorrectDataFormat => 6,
+        InboundDefect::InvalidMsgType => 11,
+        InboundDefect::TagAppearsMoreThanOnce => 13,
+        InboundDefect::RepeatingGroupFieldsOutOfOrder => 15,
+        InboundDefect::IncorrectNumInGroupCount => 16,
+        // `InboundDefect` is non-exhaustive: a later defect is *Other*.
+        _ => 99,
+    };
+    match version {
+        FixVersion::Fix40 | FixVersion::Fix41 => None,
+        FixVersion::Fix42 => {
+            if code <= 11 {
+                Some(code)
+            } else {
+                None
+            }
+        }
+        FixVersion::Fix43
+        | FixVersion::Fix44
+        | FixVersion::Fix50
+        | FixVersion::Fix50Sp1
+        | FixVersion::Fix50Sp2
+        | FixVersion::Fixt11 => Some(code),
+    }
+}
+
+/// The `BusinessRejectReason` (380) a validation defect is answered with
+/// when a BusinessMessageReject is configured, or `None` for a defect that
+/// always gets a session-level Reject.
+///
+/// Only the two content defects qualify: a missing required tag is
+/// *Conditionally required field missing* (5), an undefined message type is
+/// *Unsupported message type* (3). Every other defect is a syntax problem
+/// of the message, which the session layer rejects.
+#[must_use]
+pub(crate) const fn business_reject_reason(defect: InboundDefect) -> Option<u32> {
+    match defect {
+        InboundDefect::RequiredTagMissing => Some(5),
+        InboundDefect::InvalidMsgType => Some(3),
+        _ => None,
     }
 }
 
@@ -4222,5 +4374,177 @@ mod tests {
         let pending = factory.malformed_reject(7, None, reject);
         let frame = framed(&mut factory, 3, &pending);
         assert_eq!(decode(&frame).get_field_str(372), None);
+    }
+}
+
+#[cfg(test)]
+mod validation_reject_tests {
+    use super::*;
+    use ironfix_core::types::CompId;
+
+    fn factory_for(begin_string: &str) -> MessageFactory {
+        let (Ok(sender), Ok(target)) = (CompId::new("CLIENT"), CompId::new("VENUE")) else {
+            unreachable!("CLIENT and VENUE are valid CompIds")
+        };
+        let config = SessionConfig::new(sender, target, begin_string);
+        match wire_version(&config.begin_string) {
+            Ok(version) => MessageFactory::new(&config, version),
+            Err(err) => panic!("unsupported test version: {err}"),
+        }
+    }
+
+    /// Frames `pending` under MsgSeqNum 3 and returns the reject fields, as
+    /// (tag, value) pairs in wire order.
+    fn fields(factory: &mut MessageFactory, pending: &PendingMessage) -> Vec<(u32, String)> {
+        let frame = match factory.encode(3, pending) {
+            Ok(frame) => frame.to_vec(),
+            Err(err) => panic!("the reject must encode: {err}"),
+        };
+        let raw = match decode_frame(&frame) {
+            Ok(raw) => raw,
+            Err(err) => panic!("the reject must decode: {err}"),
+        };
+        raw.fields()
+            .filter(|field| [35, 45, 58, 371, 372, 373, 380].contains(&field.tag))
+            .map(|field| (field.tag, String::from_utf8_lossy(field.value).into_owned()))
+            .collect()
+    }
+
+    fn get(fields: &[(u32, String)], tag: u32) -> Option<&str> {
+        fields
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn missing_side() -> InboundRejection {
+        InboundRejection::new(
+            InboundDefect::RequiredTagMissing,
+            Some(54),
+            "required tag missing: Side(54)",
+        )
+    }
+
+    #[test]
+    fn test_validation_reject_code_per_version() {
+        use InboundDefect as D;
+        let all = [
+            (D::InvalidTagNumber, 0),
+            (D::RequiredTagMissing, 1),
+            (D::TagNotDefinedForMessageType, 2),
+            (D::ValueIncorrect, 5),
+            (D::IncorrectDataFormat, 6),
+            (D::InvalidMsgType, 11),
+            (D::TagAppearsMoreThanOnce, 13),
+            (D::RepeatingGroupFieldsOutOfOrder, 15),
+            (D::IncorrectNumInGroupCount, 16),
+            (D::Other, 99),
+        ];
+        for (defect, code) in all {
+            for version in [FixVersion::Fix40, FixVersion::Fix41] {
+                assert_eq!(validation_reject_code(version, defect), None);
+            }
+            let fix42 = if code <= 11 { Some(code) } else { None };
+            assert_eq!(validation_reject_code(FixVersion::Fix42, defect), fix42);
+            for version in [
+                FixVersion::Fix43,
+                FixVersion::Fix44,
+                FixVersion::Fix50,
+                FixVersion::Fix50Sp1,
+                FixVersion::Fix50Sp2,
+                FixVersion::Fixt11,
+            ] {
+                assert_eq!(validation_reject_code(version, defect), Some(code));
+            }
+        }
+    }
+
+    #[test]
+    fn test_validation_reject_fix44_is_a_session_reject_with_ref_tag() {
+        let mut factory = factory_for("FIX.4.4");
+        let pending = factory.validation_reject(7, "D", &missing_side(), false);
+        let fields = fields(&mut factory, &pending);
+        assert_eq!(get(&fields, 35), Some("3"));
+        assert_eq!(get(&fields, 45), Some("7"));
+        assert_eq!(get(&fields, 371), Some("54"));
+        assert_eq!(get(&fields, 372), Some("D"));
+        assert_eq!(get(&fields, 373), Some("1"));
+        assert_eq!(get(&fields, 58), Some("required tag missing: Side(54)"));
+    }
+
+    #[test]
+    fn test_validation_reject_fix42_omits_a_code_it_does_not_define() {
+        let mut factory = factory_for("FIX.4.2");
+        let count = InboundRejection::new(
+            InboundDefect::IncorrectNumInGroupCount,
+            Some(78),
+            "incorrect NumInGroup count for group NoAllocs(78)",
+        );
+        let pending = factory.validation_reject(7, "J", &count, false);
+        let first = fields(&mut factory, &pending);
+        assert_eq!(get(&first, 35), Some("3"));
+        assert_eq!(get(&first, 371), Some("78"));
+        assert_eq!(get(&first, 373), None);
+        assert!(get(&first, 58).is_some());
+        // A code FIX 4.2 has is sent.
+        let pending = factory.validation_reject(8, "D", &missing_side(), false);
+        assert_eq!(get(&fields(&mut factory, &pending), 373), Some("1"));
+    }
+
+    #[test]
+    fn test_validation_reject_fix40_carries_text_only() {
+        let mut factory = factory_for("FIX.4.0");
+        let pending = factory.validation_reject(7, "D", &missing_side(), true);
+        let fields = fields(&mut factory, &pending);
+        // No BusinessMessageReject before FIX 4.2, and no 371/372/373.
+        assert_eq!(get(&fields, 35), Some("3"));
+        for tag in [371, 372, 373, 380] {
+            assert_eq!(get(&fields, tag), None, "tag {tag}");
+        }
+        assert_eq!(get(&fields, 58), Some("required tag missing: Side(54)"));
+    }
+
+    #[test]
+    fn test_validation_reject_business_option_answers_content_defects_with_35_j() {
+        let mut factory = factory_for("FIX.4.4");
+        let pending = factory.validation_reject(7, "D", &missing_side(), true);
+        let bmr = fields(&mut factory, &pending);
+        assert_eq!(get(&bmr, 35), Some("j"));
+        assert_eq!(get(&bmr, 45), Some("7"));
+        assert_eq!(get(&bmr, 372), Some("D"));
+        assert_eq!(get(&bmr, 380), Some("5"));
+        assert_eq!(get(&bmr, 373), None);
+        assert_eq!(get(&bmr, 58), Some("required tag missing: Side(54)"));
+
+        let unknown = InboundRejection::new(InboundDefect::InvalidMsgType, Some(35), "unknown");
+        let pending = factory.validation_reject(8, "ZZ", &unknown, true);
+        let unsupported = fields(&mut factory, &pending);
+        assert_eq!(get(&unsupported, 35), Some("j"));
+        assert_eq!(get(&unsupported, 380), Some("3"));
+
+        // A syntax defect stays a session-level Reject.
+        let format = InboundRejection::new(
+            InboundDefect::IncorrectDataFormat,
+            Some(38),
+            "incorrect data format for OrderQty(38)",
+        );
+        let pending = factory.validation_reject(9, "D", &format, true);
+        let session = fields(&mut factory, &pending);
+        assert_eq!(get(&session, 35), Some("3"));
+        assert_eq!(get(&session, 373), Some("6"));
+    }
+
+    #[test]
+    fn test_validation_reject_fixt_uses_fixt_codes() {
+        let mut factory = factory_for("FIX.5.0SP2");
+        let dup = InboundRejection::new(
+            InboundDefect::TagAppearsMoreThanOnce,
+            Some(11),
+            "tag ClOrdID(11) appears more than once",
+        );
+        let pending = factory.validation_reject(7, "D", &dup, false);
+        let fields = fields(&mut factory, &pending);
+        assert_eq!(get(&fields, 373), Some("13"));
+        assert_eq!(get(&fields, 371), Some("11"));
     }
 }

@@ -215,8 +215,14 @@
 //!   setting: call `connect_tls` / `serve_tls` on the engine it builds. The
 //!   TLS stream is boxed like any caller stream, and nothing has measured
 //!   the cost.
-//! - **There is no dictionary validation**: `ironfix-dictionary`'s
-//!   `Validator` is never invoked on the session path.
+//! - **Dictionary validation is opt-in and covers application messages
+//!   only.** With an [`InboundValidation`] whose policy is not `Off`, every
+//!   in-sequence inbound application message is checked before `from_app`,
+//!   and logged or rejected on failure (see [`validation`], ADR-0031). The
+//!   engine names only `ironfix_core::InboundValidator`; the validator is
+//!   supplied by `ironfix-dictionary` or by the caller. Administrative
+//!   messages are not validated against a dictionary, and the validator is
+//!   not chosen per `ApplVerID` (1128).
 //! - **The store is opt-in.** Attaching one with [`Initiator::with_store`],
 //!   [`Acceptor::with_store`] or [`EngineBuilder::with_store`] enables
 //!   resend-from-store replay and seeds each session's counters in both roles.
@@ -257,6 +263,7 @@ pub mod registry;
 mod stream;
 pub mod throttle;
 pub mod tls;
+pub mod validation;
 mod wire;
 
 pub use acceptor::Acceptor;
@@ -277,6 +284,7 @@ pub use throttle::{
     ThrottlePolicy,
 };
 pub use tls::{DEFAULT_TLS_HANDSHAKE_TIMEOUT, PeerInfo, TlsError, TlsFailure};
+pub use validation::{InboundValidation, ValidationPolicy, ValidationRejectMessage};
 
 // Re-exported for convenience: the per-session configuration consumed by
 // [`Initiator`].

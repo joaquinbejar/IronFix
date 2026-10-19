@@ -325,6 +325,19 @@ engine wiring (#96) does not exist.
   against the pair with QuickFIX-like semantics: `BeginString` must be
   `FIXT.1.1`, header and trailer come from the transport, the body from the
   application, and admin messages entirely from the transport.
+- **Opt-in inbound dictionary validation** in both engines (#84,
+  `doc/adr/0031-inbound-dictionary-validation.md`). `with_inbound_validation`
+  on `Initiator`, `Acceptor` or `EngineBuilder` takes an `InboundValidation`:
+  any `ironfix_core::InboundValidator` (which `ironfix-dictionary`'s
+  `Validator`, `Dictionary` and `SessionDictionary` implement, so the engine
+  does not depend on the dictionary crate) and a `ValidationPolicy` of `Off`
+  (the default), `Log` or `Reject`. Every in-sequence inbound application
+  message is checked before `from_app`; under `Reject` a failure consumes
+  its number and gets a session Reject with the version's
+  `SessionRejectReason` and `RefTagID` (or, opt-in, a BusinessMessageReject
+  for a missing required tag or an unsupported message type), and never
+  reaches `from_app`. Neither the Reject text nor the log line quotes a field
+  value. Administrative messages are not validated.
 - **A FIX Orchestra 1.0 loader** in `ironfix-dictionary`:
   `Dictionary::from_orchestra_xml` reads the base scenario of an Orchestra
   repository into the same `Dictionary` model and returns, next to it, an
@@ -456,8 +469,11 @@ around it.
   (`ironfix-dictionary/src/loader.rs`). `SessionDictionary` does not read
   `ApplVerID(1128)`: you choose the application dictionary when you build it.
   `Validator::new` does not check `BeginString`; only `Validator::for_session`
-  does. The `Validator` is *not* invoked by the engine or the codec; you call
-  it yourself (`ironfix-engine/src/lib.rs`).
+  does. The codec never invokes the `Validator`; the engine invokes it only
+  on inbound application messages, and only when a session is given one
+  with a policy other than `Off` (`ironfix-engine/src/validation.rs`). The
+  validator is not chosen per `ApplVerID`, and administrative messages are
+  not validated against a dictionary.
 - **The embedded FIXT 1.1 dictionary deviates from FIXT 1.1 on Logon.** The
   vendored QuickFIX `FIXT11.xml` defines the `MsgTypeGrp` component with no
   members and does not define `NoMsgTypes(384)` or `MsgDirection(385)`, so a

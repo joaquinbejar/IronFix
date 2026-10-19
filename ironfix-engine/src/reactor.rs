@@ -293,6 +293,7 @@ use crate::persistence::{
 };
 use crate::stream::SessionStream;
 use crate::throttle::{Admission, BudgetId, Throttle, ThrottleConfig};
+use crate::validation::{InboundValidation, ValidationPolicy, ValidationRejectMessage};
 use crate::wire::{
     self, ApplVersionGuard, ApplVersionProblem, MessageFactory, PeerIdentity, PendingMessage,
     SendingTimeGuard, SendingTimeProblem,
@@ -302,6 +303,7 @@ use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
 use ironfix_core::error::{DecodeError, EncodeError, StoreError};
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::Timestamp;
+use ironfix_core::validation::InboundRejection;
 use ironfix_core::version::FixVersion;
 use ironfix_session::config::MAX_INBOUND_FIELDS;
 use ironfix_session::heartbeat::generate_test_req_id;
@@ -2106,6 +2108,9 @@ struct Reactor<A: Application> {
     /// Application-version check applied to every application message
     /// released to the application on a FIXT.1.1 session (`ApplVerID` 1128).
     appl_version: ApplVersionGuard,
+    /// Dictionary validation of in-sequence application messages, when its
+    /// policy is not `Off` (issue #84, ADR-0031); `None` costs one branch.
+    validation: Option<InboundValidation>,
     /// Shared session runtime (sequences + heartbeat).
     runtime: Arc<SessionRuntime>,
     /// Session configuration.
@@ -6160,6 +6165,38 @@ impl<A: Application> Reactor<A> {
                 .reject_appl_version(framed, phase, raw.msg_type().as_str(), seq, &problem)
                 .await;
         }
+        // Dictionary validation (issue #84, ADR-0031): after the version
+        // check, so a message in a refused version is rejected for that, and
+        // before the dispatcher, so a rejected message never reaches
+        // `from_app`. `None` (no validation, or `ValidationPolicy::Off`) is
+        // this one branch.
+        if let Some(validation) = &self.validation
+            && let Err(rejection) = validation.validator().validate(raw)
+        {
+            tracing::warn!(
+                session = %self.session_id,
+                seq,
+                msg_type = %raw.msg_type(),
+                defect = %rejection.defect(),
+                ref_tag = rejection.ref_tag(),
+                policy = ?validation.policy(),
+                "inbound application message failed dictionary validation"
+            );
+            if validation.policy() == ValidationPolicy::Reject {
+                let business =
+                    validation.reject_message() == ValidationRejectMessage::BusinessMessageReject;
+                return self
+                    .reject_invalid(
+                        framed,
+                        phase,
+                        raw.msg_type().as_str(),
+                        seq,
+                        &rejection,
+                        business,
+                    )
+                    .await;
+            }
+        }
         let phase = self.deliver_app(phase, seq, frame).await?;
         if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
             return Err(exhausted(phase, err));
@@ -6198,6 +6235,29 @@ impl<A: Application> Reactor<A> {
             detail = %problem,
             "rejecting an application message: its application version is not accepted"
         );
+        let phase = self.consume_rejected(phase, seq).await?;
+        // A 1128 that names a version the session refuses is echoed in
+        // RefApplVerID (1130), so the counterparty sees which version the
+        // Reject is about.
+        let reason = problem.reject_reason();
+        let reject = self.factory.session_reject_with_appl_ver(
+            seq,
+            ref_msg_type,
+            &reason,
+            problem.ref_appl_ver_id(),
+        );
+        self.send_reject(framed, phase, reject).await
+    }
+
+    /// Consumes the number of an in-sequence application message the session
+    /// rejects instead of delivering: `seq + 1` is persisted as the next
+    /// target number before the expectation moves, exactly as when the
+    /// message is delivered, so the counterparty does not resend it.
+    ///
+    /// # Errors
+    /// An exhausted target counter, or a failed persist under
+    /// [`StoreFailurePolicy::CloseSession`].
+    async fn consume_rejected(&mut self, phase: Phase, seq: u64) -> Result<Phase, SessionClosed> {
         let Some(next) = seq.checked_add(1) else {
             return Err(exhausted(
                 phase,
@@ -6213,16 +6273,30 @@ impl<A: Application> Reactor<A> {
             return Err(exhausted(phase, err));
         }
         self.note_inbound_progress();
-        // A 1128 that names a version the session refuses is echoed in
-        // RefApplVerID (1130), so the counterparty sees which version the
-        // Reject is about.
-        let reason = problem.reject_reason();
-        let reject = self.factory.session_reject_with_appl_ver(
-            seq,
-            ref_msg_type,
-            &reason,
-            problem.ref_appl_ver_id(),
-        );
+        Ok(phase)
+    }
+
+    /// Rejects an in-sequence application message that failed dictionary
+    /// validation under [`ValidationPolicy::Reject`] (issue #84, ADR-0031).
+    ///
+    /// The number is consumed first ([`Reactor::consume_rejected`]), then the
+    /// Reject goes out like any other session frame, and the session stays
+    /// up: the message never reaches `from_app`. A content defect is
+    /// answered with a BusinessMessageReject (35=j) when `business` is set
+    /// and the version has one; see [`MessageFactory::validation_reject`].
+    async fn reject_invalid(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        ref_msg_type: &str,
+        seq: u64,
+        rejection: &InboundRejection,
+        business: bool,
+    ) -> Result<Phase, SessionClosed> {
+        let phase = self.consume_rejected(phase, seq).await?;
+        let reject = self
+            .factory
+            .validation_reject(seq, ref_msg_type, rejection, business);
         self.send_reject(framed, phase, reject).await
     }
 
@@ -6430,6 +6504,9 @@ pub(crate) struct SessionParams<A: Application> {
     /// Application-version check (`ApplVerID` 1128) for a FIXT.1.1 session;
     /// the same guard the handshake checked `DefaultApplVerID` (1137) with.
     pub(crate) appl_version: ApplVersionGuard,
+    /// Dictionary validation of inbound application messages; `None`, or a
+    /// validation under `ValidationPolicy::Off`, validates nothing.
+    pub(crate) validation: Option<InboundValidation>,
     /// Session configuration.
     pub(crate) config: SessionConfig,
     /// Application callbacks.
@@ -6506,6 +6583,7 @@ where
         identity,
         sending_time,
         appl_version,
+        validation,
         config,
         application,
         session_id,
@@ -6601,6 +6679,7 @@ where
         identity,
         sending_time,
         appl_version,
+        validation: InboundValidation::active(validation),
         runtime,
         config,
         application,

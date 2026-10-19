@@ -1035,8 +1035,9 @@ rustflags = ["-C", "target-cpu=native"]
 > of QuickFIX XML; the only repository tested is the FIX Trading Community's
 > FIX 4.4 one (a test fixture, not embedded), and `FIX.Latest` is rejected
 > (ADR-0013). And the
-> `Validator` is never invoked by the engine or the codec, so no version is
-> schema-validated automatically. The "Key Characteristics" column below is
+> `Validator` is invoked by the engine only when a session is configured
+> with inbound validation (ADR-0031), and then only on application messages;
+> the codec never invokes it. The "Key Characteristics" column below is
 > background on the FIX specification, not a statement about IronFix coverage.
 
 | Version | BeginString | Transport | Key Characteristics |

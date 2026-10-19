@@ -207,8 +207,13 @@
 //! - `CheckSum(10)` presence is not re-checked: the tag-value decoder
 //!   already consumes and verifies it, so it never appears among the
 //!   parsed fields.
-//! - The validator is a standalone, opt-in facility. It is not invoked by
-//!   the codec or by the engine.
+//! - The validator is opt-in. The codec never invokes it; `ironfix-engine`
+//!   invokes it on inbound application messages only when a session is
+//!   given one through `InboundValidation` with a policy other than `Off`
+//!   (issue #84, ADR-0031). [`Validator`], [`Dictionary`] and
+//!   [`SessionDictionary`] implement [`InboundValidator`] for that, and
+//!   [`ValidationError::inbound_rejection`] maps an error to the
+//!   `SessionRejectReason` (373) the engine answers with.
 
 use crate::composition::SessionDictionary;
 use crate::group::GroupSpec;
@@ -216,6 +221,7 @@ use crate::schema::{Dictionary, FieldDef, FieldType, MessageCategory, MessageDef
 use crate::scope::{LayoutGroup, Scope, ScopeBuilder};
 use crate::walk::{self, EntryTags};
 use ironfix_core::message::RawMessage;
+use ironfix_core::validation::{InboundDefect, InboundRejection, InboundValidator};
 use std::collections::HashSet;
 
 /// Maximum group/component nesting the validator will expand.
@@ -535,8 +541,8 @@ impl<'d> Validator<'d> {
     ///   SP2, in a Heartbeat answered by FIXT 1.1) is reported as
     ///   [`ValidationError::UnknownTag`]. A session reject would map that to
     ///   `SessionRejectReason(373)=0` (invalid tag number), although `2` (tag
-    ///   not defined for this message type) describes it better; mapping
-    ///   validation errors to 373 values is future work (#84).
+    ///   not defined for this message type) describes it better; that is what
+    ///   [`ValidationError::inbound_rejection`] does, following QuickFIX/J.
     /// - The embedded FIXT 1.1 transport ([`Dictionary::fixt11`]) does not
     ///   define the Logon `NoMsgTypes(384)` group, an upstream QuickFIX
     ///   deviation, so a Logon carrying it is reported. Compose a FIXT 1.1
@@ -693,6 +699,190 @@ impl<'d> Validator<'d> {
         }
 
         sink.finish()
+    }
+}
+
+impl ValidationError {
+    /// Maps this error to the version-neutral [`InboundRejection`] a session
+    /// engine answers it with (issue #84, ADR-0031).
+    ///
+    /// The mapping follows QuickFIX/J's choice of `SessionRejectReason`
+    /// (373) and `RefTagID` (371):
+    ///
+    /// | Error | Defect (373 in FIX 4.4) | `RefTagID` |
+    /// |---|---|---|
+    /// | `UnknownMsgType` | `InvalidMsgType` (11) | 35 |
+    /// | `MissingRequiredField` | `RequiredTagMissing` (1) | the field |
+    /// | `MissingRequiredGroup` | `RequiredTagMissing` (1) | the count tag |
+    /// | `MissingRequiredFieldInGroupEntry` | `RequiredTagMissing` (1) | the missing member |
+    /// | `UnknownTag` | `InvalidTagNumber` (0) | the tag |
+    /// | `FieldNotAllowedForMessage` | `TagNotDefinedForMessageType` (2) | the tag |
+    /// | `InvalidEnumValue` | `ValueIncorrect` (5) | the field |
+    /// | `InvalidFieldFormat` | `IncorrectDataFormat` (6) | the field |
+    /// | `InvalidGroupCount` | `IncorrectDataFormat` (6) | the count tag |
+    /// | `DuplicateTag`, `RepeatedTagInGroupEntry` | `TagAppearsMoreThanOnce` (13) | the tag |
+    /// | `GroupDelimiterMismatch` | `RepeatingGroupFieldsOutOfOrder` (15) | the tag found |
+    /// | `GroupCountMismatch` | `IncorrectNumInGroupCount` (16) | the count tag |
+    /// | `BeginStringMismatch` | `ValueIncorrect` (5) | 8 |
+    /// | `UnknownComponent`, `SchemaTooDeep`, `SchemaTooLarge`, `ErrorLimitReached` | `Other` (99) | none |
+    ///
+    /// The text names tags, dictionary names and entry positions only, never
+    /// a value: unlike this error's [`Display`](std::fmt::Display), which
+    /// quotes values and must not reach the wire or a log line.
+    #[must_use]
+    pub fn inbound_rejection(&self) -> InboundRejection {
+        use InboundDefect as D;
+        let (defect, ref_tag, text) = match self {
+            Self::UnknownMsgType { .. } => (
+                D::InvalidMsgType,
+                Some(35),
+                "message type not defined in the dictionary".to_string(),
+            ),
+            Self::MissingRequiredField { tag, name } => (
+                D::RequiredTagMissing,
+                Some(*tag),
+                format!("required tag missing: {name}({tag})"),
+            ),
+            Self::MissingRequiredGroup { count_tag, name } => (
+                D::RequiredTagMissing,
+                Some(*count_tag),
+                format!("required group missing: {name}({count_tag})"),
+            ),
+            Self::MissingRequiredFieldInGroupEntry {
+                count_tag,
+                group,
+                entry,
+                tag,
+                name,
+            } => (
+                D::RequiredTagMissing,
+                Some(*tag),
+                format!(
+                    "required tag missing: {name}({tag}) in entry {entry} of group {group}({count_tag})"
+                ),
+            ),
+            Self::UnknownTag { tag } => (
+                D::InvalidTagNumber,
+                Some(*tag),
+                format!("tag {tag} is not defined in the dictionary"),
+            ),
+            Self::FieldNotAllowedForMessage { tag, .. } => (
+                D::TagNotDefinedForMessageType,
+                Some(*tag),
+                format!("tag {tag} is not defined for this message type"),
+            ),
+            Self::InvalidEnumValue { tag, name, .. } => (
+                D::ValueIncorrect,
+                Some(*tag),
+                format!("value is incorrect for {name}({tag})"),
+            ),
+            Self::InvalidFieldFormat { tag, name, .. } => (
+                D::IncorrectDataFormat,
+                Some(*tag),
+                format!("incorrect data format for {name}({tag})"),
+            ),
+            Self::InvalidGroupCount { tag, name, .. } => (
+                D::IncorrectDataFormat,
+                Some(*tag),
+                format!("incorrect data format for group count {name}({tag})"),
+            ),
+            Self::DuplicateTag { tag, name } => (
+                D::TagAppearsMoreThanOnce,
+                Some(*tag),
+                format!("tag {name}({tag}) appears more than once"),
+            ),
+            Self::RepeatedTagInGroupEntry {
+                count_tag,
+                group,
+                tag,
+                name,
+            } => (
+                D::TagAppearsMoreThanOnce,
+                Some(*tag),
+                format!(
+                    "tag {name}({tag}) appears more than once in an entry of group {group}({count_tag})"
+                ),
+            ),
+            Self::GroupDelimiterMismatch {
+                count_tag,
+                name,
+                expected,
+                found,
+            } => (
+                D::RepeatingGroupFieldsOutOfOrder,
+                Some(*found),
+                format!(
+                    "group {name}({count_tag}) entries must start with tag {expected}, found tag {found}"
+                ),
+            ),
+            Self::GroupCountMismatch {
+                count_tag, name, ..
+            } => (
+                D::IncorrectNumInGroupCount,
+                Some(*count_tag),
+                format!("incorrect NumInGroup count for group {name}({count_tag})"),
+            ),
+            Self::BeginStringMismatch { .. } => (
+                D::ValueIncorrect,
+                Some(8),
+                "BeginString(8) is not the transport dictionary's".to_string(),
+            ),
+            Self::UnknownComponent { .. }
+            | Self::SchemaTooDeep { .. }
+            | Self::SchemaTooLarge { .. } => (
+                D::Other,
+                None,
+                "the dictionary cannot validate this message type".to_string(),
+            ),
+            Self::ErrorLimitReached { .. } => {
+                (D::Other, None, "too many validation errors".to_string())
+            }
+        };
+        InboundRejection::new(defect, ref_tag, text)
+    }
+}
+
+/// The first error of a failed validation, as an [`InboundRejection`].
+///
+/// [`Validator::validate`] orders its errors deterministically (see "Error
+/// order" in the module docs), so the same message always yields the same
+/// rejection.
+fn first_rejection(errors: &[ValidationError]) -> InboundRejection {
+    match errors.first() {
+        Some(error) => error.inbound_rejection(),
+        // `validate` never fails with an empty list; this keeps a failure a
+        // failure should that ever change.
+        None => InboundRejection::new(InboundDefect::Other, None, "validation failed"),
+    }
+}
+
+/// Validates against the validator's dictionary or session pair; the first
+/// error, in the validator's deterministic order, decides the rejection.
+///
+/// A session engine holds the validator as `Arc<dyn InboundValidator>`,
+/// which needs a `Validator<'static>`: build it over an embedded dictionary
+/// ([`Dictionary::fix44`] and the others return `&'static Dictionary`), or
+/// share an owned [`Dictionary`] instead, which implements the trait too.
+impl InboundValidator for Validator<'_> {
+    fn validate(&self, msg: &RawMessage<'_>) -> Result<(), InboundRejection> {
+        Validator::validate(self, msg).map_err(|errors| first_rejection(&errors))
+    }
+}
+
+/// Validates against this one dictionary, as [`Validator::new`] does: an
+/// `Arc<Dictionary>` loaded at run time can be handed to a session engine
+/// as its `Arc<dyn InboundValidator>`.
+impl InboundValidator for Dictionary {
+    fn validate(&self, msg: &RawMessage<'_>) -> Result<(), InboundRejection> {
+        InboundValidator::validate(&Validator::new(self), msg)
+    }
+}
+
+/// Validates against the composed FIXT.1.1 transport and application pair,
+/// as [`Validator::for_session`] does.
+impl InboundValidator for SessionDictionary<'_> {
+    fn validate(&self, msg: &RawMessage<'_>) -> Result<(), InboundRejection> {
+        InboundValidator::validate(&Validator::for_session(self), msg)
     }
 }
 
@@ -3801,6 +3991,275 @@ mod tests {
                 actual: 1,
                 delimiter_tag: 210,
             }])
+        );
+    }
+
+    // ---- InboundValidator adapter (issue #84) ----
+
+    /// Validates `fields` through the `InboundValidator` trait object.
+    #[track_caller]
+    fn inbound(validator: &dyn InboundValidator, fields: &[&str]) -> Result<(), InboundRejection> {
+        let msg = build(fields);
+        let mut decoder = Decoder::new(msg.as_bytes()).with_checksum_validation(false);
+        let raw = ok(decoder.decode(), "test message decodes");
+        validator.validate(&raw)
+    }
+
+    #[track_caller]
+    fn rejection(result: Result<(), InboundRejection>) -> InboundRejection {
+        match result {
+            Ok(()) => panic!("expected the message to be rejected, but it validated"),
+            Err(rejection) => rejection,
+        }
+    }
+
+    #[test]
+    fn test_inbound_validator_passes_a_valid_new_order_single() {
+        let fields = with_header(&[
+            "11=ORDER-1",
+            "55=EURUSD",
+            "54=1",
+            "60=20260712-10:00:00",
+            "40=1",
+        ]);
+        assert_eq!(inbound(&Validator::new(fix44()), &fields), Ok(()));
+        assert_eq!(inbound(fix44(), &fields), Ok(()));
+    }
+
+    #[test]
+    fn test_inbound_validator_missing_side_names_tag_54() {
+        let fields = with_header(&["11=ORDER-1", "55=EURUSD", "60=20260712-10:00:00", "40=1"]);
+        let found = rejection(inbound(&Validator::new(fix44()), &fields));
+        assert_eq!(found.defect(), InboundDefect::RequiredTagMissing);
+        assert_eq!(found.ref_tag(), Some(54));
+        assert_eq!(found.text(), "required tag missing: Side(54)");
+        // The owned dictionary answers the same.
+        assert_eq!(rejection(inbound(fix44(), &fields)), found);
+    }
+
+    #[test]
+    fn test_inbound_validator_undefined_msg_type_is_a_failure() {
+        let mut fields: Vec<&str> = HEADER.to_vec();
+        fields[2] = "35=ZZ";
+        fields.push("10=000");
+        let found = rejection(inbound(&Validator::new(fix44()), &fields));
+        assert_eq!(found.defect(), InboundDefect::InvalidMsgType);
+        assert_eq!(found.ref_tag(), Some(35));
+        assert!(!found.text().contains("ZZ"));
+    }
+
+    #[test]
+    fn test_inbound_validator_bad_enum_text_carries_no_value() {
+        let fields = with_header(&[
+            "11=ORDER-1",
+            "55=EURUSD",
+            "54=X",
+            "60=20260712-10:00:00",
+            "40=1",
+        ]);
+        let found = rejection(inbound(&Validator::new(fix44()), &fields));
+        assert_eq!(found.defect(), InboundDefect::ValueIncorrect);
+        assert_eq!(found.ref_tag(), Some(54));
+        assert!(!found.text().contains('X'), "{}", found.text());
+    }
+
+    #[test]
+    fn test_inbound_validator_session_dictionary_validates_the_pair() {
+        let session = fixt11_fix50sp2();
+        let valid = fix50sp2_new_order_single();
+        assert_eq!(inbound(&session, &valid), Ok(()));
+        assert_eq!(inbound(&Validator::for_session(&session), &valid), Ok(()));
+        let missing_side: Vec<&str> = valid
+            .iter()
+            .copied()
+            .filter(|field| !field.starts_with("54="))
+            .collect();
+        let found = rejection(inbound(&session, &missing_side));
+        assert_eq!(found.defect(), InboundDefect::RequiredTagMissing);
+        assert_eq!(found.ref_tag(), Some(54));
+    }
+
+    #[test]
+    fn test_inbound_rejection_maps_every_error_variant() {
+        use InboundDefect as D;
+        let name = || "Name".to_string();
+        let secret = || "SECRET".to_string();
+        let cases: Vec<(ValidationError, D, Option<u32>)> = vec![
+            (
+                ValidationError::UnknownMsgType { msg_type: secret() },
+                D::InvalidMsgType,
+                Some(35),
+            ),
+            (
+                ValidationError::MissingRequiredField {
+                    tag: 54,
+                    name: name(),
+                },
+                D::RequiredTagMissing,
+                Some(54),
+            ),
+            (
+                ValidationError::UnknownTag { tag: 9999 },
+                D::InvalidTagNumber,
+                Some(9999),
+            ),
+            (
+                ValidationError::FieldNotAllowedForMessage {
+                    tag: 44,
+                    msg_type: secret(),
+                },
+                D::TagNotDefinedForMessageType,
+                Some(44),
+            ),
+            (
+                ValidationError::InvalidFieldFormat {
+                    tag: 38,
+                    name: name(),
+                    value: secret(),
+                    field_type: FieldType::Qty,
+                },
+                D::IncorrectDataFormat,
+                Some(38),
+            ),
+            (
+                ValidationError::InvalidEnumValue {
+                    tag: 54,
+                    name: name(),
+                    value: secret(),
+                },
+                D::ValueIncorrect,
+                Some(54),
+            ),
+            (
+                ValidationError::DuplicateTag {
+                    tag: 11,
+                    name: name(),
+                },
+                D::TagAppearsMoreThanOnce,
+                Some(11),
+            ),
+            (
+                ValidationError::RepeatedTagInGroupEntry {
+                    count_tag: 78,
+                    group: name(),
+                    tag: 79,
+                    name: name(),
+                },
+                D::TagAppearsMoreThanOnce,
+                Some(79),
+            ),
+            (
+                ValidationError::InvalidGroupCount {
+                    tag: 78,
+                    name: name(),
+                    value: secret(),
+                },
+                D::IncorrectDataFormat,
+                Some(78),
+            ),
+            (
+                ValidationError::GroupCountMismatch {
+                    count_tag: 78,
+                    name: name(),
+                    declared: 7_777_777,
+                    actual: 1,
+                    delimiter_tag: 79,
+                },
+                D::IncorrectNumInGroupCount,
+                Some(78),
+            ),
+            (
+                ValidationError::GroupDelimiterMismatch {
+                    count_tag: 78,
+                    name: name(),
+                    expected: 79,
+                    found: 80,
+                },
+                D::RepeatingGroupFieldsOutOfOrder,
+                Some(80),
+            ),
+            (
+                ValidationError::MissingRequiredGroup {
+                    count_tag: 78,
+                    name: name(),
+                },
+                D::RequiredTagMissing,
+                Some(78),
+            ),
+            (
+                ValidationError::UnknownComponent { name: secret() },
+                D::Other,
+                None,
+            ),
+            (
+                ValidationError::SchemaTooDeep {
+                    name: secret(),
+                    limit: 32,
+                },
+                D::Other,
+                None,
+            ),
+            (
+                ValidationError::SchemaTooLarge { limit: 4096 },
+                D::Other,
+                None,
+            ),
+            (
+                ValidationError::BeginStringMismatch {
+                    expected: secret(),
+                    found: secret(),
+                },
+                D::ValueIncorrect,
+                Some(8),
+            ),
+            (
+                ValidationError::MissingRequiredFieldInGroupEntry {
+                    count_tag: 78,
+                    group: name(),
+                    entry: 2,
+                    tag: 80,
+                    name: name(),
+                },
+                D::RequiredTagMissing,
+                Some(80),
+            ),
+            (
+                ValidationError::ErrorLimitReached { limit: 1024 },
+                D::Other,
+                None,
+            ),
+        ];
+        for (error, defect, ref_tag) in cases {
+            let found = error.inbound_rejection();
+            assert_eq!(found.defect(), defect, "{error:?}");
+            assert_eq!(found.ref_tag(), ref_tag, "{error:?}");
+            assert!(!found.text().is_empty(), "{error:?}");
+            assert!(
+                !found.text().contains("SECRET"),
+                "{error:?}: {}",
+                found.text()
+            );
+            assert!(
+                !found.text().contains("7777777"),
+                "{error:?}: {}",
+                found.text()
+            );
+        }
+    }
+
+    #[test]
+    fn test_inbound_rejection_group_entry_text_names_the_entry() {
+        let found = ValidationError::MissingRequiredFieldInGroupEntry {
+            count_tag: 78,
+            group: "NoAllocs".to_string(),
+            entry: 2,
+            tag: 80,
+            name: "AllocQty".to_string(),
+        }
+        .inbound_rejection();
+        assert_eq!(
+            found.text(),
+            "required tag missing: AllocQty(80) in entry 2 of group NoAllocs(78)"
         );
     }
 }

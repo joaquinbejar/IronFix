@@ -1106,6 +1106,7 @@ FIX 4.x session (which carries no `ApplVerID` to reject).
 | 10 | Inbound `SendingTime` (52) differs from the local clock by more than the configured tolerance |
 | 13 | FIX 5.0 only: `ApplVerID` (1128) more than once in the standard header of an inbound application message, or `DefaultApplVerID` (1137) more than once on the Logon acknowledgement (initiator); with `send_next_expected_msg_seq_num`, `NextExpectedMsgSeqNum` (789) more than once on the Logon acknowledgement (initiator, followed by a Logout); `RefTagID` = the repeated tag |
 | 14 | FIX 5.0 only: `ApplVerID` (1128), a standard-header field, after the header of an inbound application message has ended; `RefTagID` = 1128, the number is consumed and the message never reaches `from_app` |
+| 0, 1, 2, 5, 6, 11, 13, 15, 16, 99 | With inbound dictionary validation under `ValidationPolicy::Reject` (opt-in, see *Inbound dictionary validation*): an in-sequence application message that fails it, `RefTagID` = the tag at fault; the number is consumed and the message never reaches `from_app`. On FIX 4.2, 13, 15, 16 and 99 are not defined and 373 is omitted |
 | 18 | FIX 5.0 only: an inbound application message whose `ApplVerID` (1128) names no version or a version the session does not accept (`RefTagID` = 1128, and `RefApplVerID` (1130) = the refused code when it names a version, `2` to `9`; the message's number is consumed and it never reaches `from_app`), or a Logon acknowledgement whose `DefaultApplVerID` (1137) fails the same rule (`RefTagID` = 1137, followed by a Logout; initiator) |
 | any | Whatever an `Application::from_admin` / `from_app` implementation returns in its `RejectReason` |
 
@@ -2046,11 +2047,76 @@ decoded or not, is answered with a Logout whose `Text` is
   checked before it is rejected, because the header is not decoded as a whole.
   It consumes a number only from the connected counterparty's stream.
 
+### Inbound dictionary validation
+
+**Scope**: `ironfix-engine`, both roles, every FIX version; opt-in (issue #84,
+ADR-0031). The FIX specification lists the reject codes and layouts; it is
+silent on when and where an engine validates against a dictionary, so the
+placement and the defect mapping below are IronFix decisions.
+
+A session given an `InboundValidation` (an `ironfix_core::InboundValidator`,
+such as `ironfix_dictionary::Validator`, `Dictionary` or `SessionDictionary`,
+plus a `ValidationPolicy`) checks every **in-sequence application message**
+before it reaches `from_app`:
+
+1. framing and decode (a malformed body is rejected as above and never
+   validated);
+2. `MsgSeqNum`, identity (49/56) and `SendingTime` (52);
+3. the sequence check: a message above the expectation is validated when it
+   is released in order (`GapPolicy::Queue`) or when its resend arrives; a
+   possible duplicate below the expectation is dropped unvalidated;
+4. FIXT.1.1 only: the `ApplVerID` (1128) check (reason 18);
+5. **dictionary validation**;
+6. the dispatcher and `from_app`.
+
+Administrative messages are not validated against the dictionary.
+
+| Policy | On failure |
+|---|---|
+| `Off` (default) | The validator is not called; one branch, no allocation |
+| `Log` | A `warn` event (session, `MsgSeqNum`, MsgType, defect, `RefTagID`); the message is delivered |
+| `Reject` | The number is consumed (`MsgSeqNum + 1` persisted first), a Reject is sent, the message never reaches `from_app`, the session stays up |
+
+The first error in the `Validator`'s deterministic order decides the Reject:
+
+| Validation error | 373 | 371 |
+|---|---|---|
+| `UnknownTag` | 0 | the tag |
+| `MissingRequiredField`, `MissingRequiredGroup`, `MissingRequiredFieldInGroupEntry` | 1 | the field, the count tag, the missing member (group and entry index in `Text` only) |
+| `FieldNotAllowedForMessage` | 2 | the tag |
+| `InvalidEnumValue`; `BeginStringMismatch` | 5 | the field; 8 |
+| `InvalidFieldFormat`, `InvalidGroupCount` | 6 | the field, the count tag |
+| `UnknownMsgType` | 11 | 35 |
+| `DuplicateTag`, `RepeatedTagInGroupEntry` | 13 | the tag |
+| `GroupDelimiterMismatch` | 15 | the tag found |
+| `GroupCountMismatch` | 16 | the count tag |
+| `UnknownComponent`, `SchemaTooDeep`, `SchemaTooLarge`, `ErrorLimitReached` | 99 | none |
+
+FIX 4.3 and later (FIXT.1.1 included) send these codes. FIX 4.2 defines 0 to
+11 only, so a Reject for 13, 15, 16 or 99 omits 373 and keeps 371 and 58.
+FIX 4.0 and 4.1 send 45 and 58 only. With
+`ValidationRejectMessage::BusinessMessageReject`, on FIX 4.2 and later, a
+missing required tag is answered with a BusinessMessageReject (35=j,
+`BusinessRejectReason` (380) = 5) and an undefined message type with 380 = 3;
+every other defect stays a session Reject. The 35=j is an application
+message: it spends an outbound number, runs through `to_app_checked` and is
+filed for resend.
+
+`Text` (58) names tags, dictionary names and entry positions, never a field
+value, and so does the log line: `Password` (554), `NewPassword` (925) and
+`RawData` (96) cannot leak through either.
+
+**Not implemented:** the validator is not chosen per `ApplVerID` (1128); a
+`SessionDictionary` names one application dictionary. With `Log` or `Reject`
+each application message costs a full `Validator::validate`, which allocates;
+nothing has measured it.
+
 ### Repeating groups in dictionary validation
 
-**Scope**: `ironfix-dictionary::Validator`, the standalone, opt-in validator.
-Neither the codec nor the engine calls it, so nothing below is enforced on the
-session path today.
+**Scope**: `ironfix-dictionary::Validator`. The codec never calls it; the
+engine calls it on inbound application messages only when inbound dictionary
+validation is configured (see above), and then the first error decides the
+Reject.
 
 A repeating group is checked in two layers. Its **structure**: the entries
 follow the count field contiguously, each entry starts with the delimiter (the
@@ -2407,8 +2473,10 @@ checked.
 
 **Not implemented for 5.0:**
 
-- No dictionary is consulted: an accepted `ApplVerID` selects nothing, and the
-  engine never validates a message body against an application dictionary.
+- No dictionary is selected by `ApplVerID`: an accepted `ApplVerID` selects
+  nothing. Inbound dictionary validation, when configured, uses the one
+  application dictionary its `SessionDictionary` names (see *Inbound
+  dictionary validation*).
 - The counterparty's declared default is not adopted for outbound traffic:
   the session always declares and stamps its own configured version. It is
   kept and exposed as `Connection::counterparty_default_appl_version` (the
@@ -2435,8 +2503,9 @@ with QuickFIX-like semantics: `BeginString` (8) must be `FIXT.1.1`; an admin
 message the transport defines (Logon, Heartbeat, ...) is checked against FIXT
 1.1 alone, so a Logon must carry `DefaultApplVerID` (1137); an application
 message takes its header and trailer from FIXT 1.1 and its body from the
-application dictionary. Neither the engine nor the codec calls it. See
-ADR-0010.
+application dictionary. The codec never calls it; the engine calls it on
+inbound application messages when inbound dictionary validation is
+configured (ADR-0031). See ADR-0010.
 
 Where it differs from QuickFIX:
 
