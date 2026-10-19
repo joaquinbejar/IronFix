@@ -486,6 +486,7 @@ pub(crate) fn failed(seq: Option<u64>, error: &EngineError) -> SendOutcome {
         | EngineError::Encode(_)
         | EngineError::Config(_)
         | EngineError::ConnectTimeout(_)
+        | EngineError::Tls(_)
         | EngineError::LogonTimeout(_)
         | EngineError::LogonRejected { .. }
         | EngineError::HeartbeatInterval { .. }

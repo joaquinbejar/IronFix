@@ -23,6 +23,15 @@ tokio-util.workspace = true
 futures-util.workspace = true
 bytes.workspace = true
 tracing.workspace = true
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+
+[features]
+default = []
+# TLS for both roles over rustls (ADR-0009): Initiator::connect_tls,
+# Acceptor::serve_tls and AcceptorRegistry::serve_tls. Off by default; with it
+# off, no TLS crate is in the normal dependency graph (`make check-tls-deps`).
+tls = ["dep:rustls", "dep:tokio-rustls"]
 
 [dev-dependencies]
 dhat.workspace = true
@@ -30,6 +39,11 @@ dhat.workspace = true
 # (`#[tokio::test(start_paused = true)]`), which needs `test-util`: a feature
 # of a dependency the crate already has, adding no crate.
 tokio = { workspace = true, features = ["test-util"] }
+# The TLS tests (#81): ring is the crypto provider the tests build their
+# rustls configurations with, and rcgen generates the certificates at test
+# time, so no private key is committed.
+rustls = { workspace = true, features = ["ring"] }
+rcgen.workspace = true
 
 # Installs dhat as the global allocator to count the allocations of the
 # reactor's write path, so it runs as its own binary without the libtest
@@ -37,3 +51,8 @@ tokio = { workspace = true, features = ["test-util"] }
 [[test]]
 name = "allocations"
 harness = false
+
+# Only meaningful with TLS compiled in.
+[[test]]
+name = "tls_tests"
+required-features = ["tls"]

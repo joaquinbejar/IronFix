@@ -20,10 +20,11 @@
 >   `dictionary/versions/`).
 > - **Several "decisions" below are unbuilt.** There is no synchronous or
 >   kernel-bypass mode, no arena allocator (`bumpalo` is not a dependency), no
->   compiled FAST templates, no code generation in use, and no TLS. (A caller
->   can bring its own TLS stream: the engines run over any `AsyncRead +
->   AsyncWrite` stream handed to `Initiator::establish`,
->   `Acceptor::serve_stream` or `AcceptorRegistry::serve_stream`.)
+>   compiled FAST templates, and no code generation in use. TLS exists, but
+>   not in `ironfix-transport`: it is `ironfix-engine`'s optional `tls`
+>   feature (`connect_tls` / `serve_tls` over rustls, ADR-0009), and a caller
+>   can still bring its own TLS stream to `Initiator::establish`,
+>   `Acceptor::serve_stream` or `AcceptorRegistry::serve_stream`.
 > - **Code blocks are illustrative sketches, not extracts from the codebase.**
 >   Most do not compile against the current crates.
 >
@@ -1510,7 +1511,8 @@ fn configure_thread_affinity() {
 > below were the original estimate and have no bearing on when anything will
 > land; do not quote them as commitments. Work has not followed this order —
 > for example, `ironfix-engine`'s `Initiator` and `Acceptor` (listed under
-> Phase 6) exist while an mmap store (Phase 2), TLS and a transport-level TCP
+> Phase 6) and TLS (an engine feature, ADR-0009) exist while an mmap store
+> (Phase 2) and a transport-level TCP
 > connector/acceptor (Phase 3; the engines open TCP themselves, or run over
 > any stream the caller opened), the FAST template parser and multicast
 > (Phase 4) and the code generation consumers (Phase 5) do not.

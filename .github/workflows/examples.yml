@@ -33,6 +33,44 @@ jobs:
       - name: Build examples
         run: cargo build -p ironfix-example --examples
 
+      # The TLS pair (issue #81) needs the example crate's `tls` feature.
+      - name: Build and smoke test the TLS example pair
+        run: |
+          set -euo pipefail
+          cargo build -p ironfix-example --features tls \
+            --example fix44_tls_server --example fix44_tls_client
+          export FIX_PORT=9879 FIX_TLS_CA="$RUNNER_TEMP/ironfix-tls-ca.der"
+          ./target/debug/examples/fix44_tls_server > server-tls.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 30); do
+            if [ -s "$FIX_TLS_CA" ] && nc -z 127.0.0.1 "$FIX_PORT" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          # The client's exit status is kept, not discarded: a panic, an
+          # error return or the timeout (124) fails the step after the logs
+          # are shown, and so does any missing line.
+          client_rc=0
+          timeout 60 ./target/debug/examples/fix44_tls_client > client-tls.log 2>&1 \
+            || client_rc=$?
+          kill "$server_pid" 2>/dev/null || true
+          wait "$server_pid" 2>/dev/null || true
+          echo "--- server ---"; cat server-tls.log
+          echo "--- client ---"; cat client-tls.log
+          if [ "$client_rc" -ne 0 ]; then
+            echo "fix44_tls_client exited with status $client_rc"
+            exit 1
+          fi
+          for line in "logged on over TLS" "received 35=8 over TLS" "session closed: Some(LocalLogout"; do
+            if ! grep -qF "$line" client-tls.log; then
+              echo "fix44_tls_client log lacks: $line"
+              exit 1
+            fi
+          done
+          if ! grep -qF "logged on over TLS" server-tls.log; then
+            echo "fix44_tls_server log lacks: logged on over TLS"
+            exit 1
+          fi
+
       # Each pair gets its own port so a lingering socket from one run cannot
       # make the next one pass by accident.
       #

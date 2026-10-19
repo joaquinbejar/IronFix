@@ -21,6 +21,16 @@ ironfix-fast.workspace = true
 ironfix-engine.workspace = true
 rust_decimal.workspace = true
 thiserror.workspace = true
+# The TLS example pair only (feature `tls`): rcgen generates its throwaway
+# certificates at run time, and rustls' `ring` provider is the one the
+# examples select explicitly. Neither is built without the feature.
+rcgen = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true, features = ["ring"] }
+
+[features]
+default = []
+# The TLS example pair: forwards to ironfix-engine's `tls` feature (ADR-0009).
+tls = ["ironfix-engine/tls", "dep:rcgen", "dep:rustls"]
 
 [dev-dependencies]
 tokio.workspace = true
@@ -117,3 +127,13 @@ path = "examples/fix44_server_channel.rs"
 [[example]]
 name = "fast_server_lockfree"
 path = "examples/fast_server_lockfree.rs"
+
+[[example]]
+name = "fix44_tls_server"
+path = "examples/fix44_tls_server.rs"
+required-features = ["tls"]
+
+[[example]]
+name = "fix44_tls_client"
+path = "examples/fix44_tls_client.rs"
+required-features = ["tls"]

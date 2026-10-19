@@ -65,6 +65,15 @@ chrono = { version = "0.4", features = ["serde"] }
 itoa = "1.0"
 quick-xml = "0.42"
 
+# TLS for ironfix-engine's optional `tls` feature (ADR-0009). Default
+# features off on both: no crypto provider is forced on a consumer (the
+# caller's ClientConfig / ServerConfig carries the provider), and rustls'
+# `logging` feature, which would pull in the `log` crate, stays off.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+# Test-time certificates for the TLS tests (dev-dependency only).
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
+
 # SBE codec for the FIXP session messages (ironfix-fixp only). Approved by
 # ADR-0003; compatible 0.7 range, same author (joaquinbejar/IronSBE).
 ironsbe-core = "0.7.1"

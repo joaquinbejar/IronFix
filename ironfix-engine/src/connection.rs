@@ -576,7 +576,8 @@ impl Connection {
 
 /// Reports a Logon handshake that failed after `on_create` ran to
 /// [`Application::on_session_closed`](crate::Application::on_session_closed)
-/// as [`CloseReason::LogonFailed`], and hands the result back unchanged.
+/// as [`CloseReason::LogonFailed`] ([`CloseReason::Tls`] for an
+/// [`EngineError::Tls`]), and hands the result back unchanged.
 ///
 /// The detail stays in the [`EngineError`] the caller receives: the reason
 /// carries none of it, since a refused Logon can carry `Password` (554).
@@ -585,10 +586,14 @@ pub(crate) async fn report_handshake<A: crate::Application + ?Sized>(
     session_id: &SessionId,
     result: Result<Connection, EngineError>,
 ) -> Result<Connection, EngineError> {
-    if result.is_err() {
-        application
-            .on_session_closed(session_id, &CloseReason::LogonFailed {})
-            .await;
+    if let Err(err) = &result {
+        let reason = match err {
+            EngineError::Tls(tls) => CloseReason::Tls {
+                failure: tls.failure(),
+            },
+            _ => CloseReason::LogonFailed {},
+        };
+        application.on_session_closed(session_id, &reason).await;
     }
     result
 }

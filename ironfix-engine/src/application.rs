@@ -11,6 +11,7 @@
 
 use crate::close::CloseReason;
 use crate::outbound::OutboundMessage;
+use crate::tls::PeerInfo;
 use async_trait::async_trait;
 use ironfix_core::message::RawMessage;
 use std::future::Future;
@@ -144,6 +145,50 @@ pub trait Application: Send + Sync {
     /// # Arguments
     /// * `session_id` - The session identifier
     async fn on_create(&self, session_id: &SessionId);
+
+    /// Called when the transport has proved who the counterparty is, before
+    /// any FIX message is exchanged with it.
+    ///
+    /// Runs on the TLS entry points
+    /// (`Initiator::connect_tls`,
+    /// `Acceptor::serve_tls`,
+    /// `AcceptorRegistry::serve_tls`,
+    /// with the `tls` feature) once the TLS handshake has completed, and on
+    /// the `*_with_peer` stream entry points, after
+    /// [`Application::on_create`]. It never runs on a plain TCP or stream
+    /// session. `peer` carries the certificates the counterparty presented,
+    /// end-entity first, so an application can bind a client certificate to
+    /// the session it claims, for instance by requiring that it names the
+    /// session's `TargetCompID`.
+    ///
+    /// Bind to [`PeerInfo::end_entity_certificate`] only: it is the one
+    /// certificate the TLS layer verified against the configured roots. The
+    /// rest of the chain is metadata the peer chose to send, which may hold
+    /// unrelated certificates nobody verified; an entry after the first
+    /// proves neither a verified issuer nor an identity.
+    ///
+    /// The initiator calls it before its Logon, which may carry `Password`
+    /// (554), is written; the acceptor before the inbound Logon is read (for
+    /// an [`AcceptorRegistry`](crate::AcceptorRegistry), once the Logon has
+    /// been routed to `session_id`, before it is checked). An `Err` closes the
+    /// connection without writing anything to it, no store is touched, and
+    /// the caller gets [`EngineError::Tls`](crate::EngineError::Tls) carrying
+    /// [`TlsError::PeerRejected`](crate::TlsError::PeerRejected) with the
+    /// reason's `text`; [`Application::on_session_closed`] gets
+    /// [`CloseReason::Tls`]. The reason's `code` and `ref_tag` are not used.
+    ///
+    /// The default accepts every peer the TLS layer accepted.
+    ///
+    /// # Arguments
+    /// * `session_id` - The session the connection is for
+    /// * `peer` - What the transport proved about the counterparty
+    async fn authorize_peer(
+        &self,
+        _session_id: &SessionId,
+        _peer: &PeerInfo,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
 
     /// Called on successful logon.
     ///

@@ -7,6 +7,7 @@
 //! Engine error types.
 
 use crate::registry::{LogonIdentity, LookupError};
+use crate::tls::TlsError;
 use ironfix_core::error::{DecodeError, EncodeError, StoreError};
 use ironfix_session::config::SessionConfigError;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
@@ -69,6 +70,13 @@ pub enum EngineError {
     /// TCP connect did not complete within the configured timeout.
     #[error("connect timed out after {0:?}")]
     ConnectTimeout(Duration),
+
+    /// A TLS failure: the handshake failed or timed out, or
+    /// [`Application::authorize_peer`](crate::Application::authorize_peer)
+    /// refused the counterparty. Raised before any FIX message is exchanged.
+    /// See [`crate::tls`].
+    #[error(transparent)]
+    Tls(#[from] TlsError),
 
     /// The Logon (acceptor) or Logon acknowledgement (initiator) did not
     /// arrive intact within the logon timeout.

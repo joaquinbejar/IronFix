@@ -215,6 +215,7 @@ use crate::reactor::{
 };
 use crate::stream::SessionStream;
 use crate::throttle::ThrottleConfig;
+use crate::tls::{self, DEFAULT_TLS_HANDSHAKE_TIMEOUT, PeerInfo};
 use crate::wire::{
     self, ApplVersionGuard, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion,
 };
@@ -255,6 +256,8 @@ pub struct Initiator<A: Application = NoOpApplication> {
     config_check: Result<(), SessionConfigError>,
     /// TCP connect timeout.
     connect_timeout: Duration,
+    /// Bound on the TLS handshake of `Initiator::connect_tls`.
+    tls_handshake_timeout: Duration,
     /// The write timeout: bound on a handshake write, and on how long an
     /// established session's output may make no progress.
     write_timeout: Duration,
@@ -283,6 +286,7 @@ impl<A: Application> std::fmt::Debug for Initiator<A> {
             .field("session_id", &self.session_id)
             .field("version", &self.version)
             .field("connect_timeout", &self.connect_timeout)
+            .field("tls_handshake_timeout", &self.tls_handshake_timeout)
             .field("write_timeout", &self.write_timeout)
             .field("initial_sequences", &self.initial_sequences)
             .field("outbound_capacity", &self.outbound_capacity)
@@ -329,6 +333,7 @@ impl<A: Application + 'static> Initiator<A> {
             version,
             config_check,
             connect_timeout: Duration::from_secs(30),
+            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             initial_sequences: None,
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
@@ -434,6 +439,26 @@ impl<A: Application + 'static> Initiator<A> {
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
+    }
+
+    /// Sets the bound on the TLS handshake of `Initiator::connect_tls`
+    /// (`tls` feature), [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`] by default.
+    ///
+    /// It starts once the TCP connection is up (the connect timeout bounds
+    /// the dial) and ends with the handshake; the logon timeout starts after
+    /// it. Expiry fails the connect with [`EngineError::Tls`] carrying
+    /// [`TlsError::HandshakeTimeout`](crate::TlsError::HandshakeTimeout).
+    /// No other entry point runs a TLS handshake, so none reads it.
+    #[must_use]
+    pub const fn with_tls_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.tls_handshake_timeout = timeout;
+        self
+    }
+
+    /// The bound on the TLS handshake of `Initiator::connect_tls`.
+    #[must_use]
+    pub const fn tls_handshake_timeout(&self) -> Duration {
+        self.tls_handshake_timeout
     }
 
     /// Sets the write timeout (default 10s): how long the session's output
@@ -697,38 +722,118 @@ impl<A: Application + 'static> Initiator<A> {
 
         // Typestate: Disconnected -> Connecting.
         let session = Session::<Disconnected>::new(session_id.to_string()).connect();
+        let (session, stream) = self.dial(session, addr).await?;
 
-        let result = match timeout(self.connect_timeout, TcpStream::connect(addr)).await {
-            Err(_) => {
-                let _ = session.disconnect();
-                let reason = CloseReason::ConnectFailed {
+        // The only way to a TCP session: it sets TCP_NODELAY.
+        let result = self
+            .logon(version, session, SessionStream::tcp(stream))
+            .await;
+        // `on_create` has run: a failure from here is reported to the
+        // application as well as returned.
+        report_handshake(&*self.application, &session_id, result).await
+    }
+
+    /// Dials the counterparty over TCP, bounded by the connect timeout.
+    ///
+    /// `on_create` has run, so a failed dial is reported to
+    /// [`Application::on_session_closed`] as [`CloseReason::ConnectFailed`]
+    /// here, as well as returned.
+    ///
+    /// # Errors
+    /// [`EngineError::ConnectTimeout`], or [`EngineError::Io`] for a failed
+    /// dial.
+    async fn dial(
+        &self,
+        session: Session<Connecting>,
+        addr: impl ToSocketAddrs,
+    ) -> Result<(Session<Connecting>, TcpStream), EngineError> {
+        let (reason, err) = match timeout(self.connect_timeout, TcpStream::connect(addr)).await {
+            Ok(Ok(stream)) => return Ok((session, stream)),
+            Err(_) => (
+                CloseReason::ConnectFailed {
                     kind: None,
                     timed_out: true,
-                };
-                self.application
-                    .on_session_closed(&session_id, &reason)
-                    .await;
-                return Err(EngineError::ConnectTimeout(self.connect_timeout));
-            }
-            Ok(Err(err)) => {
-                let _ = session.disconnect();
-                let reason = CloseReason::ConnectFailed {
+                },
+                EngineError::ConnectTimeout(self.connect_timeout),
+            ),
+            Ok(Err(err)) => (
+                CloseReason::ConnectFailed {
                     kind: Some(err.kind()),
                     timed_out: false,
-                };
-                self.application
-                    .on_session_closed(&session_id, &reason)
-                    .await;
-                return Err(err.into());
+                },
+                err.into(),
+            ),
+        };
+        let _ = session.disconnect();
+        self.application
+            .on_session_closed(&self.session_id, &reason)
+            .await;
+        Err(err)
+    }
+
+    /// Dials the counterparty, completes a TLS handshake over the socket,
+    /// then the Logon handshake inside TLS, and spawns the session reactor.
+    ///
+    /// Available with the `tls` feature. `config` is the caller's: it carries
+    /// the crypto provider, the protocol versions and cipher suites, the
+    /// roots the server certificate is verified against, and, for mutual
+    /// TLS, the client certificate. `server_name` is the name the server
+    /// certificate must be valid for. Build both against
+    /// [`crate::tls::rustls`], the rustls version this crate is built
+    /// against. See ADR-0009 (`doc/adr/0009-tls.md`).
+    ///
+    /// The order is: the configuration checks, `on_create`, the TCP dial
+    /// (bounded by the connect timeout; `TCP_NODELAY` is set on the socket),
+    /// the TLS handshake (bounded by
+    /// [`Initiator::with_tls_handshake_timeout`]),
+    /// [`Application::authorize_peer`] with the server's certificate chain,
+    /// and only then the Logon, so credentials stamped on it by `to_admin`
+    /// are written to a server that proved its identity and the application
+    /// accepted. From the Logon on, everything is as on
+    /// [`Initiator::connect`]: FIX framing is unchanged inside TLS, and
+    /// `EncryptMethod` (98) stays 0. The TLS stream is boxed once, as on
+    /// [`Initiator::establish`].
+    ///
+    /// # Errors
+    /// Every error [`Initiator::connect`] documents, and
+    /// [`EngineError::Tls`] when the handshake fails (an untrusted or expired
+    /// certificate, a name mismatch, no common protocol), times out, or
+    /// `authorize_peer` refuses the server. A TLS failure is reported to
+    /// [`Application::on_session_closed`] as [`CloseReason::Tls`].
+    #[cfg(feature = "tls")]
+    pub async fn connect_tls(
+        &self,
+        addr: impl ToSocketAddrs,
+        config: Arc<crate::tls::rustls::ClientConfig>,
+        server_name: crate::tls::rustls::pki_types::ServerName<'static>,
+    ) -> Result<Connection, EngineError> {
+        let version = self.preflight()?;
+
+        let session_id = self.session_id.clone();
+        self.application.on_create(&session_id).await;
+
+        // Typestate: Disconnected -> Connecting. The Logon is not sent until
+        // TLS is up and the server is authorized.
+        let session = Session::<Disconnected>::new(session_id.to_string()).connect();
+        let (session, stream) = self.dial(session, addr).await?;
+
+        let result = match crate::tls::handshake::connect(
+            stream,
+            config,
+            server_name,
+            self.tls_handshake_timeout,
+        )
+        .await
+        {
+            Err(err) => {
+                let _ = session.disconnect();
+                Err(err.into())
             }
-            // The only way to a TCP session: it sets TCP_NODELAY.
-            Ok(Ok(stream)) => {
-                self.logon(version, session, SessionStream::tcp(stream))
+            Ok((stream, peer)) => {
+                self.logon_with_peer(version, session, SessionStream::erased(stream), &peer)
                     .await
             }
         };
-        // `on_create` has run: a failure from here is reported to the
-        // application as well as returned.
         report_handshake(&*self.application, &session_id, result).await
     }
 
@@ -831,6 +936,70 @@ impl<A: Application + 'static> Initiator<A> {
             .logon(version, session, SessionStream::erased(stream))
             .await;
         report_handshake(&*self.application, &session_id, result).await
+    }
+
+    /// [`Initiator::establish`] on a stream whose counterparty the caller's
+    /// transport has proved, typically a TLS stream from a TLS stack of the
+    /// caller's choice, with the certificates the peer presented.
+    ///
+    /// Runs [`Application::authorize_peer`] with `peer` after `on_create`
+    /// and before the Logon is written; everything else is
+    /// [`Initiator::establish`], unchanged. This is how a peer reaches the
+    /// application without a new bound on the stream type (ADR-0007 froze
+    /// it). The engine trusts `peer` as given: verifying the chain is the
+    /// caller's TLS stack's job.
+    ///
+    /// # Arguments
+    /// * `stream` - A connected byte stream to the counterparty
+    /// * `peer` - What the transport proved about the counterparty
+    ///
+    /// # Errors
+    /// Every error [`Initiator::establish`] documents, and
+    /// [`EngineError::Tls`] carrying
+    /// [`TlsError::PeerRejected`](crate::TlsError::PeerRejected) when
+    /// `authorize_peer` refuses the peer; nothing is written to the stream
+    /// then.
+    pub async fn establish_with_peer<S>(
+        &self,
+        stream: S,
+        peer: PeerInfo,
+    ) -> Result<Connection, EngineError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let version = self.preflight()?;
+
+        let session_id = self.session_id.clone();
+        self.application.on_create(&session_id).await;
+
+        // Typestate: Disconnected -> Connecting.
+        let session = Session::<Disconnected>::new(session_id.to_string()).connect();
+
+        let result = self
+            .logon_with_peer(version, session, SessionStream::erased(stream), &peer)
+            .await;
+        report_handshake(&*self.application, &session_id, result).await
+    }
+
+    /// [`Initiator::logon`] for a counterparty the transport proved:
+    /// [`Application::authorize_peer`] first, and nothing is written to the
+    /// stream if it refuses.
+    ///
+    /// # Errors
+    /// [`EngineError::Tls`] for a refused peer, then every error of
+    /// [`Initiator::logon`].
+    async fn logon_with_peer(
+        &self,
+        version: FixVersion,
+        session: Session<Connecting>,
+        stream: SessionStream,
+        peer: &PeerInfo,
+    ) -> Result<Connection, EngineError> {
+        if let Err(err) = tls::authorize(&*self.application, &self.session_id, peer).await {
+            let _ = session.disconnect();
+            return Err(err);
+        }
+        self.logon(version, session, stream).await
     }
 
     /// The checks [`Initiator::connect`] and [`Initiator::establish`] make
