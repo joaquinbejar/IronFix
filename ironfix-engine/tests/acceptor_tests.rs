@@ -2723,3 +2723,91 @@ async fn test_acceptor_live_session_answers_no_wrong_version_logon() {
     assert_eq!(field(&heartbeat, 112).as_deref(), Some("STILL-THERE"));
     assert!(!connection.is_closed());
 }
+
+/// Client-side frame on a FIX 4.1 session (49=CLIENT, 56=VENUE), with the
+/// whole-second `SendingTime` (52) that version types as `time`.
+fn client_msg_fix41(msg_type: &str, seq: u64, extra: &[(u32, &str)]) -> BytesMut {
+    let mut encoder = Encoder::new("FIX.4.1");
+    encoder.put_str(35, msg_type);
+    encoder.put_str(49, "CLIENT");
+    encoder.put_str(56, "VENUE");
+    encoder.put_uint(34, seq);
+    encoder.put_str(52, Timestamp::now().format_seconds().as_str());
+    for (tag, value) in extra {
+        encoder.put_str(*tag, value);
+    }
+    let mut frame = BytesMut::new();
+    ok(
+        encoder.finish_into(&mut frame),
+        "test fixture frame must encode",
+    );
+    frame
+}
+
+/// FIX 4.0 and 4.1 write an open-ended `EndSeqNo` (16) as 999999 (#137). On
+/// a FIX 4.1 acceptor, an inbound `16=999999` is answered in full from the
+/// store, and a gap the acceptor detects is requested with `16=999999`.
+#[tokio::test]
+async fn test_acceptor_fix41_resend_request_uses_end_seq_no_999999() {
+    let store = Arc::new(MemoryStore::new());
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let config = SessionConfig::new(comp_id("VENUE"), comp_id("CLIENT"), "FIX.4.1")
+        .with_heartbeat_interval(Duration::from_secs(30));
+    let acceptor = Acceptor::new(config, Arc::clone(&venue_app))
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+
+    let (listener, addr) = bind_listener().await;
+    let venue = tokio::spawn(async move { acceptor.accept(&listener).await });
+    let stream = ok(TcpStream::connect(addr).await, "client connects");
+    let mut framed = Framed::new(stream, FixCodec::new());
+    ok(
+        framed
+            .send(client_msg_fix41("A", 1, &[(98, "0"), (108, "30")]))
+            .await,
+        "client sends its logon",
+    );
+    let ack = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&ack), "A");
+    let connection = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), venue).await,
+                "handshake within 5s",
+            ),
+            "venue task joins",
+        ),
+        "acceptor establishes the session",
+    );
+
+    // Reports at 2 and 3.
+    send_reports(&connection, 1, 2).await;
+    for seq in ["2", "3"] {
+        let frame = next_frame(&mut framed).await;
+        assert_eq!(field(&frame, 34).as_deref(), Some(seq));
+    }
+
+    // Inbound "to infinity" in the FIX 4.1 form: both reports are replayed.
+    ok(
+        framed
+            .send(client_msg_fix41("2", 2, &[(7, "2"), (16, "999999")]))
+            .await,
+        "send open-ended ResendRequest",
+    );
+    for seq in ["2", "3"] {
+        let replay = next_frame(&mut framed).await;
+        assert_eq!(msg_type_of(&replay), "8");
+        assert_eq!(field(&replay, 34).as_deref(), Some(seq));
+        assert_eq!(field(&replay, 43).as_deref(), Some("Y"));
+    }
+
+    // A gap from the client (3 expected, 6 received) is requested open-ended.
+    ok(
+        framed.send(client_msg_fix41("0", 6, &[])).await,
+        "send gapped heartbeat",
+    );
+    let resend = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&resend), "2");
+    assert_eq!(field(&resend, 8).as_deref(), Some("FIX.4.1"));
+    assert_eq!(field(&resend, 7).as_deref(), Some("3"));
+    assert_eq!(field(&resend, 16).as_deref(), Some("999999"));
+}

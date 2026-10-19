@@ -656,7 +656,7 @@ sent and **nothing at all** arrived in the interval that followed.
 |-----|------------|-------------|
 | 35 | MsgType | "2" |
 | 7 | BeginSeqNo | First sequence number to resend |
-| 16 | EndSeqNo | Last sequence number (0 = infinity) |
+| 16 | EndSeqNo | Last sequence number (0 = infinity; 999999 on FIX 4.0 and 4.1) |
 
 **Server Behavior**:
 1. Retrieve messages from message store
@@ -687,12 +687,14 @@ whole range with one gap fill (see "Without a store" below).
 - `BeginSeqNo` = 0, or at or beyond our next outbound sequence number → session
   Reject, reason 5 (value incorrect), `RefTagID` = 7. We cannot resend what we
   have not sent.
-- `EndSeqNo` below `BeginSeqNo` (and not 0) → session Reject, reason 5,
-  `RefTagID` = 16.
+- `EndSeqNo` below `BeginSeqNo` (and not open-ended) → session Reject,
+  reason 5, `RefTagID` = 16. "Open-ended" is `0` on FIX 4.2 and later, and
+  `999999` or `0` on FIX 4.0 and 4.1 (see "FIX 4.0 - 4.2" below).
 
 *The reply range.* The reply always covers exactly
 `BeginSeqNo .. NewSeqNo`, where `NewSeqNo` = min(EndSeqNo + 1, next outbound
-sequence), or the next outbound sequence when `EndSeqNo` = 0 (infinity). A
+sequence), or the next outbound sequence when `EndSeqNo` is open-ended
+(infinity). A
 bounded request therefore never advances the counterparty past what it asked
 for (unless more than 64 requests were queued at once and it was merged with
 a later one, below), and every sequence number inside the range is accounted
@@ -989,19 +991,12 @@ number as one record.
 
 Not done: inbound frames are not filed (only the target counter is kept).
 
-**Outbound `EndSeqNo` sentinel — a version caveat.** When the engine detects an
-inbound gap it requests retransmission with `EndSeqNo` (16) = 0, the open-ended
-"to infinity" sentinel. That `16=0` convention was introduced in FIX 4.2; FIX
-4.0 and 4.1 instead use `999999` for an open-ended request and read `16=0` as an
-empty range. IronFix emits `16=0` for **every** configured version — the
-sentinel is not selected by `BeginString` — so an open-ended resend request sent
-to a strict FIX 4.0/4.1 counterparty is not framed the way that version expects.
-This is recorded here as a **known limitation** rather than fixed with a
-version-aware sentinel; selecting the sentinel by `BeginString` is small,
-isolated follow-up work. (The inbound direction is unaffected in practice: a
-`16=999999` request from such a peer resolves to the same range as `16=0`,
-because the GapFill's `NewSeqNo` is capped at our next outbound sequence
-regardless.)
+**Open-ended `EndSeqNo` by version (#137).** When the engine detects an
+inbound gap it requests retransmission with an open-ended `EndSeqNo` (16). FIX
+4.2 introduced `0` for "to infinity"; FIX 4.0 and 4.1 use `999999`. The engine
+selects the sentinel from the session's `FixVersion`: `16=999999` on a FIX 4.0
+or 4.1 session, `16=0` on FIX 4.2 and later, FIXT.1.1 included. See
+"FIX 4.0 - 4.2" below for how an inbound value is read.
 
 **Outbound resend recovery is bounded.** When *this* engine detects an inbound
 gap it sends a `ResendRequest` and waits. A peer that never satisfies it — while
@@ -2311,6 +2306,25 @@ every other admin message, application messages, the 52 and 122 of a
 SequenceReset-GapFill, and the 52 and 122 of a replayed message. Inbound,
 `SendingTime` is read in either form, with or without a fraction of one to
 nine digits, whatever the session's version.
+
+**ResendRequest `EndSeqNo` (16) "to infinity".** FIX 4.0 and FIX 4.1 write
+an open-ended request as `999999`; FIX 4.2 replaced it with `0`. Both engines,
+in both roles, send `16=999999` on a FIX 4.0 or 4.1 session and `16=0` on
+every later version. Inbound, a FIX 4.0 or 4.1 session reads both `999999` and
+`0` as infinity: `0` cannot name a range there, so it is answered rather than
+rejected when a peer uses the later convention. A FIX 4.2 or later session
+reads only `0` as infinity and keeps `999999` a literal bound; the reply is
+capped at our next outbound number regardless, so it is answered in full
+unless more than 999999 messages have been sent. This literal policy is
+deliberate and differs from QuickFIX, which treats `999999` as infinity on
+FIX 4.2 too (QuickFIX/C++ `src/C++/Session.cpp` lines 357 to 360; QuickFIX/J
+`quickfixj-core/src/main/java/quickfix/Session.java` lines 1269 to 1275). The
+reply range is the same unless more than 999999 messages were sent; past that,
+IronFix answers only up to 999999 where QuickFIX answers to its next number.
+
+The engine-independent demo session (`ironfix-example`, `DemoSession`) also
+writes `SendingTime` (52) in whole seconds on FIX 4.0 and 4.1 and in
+milliseconds from FIX 4.2.
 
 ### FIX 4.3 - 4.4
 - Enhanced execution report
