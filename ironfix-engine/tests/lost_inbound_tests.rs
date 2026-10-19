@@ -271,6 +271,14 @@ struct CrashStore {
     inner: Mutex<Option<Arc<dyn MessageStore>>>,
     point: Point,
     crashed: AtomicBool,
+    /// A watermark write held back this long before it is made. The hold
+    /// is taken under `gate`, so later mutations wait behind it: the store
+    /// still applies mutations in call order, as the contract requires.
+    slow_watermark: Option<(u64, Duration)>,
+    /// Serialises the counter and watermark mutations.
+    gate: tokio::sync::Mutex<()>,
+    /// The order the counter and watermark mutations were issued in.
+    issued: Mutex<Vec<String>>,
 }
 
 impl CrashStore {
@@ -279,6 +287,25 @@ impl CrashStore {
             inner: Mutex::new(Some(inner)),
             point,
             crashed: AtomicBool::new(false),
+            slow_watermark: None,
+            gate: tokio::sync::Mutex::new(()),
+            issued: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn with_slow_watermark(
+        inner: Arc<dyn MessageStore>,
+        point: Point,
+        watermark: u64,
+        delay: Duration,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Some(inner)),
+            point,
+            crashed: AtomicBool::new(false),
+            slow_watermark: Some((watermark, delay)),
+            gate: tokio::sync::Mutex::new(()),
+            issued: Mutex::new(Vec::new()),
         })
     }
 
@@ -305,6 +332,20 @@ impl CrashStore {
         match self.inner() {
             Some(inner) => inner,
             None => std::future::pending().await,
+        }
+    }
+
+    fn issue(&self, call: String) {
+        match self.issued.lock() {
+            Ok(mut issued) => issued.push(call),
+            Err(_) => panic!("crash store lock poisoned"),
+        }
+    }
+
+    fn issued(&self) -> Vec<String> {
+        match self.issued.lock() {
+            Ok(issued) => issued.clone(),
+            Err(_) => panic!("crash store lock poisoned"),
         }
     }
 
@@ -355,6 +396,8 @@ impl MessageStore for CrashStore {
     }
 
     async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.issue(format!("T{seq}"));
+        let _gate = self.gate.lock().await;
         let result = self.alive().await.set_next_target_seq(seq).await;
         if self.point == Point::TargetAfter(seq) {
             self.dead().await;
@@ -383,8 +426,15 @@ impl MessageStore for CrashStore {
     }
 
     async fn set_app_watermark(&self, watermark: u64) -> Result<(), StoreError> {
+        self.issue(format!("W{watermark}"));
+        let _gate = self.gate.lock().await;
         if self.point == Point::WatermarkBefore(watermark) {
             self.dead().await;
+        }
+        if let Some((slow, delay)) = self.slow_watermark
+            && slow == watermark
+        {
+            tokio::time::sleep(delay).await;
         }
         let result = self.alive().await.set_app_watermark(watermark).await;
         if self.point == Point::WatermarkAfter(watermark) {
@@ -1147,4 +1197,90 @@ async fn test_no_store_still_reports_a_drain_timeout() {
         app.losses(),
         vec![(2, 3, InboundLossCause::DispatcherStopped)]
     );
+}
+
+// ---------------------------------------------------------------------------
+// The opening watermark is durable before any target write (review of #157)
+// ---------------------------------------------------------------------------
+
+/// The invariant behind the fix: the opening watermark write (1, for the
+/// Logon) is **issued and completed** before the target write of the first
+/// application message (3) is issued. When the opening write was left to the
+/// dispatcher task, nothing ordered the two tasks: the reactor could issue
+/// target 3 before the dispatcher had been polled at all, and a crash then
+/// left W = 0 ("none") under cursor 3, hiding the loss of 2.
+///
+/// The store here conforms to the call-order contract (a held write holds
+/// every later mutation behind it), so the test does not rely on a store
+/// reordering writes: it checks the order the engine issues them in. The
+/// opening write is slow and the counterparty sends message 2 at once; the
+/// store crashes once target 3 has landed, and 2 is reported.
+async fn slow_opening_watermark(role: Role, kind: Kind) {
+    let case = format!("{role:?} {kind:?}: slow opening watermark");
+    let durable = Durable::new(kind, &format!("{role:?}-opening")).await;
+    let store = CrashStore::with_slow_watermark(
+        Arc::clone(&durable.store),
+        Point::TargetAfter(3),
+        1,
+        Duration::from_millis(300),
+    );
+    let app = Recorder::new();
+    let mut live = start(
+        role,
+        Arc::clone(&store) as Arc<dyn MessageStore>,
+        Arc::clone(&app),
+        1,
+        false,
+        StoreFailurePolicy::CloseSession,
+    )
+    .await;
+    send(&mut live.peer, role.app_frame(2)).await;
+    until(&format!("{case}: the store crashes"), || {
+        store.has_crashed()
+    })
+    .await;
+    assert!(
+        app.delivered().is_empty(),
+        "{case}: 2 never reached from_app"
+    );
+    let issued = store.issued();
+    let opening = issued.iter().position(|call| call == "W1");
+    let first_app_target = issued.iter().position(|call| call == "T3");
+    assert!(
+        matches!((opening, first_app_target), (Some(w), Some(t)) if w < t),
+        "{case}: the opening watermark is issued before target 3: {issued:?}"
+    );
+    let durable = durable.restart().await;
+    assert_eq!(durable.store.next_target_seq(), 3, "{case}: cursor past 2");
+    assert_eq!(
+        durable.store.app_watermark(),
+        1,
+        "{case}: the opening W landed first"
+    );
+    let after = restart_and_continue_at(role, Arc::clone(&durable.store), 3, &case).await;
+    let losses: Vec<_> = after
+        .iter()
+        .filter_map(|event| match event {
+            Event::Lost(first, last, cause) => Some((*first, *last, *cause)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        losses,
+        vec![(2, 2, InboundLossCause::FoundAtStart)],
+        "{case}: the loss of 2 is reported"
+    );
+    drop(live);
+}
+
+#[tokio::test]
+async fn test_slow_opening_watermark_still_reports_the_loss_initiator() {
+    slow_opening_watermark(Role::Initiator, Kind::Memory).await;
+    slow_opening_watermark(Role::Initiator, Kind::File).await;
+}
+
+#[tokio::test]
+async fn test_slow_opening_watermark_still_reports_the_loss_acceptor() {
+    slow_opening_watermark(Role::Acceptor, Kind::Memory).await;
+    slow_opening_watermark(Role::Acceptor, Kind::File).await;
 }

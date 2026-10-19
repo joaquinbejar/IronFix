@@ -1105,9 +1105,9 @@ impl<A: Application> AppDispatcher<A> {
 /// everything (administrative messages included). A published mark is taken
 /// only once every frame queued before it has been delivered: the reactor
 /// queues a frame before it publishes a mark covering it, so draining the
-/// queue after seeing the mark finds every such frame. The mark the channel
-/// holds when the task starts (the session's opening position) is written
-/// first, before any frame is delivered.
+/// queue after seeing the mark finds every such frame. The session's opening
+/// position is persisted by the reactor itself before it acts on any inbound
+/// message, so it is durable before any target write can move past it.
 ///
 /// The task ends when the reactor drops the queue's sender, which every exit
 /// path of [`run_reactor`] does; it accounts for the last published mark
@@ -1118,10 +1118,11 @@ async fn run_app_dispatcher<A: Application>(
     mut frames: mpsc::Receiver<AppFrame>,
     mut marks: watch::Receiver<u64>,
 ) {
-    let opening = *marks.borrow_and_update();
-    if !dispatcher.account(opening).await {
-        return;
-    }
+    // The opening mark was persisted by the reactor before it acted on any
+    // inbound message (`Reactor::persist_opening_watermark`); `written`
+    // starts there. The channel is not read here: a later mark the reactor
+    // may already have published must wait, like any other, until the
+    // frames queued before it are delivered.
     let mut marks_open = true;
     loop {
         tokio::select! {
@@ -2141,11 +2142,20 @@ async fn run_reactor<A: Application + 'static>(
     // the path below, which runs `on_logout`, the close-time reset and the
     // last counter writes. A failure leaves no phase, and the first pass of
     // the loop ends the session with it.
-    let (mut phase, mut opening_failure) =
-        match ctx.open(&mut framed, Phase::Active(session), opening).await {
+    // The opening watermark is made durable before anything else: once the
+    // first inbound message is acted on, its target write must never be on
+    // the store with no watermark below it, or a crash would leave W = 0
+    // ("none") and the loss would go unreported (ADR-0030).
+    let (mut phase, mut opening_failure) = match ctx.persist_opening_watermark().await {
+        Err(err) => (
+            None,
+            Some(ctx.close_on_store_failure(Phase::Active(session), &err)),
+        ),
+        Ok(()) => match ctx.open(&mut framed, Phase::Active(session), opening).await {
             Ok(phase) => (Some(phase), None),
             Err(outcome) => (None, Some(outcome)),
-        };
+        },
+    };
     let mut commands_open = true;
     let mut rejects_open = true;
     // Whether the latest pass of the loop started with a resend under way,
@@ -2757,6 +2767,35 @@ impl<A: Application> Reactor<A> {
             self.published = mark;
             self.accounted.send_replace(mark);
         }
+    }
+
+    /// Persists the session's opening position (everything the handshake
+    /// processed, one below the next expected target) as the inbound
+    /// application watermark, before the reactor acts on any inbound message.
+    ///
+    /// Written here, in the reactor's own order, and not by the dispatcher:
+    /// a write left pending on the dispatcher could land after the target
+    /// write of the first application message, and a crash in between would
+    /// leave the stored watermark at 0, which reads as "none", hiding the
+    /// loss.
+    ///
+    /// # Errors
+    /// The store's error under [`StoreFailurePolicy::CloseSession`].
+    async fn persist_opening_watermark(&self) -> Result<(), StoreError> {
+        let Some(store) = self.store.as_deref() else {
+            return Ok(());
+        };
+        if self.published == 0 {
+            return Ok(());
+        }
+        SessionStore::new(
+            store,
+            self.store_policy,
+            self.store_timeout,
+            &self.reset_owed,
+        )
+        .persist_app_watermark(&self.session_id, self.published)
+        .await
     }
 
     /// Reports the span the application dispatcher did not finish when the
@@ -6137,7 +6176,8 @@ where
     //
     // The handshake has processed everything below the next target number,
     // and nothing has been handed over yet: that is where the watermark
-    // starts, in memory and (written first by the dispatcher) in the store.
+    // starts, in memory and (written by the reactor before it acts on anything,
+    // `Reactor::persist_opening_watermark`) in the store.
     let opening_mark = match runtime.sequences.next_target_seq().value().checked_sub(1) {
         Some(mark) => mark,
         None => {
@@ -6161,7 +6201,7 @@ where
                 timeout: store_timeout,
                 owed: Arc::clone(&reset_owed),
             },
-            written: 0,
+            written: opening_mark,
         },
         app_rx,
         marks,

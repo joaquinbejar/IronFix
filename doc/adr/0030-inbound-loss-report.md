@@ -56,7 +56,16 @@ W is kept by the application dispatcher, the task that runs `from_app`:
   application messages therefore move W, without going through the bounded
   application queue, so they can never fill it or change its capacity;
 - the session's opening position (everything the handshake processed) is the
-  first mark, written before any frame is delivered;
+  first mark. The **reactor** writes it, and awaits it, before it acts on any
+  inbound message, so it is durable before any target write of the session
+  can be issued. It is not left to the dispatcher: the dispatcher is a
+  separate task, nothing orders its first store call against the reactor's,
+  and the reactor could persist the target of the first application message
+  before the dispatcher was even polled. A crash there would have left the
+  stored W at 0 ("none") under an advanced cursor, and the loss unreported
+  (found in review of PR #157). The dispatcher does not read the mark channel
+  when it starts: a later mark already published waits, like any other, until
+  the frames queued before it are delivered;
 - when the queue closes at the end of a session the dispatcher accounts for
   the last mark, so a clean close leaves W at the last number accepted.
 
