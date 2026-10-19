@@ -766,6 +766,16 @@ impl Session {
             // Section 4.6.1: accept what follows the gap, request the gap.
             FlowType::Recoverable => {
                 if !self.record_gap(core.config(), expected, next) {
+                    // `inbound_next` already stands past this gap, so it is
+                    // kept as the one gap above the bound: the binding
+                    // terminates now (no further gap is admitted while the
+                    // queue is over its bound), and after re-establishment
+                    // it is requested once the gaps before it are recovered.
+                    // Dropping it would lose `expected..next` for good.
+                    self.missing.push_back(Gap {
+                        from: expected,
+                        end: next,
+                    });
                     return self.violation(core, binding, "too many unrecovered sequence gaps");
                 }
                 self.request_missing(core, binding, now)
@@ -786,7 +796,8 @@ impl Session {
     }
 
     /// Adds `from..end` to the unrecovered gaps, merging with the last one
-    /// when contiguous. Returns `false` past `max_pending_gaps`.
+    /// when contiguous. Returns `false` past `max_pending_gaps`, recording
+    /// nothing.
     fn record_gap(&mut self, config: &FixpConfig, from: u64, end: u64) -> bool {
         if let Some(last) = self.missing.back_mut()
             && last.end == from
