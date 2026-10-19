@@ -216,8 +216,9 @@ pub enum StoreFailurePolicy {
     /// is acted on anyway, and a counter that could not be persisted is simply
     /// not durable.
     ///
-    /// A frame that could not be filed cannot be replayed; a later
-    /// `ResendRequest` covering it gets a `SequenceReset`-GapFill instead. This
+    /// A frame whose filing failed is not confirmed as filed; a later
+    /// `ResendRequest` covering it replays it if the store saved it despite
+    /// the error, and gets a `SequenceReset`-GapFill otherwise. This
     /// is the default, and what the engine always did before store writes were
     /// fallible. It gives **no** crash guarantee: after a failed write, a crash
     /// can leave the store behind what the counterparty has seen.
@@ -931,8 +932,9 @@ async fn refresh(
 /// counter agree before any byte reaches the socket, and a write that fails
 /// afterwards cannot lead to `seq` being reused.
 ///
-/// Returns whether the frame was filed: false without a store, and false
-/// under [`StoreFailurePolicy::Continue`] when the filing failed.
+/// Returns whether the store confirmed it filed the frame: false without a
+/// store, and false under [`StoreFailurePolicy::Continue`] when the filing
+/// failed or timed out (the store may still hold the frame).
 ///
 /// # Errors
 /// [`EngineError::SequenceExhausted`] when `seq` is `u64::MAX`;

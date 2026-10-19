@@ -1131,7 +1131,7 @@ that never collapse into one another:
 
 | Outcome | Meaning | `MsgSeqNum` |
 |---|---|---|
-| `Sent { seq, sending_time, filed }` | A flush of the write buffer covering the frame completed; `sending_time` is the `SendingTime` (52) on the wire, whole seconds on FIX 4.0 and 4.1; `filed` says whether the store accepted it | spent, the one the counterparty reads |
+| `Sent { seq, sending_time, filed }` | A flush of the write buffer covering the frame completed; `sending_time` is the `SendingTime` (52) on the wire, whole seconds on FIX 4.0 and 4.1; `filed` says whether the store confirmed it filed the frame; false means filing was not confirmed (no store, or a failed or timed out filing under `Continue`), and such a frame may or may not be replayed, since a store can fail after saving it | spent, the one the counterparty reads |
 | `NotSent { reason }` | No byte of the frame reached the stream | not spent |
 | `Unknown { seq, reason }` | The frame was buffered (or being filed) and the session ended before a flush covering it completed (a failed write, the write timeout, a closing flush that did not drain, the reactor stopped); the session closes | spent when the frame was buffered; replayed only under the conditions below |
 
@@ -1140,7 +1140,8 @@ that never collapse into one another:
 form, as handed in or as the callback left it; the detail names the tag and
 never quotes a field value), `StoreRefused` (filing failed or timed out under
 `StoreFailurePolicy::CloseSession`, which then closes the session; under
-`Continue` the frame is written anyway and reports `Sent` with `filed` false),
+`Continue` the frame is written anyway and reports `Sent` with `filed` false,
+filing not confirmed),
 `SequenceExhausted`, `SessionClosed` (never queued), `LogoutPending` (reached
 while this session's own Logout was pending, or waiting behind a resend the
 counterparty asked for after that Logout when the session ended), `Discarded`
@@ -1171,12 +1172,14 @@ never asked for.
 
 **Ordering guarantee.** `Sent` resolves only after the frame went through the
 store step of the write order above and a flush that covers it completed;
-`filed` says whether that step filed it. The session writes through a buffer
+`filed` says whether the store confirmed that step filed it. The session writes through a buffer
 (see "How a resend is written"): a frame is appended to it and the buffer is
 written out while the session goes on reading, so one completed flush resolves
-every tracked frame it wrote, in the order they were sent. A frame that was
-not filed cannot be replayed: a `ResendRequest` covering it is answered with a
-`SequenceReset`-GapFill. Flushed means handed to the stream in full: the bytes
+every tracked frame it wrote, in the order they were sent. `filed` false
+means filing was not confirmed, not that the frame is absent from the store:
+a store can save the frame and still return an error, so a `ResendRequest`
+covering it replays the frame if the store holds it and answers with a
+`SequenceReset`-GapFill if it does not. Flushed means handed to the stream in full: the bytes
 may still be in an operating-system or TLS buffer, and nothing at the FIX
 layer says the counterparty processed them. A frame still buffered when the
 session closes is written by the closing flush and reports `Sent` if that

@@ -138,10 +138,13 @@ README.
 
 - **`Sent { seq, sending_time, filed }`**: a flush that covers the frame
   completed. `Sent` means **flushed**, handed to the stream in full, not
-  queued, not buffered and not acknowledged. Whether the store filed the frame is reported
-  separately, in `filed`, because under `StoreFailurePolicy::Continue` a
-  frame whose filing failed still goes out, and such a frame cannot be
-  replayed: a `ResendRequest` covering it gets a gap fill. `filed` is false
+  queued, not buffered and not acknowledged. Whether the store confirmed it
+  filed the frame is reported separately, in `filed`, because under
+  `StoreFailurePolicy::Continue` a frame whose filing failed still goes out.
+  `filed` false means filing was **not confirmed**, not that the frame is
+  absent from the store: a store can save the frame and still return an
+  error (or time out), so a `ResendRequest` covering an unconfirmed frame
+  replays it if the store holds it and gap-fills it if not. `filed` is false
   without a store.
 - **`NotSent { reason }`**: no byte of the frame reached the stream and no
   number was spent. `NotSentReason` is `Vetoed`, `Invalid`, `StoreRefused`,

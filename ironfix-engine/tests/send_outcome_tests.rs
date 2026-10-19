@@ -1007,10 +1007,12 @@ async fn test_store_refusal_under_close_session_is_not_sent() {
 }
 
 /// Under `Continue` a refused filing does not stop the frame: it is `Sent`
-/// with `filed` false. The store does not hold it, so a `ResendRequest` for
-/// it is answered with a gap fill, not a replay.
+/// with `filed` false, which means filing was not confirmed. A store can
+/// fail after saving the frame, so a `ResendRequest` covering it gets either
+/// the frame replayed or a gap fill, never nothing; which one depends on
+/// what the store holds, so neither is asserted as guaranteed.
 #[tokio::test]
-async fn test_store_refusal_under_continue_is_sent_unfiled_and_gap_filled() {
+async fn test_store_refusal_under_continue_is_sent_with_filing_unconfirmed() {
     let store = Arc::new(RefusingStore::new());
     let (app, _rx) = GateApp::new();
     let initiator = Initiator::new(member_config(), app)
@@ -1022,18 +1024,21 @@ async fn test_store_refusal_under_continue_is_sent_unfiled_and_gap_filled() {
     let outcome = member.send_tracked(order("UNFILED-1")).await;
     let (seq, _, filed) = sent(&outcome);
     assert_eq!(seq, 2, "Continue writes the frame anyway");
-    assert!(!filed, "but the store did not file it");
+    assert!(!filed, "filing was not confirmed");
     assert_eq!(header(&next_frame(&mut venue).await), ("D".to_string(), 2));
-    assert!(
-        !holds(store.as_ref(), 2).await,
-        "the frame is not in the store"
-    );
 
     venue_send(&mut venue, venue_msg("2", 2, &[(7, "2"), (16, "0")])).await;
     let answer = next_frame(&mut venue).await;
-    assert_eq!(header(&answer), ("4".to_string(), 2), "a gap fill at 2");
-    assert_eq!(field(&answer, 123).as_deref(), Some("Y"));
-    assert_eq!(field(&answer, 36).as_deref(), Some("3"));
+    match header(&answer) {
+        (msg_type, 2) if msg_type == "D" => {
+            assert_eq!(field(&answer, 43).as_deref(), Some("Y"), "a replay");
+        }
+        (msg_type, 2) if msg_type == "4" => {
+            assert_eq!(field(&answer, 123).as_deref(), Some("Y"), "a gap fill");
+            assert_eq!(field(&answer, 36).as_deref(), Some("3"));
+        }
+        other => panic!("the ResendRequest for 2 got neither a replay nor a gap fill: {other:?}"),
+    }
     drop(venue);
     closed(&member, "the session closes once the venue is gone").await;
 }
