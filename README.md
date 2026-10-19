@@ -116,7 +116,9 @@ engine wiring (#96) does not exist.
   handshake and reactor over a stream the caller has already connected or
   accepted: anything `AsyncRead + AsyncWrite + Unpin + Send + 'static`, such
   as a TLS stream built with the TLS crate of your choice, a Unix socket, or
-  a `tokio::io::duplex` pipe for tests without sockets. `connect`, `serve`
+  a `tokio::io::duplex` pipe for tests without sockets. The
+  `*_with_peer` variants also carry the certificate chain a TLS stack of your
+  own verified to `Application::authorize_peer`. `connect`, `serve`
   and `accept` are the TCP dial or accept (with `TCP_NODELAY` set) followed by
   that same path. No public type gains a type parameter. The TCP path is
   unaffected: its socket is held by value, with no allocation and no dynamic
@@ -126,6 +128,17 @@ engine wiring (#96) does not exist.
   cost. Pass the concrete stream type, not one already boxed, and a stream
   whose `poll_read` never swaps the `ReadBuf` it is given. See
   `doc/adr/0007-engine-over-any-stream.md`.
+- **Optional TLS for both roles.** With `ironfix-engine`'s `tls` feature (off
+  by default), `Initiator::connect_tls`, `Acceptor::serve_tls` and
+  `AcceptorRegistry::serve_tls` run the TLS handshake over rustls, under their
+  own timeout, with a `ClientConfig` / `ServerConfig` you build: protocol
+  versions, cipher suites, roots and mutual TLS are yours, and so is the crypto
+  provider (IronFix enables none). `Application::authorize_peer` receives the
+  counterparty's certificate chain before any FIX message is exchanged, so a
+  client certificate can be bound to a CompID. FIX framing is unchanged inside
+  TLS and `EncryptMethod` (98) stays 0. With the feature off, no TLS crate is in
+  the dependency graph (`make check-tls-deps`, run in CI). See
+  `doc/adr/0009-tls.md`.
 - **One session reactor shared by both roles.** Once Logon completes, the
   engine owns the socket: heartbeats and TestRequests at the negotiated
   interval, CompID and `SendingTime` validation, sequence-gap detection with
@@ -415,13 +428,12 @@ around it.
   registry bounds each connection, not how many there are: capping the
   connections still in their Logon handshake is the consumer's job, in its
   accept loop.
-- **No TLS.** There is no `rustls` dependency anywhere. `ironfix-transport`
-  contains `FixCodec` only, and the engines open plain TCP themselves
-  (`Initiator::connect` calls `TcpStream::connect`, `Acceptor::serve` serves a
-  `TcpStream`). To run FIX over TLS, build the TLS stream yourself and hand it
-  to `Initiator::establish` or `Acceptor::serve_stream`: IronFix chooses no
-  TLS stack and no crypto provider. See "Current limitations" in
-  `ironfix-engine/src/lib.rs`.
+- **TLS is opt-in, with no builder knob and no example.** It needs
+  `ironfix-engine`'s `tls` feature; `EngineBuilder` has no TLS setting (call
+  `connect_tls` / `serve_tls` on the engine it builds), and there is no TLS
+  example pair yet (the tests generate their certificates at run time). The
+  TLS entry points take rustls 0.23 types, so a rustls major release is a
+  breaking change of that surface. No TLS performance figure exists.
 - **Async only.** Everything that touches a socket runs on Tokio. There is no
   synchronous mode, no kernel-bypass path, and no busy-polling transport. A
   sans-IO session core with Tokio as one driver is the accepted direction
@@ -537,7 +549,7 @@ against it.
 | `ironfix-tagvalue` | Zero-copy tag=value decoding and encoding; dictionary-free |
 | `ironfix-session` | Session-layer protocol logic: typestate FSM, sequences, heartbeats. No I/O |
 | `ironfix-store` | The `MessageStore` trait, `MemoryStore`, and the persistent `FileStore` |
-| `ironfix-transport` | `FixCodec`, a Tokio codec that frames FIX messages; depends on `ironfix-tagvalue` only. No TCP helpers, no TLS |
+| `ironfix-transport` | `FixCodec`, a Tokio codec that frames FIX messages; depends on `ironfix-tagvalue` only. No TCP helpers, no TLS (TLS lives behind `ironfix-engine`'s `tls` feature) |
 | `ironfix-sofh` | `SofhCodec`, a Tokio codec for the Simple Open Framing Header v1.0 that frames SBE and other binary encodings; depends on no other IronFix crate. Not published yet |
 | `ironfix-fixp` | The FIXP v1.1 session core, sans-IO: `FixpClient`, `FixpServer`, and the SBE session messages on `ironsbe-core`; depends on `ironfix-core` and `ironsbe-core` only. Not published yet |
 | `ironfix-fast` | FAST encoding/decoding primitives: stop-bit, presence maps, the operator table; depends on no other IronFix crate. No template layer |
@@ -618,7 +630,7 @@ sessions on inbound connections. Both engines hand the socket to the same
 session reactor once the Logon handshake completes. To run either over a
 stream you opened yourself (TLS, a Unix socket, an in-memory pipe), use
 `Initiator::establish` or `Acceptor::serve_stream` in place of `connect` or
-`accept`.
+`accept`. For TLS, see "TLS" below.
 
 ```rust,no_run
 use ironfix_core::types::CompId;
@@ -651,6 +663,35 @@ real `Application` implementation, and `fix44_server.rs` for the matching
 `Acceptor`-based server that answers each `NewOrderSingle` with an
 `ExecutionReport`.
 
+### TLS
+
+Enable the feature, and depend on `rustls` yourself with the crypto provider
+you want (here `aws-lc-rs`, rustls' default; `ring` works too):
+
+```toml
+[dependencies]
+ironfix-engine = { version = "0.4", features = ["tls"] }
+rustls = "0.23"
+```
+
+```rust,ignore
+use ironfix_engine::tls::rustls::{self, pki_types::ServerName};
+use std::sync::Arc;
+
+// `roots` is a rustls::RootCertStore holding the venue's CA.
+let config = rustls::ClientConfig::builder()
+    .with_root_certificates(roots)
+    .with_no_client_auth(); // or .with_client_auth_cert(chain, key) for mutual TLS
+let connection = initiator
+    .connect_tls("venue.example:9876", Arc::new(config), ServerName::try_from("venue.example")?)
+    .await?;
+```
+
+On the venue side, `acceptor.serve_tls(tcp_stream, Arc::new(server_config))`
+takes an accepted `TcpStream` and a `rustls::ServerConfig` (with a
+`WebPkiClientVerifier` for mutual TLS). Override
+`Application::authorize_peer` to check the certificate against the session.
+
 
 ## 🛠 Makefile Commands
 
@@ -668,7 +709,8 @@ make run EXAMPLE=fix44_server   # Run one example (the workspace has no binaries
 ### 🧪 Test & Quality
 
 ```sh
-make test          # Run all tests
+make test          # Run all tests (and the engine's TLS tests, with --features tls)
+make check-tls-deps # Prove the tls feature adds no TLS crate when off, and no crypto provider when on
 make fmt           # Format code
 make fmt-check     # Check formatting without applying
 make lint          # Run clippy with warnings as errors

@@ -81,6 +81,26 @@ release:
 .PHONY: test
 test:
 	LOGLEVEL=WARN cargo test --workspace
+	LOGLEVEL=WARN cargo test -p ironfix-engine --features tls
+
+# Proves the engine's optional `tls` feature is additive (ADR-0009): with it
+# off, no TLS crate is in ironfix-engine's normal dependency graph, and with it
+# on, no crypto provider is (the caller's rustls configuration brings one).
+.PHONY: check-tls-deps
+check-tls-deps:
+	@if cargo tree -p ironfix-engine -e normal --prefix none | grep -Eq '^(rustls|tokio-rustls|ring|aws-lc-rs|aws-lc-sys) '; then \
+		echo "check-tls-deps: a TLS crate is in ironfix-engine's normal graph with the tls feature off:"; \
+		cargo tree -p ironfix-engine -e normal --prefix none | grep -E '^(rustls|tokio-rustls|ring|aws-lc-rs|aws-lc-sys) ' | sort -u; \
+		exit 1; \
+	fi
+	@if cargo tree -p ironfix-engine -e normal --features tls --prefix none | grep -Eq '^(ring|aws-lc-rs|aws-lc-sys) '; then \
+		echo "check-tls-deps: the tls feature forces a crypto provider:"; \
+		cargo tree -p ironfix-engine -e normal --features tls --prefix none | grep -E '^(ring|aws-lc-rs|aws-lc-sys) ' | sort -u; \
+		exit 1; \
+	fi
+	@cargo tree -p ironfix-engine -e normal --features tls --prefix none | grep -Eq '^rustls ' \
+		|| { echo "check-tls-deps: rustls is missing with the tls feature on"; exit 1; }
+	@echo "check-tls-deps: no TLS crate without the feature; no crypto provider forced with it."
 
 # Format the code
 .PHONY: fmt

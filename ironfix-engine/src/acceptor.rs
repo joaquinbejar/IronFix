@@ -194,6 +194,7 @@ use crate::reactor::{
 };
 use crate::stream::SessionStream;
 use crate::throttle::ThrottleConfig;
+use crate::tls::{self, DEFAULT_TLS_HANDSHAKE_TIMEOUT, PeerInfo};
 use crate::wire::{
     self, ApplVersionGuard, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard,
     UnsupportedVersion,
@@ -281,6 +282,8 @@ pub struct Acceptor<A: Application = NoOpApplication> {
     write_timeout: Duration,
     /// Capacity of each session's inbound application queue.
     app_queue_capacity: usize,
+    /// Bound on the TLS handshake of [`Acceptor::serve_tls`].
+    tls_handshake_timeout: Duration,
     /// The optional message store, its failure policy, its call timeout and
     /// the owed-reset record, shared by every session this acceptor admits,
     /// one at a time.
@@ -310,6 +313,7 @@ impl<A: Application> std::fmt::Debug for Acceptor<A> {
             .field("outbound_capacity", &self.outbound_capacity)
             .field("write_timeout", &self.write_timeout)
             .field("app_queue_capacity", &self.app_queue_capacity)
+            .field("tls_handshake_timeout", &self.tls_handshake_timeout)
             .field("store", &self.store)
             .field("store_timeout", &self.store.timeout(self.write_timeout))
             .field("throttle", &self.throttle)
@@ -347,6 +351,7 @@ impl<A: Application + 'static> Acceptor<A> {
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             app_queue_capacity: DEFAULT_APP_QUEUE_CAPACITY,
+            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
             store: StoreAttachment::default(),
             admitted: Arc::new(Mutex::new(HashSet::new())),
             throttle: None,
@@ -527,6 +532,27 @@ impl<A: Application + 'static> Acceptor<A> {
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout.max(TICK_INTERVAL);
         self
+    }
+
+    /// Sets the bound on the TLS handshake of `Acceptor::serve_tls` (`tls`
+    /// feature), [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`] by default.
+    ///
+    /// It starts when `serve_tls` is called and ends with the handshake; the
+    /// logon timeout starts after it. Expiry fails the call with
+    /// [`EngineError::Tls`] carrying
+    /// [`TlsError::HandshakeTimeout`](crate::TlsError::HandshakeTimeout), so
+    /// a client that connects and never speaks TLS holds the call no longer.
+    /// No other entry point runs a TLS handshake, so none reads it.
+    #[must_use]
+    pub const fn with_tls_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.tls_handshake_timeout = timeout;
+        self
+    }
+
+    /// The bound on the TLS handshake of `Acceptor::serve_tls`.
+    #[must_use]
+    pub const fn tls_handshake_timeout(&self) -> Duration {
+        self.tls_handshake_timeout
     }
 
     /// Sets the capacity of each session's inbound application queue (default
@@ -918,7 +944,53 @@ impl<A: Application + 'static> Acceptor<A> {
     /// store under [`StoreFailurePolicy::CloseSession`].
     pub async fn serve(&self, stream: TcpStream) -> Result<Connection, EngineError> {
         // The only way to a TCP session: it sets TCP_NODELAY.
-        self.serve_session_stream(SessionStream::tcp(stream)).await
+        self.serve_session_stream(SessionStream::tcp(stream), None)
+            .await
+    }
+
+    /// Completes a TLS handshake on an accepted TCP connection, then the
+    /// acceptor-side Logon handshake inside TLS, and spawns the session
+    /// reactor.
+    ///
+    /// Available with the `tls` feature. `config` is the caller's: it carries
+    /// the crypto provider, the protocol versions and cipher suites, the
+    /// server certificate and key, and the client certificate policy. For
+    /// mutual TLS, build it with a client certificate verifier (rustls'
+    /// `WebPkiClientVerifier`), and a client without a certificate the
+    /// verifier accepts fails the TLS handshake, before any FIX message. Build
+    /// it against [`crate::tls::rustls`], the rustls version this crate is
+    /// built against. See ADR-0009 (`doc/adr/0009-tls.md`).
+    ///
+    /// The order is: the configuration checks, the TLS handshake (bounded by
+    /// [`Acceptor::with_tls_handshake_timeout`]; `TCP_NODELAY` is set on the
+    /// socket first), `on_create`, [`Application::authorize_peer`] with the
+    /// client's certificate chain (empty when the configuration does not ask
+    /// for one), and then the Logon handshake of [`Acceptor::serve`],
+    /// unchanged: FIX framing is the same inside TLS, and `EncryptMethod` (98)
+    /// must still be 0. A failed handshake runs no callback and touches no
+    /// store, like a connection that never sends a Logon. The TLS stream is
+    /// boxed once, as on [`Acceptor::serve_stream`].
+    ///
+    /// # Errors
+    /// Every error [`Acceptor::serve`] documents, and [`EngineError::Tls`]
+    /// when the handshake fails or times out (nothing is reported to the
+    /// application then), or when `authorize_peer` refuses the client (then
+    /// reported to [`Application::on_session_closed`] as
+    /// [`CloseReason::Tls`](crate::CloseReason::Tls)); nothing is written to
+    /// a refused client.
+    #[cfg(feature = "tls")]
+    pub async fn serve_tls(
+        &self,
+        stream: TcpStream,
+        config: Arc<crate::tls::rustls::ServerConfig>,
+    ) -> Result<Connection, EngineError> {
+        // Refused before the handshake: no point proving a peer for a
+        // session that cannot run.
+        self.preflight()?;
+        let (stream, peer) =
+            crate::tls::handshake::accept(stream, config, self.tls_handshake_timeout).await?;
+        self.serve_session_stream(SessionStream::erased(stream), Some(&peer))
+            .await
     }
 
     /// Establishes a session on a byte stream the caller has already
@@ -973,7 +1045,40 @@ impl<A: Application + 'static> Acceptor<A> {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_session_stream(SessionStream::erased(stream))
+        self.serve_session_stream(SessionStream::erased(stream), None)
+            .await
+    }
+
+    /// [`Acceptor::serve_stream`] on a stream whose counterparty the
+    /// caller's transport has proved, typically a TLS stream from a TLS stack
+    /// of the caller's choice, with the certificate chain it verified.
+    ///
+    /// Runs [`Application::authorize_peer`] with `peer` after `on_create` and
+    /// before the inbound Logon is read; everything else is
+    /// [`Acceptor::serve_stream`], unchanged. This is how a peer reaches the
+    /// application without a new bound on the stream type (ADR-0007 froze
+    /// it). The engine trusts `peer` as given: verifying the chain is the
+    /// caller's TLS stack's job.
+    ///
+    /// # Arguments
+    /// * `stream` - An accepted byte stream from the counterparty
+    /// * `peer` - What the transport proved about the counterparty
+    ///
+    /// # Errors
+    /// Every error [`Acceptor::serve_stream`] documents, and
+    /// [`EngineError::Tls`] carrying
+    /// [`TlsError::PeerRejected`](crate::TlsError::PeerRejected) when
+    /// `authorize_peer` refuses the peer; nothing is read from or written to
+    /// the stream then, and no store is touched.
+    pub async fn serve_stream_with_peer<S>(
+        &self,
+        stream: S,
+        peer: PeerInfo,
+    ) -> Result<Connection, EngineError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_session_stream(SessionStream::erased(stream), Some(&peer))
             .await
     }
 
@@ -983,7 +1088,11 @@ impl<A: Application + 'static> Acceptor<A> {
     ///
     /// # Errors
     /// Every error [`Acceptor::serve`] documents.
-    async fn serve_session_stream(&self, stream: SessionStream) -> Result<Connection, EngineError> {
+    async fn serve_session_stream(
+        &self,
+        stream: SessionStream,
+        peer: Option<&PeerInfo>,
+    ) -> Result<Connection, EngineError> {
         let version = self.preflight()?;
 
         let session_id = self.session_id.clone();
@@ -991,6 +1100,15 @@ impl<A: Application + 'static> Acceptor<A> {
 
         // Typestate: Disconnected -> Connecting (acceptor side).
         let session = Session::<Disconnected>::new(session_id.to_string()).accept();
+
+        // A peer the transport proved is authorized before anything is read:
+        // a refused one gets no reply and touches no store.
+        if let Some(peer) = peer
+            && let Err(err) = tls::authorize(&*self.application, &session_id, peer).await
+        {
+            let _ = session.disconnect();
+            return report_handshake(&*self.application, &session_id, Err(err)).await;
+        }
 
         let mut framed = Framed::new(stream, session_codec(&self.config, version));
 
@@ -1054,6 +1172,7 @@ impl<A: Application + 'static> Acceptor<A> {
         mut framed: FixFramed,
         logon_frame: BytesMut,
         authenticated: Option<&AtomicBool>,
+        peer: Option<&PeerInfo>,
     ) -> Result<Connection, EngineError> {
         let version = self.preflight()?;
 
@@ -1062,6 +1181,16 @@ impl<A: Application + 'static> Acceptor<A> {
 
         // Typestate: Disconnected -> Connecting (acceptor side).
         let session = Session::<Disconnected>::new(session_id.to_string()).accept();
+
+        // A peer the transport proved is authorized for the session its Logon
+        // was routed to, before the Logon is checked: a refused one gets no
+        // reply, touches no store, and is never marked authenticated.
+        if let Some(peer) = peer
+            && let Err(err) = tls::authorize(&*self.application, &session_id, peer).await
+        {
+            let _ = session.disconnect();
+            return report_handshake(&*self.application, &session_id, Err(err)).await;
+        }
 
         // From here on the socket is this session's: frames after the Logon
         // are framed under its own settings, exactly as on `serve`. The codec

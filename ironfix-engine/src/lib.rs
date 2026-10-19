@@ -169,6 +169,28 @@
 //! stream, so those are the caller's. A TLS handshake the caller runs before
 //! handing the stream over is outside the engine's logon timeout.
 //!
+//! ## TLS
+//!
+//! With the `tls` feature (off by default), `Initiator::connect_tls`,
+//! `Acceptor::serve_tls` and `AcceptorRegistry::serve_tls` run the TLS
+//! handshake themselves over rustls (through tokio-rustls), under their own
+//! timeout ([`DEFAULT_TLS_HANDSHAKE_TIMEOUT`] unless set with
+//! `with_tls_handshake_timeout`), with a `rustls::ClientConfig` or
+//! `rustls::ServerConfig` the caller builds (mutual TLS included). IronFix
+//! enables no crypto provider: the caller's configuration carries one. FIX
+//! framing is unchanged inside TLS, and `EncryptMethod` (98) stays 0. With
+//! the feature off, no TLS crate is in the dependency graph.
+//!
+//! Whichever features are on, [`Application::authorize_peer`] receives the
+//! counterparty's certificate chain as a [`PeerInfo`] before any FIX message
+//! is exchanged, so an application can bind a certificate to a CompID; the
+//! `*_with_peer` stream entry points ([`Initiator::establish_with_peer`],
+//! [`Acceptor::serve_stream_with_peer`],
+//! [`AcceptorRegistry::serve_stream_with_peer`]) bring a chain from a TLS
+//! stack of the caller's own. A TLS failure is [`EngineError::Tls`] and, after
+//! `on_create`, [`CloseReason::Tls`]. See [`tls`] and ADR-0009
+//! (`doc/adr/0009-tls.md`).
+//!
 //! No public type gains a stream type parameter, [`Connection`] included. The
 //! TCP path is unaffected by the seam: its socket is held by value, with no
 //! allocation and no dynamic call. A caller's stream is boxed once, when the
@@ -180,10 +202,12 @@
 //!
 //! ## Current limitations
 //!
-//! - **There is no TLS** in the workspace: no TLS dependency and no TLS
-//!   setting. A caller that needs it builds the TLS stream itself, with the
-//!   TLS stack and crypto provider of its choice, and hands it to
-//!   [`Initiator::establish`] or [`Acceptor::serve_stream`].
+//! - **TLS is opt-in and has no builder knob.** It needs the `tls` feature,
+//!   the TLS entry points take rustls types (a rustls major release is a
+//!   breaking change of that surface), and `EngineBuilder` has no TLS
+//!   setting: call `connect_tls` / `serve_tls` on the engine it builds. The
+//!   TLS stream is boxed like any caller stream, and nothing has measured
+//!   the cost.
 //! - **There is no dictionary validation**: `ironfix-dictionary`'s
 //!   `Validator` is never invoked on the session path.
 //! - **The store is opt-in.** Attaching one with [`Initiator::with_store`],
@@ -224,6 +248,7 @@ mod reactor;
 pub mod registry;
 mod stream;
 pub mod throttle;
+pub mod tls;
 mod wire;
 
 pub use acceptor::Acceptor;
@@ -242,6 +267,7 @@ pub use throttle::{
     BudgetId, ThrottleBudget, ThrottleConfig, ThrottleConfigBuilder, ThrottleConfigError,
     ThrottlePolicy,
 };
+pub use tls::{DEFAULT_TLS_HANDSHAKE_TIMEOUT, PeerInfo, TlsError, TlsFailure};
 
 // Re-exported for convenience: the per-session configuration consumed by
 // [`Initiator`].

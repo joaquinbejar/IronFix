@@ -43,6 +43,7 @@
 //! one: `Password` (554), `NewPassword` (925) and `RawData` (96) cannot
 //! appear in it.
 
+use crate::tls::TlsFailure;
 use ironfix_session::sequence::SequenceCounter;
 use std::fmt;
 use std::time::Duration;
@@ -245,6 +246,21 @@ pub enum CloseReason {
     /// or `serve` receives the detailed [`EngineError`](crate::EngineError).
     #[non_exhaustive]
     LogonFailed {},
+    /// TLS failed after `on_create` had run: the TLS handshake of
+    /// `Initiator::connect_tls` failed or
+    /// timed out, or
+    /// [`Application::authorize_peer`](crate::Application::authorize_peer)
+    /// refused the counterparty on any entry point that proves a peer.
+    /// Reported to
+    /// [`Application::on_session_closed`](crate::Application::on_session_closed)
+    /// only; the caller receives [`EngineError::Tls`](crate::EngineError::Tls).
+    /// A failed TLS handshake on an acceptor runs before `on_create` and is
+    /// not reported here. The session never reached Active.
+    #[non_exhaustive]
+    Tls {
+        /// Which TLS step failed.
+        failure: TlsFailure,
+    },
     /// The engine reached a state it does not expect. Logged with detail.
     #[non_exhaustive]
     Internal {},
@@ -263,12 +279,16 @@ impl CloseReason {
     }
 
     /// Whether the session reached Active before it ended: false only for
-    /// [`CloseReason::ConnectFailed`] and [`CloseReason::LogonFailed`]. The default
+    /// [`CloseReason::ConnectFailed`], [`CloseReason::LogonFailed`] and
+    /// [`CloseReason::Tls`]. The default
     /// [`Application::on_session_closed`](crate::Application::on_session_closed)
     /// forwards to `on_logout` exactly when this is true.
     #[must_use]
     pub const fn was_active(&self) -> bool {
-        !matches!(self, Self::ConnectFailed { .. } | Self::LogonFailed { .. })
+        !matches!(
+            self,
+            Self::ConnectFailed { .. } | Self::LogonFailed { .. } | Self::Tls { .. }
+        )
     }
 
     /// The reason a graceful close becomes when this session's own Logout
@@ -398,6 +418,7 @@ impl fmt::Display for CloseReason {
             } => write!(f, "connect failed: {kind}"),
             Self::ConnectFailed { .. } => f.write_str("connect failed"),
             Self::LogonFailed {} => f.write_str("Logon handshake failed"),
+            Self::Tls { failure } => write!(f, "{failure}"),
             Self::Internal {} => f.write_str("internal error"),
         }
     }
@@ -464,6 +485,12 @@ mod tests {
     #[test]
     fn test_was_active() {
         assert!(!CloseReason::LogonFailed {}.was_active());
+        let tls = CloseReason::Tls {
+            failure: TlsFailure::PeerRejected,
+        };
+        assert!(!tls.was_active());
+        assert!(!tls.is_graceful());
+        assert_eq!(tls.to_string(), "TLS peer refused by the application");
         assert!(CloseReason::TransportClosed {}.was_active());
     }
 

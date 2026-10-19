@@ -153,6 +153,7 @@ use crate::connection::Connection;
 use crate::error::EngineError;
 use crate::reactor::{HandshakeRead, read_handshake_frame_until};
 use crate::stream::SessionStream;
+use crate::tls::{DEFAULT_TLS_HANDSHAKE_TIMEOUT, PeerInfo};
 use crate::wire::{self, FieldOccurrence};
 use async_trait::async_trait;
 use ironfix_core::message::{MsgType, RawMessage};
@@ -818,6 +819,8 @@ pub struct AcceptorRegistry<A: Application = NoOpApplication> {
     max_message_size: usize,
     /// Most lookup-admitted sessions held at once, if capped.
     max_sessions: Option<usize>,
+    /// Bound on the TLS handshake of [`AcceptorRegistry::serve_tls`].
+    tls_handshake_timeout: Duration,
 }
 
 /// Written by hand rather than derived: `dyn SessionLookup` is not `Debug`.
@@ -834,6 +837,7 @@ impl<A: Application> std::fmt::Debug for AcceptorRegistry<A> {
             .field("logon_timeout", &self.logon_timeout)
             .field("max_message_size", &self.max_message_size)
             .field("max_sessions", &self.max_sessions)
+            .field("tls_handshake_timeout", &self.tls_handshake_timeout)
             .finish()
     }
 }
@@ -856,6 +860,7 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
             logon_timeout: DEFAULT_LOGON_TIMEOUT,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_sessions: None,
+            tls_handshake_timeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT,
         }
     }
 
@@ -924,6 +929,30 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     pub const fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
+    }
+
+    /// Sets the bound on the TLS handshake of `AcceptorRegistry::serve_tls`
+    /// (`tls` feature), [`DEFAULT_TLS_HANDSHAKE_TIMEOUT`] by default.
+    ///
+    /// It starts when `serve_tls` is called and ends with the handshake; the
+    /// registry's logon timeout starts after it. Expiry fails the call with
+    /// [`EngineError::Tls`] carrying
+    /// [`TlsError::HandshakeTimeout`](crate::TlsError::HandshakeTimeout). The
+    /// TLS timeout of a registered [`Acceptor`] is not read on this path.
+    ///
+    /// # Arguments
+    /// * `timeout` - Maximum duration of the TLS handshake
+    #[must_use]
+    pub const fn with_tls_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.tls_handshake_timeout = timeout;
+        self
+    }
+
+    /// Returns the bound on the TLS handshake of
+    /// `AcceptorRegistry::serve_tls`.
+    #[must_use]
+    pub const fn tls_handshake_timeout(&self) -> Duration {
+        self.tls_handshake_timeout
     }
 
     /// Returns the bound on reading and routing an inbound Logon.
@@ -1038,7 +1067,43 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     /// live.
     pub async fn serve(&self, stream: TcpStream) -> Result<Connection, EngineError> {
         // The only way to a TCP session: it sets TCP_NODELAY.
-        self.serve_session_stream(SessionStream::tcp(stream)).await
+        self.serve_session_stream(SessionStream::tcp(stream), None)
+            .await
+    }
+
+    /// Completes a TLS handshake on an accepted TCP connection, then reads
+    /// the Logon inside TLS, routes it and completes that session's
+    /// handshake, as [`AcceptorRegistry::serve`] does.
+    ///
+    /// Available with the `tls` feature. `config` is the caller's, as on
+    /// [`Acceptor::serve_tls`]: one server configuration for every session of
+    /// the registry. The order is: the registry's settings check, the TLS
+    /// handshake (bounded by
+    /// [`AcceptorRegistry::with_tls_handshake_timeout`]; `TCP_NODELAY` is set
+    /// on the socket first), the routing of [`AcceptorRegistry::serve`],
+    /// unchanged, and then, for the session the Logon was routed to,
+    /// `on_create`, [`Application::authorize_peer`] with the client's
+    /// certificate chain, and that session's Logon checks. A client
+    /// certificate can therefore be bound to the session its Logon claims. A
+    /// lookup-admitted session whose peer is refused is evicted like one
+    /// whose Logon `from_admin` refuses. See ADR-0009 (`doc/adr/0009-tls.md`).
+    ///
+    /// # Errors
+    /// Every error [`AcceptorRegistry::serve`] documents, and
+    /// [`EngineError::Tls`] when the handshake fails or times out (no callback
+    /// runs then), or when `authorize_peer` refuses the client; nothing is
+    /// written to a refused client.
+    #[cfg(feature = "tls")]
+    pub async fn serve_tls(
+        &self,
+        stream: TcpStream,
+        config: Arc<crate::tls::rustls::ServerConfig>,
+    ) -> Result<Connection, EngineError> {
+        self.settings_check()?;
+        let (stream, peer) =
+            crate::tls::handshake::accept(stream, config, self.tls_handshake_timeout).await?;
+        self.serve_session_stream(SessionStream::erased(stream), Some(&peer))
+            .await
     }
 
     /// Reads the Logon on a byte stream the caller has already accepted,
@@ -1087,7 +1152,39 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_session_stream(SessionStream::erased(stream))
+        self.serve_session_stream(SessionStream::erased(stream), None)
+            .await
+    }
+
+    /// [`AcceptorRegistry::serve_stream`] on a stream whose counterparty the
+    /// caller's transport has proved, typically a TLS stream from a TLS stack
+    /// of the caller's choice, with the certificate chain it verified.
+    ///
+    /// Routing is unchanged. Once the Logon is routed, the session runs
+    /// [`Application::authorize_peer`] with `peer` after `on_create` and
+    /// before the Logon is checked; everything else is
+    /// [`AcceptorRegistry::serve_stream`]. The engine trusts `peer` as given:
+    /// verifying the chain is the caller's TLS stack's job.
+    ///
+    /// # Arguments
+    /// * `stream` - An accepted byte stream from a counterparty
+    /// * `peer` - What the transport proved about the counterparty
+    ///
+    /// # Errors
+    /// Every error [`AcceptorRegistry::serve_stream`] documents, and
+    /// [`EngineError::Tls`] carrying
+    /// [`TlsError::PeerRejected`](crate::TlsError::PeerRejected) when
+    /// `authorize_peer` refuses the peer; nothing is written to the stream
+    /// then.
+    pub async fn serve_stream_with_peer<S>(
+        &self,
+        stream: S,
+        peer: PeerInfo,
+    ) -> Result<Connection, EngineError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        self.serve_session_stream(SessionStream::erased(stream), Some(&peer))
             .await
     }
 
@@ -1096,7 +1193,11 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
     ///
     /// # Errors
     /// Every error [`AcceptorRegistry::serve`] documents.
-    async fn serve_session_stream(&self, stream: SessionStream) -> Result<Connection, EngineError> {
+    async fn serve_session_stream(
+        &self,
+        stream: SessionStream,
+        peer: Option<&PeerInfo>,
+    ) -> Result<Connection, EngineError> {
         self.settings_check()?;
         // One deadline for the read and the lookup together. The bound is
         // checked to be at most `MAX_TIMEOUT`, so the sum cannot overflow; it
@@ -1123,7 +1224,7 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
         };
 
         match self.route(&logon_frame, deadline).await? {
-            Routed::Kept(acceptor) => acceptor.serve_logon(framed, logon_frame, None).await,
+            Routed::Kept(acceptor) => acceptor.serve_logon(framed, logon_frame, None, peer).await,
             // A lookup-admitted session not yet authenticated: whatever ends
             // this handshake, the claim is released when this arm ends (the
             // session kept once `from_admin` accepted a Logon for it, evicted
@@ -1131,7 +1232,7 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
             Routed::Provisional(claim) => {
                 claim
                     .acceptor
-                    .serve_logon(framed, logon_frame, Some(&claim.authenticated))
+                    .serve_logon(framed, logon_frame, Some(&claim.authenticated), peer)
                     .await
             }
         }

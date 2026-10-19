@@ -27,6 +27,12 @@ jobs:
       - name: Run tests
         run: make test
 
+      # ADR-0009: the engine's `tls` feature is additive. With it off, no TLS
+      # crate may enter ironfix-engine's normal dependency graph; with it on,
+      # no crypto provider may be forced on the consumer.
+      - name: TLS feature dependency check
+        run: make check-tls-deps
+
       # Compiles the criterion benchmarks without running them. A timing taken
       # on a shared runner is not a measurement, but a benchmark that stops
       # compiling is a real regression, and this catches it.
