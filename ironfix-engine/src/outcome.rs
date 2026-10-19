@@ -65,8 +65,9 @@
 //! a flush that covers it completed. The session writes through a buffer:
 //! a frame is appended to it, and the buffer is written out, and the stream
 //! flushed, while the session goes on reading. A completed flush resolves
-//! every tracked frame it wrote at once, in the order they were sent. Its `filed` field says whether the store
-//! accepted the frame: it is false without a store, and false under
+//! every tracked frame it wrote at once, in the order they were sent. Its
+//! `filed` field says whether the store accepted the frame: it is false
+//! without a store, and false under
 //! [`StoreFailurePolicy::Continue`](crate::StoreFailurePolicy::Continue) when
 //! the filing failed and the frame went out anyway. A frame that was not
 //! filed cannot be replayed: a `ResendRequest` covering it is answered with a
@@ -103,8 +104,9 @@ pub enum SendOutcome {
     Sent {
         /// The `MsgSeqNum` (34) the frame carries.
         seq: u64,
-        /// The `SendingTime` (52) the frame carries, at the millisecond
-        /// precision written on the wire.
+        /// The `SendingTime` (52) the frame carries, at the precision the
+        /// session writes on the wire: whole seconds on FIX 4.0 and FIX 4.1,
+        /// milliseconds on every later version.
         sending_time: Timestamp,
         /// Whether the attached store filed the frame. False without a store,
         /// and false under
@@ -231,12 +233,17 @@ pub enum NotSentReason {
     /// queued. It never reached the session reactor.
     #[non_exhaustive]
     SessionClosed {},
-    /// This session's own Logout had been sent when the message was reached,
-    /// or when the session closed with the message still queued behind it:
-    /// the session is on its way out, and a new application message would
-    /// arrive after the Logout the counterparty has already seen.
+    /// This session's own Logout had been framed when the reactor reached
+    /// the message: the session is on its way out, and a new application
+    /// message would arrive after the Logout the counterparty has already
+    /// seen. Also reported when the session closed with the message waiting
+    /// behind a resend that the counterparty asked for after that Logout. A
+    /// message still in the outbound queue at close, with no resend under
+    /// way, reports [`NotSentReason::Discarded`] instead, Logout or not.
     LogoutPending,
-    /// The session ended while the message was waiting in the outbound queue.
+    /// The session ended while the message was waiting in the outbound queue
+    /// and no resend was under way, including when this session's own Logout
+    /// had been framed ahead of it.
     #[non_exhaustive]
     Discarded {},
     /// The session ended while the message was waiting behind a resend this

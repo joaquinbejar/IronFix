@@ -55,11 +55,12 @@
 //!   default runs `to_app` and sends, and an override can veto the message
 //!   (the equivalent of QuickFIX's `DoNotSend`) through the [`SendVerdict`]
 //!   it returns, before a `MsgSeqNum` is spent or the store is touched; a
-//!   verdict decided at once ([`SendVerdict::ready`]) allocates nothing. A replay of a filed frame (the answer to a
-//!   `ResendRequest`, the 789 resend) is resent as filed and is not gated,
-//!   unlike QuickFIX. Administrative messages (Logon, Logout, Heartbeat,
-//!   TestRequest, ResendRequest, SequenceReset, Reject, XmlMessage) go
-//!   through `to_admin` and cannot be vetoed. See
+//!   verdict decided at once ([`SendVerdict::ready`]) allocates nothing. A
+//!   replay of a filed frame (the answer to a `ResendRequest`, the 789
+//!   resend) is resent as filed and is not gated, unlike QuickFIX.
+//!   Administrative messages (Logon, Logout, Heartbeat, TestRequest,
+//!   ResendRequest, SequenceReset, Reject, XmlMessage) go through
+//!   `to_admin` and cannot be vetoed. See
 //!   `doc/adr/0023-outbound-veto-and-send-outcomes.md`.
 //! - **[`EngineBuilder`]**: fluent configuration that terminates in a
 //!   ready-to-run [`Initiator`], [`Acceptor`] or [`AcceptorRegistry`].

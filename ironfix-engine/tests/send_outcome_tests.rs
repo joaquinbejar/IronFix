@@ -1209,6 +1209,52 @@ async fn test_frame_flushed_by_the_closing_flush_is_sent() {
     assert_eq!(sent(&outcome).0, 2, "the closing flush wrote it");
 }
 
+/// A tracked frame is still in the write buffer when a `ResendRequest`
+/// arrives: the replay is fed behind it, and the one flush that drains the
+/// buffer writes both. The frame reports `Sent` with its own number, not the
+/// replay's, and only once that flush completes.
+#[tokio::test]
+async fn test_frame_flushed_together_with_a_replay_behind_it_is_sent() {
+    let store = Arc::new(MemoryStore::new());
+    let logon_seq = previous_orders(&store, 1, 64).await;
+    let (app, _rx) = GateApp::new();
+    let initiator = Initiator::new(member_config(), app)
+        .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let (member, mut venue, _logon) = scripted(&initiator, SMALL_PIPE, ACK).await;
+
+    let mut tracked = buffered_order(&member).await;
+    venue_send(&mut venue, venue_msg("2", 2, &[(7, "2"), (16, "2")])).await;
+    tokio::select! {
+        outcome = &mut tracked => panic!("the buffer has not drained: {outcome:?}"),
+        () = tokio::time::sleep(QUIET) => {}
+    }
+
+    let fresh = next_frame(&mut venue).await;
+    assert_eq!(header(&fresh), ("D".to_string(), logon_seq + 1));
+    assert_eq!(
+        field(&fresh, 43),
+        None,
+        "the tracked frame, first in the buffer"
+    );
+    let replay = next_frame(&mut venue).await;
+    assert_eq!(header(&replay), ("D".to_string(), 2));
+    assert_eq!(
+        field(&replay, 43).as_deref(),
+        Some("Y"),
+        "the replay behind it"
+    );
+
+    let outcome = ok(
+        timeout(STEP, tracked).await,
+        "the outcome resolves once the flush drains the buffer",
+    );
+    let (seq, _, filed) = sent(&outcome);
+    assert_eq!(seq, logon_seq + 1, "its own number, not the replay's");
+    assert!(filed);
+    drop(venue);
+    closed(&member, "the session closes once the venue is gone").await;
+}
+
 /// The session closes while a tracked frame is still in the write buffer,
 /// and the counterparty never reads it: the frame reports `Unknown` with
 /// `WriteTimeout` and the number it spent when it was buffered, resolved

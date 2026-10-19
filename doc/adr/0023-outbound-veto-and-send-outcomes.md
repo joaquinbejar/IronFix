@@ -73,11 +73,32 @@ every existing implementor would pay an allocation per message for a gate it
 does not use. The #126 allocation test (`ironfix-engine/tests/allocations.rs`)
 pins the budget at one block per live send, and caught it.
 
+The options weighed for the shape:
+
+1. **`async fn to_app_checked(...) -> Result<(), RejectReason>`.** Rejected:
+   two boxed futures per message on the default path, as above.
+2. **A synchronous `fn to_app_checked(...) -> Result<(), RejectReason>`.**
+   Rejected. A synchronous method cannot default to the asynchronous
+   `to_app`, so the engine would need two callbacks per message (`to_app`,
+   then the synchronous check) and would always pay `to_app`'s boxed future
+   even for an application whose gate decides everything; and a gate that
+   later needs to wait (a remote risk service) could only be added by
+   changing the method's signature, a breaking change.
+3. **A return-position `impl Future`.** Rejected: the trait would no longer
+   be object-safe (see below).
+4. **A concrete future type, `SendVerdict`** (chosen).
+
 `SendVerdict` has three forms: the default wraps the boxed future `to_app`
 already returns, without boxing it again (one block per message, as before);
 `SendVerdict::ready` holds a decision taken at once and allocates nothing, so
 an in-process kill switch or risk check costs nothing extra; and
-`SendVerdict::new` boxes a decision that must wait, once. The trait stays
+`SendVerdict::new` boxes a decision that must wait, once. While a
+`SendVerdict::new` decision is pending the reactor awaits it inline: it reads
+nothing, flushes nothing and answers no Heartbeat or TestRequest, so a risk
+check belongs in `ready`. A verdict polled again after it resolved vetoes
+(`RejectReason` code 0, "verdict already consumed") rather than sending a
+message it no longer decides about; the engine never repolls one. The trait
+stays
 object-safe: the method has lifetime parameters and a concrete return type,
 nothing generic. A return-position `impl Future` would have avoided the type
 but made the trait no longer object-safe, a breaking change for any
@@ -186,9 +207,10 @@ reading. Outcomes follow the buffer:
   entries `(seq, sending_time, filed, receipt)`, in number order.
 - `Reactor::on_flushed`, the one place a completed flush is seen, is told the
   first and last new `MsgSeqNum` the flush covered (resends and gap fills
-  re-occupy old numbers and are not counted). It resolves as `Sent` every
-  pending entry numbered at or below that last number, through one helper,
-  `Reactor::resolve_sent`.
+  re-occupy old numbers and are not counted). A completed flush wrote
+  everything fed before it, so it resolves as `Sent` every pending entry,
+  through one helper, `Reactor::resolve_sent`, without comparing numbers (a
+  debug assertion checks the entries are in `MsgSeqNum` order).
 - A failed flush and the tick's write timeout both end in
   `Reactor::close_on_write_failure`, which resolves every pending entry as
   `Unknown` with `Transport` or `WriteTimeout`, each with its spent number;
@@ -208,8 +230,8 @@ stream takes in one flush resolves together.
   `application::SendVerdict` (re-exported at the crate root),
   `Connection::send_tracked`, the public module `outcome` with `SendOutcome`,
   `NotSentReason` and `UnknownReason` (re-exported at the crate root), and
-  `PartialEq`/`Eq` on `RejectReason`. `cargo semver-checks` reports a minor
-  change.
+  `PartialEq`/`Eq` on `RejectReason`. `cargo semver-checks` reports no
+  breaking change, so this is a minor release.
 - **Cost:** an application message costs the same one allocation as before
   (`to_app`'s future) through the default gate, none more through a
   `SendVerdict::ready` gate, and one through a `SendVerdict::new` gate. A
@@ -217,9 +239,12 @@ stream takes in one flush resolves together.
   grows by the size of an empty receipt option. A tracked send allocates one
   single-use channel. A veto costs the callback and nothing else.
 - **Close path:** the reactor closes the outbound queue when the session
-  ends and resolves whatever is still queued (`Discarded`,
-  `DiscardedBehindResend`, or `LogoutPending` once this session's own Logout
-  went out), and logs a count of the discarded messages, tracked or not.
+  ends and resolves whatever is still queued: `DiscardedBehindResend` when a
+  resend was under way, or `LogoutPending` instead when that resend followed
+  this session's own Logout, and `Discarded` otherwise, this session's
+  Logout framed ahead of the message or not. A message the reactor reached
+  while its own Logout was pending had already resolved `LogoutPending`. The
+  count of discarded messages, tracked or not, is logged.
 - **Tests:** `ironfix-engine/tests/send_outcome_tests.rs` covers the veto in
   both roles (no number spent, nothing filed, no gap), `Sent` only after the
   flush, `filed` under both store policies, `Unknown` on a stalled write with

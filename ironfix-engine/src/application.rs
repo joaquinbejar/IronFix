@@ -345,14 +345,23 @@ pub trait Application: Send + Sync {
 ///
 /// Build one with [`SendVerdict::ready`] for a decision taken at once, which
 /// allocates nothing, or [`SendVerdict::new`] for a decision that must
-/// wait (on a risk service, say), which boxes its future once. The default
-/// `to_app_checked` wraps the future of [`Application::to_app`] without
-/// boxing it again.
+/// wait (on a risk service, say), which boxes its future once and holds the
+/// session up while it waits. The default `to_app_checked` wraps the future
+/// of [`Application::to_app`] without boxing it again.
+///
+/// Like any future it is polled until it resolves, once. A verdict polled
+/// again after it resolved vetoes, with `RejectReason` code 0 and text
+/// "verdict already consumed", rather than sending: it no longer decides
+/// about any message. The engine never polls one again.
 #[must_use = "a verdict does nothing unless the engine awaits it"]
 pub struct SendVerdict<'a> {
     /// The decision, or the future that produces it.
     inner: Verdict<'a>,
 }
+
+/// The `Text` of the veto a [`SendVerdict`] returns when it is polled again
+/// after it resolved.
+const CONSUMED: &str = "verdict already consumed";
 
 /// The forms a [`SendVerdict`] takes.
 enum Verdict<'a> {
@@ -377,6 +386,14 @@ impl<'a> SendVerdict<'a> {
     /// A verdict that waits on `decision`, boxed once. The future may still
     /// mutate the message it captured; the engine frames the message once
     /// the future resolves `Ok(())`.
+    ///
+    /// **The session waits with it.** The verdict is awaited inline by the
+    /// session reactor: while it is pending the session reads nothing,
+    /// flushes nothing, and answers no Heartbeat or TestRequest, so a slow
+    /// decision can time the session out. A pre-trade risk check or a kill
+    /// switch should decide from state it already holds, with
+    /// [`SendVerdict::ready`]; reserve `new` for a decision that genuinely
+    /// has to wait, and bound it.
     pub fn new(decision: impl Future<Output = Result<(), RejectReason>> + Send + 'a) -> Self {
         Self {
             inner: Verdict::Pending(Box::pin(decision)),
@@ -398,11 +415,14 @@ impl Future for SendVerdict<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Every form is `Unpin` (a box, or a plain value), so the verdict is.
         match &mut self.get_mut().inner {
-            Verdict::Ready(decision) => {
-                // A verdict polled again after it resolved sends: the engine
-                // never does, and there is nothing else to report.
-                Poll::Ready(decision.take().unwrap_or(Ok(())))
-            }
+            // A verdict polled again after it resolved vetoes: it no
+            // longer decides about any message, and the safe answer for a
+            // gate is not to send. The engine never polls one again.
+            Verdict::Ready(decision) => Poll::Ready(
+                decision
+                    .take()
+                    .unwrap_or_else(|| Err(RejectReason::new(0, CONSUMED))),
+            ),
             Verdict::Forward(to_app) => to_app.as_mut().poll(cx).map(|()| Ok(())),
             Verdict::Pending(decision) => decision.as_mut().poll(cx),
         }
@@ -537,6 +557,26 @@ mod tests {
         let forwarded = SendVerdict::forward(Box::pin(async {}));
         assert!(format!("{forwarded:?}").contains("to_app"));
         assert_eq!(forwarded.await, Ok(()), "the default sends after to_app");
+    }
+
+    #[test]
+    fn test_send_verdict_polled_again_after_it_resolved_vetoes() {
+        let mut verdict = SendVerdict::ready(Ok(()));
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert_eq!(
+            Pin::new(&mut verdict).poll(&mut cx),
+            Poll::Ready(Ok(())),
+            "the first poll takes the decision"
+        );
+        match Pin::new(&mut verdict).poll(&mut cx) {
+            Poll::Ready(Err(reason)) => {
+                assert_eq!(reason.code, 0);
+                assert_eq!(reason.text, CONSUMED);
+            }
+            other => panic!("a repolled verdict must veto, not send: {other:?}"),
+        }
+        assert!(format!("{verdict:?}").contains("taken"));
     }
 
     #[tokio::test]

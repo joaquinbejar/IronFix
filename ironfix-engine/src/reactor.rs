@@ -191,8 +191,8 @@
 //! resolved exactly once:
 //!
 //! - `Sent` by [`Reactor::resolve_sent`], from [`Reactor::on_flushed`], for
-//!   every pending receipt the completed flush covered (its `MsgSeqNum` at or
-//!   below the last new number the flush wrote);
+//!   every pending receipt: a completed flush wrote everything fed before
+//!   it;
 //! - `Unknown` with `Transport` or `WriteTimeout` when the write fails or the
 //!   write timeout runs out ([`Reactor::close_on_write_failure`]), or when
 //!   the closing session's last flush does not drain the buffer: the number
@@ -2081,30 +2081,31 @@ impl<A: Application> Reactor<A> {
         lock_heartbeat(&self.runtime).on_message_sent();
         if let Some((first, last)) = covered {
             tracing::trace!(session = %self.session_id, first, last, "flushed");
-            self.resolve_sent(last);
         }
+        self.resolve_sent();
     }
 
-    /// Resolves as [`SendOutcome::Sent`] every pending receipt whose frame a
-    /// completed flush covered: those numbered at or below `last`, the last
-    /// new `MsgSeqNum` it wrote. Receipts are fed in number order, so they
-    /// are taken from the front.
+    /// Resolves every pending receipt as [`SendOutcome::Sent`]: a completed
+    /// flush wrote everything fed before it, so every tracked frame waiting
+    /// in the buffer was in it. No sequence number is compared, so nothing
+    /// here depends on numbers only going up.
     ///
     /// Called only from [`Reactor::on_flushed`]: a frame is reported sent
     /// once it has been flushed, never when it is buffered.
-    fn resolve_sent(&mut self, last: u64) {
-        while self
-            .receipts
-            .front()
-            .is_some_and(|pending| pending.seq <= last)
-        {
-            if let Some(pending) = self.receipts.pop_front() {
-                pending.receipt.resolve(SendOutcome::Sent {
-                    seq: pending.seq,
-                    sending_time: pending.sending_time,
-                    filed: pending.filed,
-                });
-            }
+    fn resolve_sent(&mut self) {
+        debug_assert!(
+            self.receipts
+                .iter()
+                .zip(self.receipts.iter().skip(1))
+                .all(|(earlier, later)| earlier.seq < later.seq),
+            "pending receipts are fed in MsgSeqNum order"
+        );
+        for pending in self.receipts.drain(..) {
+            pending.receipt.resolve(SendOutcome::Sent {
+                seq: pending.seq,
+                sending_time: pending.sending_time,
+                filed: pending.filed,
+            });
         }
     }
 

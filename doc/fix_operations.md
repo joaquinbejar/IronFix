@@ -1141,10 +1141,12 @@ form, as handed in or as the callback left it; the detail names the tag and
 never quotes a field value), `StoreRefused` (filing failed or timed out under
 `StoreFailurePolicy::CloseSession`, which then closes the session; under
 `Continue` the frame is written anyway and reports `Sent` with `filed` false),
-`SequenceExhausted`, `SessionClosed` (never queued), `LogoutPending` (behind
-this session's own Logout), `Discarded` (still in the outbound queue when the
-session ended) and `DiscardedBehindResend` (waiting behind a resend when the
-session ended).
+`SequenceExhausted`, `SessionClosed` (never queued), `LogoutPending` (reached
+while this session's own Logout was pending, or waiting behind a resend the
+counterparty asked for after that Logout when the session ended), `Discarded`
+(still in the outbound queue when the session ended with no resend under way,
+whether or not this session's Logout was ahead of it) and
+`DiscardedBehindResend` (waiting behind a resend when the session ended).
 
 A `StoreRefused` frame is not sent within the process, but a failed or
 timed-out store write leaves the store's state unknown: the frame may have been
