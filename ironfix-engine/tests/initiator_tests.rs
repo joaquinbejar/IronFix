@@ -8240,3 +8240,60 @@ async fn test_a_write_failing_before_the_ack_still_owes_a_reset_after_one_is_pai
 async fn test_a_write_failing_after_the_ack_still_owes_a_reset_after_one_is_paid() {
     owed_reset_survives_a_write_failing_while_it_is_paid(HandshakeFailure::AckTarget).await;
 }
+
+/// Inbound messages are decoded through the session's reusable field index
+/// (`SessionConfig::max_inbound_fields`); one with more fields than the index
+/// holds is not rejected but decoded through the unbounded fallback, so both
+/// reach the application in order.
+#[tokio::test]
+async fn test_message_above_max_inbound_fields_falls_back_and_is_delivered() {
+    let (listener, addr) = bind_listener().await;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let acceptor = tokio::spawn(async move {
+        let mut framed = accept_logon(listener).await;
+        ok(
+            framed
+                .send(venue_msg("8", 2, &[(37, "ORDER-1"), (39, "0")]))
+                .await,
+            "send a report within the index",
+        );
+        let wide: Vec<(u32, String)> = (0..40u32).map(|i| (5000 + i, format!("V{i}"))).collect();
+        let wide: Vec<(u32, &str)> = wide.iter().map(|(t, v)| (*t, v.as_str())).collect();
+        ok(
+            framed.send(venue_msg("8", 3, &wide)).await,
+            "send a report above the index",
+        );
+        ok(
+            framed
+                .send(venue_msg("8", 4, &[(37, "ORDER-2"), (39, "2")]))
+                .await,
+            "send a report within the index after the fallback",
+        );
+        let _ = done_rx.await;
+    });
+
+    let (app, mut app_rx) = RecordingApp::new();
+    let config = client_config(Duration::from_secs(30)).with_max_inbound_fields(12);
+    let initiator = Initiator::new(config, Arc::clone(&app));
+    let connection = ok(initiator.connect(addr).await, "connect");
+
+    for _ in 0..3 {
+        let received = ok(
+            timeout(Duration::from_secs(5), app_rx.recv()).await,
+            "every report must reach the application",
+        );
+        assert_eq!(some(received, "app channel must stay open"), "8");
+    }
+    assert_eq!(connection.next_target_seq(), 5);
+    assert!(!connection.is_closed());
+
+    let _ = done_tx.send(());
+    ok(
+        ok(
+            timeout(Duration::from_secs(20), acceptor).await,
+            "acceptor done within 20s",
+        ),
+        "acceptor task",
+    );
+}

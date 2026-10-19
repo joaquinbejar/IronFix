@@ -16,6 +16,7 @@
 //! [`DecodeError`] instead of a panic or a silent default.
 
 use crate::checksum::{calculate_checksum, parse_checksum};
+use crate::index::{FieldIndex, IndexedMessage};
 use ironfix_core::error::DecodeError;
 use ironfix_core::field::FieldRef;
 use ironfix_core::message::{MsgType, RawMessage};
@@ -401,6 +402,54 @@ struct PendingData {
     declared: usize,
 }
 
+/// The framing of one decoded message, before its fields are packaged.
+struct Frame<'a> {
+    /// The complete frame.
+    buffer: &'a [u8],
+    /// Frame-relative range of the BeginString (8) value.
+    begin_string: Range<usize>,
+    /// Frame-relative range of the body.
+    body: Range<usize>,
+    /// The parsed MsgType (35).
+    msg_type: MsgType,
+}
+
+/// Where [`Decoder::decode_frame`] collects fields.
+///
+/// `span` computes the field value's frame-relative range on demand, so a
+/// sink that only keeps borrowed [`FieldRef`]s pays nothing for it.
+trait FieldSink<'a> {
+    /// Appends one field.
+    fn push(
+        &mut self,
+        field: FieldRef<'a>,
+        span: impl FnOnce() -> Result<Range<usize>, DecodeError>,
+    ) -> Result<(), DecodeError>;
+}
+
+impl<'a> FieldSink<'a> for SmallVec<[FieldRef<'a>; 32]> {
+    #[inline]
+    fn push(
+        &mut self,
+        field: FieldRef<'a>,
+        _span: impl FnOnce() -> Result<Range<usize>, DecodeError>,
+    ) -> Result<(), DecodeError> {
+        SmallVec::push(self, field);
+        Ok(())
+    }
+}
+
+impl<'a> FieldSink<'a> for FieldIndex {
+    #[inline]
+    fn push(
+        &mut self,
+        field: FieldRef<'a>,
+        span: impl FnOnce() -> Result<Range<usize>, DecodeError>,
+    ) -> Result<(), DecodeError> {
+        FieldIndex::push(self, field.tag, span()?)
+    }
+}
+
 /// Zero-copy FIX message decoder.
 ///
 /// The decoder parses FIX messages from a byte buffer, extracting fields
@@ -458,6 +507,48 @@ impl<'a> Decoder<'a> {
     /// Structural garbage after the last field is an error even when checksum
     /// validation is disabled — it is never silently discarded.
     pub fn decode(&mut self) -> Result<RawMessage<'a>, DecodeError> {
+        let mut fields: SmallVec<[FieldRef<'a>; 32]> = SmallVec::new();
+        let frame = self.decode_frame(&mut fields)?;
+        RawMessage::new(
+            frame.buffer,
+            frame.begin_string,
+            frame.body,
+            frame.msg_type,
+            fields,
+        )
+    }
+
+    /// Decodes a complete FIX message into a caller-owned, reusable
+    /// [`FieldIndex`].
+    ///
+    /// Framing, BodyLength, CheckSum and every malformed-input error are
+    /// exactly those of [`Decoder::decode`]; only where the fields land
+    /// differs. The index is cleared first and never grows: decoding a message
+    /// that fits allocates nothing, and a message with more fields than
+    /// [`FieldIndex::capacity`] is refused.
+    ///
+    /// # Errors
+    /// [`DecodeError::TooManyFields`] when the message carries more fields
+    /// (CheckSum (10) excluded) than the index holds, plus every error
+    /// [`Decoder::decode`] returns.
+    pub fn decode_into<'i>(
+        &mut self,
+        index: &'i mut FieldIndex,
+    ) -> Result<IndexedMessage<'a, 'i>, DecodeError> {
+        index.clear();
+        let frame = self.decode_frame(index)?;
+        Ok(IndexedMessage::new(
+            frame.buffer,
+            index,
+            frame.msg_type,
+            frame.begin_string,
+            frame.body,
+        ))
+    }
+
+    /// The decode loop shared by [`Decoder::decode`] and
+    /// [`Decoder::decode_into`], generic over where the fields are collected.
+    fn decode_frame<S: FieldSink<'a>>(&mut self, sink: &mut S) -> Result<Frame<'a>, DecodeError> {
         let start_offset = self.offset;
         // Length/Data framing never carries across a message boundary.
         self.pending_data = None;
@@ -480,6 +571,7 @@ impl<'a> Decoder<'a> {
         // in this file is used here.
         let body_length =
             parse_length(body_length_field.value).ok_or(DecodeError::InvalidBodyLength)?;
+        let body_length_range = self.value_range(start_offset, body_length_field.value.len())?;
 
         // Record body start position. BodyLength (tag 9) is fully
         // attacker-controlled, so the end of the body is computed with checked
@@ -504,11 +596,12 @@ impl<'a> Decoder<'a> {
         // route the frame to the wrong handler.
         let msg_type: MsgType = msg_type_field.as_str()?.parse()?;
 
-        // Collect all fields
-        let mut fields: SmallVec<[FieldRef<'a>; 32]> = SmallVec::new();
-        fields.push(begin_string_field);
-        fields.push(body_length_field);
-        fields.push(msg_type_field);
+        // Collect all fields.
+        sink.push(begin_string_field, || Ok(begin_string.clone()))?;
+        sink.push(body_length_field, || Ok(body_length_range))?;
+        sink.push(msg_type_field, || {
+            self.value_range(start_offset, msg_type_field.value.len())
+        })?;
 
         // Parse remaining fields until checksum
         let mut checksum_field: Option<FieldRef<'a>> = None;
@@ -529,7 +622,7 @@ impl<'a> Decoder<'a> {
                 checksum_field_start = field_start;
                 break;
             }
-            fields.push(field);
+            sink.push(field, || self.value_range(start_offset, field.value.len()))?;
         }
 
         // The CheckSum field terminates every FIX frame, so its presence is
@@ -584,7 +677,12 @@ impl<'a> Decoder<'a> {
                     buffer_len: self.input.len(),
                 })?;
 
-        RawMessage::new(buffer, begin_string, body, msg_type, fields)
+        Ok(Frame {
+            buffer,
+            begin_string,
+            body,
+            msg_type,
+        })
     }
 
     /// Parses the next field from the buffer.
@@ -1675,5 +1773,117 @@ mod tests {
         assert!(decoder.decode().is_ok());
         decoder.reset();
         assert!(decoder.decode().is_ok());
+    }
+
+    /// Asserts `decode_into` yields exactly the framing and fields `decode`
+    /// yields for every message in `input`, reusing one index.
+    fn assert_indexed_matches_decode(input: &[u8], validate: bool, index: &mut FieldIndex) {
+        let mut plain = Decoder::new(input).with_checksum_validation(validate);
+        let mut indexed = Decoder::new(input).with_checksum_validation(validate);
+        while !plain.is_empty() {
+            let expected = plain.decode();
+            let actual = indexed.decode_into(index);
+            let (expected, actual) = match (expected, actual) {
+                (Ok(expected), Ok(actual)) => (expected, actual),
+                (expected, actual) => {
+                    assert_eq!(expected.err(), actual.err());
+                    return;
+                }
+            };
+            assert_eq!(expected.msg_type(), actual.msg_type());
+            assert_eq!(expected.len(), actual.buffer().len());
+            assert_eq!(expected.begin_string(), actual.begin_string());
+            assert_eq!(expected.body(), actual.body());
+            assert_eq!(expected.field_count(), actual.field_count());
+            let pairs = |fields: &[FieldRef<'_>]| -> Vec<(u32, Vec<u8>)> {
+                fields.iter().map(|f| (f.tag, f.value.to_vec())).collect()
+            };
+            let actual_fields: Vec<FieldRef<'_>> = actual.fields().collect();
+            assert_eq!(pairs(expected.field_slice()), pairs(&actual_fields));
+            let Ok(raw) = actual.to_raw_message() else {
+                panic!("an indexed message converts to a RawMessage");
+            };
+            assert_eq!(pairs(raw.field_slice()), pairs(expected.field_slice()));
+            assert_eq!(plain.offset(), indexed.offset());
+        }
+    }
+
+    #[test]
+    fn test_decode_into_matches_decode_with_a_reused_index() {
+        let mut index = FieldIndex::with_capacity(16);
+        let mut stream = build_frame(b"35=D\x0149=A\x0156=B\x0134=7\x0144=101.25\x01");
+        stream.extend_from_slice(&build_frame(b"35=A\x0195=7\x0196=a\x01b=c\x01d\x01"));
+        stream.extend_from_slice(&build_frame(b"35=0\x01"));
+        assert_indexed_matches_decode(&stream, true, &mut index);
+        assert_indexed_matches_decode(
+            &build_frame_with_begin_string(b"FIXT.1.1", b"35=8\x011128=9\x01"),
+            true,
+            &mut index,
+        );
+    }
+
+    #[test]
+    fn test_decode_into_matches_decode_with_zero_padded_tags() {
+        let mut index = FieldIndex::with_capacity(8);
+        assert_indexed_matches_decode(
+            b"8=FIX.4.4\x0109=5\x01035=0\x01010=000\x01",
+            false,
+            &mut index,
+        );
+    }
+
+    #[test]
+    fn test_decode_into_returns_the_same_errors_as_decode() {
+        let mut index = FieldIndex::with_capacity(8);
+        let mut bad_checksum = build_frame(b"35=0\x01");
+        let digit_at = bad_checksum.len() - 2;
+        if let Some(digit) = bad_checksum.get_mut(digit_at) {
+            *digit = if *digit == b'9' { b'0' } else { *digit + 1 };
+        }
+        for frame in [
+            bad_checksum,
+            frame_with_body_length("99999999999999999999", "9"),
+            frame_with_body_length("3", "9"),
+            b"8=FIX.4.4\x019=5\x0135=0".to_vec(),
+            b"8=FIX.4.4\x019=12\x0135=0\x01abc=1\x0110=000\x01".to_vec(),
+        ] {
+            assert_indexed_matches_decode(&frame, true, &mut index);
+        }
+    }
+
+    #[test]
+    fn test_decode_into_over_capacity_is_too_many_fields() {
+        let frame = build_frame(b"35=D\x0149=A\x0156=B\x0134=7\x01");
+        // 8, 9, 35, 49, 56, 34: six fields, CheckSum excluded.
+        let mut fits = FieldIndex::with_capacity(6);
+        assert!(Decoder::new(&frame).decode_into(&mut fits).is_ok());
+
+        let mut short = FieldIndex::with_capacity(5);
+        assert_eq!(
+            Decoder::new(&frame).decode_into(&mut short).err(),
+            Some(DecodeError::TooManyFields { capacity: 5 })
+        );
+        let mut header_only = FieldIndex::with_capacity(2);
+        assert_eq!(
+            Decoder::new(&frame).decode_into(&mut header_only).err(),
+            Some(DecodeError::TooManyFields { capacity: 2 })
+        );
+    }
+
+    #[test]
+    fn test_decode_into_recovers_after_too_many_fields() {
+        let mut index = FieldIndex::with_capacity(4);
+        let large = build_frame(b"35=D\x0149=A\x0156=B\x0134=7\x01");
+        let small = build_frame(b"35=0\x0134=8\x01");
+        assert_eq!(
+            Decoder::new(&large).decode_into(&mut index).err(),
+            Some(DecodeError::TooManyFields { capacity: 4 })
+        );
+        let Ok(message) = Decoder::new(&small).decode_into(&mut index) else {
+            panic!("a message within the capacity decodes");
+        };
+        assert_eq!(message.field_count(), 4);
+        assert_eq!(message.get_field_str(34), Some("8"));
+        assert_eq!(index.capacity(), 4);
     }
 }

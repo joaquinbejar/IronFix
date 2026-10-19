@@ -148,6 +148,19 @@ pub enum DecodeError {
     /// truncated or defaulted message type.
     #[error("invalid msg type (tag 35): {0}")]
     InvalidMsgType(#[from] MsgTypeError),
+
+    /// The message carries more fields than the caller-owned field index can
+    /// hold.
+    ///
+    /// Raised by a bounded decode (for example
+    /// `ironfix_tagvalue::Decoder::decode_into`) instead of growing the index:
+    /// the bound is the caller's resource ceiling, so a message above it is
+    /// rejected rather than allocated for.
+    #[error("message has more than {capacity} fields")]
+    TooManyFields {
+        /// Number of fields the index can hold.
+        capacity: usize,
+    },
 }
 
 /// Errors that occur during FIX message encoding.

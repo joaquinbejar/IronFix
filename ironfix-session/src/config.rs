@@ -34,6 +34,7 @@
 //! | `heartbeat_interval` | whole seconds | 0 (disabled) or [`MIN_HEARTBEAT_INTERVAL_SECS`]..=[`MAX_HEARTBEAT_INTERVAL_SECS`] | 30 s |
 //! | `logon_timeout` / `logout_timeout` | duration | non-zero, at most [`MAX_TIMEOUT`] | 10 s |
 //! | `max_message_size` | bytes | [`MIN_MESSAGE_SIZE_LIMIT`]..=[`MAX_MESSAGE_SIZE_LIMIT`] | 1 MiB |
+//! | `max_inbound_fields` | fields per message | [`MIN_INBOUND_FIELDS`]..=[`MAX_INBOUND_FIELDS`] | [`DEFAULT_MAX_INBOUND_FIELDS`] (256) |
 //! | `garbled_frame_limit` | frames within a duration | unset, or 1..=[`MAX_GARBLED_FRAME_LIMIT`] frames within a non-zero window of at most [`MAX_GARBLED_FRAME_WINDOW`] | unset |
 //! | `sender_sub_id` / `target_sub_id` | ASCII | unset, or 1..=[`MAX_ID_LEN`] bytes, printable ASCII except `=` | unset |
 //! | `sender_location_id` / `target_location_id` | ASCII | as above | unset |
@@ -132,6 +133,23 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `max_message_size` used when the builder is not told otherwise (1 MiB).
 const DEFAULT_MESSAGE_SIZE_LIMIT: usize = 1024 * 1024;
+
+/// Smallest `max_inbound_fields` accepted: BeginString (8), BodyLength (9)
+/// and MsgType (35), which every message carries.
+pub const MIN_INBOUND_FIELDS: usize = 3;
+
+/// Largest `max_inbound_fields` accepted.
+///
+/// The engine allocates its inbound field index once, at this many entries at
+/// most, so the knob is also a per-session memory ceiling.
+pub const MAX_INBOUND_FIELDS: usize = 65_536;
+
+/// `max_inbound_fields` used when not told otherwise.
+///
+/// Comfortably above an ExecutionReport with a few repeating groups; a larger
+/// message still decodes, through the slower fallback described on
+/// [`SessionConfig::max_inbound_fields`].
+pub const DEFAULT_MAX_INBOUND_FIELDS: usize = 256;
 
 /// Largest number of garbled frames a [`GarbledFrameLimit`] may allow within
 /// its window.
@@ -302,6 +320,17 @@ pub enum SessionConfigError {
         /// The smallest limit accepted, in bytes.
         min: usize,
         /// The largest limit accepted, in bytes.
+        max: usize,
+    },
+
+    /// `max_inbound_fields` is outside its supported range.
+    #[error("max_inbound_fields of {fields} is outside the supported range {min}..={max}")]
+    InboundFieldLimitOutOfRange {
+        /// The configured limit, in fields per message.
+        fields: usize,
+        /// The smallest limit accepted, [`MIN_INBOUND_FIELDS`].
+        min: usize,
+        /// The largest limit accepted, [`MAX_INBOUND_FIELDS`].
         max: usize,
     },
 
@@ -661,6 +690,25 @@ pub struct SessionConfig {
     /// From [`MIN_MESSAGE_SIZE_LIMIT`] to [`MAX_MESSAGE_SIZE_LIMIT`]. Also the
     /// per-connection buffering ceiling of the codec.
     pub max_message_size: usize,
+    /// Capacity of the reusable field index the engine decodes inbound
+    /// messages into, in fields per message (CheckSum (10) excluded).
+    ///
+    /// The index is allocated once per session, so an inbound message with at
+    /// most this many fields is decoded without a per-message allocation for
+    /// its field index. Only that scratch index is reused: the engine still
+    /// hands each message on as a `RawMessage`, whose
+    /// `SmallVec<[FieldRef; 32]>` allocates for any message above 32 fields,
+    /// so the inbound path is not allocation-free end to end. A message with
+    /// more fields than this bound is **not** rejected: it is
+    /// decoded again through the unbounded path, which allocates, and the
+    /// engine counts and logs the fallback. The bound on hostile input
+    /// remains [`SessionConfig::max_message_size`].
+    ///
+    /// Range: [`MIN_INBOUND_FIELDS`]..=[`MAX_INBOUND_FIELDS`]; anything else
+    /// is refused by [`SessionConfig::validate`] with
+    /// [`SessionConfigError::InboundFieldLimitOutOfRange`]. Default:
+    /// [`DEFAULT_MAX_INBOUND_FIELDS`].
+    pub max_inbound_fields: usize,
     /// How long to wait for the Logon acknowledgement.
     ///
     /// Non-zero, at most [`MAX_TIMEOUT`].
@@ -853,6 +901,7 @@ impl SessionConfig {
             reset_on_logout: false,
             reset_on_disconnect: false,
             max_message_size: DEFAULT_MESSAGE_SIZE_LIMIT,
+            max_inbound_fields: DEFAULT_MAX_INBOUND_FIELDS,
             logon_timeout: DEFAULT_TIMEOUT,
             logout_timeout: DEFAULT_TIMEOUT,
             validate_checksum: true,
@@ -888,6 +937,8 @@ impl SessionConfig {
     /// non-encodable identity string, a fractional or out-of-range heartbeat
     /// interval, a zero or excessive handshake timeout, a message-size
     /// limit outside [`MIN_MESSAGE_SIZE_LIMIT`]..=[`MAX_MESSAGE_SIZE_LIMIT`],
+    /// a field-index capacity outside
+    /// [`MIN_INBOUND_FIELDS`]..=[`MAX_INBOUND_FIELDS`],
     /// an [`SessionConfig::allowed_appl_versions`] set the session cannot
     /// honour, or [`SessionConfig::send_next_expected_msg_seq_num`] on a
     /// version that does not define `NextExpectedMsgSeqNum` (789), or a
@@ -903,6 +954,13 @@ impl SessionConfig {
                 size: self.max_message_size,
                 min: MIN_MESSAGE_SIZE_LIMIT,
                 max: MAX_MESSAGE_SIZE_LIMIT,
+            });
+        }
+        if !(MIN_INBOUND_FIELDS..=MAX_INBOUND_FIELDS).contains(&self.max_inbound_fields) {
+            return Err(SessionConfigError::InboundFieldLimitOutOfRange {
+                fields: self.max_inbound_fields,
+                min: MIN_INBOUND_FIELDS,
+                max: MAX_INBOUND_FIELDS,
             });
         }
 
@@ -1028,6 +1086,20 @@ impl SessionConfig {
     #[must_use]
     pub const fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
+        self
+    }
+
+    /// Sets the capacity of the inbound field index, in fields per message.
+    ///
+    /// Only the scratch index is reused; the `RawMessage` handed on still
+    /// allocates above 32 fields.
+    ///
+    /// [`MIN_INBOUND_FIELDS`]..=[`MAX_INBOUND_FIELDS`]. Checked by
+    /// [`SessionConfig::validate`], not here. See
+    /// [`SessionConfig::max_inbound_fields`].
+    #[must_use]
+    pub const fn with_max_inbound_fields(mut self, fields: usize) -> Self {
+        self.max_inbound_fields = fields;
         self
     }
 
@@ -1501,6 +1573,7 @@ impl SessionConfigBuilder {
             reset_on_logout: self.reset_on_logout,
             reset_on_disconnect: self.reset_on_disconnect,
             max_message_size: self.max_message_size,
+            max_inbound_fields: DEFAULT_MAX_INBOUND_FIELDS,
             logon_timeout: self.logon_timeout,
             logout_timeout: self.logout_timeout,
             validate_checksum: self.validate_checksum,
@@ -1814,6 +1887,33 @@ mod tests {
     }
 
     // --- Message size limit --------------------------------------------------
+
+    #[test]
+    fn test_max_inbound_fields_defaults_and_bounds() {
+        assert_eq!(config().max_inbound_fields, DEFAULT_MAX_INBOUND_FIELDS);
+        assert_eq!(
+            built(required()).max_inbound_fields,
+            DEFAULT_MAX_INBOUND_FIELDS
+        );
+        for fields in [MIN_INBOUND_FIELDS, MAX_INBOUND_FIELDS] {
+            assert_eq!(config().with_max_inbound_fields(fields).validate(), Ok(()));
+        }
+        for fields in [
+            0,
+            MIN_INBOUND_FIELDS - 1,
+            MAX_INBOUND_FIELDS + 1,
+            usize::MAX,
+        ] {
+            assert_eq!(
+                config().with_max_inbound_fields(fields).validate(),
+                Err(SessionConfigError::InboundFieldLimitOutOfRange {
+                    fields,
+                    min: MIN_INBOUND_FIELDS,
+                    max: MAX_INBOUND_FIELDS,
+                })
+            );
+        }
+    }
 
     #[test]
     fn test_build_with_zero_max_message_size_is_rejected() {

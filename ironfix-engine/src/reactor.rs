@@ -261,6 +261,7 @@ use ironfix_core::error::{DecodeError, EncodeError, StoreError};
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::Timestamp;
 use ironfix_core::version::FixVersion;
+use ironfix_session::config::MAX_INBOUND_FIELDS;
 use ironfix_session::heartbeat::generate_test_req_id;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
 use ironfix_session::{
@@ -268,6 +269,7 @@ use ironfix_session::{
     TestRequestOutcome,
 };
 use ironfix_store::{MessageStore, StoredMessage};
+use ironfix_tagvalue::FieldIndex;
 use ironfix_transport::{CodecError, FixCodec};
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -1879,6 +1881,12 @@ struct Reactor<A: Application> {
     /// order once it is filled ([`Reactor::release_ready`]); `None` under
     /// `Discard`.
     gap_queue: Option<GapQueue>,
+    /// The field index every inbound frame is decoded into, allocated once
+    /// with [`SessionConfig::max_inbound_fields`] entries.
+    inbound_index: FieldIndex,
+    /// Inbound frames with more fields than `inbound_index` holds, decoded
+    /// through the unbounded fallback instead.
+    field_index_fallbacks: u64,
 }
 
 /// A new outbound application message held by the outbound throttle until
@@ -5140,6 +5148,24 @@ impl<A: Application> Reactor<A> {
         Ok(phase)
     }
 
+    /// Counts an inbound frame too large for the reusable field index, which
+    /// is then decoded through the unbounded path.
+    ///
+    /// The log carries the session and the counts, never the frame.
+    fn note_field_index_fallback(&mut self, capacity: usize) {
+        match self.field_index_fallbacks.checked_add(1) {
+            Some(count) => self.field_index_fallbacks = count,
+            None => debug_assert!(false, "field-index fallback count overflowed u64"),
+        }
+        tracing::debug!(
+            session = %self.session_id,
+            capacity,
+            fallbacks = self.field_index_fallbacks,
+            "inbound message has more fields than max_inbound_fields: decoded through the \
+             unbounded fallback"
+        );
+    }
+
     /// Handles one inbound frame: identity validation, sequence validation,
     /// admin processing, and application callback dispatch.
     async fn on_frame(
@@ -5151,7 +5177,14 @@ impl<A: Application> Reactor<A> {
         // Frozen once: handing an application message to the dispatcher is
         // then a reference-count bump on this buffer, not a copy of it.
         let frame = frame.freeze();
-        let raw = match wire::decode_frame(&frame) {
+        let decoded = match wire::decode_frame_into(&frame, &mut self.inbound_index) {
+            Err(DecodeError::TooManyFields { capacity }) => {
+                self.note_field_index_fallback(capacity);
+                wire::decode_frame(&frame)
+            }
+            decoded => decoded,
+        };
+        let raw = match decoded {
             Ok(raw) => raw,
             // A frame whose header does not decode (MsgType (35) not third,
             // BodyLength invalid, a malformed field among the first three) is
@@ -5708,6 +5741,11 @@ where
     let (reject_tx, reject_rx) = mpsc::channel(app_queue_capacity);
     let garbled = config.garbled_frame_limit.map(GarbledFrameWindow::new);
     let gap_queue = GapQueue::for_policy(config.gap_policy);
+    // `SessionConfig::validate` bounds the knob before a session starts; the
+    // `min` keeps a configuration assembled by hand from sizing this
+    // allocation past the documented ceiling.
+    let inbound_index =
+        FieldIndex::with_capacity(config.max_inbound_fields.min(MAX_INBOUND_FIELDS));
     let writer = Writer::new(config.max_message_size).with_capture(capture);
     // A budget whose tokens come faster than the release timer's resolution
     // keeps its rate only with a burst of a millisecond's worth of tokens.
@@ -5776,6 +5814,8 @@ where
         garbled,
         throttle,
         gap_queue,
+        inbound_index,
+        field_index_fallbacks: 0,
     };
 
     let channels = ReactorChannels {

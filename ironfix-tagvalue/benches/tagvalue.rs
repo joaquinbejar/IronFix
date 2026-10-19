@@ -12,6 +12,10 @@
 //!   two pinned message literals (a Logon and an ExecutionReport), captured once
 //!   from the crate's `Encoder` so the decode input does not silently track a
 //!   later encoder change.
+//! - `tagvalue/decode_index` — `Decoder::decode` against
+//!   `Decoder::decode_into` a reused `FieldIndex`, on the two pinned messages
+//!   and on a 100-field message built once by the `Encoder` (above the 32
+//!   fields `RawMessage` keeps inline).
 //! - `tagvalue/encode` — a full `finish()` and the reused-buffer append path,
 //!   built inline by the `Encoder` under test.
 //! - `tagvalue/checksum` — `calculate_checksum` across payload sizes, with the
@@ -28,7 +32,7 @@ use std::hint::black_box;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ironfix_core::Timestamp;
 use ironfix_tagvalue::checksum::{format_checksum, parse_checksum};
-use ironfix_tagvalue::{Decoder, Encoder, calculate_checksum};
+use ironfix_tagvalue::{Decoder, Encoder, FieldIndex, calculate_checksum};
 
 const BEGIN_STRING: &str = "FIX.4.4";
 
@@ -79,6 +83,52 @@ fn bench_decode(c: &mut Criterion) {
                     count += black_box(field).value.len();
                 }
                 black_box(count)
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Builds a message with 100 fields (8, 9, 35 and 97 body fields), once,
+/// before measurement.
+fn hundred_field_message() -> Vec<u8> {
+    let mut encoder = Encoder::new(BEGIN_STRING);
+    encoder.put_str(35, "8");
+    for tag in 5000..5097u32 {
+        encoder.put_uint(tag, u64::from(tag));
+    }
+    encoder.finish().expect("fixture encodes").to_vec()
+}
+
+fn bench_decode_index(c: &mut Criterion) {
+    let mut group = c.benchmark_group("tagvalue/decode_index");
+    let hundred = hundred_field_message();
+
+    for (name, msg) in [
+        ("logon", LOGON),
+        ("execution_report", EXECUTION_REPORT),
+        ("hundred_fields", hundred.as_slice()),
+    ] {
+        group.throughput(Throughput::Bytes(msg.len() as u64));
+
+        group.bench_with_input(BenchmarkId::new("decode", name), &msg, |b, &msg| {
+            b.iter(|| {
+                let mut decoder = Decoder::new(black_box(msg));
+                black_box(decoder.decode().expect("fixture decodes").field_count())
+            });
+        });
+
+        let mut index = FieldIndex::with_capacity(128);
+        group.bench_with_input(BenchmarkId::new("decode_into", name), &msg, |b, &msg| {
+            b.iter(|| {
+                let mut decoder = Decoder::new(black_box(msg));
+                black_box(
+                    decoder
+                        .decode_into(&mut index)
+                        .expect("fixture decodes")
+                        .field_count(),
+                )
             });
         });
     }
@@ -194,6 +244,7 @@ fn bench_sending_time(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_decode,
+    bench_decode_index,
     bench_encode,
     bench_checksum,
     bench_sending_time
