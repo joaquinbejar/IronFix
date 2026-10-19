@@ -168,8 +168,39 @@
 //! or a message acted on. A slow store therefore delays this session's reads,
 //! heartbeats and timeout detection for as long as the call takes. Each call is
 //! bounded by the store timeout, and an overrun is a failed write under the
-//! [`StoreFailurePolicy`]. `to_admin`, `to_app` and `from_admin` also run
-//! inline.
+//! [`StoreFailurePolicy`]. `to_admin`, `to_app_checked` (and through it
+//! `to_app`) and `from_admin` also run inline.
+//!
+//! # The outbound gate and send outcomes
+//!
+//! Every **new** outbound application message goes through
+//! [`Application::to_app_checked`] when it is about to be framed, before a
+//! sequence number is peeked and before the store is touched, so a veto
+//! spends nothing and files nothing. A replay is not gated: the answer to a
+//! `ResendRequest` and the `NextExpectedMsgSeqNum` (789) resend write the
+//! filed frame as it was filed, without the callback, where QuickFIX calls
+//! `toApp` on each resent application message and gap-fills one that throws
+//! `DoNotSend`. Administrative messages go through `to_admin`, which cannot
+//! refuse them.
+//!
+//! A message handed in with
+//! [`Connection::send_tracked`](crate::Connection::send_tracked) carries a
+//! receipt. Once its frame is fed to the write buffer, the receipt waits in a
+//! queue of pending receipts, with the frame's `MsgSeqNum`, the `SendingTime`
+//! captured right after it was encoded and whether the store filed it, and is
+//! resolved exactly once:
+//!
+//! - `Sent` by [`Reactor::resolve_sent`], from [`Reactor::on_flushed`], for
+//!   every pending receipt: a completed flush wrote everything fed before
+//!   it;
+//! - `Unknown` with `Transport` or `WriteTimeout` when the write fails or the
+//!   write timeout runs out ([`Reactor::close_on_write_failure`]), or when
+//!   the closing session's last flush does not drain the buffer: the number
+//!   was spent when the frame was buffered;
+//! - `NotSent` where the path stops before that (a veto, an unframeable
+//!   body, a store refusal), and `Discarded`, `DiscardedBehindResend` or
+//!   `LogoutPending` for whatever is still queued when the loop ends
+//!   ([`Reactor::discard_unsent`]).
 //!
 //! All sequence arithmetic goes through the checked
 //! [`SequenceManager::try_allocate_sender_seq`] /
@@ -181,6 +212,7 @@ use crate::connection::{Command, SessionRuntime};
 use crate::error::EngineError;
 use crate::garbled::{GarbledFrameWindow, GarbledVerdict};
 use crate::outbound;
+use crate::outcome::{self, NotSentReason, Receipt, SendOutcome, UnknownReason};
 use crate::persistence::{
     HandshakeStore, OwedReset, PersistedCounters, SessionStore, StoreFailurePolicy, file_and_spend,
     timed,
@@ -194,6 +226,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
 use ironfix_core::error::{DecodeError, EncodeError, StoreError};
 use ironfix_core::message::{MsgType, RawMessage};
+use ironfix_core::types::Timestamp;
 use ironfix_core::version::FixVersion;
 use ironfix_session::heartbeat::generate_test_req_id;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
@@ -1342,7 +1375,9 @@ enum CloseFlush {
 
 /// Writes out what a closing session left in the write buffer (its last
 /// Logout, typically) before the socket is dropped. Returns whether the
-/// buffer drained.
+/// buffer drained: `Ok`, or why not, as the reason a tracked frame still in
+/// it reports ([`UnknownReason::Transport`] when the write failed,
+/// [`UnknownReason::WriteTimeout`] when the stream stopped taking bytes).
 ///
 /// The same rule bounds it as the open session: it gives up once the stream
 /// has accepted no byte for the write timeout, `budget` being what is left of
@@ -1360,7 +1395,7 @@ async fn flush_on_close(
     budget: Duration,
     write_timeout: Duration,
     session_id: &SessionId,
-) -> bool {
+) -> Result<(), UnknownReason> {
     let mut reading = true;
     let mut budget = budget;
     loop {
@@ -1378,21 +1413,21 @@ async fn flush_on_close(
         });
         match timeout(budget, wait).await {
             Ok(CloseFlush::Progressed) => budget = write_timeout,
-            Ok(CloseFlush::Done(Ok(()))) => return true,
+            Ok(CloseFlush::Done(Ok(()))) => return Ok(()),
             Ok(CloseFlush::Done(Err(err))) => {
                 tracing::warn!(
                     session = %session_id,
                     error = %err,
                     "cannot write the closing session's last output"
                 );
-                return false;
+                return Err(UnknownReason::Transport);
             }
             Err(_) => {
                 tracing::warn!(
                     session = %session_id,
                     "the closing session's last output made no progress for the write timeout"
                 );
-                return false;
+                return Err(UnknownReason::WriteTimeout);
             }
         }
     }
@@ -1457,6 +1492,13 @@ struct Reactor<A: Application> {
     /// this session re-request, so it re-requests at most once per number
     /// ([`Reactor::rerequest_spanned_gap`]).
     spanning_rerequested: Option<u64>,
+    /// Whether this session's own Logout has been fed: messages still queued
+    /// behind it when the session closes report `LogoutPending`.
+    logout_sent: bool,
+    /// Tracked frames fed to the write buffer and not yet flushed, in the
+    /// order they were fed; resolved by the flush that covers them or by the
+    /// failure that ends the session ([`PendingReceipt`]).
+    receipts: VecDeque<PendingReceipt>,
     /// How long waiting output may make no progress before the session is
     /// closed ([`Writer::on_tick`]).
     write_timeout: Duration,
@@ -1525,6 +1567,9 @@ async fn run_reactor<A: Application + 'static>(
         };
     let mut commands_open = true;
     let mut rejects_open = true;
+    // Whether the latest pass of the loop started with a resend under way,
+    // read once the loop ends to say why queued messages were not sent.
+    let mut resending = false;
     let mut tick = interval(TICK_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -1573,7 +1618,7 @@ async fn run_reactor<A: Application + 'static>(
         // messages wait in the command queue, so they never overtake it. Live
         // messages stop at the lower live mark, which is what holds a sender
         // back while the counterparty reads slowly.
-        let resending = ctx.resend_in_progress();
+        resending = ctx.resend_in_progress();
         let waiting = framed.write_buffer().len();
         let resend_ready = resending && waiting < WRITE_BUFFER_HIGH_WATER;
         let live_room = waiting < LIVE_HIGH_WATER;
@@ -1654,15 +1699,23 @@ async fn run_reactor<A: Application + 'static>(
         }
     };
 
+    // Nothing more is framed: every send still queued, or held behind a
+    // resend, resolves now, before the close-time store work and before
+    // `wait_closed` fires.
+    let behind_resend = resending || ctx.resend_in_progress();
+    ctx.discard_unsent(&mut commands, behind_resend);
+
     // What the session queued last (its Logout, the reply to the
     // counterparty's, the Reject before an identity Logout) may still be in
     // the write buffer: it is written out before anything else closes, within
-    // what is left of the write timeout, unless writing is what failed.
+    // what is left of the write timeout, unless writing is what failed. The
+    // tracked frames in it are sent if that flush drains the buffer, and
+    // unknown otherwise: their numbers were spent when they were buffered.
     let mut outcome = outcome;
     if ctx.writer.pending && !ctx.writer.failed {
         let budget = ctx.writer.close_budget(driver_now(), ctx.write_timeout);
         let write_timeout = ctx.write_timeout;
-        if flush_on_close(
+        match flush_on_close(
             &mut framed,
             &mut ctx.writer,
             budget,
@@ -1671,9 +1724,12 @@ async fn run_reactor<A: Application + 'static>(
         )
         .await
         {
-            ctx.on_flushed(&mut framed);
+            Ok(()) => ctx.on_flushed(&mut framed),
+            Err(reason) => ctx.fail_receipts(reason),
         }
     }
+    // Anything still waiting was buffered behind a write that failed.
+    ctx.fail_receipts(UnknownReason::Transport);
     // A Logout exchange is complete only once this session's own Logout has
     // been written. One still in the buffer never reached the counterparty:
     // the close is not graceful, so `reset_on_logout` does not reset a stream
@@ -1833,9 +1889,10 @@ enum Sent {
     /// and a sequence number was spent. The reactor loop writes it out; if
     /// that fails, the session closes.
     Yes,
-    /// The message was dropped before the wire: `to_admin`/`to_app` left it
-    /// unframeable or dropped a required field. No sequence number was spent
-    /// and the session is intact.
+    /// The message was dropped before the wire: `to_app_checked` vetoed it,
+    /// or the callback (`to_admin` / `to_app_checked`) left it unframeable or
+    /// dropped a required field. No sequence number was spent and the session
+    /// is intact.
     Dropped,
     /// A resend is under way: the message waits behind it and is written, in
     /// order, once the resend is done ([`Reactor::finish_resends`]). No
@@ -1843,13 +1900,51 @@ enum Sent {
     Deferred,
 }
 
+/// Why [`Reactor::prepare`] refused a message before it was framed. Nothing
+/// was spent and nothing filed.
+#[derive(Debug)]
+enum Refusal {
+    /// `to_app_checked` vetoed the application message.
+    Vetoed(RejectReason),
+    /// The callback left a body the engine will not frame.
+    Invalid(EngineError),
+}
+
+impl Refusal {
+    /// The reason a tracked send reports for this refusal.
+    #[must_use]
+    fn into_reason(self) -> NotSentReason {
+        match self {
+            Self::Vetoed(reason) => NotSentReason::Vetoed { reason },
+            Self::Invalid(err) => NotSentReason::invalid(&err),
+        }
+    }
+}
+
+/// A tracked frame fed to the write buffer, waiting for the flush that
+/// writes it: everything its `Sent` outcome reports, captured when it was
+/// framed and filed.
+#[derive(Debug)]
+struct PendingReceipt {
+    /// The `MsgSeqNum` (34) spent on the frame.
+    seq: u64,
+    /// The `SendingTime` (52) it carries, as written on the wire.
+    sending_time: Timestamp,
+    /// Whether the store filed it.
+    filed: bool,
+    /// The caller's receipt, marked as written.
+    receipt: Receipt,
+}
+
 /// A message that takes a new sequence number, held back while a resend is
 /// under way and written once it is done.
 #[derive(Debug)]
 enum DeferredSend {
     /// A message built when it was asked for: a Heartbeat answering a
-    /// TestRequest, a session Reject.
-    Message(PendingMessage),
+    /// TestRequest, a session Reject. A tracked application message would
+    /// carry its receipt here, but none is ever held: application messages
+    /// wait in the command queue while a resend is under way.
+    Message(PendingMessage, Option<Receipt>),
     /// The `ResendRequest` for the gap recovery tracks. It is built when it is
     /// written, from the gap as it stands then, and skipped if the gap has
     /// closed meanwhile.
@@ -1959,7 +2054,9 @@ impl<A: Application> Reactor<A> {
                 self.on_flushed(framed);
                 Ok(phase)
             }
-            SocketEvent::Flushed(Err(err)) => Err(self.close_on_write_failure(phase, &err)),
+            SocketEvent::Flushed(Err(err)) => {
+                Err(self.close_on_write_failure(phase, &err, UnknownReason::Transport))
+            }
             SocketEvent::Inbound(inbound) => {
                 if resend_ready && let Some(reads) = self.reads_since_resend_step.checked_add(1) {
                     self.reads_since_resend_step = reads;
@@ -1985,6 +2082,44 @@ impl<A: Application> Reactor<A> {
         if let Some((first, last)) = covered {
             tracing::trace!(session = %self.session_id, first, last, "flushed");
         }
+        self.resolve_sent();
+    }
+
+    /// Resolves every pending receipt as [`SendOutcome::Sent`]: a completed
+    /// flush wrote everything fed before it, so every tracked frame waiting
+    /// in the buffer was in it. No sequence number is compared, so nothing
+    /// here depends on numbers only going up.
+    ///
+    /// Called only from [`Reactor::on_flushed`]: a frame is reported sent
+    /// once it has been flushed, never when it is buffered.
+    fn resolve_sent(&mut self) {
+        debug_assert!(
+            self.receipts
+                .iter()
+                .zip(self.receipts.iter().skip(1))
+                .all(|(earlier, later)| earlier.seq < later.seq),
+            "pending receipts are fed in MsgSeqNum order"
+        );
+        for pending in self.receipts.drain(..) {
+            pending.receipt.resolve(SendOutcome::Sent {
+                seq: pending.seq,
+                sending_time: pending.sending_time,
+                filed: pending.filed,
+            });
+        }
+    }
+
+    /// Resolves every pending receipt as [`SendOutcome::Unknown`] with
+    /// `reason`: their frames were numbered and buffered, and the write that
+    /// would have carried them failed or will not happen. Each keeps the
+    /// number spent on it.
+    fn fail_receipts(&mut self, reason: UnknownReason) {
+        for pending in self.receipts.drain(..) {
+            pending.receipt.resolve(SendOutcome::Unknown {
+                seq: pending.seq,
+                reason,
+            });
+        }
     }
 
     /// Writes the waiting output at once if the stream takes it now, without
@@ -2006,6 +2141,7 @@ impl<A: Application> Reactor<A> {
             }
             Some(Err(err)) => {
                 self.writer.failed = true;
+                self.fail_receipts(UnknownReason::Transport);
                 Err(err)
             }
         }
@@ -2027,13 +2163,16 @@ impl<A: Application> Reactor<A> {
 
     /// Ends the session because writing to the counterparty failed, or made
     /// no progress for the write timeout. Nothing more is written: the
-    /// closing session does not try to flush what is left.
+    /// closing session does not try to flush what is left, and every tracked
+    /// frame still buffered resolves [`SendOutcome::Unknown`] with `reason`.
     fn close_on_write_failure(
         &mut self,
         phase: Phase,
         err: &dyn std::fmt::Display,
+        reason: UnknownReason,
     ) -> SessionClosed {
         self.writer.failed = true;
+        self.fail_receipts(reason);
         teardown(phase);
         closed(format!("write failed: {err}"), false)
     }
@@ -2054,6 +2193,15 @@ impl<A: Application> Reactor<A> {
     /// filing it would overwrite a message under `seq` that is still
     /// resendable, and it spends no number.
     ///
+    /// A tracked send passes its `receipt`, and this resolves it on every
+    /// path but one: not sent when the frame cannot be built, numbered or
+    /// filed, unknown when the codec refuses the frame after it was filed.
+    /// It is marked as filing before the store is touched (a filing that is
+    /// interrupted may still have reached the store), and once the frame is
+    /// fed it waits with the frame's number, its `SendingTime` as written on
+    /// the wire (captured right after the encode) and whether the store filed
+    /// it, in the queue the flush resolves ([`Reactor::resolve_sent`]).
+    ///
     /// # Errors
     /// [`WriteFailure::Encode`] leaves the session untouched — nothing was
     /// written and nothing was spent. [`WriteFailure::Fatal`] does not: a
@@ -2066,12 +2214,25 @@ impl<A: Application> Reactor<A> {
         seq: u64,
         pending: &PendingMessage,
         spend: bool,
+        mut receipt: Option<Receipt>,
     ) -> Result<(), WriteFailure> {
-        let frame = match self.factory.encode(seq, pending) {
-            Ok(frame) => frame,
-            Err(err) => return Err(WriteFailure::Encode(err)),
+        let precision = self.factory.sending_time_precision();
+        let (frame, stamped) = match self.factory.encode_stamped(seq, pending) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                outcome::resolve(receipt, || {
+                    SendOutcome::not_sent(NotSentReason::unencodable(&err))
+                });
+                return Err(WriteFailure::Encode(err));
+            }
         };
+        let mut filed = false;
         if spend {
+            // Marked before the store is touched: a filing that is
+            // interrupted may still have reached the store.
+            if let Some(receipt) = receipt.as_mut() {
+                receipt.filing(seq);
+            }
             // Only the reactor allocates sender numbers and only this method
             // spends them, so nothing can take the peeked number in between;
             // the mismatch check inside exists so a wrong `MsgSeqNum` can never
@@ -2083,7 +2244,7 @@ impl<A: Application> Reactor<A> {
                 &self.reset_owed,
             )
             .map(|store| (store, &mut self.persisted));
-            file_and_spend(
+            filed = match file_and_spend(
                 store,
                 &self.runtime.sequences,
                 &self.session_id,
@@ -2092,15 +2253,36 @@ impl<A: Application> Reactor<A> {
                 frame,
             )
             .await
-            .map_err(WriteFailure::Fatal)?;
+            {
+                Ok(filed) => filed,
+                Err(err) => {
+                    if let Some(receipt) = receipt {
+                        receipt.fail(&err);
+                    }
+                    return Err(WriteFailure::Fatal(err));
+                }
+            };
         }
         // Appended, not written: the reactor loop writes it out while it
         // goes on reading, and the write timeout watches that.
-        self.writer
-            .feed(framed, frame)
-            .map_err(|err| WriteFailure::Fatal(err.into()))?;
+        if let Err(err) = self.writer.feed(framed, frame) {
+            let err = EngineError::from(err);
+            if let Some(receipt) = receipt {
+                receipt.fail(&err);
+            }
+            return Err(WriteFailure::Fatal(err));
+        }
         if spend {
             self.writer.fed_new(seq);
+            if let Some(mut receipt) = receipt.take() {
+                receipt.writing(seq);
+                self.receipts.push_back(PendingReceipt {
+                    seq,
+                    sending_time: precision.truncate(stamped),
+                    filed,
+                    receipt,
+                });
+            }
         }
         Ok(())
     }
@@ -2109,9 +2291,9 @@ impl<A: Application> Reactor<A> {
     /// frame, frames the message under the next sender sequence number and
     /// writes it.
     ///
-    /// `to_admin` or `to_app` is chosen by the MsgType, and each runs on the
-    /// message **before** it is framed, so what the callback hands back is what
-    /// goes on the wire.
+    /// `to_admin` or `to_app_checked` is chosen by the MsgType, and each runs
+    /// on the message **before** it is framed, so what the callback hands back
+    /// is what goes on the wire; `to_app_checked` can also veto it.
     ///
     /// The sequence number is peeked to frame the message and spent only once
     /// the frame exists and has been filed (see [`Reactor::write_at`]). A body
@@ -2143,11 +2325,27 @@ impl<A: Application> Reactor<A> {
         framed: &mut FixFramed,
         pending: PendingMessage,
     ) -> Result<Sent, EngineError> {
+        self.send_tracked(framed, pending, None).await
+    }
+
+    /// [`Reactor::send`] for a message that may carry a [`Receipt`]: the
+    /// receipt travels with it, through a hold behind a resend included, and
+    /// is resolved with the message's outcome.
+    ///
+    /// # Errors
+    /// As for [`Reactor::send`].
+    async fn send_tracked(
+        &mut self,
+        framed: &mut FixFramed,
+        pending: PendingMessage,
+        receipt: Option<Receipt>,
+    ) -> Result<Sent, EngineError> {
         if self.resend_in_progress() {
-            self.deferred.push_back(DeferredSend::Message(pending));
+            self.deferred
+                .push_back(DeferredSend::Message(pending, receipt));
             return Ok(Sent::Deferred);
         }
-        self.send_now(framed, pending).await
+        self.send_now_tracked(framed, pending, receipt).await
     }
 
     /// Feeds `pending` to the write buffer at once, under the next sender
@@ -2161,13 +2359,30 @@ impl<A: Application> Reactor<A> {
     async fn send_now(
         &mut self,
         framed: &mut FixFramed,
-        mut pending: PendingMessage,
+        pending: PendingMessage,
     ) -> Result<Sent, EngineError> {
-        if !self.prepare(&mut pending).await {
+        self.send_now_tracked(framed, pending, None).await
+    }
+
+    /// [`Reactor::send_now`] for a message that may carry a [`Receipt`]. A
+    /// refusal by the callback resolves it here; [`Reactor::write_at`]
+    /// resolves it when the frame cannot be built, numbered or filed, and
+    /// queues it for the flush once the frame is fed.
+    ///
+    /// # Errors
+    /// As for [`Reactor::send`].
+    async fn send_now_tracked(
+        &mut self,
+        framed: &mut FixFramed,
+        mut pending: PendingMessage,
+        receipt: Option<Receipt>,
+    ) -> Result<Sent, EngineError> {
+        if let Err(refusal) = self.prepare(&mut pending).await {
+            outcome::resolve(receipt, || SendOutcome::not_sent(refusal.into_reason()));
             return Ok(Sent::Dropped);
         }
         let seq = self.runtime.sequences.next_sender_seq().value();
-        match self.write_at(framed, seq, &pending, true).await {
+        match self.write_at(framed, seq, &pending, true, receipt).await {
             Ok(()) => {
                 if pending.msg_type() == &MsgType::Logout {
                     self.writer.mark_logout(framed);
@@ -2187,22 +2402,37 @@ impl<A: Application> Reactor<A> {
         }
     }
 
-    /// Runs `to_admin` / `to_app` on `pending` and rechecks its body.
+    /// Runs `to_admin`, or `to_app_checked` for an application message, on
+    /// `pending` and rechecks its body.
     ///
-    /// Returns `false` when the callback left a body the engine will not
-    /// frame — a tag the standard header already carries, or a value with no
-    /// wire form. The message is then dropped; the warning names the tag and
-    /// never the value, because an outbound Logon body carries `Password`
-    /// (554).
-    async fn prepare(&mut self, pending: &mut PendingMessage) -> bool {
+    /// Returns why the message must not be sent when `to_app_checked` vetoes
+    /// it, or when the callback left a body the engine will not frame: a
+    /// tag the standard header already carries, or a value with no wire
+    /// form. The message is then dropped before a sequence number is peeked
+    /// and before the store is touched. The warning for an unframeable body
+    /// names the tag and never the value, because an outbound Logon body
+    /// carries `Password` (554); a veto is logged at debug level with the
+    /// reason's code only, since it is the application's own decision.
+    ///
+    /// Administrative messages go through `to_admin`, which cannot refuse
+    /// them: they are what keeps the session legal.
+    async fn prepare(&mut self, pending: &mut PendingMessage) -> Result<(), Refusal> {
         if pending.msg_type().is_admin() {
             self.application
                 .to_admin(pending.message_mut(), &self.session_id)
                 .await;
-        } else {
-            self.application
-                .to_app(pending.message_mut(), &self.session_id)
-                .await;
+        } else if let Err(reason) = self
+            .application
+            .to_app_checked(pending.message_mut(), &self.session_id)
+            .await
+        {
+            tracing::debug!(
+                session = %self.session_id,
+                msg_type = %pending.msg_type(),
+                code = reason.code,
+                "outbound application message vetoed by to_app_checked; no sequence number spent"
+            );
+            return Err(Refusal::Vetoed(reason));
         }
         if let Err(err) = outbound::check_body(pending.message()) {
             tracing::warn!(
@@ -2211,9 +2441,9 @@ impl<A: Application> Reactor<A> {
                 error = %err,
                 "dropping outbound message rejected after the application callback"
             );
-            return false;
+            return Err(Refusal::Invalid(err));
         }
-        true
+        Ok(())
     }
 
     /// Feeds an already-built replay frame to the write buffer.
@@ -2251,10 +2481,10 @@ impl<A: Application> Reactor<A> {
         new_seq: u64,
     ) -> Result<(), EngineError> {
         let mut gap_fill = self.factory.sequence_reset_gap_fill(new_seq);
-        if !self.prepare(&mut gap_fill).await {
+        if self.prepare(&mut gap_fill).await.is_err() {
             return Ok(());
         }
-        match self.write_at(framed, at_seq, &gap_fill, false).await {
+        match self.write_at(framed, at_seq, &gap_fill, false, None).await {
             Ok(()) => Ok(()),
             Err(WriteFailure::Encode(err)) => {
                 tracing::warn!(
@@ -2283,20 +2513,23 @@ impl<A: Application> Reactor<A> {
         // next command is taken the task has yielded and the budget is fresh.
         // Frames then wait only while the stream is not taking bytes.
         if let Err(err) = self.write_through(framed) {
-            return Err(self.close_on_write_failure(phase, &err));
+            return Err(self.close_on_write_failure(phase, &err, UnknownReason::Transport));
         }
         match command {
-            Command::Send(message) => {
+            Command::Send { message, receipt } => {
                 if matches!(phase, Phase::LogoutQueued(_) | Phase::LogoutPending(_)) {
                     tracing::warn!(
                         session = %self.session_id,
                         msg_type = %message.msg_type(),
                         "dropping outbound message: logout pending"
                     );
+                    outcome::resolve(receipt, || {
+                        SendOutcome::not_sent(NotSentReason::LogoutPending)
+                    });
                     return Ok(phase);
                 }
                 if let Err(err) = self
-                    .send(framed, PendingMessage::application(message))
+                    .send_tracked(framed, PendingMessage::application(message), receipt)
                     .await
                 {
                     teardown(phase);
@@ -2347,6 +2580,7 @@ impl<A: Application> Reactor<A> {
                 // still answered, as FIX allows.
                 self.resend = None;
                 self.held_logon = None;
+                self.logout_sent = true;
                 // Typestate: Active -> LogoutPending once the Logout is
                 // written (at once if it was written through). The new state
                 // records that moment, which is what `on_tick` times through
@@ -2373,7 +2607,9 @@ impl<A: Application> Reactor<A> {
         match poll_flush_now(framed, &mut self.writer) {
             None => {}
             Some(Ok(())) => self.on_flushed(framed),
-            Some(Err(err)) => return Err(self.close_on_write_failure(phase, &err)),
+            Some(Err(err)) => {
+                return Err(self.close_on_write_failure(phase, &err, UnknownReason::Transport));
+            }
         }
         let phase = self.advance_logout(phase);
         match self.writer.on_tick(driver_now(), self.write_timeout) {
@@ -2381,7 +2617,7 @@ impl<A: Application> Reactor<A> {
             WriteCheck::Progressed => lock_heartbeat(&self.runtime).on_message_sent(),
             WriteCheck::Stalled => {
                 let err = EngineError::WriteTimeout(self.write_timeout);
-                return Err(self.close_on_write_failure(phase, &err));
+                return Err(self.close_on_write_failure(phase, &err, UnknownReason::WriteTimeout));
             }
         }
 
@@ -3338,14 +3574,14 @@ impl<A: Application> Reactor<A> {
     ) -> Result<Phase, SessionClosed> {
         while let Some(next) = self.deferred.pop_front() {
             let request = matches!(next, DeferredSend::ResendRequest);
-            let pending = match next {
-                DeferredSend::Message(pending) => pending,
+            let (pending, receipt) = match next {
+                DeferredSend::Message(pending, receipt) => (pending, receipt),
                 DeferredSend::ResendRequest => match self.resend {
-                    Some(state) => self.factory.resend_request(state.expected, 0),
+                    Some(state) => (self.factory.resend_request(state.expected, 0), None),
                     None => continue,
                 },
             };
-            match self.send_now(framed, pending).await {
+            match self.send_now_tracked(framed, pending, receipt).await {
                 Err(EngineError::Store(err)) => {
                     return Err(self.close_on_store_failure(phase, &err));
                 }
@@ -3413,7 +3649,8 @@ impl<A: Application> Reactor<A> {
     ) -> Result<Phase, SessionClosed> {
         if abandoned {
             self.resends.clear();
-            self.deferred.clear();
+            let reason = self.reason_behind_resend();
+            self.discard_deferred(&reason);
         }
         let text = self.logout_owed.take().map_or_else(
             || "logout initiated by counterparty".to_string(),
@@ -3437,6 +3674,73 @@ impl<A: Application> Reactor<A> {
             .any(|held| matches!(held, DeferredSend::ResendRequest))
         {
             self.deferred.push_back(DeferredSend::ResendRequest);
+        }
+    }
+
+    /// The reason a message held behind a resend reports when the session
+    /// ends: [`NotSentReason::LogoutPending`] once this session's own Logout
+    /// has been fed (the message is behind it as well), otherwise
+    /// [`NotSentReason::DiscardedBehindResend`].
+    #[must_use]
+    const fn reason_behind_resend(&self) -> NotSentReason {
+        if self.logout_sent {
+            NotSentReason::LogoutPending
+        } else {
+            NotSentReason::DiscardedBehindResend {}
+        }
+    }
+
+    /// Drops the messages held back behind a resend, resolving any tracked
+    /// one with `reason`.
+    fn discard_deferred(&mut self, reason: &NotSentReason) {
+        for held in self.deferred.drain(..) {
+            if let DeferredSend::Message(_, receipt) = held {
+                outcome::resolve(receipt, || SendOutcome::not_sent(reason.clone()));
+            }
+        }
+    }
+
+    /// Resolves every send the closing session will never frame, once the
+    /// reactor loop has ended: the messages held back behind a resend, and
+    /// the commands still in the outbound queue, which is closed first so
+    /// nothing more joins it (a handle that tries gets
+    /// [`EngineError::Closed`], or [`NotSentReason::SessionClosed`] from
+    /// `send_tracked`).
+    ///
+    /// `behind_resend` says the queued messages were waiting behind a resend:
+    /// the pass that closed the session started with a resend under way
+    /// (while one is, the outbound queue is not read at all), or a resend was
+    /// queued during that pass. Tracked ones then resolve
+    /// [`NotSentReason::DiscardedBehindResend`], or
+    /// [`NotSentReason::LogoutPending`] if this session's own Logout had been
+    /// fed, which they were behind as well; otherwise they resolve
+    /// [`NotSentReason::Discarded`]. Untracked ones are counted in the same
+    /// warning, since nothing else reports them. Frames already fed to the
+    /// write buffer are not here: they are resolved by the close's last flush.
+    fn discard_unsent(&mut self, commands: &mut mpsc::Receiver<Command>, behind_resend: bool) {
+        let held = self.reason_behind_resend();
+        self.discard_deferred(&held);
+        let reason = if behind_resend {
+            held
+        } else {
+            NotSentReason::Discarded {}
+        };
+        commands.close();
+        let discarded = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|command| match command {
+                Command::Send { receipt, .. } => Some(receipt),
+                Command::Logout => None,
+            })
+            .map(|receipt| outcome::resolve(receipt, || SendOutcome::not_sent(reason.clone())))
+            .count();
+        if discarded > 0 {
+            tracing::warn!(
+                session = %self.session_id,
+                discarded,
+                behind_resend,
+                "outbound application message(s) still queued when the session closed were \
+                 discarded: none was framed and no sequence number was spent on them"
+            );
         }
     }
 
@@ -4354,6 +4658,8 @@ where
         deferred: VecDeque::new(),
         logout_owed: None,
         spanning_rerequested: None,
+        logout_sent: false,
+        receipts: VecDeque::new(),
         write_timeout,
         writer,
         app_tx,

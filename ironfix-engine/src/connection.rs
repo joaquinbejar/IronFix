@@ -14,6 +14,7 @@
 use crate::application::SessionId;
 use crate::error::EngineError;
 use crate::outbound::OutboundMessage;
+use crate::outcome::{NotSentReason, Receipt, SendOutcome};
 use ironfix_core::version::FixVersion;
 use ironfix_session::{HeartbeatManager, SequenceManager};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -23,7 +24,13 @@ use tokio::sync::{mpsc, watch};
 #[derive(Debug)]
 pub(crate) enum Command {
     /// Send an application message.
-    Send(OutboundMessage),
+    Send {
+        /// The message.
+        message: OutboundMessage,
+        /// Where its outcome goes: set by [`Connection::send_tracked`] only,
+        /// so a plain [`Connection::send`] allocates nothing for it.
+        receipt: Option<Receipt>,
+    },
     /// Initiate a graceful logout.
     Logout,
 }
@@ -100,6 +107,14 @@ impl Connection {
     /// it is queued, so a message the session layer will not carry is refused
     /// to the caller rather than dropped later.
     ///
+    /// When the reactor reaches it, the message goes through
+    /// [`Application::to_app_checked`](crate::Application::to_app_checked),
+    /// whose default runs `to_app` and never refuses: an application that
+    /// overrides only `to_app` sees no change. One that overrides
+    /// `to_app_checked` can veto the message there; it is then dropped with a
+    /// debug log, having spent no `MsgSeqNum`. Use
+    /// [`Connection::send_tracked`] to learn what became of each message.
+    ///
     /// # Arguments
     /// * `message` - The application message to send
     ///
@@ -155,9 +170,99 @@ impl Connection {
     pub async fn send(&self, message: OutboundMessage) -> Result<(), EngineError> {
         crate::outbound::check_sendable(&message)?;
         self.commands
-            .send(Command::Send(message))
+            .send(Command::Send {
+                message,
+                receipt: None,
+            })
             .await
             .map_err(|_| EngineError::Closed)
+    }
+
+    /// Sends an application message on the session and reports what became
+    /// of it.
+    ///
+    /// The message takes the same path as one handed to [`Connection::send`]:
+    /// the same checks before it is queued, the same queue, the same
+    /// [`Application::to_app_checked`](crate::Application::to_app_checked)
+    /// gate, the same store order and the same wait behind a resend. Instead
+    /// of returning once it is queued, this waits for its fate (see
+    /// [`crate::outcome`]):
+    ///
+    /// - [`SendOutcome::Sent`] once the frame has been through the store step
+    ///   and a flush that covers it has completed (the session writes through
+    ///   a buffer, so that may be after later frames were buffered), with the
+    ///   `MsgSeqNum` (34) and
+    ///   `SendingTime` (52) the counterparty reads, and `filed`, which says
+    ///   whether the store accepted the frame (false without a store, and
+    ///   under [`StoreFailurePolicy::Continue`](crate::StoreFailurePolicy::Continue)
+    ///   after a failed filing: such a frame is gap-filled, not replayed);
+    /// - [`SendOutcome::NotSent`] when no byte of it reached the stream and no
+    ///   number was spent: the reason is
+    ///   [`NotSentReason::Invalid`] for a message `send` would refuse with an
+    ///   error (an administrative MsgType, a reserved tag, a value with no
+    ///   wire form) or one `to_app_checked` left that way,
+    ///   [`NotSentReason::Vetoed`] when `to_app_checked` refused it,
+    ///   [`NotSentReason::StoreRefused`] when the store refused it under
+    ///   [`StoreFailurePolicy::CloseSession`](crate::StoreFailurePolicy::CloseSession),
+    ///   [`NotSentReason::SequenceExhausted`], and, when the session ends
+    ///   first, [`NotSentReason::SessionClosed`],
+    ///   [`NotSentReason::LogoutPending`], [`NotSentReason::Discarded`] or
+    ///   [`NotSentReason::DiscardedBehindResend`];
+    /// - [`SendOutcome::Unknown`] when the frame was numbered (being filed,
+    ///   or waiting in the write buffer) and the session ended before a flush
+    ///   covering it completed: a number is spent when the frame is
+    ///   buffered, so this is never `NotSent`. **The
+    ///   order may be live**: do not resubmit it blindly. Reconcile it by
+    ///   `ClOrdID` (11) after the next Logon, through the `ExecutionReport`
+    ///   (8) or an `OrderStatusRequest` (H); a resubmission reuses the
+    ///   `ClOrdID` and sets `PossResend` (97) = Y. The number stays spent; the
+    ///   frame is replayed under it only if it was filed, no reset erased it
+    ///   (at the close, or by `ResetSeqNumFlag` (141) on the next Logon), the
+    ///   store still holds it, and the counterparty asks (see
+    ///   [`crate::outcome`]).
+    ///
+    /// It never waits forever: every message queued on a session that ends
+    /// resolves, at the latest as the session closes, before
+    /// [`Connection::wait_closed`] returns; and once the session has closed
+    /// this returns whatever has resolved by then, or
+    /// [`NotSentReason::Discarded`].
+    ///
+    /// # Cost and cancellation
+    ///
+    /// Each call allocates one single-use channel for its outcome; a plain
+    /// `send` allocates none. Dropping the returned future does not withdraw
+    /// a message already queued: it is still written, and its outcome is
+    /// discarded. Polling several calls concurrently keeps several messages
+    /// in flight; each is queued when its future is first polled, in that
+    /// order while the queue has room.
+    #[must_use = "the outcome says whether the message reached the counterparty; an Unknown one \
+                  may be live and must be reconciled"]
+    pub async fn send_tracked(&self, message: OutboundMessage) -> SendOutcome {
+        if let Err(err) = crate::outbound::check_sendable(&message) {
+            return SendOutcome::not_sent(NotSentReason::invalid(&err));
+        }
+        let (receipt, mut outcome) = Receipt::new();
+        let command = Command::Send {
+            message,
+            receipt: Some(receipt),
+        };
+        if self.commands.send(command).await.is_err() {
+            return SendOutcome::not_sent(NotSentReason::SessionClosed {});
+        }
+        // Every receipt answers, explicitly or as it is dropped, before the
+        // session reports itself closed. Waiting on the close as well means a
+        // reactor gone in a way that answered neither cannot leave this
+        // waiting: once closed, whatever has arrived is taken, without
+        // blocking, and anything else is reported discarded.
+        tokio::select! {
+            biased;
+            resolved = &mut outcome => {
+                resolved.unwrap_or(SendOutcome::not_sent(NotSentReason::Discarded {}))
+            }
+            () = self.wait_closed() => outcome
+                .try_recv()
+                .unwrap_or(SendOutcome::not_sent(NotSentReason::Discarded {})),
+        }
     }
 
     /// Initiates a graceful logout.

@@ -356,12 +356,15 @@ impl<'s> SessionStore<'s> {
     /// a filed frame and the old counter, so the number is reused for a
     /// message the peer never saw and the filed frame is replaced.
     ///
+    /// Returns whether the frame was filed: true only when the store's
+    /// `file_outbound` returned `Ok`.
+    ///
     /// # Errors
     /// Under [`StoreFailurePolicy::CloseSession`], the store's error; the frame
     /// must then not be written. Under [`StoreFailurePolicy::Continue`] the
     /// failure is logged, the counter is written on its own as a best effort
-    /// (the combined call may have failed on the frame alone), and `Ok` is
-    /// returned.
+    /// (the combined call may have failed on the frame alone), and `Ok(false)`
+    /// is returned: the frame goes out unfiled.
     pub(crate) async fn file_outbound(
         self,
         session_id: &SessionId,
@@ -369,15 +372,17 @@ impl<'s> SessionStore<'s> {
         msg_type: &MsgType,
         frame: &[u8],
         next_sender: u64,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let filed = self
             .mutate(self.store.file_outbound(seq, msg_type, frame, next_sender))
             .await;
         match filed {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(true),
             Err(err) => {
                 self.on_failure(session_id, StoreWrite::Frame { seq, msg_type }, err)?;
-                self.persist_sender(session_id, next_sender).await
+                self.persist_sender(session_id, next_sender)
+                    .await
+                    .map(|()| false)
             }
         }
     }
@@ -926,6 +931,9 @@ async fn refresh(
 /// counter agree before any byte reaches the socket, and a write that fails
 /// afterwards cannot lead to `seq` being reused.
 ///
+/// Returns whether the frame was filed: false without a store, and false
+/// under [`StoreFailurePolicy::Continue`] when the filing failed.
+///
 /// # Errors
 /// [`EngineError::SequenceExhausted`] when `seq` is `u64::MAX`;
 /// [`EngineError::Store`] when the store write fails under
@@ -939,23 +947,26 @@ pub(crate) async fn file_and_spend(
     seq: u64,
     msg_type: &MsgType,
     frame: &[u8],
-) -> Result<(), EngineError> {
+) -> Result<bool, EngineError> {
     let next = seq.checked_add(1).ok_or(SequenceExhausted {
         counter: SequenceCounter::Sender,
     })?;
-    if let Some((store, persisted)) = store {
-        persisted.record_sender(next);
-        store
-            .file_outbound(session_id, seq, msg_type, frame, next)
-            .await?;
-    }
+    let filed = match store {
+        Some((store, persisted)) => {
+            persisted.record_sender(next);
+            store
+                .file_outbound(session_id, seq, msg_type, frame, next)
+                .await?
+        }
+        None => false,
+    };
     let allocated = sequences.try_allocate_sender_seq()?.value();
     if allocated != seq {
         return Err(EngineError::Sequence(format!(
             "sender sequence moved from {seq} to {allocated} while a frame was being built"
         )));
     }
-    Ok(())
+    Ok(filed)
 }
 
 /// The counter values last written to the store, so that a counter is written

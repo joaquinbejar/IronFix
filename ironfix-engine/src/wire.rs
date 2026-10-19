@@ -1216,6 +1216,22 @@ impl SendingTimePrecision {
         }
     }
 
+    /// Returns `at` as this precision writes it on the wire: truncated to the
+    /// whole second, or to the millisecond, exactly as
+    /// [`Timestamp::format_seconds`] and [`Timestamp::format_millis`]
+    /// truncate. A tracked send reports this value, so it equals the
+    /// `SendingTime` (52) the counterparty reads.
+    #[must_use]
+    pub(crate) fn truncate(self, at: Timestamp) -> Timestamp {
+        let millis = at.as_millis();
+        let kept = match self {
+            Self::Millis => Some(millis),
+            Self::Seconds => (millis / 1_000).checked_mul(1_000),
+        };
+        kept.and_then(|millis| Timestamp::from_millis(millis).ok())
+            .unwrap_or(at)
+    }
+
     /// Returns a stored `UTCTimestamp` in this precision, for the
     /// `OrigSendingTime` (122) of a resend.
     ///
@@ -1520,6 +1536,22 @@ impl MessageFactory {
         seq: u64,
         pending: &PendingMessage,
     ) -> Result<&[u8], EncodeError> {
+        self.encode_stamped(seq, pending).map(|(frame, _)| frame)
+    }
+
+    /// [`MessageFactory::encode`], also returning the clock reading stamped
+    /// into `SendingTime` (52), at full precision: what the frame carries is
+    /// that instant in [`MessageFactory::sending_time_precision`] (see
+    /// [`SendingTimePrecision::truncate`]). The reading is taken once, so the
+    /// value returned and the value written are the same instant.
+    ///
+    /// # Errors
+    /// As for [`MessageFactory::encode`].
+    pub(crate) fn encode_stamped(
+        &mut self,
+        seq: u64,
+        pending: &PendingMessage,
+    ) -> Result<(&[u8], Timestamp), EncodeError> {
         let poss_dup = pending.poss_dup;
         let message = &pending.message;
         // Session-level messages are versioned by the BeginString; only
@@ -1555,7 +1587,8 @@ impl MessageFactory {
         }
         let precision = self.sending_time_precision();
         let encoder = &mut self.encoder;
-        precision.with_formatted(Timestamp::now(), |sending_time| {
+        let stamped = Timestamp::now();
+        precision.with_formatted(stamped, |sending_time| {
             encoder.put_str(52, sending_time);
             if poss_dup {
                 encoder.put_str(122, sending_time);
@@ -1572,7 +1605,7 @@ impl MessageFactory {
                 } => self.encoder.put_data(*length_tag, *data_tag, value),
             }
         }
-        self.encoder.finish()
+        self.encoder.finish().map(|frame| (frame, stamped))
     }
 
     /// Builds a Logon (35=A) with EncryptMethod=0, HeartBtInt,
@@ -2346,6 +2379,57 @@ mod tests {
         "FIX.5.0SP1",
         "FIX.5.0SP2",
     ];
+
+    #[test]
+    fn test_encode_stamped_reports_the_sending_time_on_the_wire() {
+        for (begin_string, precision) in [
+            ("FIX.4.0", SendingTimePrecision::Seconds),
+            ("FIX.4.1", SendingTimePrecision::Seconds),
+            ("FIX.4.2", SendingTimePrecision::Millis),
+            ("FIX.4.4", SendingTimePrecision::Millis),
+            ("FIX.5.0SP2", SendingTimePrecision::Millis),
+        ] {
+            let mut factory = factory_for(begin_string);
+            assert_eq!(factory.sending_time_precision(), precision);
+            let heartbeat = factory.heartbeat(None);
+            let (frame, stamped) = match factory.encode_stamped(4, &heartbeat) {
+                Ok((frame, stamped)) => (frame.to_vec(), stamped),
+                Err(err) => panic!("factory frame must encode: {err}"),
+            };
+            let on_wire = precision.truncate(stamped);
+            let expected = match precision {
+                SendingTimePrecision::Seconds => on_wire.format_seconds().to_string(),
+                SendingTimePrecision::Millis => on_wire.format_millis().to_string(),
+            };
+            assert_eq!(
+                decode(&frame).get_field_str(52),
+                Some(expected.as_str()),
+                "{begin_string}: the reported time formats to the stamped SendingTime (52)"
+            );
+            let unit = match precision {
+                SendingTimePrecision::Seconds => 1_000_000_000,
+                SendingTimePrecision::Millis => 1_000_000,
+            };
+            assert_eq!(
+                on_wire.as_nanos() % unit,
+                0,
+                "{begin_string}: truncated to the precision the wire carries"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sending_time_precision_truncates_as_the_formatters_do() {
+        let Ok(at) = Timestamp::from_nanos(1_700_000_000_987_654_321) else {
+            panic!("a representable instant")
+        };
+        let seconds = SendingTimePrecision::Seconds.truncate(at);
+        assert_eq!(seconds.as_nanos(), 1_700_000_000_000_000_000);
+        assert_eq!(seconds.format_seconds(), at.format_seconds());
+        let millis = SendingTimePrecision::Millis.truncate(at);
+        assert_eq!(millis.as_nanos(), 1_700_000_000_987_000_000);
+        assert_eq!(millis.format_millis(), at.format_millis());
+    }
 
     #[test]
     fn test_sending_time_precision_is_whole_seconds_only_before_fix42() {

@@ -37,11 +37,31 @@
 //! - **[`Connection`]**: a cheap-clone handle returned by both engines — send,
 //!   logout, await close, read sequence numbers and, on a FIX 5.0 session,
 //!   the counterparty's declared default application version.
+//!   [`Connection::send_tracked`] waits for one message's fate and reports it
+//!   as a [`SendOutcome`] (see [`outcome`]): `Sent` with the `MsgSeqNum`,
+//!   the `SendingTime` and whether the store filed it, once the frame is
+//!   flushed; `NotSent` with a [`NotSentReason`] when no byte of it reached
+//!   the stream and no number was spent; or `Unknown` with the spent number
+//!   when the frame was buffered (or being filed) and no completed flush
+//!   covered it, an order that may be live and must be reconciled, not
+//!   blindly resubmitted. [`Connection::send`] stays fire-and-forget.
 //! - **[`OutboundMessage`]**: the body you hand to [`Connection::send`]; the
 //!   engine stamps the header, `MsgSeqNum` and trailer.
 //! - **[`Application`]**: the QuickFIX-shaped callback trait
 //!   (`on_create` / `on_logon` / `on_logout` / `to_admin` / `from_admin` /
 //!   `to_app` / `from_app`), plus [`NoOpApplication`].
+//!   [`Application::to_app_checked`] is the outbound gate every new
+//!   application message passes, whichever `send` it came through: its
+//!   default runs `to_app` and sends, and an override can veto the message
+//!   (the equivalent of QuickFIX's `DoNotSend`) through the [`SendVerdict`]
+//!   it returns, before a `MsgSeqNum` is spent or the store is touched; a
+//!   verdict decided at once ([`SendVerdict::ready`]) allocates nothing. A
+//!   replay of a filed frame (the answer to a `ResendRequest`, the 789
+//!   resend) is resent as filed and is not gated, unlike QuickFIX.
+//!   Administrative messages (Logon, Logout, Heartbeat, TestRequest,
+//!   ResendRequest, SequenceReset, Reject, XmlMessage) go through
+//!   `to_admin` and cannot be vetoed. See
+//!   `doc/adr/0023-outbound-veto-and-send-outcomes.md`.
 //! - **[`EngineBuilder`]**: fluent configuration that terminates in a
 //!   ready-to-run [`Initiator`], [`Acceptor`] or [`AcceptorRegistry`].
 //!
@@ -149,6 +169,7 @@ mod garbled;
 pub mod initiator;
 mod next_expected;
 pub mod outbound;
+pub mod outcome;
 pub mod persistence;
 mod reactor;
 pub mod registry;
@@ -156,12 +177,13 @@ mod stream;
 mod wire;
 
 pub use acceptor::Acceptor;
-pub use application::{Application, NoOpApplication, RejectReason, SessionId};
+pub use application::{Application, NoOpApplication, RejectReason, SendVerdict, SessionId};
 pub use builder::EngineBuilder;
 pub use connection::Connection;
 pub use error::EngineError;
 pub use initiator::Initiator;
 pub use outbound::{OutboundField, OutboundMessage};
+pub use outcome::{NotSentReason, SendOutcome, UnknownReason};
 pub use persistence::StoreFailurePolicy;
 pub use registry::{AcceptorRegistry, LogonIdentity, LookupError, SessionLookup};
 
