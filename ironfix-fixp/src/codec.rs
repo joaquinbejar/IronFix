@@ -21,8 +21,9 @@
 //! version reads ([`FixpDecodeError::BlockLengthTooShort`]) and against the
 //! input ([`FixpDecodeError::Truncated`]), and every variable-length field's
 //! declared length against the bytes actually present before any of them is
-//! copied. A copy is never larger than the input, and never larger than
-//! 65 535 bytes.
+//! copied. A declared length of `0xFFFF`, the SBE `uint16` null value, is
+//! refused ([`FixpDecodeError::NullVarDataLength`]). A copy is never larger
+//! than the input, and never larger than 65 534 bytes.
 //!
 //! A `blockLength` larger than this version's root block is accepted and the
 //! extra bytes skipped, as SBE schema evolution requires, and the `version`
@@ -141,7 +142,7 @@ impl SessionMessage {
     /// Returns [`FixpEncodeError::VarDataTooLong`] if a variable-length field
     /// exceeds its 16-bit length prefix.
     pub fn encoded_len(&self) -> Result<usize, FixpEncodeError> {
-        // At most 8 + 65 535 + 2 * (2 + 65 535) bytes: no sum below can
+        // At most 8 + 65 535 + 2 * (2 + 65 534) bytes: no sum below can
         // overflow, because each field length is checked first.
         let (block, var_fields) = self.layout();
         let mut len = HEADER_LEN + usize::from(block);
@@ -359,15 +360,18 @@ impl SessionMessage {
             }
         }
         // Offsets below stay within `buf`, which is `encoded_len` bytes long,
-        // so they are at most 8 + 65 535 + 2 * (2 + 65 535) and cannot
+        // so they are at most 8 + 65 535 + 2 * (2 + 65 534) and cannot
         // overflow; `ironsbe-core`'s writers index `buf` at them.
         let mut position = HEADER_LEN + usize::from(block);
         for (field, bytes) in var_fields.into_iter().flatten() {
-            let len = u16::try_from(bytes.len()).map_err(|_| FixpEncodeError::VarDataTooLong {
-                field,
-                len: bytes.len(),
-                max: MAX_VAR_DATA_LEN,
-            })?;
+            let len = u16::try_from(bytes.len())
+                .ok()
+                .filter(|_| bytes.len() <= MAX_VAR_DATA_LEN)
+                .ok_or(FixpEncodeError::VarDataTooLong {
+                    field,
+                    len: bytes.len(),
+                    max: MAX_VAR_DATA_LEN,
+                })?;
             VarDataHeader::new(len).encode(out.buf, position);
             out.buf.put_bytes(position + VAR_PREFIX_LEN, bytes);
             position += VAR_PREFIX_LEN + bytes.len();
@@ -504,6 +508,11 @@ impl<'a> Reader<'a> {
         }
         let prefix = VarDataHeader::wrap(self.src, self.position);
         let len = prefix.length;
+        if len == u16::MAX {
+            return Err(FixpDecodeError::NullVarDataLength {
+                offset: self.position,
+            });
+        }
         let end = prefix_end
             .checked_add(usize::from(len))
             .ok_or(FixpDecodeError::Truncated {
@@ -1259,17 +1268,71 @@ mod tests {
             code: TerminationCode::Finished,
             reason: "ok".to_owned(),
         }));
-        // Declare a 65 535-byte reason with only 2 bytes behind it.
+        // Declare a 65 534-byte reason with only 2 bytes behind it.
         if let Some(prefix) = wire.get_mut(25..27) {
-            prefix.copy_from_slice(&[0xFF, 0xFF]);
+            prefix.copy_from_slice(&[0xFE, 0xFF]);
         }
         assert_eq!(
             SessionMessage::decode(&wire),
             Err(FixpDecodeError::Truncated {
-                needed: 27 + 65_535,
+                needed: 27 + 65_534,
                 available: 29,
             })
         );
+    }
+
+    #[test]
+    fn test_decode_rejects_the_uint16_null_var_data_length() {
+        let mut wire = encode(&SessionMessage::Terminate(Terminate {
+            session_id: id(1),
+            code: TerminationCode::Finished,
+            reason: "ok".to_owned(),
+        }));
+        // 0xFFFF is the SBE uint16 null value, never a valid Length.
+        if let Some(prefix) = wire.get_mut(25..27) {
+            prefix.copy_from_slice(&[0xFF, 0xFF]);
+        }
+        wire.resize(27 + 65_535, b'r');
+        assert_eq!(
+            SessionMessage::decode(&wire),
+            Err(FixpDecodeError::NullVarDataLength { offset: 25 })
+        );
+    }
+
+    #[test]
+    fn test_var_data_of_65_534_bytes_round_trips() {
+        let message = SessionMessage::Terminate(Terminate {
+            session_id: id(1),
+            code: TerminationCode::Finished,
+            reason: "r".repeat(65_534),
+        });
+        let wire = encode(&message);
+        assert_eq!(wire.get(25..27), Some(&[0xFE, 0xFF][..]));
+        let decoded = SessionMessage::decode(&wire).map(|(m, _)| m);
+        assert_eq!(decoded, Ok(message));
+    }
+
+    #[test]
+    fn test_encode_refuses_a_65_535_byte_var_data() {
+        let message = SessionMessage::Terminate(Terminate {
+            session_id: id(1),
+            code: TerminationCode::Finished,
+            reason: "r".repeat(65_535),
+        });
+        let mut wire = Vec::new();
+        assert_eq!(
+            message.encode(&mut wire),
+            Err(FixpEncodeError::VarDataTooLong {
+                field: "Reason",
+                len: 65_535,
+                max: 65_534,
+            })
+        );
+        assert!(wire.is_empty());
+        assert!(matches!(
+            message.encoded_len(),
+            Err(FixpEncodeError::VarDataTooLong { len: 65_535, .. })
+        ));
     }
 
     #[test]

@@ -255,9 +255,13 @@ pub enum Delivery {
         /// `true` if it arrived in a retransmission batch.
         retransmitted: bool,
     },
-    /// Ignore it: it broke the protocol (the session has already answered
-    /// that), or it arrived after a Terminate (FIXP v1.1 sections 4.4 and
-    /// 6.3).
+    /// Ignore it, for one of three reasons:
+    ///
+    /// - it broke the protocol, and the session has already answered that;
+    /// - it arrived after a Terminate (FIXP v1.1 sections 4.4 and 6.3);
+    /// - it is a valid retransmission of a number this session already
+    ///   delivered live, discarded so that a Recoverable flow stays exactly
+    ///   once (section 3.4.4).
     Discard,
 }
 

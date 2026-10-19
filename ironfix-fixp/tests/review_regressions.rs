@@ -1,0 +1,563 @@
+/******************************************************************************
+   Author: Joaquín Béjar García
+   Email: jb@taunais.com
+   Date: 19/10/26
+******************************************************************************/
+//! Regression tests for the FIXP session core review findings on PR #132
+//! (issue #95), driven through the public client and server API.
+use ironfix_fixp::*;
+use std::num::NonZeroUsize;
+use std::time::Instant;
+
+const ID: SessionId = SessionId::from_bytes([0x42; 16]);
+fn drain(client: &mut FixpClient) -> Vec<Output> {
+    std::iter::from_fn(|| client.poll_output()).collect()
+}
+fn establish(client: &mut FixpClient, now: Instant, next: u64) {
+    client.establish(now).expect("establish command");
+    let request = drain(client)
+        .into_iter()
+        .find_map(|o| match o {
+            Output::Send(SessionMessage::Establish(m)) => Some(m.timestamp),
+            _ => None,
+        })
+        .expect("Establish emitted");
+    client.handle_message(
+        &SessionMessage::EstablishmentAck(EstablishmentAck {
+            session_id: ID,
+            request_timestamp: request,
+            keepalive_interval: 5000,
+            next_seq_no: Some(next),
+        }),
+        now,
+    );
+}
+fn client(now: Instant, cfg: FixpConfig) -> FixpClient {
+    let anchor = ClockAnchor::new(now, Timestamp::EPOCH);
+    let mut client = FixpClient::new(cfg, anchor, ID, FlowType::Idempotent, None);
+    client.negotiate(now).expect("negotiate command");
+    let request = drain(&mut client)
+        .into_iter()
+        .find_map(|o| match o {
+            Output::Send(SessionMessage::Negotiate(m)) => Some(m.timestamp),
+            _ => None,
+        })
+        .expect("Negotiate emitted");
+    client.handle_message(
+        &SessionMessage::NegotiationResponse(NegotiationResponse {
+            session_id: ID,
+            request_timestamp: request,
+            server_flow: FlowType::Recoverable,
+            credentials: None,
+        }),
+        now,
+    );
+    drain(&mut client);
+    establish(&mut client, now, 1);
+    drain(&mut client);
+    client
+}
+fn requests(outputs: Vec<Output>) -> Vec<RetransmitRequest> {
+    outputs
+        .into_iter()
+        .filter_map(|o| match o {
+            Output::Send(SessionMessage::RetransmitRequest(m)) => Some(m),
+            _ => None,
+        })
+        .collect()
+}
+fn seq(client: &mut FixpClient, now: Instant, next: u64) {
+    client.handle_message(
+        &SessionMessage::Sequence(Sequence { next_seq_no: next }),
+        now,
+    );
+}
+fn replay_one(client: &mut FixpClient, now: Instant, request: RetransmitRequest) {
+    client.handle_message(
+        &SessionMessage::Retransmission(Retransmission {
+            session_id: ID,
+            request_timestamp: request.timestamp,
+            next_seq_no: request.from_seq_no,
+            count: 1,
+        }),
+        now,
+    );
+    assert!(matches!(
+        client.on_application_message(now),
+        Delivery::Accept {
+            retransmitted: true,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn rejected_gap_remains_recoverable_after_reestablishment() {
+    let now = Instant::now();
+    let cfg = FixpConfig::builder()
+        .max_pending_gaps(NonZeroUsize::new(1).expect("one"))
+        .build()
+        .expect("config");
+    let mut client = client(now, cfg);
+    seq(&mut client, now, 2); // Missing sequence 1.
+    assert_eq!(requests(drain(&mut client))[0].from_seq_no, 1);
+    assert!(matches!(
+        client.on_application_message(now),
+        Delivery::Accept { .. }
+    )); // Received 2.
+    seq(&mut client, now, 4); // Missing sequence 3 cannot be recorded.
+    assert_eq!(client.status(), SessionStatus::Negotiated);
+    drain(&mut client);
+    client.on_transport_closed();
+    drain(&mut client);
+    establish(&mut client, now, 4);
+    let request = requests(drain(&mut client))
+        .into_iter()
+        .next()
+        .expect("request for first gap");
+    assert_eq!(request.from_seq_no, 1);
+    replay_one(&mut client, now, request);
+    let outputs = drain(&mut client);
+    assert!(
+        requests(outputs.clone()).iter().any(|r| r.from_seq_no == 3),
+        "sequence 3 was forgotten: outputs={outputs:?}, pending={}, next={:?}",
+        client.has_pending_recovery(),
+        client.next_inbound_seq()
+    );
+}
+
+#[test]
+fn gap_within_capacity_stays_recoverable_after_reestablishment() {
+    let now = Instant::now();
+    let mut client = client(now, FixpConfig::default());
+    seq(&mut client, now, 2);
+    drain(&mut client);
+    assert!(matches!(
+        client.on_application_message(now),
+        Delivery::Accept { .. }
+    ));
+    seq(&mut client, now, 4);
+    assert_eq!(client.status(), SessionStatus::Established);
+    drain(&mut client);
+    client.on_transport_closed();
+    drain(&mut client);
+    establish(&mut client, now, 4);
+    let request = requests(drain(&mut client))
+        .into_iter()
+        .next()
+        .expect("request for first gap");
+    assert_eq!(request.from_seq_no, 1);
+    replay_one(&mut client, now, request);
+    let requests = requests(drain(&mut client));
+    assert!(requests.iter().any(|r| r.from_seq_no == 3), "{requests:?}");
+}
+
+#[test]
+fn realtime_after_replay_requires_a_sequence() {
+    let now = Instant::now();
+    let mut client = client(now, FixpConfig::default());
+    seq(&mut client, now, 2);
+    let request = requests(drain(&mut client))
+        .into_iter()
+        .next()
+        .expect("request");
+    replay_one(&mut client, now, request);
+    drain(&mut client);
+    assert_eq!(
+        client.on_application_message(now),
+        Delivery::Discard,
+        "an application message after the batch without Sequence must not become live traffic"
+    );
+}
+
+#[test]
+fn explicit_sequence_after_replay_accepts_live_message() {
+    let now = Instant::now();
+    let mut client = client(now, FixpConfig::default());
+    seq(&mut client, now, 2);
+    let request = requests(drain(&mut client))
+        .into_iter()
+        .next()
+        .expect("request");
+    replay_one(&mut client, now, request);
+    drain(&mut client);
+    seq(&mut client, now, 2);
+    assert_eq!(
+        client.on_application_message(now),
+        Delivery::Accept {
+            seq: Some(SeqNum::new(2)),
+            retransmitted: false,
+        }
+    );
+}
+
+#[test]
+fn duplicate_negotiate_does_not_keep_sending_after_reject() {
+    let now = Instant::now();
+    let mut server = FixpServer::new(
+        FixpConfig::default(),
+        ClockAnchor::new(now, Timestamp::EPOCH),
+        now,
+    );
+    let negotiate = SessionMessage::Negotiate(Negotiate {
+        session_id: ID,
+        timestamp: Nanotime::from_nanos(1),
+        client_flow: FlowType::Recoverable,
+        credentials: None,
+    });
+    server.handle_message(&negotiate, now);
+    server
+        .accept_negotiation(FlowType::Recoverable, None, now)
+        .expect("accept negotiation");
+    while server.poll_output().is_some() {}
+    server.handle_message(
+        &SessionMessage::Establish(Establish {
+            session_id: ID,
+            timestamp: Nanotime::from_nanos(2),
+            keepalive_interval: 5000,
+            next_seq_no: Some(1),
+            credentials: None,
+        }),
+        now,
+    );
+    server.accept_establishment(now).expect("accept establish");
+    while server.poll_output().is_some() {}
+    server.handle_message(&negotiate, now);
+    let outputs: Vec<_> = std::iter::from_fn(|| server.poll_output()).collect();
+    assert!(
+        outputs.iter().any(|o| matches!(o, Output::CloseTransport)),
+        "after NegotiationReject transport stays open: {outputs:?}, send_application={:?}",
+        server.send_application(now)
+    );
+}
+
+/// Replays a whole request and returns the numbers it delivered.
+fn replay_all(client: &mut FixpClient, now: Instant, request: &RetransmitRequest) -> Vec<u64> {
+    client.handle_message(
+        &SessionMessage::Retransmission(Retransmission {
+            session_id: ID,
+            request_timestamp: request.timestamp,
+            next_seq_no: request.from_seq_no,
+            count: request.count,
+        }),
+        now,
+    );
+    // A number already received live is discarded, not delivered again.
+    (0..request.count)
+        .filter_map(|_| match client.on_application_message(now) {
+            Delivery::Accept {
+                seq: Some(seq),
+                retransmitted: true,
+            } => Some(seq.value()),
+            Delivery::Discard => None,
+            other => panic!("a retransmitted message, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn reconnects_keep_one_overflow_gap_and_lose_no_number() {
+    let now = Instant::now();
+    let cfg = FixpConfig::builder()
+        .max_pending_gaps(NonZeroUsize::new(1).expect("one"))
+        .build()
+        .expect("config");
+    let mut client = client(now, cfg);
+    // 32 cycles: one number missed, the next received, a reconnect whenever
+    // the refused gap terminated the binding.
+    for missing in (1..64).step_by(2) {
+        let next = missing + 1;
+        seq(&mut client, now, next);
+        drain(&mut client);
+        if client.status() == SessionStatus::Negotiated {
+            client.on_transport_closed();
+            drain(&mut client);
+            establish(&mut client, now, next);
+            drain(&mut client);
+        }
+        assert_eq!(client.status(), SessionStatus::Established);
+        assert_eq!(
+            client.on_application_message(now),
+            Delivery::Accept {
+                seq: Some(SeqNum::new(next)),
+                retransmitted: false,
+            }
+        );
+        drain(&mut client);
+    }
+    client.on_transport_closed();
+    drain(&mut client);
+    establish(&mut client, now, 65);
+    let mut pending = requests(drain(&mut client)).into_iter().next();
+    let mut gaps = Vec::new();
+    let mut recovered = std::collections::BTreeSet::new();
+    while let Some(request) = pending {
+        gaps.push(request.from_seq_no);
+        recovered.extend(replay_all(&mut client, now, &request));
+        pending = requests(drain(&mut client)).into_iter().next();
+    }
+    assert!(!client.has_pending_recovery());
+    assert!(
+        gaps.len() <= 2,
+        "max_pending_gaps=1 plus one overflow slot, got {} gaps: {gaps:?}",
+        gaps.len()
+    );
+    for missing in (1..64).step_by(2) {
+        assert!(recovered.contains(&missing), "sequence {missing} was lost");
+    }
+    for live in (2..=64).step_by(2) {
+        assert!(
+            !recovered.contains(&live),
+            "sequence {live} was delivered twice"
+        );
+    }
+}
+
+fn repeated_negotiate_before_bound_closes(pending_establish: bool) {
+    let now = Instant::now();
+    let mut server = FixpServer::new(
+        FixpConfig::default(),
+        ClockAnchor::new(now, Timestamp::EPOCH),
+        now,
+    );
+    let negotiate = SessionMessage::Negotiate(Negotiate {
+        session_id: ID,
+        timestamp: Nanotime::from_nanos(1),
+        client_flow: FlowType::Recoverable,
+        credentials: None,
+    });
+    server.handle_message(&negotiate, now);
+    server
+        .accept_negotiation(FlowType::Recoverable, None, now)
+        .expect("accept negotiation");
+    while server.poll_output().is_some() {}
+    let establish = SessionMessage::Establish(Establish {
+        session_id: ID,
+        timestamp: Nanotime::from_nanos(2),
+        keepalive_interval: 5000,
+        next_seq_no: Some(1),
+        credentials: None,
+    });
+    if pending_establish {
+        server.handle_message(&establish, now);
+        assert_eq!(server.status(), SessionStatus::EstablishPending);
+    } else {
+        assert_eq!(server.status(), SessionStatus::Negotiated);
+    }
+    while server.poll_output().is_some() {}
+    server.handle_message(&negotiate, now);
+    let outputs: Vec<_> = std::iter::from_fn(|| server.poll_output()).collect();
+    assert!(
+        outputs
+            .iter()
+            .any(|o| matches!(o, Output::Send(SessionMessage::NegotiationReject(_)))),
+        "pending_establish={pending_establish}: {outputs:?}"
+    );
+    assert!(
+        outputs.iter().any(|o| matches!(o, Output::CloseTransport)),
+        "pending_establish={pending_establish}: {outputs:?}"
+    );
+    // The closed transport carries nothing more: no EstablishmentAck.
+    if !pending_establish {
+        server.handle_message(&establish, now);
+    }
+    let _ = server.accept_establishment(now);
+    let later: Vec<_> = std::iter::from_fn(|| server.poll_output()).collect();
+    assert!(
+        !later
+            .iter()
+            .any(|o| matches!(o, Output::Send(SessionMessage::EstablishmentAck(_)))),
+        "pending_establish={pending_establish}: {later:?}"
+    );
+    assert_ne!(server.status(), SessionStatus::Established);
+}
+
+#[test]
+fn repeated_negotiate_in_negotiated_closes() {
+    repeated_negotiate_before_bound_closes(false);
+}
+
+#[test]
+fn repeated_negotiate_in_establish_pending_closes() {
+    repeated_negotiate_before_bound_closes(true);
+}
+
+fn replay_all_deliveries(
+    client: &mut FixpClient,
+    now: Instant,
+    request: RetransmitRequest,
+) -> Vec<Delivery> {
+    client.handle_message(
+        &SessionMessage::Retransmission(Retransmission {
+            session_id: ID,
+            request_timestamp: request.timestamp,
+            next_seq_no: request.from_seq_no,
+            count: request.count,
+        }),
+        now,
+    );
+    (0..request.count)
+        .map(|_| client.on_application_message(now))
+        .collect()
+}
+
+fn prepare_separated_gaps(client: &mut FixpClient, now: Instant, end: u64) -> Vec<Delivery> {
+    let mut live = Vec::new();
+    for missing in (1..end).step_by(2) {
+        let next = missing + 1;
+        seq(client, now, next);
+        drain(client);
+        if client.status() == SessionStatus::Negotiated {
+            client.on_transport_closed();
+            drain(client);
+            establish(client, now, next);
+            drain(client);
+        }
+        assert_eq!(client.status(), SessionStatus::Established);
+        live.push(client.on_application_message(now));
+        drain(client);
+    }
+    client.on_transport_closed();
+    drain(client);
+    establish(client, now, end + 1);
+    live
+}
+
+#[test]
+fn overflow_recovery_never_accepts_an_already_accepted_sequence() {
+    let now = Instant::now();
+    let cfg = FixpConfig::builder()
+        .max_pending_gaps(NonZeroUsize::new(1).expect("one"))
+        .build()
+        .expect("config");
+    let mut client = client(now, cfg);
+    let live = prepare_separated_gaps(&mut client, now, 6);
+    let mut accepted = live.clone();
+    let mut pending = requests(drain(&mut client)).into_iter().next();
+    let mut recovered = Vec::new();
+    while let Some(request) = pending {
+        recovered.extend(replay_all_deliveries(&mut client, now, request));
+        pending = requests(drain(&mut client)).into_iter().next();
+    }
+    assert!(!client.has_pending_recovery());
+    accepted.extend(recovered.clone());
+    let mut unique = std::collections::BTreeSet::new();
+    for delivery in accepted {
+        if let Delivery::Accept { seq: Some(seq), .. } = delivery {
+            assert!(
+                unique.insert(seq),
+                "Recoverable sequence {} accepted twice; live={live:?}; recovery={recovered:?}",
+                seq
+            );
+        }
+    }
+}
+
+#[test]
+fn widened_recovery_is_bounded_and_recovers_every_missing_sequence() {
+    let now = Instant::now();
+    let cfg = FixpConfig::builder()
+        .max_pending_gaps(NonZeroUsize::new(1).expect("one"))
+        .build()
+        .expect("config");
+    let mut client = client(now, cfg);
+    prepare_separated_gaps(&mut client, now, 64);
+    let mut pending = requests(drain(&mut client)).into_iter().next();
+    let mut starts = Vec::new();
+    let mut recovered = std::collections::BTreeSet::new();
+    while let Some(request) = pending {
+        starts.push(request.from_seq_no);
+        for delivery in replay_all_deliveries(&mut client, now, request) {
+            if let Delivery::Accept { seq: Some(seq), .. } = delivery {
+                recovered.insert(seq);
+            }
+        }
+        pending = requests(drain(&mut client)).into_iter().next();
+    }
+    assert!(!client.has_pending_recovery());
+    assert!(starts.len() <= 2, "{starts:?}");
+    for missing in (1..64).step_by(2) {
+        assert!(recovered.contains(&SeqNum::new(missing)), "{missing}");
+    }
+}
+
+#[test]
+fn overflow_recovery_never_reemits_an_already_delivered_not_applied_event() {
+    let now = Instant::now();
+    let cfg = FixpConfig::builder()
+        .max_pending_gaps(NonZeroUsize::new(1).expect("one"))
+        .build()
+        .expect("config");
+    let mut client = client(now, cfg);
+    let acknowledgement = SessionMessage::NotApplied(NotApplied {
+        from_seq_no: 99,
+        count: 1,
+    });
+    let mut outputs = Vec::new();
+    for missing in [1, 3, 5] {
+        let next = missing + 1;
+        seq(&mut client, now, next);
+        outputs.extend(drain(&mut client));
+        if client.status() == SessionStatus::Negotiated {
+            client.on_transport_closed();
+            outputs.extend(drain(&mut client));
+            establish(&mut client, now, next);
+            outputs.extend(drain(&mut client));
+        }
+        if next == 4 {
+            client.handle_message(&acknowledgement, now);
+        } else {
+            assert!(matches!(
+                client.on_application_message(now),
+                Delivery::Accept { .. }
+            ));
+        }
+        outputs.extend(drain(&mut client));
+    }
+    client.on_transport_closed();
+    outputs.extend(drain(&mut client));
+    establish(&mut client, now, 7);
+    let mut pending = requests(drain(&mut client)).into_iter().next();
+    while let Some(request) = pending {
+        client.handle_message(
+            &SessionMessage::Retransmission(Retransmission {
+                session_id: ID,
+                request_timestamp: request.timestamp,
+                next_seq_no: request.from_seq_no,
+                count: request.count,
+            }),
+            now,
+        );
+        for seq in request.from_seq_no..request.from_seq_no + u64::from(request.count) {
+            if seq == 4 {
+                client.handle_message(&acknowledgement, now);
+            } else {
+                assert!(matches!(
+                    client.on_application_message(now),
+                    Delivery::Accept { .. }
+                ));
+            }
+        }
+        let batch_outputs = drain(&mut client);
+        pending = requests(batch_outputs.clone()).into_iter().next();
+        outputs.extend(batch_outputs);
+    }
+    assert!(!client.has_pending_recovery());
+    let acknowledgements: Vec<_> = outputs
+        .into_iter()
+        .filter(|o| {
+            matches!(
+                o,
+                Output::Event(Event::NotApplied {
+                    from_seq_no: 99,
+                    count: 1
+                })
+            )
+        })
+        .collect();
+    assert_eq!(
+        acknowledgements.len(),
+        1,
+        "same numbered NotApplied delivered twice, with no inbound sequence or retransmitted metadata: {acknowledgements:?}"
+    );
+}

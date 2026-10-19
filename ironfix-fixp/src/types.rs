@@ -16,8 +16,10 @@ use crate::error::FixpEncodeError;
 use std::fmt;
 
 /// Largest length of an SBE variable-length field in this schema, in bytes:
-/// both `Object` and `CharacterString` carry a `uint16` length prefix.
-pub const MAX_VAR_DATA_LEN: usize = u16::MAX as usize;
+/// both `Object` and `CharacterString` carry a `uint16` length prefix, and
+/// `0xFFFF` is the SBE `uint16` null value, so the largest valid length is
+/// 65 534.
+pub const MAX_VAR_DATA_LEN: usize = (u16::MAX - 1) as usize;
 
 /// A FIXP session identifier: a 16-byte UUID (FIXP v1.1 section 3.4.1).
 ///
@@ -176,7 +178,7 @@ impl Credentials {
     /// # Errors
     /// Returns [`FixpEncodeError::VarDataTooLong`] above
     /// [`MAX_VAR_DATA_LEN`] bytes, the most the field's `uint16` length
-    /// prefix can carry.
+    /// prefix can carry without using the `uint16` null value.
     pub fn try_new(bytes: impl Into<Vec<u8>>) -> Result<Self, FixpEncodeError> {
         let bytes = bytes.into();
         if bytes.len() > MAX_VAR_DATA_LEN {
