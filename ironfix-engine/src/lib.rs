@@ -58,6 +58,12 @@
 //!   `doc/adr/0025-typed-close-reason.md`.
 //! - **[`OutboundMessage`]**: the body you hand to [`Connection::send`]; the
 //!   engine stamps the header, `MsgSeqNum` and trailer.
+//!   [`Connection::acquire`] takes one from the session's bounded pool, to
+//!   which it returns, cleared but with its storage kept, when it is dropped,
+//!   sent or not: a body built with the copying push methods then allocates
+//!   nothing. A send still boxes the `#[async_trait]` `to_app` future the
+//!   default [`Application::to_app_checked`] awaits (see
+//!   `doc/adr/0008-pooled-outbound-messages.md`).
 //! - **[`Application`]**: the QuickFIX-shaped callback trait
 //!   (`on_create` / `on_logon` / `on_logout` / `to_admin` / `from_admin` /
 //!   `to_app` / `from_app`), plus [`NoOpApplication`].

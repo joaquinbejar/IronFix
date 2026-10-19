@@ -204,6 +204,7 @@ use crate::connection::{Connection, SessionRuntime, report_handshake};
 use crate::error::EngineError;
 use crate::next_expected::{self, NextExpectedPlan};
 use crate::observer::{Capture, FrameObserver};
+use crate::outbound::OutboundPool;
 use crate::persistence::{
     PersistedCounters, SeedPlan, Seeded, StoreAttachment, StoreFailurePolicy, seed_session,
 };
@@ -1542,6 +1543,7 @@ impl<A: Application + 'static> Initiator<A> {
             commands: command_tx,
             closed: closed_rx,
             runtime,
+            pool: OutboundPool::new(self.outbound_capacity),
         })
     }
 }
