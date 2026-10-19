@@ -54,7 +54,8 @@
 //!
 //! A message that reached the session and was never fed to the stream (a
 //! veto by `to_app_checked`, a body the engine will not frame, the throttle,
-//! a store refusal, a message still queued or held when the session closes)
+//! a store refusal, a message still queued or held when the session closes, a gap fill
+//! `to_admin` left unframeable, a replay the codec refuses)
 //! was never observed as outbound, and is reported by
 //! [`OutboundResult::NotSent`] alone, with no `MsgSeqNum`: the engine
 //! guarantees no byte of it reached the stream. A frame that was numbered and filed but then refused by the
@@ -101,6 +102,7 @@
 
 use crate::application::SessionId;
 use crate::outcome::{NotSentReason, SendOutcome, UnknownReason};
+use ironfix_tagvalue::Decoder;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -349,27 +351,32 @@ impl Capture {
 /// How many fields of the standard header are looked at for `MsgSeqNum`.
 const HEADER_SCAN_FIELDS: usize = 16;
 
-/// The `MsgSeqNum` (34) of `frame`, read from the first fields of its
-/// standard header without decoding it: `None` when it is not there, not a
-/// number, or does not fit a `u64`. Only an observation reads it; no
-/// decision does.
+/// The `MsgSeqNum` (34) of `frame`, read from its first
+/// [`HEADER_SCAN_FIELDS`] fields with the tag=value decoder's own field walk:
+/// a `DATA` field (`SecureData` (91), `RawData` (96), ...) is skipped by the
+/// count its `LENGTH` field declares, so a `34=` inside its bytes is never
+/// read. `None` when 34 is not among those fields, is not a number, or does
+/// not fit a `u64`, and as soon as a field does not decode. Allocates
+/// nothing. Only an observation reads it; no decision does.
 #[must_use]
 fn peek_msg_seq_num(frame: &[u8]) -> Option<u64> {
-    frame
-        .split(|byte| *byte == 0x01)
-        .take(HEADER_SCAN_FIELDS)
-        .find_map(|field| field.strip_prefix(b"34="))
-        .and_then(|value| {
+    let mut decoder = Decoder::new(frame);
+    for _ in 0..HEADER_SCAN_FIELDS {
+        let field = decoder.next_field().ok()??;
+        if field.tag().value() == 34 {
+            let value = field.as_bytes();
             if value.is_empty() {
                 return None;
             }
-            value.iter().try_fold(0u64, |acc, byte| {
+            return value.iter().try_fold(0u64, |acc, byte| {
                 if !byte.is_ascii_digit() {
                     return None;
                 }
                 acc.checked_mul(10)?.checked_add(u64::from(byte - b'0'))
-            })
-        })
+            });
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -391,6 +398,16 @@ mod tests {
             peek_msg_seq_num(b"8=FIX.4.4\x0134=99999999999999999999999\x01"),
             None
         );
+    }
+
+    #[test]
+    fn test_peek_msg_seq_num_never_reads_inside_a_data_field() {
+        // SecureDataLen (90) / SecureData (91) ahead of the real 34.
+        let frame = b"8=FIX.4.4\x019=5\x0135=5\x0190=18\x0191=opaque\x0134=777\x01tail\x0134=2\x01";
+        assert_eq!(peek_msg_seq_num(frame), Some(2));
+        // RawDataLength (95) / RawData (96) and no real 34 at all.
+        let frame = b"8=FIX.4.4\x019=5\x0135=5\x0195=18\x0196=opaque\x0134=777\x01tail\x0152=x\x01";
+        assert_eq!(peek_msg_seq_num(frame), None);
     }
 
     #[test]

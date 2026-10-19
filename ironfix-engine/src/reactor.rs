@@ -2947,9 +2947,17 @@ impl<A: Application> Reactor<A> {
         seq: u64,
         frame: &[u8],
     ) -> Result<(), EngineError> {
-        self.writer
+        if let Err(err) = self
+            .writer
             .feed_frame(framed, frame, seq, FrameKind::Replay)
-            .map_err(EngineError::from)
+        {
+            // Refused before any byte was buffered, and a replay spends no
+            // number: reported as the SendOutcome mapping has it.
+            let err = EngineError::from(err);
+            self.fail_unobserved(FrameKind::Replay, None, None, &err);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Feeds a SequenceReset-GapFill covering `at_seq..new_seq`, numbered with
@@ -2972,7 +2980,13 @@ impl<A: Application> Reactor<A> {
         new_seq: u64,
     ) -> Result<(), EngineError> {
         let mut gap_fill = self.factory.sequence_reset_gap_fill(new_seq);
-        if self.prepare(&mut gap_fill).await.is_err() {
+        if let Err(refusal) = self.prepare(&mut gap_fill).await {
+            settle(
+                self.writer.capture.as_ref(),
+                FrameKind::GapFill,
+                None,
+                || SendOutcome::not_sent(refusal.into_reason()),
+            );
             return Ok(());
         }
         match self.write_at(framed, at_seq, &gap_fill, false, None).await {

@@ -895,3 +895,202 @@ async fn test_partial_write_is_observed_then_unknown() {
     recorder.assert_one_result_per_frame();
     drop(venue);
 }
+
+/// A Logout from the venue carrying a `LENGTH`/`DATA` pair whose bytes embed
+/// `SOH 34=777 SOH`, followed by the real `MsgSeqNum` (34) when `seq` is set.
+fn data_frame(length_tag: u32, data_tag: u32, seq: Option<u64>) -> BytesMut {
+    let mut encoder = Encoder::new("FIX.4.4");
+    encoder.put_str(35, "5");
+    encoder.put_str(49, "VENUE");
+    encoder.put_str(56, "CLIENT");
+    encoder.put_data(length_tag, data_tag, b"opaque\x0134=777\x01tail");
+    if let Some(seq) = seq {
+        encoder.put_uint(34, seq);
+    }
+    encoder.put_str(52, Timestamp::now().format_millis().as_str());
+    let mut frame = BytesMut::new();
+    ok(
+        encoder.finish_into(&mut frame),
+        "frame with embedded field bytes",
+    );
+    frame
+}
+
+/// The inbound entry observed for exactly `frame`, waiting for it.
+async fn observed_inbound(recorder: &Recorder, frame: &[u8]) -> Entry {
+    ok(
+        timeout(STEP, async {
+            loop {
+                let found = recorder.entries().into_iter().find(|entry| {
+                    matches!(entry, Entry::Frame { direction: Direction::Inbound, bytes, .. }
+                        if bytes.as_slice() == frame)
+                });
+                if let Some(entry) = found {
+                    break entry;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await,
+        "the frame is observed",
+    )
+}
+
+/// Regression (PR #149 review): a `34=` inside `SecureData` (91) is not the
+/// header's `MsgSeqNum`; the observation reports the real one.
+#[tokio::test]
+async fn test_msg_seq_num_inside_secure_data_is_not_reported() {
+    let recorder = Arc::new(Recorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+    let frame = data_frame(90, 91, Some(2));
+    assert_eq!(field(&frame, 34).as_deref(), Some("2"));
+    venue.send(frame.clone()).await;
+    let entry = observed_inbound(&recorder, &frame).await;
+    closed(&member, "the venue's Logout closes the session").await;
+    assert!(
+        matches!(
+            entry,
+            Entry::Frame {
+                kind: FrameKind::Session,
+                seq: Some(2),
+                ..
+            }
+        ),
+        "the real MsgSeqNum is 2: {entry:?}"
+    );
+}
+
+/// Regression (PR #149 review): a frame with no `MsgSeqNum` (34) but a
+/// `34=` inside `RawData` (96) reports none.
+#[tokio::test]
+async fn test_msg_seq_num_is_not_fabricated_from_raw_data() {
+    let recorder = Arc::new(Recorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+    let frame = data_frame(95, 96, None);
+    assert_eq!(field(&frame, 34), None, "no real MsgSeqNum");
+    venue.send(frame.clone()).await;
+    let entry = observed_inbound(&recorder, &frame).await;
+    drop(venue);
+    closed(&member, "the transport closes").await;
+    assert!(
+        matches!(
+            entry,
+            Entry::Frame {
+                kind: FrameKind::Session,
+                seq: None,
+                ..
+            }
+        ),
+        "no MsgSeqNum is reported: {entry:?}"
+    );
+}
+
+/// An application whose `to_admin` breaks every SequenceReset with an empty
+/// Text (58), so the engine refuses to frame a gap fill.
+struct DropGapFillApp;
+
+#[async_trait]
+impl Application for DropGapFillApp {
+    async fn on_create(&self, _: &SessionId) {}
+
+    async fn on_logon(&self, _: &SessionId) {}
+
+    async fn on_logout(&self, _: &SessionId) {}
+
+    async fn to_admin(&self, message: &mut OutboundMessage, _: &SessionId) {
+        if message.msg_type() == &MsgType::SequenceReset {
+            message.push_str(58, "");
+        }
+    }
+
+    async fn from_admin(&self, _: &RawMessage<'_>, _: &SessionId) -> Result<(), RejectReason> {
+        Ok(())
+    }
+
+    async fn to_app(&self, _: &mut OutboundMessage, _: &SessionId) {}
+
+    async fn from_app(&self, _: &RawMessage<'_>, _: &SessionId) -> Result<(), RejectReason> {
+        Ok(())
+    }
+}
+
+/// Regression (PR #149 review): a gap fill `to_admin` left unframeable is
+/// never observed as a frame and reports one `GapFill` `NotSent`.
+#[tokio::test]
+async fn test_refused_gap_fill_reports_not_sent() {
+    let recorder = Arc::new(Recorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(DropGapFillApp))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+    venue.send(venue_msg("2", 2, &[(7, "1"), (16, "1")])).await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await,
+        "the request is consumed",
+    );
+    // A new message cannot overtake the resend, so its outcome fences it.
+    assert!(member.send_tracked(order("AFTER-FILL")).await.is_sent());
+    let fills: Vec<_> = recorder
+        .results()
+        .into_iter()
+        .filter(|(kind, _, _)| *kind == FrameKind::GapFill)
+        .collect();
+    assert_eq!(fills.len(), 1, "{:?}", recorder.entries());
+    assert!(matches!(
+        &fills[0],
+        (FrameKind::GapFill, None, OutboundResult::NotSent { .. })
+    ));
+    recorder.assert_one_result_per_frame();
+    drop(venue);
+    closed(&member, "the session closes once the venue is gone").await;
+}
+
+/// Regression (PR #149 review): a stored message larger than the session's
+/// current `max_message_size` is refused by the codec when replayed; the
+/// session closes and the replay reports one result.
+#[tokio::test]
+async fn test_codec_refused_replay_reports_a_result() {
+    let recorder = Arc::new(Recorder::default());
+    let store = Arc::new(MemoryStore::new());
+    let padding = "x".repeat(1024);
+    let old = frame_from("CLIENT", "VENUE", "D", 2, &[(11, "OLD"), (58, &padding)]);
+    ok(
+        store.store(2, &MsgType::NewOrderSingle, &old).await,
+        "seed a large frame",
+    );
+    ok(
+        store.set_next_sender_seq(3).await,
+        "seed the sender counter",
+    );
+    let mut config = member_config();
+    config.max_message_size = 512;
+    let initiator = Initiator::new(config, Arc::new(GateApp::default()))
+        .with_store(store as Arc<dyn MessageStore>)
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+    venue.send(venue_msg("2", 2, &[(7, "2"), (16, "2")])).await;
+    closed(&member, "the refused replay closes the session").await;
+    assert!(matches!(
+        member.close_reason(),
+        Some(ironfix_engine::CloseReason::MessageTooLarge { .. })
+    ));
+    let replays: Vec<_> = recorder
+        .results()
+        .into_iter()
+        .filter(|(kind, _, _)| *kind == FrameKind::Replay)
+        .collect();
+    assert_eq!(replays.len(), 1, "{:?}", recorder.entries());
+    assert!(matches!(
+        &replays[0],
+        (FrameKind::Replay, None, OutboundResult::NotSent { .. })
+    ));
+    recorder.assert_one_result_per_frame();
+}

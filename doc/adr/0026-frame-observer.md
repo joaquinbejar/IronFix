@@ -70,7 +70,8 @@ Constraints any answer keeps:
    frames awaiting a result, pre-allocated (256) only when an observer is
    attached. A message that reached the session and was never fed (veto,
    unframeable body, throttle, store refusal, logout pending, discarded at
-   close) is reported `NotSent` alone, never observed as a frame, with no
+   close, a gap fill `to_admin` left unframeable, a replay above
+   `max_message_size`) is reported `NotSent` alone, never observed as a frame, with no
    `MsgSeqNum`; the outcome is built once and shared with the tracked
    receipt, if any. A frame numbered and filed but refused by the codec
    reports `Unknown`, as its tracked outcome does.
