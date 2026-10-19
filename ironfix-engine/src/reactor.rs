@@ -2764,7 +2764,15 @@ impl<A: Application> Reactor<A> {
                 }
                 Ok(phase)
             }
-            Ok(Sent::Yes | Sent::Deferred) => Ok(phase),
+            Ok(Sent::Yes | Sent::Deferred) => {
+                // The token was taken before the gate and the store were
+                // awaited; it is charged at the instant the frame was fed, so
+                // that wait earns nothing on top of it.
+                if let (Some(budget), Some(throttle)) = (budget, self.throttle.as_mut()) {
+                    throttle.state.charge_at(budget, driver_now());
+                }
+                Ok(phase)
+            }
             Err(err) => {
                 teardown(phase);
                 Err(closed(format!("send failed: {err}"), false))

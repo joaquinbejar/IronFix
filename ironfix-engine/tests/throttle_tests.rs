@@ -1341,6 +1341,42 @@ async fn test_vetoed_message_gives_its_token_back() {
     assert_discarded_by_throttle(&outcome(held).await, BudgetId::DEFAULT);
 }
 
+/// A gate that holds the first message longer than the window does not let
+/// the next one out right behind it: the token is charged when the frame is
+/// fed, so the next message still waits a full spacing after it.
+#[tokio::test(start_paused = true)]
+async fn test_slow_gate_does_not_let_the_next_message_out_early() {
+    let (app, _rx) = ThrottleApp::new();
+    let (connection, mut peer, handshake) = start(
+        Role::Initiator,
+        Arc::clone(&app),
+        Setup::new(one_budget(1, SECOND)),
+    )
+    .await;
+    let first = handshake + 1;
+    let gated = track(&connection, order("GATE")).await;
+    ok(
+        timeout(STEP, app.entered.notified()).await,
+        "the gated message reaches to_app_checked",
+    );
+    let next = track(&connection, order("NEXT-1")).await;
+    tokio::time::sleep(2 * SECOND).await;
+    app.release.notify_one();
+    let frame = frame_of_type(&mut peer.framed, "D").await;
+    assert_eq!(field(&frame, 11).as_deref(), Some("GATE"));
+    let fed = Instant::now();
+    let frame = frame_of_type(&mut peer.framed, "D").await;
+    assert_eq!(field(&frame, 11).as_deref(), Some("NEXT-1"));
+    let gap = fed.elapsed();
+    assert!(
+        gap >= SECOND && gap < SECOND + RELEASE_SLACK,
+        "the next message left {gap:?} after the gated one"
+    );
+    assert_eq!(sent(&outcome(gated).await), first);
+    assert_eq!(sent(&outcome(next).await), first + 1);
+    log_out(&connection, &mut peer).await;
+}
+
 /// A plain `send` goes through the same throttle: one refused is dropped,
 /// spending nothing, and the next tracked message takes the next number.
 #[tokio::test(start_paused = true)]

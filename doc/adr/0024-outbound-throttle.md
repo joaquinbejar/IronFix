@@ -180,8 +180,11 @@ message whose write is partial, or fails, is `Unknown`, as ADR-0023 defines.
   enum. `cargo semver-checks` reports no breaking change.
 - **Cost:** without a throttle, one `Option` check per message and per loop
   pass. With one, a throttled message costs no allocation in steady state:
-  the per-budget queue keeps its capacity and the release timer is reset,
-  not rebuilt. The #126 allocation test measures a throttled window at one
+  the per-budget queue keeps the capacity of its deepest fill for the rest
+  of the session (the bounded worst case: `max_depth` entries per budget,
+  given back when the session ends) and the release timer is reset, not
+  rebuilt. An earlier revision shrank a drained queue, which made every
+  fill past the retained size reallocate; it was dropped for that reason. The #126 allocation test measures a throttled window at one
   block per message, as without the throttle. No throughput figure is
   claimed.
 - **Plain sends:** with a throttle the reactor goes on draining the outbound

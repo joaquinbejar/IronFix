@@ -104,7 +104,10 @@ pub const MAX_THROTTLE_BUDGETS: usize = 16;
 ///
 /// A held message is kept whole in memory until it is released, so the bound
 /// is also what one budget can hold: `max_depth` times the size of the
-/// largest message the application sends.
+/// largest message the application sends. A budget's queue keeps the
+/// capacity its deepest fill gave it for the rest of the session (at most
+/// `max_depth` entries), so filling and draining it again allocates
+/// nothing; that capacity is given back when the session ends.
 pub const MAX_THROTTLE_QUEUE_DEPTH: usize = 65_536;
 
 /// Longest window a [`ThrottleBudget`] accepts: one day.
@@ -113,10 +116,6 @@ pub const MAX_THROTTLE_WINDOW: Duration = Duration::from_secs(86_400);
 /// The `max_depth` of the [`ThrottlePolicy::Queue`] a [`ThrottleBudget`]
 /// starts with, in messages: the default capacity of the outbound queue.
 pub const DEFAULT_THROTTLE_QUEUE_DEPTH: usize = 1_024;
-
-/// Capacity a budget's queue keeps once it drains: a larger one, grown by a
-/// burst, is given back.
-const QUEUE_RETAINED: usize = 64;
 
 /// The resolution of the timer a held message waits on: Tokio's.
 const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
@@ -760,9 +759,6 @@ impl<T> Throttle<T> {
             return None;
         }
         let (_, item) = bucket.queue.pop_front()?;
-        if bucket.queue.is_empty() && bucket.queue.capacity() > QUEUE_RETAINED {
-            bucket.queue.shrink_to(QUEUE_RETAINED);
-        }
         // The message just taken out was counted, so `held` is at least 1.
         debug_assert!(self.held > 0, "a held message was counted");
         if let Some(held) = self.held.checked_sub(1) {
@@ -789,6 +785,25 @@ impl<T> Throttle<T> {
             .iter_mut()
             .filter_map(|bucket| bucket.ready_at(now))
             .min()
+    }
+
+    /// Charges, at `now`, the token a message of `budget` took earlier and
+    /// whose frame is only now fed: the time spent in between (the outbound
+    /// gate, the store) must not earn a token on top of it. The bucket is
+    /// brought up to date at `now`; if that fills it, the token is taken from
+    /// the refill and the clock restarts at `now`, exactly as if the token had
+    /// been taken at `now`. A wait too short to fill the bucket changes
+    /// nothing, which is also what taking it at `now` gives.
+    pub(crate) fn charge_at(&mut self, budget: BudgetId, now: Instant) {
+        if let Some(bucket) = self.bucket_mut(budget) {
+            bucket.refill(now);
+            if bucket.tokens >= bucket.burst
+                && let Some(left) = bucket.burst.checked_sub(1)
+            {
+                bucket.tokens = left;
+                bucket.refilled_at = now;
+            }
+        }
     }
 
     /// Gives back the token a message of `budget` took and did not use: the
@@ -1204,6 +1219,59 @@ mod tests {
         assert_eq!(throttle.release(t1), Some((a, 4)));
         assert!(throttle.release(t1).is_none());
         assert_eq!(throttle.release(t0 + 2 * SECOND), Some((b, 5)));
+    }
+
+    #[test]
+    fn test_throttle_charge_at_feed_does_not_bank_the_wait() {
+        let t0 = Instant::now();
+        let mut throttle = single(ThrottleBudget::new(1, SECOND), t0);
+        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
+        // The frame is fed two windows later: the token counts from then.
+        let fed = t0 + 2 * SECOND;
+        throttle.charge_at(BudgetId::DEFAULT, fed);
+        assert_held(throttle.admit(BudgetId::DEFAULT, 2, fed));
+        assert_eq!(throttle.next_release(fed), Some(fed + SECOND));
+
+        let mut throttle = single(ThrottleBudget::new(1, SECOND).with_burst(3), t0);
+        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
+        throttle.charge_at(BudgetId::DEFAULT, t0 + Duration::from_millis(500));
+        assert_now(throttle.admit(BudgetId::DEFAULT, 2, t0), 2);
+        assert_now(throttle.admit(BudgetId::DEFAULT, 3, t0), 3);
+        assert_held(throttle.admit(BudgetId::DEFAULT, 4, t0));
+    }
+
+    /// Filling and draining a queue again and again, at a depth just past a
+    /// power of two, never reallocates it once warmed: the queue keeps its
+    /// capacity.
+    #[test]
+    fn test_throttle_queue_cycles_without_reallocating() {
+        let t0 = Instant::now();
+        let mut throttle = single(
+            ThrottleBudget::new(1, Duration::from_nanos(1))
+                .with_policy(ThrottlePolicy::Queue { max_depth: 65 }),
+            t0,
+        );
+        assert_now(throttle.admit(BudgetId::DEFAULT, 99, t0), 99);
+        let mut capacity = None;
+        let mut at = t0;
+        for _ in 0..10 {
+            for item in 0..65 {
+                assert_held(throttle.admit(BudgetId::DEFAULT, item, t0));
+            }
+            for _ in 0..65 {
+                at += Duration::from_nanos(1);
+                assert!(throttle.release(at).is_some());
+            }
+            let now = throttle
+                .buckets
+                .first()
+                .map(|bucket| bucket.queue.capacity());
+            assert!(
+                capacity.is_none() || capacity == now,
+                "the queue was reallocated"
+            );
+            capacity = now;
+        }
     }
 
     #[test]
