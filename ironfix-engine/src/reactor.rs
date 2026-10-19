@@ -240,6 +240,7 @@ use crate::application::{Application, RejectReason, SessionId};
 use crate::close::{CloseReason, LogoutCause, bounded_peer_text};
 use crate::connection::{Command, SessionRuntime};
 use crate::error::EngineError;
+use crate::gap_queue::{GapQueue, Gapped, Insert};
 use crate::garbled::{GarbledFrameWindow, GarbledVerdict};
 use crate::observer::{Capture, FrameKind, OutboundResult};
 use crate::outbound;
@@ -1873,6 +1874,11 @@ struct Reactor<A: Application> {
     /// The outbound throttle, when one is attached: the budgets new
     /// application messages are held to, and the messages they hold.
     throttle: Option<OutboundThrottle>,
+    /// Messages held above an open gap under
+    /// [`GapPolicy::Queue`](ironfix_session::GapPolicy::Queue), released in
+    /// order once it is filled ([`Reactor::release_ready`]); `None` under
+    /// `Discard`.
+    gap_queue: Option<GapQueue>,
 }
 
 /// A new outbound application message held by the outbound throttle until
@@ -2849,7 +2855,8 @@ impl<A: Application> Reactor<A> {
     /// ([`Sent::Deferred`]) and written once the resend is done: a new number
     /// reaching the counterparty in the middle of a resend is outside the
     /// range being answered, and a counterparty that does not queue gapped
-    /// messages (IronFix itself, until #71) would be left waiting for it. The
+    /// messages (IronFix itself under `GapPolicy::Discard`) would be left
+    /// waiting for it. The
     /// hold has no overflow path: once it holds [`MAX_DEFERRED_SENDS`], the
     /// reactor stops reading (and taking application Rejects) until the
     /// resend is done, so it grows past the bound by at most what one inbound
@@ -3379,6 +3386,7 @@ impl<A: Application> Reactor<A> {
                 // still answered, as FIX allows.
                 self.resend = None;
                 self.held_logon = None;
+                self.clear_gap_queue("this session logged out");
                 self.logout_sent = true;
                 self.logout_cause = Some(cause);
                 // Nothing that takes a new number follows this session's own
@@ -4044,6 +4052,7 @@ impl<A: Application> Reactor<A> {
         phase: Phase,
         raw: &RawMessage<'_>,
         seq: u64,
+        frame: &Bytes,
     ) -> Result<Phase, SessionClosed> {
         // Only Y and N are valid GapFillFlag Booleans. An absent 123 is Reset
         // mode per spec, but a present-but-malformed value is rejected with
@@ -4082,8 +4091,14 @@ impl<A: Application> Reactor<A> {
                 SequenceResult::Gap { expected, received } => {
                     // The fill is itself gapped: it cannot be trusted to
                     // describe the missing range, so NewSeqNo is not applied
-                    // and the range is requested instead.
-                    return self.request_resend(framed, phase, expected, received).await;
+                    // and the range is requested instead. Under the Queue
+                    // policy it is kept and applied in turn, once the gap
+                    // below it is filled.
+                    let phase = self
+                        .request_resend(framed, phase, expected, received)
+                        .await?;
+                    self.queue_gapped(&phase, seq, Gapped::Frame(frame.clone()));
+                    return Ok(phase);
                 }
                 SequenceResult::TooLow { expected, received } => {
                     if raw.get_field_str(43) == Some("Y") {
@@ -4215,6 +4230,12 @@ impl<A: Application> Reactor<A> {
             return Err(self.close_on_store_failure(phase, &err));
         }
         self.runtime.sequences.set_target_seq(new_seq);
+        // A Reset renumbers the stream: what was queued above the gap was
+        // numbered before it, so none of it is released. A Gap Fill keeps the
+        // numbering; queued messages it jumped past are dropped on release.
+        if !gap_fill {
+            self.clear_gap_queue("a SequenceReset-Reset renumbered the stream");
+        }
         // Only a reset that actually advances the expectation touches an
         // outstanding ResendRequest. A reset landing on the number we already
         // expect changes nothing, and reconciling for it would let a peer replay
@@ -4810,7 +4831,171 @@ impl<A: Application> Reactor<A> {
             capture.inbound(&frame, FrameKind::Session);
         }
         let phase = self.on_frame(framed, phase, frame).await?;
-        self.release_held_logon(phase).await
+        self.release_ready(framed, phase).await
+    }
+
+    /// Consumes whatever the inbound expectation has reached after a frame:
+    /// a held Logon ([`Reactor::release_held_logon`]) and, under
+    /// [`GapPolicy::Queue`](ironfix_session::GapPolicy::Queue), the messages
+    /// held above the gap, one number at a time, until the next number is
+    /// neither.
+    ///
+    /// Each queued message goes through the path it would have taken had it
+    /// arrived in sequence, minus what was already done when it was framed:
+    /// it was observed, counted as proof of life, and checked for identity
+    /// and `SendingTime` then, and is not again. An application message goes
+    /// through [`Reactor::on_app_in_sequence`] (the `ApplVerID` check, the
+    /// target persist, the dispatcher), a `SequenceReset`-GapFill through
+    /// [`Reactor::on_sequence_reset`], and an administrative message already
+    /// acted on only has its number consumed, persisted first (ADR-0005).
+    /// Held messages that something else moved the expectation past (a gap
+    /// fill, the held Logon) are dropped.
+    ///
+    /// With nothing held this is one map lookup: no allocation.
+    ///
+    /// # Errors
+    /// Whatever closes the session while a released message is acted on.
+    async fn release_ready(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+    ) -> Result<Phase, SessionClosed> {
+        let mut phase = self.release_held_logon(phase).await?;
+        loop {
+            let expected = self.runtime.sequences.next_target_seq().value();
+            let Some(queue) = self.gap_queue.as_mut() else {
+                return Ok(phase);
+            };
+            if queue.is_empty() {
+                return Ok(phase);
+            }
+            let ready = queue.take_ready(expected);
+            if ready.superseded > 0 {
+                tracing::debug!(
+                    session = %self.session_id,
+                    expected,
+                    dropped = ready.superseded,
+                    "dropped queued messages the expectation moved past"
+                );
+            }
+            let Some(entry) = ready.next else {
+                return Ok(phase);
+            };
+            phase = match entry {
+                Gapped::Frame(frame) => self.release_frame(framed, phase, expected, &frame).await?,
+                Gapped::Processed => self.consume_processed(phase, expected).await?,
+            };
+            phase = self.release_held_logon(phase).await?;
+        }
+    }
+
+    /// Acts on a queued frame whose number the expectation has reached.
+    async fn release_frame(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        seq: u64,
+        frame: &Bytes,
+    ) -> Result<Phase, SessionClosed> {
+        // The frame decoded when it arrived; the same bytes decode again.
+        let Ok(raw) = wire::decode_frame(frame) else {
+            return Ok(phase);
+        };
+        tracing::debug!(
+            session = %self.session_id,
+            seq,
+            msg_type = %raw.msg_type(),
+            "releasing a message queued above a gap"
+        );
+        if *raw.msg_type() == MsgType::SequenceReset {
+            return self
+                .on_sequence_reset(framed, phase, &raw, seq, frame)
+                .await;
+        }
+        self.on_app_in_sequence(framed, phase, &raw, seq, frame)
+            .await
+    }
+
+    /// Consumes the number of a queued administrative message, acted on when
+    /// it arrived: `seq + 1` is persisted as the next target number before the
+    /// expectation moves, as for one in sequence.
+    async fn consume_processed(&mut self, phase: Phase, seq: u64) -> Result<Phase, SessionClosed> {
+        let Some(next) = seq.checked_add(1) else {
+            return Err(exhausted(
+                phase,
+                SequenceExhausted {
+                    counter: SequenceCounter::Target,
+                },
+            ));
+        };
+        if let Err(err) = self.persist_target(next).await {
+            return Err(self.close_on_store_failure(phase, &err));
+        }
+        if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
+            return Err(exhausted(phase, err));
+        }
+        self.note_inbound_progress();
+        Ok(phase)
+    }
+
+    /// Holds a message that arrived above the expectation, under
+    /// [`GapPolicy::Queue`](ironfix_session::GapPolicy::Queue).
+    ///
+    /// Only an Active session with no Logout owed queues: a session on its
+    /// way out releases nothing more. Past a bound the message is dropped, as
+    /// under `Discard`, and the session stays up: the open-ended
+    /// `ResendRequest` covers it.
+    ///
+    /// Returns whether a message with this number was already queued: the
+    /// new one is then a copy and must not be acted on either, so a repeated
+    /// gapped TestRequest is not answered twice and an administrative frame
+    /// on a number an application message already claimed does not run. An
+    /// overflow returns `false`: the message is acted on as under `Discard`.
+    fn queue_gapped(&mut self, phase: &Phase, seq: u64, entry: Gapped) -> bool {
+        if !matches!(phase, Phase::Active(_)) || self.logout_owed.is_some() {
+            return false;
+        }
+        let Some(queue) = self.gap_queue.as_mut() else {
+            return false;
+        };
+        match queue.insert(seq, entry) {
+            Insert::Queued => false,
+            Insert::Duplicate => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    seq,
+                    "a message with this number is already queued above the gap: dropping the copy"
+                );
+                true
+            }
+            Insert::Overflow => {
+                if queue.first_overflow() {
+                    tracing::warn!(
+                        session = %self.session_id,
+                        seq,
+                        "the gap queue is full: discarding further messages above the gap until \
+                         it drains; the resend delivers them"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// Drops every queued message, logging why when there were any.
+    fn clear_gap_queue(&mut self, why: &'static str) {
+        let Some(queue) = self.gap_queue.as_mut() else {
+            return;
+        };
+        let dropped = queue.clear();
+        if dropped > 0 {
+            tracing::debug!(
+                session = %self.session_id,
+                dropped,
+                why,
+                "dropped the messages queued above a gap"
+            );
+        }
     }
 
     /// Consumes a Logon or acknowledgement held by [`Reactor::open`] once the
@@ -5049,7 +5234,9 @@ impl<A: Application> Reactor<A> {
         }
 
         if msg_type == MsgType::SequenceReset {
-            return self.on_sequence_reset(framed, phase, &raw, seq).await;
+            return self
+                .on_sequence_reset(framed, phase, &raw, seq, &frame)
+                .await;
         }
 
         match self.runtime.sequences.validate_incoming(seq) {
@@ -5102,8 +5289,19 @@ impl<A: Application> Reactor<A> {
                     .await?;
                 if msg_type.is_app() {
                     // Application messages inside a gap will be resent in
-                    // order; admin messages are still processed below
-                    // (without advancing the target sequence).
+                    // order; under the Queue policy this copy is kept and
+                    // released once the gap is filled. Admin messages are
+                    // still processed below (without advancing the target
+                    // sequence), and under Queue their number is kept to be
+                    // consumed in turn, except a Logout's: it empties the
+                    // queue.
+                    self.queue_gapped(&phase, seq, Gapped::Frame(frame.clone()));
+                    return Ok(phase);
+                }
+                if msg_type != MsgType::Logout && self.queue_gapped(&phase, seq, Gapped::Processed)
+                {
+                    // A copy of a number already held: dropped, not acted
+                    // on a second time.
                     return Ok(phase);
                 }
                 self.dispatch_admin(framed, phase, &raw, seq).await
@@ -5116,10 +5314,9 @@ impl<A: Application> Reactor<A> {
     ///
     /// This is the one path an application message takes to `from_app`, so
     /// every check that decides whether the application may see it lives
-    /// here. A path that releases application messages later (a queue of
-    /// messages held across a gap, #71) must release each through this
-    /// method, in order, rather than calling [`Reactor::deliver_app`]
-    /// directly.
+    /// here. A path that releases application messages later (the gap queue,
+    /// [`Reactor::release_ready`]) must release each through this method, in
+    /// order, rather than calling [`Reactor::deliver_app`] directly.
     ///
     /// On a FIXT.1.1 session, an `ApplVerID` (1128) that names a version the
     /// session does not accept ([`ApplVersionGuard::check_application`], a
@@ -5329,48 +5526,61 @@ impl<A: Application> Reactor<A> {
                 );
                 Ok(phase)
             }
-            MsgType::Logout => match phase {
-                Phase::LogoutPending(session) => {
-                    // Typestate: LogoutPending -> Disconnected.
-                    let _ = session.on_logout_ack();
-                    Err(self.local_logout_complete(raw))
-                }
-                // The counterparty's Logout arrived while ours was still
-                // being written (its last bytes accepted in this same poll,
-                // or the two Logouts crossing): the exchange is complete. What
-                // is left of ours is written out as the session closes, and a
-                // close whose Logout never got out is not graceful.
-                Phase::LogoutQueued(session) => {
-                    // Typestate: Active -> LogoutPending -> Disconnected.
-                    let _ = session.initiate_logout().on_logout_ack();
-                    Err(self.local_logout_complete(raw))
-                }
-                Phase::Active(session) => {
-                    let text = bounded_peer_text(raw.get_field_str(58));
-                    self.logout_owed = Some(OwedLogout {
-                        since: Instant::now(),
-                        text,
-                    });
-                    // A resend this session owes is finished first: FIX gives
-                    // the remote end the chance to fill any gap before it
-                    // replies to a Logout. The reply waits, bounded by the
-                    // logout timeout, and the session keeps resending and
-                    // reading meanwhile.
-                    if self.resend_in_progress() {
-                        tracing::debug!(
-                            session = %self.session_id,
-                            "the counterparty logged out while a resend is owed: replying once it \
-                             is done"
-                        );
-                        return Ok(Phase::Active(session));
-                    }
-                    self.reply_owed_logout(framed, Phase::Active(session), false)
-                        .await
-                }
-            },
+            MsgType::Logout => {
+                self.clear_gap_queue("the counterparty logged out");
+                self.on_logout(framed, phase, raw).await
+            }
             // SequenceReset is handled before dispatch; every other admin
             // type is matched above.
             _ => Ok(phase),
+        }
+    }
+
+    /// Acts on the counterparty's Logout (35=5).
+    async fn on_logout(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        raw: &RawMessage<'_>,
+    ) -> Result<Phase, SessionClosed> {
+        match phase {
+            Phase::LogoutPending(session) => {
+                // Typestate: LogoutPending -> Disconnected.
+                let _ = session.on_logout_ack();
+                Err(self.local_logout_complete(raw))
+            }
+            // The counterparty's Logout arrived while ours was still
+            // being written (its last bytes accepted in this same poll,
+            // or the two Logouts crossing): the exchange is complete. What
+            // is left of ours is written out as the session closes, and a
+            // close whose Logout never got out is not graceful.
+            Phase::LogoutQueued(session) => {
+                // Typestate: Active -> LogoutPending -> Disconnected.
+                let _ = session.initiate_logout().on_logout_ack();
+                Err(self.local_logout_complete(raw))
+            }
+            Phase::Active(session) => {
+                let text = bounded_peer_text(raw.get_field_str(58));
+                self.logout_owed = Some(OwedLogout {
+                    since: Instant::now(),
+                    text,
+                });
+                // A resend this session owes is finished first: FIX gives
+                // the remote end the chance to fill any gap before it
+                // replies to a Logout. The reply waits, bounded by the
+                // logout timeout, and the session keeps resending and
+                // reading meanwhile.
+                if self.resend_in_progress() {
+                    tracing::debug!(
+                        session = %self.session_id,
+                        "the counterparty logged out while a resend is owed: replying once it \
+                         is done"
+                    );
+                    return Ok(Phase::Active(session));
+                }
+                self.reply_owed_logout(framed, Phase::Active(session), false)
+                    .await
+            }
         }
     }
 }
@@ -5497,6 +5707,7 @@ where
     let (app_tx, app_rx) = mpsc::channel(app_queue_capacity);
     let (reject_tx, reject_rx) = mpsc::channel(app_queue_capacity);
     let garbled = config.garbled_frame_limit.map(GarbledFrameWindow::new);
+    let gap_queue = GapQueue::for_policy(config.gap_policy);
     let writer = Writer::new(config.max_message_size).with_capture(capture);
     // A budget whose tokens come faster than the release timer's resolution
     // keeps its rate only with a burst of a millisecond's worth of tokens.
@@ -5564,6 +5775,7 @@ where
         app_tx,
         garbled,
         throttle,
+        gap_queue,
     };
 
     let channels = ReactorChannels {

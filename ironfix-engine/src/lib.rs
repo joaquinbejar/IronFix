@@ -206,6 +206,7 @@ pub mod builder;
 pub mod close;
 pub mod connection;
 pub mod error;
+mod gap_queue;
 mod garbled;
 pub mod initiator;
 mod next_expected;
@@ -238,4 +239,4 @@ pub use throttle::{
 
 // Re-exported for convenience: the per-session configuration consumed by
 // [`Initiator`].
-pub use ironfix_session::SessionConfig;
+pub use ironfix_session::{GapPolicy, SessionConfig};

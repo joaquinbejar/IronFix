@@ -25,7 +25,8 @@ Constraints any answer keeps:
   `version.rs`); `ironfix-session` depends on `core` only and holds the
   configuration; `ironfix-engine` composes;
 - a check on application messages must hold for every path that releases one
-  to `from_app`, including a future queue of messages held across a gap (#71);
+  to `from_app`, including the queue of messages held across a gap (#71,
+  ADR-0027);
 - FIX 4.x sessions do not change.
 
 ## Decision
@@ -207,7 +208,8 @@ before.
 
 Any later path that releases application messages, such as the gap queue of
 #71, must release each through `on_app_in_sequence`, in order, rather than
-calling `deliver_app` directly; the method's documentation says so.
+calling `deliver_app` directly; the method's documentation says so. The gap
+queue (ADR-0027) does.
 
 ## Deviations
 

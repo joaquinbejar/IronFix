@@ -40,7 +40,9 @@ pub mod heartbeat;
 pub mod sequence;
 pub mod state;
 
-pub use config::{GarbledFrameLimit, SessionConfig, SessionConfigBuilder, SessionConfigError};
+pub use config::{
+    GapPolicy, GarbledFrameLimit, SessionConfig, SessionConfigBuilder, SessionConfigError,
+};
 pub use heartbeat::{
     HeartbeatIntervalError, HeartbeatManager, MAX_HEARTBEAT_INTERVAL_SECS, TestRequestOutcome,
     generate_test_req_id, negotiate_interval,

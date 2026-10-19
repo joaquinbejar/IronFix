@@ -410,8 +410,8 @@ reactor before #126.
 
 **Nothing that takes a new number is written in the middle of a resend.** A
 new number reaching the counterparty inside the range being answered is
-outside it, and a receiver that does not queue gapped messages (IronFix itself,
-until #71) is left waiting for it: it reads the frame as gapped, fills the rest
+outside it, and a receiver that does not queue gapped messages (IronFix itself
+under the default `GapPolicy::Discard`; see ADR-0027) is left waiting for it: it reads the frame as gapped, fills the rest
 of the gap, and then expects that number, which nothing sends again until it
 asks (found in review; the base never interleaved, because it wrote a resend to
 completion). So while a resend is under way:
@@ -537,9 +537,12 @@ past it.
   types, `engine` the decisions. No dependency was added.
 - No performance claim (ADR-0001): the Logon exchange reads one more field,
   and the replay is the existing resend path; nothing was measured.
-- **Not done:** 789 is not consulted outside the Logon exchange; only the
-  Logon's number is held, and a general queue of messages received across a
-  gap is #71; the joint crash and takeover suite that exercises 789 across
+- **Not done:** 789 is not consulted outside the Logon exchange. Under the
+  default `GapPolicy::Discard` only the Logon's number is held; the opt-in
+  `GapPolicy::Queue` (#71, ADR-0027) also keeps the frames that overtake the
+  resend, so administrative frames `L+1 .. L+k` past a held Logon `L` are
+  released in turn once it is consumed instead of being stranded until the
+  resend timeout. The joint crash and takeover suite that exercises 789 across
   injected crashes is #89.
 - The overlapping gap fill of an earlier revision (after the fallback request,
   a fill numbered with an already consumed Logon was dropped) no longer
