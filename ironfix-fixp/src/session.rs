@@ -42,6 +42,9 @@ use std::time::{Duration, Instant};
 /// cannot carry, so the outbound counter never reaches it.
 const SEQ_NULL: u64 = u64::MAX;
 
+/// The name [`Event::Ignored`] gives an application message.
+pub(crate) const APPLICATION_MESSAGE: &str = "application message";
+
 /// State every session state needs, whatever the role and phase.
 #[derive(Debug)]
 pub(crate) struct Core {
@@ -272,6 +275,15 @@ impl Binding {
             BindState::Terminating { .. } | BindState::Closing { .. } => false,
         }
     }
+
+    /// This side sent a session message other than a Sequence: the receiver
+    /// may no longer number its next application message implicitly, so the
+    /// next one goes behind a Sequence (FIXP v1.1 Appendix A 7.3.1.1, which
+    /// reads section 3.5.4 broadly). A redundant Sequence is only a
+    /// heartbeat, so the broad reading is always safe.
+    const fn leave_sequence(&mut self) {
+        self.in_sequence = false;
+    }
 }
 
 /// A half-open range of missing sequence numbers, `from..end`.
@@ -299,6 +311,10 @@ struct Outstanding {
     /// A Sequence or Context cut the last batch short of its `Count`: the
     /// provider stopped serving it (section 3.5.4).
     interrupted: bool,
+    /// The last batch was delivered in full and the request is still short:
+    /// a provider that serves one batch per request (section 4.6.2.2) is
+    /// done with it. Read by [`RetransmitStallPolicy::ReRequestAfterBatch`].
+    batch_complete: bool,
     /// The current stall was reported and is waited out; no timer runs
     /// until the provider makes progress again.
     stall_reported: bool,
@@ -366,6 +382,11 @@ pub(crate) struct Session {
     awaiting_resume: bool,
     provider: Option<Provider>,
     peer_finished: Option<PeerFinished>,
+    /// The logical session is finalized (section 4.7.2): this side answered
+    /// the counterparty's FinishedSending and the binding then ended with a
+    /// Terminate exchange. Its identifier may not be established again
+    /// (section 6.3).
+    finalized: bool,
 }
 
 impl Session {
@@ -391,6 +412,7 @@ impl Session {
             awaiting_resume: false,
             provider: None,
             peer_finished: None,
+            finalized: false,
         }
     }
 
@@ -423,6 +445,32 @@ impl Session {
 
     pub(crate) fn has_pending_recovery(&self) -> bool {
         !self.missing.is_empty()
+    }
+
+    /// Whether the logical session is finalized (FIXP v1.1 section 4.7.2).
+    pub(crate) const fn is_finalized(&self) -> bool {
+        self.finalized
+    }
+
+    /// Whether FinishedReceiving has gone out (section 4.7.2).
+    const fn finished_receiving_sent(&self) -> bool {
+        matches!(
+            self.peer_finished,
+            Some(PeerFinished {
+                receiving_sent: true,
+                ..
+            })
+        )
+    }
+
+    /// Marks the session finalized if this side answered the counterparty's
+    /// FinishedSending (section 4.7.2): the Terminate exchange that ends this
+    /// binding ends the logical session.
+    fn finalize_if_finished(&mut self) {
+        if self.finished_receiving_sent() && !self.finalized {
+            tracing::debug!(session_id = %self.id, "fixp session finalized");
+            self.finalized = true;
+        }
     }
 
     /// The `NextSeqNo` this side announces in Establish or EstablishmentAck:
@@ -608,7 +656,15 @@ impl Session {
         now: Instant,
     ) -> (Delivery, Bound) {
         match binding.state {
-            BindState::Closing { .. } => return (Delivery::Discard, Bound::Stay),
+            // FIXP v1.1 section 4.4: anything after a Terminate is ignored,
+            // and reported as a session message would be.
+            BindState::Closing { .. } => {
+                core.ignore(
+                    APPLICATION_MESSAGE,
+                    "it arrived after the counterparty's Terminate",
+                );
+                return (Delivery::Discard, Bound::Stay);
+            }
             BindState::Established | BindState::Terminating { .. } => {}
         }
         binding.last_received = now;
@@ -621,6 +677,7 @@ impl Session {
                 );
             };
             // `remaining` is at least one; the batch ends when it reaches zero.
+            let batch_ends = replay.remaining.get() == 1;
             self.replay = replay
                 .remaining
                 .get()
@@ -638,6 +695,7 @@ impl Session {
                         outstanding.delivered = delivered;
                         outstanding.last_progress = now;
                         outstanding.stall_reported = false;
+                        outstanding.batch_complete = batch_ends;
                         delivered >= outstanding.count
                     }
                     None => true,
@@ -957,6 +1015,7 @@ impl Session {
             from_seq_no: front.from,
             count,
         }));
+        binding.leave_sequence();
         self.outstanding = Some(Outstanding {
             timestamp,
             from: front.from,
@@ -964,6 +1023,7 @@ impl Session {
             delivered: 0,
             last_progress: now,
             interrupted: false,
+            batch_complete: false,
             stall_reported: false,
         });
         Bound::Stay
@@ -1030,6 +1090,7 @@ impl Session {
         if let Some(outstanding) = self.outstanding.as_mut() {
             outstanding.last_progress = now;
             outstanding.interrupted = false;
+            outstanding.batch_complete = false;
             outstanding.stall_reported = false;
         }
         Bound::Stay
@@ -1105,6 +1166,7 @@ impl Session {
         if message.session_id != self.id {
             return self.refuse_retransmit(
                 core,
+                binding,
                 message,
                 RetransmitRejectCode::InvalidSession,
                 "unknown session",
@@ -1125,6 +1187,7 @@ impl Session {
         if message.count == 0 {
             return self.refuse_retransmit(
                 core,
+                binding,
                 message,
                 RetransmitRejectCode::OutOfRange,
                 "empty range",
@@ -1133,6 +1196,7 @@ impl Session {
         if message.count > core.config().max_retransmit_count().get() {
             return self.refuse_retransmit(
                 core,
+                binding,
                 message,
                 RetransmitRejectCode::RequestLimitExceeded,
                 "count exceeds the retransmission limit",
@@ -1143,6 +1207,7 @@ impl Session {
         if !in_range {
             return self.refuse_retransmit(
                 core,
+                binding,
                 message,
                 RetransmitRejectCode::OutOfRange,
                 "range not yet sent",
@@ -1164,6 +1229,7 @@ impl Session {
     fn refuse_retransmit(
         &mut self,
         core: &mut Core,
+        binding: &mut Binding,
         message: &RetransmitRequest,
         code: RetransmitRejectCode,
         reason: &'static str,
@@ -1174,6 +1240,7 @@ impl Session {
             code,
             reason: reason.to_owned(),
         }));
+        binding.leave_sequence();
         core.event(Event::Refused {
             message: RetransmitReject::NAME,
             reason,
@@ -1203,6 +1270,12 @@ impl Session {
                 });
                 core.close_transport();
                 self.release_binding_state();
+                // Both sides must have ended gracefully: an error code in
+                // the answer ends the binding, not the session (local
+                // policy; section 4.7.2 names no code).
+                if *code == TerminationCode::Finished && message.code == TerminationCode::Finished {
+                    self.finalize_if_finished();
+                }
                 Bound::Unbind
             }
             // Section 4.4.1: answer with a Terminate, the last message sent.
@@ -1218,6 +1291,16 @@ impl Session {
                     by: TerminatedBy::Peer,
                 });
                 self.release_binding_state();
+                // Section 4.7.2: the finalization's initiator unbinds after
+                // FinishedReceiving, which ends the logical session. Only a
+                // graceful Terminate does: an error code ends the binding,
+                // not the session, and the counterparty may come back.
+                // Section 4.7.2 ties finalization to unbinding after
+                // FinishedReceiving without naming a code; `Finished` only
+                // is this crate's conservative policy, not a spec check.
+                if message.code == TerminationCode::Finished {
+                    self.finalize_if_finished();
+                }
                 binding.state = BindState::Closing {
                     deadline: now.checked_add(binding.local_keepalive),
                 };
@@ -1286,7 +1369,7 @@ impl Session {
 
     /// Sends FinishedReceiving once the counterparty has finished sending and
     /// no gap of its flow is still being recovered (section 4.7.2).
-    fn maybe_finish_receiving(&mut self, core: &mut Core, binding: &Binding) {
+    fn maybe_finish_receiving(&mut self, core: &mut Core, binding: &mut Binding) {
         let Some(finished) = self.peer_finished.as_mut() else {
             return;
         };
@@ -1301,6 +1384,7 @@ impl Session {
             session_id: self.id,
         }));
         finished.receiving_sent = true;
+        binding.leave_sequence();
     }
 
     /// The counterparty broke the protocol: terminate (section 6.3).
@@ -1432,6 +1516,14 @@ impl Session {
         now: Instant,
     ) -> Result<Option<SeqNum>, FixpError> {
         Self::require_established(binding, "send_application")?;
+        // Section 6.3: the responder sends no application message after
+        // FinishedReceiving. Appendix A 7.4.1 and 7.4.6 (informative) show a
+        // half-close instead; the normative section wins, and per section
+        // 4.7.2 such a message would likely be lost to the Terminate that
+        // follows anyway.
+        if self.finished_receiving_sent() {
+            return Err(FixpError::FinishedReceivingSent);
+        }
         match self.local_flow {
             FlowType::None => Err(FixpError::FlowCarriesNoApplicationMessages {
                 flow: self.local_flow,
@@ -1558,7 +1650,7 @@ impl Session {
     pub(crate) fn reject_retransmit_request(
         &mut self,
         core: &mut Core,
-        binding: &Binding,
+        binding: &mut Binding,
         code: RetransmitRejectCode,
         reason: String,
     ) -> Result<(), FixpError> {
@@ -1574,6 +1666,7 @@ impl Session {
             code,
             reason,
         }));
+        binding.leave_sequence();
         Ok(())
     }
 
@@ -1725,14 +1818,19 @@ impl Session {
             // The provider cut its batch short with a context switch: it has
             // stopped serving, so asking again is not premature.
             RetransmitStallPolicy::ReRequestAfterContextSwitch if outstanding.interrupted => {
-                self.outstanding = None;
-                self.replay = None;
-                self.consume_missing(u64::from(outstanding.delivered));
-                self.request_missing(core, binding, now)
+                self.re_request(core, binding, outstanding, now)
+            }
+            // Also a provider that served one complete batch per request
+            // (section 4.6.2.2) and went quiet: it waits for a new request.
+            RetransmitStallPolicy::ReRequestAfterBatch
+                if outstanding.interrupted || outstanding.batch_complete =>
+            {
+                self.re_request(core, binding, outstanding, now)
             }
             // The provider may still be pacing its batches: a second request
             // now could be terminated as premature (sections 4.6.1, 4.6.4).
             RetransmitStallPolicy::ReRequestAfterContextSwitch
+            | RetransmitStallPolicy::ReRequestAfterBatch
             | RetransmitStallPolicy::EventOnly => {
                 if let Some(outstanding) = self.outstanding.as_mut() {
                     outstanding.stall_reported = true;
@@ -1740,6 +1838,21 @@ impl Session {
                 Bound::Stay
             }
         }
+    }
+
+    /// Gives up the stalled request, keeping what it delivered, and asks for
+    /// what is still missing.
+    fn re_request(
+        &mut self,
+        core: &mut Core,
+        binding: &mut Binding,
+        outstanding: Outstanding,
+        now: Instant,
+    ) -> Bound {
+        self.outstanding = None;
+        self.replay = None;
+        self.consume_missing(u64::from(outstanding.delivered));
+        self.request_missing(core, binding, now)
     }
 
     /// Sends the heartbeat of this side's flow (FIXP v1.1 section 4.5).
@@ -1849,6 +1962,30 @@ mod tests {
         let mut session = Session::new(crate::testkit::SESSION, local, remote);
         let binding = session.bind(origin, crate::testkit::KEEPALIVE, crate::testkit::KEEPALIVE);
         (core, session, binding)
+    }
+
+    #[test]
+    fn test_finished_receiving_leaves_sequenced_mode() {
+        // Appendix A 7.3.1.1: FinishedReceiving is a session message other
+        // than a Sequence, so it ends sequenced mode. Its effect cannot be
+        // seen on the wire (no application message follows it, section
+        // 6.3), so the binding is checked directly.
+        let origin = Instant::now();
+        let (mut core, mut session, mut binding) =
+            bare(origin, FlowType::Recoverable, FlowType::Recoverable);
+        assert!(
+            session
+                .send_application(&mut core, &mut binding, origin)
+                .is_ok()
+        );
+        assert!(binding.in_sequence);
+        session.peer_finished = Some(PeerFinished {
+            receiving_sent: false,
+            end: None,
+        });
+        session.maybe_finish_receiving(&mut core, &mut binding);
+        assert!(session.finished_receiving_sent());
+        assert!(!binding.in_sequence);
     }
 
     #[test]
@@ -3382,8 +3519,15 @@ mod flow_tests {
                 reason: "the transport is closing",
             })]
         );
+        // Section 4.4: reported as Event::Ignored, like a session message.
         assert_eq!(client.on_application_message(origin), Delivery::Discard);
-        assert!(drain(&mut client).is_empty());
+        assert_eq!(
+            drain(&mut client),
+            vec![Output::Event(Event::Ignored {
+                message: "application message",
+                reason: "the transport is closing",
+            })]
+        );
         assert_eq!(
             client.establish(origin),
             Err(FixpError::TransportClosing {
@@ -3947,8 +4091,15 @@ mod flow_tests {
                 reason: "it arrived after the counterparty's Terminate",
             })]
         );
+        // Reported, like the Sequence above (section 4.4).
         assert_eq!(server.on_application_message(origin), Delivery::Discard);
-        assert!(drain(&mut server).is_empty());
+        assert_eq!(
+            drain(&mut server),
+            vec![Output::Event(Event::Ignored {
+                message: "application message",
+                reason: "it arrived after the counterparty's Terminate",
+            })]
+        );
         assert!(matches!(
             server.send_application(origin),
             Err(FixpError::InvalidState {
@@ -3991,6 +4142,395 @@ mod flow_tests {
             })
         );
         assert_eq!(client.status(), SessionStatus::Established);
+    }
+
+    // ----- issue #130 refinements ---------------------------------------------
+
+    #[test]
+    fn test_no_application_message_after_finished_receiving() {
+        // FIXP v1.1 section 6.3 forbids the responder an application message
+        // after FinishedReceiving; Appendix A 7.4.1 and 7.4.6 (informative)
+        // show a half-close, which is declined. Until FinishedReceiving goes
+        // out (a gap still being recovered) sending is allowed.
+        let origin = Instant::now();
+        let (mut client, _server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        client.handle_message(&finished_sending(Some(2)), origin);
+        let request = one_request(&drain(&mut client));
+        assert_eq!(client.send_application(origin), Ok(Some(SeqNum::new(1))));
+        let _ = drain(&mut client);
+        let _ = replay(&mut client, &request, 1, 2, origin);
+        assert!(sent(&drain(&mut client)).contains(&finished_receiving()));
+        assert_eq!(
+            client.send_application(origin),
+            Err(FixpError::FinishedReceivingSent)
+        );
+        assert!(drain(&mut client).is_empty(), "nothing is queued");
+        assert_eq!(client.next_outbound_seq(), Some(SeqNum::new(2)));
+        assert_eq!(client.status(), SessionStatus::Established);
+    }
+
+    #[test]
+    fn test_after_batch_stall_policy_asks_again_after_a_complete_short_batch() {
+        // Section 4.6.2.2: a provider that serves one batch per request sends
+        // a complete batch short of the Count and waits for a new request.
+        // `ReRequestAfterBatch` asks again retransmit_timeout after the
+        // batch's last message; the default keeps waiting.
+        fn short_batch(policy: crate::RetransmitStallPolicy) -> (Vec<Output>, RetransmitRequest) {
+            let origin = Instant::now();
+            let (mut client, _server) = client_with(with_policy(policy), origin);
+            client.handle_message(&sequence(11), origin);
+            let first = one_request(&drain(&mut client));
+            let batch_end = at(origin, 500);
+            let deliveries = replay(&mut client, &first, 1, 4, batch_end);
+            assert_eq!(deliveries.last(), Some(&accepted(4, true)));
+            let stall = batch_end + RETRANSMIT_TIMEOUT;
+            assert_eq!(client.poll_timeout(), Some(stall));
+            client.handle_timeout(stall - Duration::from_millis(1));
+            assert!(requests(&drain(&mut client)).is_empty());
+            client.handle_timeout(stall);
+            (drain(&mut client), first)
+        }
+        let (outputs, first) = short_batch(crate::RetransmitStallPolicy::ReRequestAfterBatch);
+        assert!(events(&outputs).contains(&Event::RetransmitTimedOut {
+            from: SeqNum::new(1),
+            count: 10,
+        }));
+        let second = one_request(&outputs);
+        assert_eq!((second.from_seq_no, second.count), (5, 6));
+        assert!(second.timestamp > first.timestamp);
+        let (outputs, _) = short_batch(crate::RetransmitStallPolicy::ReRequestAfterContextSwitch);
+        assert!(requests(&outputs).is_empty(), "the default only waits");
+    }
+
+    #[test]
+    fn test_after_batch_stall_policy_waits_while_a_batch_is_incomplete() {
+        // A batch still short of its own Count is not complete: the provider
+        // may be writing it, so no second request goes out.
+        let origin = Instant::now();
+        let (mut client, _server) = client_with(
+            with_policy(crate::RetransmitStallPolicy::ReRequestAfterBatch),
+            origin,
+        );
+        client.handle_message(&sequence(11), origin);
+        let first = one_request(&drain(&mut client));
+        client.handle_message(
+            &SessionMessage::Retransmission(Retransmission {
+                session_id: SESSION,
+                request_timestamp: first.timestamp,
+                next_seq_no: 1,
+                count: 4,
+            }),
+            origin,
+        );
+        for seq in 1..=3 {
+            assert_eq!(client.on_application_message(origin), accepted(seq, true));
+        }
+        client.handle_timeout(origin + RETRANSMIT_TIMEOUT);
+        let outputs = drain(&mut client);
+        assert!(events(&outputs).contains(&Event::RetransmitTimedOut {
+            from: SeqNum::new(1),
+            count: 10,
+        }));
+        assert!(requests(&outputs).is_empty());
+    }
+
+    #[test]
+    fn test_finished_receiving_after_a_retransmit_reject_follows_the_reported_loss() {
+        // Section 4.7.2 answers FinishedSending once every message up to
+        // LastSeqNo is accounted for. A RetransmitReject (section 4.6.2.3)
+        // gives the rest up: it is not a violation, nothing more can be
+        // recovered, and the loss is reported with Event::RetransmitRejected
+        // before FinishedReceiving goes out.
+        let origin = Instant::now();
+        let (mut client, _server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        client.handle_message(&finished_sending(Some(5)), origin);
+        let request = one_request(&drain(&mut client));
+        assert_eq!((request.from_seq_no, request.count), (1, 5));
+        client.handle_message(
+            &SessionMessage::RetransmitReject(RetransmitReject {
+                session_id: SESSION,
+                request_timestamp: request.timestamp,
+                code: RetransmitRejectCode::OutOfRange,
+                reason: String::new(),
+            }),
+            origin,
+        );
+        let outputs = drain(&mut client);
+        let rejected = outputs
+            .iter()
+            .position(|output| matches!(output, Output::Event(Event::RetransmitRejected { .. })));
+        let answered = outputs
+            .iter()
+            .position(|output| *output == Output::Send(finished_receiving()));
+        assert!(
+            matches!((rejected, answered), (Some(r), Some(a)) if r < a),
+            "{outputs:?}"
+        );
+        assert!(
+            !events(&outputs)
+                .iter()
+                .any(|event| matches!(event, Event::ProtocolViolation { .. }))
+        );
+        assert_eq!(client.status(), SessionStatus::Established);
+    }
+
+    #[test]
+    fn test_a_finalized_client_cannot_establish_again() {
+        // Section 4.7.2: FinishedSending, FinishedReceiving, then the
+        // initiator's Terminate finalizes the logical session. Section 6.3:
+        // establishing it again is a violation, so the client refuses to.
+        let origin = Instant::now();
+        let (mut client, mut server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        client.handle_message(&finished_sending(Some(0)), origin);
+        assert_eq!(sent(&drain(&mut client)), vec![finished_receiving()]);
+        assert_eq!(
+            server.terminate(TerminationCode::Finished, "", origin),
+            Ok(())
+        );
+        deliver_all(&drain(&mut server), &mut client, origin);
+        deliver_all(&drain(&mut client), &mut server, origin);
+        assert!(closes(&drain(&mut server)));
+        server.on_transport_closed();
+        assert_eq!(
+            server.status(),
+            SessionStatus::Negotiated,
+            "the side that never answered a FinishedSending is not finalized"
+        );
+        assert_eq!(client.status(), SessionStatus::Closing);
+        client.on_transport_closed();
+        assert_eq!(
+            events(&drain(&mut client)),
+            vec![
+                Event::TransportClosed,
+                Event::SessionFinalized {
+                    session_id: SESSION
+                },
+            ]
+        );
+        assert_eq!(client.status(), SessionStatus::Finalized);
+        assert_eq!(
+            client.establish(origin),
+            Err(FixpError::InvalidState {
+                operation: "establish",
+                status: SessionStatus::Finalized,
+            })
+        );
+        assert!(drain(&mut client).is_empty());
+    }
+
+    #[test]
+    fn test_a_finalized_client_is_marked_when_its_closing_deadline_lapses() {
+        let origin = Instant::now();
+        let (mut client, _server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        client.handle_message(&finished_sending(Some(0)), origin);
+        let _ = drain(&mut client);
+        client.handle_message(
+            &SessionMessage::Terminate(Terminate {
+                session_id: SESSION,
+                code: TerminationCode::Finished,
+                reason: String::new(),
+            }),
+            origin,
+        );
+        let _ = drain(&mut client);
+        client.handle_timeout(origin + KEEPALIVE);
+        let outputs = drain(&mut client);
+        assert!(closes(&outputs));
+        assert!(events(&outputs).contains(&Event::SessionFinalized {
+            session_id: SESSION
+        }));
+        assert_eq!(client.status(), SessionStatus::Finalized);
+    }
+
+    #[test]
+    fn test_an_error_terminate_after_finished_receiving_does_not_finalize() {
+        // Section 4.7.2 finalizes on the initiator's graceful Terminate; an
+        // error Terminate ends the binding only, so the session stays
+        // negotiated and may be established again.
+        let origin = Instant::now();
+        let (mut client, _server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        client.handle_message(&finished_sending(Some(0)), origin);
+        assert_eq!(sent(&drain(&mut client)), vec![finished_receiving()]);
+        client.handle_message(
+            &SessionMessage::Terminate(Terminate {
+                session_id: SESSION,
+                code: TerminationCode::UnspecifiedError,
+                reason: String::new(),
+            }),
+            origin,
+        );
+        let _ = drain(&mut client);
+        client.on_transport_closed();
+        let outputs = drain(&mut client);
+        assert_eq!(events(&outputs), vec![Event::TransportClosed]);
+        assert_eq!(client.status(), SessionStatus::Negotiated);
+        assert_eq!(client.establish(origin), Ok(()));
+    }
+
+    #[test]
+    fn test_an_error_answer_to_our_finished_terminate_does_not_finalize() {
+        // This side terminates gracefully after FinishedReceiving, but the
+        // counterparty answers with an error code: the binding ends, the
+        // session is not finalized (local policy, section 4.7.2).
+        let origin = Instant::now();
+        let (mut client, _server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        client.handle_message(&finished_sending(Some(0)), origin);
+        assert_eq!(sent(&drain(&mut client)), vec![finished_receiving()]);
+        assert_eq!(
+            client.terminate(TerminationCode::Finished, "", origin),
+            Ok(())
+        );
+        let _ = drain(&mut client);
+        client.handle_message(
+            &SessionMessage::Terminate(Terminate {
+                session_id: SESSION,
+                code: TerminationCode::UnspecifiedError,
+                reason: String::new(),
+            }),
+            origin,
+        );
+        let outputs = drain(&mut client);
+        assert!(closes(&outputs));
+        assert!(
+            !events(&outputs)
+                .iter()
+                .any(|event| matches!(event, Event::SessionFinalized { .. }))
+        );
+        client.on_transport_closed();
+        assert_eq!(events(&drain(&mut client)), vec![Event::TransportClosed]);
+        assert_eq!(client.status(), SessionStatus::Negotiated);
+        assert_eq!(client.establish(origin), Ok(()));
+    }
+
+    #[test]
+    fn test_a_finalized_server_refuses_the_session_id() {
+        // Section 6.3: a finalized identifier is never established or
+        // negotiated again.
+        let origin = Instant::now();
+        let (_client, mut server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        server.handle_message(&finished_sending(Some(0)), origin);
+        assert_eq!(sent(&drain(&mut server)), vec![finished_receiving()]);
+        server.handle_message(
+            &SessionMessage::Terminate(Terminate {
+                session_id: SESSION,
+                code: TerminationCode::Finished,
+                reason: String::new(),
+            }),
+            origin,
+        );
+        let _ = drain(&mut server);
+        assert_eq!(server.status(), SessionStatus::Closing);
+        server.on_transport_closed();
+        assert!(
+            events(&drain(&mut server)).contains(&Event::SessionFinalized {
+                session_id: SESSION
+            })
+        );
+        assert_eq!(server.status(), SessionStatus::Finalized);
+        assert_eq!(server.session_id(), Some(SESSION));
+        assert_eq!(
+            server.on_transport_opened(origin),
+            Err(FixpError::InvalidState {
+                operation: "on_transport_opened",
+                status: SessionStatus::Finalized,
+            })
+        );
+        server.handle_message(
+            &SessionMessage::Establish(crate::messages::Establish {
+                session_id: SESSION,
+                timestamp: Nanotime::from_nanos(7),
+                keepalive_interval: 1_000,
+                next_seq_no: Some(1),
+                credentials: None,
+            }),
+            origin,
+        );
+        let outputs = drain(&mut server);
+        assert!(matches!(
+            sent(&outputs).as_slice(),
+            [SessionMessage::EstablishmentReject(
+                crate::messages::EstablishmentReject {
+                    code: crate::types::EstablishmentRejectCode::Unnegotiated,
+                    ..
+                }
+            )]
+        ));
+        assert!(events(&outputs).contains(&Event::ProtocolViolation {
+            reason: "Establish for a finalized session"
+        }));
+        assert!(closes(&outputs));
+        server.on_transport_closed();
+        let _ = drain(&mut server);
+        server.handle_message(
+            &SessionMessage::Negotiate(crate::messages::Negotiate {
+                session_id: SESSION,
+                timestamp: Nanotime::from_nanos(8),
+                client_flow: FlowType::Idempotent,
+                credentials: None,
+            }),
+            origin,
+        );
+        let outputs = drain(&mut server);
+        assert!(matches!(
+            sent(&outputs).as_slice(),
+            [SessionMessage::NegotiationReject(
+                crate::messages::NegotiationReject {
+                    code: crate::types::NegotiationRejectCode::DuplicateId,
+                    ..
+                }
+            )]
+        ));
+        assert!(closes(&outputs));
+        assert_eq!(server.status(), SessionStatus::Finalized);
+    }
+
+    #[test]
+    fn test_a_retransmit_request_leaves_sequenced_mode() {
+        // Appendix A 7.3.1.1: a session message other than a Sequence ends
+        // sequenced mode, so the next application message goes behind a
+        // Sequence (a redundant one is a heartbeat, section 3.5.4).
+        let origin = Instant::now();
+        let (mut client, _server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        assert_eq!(client.send_application(origin), Ok(Some(SeqNum::new(1))));
+        assert_eq!(sent(&drain(&mut client)), vec![sequence(1)]);
+        assert_eq!(client.send_application(origin), Ok(Some(SeqNum::new(2))));
+        assert!(sent(&drain(&mut client)).is_empty(), "numbered implicitly");
+        client.handle_message(&sequence(3), origin);
+        let _ = one_request(&drain(&mut client));
+        assert_eq!(client.send_application(origin), Ok(Some(SeqNum::new(3))));
+        assert_eq!(sent(&drain(&mut client)), vec![sequence(3)]);
+    }
+
+    #[test]
+    fn test_a_retransmit_reject_leaves_sequenced_mode() {
+        let origin = Instant::now();
+        let (_client, mut server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        assert_eq!(server.send_application(origin), Ok(Some(SeqNum::new(1))));
+        assert_eq!(sent(&drain(&mut server)), vec![sequence(1)]);
+        server.handle_message(
+            &SessionMessage::RetransmitRequest(RetransmitRequest {
+                session_id: SESSION,
+                timestamp: Nanotime::from_nanos(5),
+                from_seq_no: 1,
+                count: 0,
+            }),
+            origin,
+        );
+        assert!(matches!(
+            sent(&drain(&mut server)).as_slice(),
+            [SessionMessage::RetransmitReject(_)]
+        ));
+        assert_eq!(server.send_application(origin), Ok(Some(SeqNum::new(2))));
+        assert_eq!(sent(&drain(&mut server)), vec![sequence(2)]);
     }
 }
 

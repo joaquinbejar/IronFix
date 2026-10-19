@@ -128,7 +128,12 @@
 //! - **Receiving a finalization** (section 4.7): a counterparty's
 //!   FinishedSending is answered with FinishedReceiving once every message
 //!   up to its `LastSeqNo` is accounted for, after which this side waits for
-//!   the counterparty's Terminate.
+//!   the counterparty's Terminate and sends no application message
+//!   ([`FixpError::FinishedReceivingSent`], section 6.3). When that binding
+//!   ends with the Terminate exchange the logical session is finalized
+//!   ([`Event::SessionFinalized`], [`SessionStatus::Finalized`]): the client
+//!   refuses to establish it again and the server refuses its identifier
+//!   (section 6.3).
 //!
 //! ## Untrusted input
 //!
@@ -175,6 +180,19 @@
 //!   the default asks again only `retransmit_timeout` after a Sequence cut
 //!   a batch short (section 3.5.4), because a second request while the
 //!   provider is still serving is a violation (sections 4.6.1, 4.6.4, 6.3).
+//!   `ReRequestAfterBatch` also asks again after a complete batch short of
+//!   the request, for a provider that serves one batch per request
+//!   (section 4.6.2.2).
+//! - No application message is sent after FinishedReceiving (section 6.3);
+//!   the half-close of Appendix A 7.4.1 and 7.4.6 (informative) is declined.
+//! - FinishedReceiving still goes out when a RetransmitReject gave up part
+//!   of the range up to `LastSeqNo`: nothing more can be recovered, and the
+//!   loss was already reported with [`Event::RetransmitRejected`].
+//! - Any session message this side sends other than a Sequence (a
+//!   RetransmitRequest, RetransmitReject or FinishedReceiving, as well as a
+//!   Retransmission) ends sequenced mode, so the next application message
+//!   goes behind a Sequence (Appendix A 7.3.1.1, the broader reading of
+//!   section 3.5.4).
 //! - A RetransmitReject abandons the requested range: those messages are not
 //!   requested again, and [`Event::RetransmitRejected`] says so.
 //! - The counterparty's silence ends the session after its keepalive
@@ -190,8 +208,9 @@
 //! ## Not implemented
 //!
 //! - **Sending a finalization** (section 4.7): this side never sends
-//!   FinishedSending, so it never finalizes a logical session itself; a
-//!   FinishedReceiving from the counterparty is therefore a violation.
+//!   FinishedSending, so it never starts the finalization of a logical
+//!   session; a FinishedReceiving from the counterparty is therefore a
+//!   violation. Answering the counterparty's is implemented.
 //! - **Multiplexing** (section 3.5.3): one session per transport. A Context
 //!   naming another session terminates.
 //! - **Datagram transports** (section 3.5.2): the core assumes a stream; it

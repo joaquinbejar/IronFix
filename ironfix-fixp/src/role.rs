@@ -43,6 +43,16 @@ macro_rules! bound_api {
                 now: std::time::Instant,
             ) -> crate::output::Delivery {
                 match self.bound_parts("on_application_message") {
+                    // A transport this side asked to close carries nothing
+                    // more (FIXP v1.1 section 4.4); it is reported, not
+                    // numbered.
+                    Ok((core, _, _)) if core.transport_closing() => {
+                        core.ignore(
+                            crate::session::APPLICATION_MESSAGE,
+                            "the transport is closing",
+                        );
+                        crate::output::Delivery::Discard
+                    }
                     Ok((core, session, binding)) => {
                         let (delivery, bound) = session.on_application(core, binding, now);
                         self.after(bound);

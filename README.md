@@ -92,7 +92,8 @@ engine wiring (#96) does not exist.
   (NotApplied), Unsequenced and None flows, keepalive heartbeats and
   termination on counterparty silence, bounded handshake timeouts, the
   Terminate handshake, and the receiving side of a finalization (a
-  counterparty's FinishedSending is answered with FinishedReceiving).
+  counterparty's FinishedSending is answered with FinishedReceiving, and
+  the session is then marked finalized so its identifier is not reused).
   Malformed input is a typed error and protocol violations are answered on
   the wire. What is implemented and tested, and every decision
   the specification leaves open, are listed in `doc/fixp_operations.md`.
@@ -496,7 +497,7 @@ around it.
   `ironfix-fixp` runs the FIXP session logic, but no driver composes them
   over a socket: the engine wiring behind a `fixp` feature is #96. Of FIXP
   itself, sending a finalization (this side never sends FinishedSending, so
-  it never finalizes a session itself), multiplexing several sessions on one
+  it never starts one), multiplexing several sessions on one
   transport, datagram transports, multicast, WebSocket and session
   persistence across process restarts are not implemented; the application
   SBE schemas a venue uses are out of `ironfix-fixp`'s scope. The SOFH v1.1
