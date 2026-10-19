@@ -1602,6 +1602,26 @@ const OBSERVED_READ_LIMIT: usize = 2 * OBSERVED_LIVE_LIMIT;
 /// receipt still pending as [`SendOutcome::Unknown`].
 const RECEIPT_LIVE_LIMIT: usize = 4096;
 
+/// The fed-byte count a new writer starts from: zero, so receipts resolve
+/// per frame. Test builds can start it uncounted instead
+/// (`tests::UNCOUNTED_WRITERS`), which puts every receipt on the
+/// wait-for-flush fallback that [`add_bytes`] falls back to.
+#[cfg(not(test))]
+const fn initial_fed_bytes() -> Option<u64> {
+    Some(0)
+}
+
+/// The fed-byte count a new writer starts from: `None` while the calling
+/// thread has set `tests::UNCOUNTED_WRITERS`, zero otherwise.
+#[cfg(test)]
+fn initial_fed_bytes() -> Option<u64> {
+    if tests::UNCOUNTED_WRITERS.with(std::cell::Cell::get) {
+        None
+    } else {
+        Some(0)
+    }
+}
+
 impl Writer {
     /// A writer framing outbound bytes under `max_message_size`, with no
     /// output waiting.
@@ -1620,7 +1640,7 @@ impl Writer {
             crossed_at: None,
             capture: None,
             observed: VecDeque::new(),
-            fed_bytes: Some(0),
+            fed_bytes: initial_fed_bytes(),
             accepted_bytes: Some(0),
             receipts: VecDeque::new(),
         }
@@ -6426,6 +6446,161 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Set by a test to start every writer created on this thread
+        /// without a fed-byte count, so its receipts wait for a completed
+        /// flush (the fallback when the count cannot be kept). A
+        /// current-thread runtime runs the engines on the test's thread.
+        pub(super) static UNCOUNTED_WRITERS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// A stream that accepts every byte but, once `hold` is set, never
+    /// completes a flush.
+    struct FlushNever {
+        inner: tokio::io::DuplexStream,
+        hold: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl tokio::io::AsyncRead for FlushNever {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FlushNever {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+                return std::task::Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Tracked sends issued at once in the receipt-bound tests: well past
+    /// [`RECEIPT_LIVE_LIMIT`].
+    const BOUND_SENDS: usize = RECEIPT_LIVE_LIMIT + 1904;
+
+    /// The member (CLIENT to VENUE) and venue (VENUE to CLIENT) configs.
+    fn bound_configs() -> (SessionConfig, SessionConfig) {
+        let (Ok(client), Ok(venue)) = (
+            ironfix_core::types::CompId::new("CLIENT"),
+            ironfix_core::types::CompId::new("VENUE"),
+        ) else {
+            unreachable!("CLIENT and VENUE are valid CompIDs")
+        };
+        (
+            SessionConfig::new(client.clone(), venue.clone(), "FIX.4.4"),
+            SessionConfig::new(venue, client, "FIX.4.4"),
+        )
+    }
+
+    /// Issue #150, on the wait-for-flush fallback: with no fed-byte count, a
+    /// receipt resolves only on a completed flush, which `sender`'s stream
+    /// never gives once `hold` is set. Exactly [`RECEIPT_LIVE_LIMIT`] tracked
+    /// sends are admitted (each spends a number and resolves `Unknown` at
+    /// the write timeout); every other one is `NotSent`; none is `Sent`.
+    async fn assert_receipts_bounded(
+        sender: &crate::Connection,
+        hold: &std::sync::atomic::AtomicBool,
+    ) {
+        hold.store(true, std::sync::atomic::Ordering::SeqCst);
+        let sends: Vec<_> = (0..BOUND_SENDS)
+            .map(|index| {
+                let sender = sender.clone();
+                tokio::spawn(async move {
+                    let mut order = crate::OutboundMessage::new(MsgType::NewOrderSingle);
+                    order
+                        .push_str(11, &format!("B-{index}"))
+                        .push_str(55, "EUR/USD")
+                        .push_char(54, '1')
+                        .push_uint(38, 100);
+                    sender.send_tracked(order).await
+                })
+            })
+            .collect();
+        let closed = tokio::time::timeout(Duration::from_secs(60), sender.wait_closed()).await;
+        assert!(closed.is_ok(), "the write timeout closes the session");
+        let (mut unknown, mut not_sent) = (0usize, 0usize);
+        for send in sends {
+            match tokio::time::timeout(Duration::from_secs(5), send).await {
+                Ok(Ok(SendOutcome::Unknown { .. })) => unknown += 1,
+                Ok(Ok(SendOutcome::NotSent { .. })) => not_sent += 1,
+                other => panic!("every send resolves Unknown or NotSent: {other:?}"),
+            }
+        }
+        assert_eq!(unknown, RECEIPT_LIVE_LIMIT, "admissions stop at the bound");
+        assert_eq!(unknown + not_sent, BOUND_SENDS, "every receipt resolves");
+    }
+
+    #[tokio::test]
+    async fn test_receipt_bound_holds_on_the_flush_fallback_on_the_initiator() {
+        UNCOUNTED_WRITERS.with(|flag| flag.set(true));
+        let (member_config, venue_config) = bound_configs();
+        let initiator = crate::Initiator::new(member_config, Arc::new(crate::NoOpApplication))
+            .with_write_timeout(Duration::from_millis(300))
+            .with_outbound_capacity(16);
+        let acceptor = crate::Acceptor::new(venue_config, Arc::new(crate::NoOpApplication));
+        let (client_io, venue_io) = tokio::io::duplex(64 * 1024);
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream = FlushNever {
+            inner: client_io,
+            hold: Arc::clone(&hold),
+        };
+        let (member, venue) =
+            tokio::join!(initiator.establish(stream), acceptor.serve_stream(venue_io));
+        let (Ok(member), Ok(_venue)) = (member, venue) else {
+            panic!("both ends log on")
+        };
+        assert_receipts_bounded(&member, &hold).await;
+    }
+
+    #[tokio::test]
+    async fn test_receipt_bound_holds_on_the_flush_fallback_on_the_acceptor() {
+        UNCOUNTED_WRITERS.with(|flag| flag.set(true));
+        let (member_config, venue_config) = bound_configs();
+        let initiator = crate::Initiator::new(member_config, Arc::new(crate::NoOpApplication));
+        let acceptor = crate::Acceptor::new(venue_config, Arc::new(crate::NoOpApplication))
+            .with_write_timeout(Duration::from_millis(300))
+            .with_outbound_capacity(16);
+        let (client_io, venue_io) = tokio::io::duplex(64 * 1024);
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stream = FlushNever {
+            inner: venue_io,
+            hold: Arc::clone(&hold),
+        };
+        let (member, venue) = tokio::join!(
+            initiator.establish(client_io),
+            acceptor.serve_stream(stream)
+        );
+        let (Ok(_member), Ok(venue)) = (member, venue) else {
+            panic!("both ends log on")
+        };
+        assert_receipts_bounded(&venue, &hold).await;
+    }
 
     /// A session configuration allowing `limit` ResendRequests per gap.
     fn config_with_limit(limit: u32) -> SessionConfig {
