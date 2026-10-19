@@ -84,6 +84,52 @@
 //!   `max_message_size` allows; once the acceptor reads again and the buffer
 //!   drains, the flush gives the grown capacity back.
 //!
+//! # The allocation matrix (issue #81, deferred from #76)
+//!
+//! The full profile is one session with every ingredient together: a
+//! `FileStore`, a frame observer, TLS, and session-level Rejects (35=3)
+//! between accepted messages. In its window the initiator sends [`MESSAGES`]
+//! orders while the acceptor sends [`MESSAGES`] ExecutionReports, of which
+//! the application refuses the even-numbered half in `from_app`, each refusal
+//! answered by a Reject. Control windows, each adding one ingredient, name
+//! where every block comes from, and the report gives each component and the
+//! profile in blocks per message and per frame (orders, Rejects and messages
+//! received together). Measured with this test on macOS, debug and release
+//! alike within a few blocks:
+//!
+//! | Component | Blocks |
+//! |---|---|
+//! | `to_app` future (`async_trait`), per order | 1 |
+//! | `FileStore` filing, per order | 1 |
+//! | inbound delivery: the `from_app` future (`async_trait`); the dispatcher's `mpsc` amortised | 1 |
+//! | `FileStore`, per message received (the receive cursor) | 1 |
+//! | Reject reply: the refusal's text, the `RefMsgType` copy, the Reject body's field list and four values, the `to_admin` future; the rejection `mpsc` amortised | 8 |
+//! | `FileStore` filing, per Reject | 1 |
+//! | `RawMessage` spill (11 fields, 32 held inline) | 0 |
+//! | frame observer | 0 |
+//! | rustls, both endpoints, per order | about 1.6 to 1.9 |
+//! | rustls, both endpoints, per refused message and its Reject | about 2.1 |
+//!
+//! The profile without TLS (1024 sent, 1024 received, 512 rejected) costs
+//! about 8750 blocks, 3.41 per frame, and the components predict it within
+//! a few blocks; the test asserts that they agree within 4 x [`SLACK`]. With
+//! TLS it costs about 11850, 4.6 per frame: the rustls share is about 3100
+//! blocks, 1.2 per frame.
+//!
+//! What cannot be measured in a meaningful way: the engine's own half of
+//! the rustls share. dhat counts every thread of the process, and the
+//! counterparty's TLS endpoint runs in the same process, so every rustls
+//! figure here is both endpoints together. A per-frame split would need the
+//! counterparty out of process, where dhat cannot see it either. The test
+//! therefore asserts only that the share is positive and no larger than the
+//! TLS controls charge for the same traffic. The `FileStore` journals are
+//! opened under `SyncPolicy::Never`: a flush is a system call that allocates
+//! nothing here, and `EveryWrite` would only make the windows slower. The TLS
+//! session is established through `Initiator::establish_with_peer`, the path
+//! `Initiator::connect_tls` hands its stream to once it has dialled; the TLS
+//! windows and the check of the full profile run only with the `tls` feature
+//! (`make test` runs it).
+//!
 //! Each window may also allocate up to [`SLACK`] blocks that do not recur per
 //! frame (a page `Vec` per 256 stored messages, a queue block, a request's
 //! own callbacks). A write path that allocated once per frame would exceed it
@@ -116,7 +162,7 @@ use ironfix_engine::{
     OutboundMessage, OutboundResult, RejectReason, SendVerdict, SessionId,
 };
 use ironfix_session::SessionConfig;
-use ironfix_store::{MemoryStore, MessageStore};
+use ironfix_store::{FileStore, FileStoreConfig, MemoryStore, MessageStore, SyncPolicy};
 use ironfix_tagvalue::Encoder;
 use ironfix_transport::FixCodec;
 use std::io;
@@ -177,6 +223,12 @@ const REPLY_BLOCKS: u64 = 4;
 
 /// Blocks rebuilding one stored frame as a resend costs.
 const REBUILD_BLOCKS: u64 = 4;
+
+/// Blocks the reactor's answer to one `from_app` refusal costs: the
+/// refusal's text (the application's `RejectReason`), the copy of
+/// `RefMsgType` (372) the reactor takes, the Reject body's field list and
+/// its four values (45, 372, 373, 58), and the `to_admin` future.
+const REJECT_REPLY_BLOCKS: i128 = 8;
 
 /// Blocks a window may allocate beyond its per-frame cost: allocations that
 /// do not recur per frame.
@@ -463,10 +515,10 @@ fn initiator_with<A: Application + 'static>(
 }
 
 /// A session logged on over a pipe, seen from the scripted acceptor.
-struct Session {
+struct Session<V = DuplexStream> {
     connection: Connection,
     /// Where the acceptor writes its frames.
-    requests: WriteHalf<DuplexStream>,
+    requests: WriteHalf<V>,
     /// Frames the acceptor has received since the acknowledgement.
     frames: Arc<AtomicU64>,
     /// Opens and closes the acceptor's reading.
@@ -563,8 +615,8 @@ fn throttle() -> ThrottleConfig {
 
 /// Sends `MESSAGES` live orders on `session` after `WARM_UP` and measures
 /// the window, and how long it took.
-async fn measure_live(
-    session: &Session,
+async fn measure_live<V>(
+    session: &Session<V>,
     orders: &mut impl Iterator<Item = OutboundMessage>,
 ) -> (Window, std::time::Duration) {
     for message in orders.by_ref().take(usize::try_from(WARM_UP).unwrap_or(0)) {
@@ -662,6 +714,475 @@ fn eprint_counts(windows: &[(&str, &Window)]) {
     }
 }
 
+/// Which inbound application messages the [`Inbound`] application refuses
+/// in `from_app`; the reactor answers each refusal with a session-level
+/// Reject (35=3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refuse {
+    /// None: every message is accepted, and nothing goes back.
+    None,
+    /// Every one.
+    All,
+    /// Those with an even `MsgSeqNum` (34): Rejects between accepted
+    /// messages.
+    EvenSeq,
+}
+
+/// An application that counts the inbound application messages it is given
+/// and refuses those `refuse` names, allocating nothing of its own but the
+/// refusal's text.
+#[derive(Debug)]
+struct Inbound {
+    refuse: Refuse,
+    seen: Arc<AtomicU64>,
+}
+
+impl Inbound {
+    fn new(refuse: Refuse) -> (Self, Arc<AtomicU64>) {
+        let seen = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                refuse,
+                seen: Arc::clone(&seen),
+            },
+            seen,
+        )
+    }
+}
+
+#[async_trait]
+impl Application for Inbound {
+    async fn on_create(&self, _: &SessionId) {}
+    async fn on_logon(&self, _: &SessionId) {}
+    async fn on_logout(&self, _: &SessionId) {}
+    async fn to_admin(&self, _: &mut OutboundMessage, _: &SessionId) {}
+    async fn from_admin(&self, _: &RawMessage<'_>, _: &SessionId) -> Result<(), RejectReason> {
+        Ok(())
+    }
+    async fn to_app(&self, _: &mut OutboundMessage, _: &SessionId) {}
+    async fn from_app(&self, message: &RawMessage<'_>, _: &SessionId) -> Result<(), RejectReason> {
+        let refused = match self.refuse {
+            Refuse::None => false,
+            Refuse::All => true,
+            Refuse::EvenSeq => message
+                .get_field_str(34)
+                .and_then(|seq| seq.parse::<u64>().ok())
+                .is_some_and(|seq| seq % 2 == 0),
+        };
+        self.seen.fetch_add(1, Ordering::Relaxed);
+        if refused {
+            Err(RejectReason::new(99, "refused"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// `count` ExecutionReports from the acceptor, numbered from `first`, in one
+/// buffer: 11 fields each, well under the 32 a `RawMessage` holds inline.
+fn executions(first: u64, count: u64) -> BytesMut {
+    let mut wire = BytesMut::new();
+    for seq in first..first + count {
+        let id = format!("EXEC-{seq:06}");
+        wire.extend_from_slice(&frame(
+            "VENUE",
+            "CLIENT",
+            "8",
+            seq,
+            &[(37, id.as_str()), (17, id.as_str()), (39, "0")],
+        ));
+    }
+    wire
+}
+
+/// How many of the `count` messages numbered from `first` have an even
+/// `MsgSeqNum`, and so are refused under [`Refuse::EvenSeq`].
+fn even_in(first: u64, count: u64) -> u64 {
+    u64::try_from((first..first + count).filter(|seq| seq % 2 == 0).count()).unwrap_or(u64::MAX)
+}
+
+/// A `FileStore` journal named `name` in `directory`, created empty.
+///
+/// Opened under `SyncPolicy::Never`: a flush is a system call and allocates
+/// nothing in this process, so the policy changes how long a window takes,
+/// not what it allocates, while `EveryWrite` would make each window last as
+/// many flushes as it has messages.
+async fn file_store(directory: &std::path::Path, name: &str) -> Arc<dyn MessageStore> {
+    let config = ok(FileStoreConfig::try_new(directory, name), "store config")
+        .with_create_if_missing(true)
+        .with_sync_policy(SyncPolicy::Never);
+    Arc::new(ok(FileStore::open(config).await, "the file store opens"))
+}
+
+/// Yields until `counter` reaches `target`.
+async fn wait_for_count(counter: &AtomicU64, target: u64) {
+    let waited = tokio::time::timeout(Duration::from_secs(60), async {
+        while counter.load(Ordering::Relaxed) < target {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    ok(waited, "the application sees every message within 60s");
+}
+
+/// What a window of mixed traffic moved, beside its blocks.
+#[derive(Debug, Clone, Copy)]
+struct Traffic {
+    /// Orders this session sent.
+    sent: u64,
+    /// Application messages it received.
+    received: u64,
+    /// Of those, the ones `from_app` refused, each answered by a Reject.
+    rejected: u64,
+}
+
+impl Traffic {
+    /// Every frame of the window, both ways: orders, Rejects, and the
+    /// messages received.
+    const fn frames(&self) -> u64 {
+        self.sent + self.rejected + self.received
+    }
+}
+
+/// Measures one window of mixed traffic on `session`, after a warm-up of the
+/// same shape: `orders` live orders out while the acceptor sends the
+/// executions of `inbound`, which the [`Inbound`] application counts in
+/// `seen` and refuses per its policy. Waits until the acceptor has counted
+/// every order and Reject and the application every execution.
+async fn measure_traffic<V: AsyncWrite>(
+    session: &mut Session<V>,
+    seen: &AtomicU64,
+    orders: &mut impl Iterator<Item = OutboundMessage>,
+    warm_up: (&BytesMut, Traffic),
+    window: (&BytesMut, Traffic),
+) -> Window {
+    let mut step = |wire: &BytesMut, traffic: Traffic| {
+        let batch: Vec<OutboundMessage> = orders
+            .by_ref()
+            .take(usize::try_from(traffic.sent).unwrap_or(0))
+            .collect();
+        let wire = wire.clone();
+        (batch, wire, traffic)
+    };
+    let warm = step(warm_up.0, warm_up.1);
+    let measured = step(window.0, window.1);
+    let mut out_total = 0_u64;
+    let mut in_total = 0_u64;
+    let mut result = None;
+    for (index, (batch, wire, traffic)) in [warm, measured].into_iter().enumerate() {
+        out_total += traffic.sent + traffic.rejected;
+        in_total += traffic.received;
+        let (writes, refused) = session.counts.snapshot();
+        let before = blocks();
+        let connection = &session.connection;
+        let requests = &mut session.requests;
+        let send = async {
+            for message in batch {
+                ok(connection.send(message).await, "an order");
+            }
+        };
+        let inbound = async {
+            if !wire.is_empty() {
+                ok(requests.write_all(&wire).await, "executions");
+                // A TLS writer keeps ciphertext the pipe has no room for
+                // until flushed.
+                ok(requests.flush().await, "flush");
+            }
+        };
+        tokio::join!(send, inbound);
+        wait_for_frames(&session.frames, out_total).await;
+        wait_for_count(seen, in_total).await;
+        if index == 1 {
+            let (writes_after, refused_after) = session.counts.snapshot();
+            result = Some(Window {
+                blocks: blocks() - before,
+                writes: writes_after - writes,
+                refused: refused_after - refused,
+            });
+        }
+    }
+    some(result, "the window was measured")
+}
+
+/// TLS for the full-profile windows: a self-signed certificate generated at
+/// run time, on the `ring` provider (a dev-dependency). No key is committed.
+#[cfg(feature = "tls")]
+mod tls_profile {
+    use super::{CountingStream, IoCounts, Session, count_frames, frame, ok, some};
+    use futures_util::{SinkExt, StreamExt};
+    use ironfix_engine::tls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use ironfix_engine::tls::rustls::{self, ClientConfig, RootCertStore, ServerConfig};
+    use ironfix_engine::{Application, Initiator, PeerInfo};
+    use ironfix_transport::FixCodec;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use tokio::io::DuplexStream;
+    use tokio::sync::watch;
+    use tokio_rustls::server::TlsStream;
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+    use tokio_util::codec::Framed;
+
+    /// The venue's end of a TLS session.
+    pub(super) type VenueStream = TlsStream<DuplexStream>;
+
+    /// A client and a server configuration for one self-signed venue
+    /// certificate.
+    pub(super) fn configs() -> (Arc<ClientConfig>, Arc<ServerConfig>) {
+        let certified = ok(
+            rcgen::generate_simple_self_signed(vec!["venue.test".to_string()]),
+            "certificate",
+        );
+        let cert = certified.cert.der().clone();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            certified.signing_key.serialize_der(),
+        ));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = RootCertStore::empty();
+        ok(roots.add(cert.clone()), "root");
+        let client = ok(
+            ClientConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions(),
+            "client versions",
+        )
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let server = ok(
+            ok(
+                ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions(),
+                "server versions",
+            )
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key),
+            "server certificate",
+        );
+        (Arc::new(client), Arc::new(server))
+    }
+
+    /// Logs `initiator` on over TLS on a pipe of `pipe_bytes` per direction,
+    /// through `establish_with_peer` (the path `connect_tls` hands its TLS
+    /// stream to once it has dialled), to a scripted acceptor that
+    /// acknowledges and then only counts frames. The initiator's TLS runs
+    /// over a counting stream, so the window still sees its writes.
+    pub(super) async fn log_on<A: Application + 'static>(
+        initiator: Initiator<A>,
+        pipe_bytes: usize,
+        client: Arc<ClientConfig>,
+        server: Arc<ServerConfig>,
+    ) -> Session<VenueStream> {
+        let counts = Arc::new(IoCounts::default());
+        let (client_io, venue_io) = tokio::io::duplex(pipe_bytes);
+        let client_io = CountingStream {
+            inner: client_io,
+            counts: Arc::clone(&counts),
+        };
+        let venue = tokio::spawn(async move {
+            let tls = ok(
+                TlsAcceptor::from(server).accept(venue_io).await,
+                "the venue's TLS handshake",
+            );
+            let mut framed = Framed::new(tls, FixCodec::new());
+            let logon = some(framed.next().await, "the Logon arrives");
+            ok(logon, "the Logon decodes");
+            let ack = frame("VENUE", "CLIENT", "A", 1, &[(98, "0"), (108, "30")]);
+            ok(framed.send(ack).await, "the venue acknowledges");
+            framed.into_inner()
+        });
+        let name = ok(ServerName::try_from("venue.test"), "server name");
+        let tls = ok(
+            TlsConnector::from(client).connect(name, client_io).await,
+            "the client's TLS handshake",
+        );
+        let peer = PeerInfo::new(
+            tls.get_ref()
+                .1
+                .peer_certificates()
+                .unwrap_or_default()
+                .iter()
+                .map(|cert| bytes::Bytes::copy_from_slice(cert.as_ref())),
+        );
+        let connection = ok(
+            initiator.establish_with_peer(tls, peer).await,
+            "the initiator logs on over TLS",
+        );
+        let venue_io = ok(venue.await, "the venue task joins");
+        let (read_half, requests) = tokio::io::split(venue_io);
+        let frames = Arc::new(AtomicU64::new(0));
+        let (gate, gate_rx) = watch::channel(true);
+        let counter = tokio::spawn(count_frames(read_half, Arc::clone(&frames), gate_rx));
+        Session {
+            connection,
+            requests,
+            frames,
+            gate,
+            counts,
+            counter,
+        }
+    }
+}
+
+/// Every window of the allocation matrix (issue #81).
+struct Matrix<'a> {
+    /// Live sends, no store: the `to_app` future per order.
+    live: &'a Window,
+    /// Live sends with a `FileStore`.
+    file_live: &'a Window,
+    /// Inbound application messages, all accepted, no store.
+    accepted: &'a Window,
+    /// Inbound application messages, all refused, no store.
+    rejected: &'a Window,
+    /// The same two with a `FileStore`.
+    file_accepted: &'a Window,
+    file_rejected: &'a Window,
+    /// The full profile without TLS: `FileStore`, frame observer, orders out
+    /// and executions in, the even-numbered ones refused.
+    plain: &'a Window,
+    /// The traffic of the two profile windows.
+    mixed: Traffic,
+    /// With the `tls` feature: live sends over TLS, refused inbound over TLS
+    /// (no store either), and the full profile over TLS.
+    tls: Option<&'a (Window, Window, Window)>,
+}
+
+/// `blocks / count` with two decimals, in integer arithmetic.
+fn per(blocks: i128, count: u64) -> String {
+    let count = i128::from(count.max(1));
+    let hundredths = blocks * 100 / count;
+    let sign = if hundredths < 0 { "-" } else { "" };
+    let hundredths = hundredths.abs();
+    format!("{sign}{}.{:02}", hundredths / 100, hundredths % 100)
+}
+
+fn total(window: &Window) -> i128 {
+    i128::from(window.blocks)
+}
+
+/// Names each allocation component from the differences between the control
+/// windows, reports them and the full profile in blocks per message and per
+/// frame, and checks that the components add up to the profile.
+fn check_matrix(matrix: &Matrix<'_>) {
+    use std::io::Write as _;
+    let m = MESSAGES;
+    let mixed = matrix.mixed;
+    let to_app = total(matrix.live);
+    let store_order = total(matrix.file_live) - to_app;
+    let inbound = total(matrix.accepted);
+    let store_inbound = total(matrix.file_accepted) - inbound;
+    let reject = total(matrix.rejected) - inbound;
+    let store_reject = total(matrix.file_rejected) - total(matrix.file_accepted) - reject;
+    let rejected = i128::from(mixed.rejected);
+    let full_m = i128::from(m);
+    // What the plain profile should cost if the components add up: every
+    // order filed, every message received filed, and every refused one
+    // answered with a filed Reject. The frame observer adds nothing.
+    let predicted = total(matrix.file_live)
+        + total(matrix.file_accepted)
+        + rejected * (total(matrix.file_rejected) - total(matrix.file_accepted)) / full_m;
+    let plain = total(matrix.plain);
+
+    let mut lines = vec![
+        format!("allocation matrix, {m} messages per control window:"),
+        format!(
+            "  async_trait to_app future, per order:          {}",
+            per(to_app, m)
+        ),
+        format!(
+            "  FileStore filing, per order:                    {}",
+            per(store_order, m)
+        ),
+        format!(
+            "  inbound delivery (the async_trait from_app future; the dispatcher's mpsc \
+             amortised), per message: {}",
+            per(inbound, m)
+        ),
+        format!(
+            "  FileStore, per message received:                {}",
+            per(store_inbound, m)
+        ),
+        format!(
+            "  Reject reply (the refusal's text, the RefMsgType copy, the Reject body's field \
+             list and 4 values, the async_trait to_admin future; the rejection mpsc amortised), \
+             per Reject: {}",
+            per(reject, m)
+        ),
+        format!(
+            "  FileStore filing, per Reject:                   {}",
+            per(store_reject, m)
+        ),
+        "  RawMessage spill: none (11 fields, 32 inline)".to_string(),
+        format!(
+            "  plain profile (FileStore + observer + Rejects): sent {}, received {}, \
+             rejected {}: {plain} blocks, predicted {predicted}, {} per frame",
+            mixed.sent,
+            mixed.received,
+            mixed.rejected,
+            per(plain, mixed.frames())
+        ),
+    ];
+    if let Some((tls_live, tls_rejected, full)) = matrix.tls {
+        let tls_order = total(tls_live) - to_app;
+        let tls_reject = total(tls_rejected) - total(matrix.rejected);
+        let full_total = total(full);
+        let rustls = full_total - plain;
+        lines.push(format!(
+            "  rustls, both endpoints, per order (control):    {}",
+            per(tls_order, m)
+        ));
+        lines.push(format!(
+            "  rustls, both endpoints, per refused message and its Reject (control): {}",
+            per(tls_reject, m)
+        ));
+        lines.push(format!(
+            "  FULL PROFILE (TLS + FileStore + observer + Rejects): sent {}, received {}, \
+             rejected {}: {full_total} blocks, {} per frame; rustls share (both endpoints) \
+             {rustls} blocks, {} per frame",
+            mixed.sent,
+            mixed.received,
+            mixed.rejected,
+            per(full_total, mixed.frames()),
+            per(rustls, mixed.frames())
+        ));
+        // Over TLS the profile pays what it pays without TLS, plus rustls:
+        // more than nothing, and no more than the TLS controls charge for
+        // the same traffic (every order, every message received, every
+        // Reject).
+        let slack = i128::from(SLACK);
+        assert!(
+            rustls > 0 && rustls <= tls_order + tls_reject + 2 * slack,
+            "the full profile's rustls share ({rustls} blocks) is outside (0, {}]",
+            tls_order + tls_reject + 2 * slack
+        );
+    }
+    // Each component, at its documented rate. The store's are about one
+    // block a call either way: a few B-tree-free pages and queue blocks per
+    // window move them by less than the slack.
+    let slack = i128::from(SLACK);
+    for (name, measured, expected) in [
+        ("the to_app future", to_app, 1),
+        ("FileStore filing per order", store_order, 1),
+        ("inbound delivery", inbound, 1),
+        ("FileStore per message received", store_inbound, 1),
+        ("the Reject reply", reject, REJECT_REPLY_BLOCKS),
+        ("FileStore filing per Reject", store_reject, 1),
+    ] {
+        let expected = expected * full_m;
+        assert!(
+            (measured - expected).abs() <= slack,
+            "{name}: {measured} blocks for {m} messages, expected {expected} within {slack}"
+        );
+    }
+    let mut stderr = io::stderr().lock();
+    for line in &lines {
+        let _ = writeln!(stderr, "{line}");
+    }
+    drop(stderr);
+    let tolerance = i128::from(4 * SLACK);
+    assert!(
+        (plain - predicted).abs() <= tolerance,
+        "the plain profile allocated {plain} blocks, the components predict {predicted}: \
+         they must agree within {tolerance}"
+    );
+}
+
 fn main() {
     let runtime = ok(
         tokio::runtime::Builder::new_current_thread()
@@ -722,6 +1243,96 @@ fn main() {
     let pooled_observer = Arc::new(CountingObserver::default());
     let pooled_observing =
         initiator(None).with_frame_observer(Arc::clone(&pooled_observer) as Arc<dyn FrameObserver>);
+
+    // The allocation matrix (issue #81, deferred from #76): controls, then
+    // the full profile. One FileStore journal per session, in a directory
+    // of this process's own, removed at the end.
+    let store_dir =
+        std::env::temp_dir().join(format!("ironfix-allocations-{}", std::process::id()));
+    let stores = runtime.block_on(async {
+        let mut stores = Vec::new();
+        for name in ["live", "accepted", "rejected", "plain", "full"] {
+            stores.push(file_store(&store_dir, name).await);
+        }
+        stores
+    });
+    let [
+        live_store,
+        accepted_store,
+        rejected_store,
+        plain_store,
+        full_store,
+    ]: [Arc<dyn MessageStore>; 5] = match stores.try_into() {
+        Ok(stores) => stores,
+        Err(_) => panic!("five stores"),
+    };
+    let none = Traffic {
+        sent: 0,
+        received: 0,
+        rejected: 0,
+    };
+    let orders_only = |sent| Traffic { sent, ..none };
+    let inbound_only = |received, rejected| Traffic {
+        received,
+        rejected,
+        ..none
+    };
+    let warm_up_executions = executions(2, WARM_UP);
+    let window_executions = executions(2 + WARM_UP, MESSAGES);
+    let empty = BytesMut::new();
+    let mixed_warm_up = Traffic {
+        sent: WARM_UP,
+        received: WARM_UP,
+        rejected: even_in(2, WARM_UP),
+    };
+    let mixed = Traffic {
+        sent: MESSAGES,
+        received: MESSAGES,
+        rejected: even_in(2 + WARM_UP, MESSAGES),
+    };
+    // Each session of the matrix, with what it counts.
+    let file_live = initiator(None).with_store(live_store);
+    let (app, accepted_seen) = Inbound::new(Refuse::None);
+    let accepting = initiator_with(None, app);
+    let (app, rejected_seen) = Inbound::new(Refuse::All);
+    let rejecting = initiator_with(None, app);
+    let (app, file_accepted_seen) = Inbound::new(Refuse::None);
+    let file_accepting = initiator_with(None, app).with_store(accepted_store);
+    let (app, file_rejected_seen) = Inbound::new(Refuse::All);
+    let file_rejecting = initiator_with(None, app).with_store(rejected_store);
+    let plain_observer = Arc::new(CountingObserver::default());
+    let (app, plain_seen) = Inbound::new(Refuse::EvenSeq);
+    let plain = initiator_with(None, app)
+        .with_store(plain_store)
+        .with_frame_observer(Arc::clone(&plain_observer) as Arc<dyn FrameObserver>);
+    let full_observer = Arc::new(CountingObserver::default());
+    let (app, full_seen) = Inbound::new(Refuse::EvenSeq);
+    let full = initiator_with(None, app)
+        .with_store(full_store)
+        .with_frame_observer(Arc::clone(&full_observer) as Arc<dyn FrameObserver>);
+    #[cfg(feature = "tls")]
+    let (tls_client, tls_server) = tls_profile::configs();
+    #[cfg(feature = "tls")]
+    let tls_live = initiator(None);
+    #[cfg(feature = "tls")]
+    let (app, tls_rejected_seen) = Inbound::new(Refuse::All);
+    #[cfg(feature = "tls")]
+    let tls_rejecting = initiator_with(None, app);
+    #[cfg(not(feature = "tls"))]
+    drop((full, Arc::clone(&full_seen)));
+    let matrix_orders = || {
+        (0..2 * (WARM_UP + MESSAGES))
+            .map(order)
+            .collect::<Vec<_>>()
+            .into_iter()
+    };
+    let mut file_live_orders = matrix_orders();
+    let mut plain_orders = matrix_orders();
+    #[cfg(feature = "tls")]
+    let mut tls_live_orders = matrix_orders();
+    #[cfg(feature = "tls")]
+    let mut full_orders = matrix_orders();
+    let mut no_orders = std::iter::empty::<OutboundMessage>();
 
     let _profiler = dhat::Profiler::builder().testing().build();
     let measured = runtime.block_on(async move {
@@ -864,6 +1475,143 @@ fn main() {
         piled_up,
         retained,
     ) = measured;
+
+    // The allocation matrix (issue #81): the controls, then the full
+    // profile with every ingredient together.
+    let matrix = runtime.block_on(async move {
+        let mut session = log_on(file_live).await;
+        let file_live = measure_traffic(
+            &mut session,
+            &AtomicU64::new(0),
+            &mut file_live_orders,
+            (&empty, orders_only(WARM_UP)),
+            (&empty, orders_only(MESSAGES)),
+        )
+        .await;
+        session.counter.abort();
+        drop(session);
+
+        let mut inbound_windows = Vec::new();
+        for (initiator, seen, rejects) in [
+            (accepting, accepted_seen, false),
+            (rejecting, rejected_seen, true),
+            (file_accepting, file_accepted_seen, false),
+            (file_rejecting, file_rejected_seen, true),
+        ] {
+            let warm = inbound_only(WARM_UP, if rejects { WARM_UP } else { 0 });
+            let window = inbound_only(MESSAGES, if rejects { MESSAGES } else { 0 });
+            let mut session = log_on(initiator).await;
+            inbound_windows.push(
+                measure_traffic(
+                    &mut session,
+                    &seen,
+                    &mut no_orders,
+                    (&warm_up_executions, warm),
+                    (&window_executions, window),
+                )
+                .await,
+            );
+            session.counter.abort();
+            drop(session);
+        }
+
+        let mut session = log_on(plain).await;
+        let plain = measure_traffic(
+            &mut session,
+            &plain_seen,
+            &mut plain_orders,
+            (&warm_up_executions, mixed_warm_up),
+            (&window_executions, mixed),
+        )
+        .await;
+        session.counter.abort();
+        drop(session);
+
+        #[cfg(feature = "tls")]
+        let tls = {
+            let mut session = tls_profile::log_on(
+                tls_live,
+                PIPE_BYTES,
+                Arc::clone(&tls_client),
+                Arc::clone(&tls_server),
+            )
+            .await;
+            let tls_live = measure_traffic(
+                &mut session,
+                &AtomicU64::new(0),
+                &mut tls_live_orders,
+                (&empty, orders_only(WARM_UP)),
+                (&empty, orders_only(MESSAGES)),
+            )
+            .await;
+            session.counter.abort();
+            drop(session);
+
+            let mut session = tls_profile::log_on(
+                tls_rejecting,
+                PIPE_BYTES,
+                Arc::clone(&tls_client),
+                Arc::clone(&tls_server),
+            )
+            .await;
+            let tls_rejected = measure_traffic(
+                &mut session,
+                &tls_rejected_seen,
+                &mut no_orders,
+                (&warm_up_executions, inbound_only(WARM_UP, WARM_UP)),
+                (&window_executions, inbound_only(MESSAGES, MESSAGES)),
+            )
+            .await;
+            session.counter.abort();
+            drop(session);
+
+            let mut session = tls_profile::log_on(full, PIPE_BYTES, tls_client, tls_server).await;
+            let full = measure_traffic(
+                &mut session,
+                &full_seen,
+                &mut full_orders,
+                (&warm_up_executions, mixed_warm_up),
+                (&window_executions, mixed),
+            )
+            .await;
+            session.counter.abort();
+            drop(session);
+            Some((tls_live, tls_rejected, full))
+        };
+        #[cfg(not(feature = "tls"))]
+        let tls: Option<(Window, Window, Window)> = None;
+        (file_live, inbound_windows, plain, tls)
+    });
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let (file_live, inbound_windows, plain, tls) = matrix;
+    let [accepted, rejected, file_accepted, file_rejected]: [Window; 4] =
+        match inbound_windows.try_into() {
+            Ok(windows) => windows,
+            Err(_) => panic!("four inbound windows"),
+        };
+    check_matrix(&Matrix {
+        live: &live,
+        file_live: &file_live,
+        accepted: &accepted,
+        rejected: &rejected,
+        file_accepted: &file_accepted,
+        file_rejected: &file_rejected,
+        plain: &plain,
+        mixed,
+        tls: tls.as_ref(),
+    });
+    assert!(
+        plain_observer.outbound.load(Ordering::Relaxed) > mixed.sent + mixed.rejected,
+        "the observer of the plain profile saw every order and Reject"
+    );
+    #[cfg(feature = "tls")]
+    assert!(
+        full_observer.outbound.load(Ordering::Relaxed) > mixed.sent + mixed.rejected
+            && full_observer.inbound.load(Ordering::Relaxed) > mixed.received,
+        "the observer of the full profile saw every frame"
+    );
+    #[cfg(not(feature = "tls"))]
+    let _ = &full_observer;
 
     // Each window went through the write buffer with the flush waiting on
     // the stream: the stream refused writes for want of room.

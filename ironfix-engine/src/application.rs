@@ -156,10 +156,16 @@ pub trait Application: Send + Sync {
     /// with the `tls` feature) once the TLS handshake has completed, and on
     /// the `*_with_peer` stream entry points, after
     /// [`Application::on_create`]. It never runs on a plain TCP or stream
-    /// session. `peer` carries the certificate chain the TLS layer verified,
+    /// session. `peer` carries the certificates the counterparty presented,
     /// end-entity first, so an application can bind a client certificate to
     /// the session it claims, for instance by requiring that it names the
     /// session's `TargetCompID`.
+    ///
+    /// Bind to [`PeerInfo::end_entity_certificate`] only: it is the one
+    /// certificate the TLS layer verified against the configured roots. The
+    /// rest of the chain is metadata the peer chose to send, which may hold
+    /// unrelated certificates nobody verified; an entry after the first
+    /// proves neither a verified issuer nor an identity.
     ///
     /// The initiator calls it before its Logon, which may carry `Password`
     /// (554), is written; the acceptor before the inbound Logon is read (for

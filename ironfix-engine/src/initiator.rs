@@ -256,7 +256,7 @@ pub struct Initiator<A: Application = NoOpApplication> {
     config_check: Result<(), SessionConfigError>,
     /// TCP connect timeout.
     connect_timeout: Duration,
-    /// Bound on the TLS handshake of [`Initiator::connect_tls`].
+    /// Bound on the TLS handshake of `Initiator::connect_tls`.
     tls_handshake_timeout: Duration,
     /// The write timeout: bound on a handshake write, and on how long an
     /// established session's output may make no progress.
@@ -940,7 +940,7 @@ impl<A: Application + 'static> Initiator<A> {
 
     /// [`Initiator::establish`] on a stream whose counterparty the caller's
     /// transport has proved, typically a TLS stream from a TLS stack of the
-    /// caller's choice, with the certificate chain it verified.
+    /// caller's choice, with the certificates the peer presented.
     ///
     /// Runs [`Application::authorize_peer`] with `peer` after `on_create`
     /// and before the Logon is written; everything else is

@@ -118,7 +118,7 @@ engine wiring (#96) does not exist.
   as a TLS stream built with the TLS crate of your choice, a Unix socket, or
   a `tokio::io::duplex` pipe for tests without sockets. The
   `*_with_peer` variants also carry the certificate chain a TLS stack of your
-  own verified to `Application::authorize_peer`. `connect`, `serve`
+  own received to `Application::authorize_peer`. `connect`, `serve`
   and `accept` are the TCP dial or accept (with `TCP_NODELAY` set) followed by
   that same path. No public type gains a type parameter. The TCP path is
   unaffected: its socket is held by value, with no allocation and no dynamic
@@ -134,8 +134,9 @@ engine wiring (#96) does not exist.
   own timeout, with a `ClientConfig` / `ServerConfig` you build: protocol
   versions, cipher suites, roots and mutual TLS are yours, and so is the crypto
   provider (IronFix enables none). `Application::authorize_peer` receives the
-  counterparty's certificate chain before any FIX message is exchanged, so a
-  client certificate can be bound to a CompID. FIX framing is unchanged inside
+  certificates the counterparty presented before any FIX message is
+  exchanged, so a client certificate can be bound to a CompID: bind the
+  end-entity certificate, the only one TLS verifies. FIX framing is unchanged inside
   TLS and `EncryptMethod` (98) stays 0. With the feature off, no TLS crate is in
   the dependency graph (`make check-tls-deps`, run in CI). See
   `doc/adr/0009-tls.md`.
@@ -428,12 +429,13 @@ around it.
   registry bounds each connection, not how many there are: capping the
   connections still in their Logon handshake is the consumer's job, in its
   accept loop.
-- **TLS is opt-in, with no builder knob and no example.** It needs
-  `ironfix-engine`'s `tls` feature; `EngineBuilder` has no TLS setting (call
-  `connect_tls` / `serve_tls` on the engine it builds), and there is no TLS
-  example pair yet (the tests generate their certificates at run time). The
-  TLS entry points take rustls 0.23 types, so a rustls major release is a
-  breaking change of that surface. No TLS performance figure exists.
+- **TLS is opt-in, with no builder knob.** It needs `ironfix-engine`'s `tls`
+  feature; `EngineBuilder` has no TLS setting (call `connect_tls` /
+  `serve_tls` on the engine it builds). The TLS entry points take rustls 0.23
+  types, so a rustls major release is a breaking change of that surface. Only
+  the end-entity certificate in `PeerInfo` is verified; the rest of the chain
+  is what the peer chose to send. No TLS performance figure exists; the
+  engine's allocation test counts blocks per frame for TLS, not time.
 - **Async only.** Everything that touches a socket runs on Tokio. There is no
   synchronous mode, no kernel-bypass path, and no busy-polling transport. A
   sans-IO session core with Tokio as one driver is the accepted direction
@@ -820,6 +822,19 @@ Engine and concurrency examples:
 FAST examples:
 
 - `fast_server` / `fast_client`: FAST encode/decode over a socket (port 9890)
+
+TLS examples (need `--features tls`):
+
+- `fix44_tls_server` / `fix44_tls_client` — FIX 4.4 over TLS (port 9879), on
+  `Acceptor::serve_tls` and `Initiator::connect_tls`. The server generates a
+  throwaway authority and a `localhost` certificate at start-up and writes
+  only the authority's certificate (`FIX_TLS_CA`, default in the system
+  temporary directory) for the client to trust; no private key is written.
+
+```bash
+cargo run -p ironfix-example --features tls --example fix44_tls_server
+cargo run -p ironfix-example --features tls --example fix44_tls_client
+```
 - `fast_server_lockfree`: a generator thread and an encoding broadcaster
   thread joined by a bounded lock-free `crossbeam-channel`, both outside the
   Tokio runtime

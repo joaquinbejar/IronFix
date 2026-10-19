@@ -8,10 +8,11 @@
 //!
 //! FIX over TLS is plain FIX framing inside the TLS stream: nothing on the
 //! wire changes, and `EncryptMethod` (98) stays 0. What TLS adds is a
-//! counterparty identity the Logon cannot fake, the certificate chain it
-//! presented, which this module carries to the application as a
-//! [`PeerInfo`] through
-//! [`Application::authorize_peer`].
+//! counterparty identity the Logon cannot fake: the end-entity certificate
+//! the TLS layer verified. This module carries the certificates the peer
+//! presented to the application as a [`PeerInfo`] through
+//! [`Application::authorize_peer`]; only the first of them is verified (see
+//! [`PeerInfo`]).
 //!
 //! # Always compiled
 //!
@@ -66,19 +67,34 @@ pub use tokio_rustls::rustls;
 /// The TLS handshake timeout an engine starts with: 10 seconds.
 pub const DEFAULT_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What the transport proved about the counterparty: the certificate chain it
-/// presented, end-entity certificate first, each one DER-encoded.
+/// The certificates the counterparty presented in the TLS handshake,
+/// end-entity certificate first, each one DER-encoded, exactly as it sent
+/// them.
 ///
-/// Handed to
-/// [`Application::authorize_peer`] before
-/// the Logon exchange, so an application can bind a certificate to the
-/// session (for instance, require that the client certificate names the
-/// session's `TargetCompID`). The chain is the one the TLS layer verified
-/// against the configured roots; IronFix does not parse it.
+/// Handed to [`Application::authorize_peer`] before the Logon exchange, so
+/// an application can bind a certificate to the session (for instance,
+/// require that the client certificate names the session's
+/// `TargetCompID`). IronFix does not parse the certificates.
+///
+/// # What is verified, and what is not
+///
+/// The TLS layer verifies the **end-entity certificate**
+/// ([`PeerInfo::end_entity_certificate`], the first one) against the
+/// configured roots and the peer's proof that it holds the matching key. The
+/// rest of [`PeerInfo::certificate_chain`] is metadata the peer presented: it
+/// may contain certificates that took no part in that verification,
+/// unrelated ones included, issued by anyone. A certificate after the first
+/// proves neither a verified issuer nor an identity, so a binding of a
+/// certificate to a CompID must use the end-entity certificate, under the
+/// verification policy of the TLS configuration, and treat every other entry
+/// as untrusted unless the application validates it separately.
+///
+/// Through the `*_with_peer` entry points the engine verifies nothing: it
+/// passes on what the caller's TLS stack handed over.
 ///
 /// The chain is empty when the counterparty presented no certificate: a
 /// client on a server that does not ask for one.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct PeerInfo {
     /// The DER-encoded certificates, end-entity first.
     certificates: Arc<[Bytes]>,
@@ -88,8 +104,9 @@ impl PeerInfo {
     /// A peer that presented `certificates`, end-entity first, each one
     /// DER-encoded.
     ///
-    /// For a caller that runs its own TLS stack and hands the verified chain
-    /// to an `*_with_peer` entry point.
+    /// For a caller that runs its own TLS stack and hands the chain the peer
+    /// presented to an `*_with_peer` entry point; whatever that stack
+    /// verified, the engine verifies nothing more.
     #[must_use]
     pub fn new(certificates: impl IntoIterator<Item = Bytes>) -> Self {
         Self {
@@ -97,15 +114,19 @@ impl PeerInfo {
         }
     }
 
-    /// The certificate chain, end-entity first, each one DER-encoded. Empty
-    /// when the counterparty presented none.
+    /// The certificates the counterparty presented, end-entity first, each
+    /// one DER-encoded. Empty when it presented none.
+    ///
+    /// Only the first entry is verified by the TLS layer; the others are
+    /// untrusted metadata (see [`PeerInfo`]).
     #[must_use]
     pub fn certificate_chain(&self) -> &[Bytes] {
         &self.certificates
     }
 
     /// The counterparty's own (end-entity) certificate, DER-encoded, if it
-    /// presented one.
+    /// presented one: the one certificate the TLS layer verified against the
+    /// configured roots, and the one to bind to a CompID.
     #[must_use]
     pub fn end_entity_certificate(&self) -> Option<&Bytes> {
         self.certificates.first()
@@ -132,6 +153,7 @@ impl fmt::Debug for PeerInfo {
 /// [`CloseReason::Tls`](crate::CloseReason::Tls) carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum TlsFailure {
     /// The TLS handshake failed: an untrusted or expired certificate, a
     /// missing or refused client certificate, no common protocol version or
@@ -164,7 +186,7 @@ impl fmt::Display for TlsFailure {
 #[non_exhaustive]
 pub enum TlsError {
     /// The TLS handshake failed. See [`TlsFailure::Handshake`].
-    #[error("TLS handshake failed: {detail}")]
+    #[error("tls handshake failed: {detail}")]
     #[non_exhaustive]
     Handshake {
         /// The I/O error kind the handshake failed with.
@@ -173,12 +195,12 @@ pub enum TlsError {
         detail: String,
     },
     /// The TLS handshake did not complete within the timeout.
-    #[error("TLS handshake timed out after {0:?}")]
+    #[error("tls handshake timed out after {0:?}")]
     HandshakeTimeout(Duration),
     /// [`Application::authorize_peer`]
     /// refused the counterparty. Nothing was written to it: no Logon, no
     /// Logout.
-    #[error("TLS peer refused: {reason}")]
+    #[error("tls peer refused: {reason}")]
     #[non_exhaustive]
     PeerRejected {
         /// The `text` of the application's
@@ -351,6 +373,6 @@ mod tests {
             reason: "wrong CompID".to_string(),
         };
         assert_eq!(rejected.failure(), TlsFailure::PeerRejected);
-        assert_eq!(rejected.to_string(), "TLS peer refused: wrong CompID");
+        assert_eq!(rejected.to_string(), "tls peer refused: wrong CompID");
     }
 }

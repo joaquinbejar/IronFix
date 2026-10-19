@@ -1053,3 +1053,70 @@ async fn test_credentials_are_never_logged_over_tls() {
     );
     assert_no_secret(&log);
 }
+
+// ---------------------------------------------------------------------------
+// What PeerInfo vouches for
+// ---------------------------------------------------------------------------
+
+/// The review probe on #154: a server presents its trusted leaf followed by
+/// an unrelated leaf from a rogue CA. The handshake succeeds, since rustls
+/// verifies the end-entity certificate only, and `authorize_peer` receives
+/// both, exactly as presented. The documented contract holds: the first
+/// entry is the verified certificate to bind to a CompID, and the second is
+/// untrusted metadata that proves nothing.
+#[tokio::test]
+async fn test_peer_info_passes_unverified_extra_certificates_as_presented() {
+    log_capture();
+    let trusted_ca = Ca::new("trusted CA");
+    let rogue_ca = Ca::new("rogue CA");
+    let leaf = trusted_ca.leaf("venue.test");
+    let unrelated = rogue_ca.leaf("unrelated.test");
+
+    let server = Arc::new(ok(
+        ok(
+            ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions(),
+            "server protocol versions",
+        )
+        .with_no_client_auth()
+        .with_single_cert(vec![leaf.cert.clone(), unrelated.cert.clone()], leaf.key()),
+        "server certificate chain",
+    ));
+    let (listener, addr) = listener().await;
+    let (venue_app, mut venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(venue_config("MEMBER"), Arc::clone(&venue_app));
+    let served = tokio::spawn(async move {
+        let (stream, _) = ok(listener.accept().await, "accept");
+        acceptor.serve_tls(stream, server).await
+    });
+
+    let (member_app, mut member_rx) = RecordingApp::new();
+    let initiator = Initiator::new(member_config("MEMBER"), Arc::clone(&member_app));
+    let member = ok(
+        initiator
+            .connect_tls(addr, client_config(&trusted_ca, None), venue_name())
+            .await,
+        "the handshake succeeds: only the end-entity certificate is verified",
+    );
+    let venue = ok(
+        ok(ok(timeout(STEP, served).await, "serve in time"), "task"),
+        "serve_tls",
+    );
+
+    let peers = member_app.peers();
+    assert_eq!(peers.len(), 1);
+    let peer = &peers[0];
+    assert_eq!(
+        peer.end_entity_certificate().map(|c| c.as_ref()),
+        Some(leaf.cert.as_ref()),
+        "the first certificate is the verified one"
+    );
+    assert_eq!(
+        peer.certificate_chain()
+            .iter()
+            .map(|c| c.as_ref())
+            .collect::<Vec<_>>(),
+        [leaf.cert.as_ref(), unrelated.cert.as_ref()],
+        "the chain is passed on as presented, the unverified entry included"
+    );
+    exchange_and_logout(&member, &venue, &mut member_rx, &mut venue_rx).await;
+}

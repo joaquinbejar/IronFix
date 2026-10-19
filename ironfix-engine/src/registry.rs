@@ -819,7 +819,7 @@ pub struct AcceptorRegistry<A: Application = NoOpApplication> {
     max_message_size: usize,
     /// Most lookup-admitted sessions held at once, if capped.
     max_sessions: Option<usize>,
-    /// Bound on the TLS handshake of [`AcceptorRegistry::serve_tls`].
+    /// Bound on the TLS handshake of `AcceptorRegistry::serve_tls`.
     tls_handshake_timeout: Duration,
 }
 
@@ -1158,7 +1158,7 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
 
     /// [`AcceptorRegistry::serve_stream`] on a stream whose counterparty the
     /// caller's transport has proved, typically a TLS stream from a TLS stack
-    /// of the caller's choice, with the certificate chain it verified.
+    /// of the caller's choice, with the certificates the peer presented.
     ///
     /// Routing is unchanged. Once the Logon is routed, the session runs
     /// [`Application::authorize_peer`] with `peer` after `on_create` and

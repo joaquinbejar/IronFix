@@ -282,7 +282,7 @@ pub struct Acceptor<A: Application = NoOpApplication> {
     write_timeout: Duration,
     /// Capacity of each session's inbound application queue.
     app_queue_capacity: usize,
-    /// Bound on the TLS handshake of [`Acceptor::serve_tls`].
+    /// Bound on the TLS handshake of `Acceptor::serve_tls`.
     tls_handshake_timeout: Duration,
     /// The optional message store, its failure policy, its call timeout and
     /// the owed-reset record, shared by every session this acceptor admits,
@@ -1051,7 +1051,7 @@ impl<A: Application + 'static> Acceptor<A> {
 
     /// [`Acceptor::serve_stream`] on a stream whose counterparty the
     /// caller's transport has proved, typically a TLS stream from a TLS stack
-    /// of the caller's choice, with the certificate chain it verified.
+    /// of the caller's choice, with the certificates the peer presented.
     ///
     /// Runs [`Application::authorize_peer`] with `peer` after `on_create` and
     /// before the inbound Logon is read; everything else is

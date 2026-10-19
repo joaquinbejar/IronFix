@@ -33,6 +33,28 @@ jobs:
       - name: Build examples
         run: cargo build -p ironfix-example --examples
 
+      # The TLS pair (issue #81) needs the example crate's `tls` feature.
+      - name: Build and smoke test the TLS example pair
+        run: |
+          set -euo pipefail
+          cargo build -p ironfix-example --features tls \
+            --example fix44_tls_server --example fix44_tls_client
+          export FIX_PORT=9879 FIX_TLS_CA="$RUNNER_TEMP/ironfix-tls-ca.der"
+          ./target/debug/examples/fix44_tls_server > server-tls.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 30); do
+            if [ -s "$FIX_TLS_CA" ] && nc -z 127.0.0.1 "$FIX_PORT" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          timeout 60 ./target/debug/examples/fix44_tls_client > client-tls.log 2>&1 || true
+          kill "$server_pid" 2>/dev/null || true
+          wait "$server_pid" 2>/dev/null || true
+          echo "--- server ---"; cat server-tls.log
+          echo "--- client ---"; cat client-tls.log
+          grep -q "logged on over TLS" client-tls.log
+          grep -q "received 35=8 over TLS" client-tls.log
+          grep -q "logged on over TLS" server-tls.log
+
       # Each pair gets its own port so a lingering socket from one run cannot
       # make the next one pass by accident.
       #
