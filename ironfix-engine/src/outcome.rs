@@ -67,7 +67,9 @@
 //! flushed, while the session goes on reading. Each tracked frame resolves
 //! as soon as the stream has accepted its last byte, in the order they were
 //! sent, even while later frames are still buffered and before the stream's
-//! own flush completes; a completed flush resolves any left. Its
+//! own flush completes; a completed flush resolves any left. Do not infer
+//! a completed flush from `Sent`: a buffered caller stream or a TLS stream
+//! can accept a frame long before its flush completes. Its
 //! `filed` field says whether the store confirmed it filed the frame: it is
 //! false without a store, and false under
 //! [`StoreFailurePolicy::Continue`](crate::StoreFailurePolicy::Continue) when
