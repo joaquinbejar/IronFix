@@ -1860,27 +1860,28 @@ impl AsyncWrite for ReplyBeforeFlushStream {
         }
         let result = Pin::new(&mut self.io).poll_write(cx, buf);
         if self.control.stage.load(Ordering::SeqCst) == 2
-            && let Poll::Ready(Ok(n)) = &result {
-                self.captured.extend_from_slice(&buf[..*n]);
-                loop {
-                    let this = &mut *self;
-                    match tokio_util::codec::Decoder::decode(&mut this.codec, &mut this.captured) {
-                        Ok(Some(frame)) if field(&frame, 35).as_deref() == Some("1") => {
-                            let id = some(field(&frame, 112), "probe id");
-                            this.injected.extend_from_slice(&peer_frame(
-                                "VENUE",
-                                "CLIENT",
-                                "0",
-                                2,
-                                &[(112, &id)],
-                            ));
-                        }
-                        Ok(Some(_)) => {}
-                        Ok(None) => break,
-                        Err(err) => panic!("captured frame: {err}"),
+            && let Poll::Ready(Ok(n)) = &result
+        {
+            self.captured.extend_from_slice(&buf[..*n]);
+            loop {
+                let this = &mut *self;
+                match tokio_util::codec::Decoder::decode(&mut this.codec, &mut this.captured) {
+                    Ok(Some(frame)) if field(&frame, 35).as_deref() == Some("1") => {
+                        let id = some(field(&frame, 112), "probe id");
+                        this.injected.extend_from_slice(&peer_frame(
+                            "VENUE",
+                            "CLIENT",
+                            "0",
+                            2,
+                            &[(112, &id)],
+                        ));
                     }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(err) => panic!("captured frame: {err}"),
                 }
             }
+        }
         result
     }
 
