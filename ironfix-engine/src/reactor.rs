@@ -1264,7 +1264,13 @@ impl ResendState {
     /// Records that another request for this same gap has gone out.
     fn record_retry(&mut self) {
         self.requested_at = Instant::now();
-        self.attempts = self.attempts.saturating_add(1);
+        // `attempts` never passes `limit` (a u32) by more than the one
+        // request `can_retry` allowed, so this cannot overflow; if it ever
+        // did, the count stays at its ceiling, which already refuses a retry.
+        match self.attempts.checked_add(1) {
+            Some(attempts) => self.attempts = attempts,
+            None => debug_assert!(false, "ResendRequest attempt count overflowed u32"),
+        }
     }
 
     /// Records genuine in-order progress within the outstanding range.
@@ -6431,6 +6437,16 @@ mod tests {
         assert!(writer.receipts_full(), "no live send past the limit");
         writer.receipts.clear();
         assert!(!writer.receipts_full());
+    }
+
+    #[test]
+    fn test_resend_state_record_retry_counts_each_request() {
+        let config = config_with_limit(3);
+        let mut state = ResendState::first(3, 6, &config);
+        state.record_retry();
+        state.record_retry();
+        assert_eq!(state.attempts, 3);
+        assert!(!state.can_retry());
     }
 
     #[test]
