@@ -554,7 +554,9 @@ loop. Every session keeps its own sequence numbers, store and heartbeat.
 **What IronFix implements today**
 
 `ironfix-session::HeartbeatManager` owns the timing; `ironfix-engine`'s
-reactor polls it on a 100 ms tick.
+reactor polls it on a 100 ms tick. The manager never reads a clock: every
+timing method takes the current monotonic `now` from the engine (ADR-0002,
+issue #90), so the same decisions can be driven by synthetic time.
 
 - **`HeartBtInt` = 0 means no heartbeating.** Zero is a legal negotiated
   interval and disables the mechanism outright: no Heartbeat is emitted, no

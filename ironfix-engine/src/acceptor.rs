@@ -1251,7 +1251,7 @@ impl<A: Application + 'static> Acceptor<A> {
         let store_timeout = self.store.timeout(write_timeout);
 
         // Typestate: Connecting -> LogonReceived.
-        let session = session.on_logon_received();
+        let session = session.on_logon_received(std::time::Instant::now());
 
         // (gap start, high-water) of a gap detected in the inbound Logon.
         let mut pending_resend: Option<(u64, u64)> = None;
@@ -1659,7 +1659,7 @@ impl<A: Application + 'static> Acceptor<A> {
             }
             runtime = Arc::new(SessionRuntime::new(
                 sequences,
-                HeartbeatManager::new(self.config.heartbeat_interval),
+                HeartbeatManager::new(self.config.heartbeat_interval, std::time::Instant::now()),
             ));
             if let Some(declared) = declared_appl_version {
                 runtime.record_counterparty_default_appl_version(declared);
@@ -1670,7 +1670,8 @@ impl<A: Application + 'static> Acceptor<A> {
 
             {
                 let mut heartbeat = lock_heartbeat(&runtime);
-                heartbeat.on_message_received(false, None);
+                let now = std::time::Instant::now();
+                heartbeat.on_message_received(false, None, now);
                 if Duration::from_secs(requested_heartbeat_secs) != heartbeat.interval() {
                     tracing::info!(
                         session = %session_id,
@@ -1678,7 +1679,7 @@ impl<A: Application + 'static> Acceptor<A> {
                         "honoring HeartBtInt requested by counterparty"
                     );
                     *heartbeat =
-                        HeartbeatManager::new(Duration::from_secs(requested_heartbeat_secs));
+                        HeartbeatManager::new(Duration::from_secs(requested_heartbeat_secs), now);
                 }
             }
             let reply_heartbeat_secs = requested_heartbeat_secs;
@@ -1827,7 +1828,7 @@ impl<A: Application + 'static> Acceptor<A> {
                 let _ = session.reject_logon();
                 return Err(err);
             }
-            lock_heartbeat(&runtime).on_message_sent();
+            lock_heartbeat(&runtime).on_message_sent(std::time::Instant::now());
         }
 
         // The acknowledgement that declared the reset is on the wire: that

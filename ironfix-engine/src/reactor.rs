@@ -3039,7 +3039,7 @@ impl<A: Application> Reactor<A> {
     /// the heartbeat clock counts as sending.
     fn on_flushed(&mut self, framed: &mut FixFramed) {
         let covered = self.writer.flushed(framed);
-        lock_heartbeat(&self.runtime).on_message_sent();
+        lock_heartbeat(&self.runtime).on_message_sent(Instant::now());
         if let Some((first, last)) = covered {
             tracing::trace!(session = %self.session_id, first, last, "flushed");
         }
@@ -3120,7 +3120,7 @@ impl<A: Application> Reactor<A> {
         match phase {
             Phase::LogoutQueued(session) if self.writer.logout.take_written() => {
                 // Typestate: Active -> LogoutPending, as the Logout is sent.
-                Phase::LogoutPending(session.initiate_logout())
+                Phase::LogoutPending(session.initiate_logout(Instant::now()))
             }
             phase => phase,
         }
@@ -3134,7 +3134,7 @@ impl<A: Application> Reactor<A> {
         if self.writer.test_request.take_written()
             && let Some(test_req_id) = self.unwritten_test_request.take()
         {
-            lock_heartbeat(&self.runtime).on_test_request_sent(test_req_id);
+            lock_heartbeat(&self.runtime).on_test_request_sent(test_req_id, Instant::now());
         }
         if self.writer.resend_request.take_written()
             && let Some(state) = self.resend.as_mut()
@@ -3921,7 +3921,7 @@ impl<A: Application> Reactor<A> {
         self.advance_probes();
         match self.writer.on_tick(driver_now(), self.write_timeout) {
             WriteCheck::Fine => {}
-            WriteCheck::Progressed => lock_heartbeat(&self.runtime).on_message_sent(),
+            WriteCheck::Progressed => lock_heartbeat(&self.runtime).on_message_sent(Instant::now()),
             WriteCheck::Stalled => {
                 let close = CloseReason::WriteTimeout {
                     timeout: self.write_timeout,
@@ -3950,7 +3950,7 @@ impl<A: Application> Reactor<A> {
         // the resend is done, or now if the logout timeout has run out.
         if self.resend_in_progress() {
             let phase = self.cut_resend_for_owed_logout(framed, phase).await?;
-            if lock_heartbeat(&self.runtime).is_timed_out() {
+            if lock_heartbeat(&self.runtime).is_timed_out(Instant::now()) {
                 teardown(phase);
                 return Err(closed(CloseReason::HeartbeatTimeout {}));
             }
@@ -3964,7 +3964,7 @@ impl<A: Application> Reactor<A> {
         // write timeout can close the session. Only the deadlines are
         // checked.
         if self.writer.observed_full() {
-            if lock_heartbeat(&self.runtime).is_timed_out() {
+            if lock_heartbeat(&self.runtime).is_timed_out(Instant::now()) {
                 teardown(phase);
                 return Err(closed(CloseReason::HeartbeatTimeout {}));
             }
@@ -3986,10 +3986,11 @@ impl<A: Application> Reactor<A> {
 
         let (timed_out, send_test_request, send_heartbeat) = {
             let heartbeat = lock_heartbeat(&self.runtime);
+            let now = Instant::now();
             (
-                heartbeat.is_timed_out(),
-                heartbeat.should_send_test_request(),
-                heartbeat.should_send_heartbeat(),
+                heartbeat.is_timed_out(now),
+                heartbeat.should_send_test_request(now),
+                heartbeat.should_send_heartbeat(now),
             )
         };
 
@@ -3998,7 +3999,7 @@ impl<A: Application> Reactor<A> {
             return Err(closed(CloseReason::HeartbeatTimeout {}));
         }
         if send_test_request && self.unwritten_test_request.is_none() {
-            let test_req_id = generate_test_req_id();
+            let test_req_id = generate_test_req_id(std::time::SystemTime::now());
             let request = self.factory.test_request(&test_req_id);
             match self.send(framed, request).await {
                 Err(err) => {
@@ -5835,8 +5836,11 @@ impl<A: Application> Reactor<A> {
         // frames still count here — and so does any frame arriving while a
         // TestRequest is outstanding, which is what stops the countdown.
         let test_req_id = raw.get_field_str(112);
-        let outcome = lock_heartbeat(&self.runtime)
-            .on_message_received(msg_type == MsgType::Heartbeat, test_req_id);
+        let outcome = lock_heartbeat(&self.runtime).on_message_received(
+            msg_type == MsgType::Heartbeat,
+            test_req_id,
+            Instant::now(),
+        );
         match outcome {
             TestRequestOutcome::Confirmed => tracing::debug!(
                 session = %self.session_id,
@@ -6169,7 +6173,7 @@ impl<A: Application> Reactor<A> {
             // close whose Logout never got out is not graceful.
             Phase::LogoutQueued(session) => {
                 // Typestate: Active -> LogoutPending -> Disconnected.
-                let _ = session.initiate_logout().on_logout_ack();
+                let _ = session.initiate_logout(Instant::now()).on_logout_ack();
                 Err(self.local_logout_complete(raw))
             }
             Phase::Active(session) => {

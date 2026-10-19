@@ -35,8 +35,19 @@
 //! that omits tag 112 or let it be reordered behind application traffic.
 //! This matches the QuickFIX family, which resets its test-request counter on
 //! any successfully verified inbound message.
+//!
+//! # Time is an input
+//!
+//! This module never reads a clock (ADR-0002, "Time source contract"). Every
+//! method whose result or effect depends on time takes `now: Instant`, a
+//! monotonic instant supplied by the driver; [`generate_test_req_id`] takes
+//! the wall-clock time it encodes. The same manager therefore runs under the
+//! Tokio reactor, under a consumer's own event loop, or in a test driven by
+//! synthetic instants. Callers must pass instants that do not go backwards for
+//! a given manager; an instant earlier than a recorded one is read as zero
+//! elapsed time (and trips a `debug_assert!` in debug builds).
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Largest counterparty-confirmed `HeartBtInt` (108) this engine will honour,
 /// in seconds (one hour).
@@ -136,6 +147,22 @@ fn grace_for(interval: Duration) -> Duration {
     (interval / TEST_REQUEST_GRACE_DIVISOR).max(MIN_TEST_REQUEST_GRACE)
 }
 
+/// Time elapsed from `earlier` to `now`, both supplied by the caller.
+///
+/// A `now` before `earlier` breaks the monotonic-input contract; it is
+/// reported in debug builds and read as zero elapsed time in release builds,
+/// which can only delay a timer, never fire one early.
+fn elapsed_between(earlier: Instant, now: Instant) -> Duration {
+    debug_assert!(
+        now >= earlier,
+        "HeartbeatManager was given an instant earlier than one it recorded"
+    );
+    match now.checked_duration_since(earlier) {
+        Some(elapsed) => elapsed,
+        None => Duration::ZERO,
+    }
+}
+
 /// Manages heartbeat timing for a FIX session.
 #[derive(Debug)]
 pub struct HeartbeatManager {
@@ -162,9 +189,9 @@ impl HeartbeatManager {
     ///
     /// # Arguments
     /// * `interval` - The heartbeat interval
+    /// * `now` - The current monotonic instant; both timers start from it
     #[must_use]
-    pub fn new(interval: Duration) -> Self {
-        let now = Instant::now();
+    pub fn new(interval: Duration, now: Instant) -> Self {
         Self {
             interval,
             grace: grace_for(interval),
@@ -183,10 +210,10 @@ impl HeartbeatManager {
         !self.interval.is_zero()
     }
 
-    /// Records that a message was sent.
+    /// Records that a message was sent at `now`.
     #[inline]
-    pub fn on_message_sent(&mut self) {
-        self.last_sent = Instant::now();
+    pub fn on_message_sent(&mut self, now: Instant) {
+        self.last_sent = now;
     }
 
     /// Records that a message was received.
@@ -200,12 +227,14 @@ impl HeartbeatManager {
     /// # Arguments
     /// * `is_heartbeat` - Whether the received message is a Heartbeat
     /// * `test_req_id` - The `TestReqID` (112) on the message, if present
+    /// * `now` - When the message was received
     pub fn on_message_received(
         &mut self,
         is_heartbeat: bool,
         test_req_id: Option<&str>,
+        now: Instant,
     ) -> TestRequestOutcome {
-        self.last_received = Instant::now();
+        self.last_received = now;
 
         let Some(pending) = self.test_request_pending.take() else {
             return TestRequestOutcome::NonePending;
@@ -224,8 +253,8 @@ impl HeartbeatManager {
     /// A heartbeat should be sent if no message has been sent within the
     /// interval. Always `false` when `HeartBtInt` is 0.
     #[must_use]
-    pub fn should_send_heartbeat(&self) -> bool {
-        self.is_enabled() && self.last_sent.elapsed() >= self.interval
+    pub fn should_send_heartbeat(&self, now: Instant) -> bool {
+        self.is_enabled() && elapsed_between(self.last_sent, now) >= self.interval
     }
 
     /// Checks if a TestRequest should be sent.
@@ -234,14 +263,14 @@ impl HeartbeatManager {
     /// interval plus [`HeartbeatManager::test_request_grace`], and no
     /// TestRequest is already pending. Always `false` when `HeartBtInt` is 0.
     #[must_use]
-    pub fn should_send_test_request(&self) -> bool {
+    pub fn should_send_test_request(&self, now: Instant) -> bool {
         if !self.is_enabled() || self.test_request_pending.is_some() {
             return false;
         }
         // An interval so large that adding the grace overflows can never come
         // due; report that rather than panicking on the addition.
         match self.interval.checked_add(self.grace) {
-            Some(due_after) => self.last_received.elapsed() >= due_after,
+            Some(due_after) => elapsed_between(self.last_received, now) >= due_after,
             None => false,
         }
     }
@@ -254,12 +283,12 @@ impl HeartbeatManager {
     /// [`HeartbeatManager::on_message_received`]). Always `false` when
     /// `HeartBtInt` is 0.
     #[must_use]
-    pub fn is_timed_out(&self) -> bool {
+    pub fn is_timed_out(&self, now: Instant) -> bool {
         if !self.is_enabled() {
             return false;
         }
         match self.test_request_sent_at {
-            Some(sent_at) => sent_at.elapsed() >= self.interval,
+            Some(sent_at) => elapsed_between(sent_at, now) >= self.interval,
             None => false,
         }
     }
@@ -268,10 +297,11 @@ impl HeartbeatManager {
     ///
     /// # Arguments
     /// * `test_req_id` - The `TestReqID` that was sent
-    pub fn on_test_request_sent(&mut self, test_req_id: String) {
+    /// * `now` - When it was sent; the timeout countdown runs from here
+    pub fn on_test_request_sent(&mut self, test_req_id: String, now: Instant) {
         self.test_request_pending = Some(test_req_id);
-        self.test_request_sent_at = Some(Instant::now());
-        self.last_sent = Instant::now();
+        self.test_request_sent_at = Some(now);
+        self.last_sent = now;
     }
 
     /// Returns the pending TestRequest ID, if any.
@@ -280,16 +310,16 @@ impl HeartbeatManager {
         self.test_request_pending.as_deref()
     }
 
-    /// Returns the time since the last message was received.
+    /// Returns the time from the last message received to `now`.
     #[must_use]
-    pub fn time_since_last_received(&self) -> Duration {
-        self.last_received.elapsed()
+    pub fn time_since_last_received(&self, now: Instant) -> Duration {
+        elapsed_between(self.last_received, now)
     }
 
-    /// Returns the time since the last message was sent.
+    /// Returns the time from the last message sent to `now`.
     #[must_use]
-    pub fn time_since_last_sent(&self) -> Duration {
-        self.last_sent.elapsed()
+    pub fn time_since_last_sent(&self, now: Instant) -> Duration {
+        elapsed_between(self.last_sent, now)
     }
 
     /// Returns the heartbeat interval.
@@ -311,9 +341,9 @@ impl HeartbeatManager {
     /// Resets the manager state.
     ///
     /// The interval and its derived grace are session configuration and are
-    /// kept; only the timers and the pending TestRequest are cleared.
-    pub fn reset(&mut self) {
-        let now = Instant::now();
+    /// kept; only the timers and the pending TestRequest are cleared, and
+    /// both timers restart from `now`.
+    pub fn reset(&mut self, now: Instant) {
         self.last_sent = now;
         self.last_received = now;
         self.test_request_pending = None;
@@ -321,17 +351,22 @@ impl HeartbeatManager {
     }
 }
 
-/// Generates a unique TestReqID.
+/// Generates a TestReqID (112) from a wall-clock time the caller supplies.
 ///
-/// Uses the current timestamp in nanoseconds.
+/// The ID is `TEST` followed by `wall_clock` in nanoseconds since the Unix
+/// epoch, so distinct times yield distinct IDs. The session layer reads no
+/// clock: the driver passes the current time (or any other monotonically
+/// distinct value expressed as a `SystemTime`). A time before the epoch
+/// encodes as `TEST0`.
+///
+/// # Arguments
+/// * `wall_clock` - The entropy for the ID, normally the current time
 #[must_use]
-pub fn generate_test_req_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+pub fn generate_test_req_id(wall_clock: SystemTime) -> String {
+    let nanos = match wall_clock.duration_since(UNIX_EPOCH) {
+        Ok(since_epoch) => since_epoch.as_nanos(),
+        Err(_) => 0,
+    };
 
     format!("TEST{}", nanos)
 }
@@ -339,160 +374,195 @@ pub fn generate_test_req_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread::sleep;
+
+    // Every timing test is driven by synthetic instants: one base instant is
+    // taken, and every later moment is `base + offset`. No test sleeps, so the
+    // boundaries are asserted exactly rather than with scheduler slack.
+
+    fn base() -> Instant {
+        Instant::now()
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
 
     #[test]
     fn test_heartbeat_manager_new() {
-        let mgr = HeartbeatManager::new(Duration::from_secs(30));
+        let mgr = HeartbeatManager::new(Duration::from_secs(30), base());
         assert_eq!(mgr.interval(), Duration::from_secs(30));
         assert!(mgr.pending_test_request().is_none());
         assert!(mgr.is_enabled());
     }
 
     #[test]
-    fn test_should_send_heartbeat() {
-        let mgr = HeartbeatManager::new(Duration::from_millis(10));
-        assert!(!mgr.should_send_heartbeat());
-
-        sleep(Duration::from_millis(15));
-        assert!(mgr.should_send_heartbeat());
+    fn test_should_send_heartbeat_exact_boundary() {
+        let t0 = base();
+        let mgr = HeartbeatManager::new(ms(10), t0);
+        assert!(!mgr.should_send_heartbeat(t0));
+        assert!(!mgr.should_send_heartbeat(t0 + ms(9)));
+        assert!(mgr.should_send_heartbeat(t0 + ms(10)));
+        assert!(mgr.should_send_heartbeat(t0 + ms(15)));
     }
 
     #[test]
-    fn test_on_message_sent() {
-        let mut mgr = HeartbeatManager::new(Duration::from_millis(10));
-        sleep(Duration::from_millis(15));
-        assert!(mgr.should_send_heartbeat());
+    fn test_on_message_sent_restarts_the_heartbeat_timer() {
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(ms(10), t0);
+        assert!(mgr.should_send_heartbeat(t0 + ms(15)));
 
-        mgr.on_message_sent();
-        assert!(!mgr.should_send_heartbeat());
+        mgr.on_message_sent(t0 + ms(15));
+        assert!(!mgr.should_send_heartbeat(t0 + ms(15)));
+        assert!(!mgr.should_send_heartbeat(t0 + ms(24)));
+        assert!(mgr.should_send_heartbeat(t0 + ms(25)));
+        assert_eq!(mgr.time_since_last_sent(t0 + ms(20)), ms(5));
+    }
+
+    #[test]
+    fn test_inbound_traffic_does_not_restart_the_heartbeat_timer() {
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(ms(10), t0);
+        let _ = mgr.on_message_received(false, None, t0 + ms(8));
+        assert!(mgr.should_send_heartbeat(t0 + ms(10)));
+        assert_eq!(mgr.time_since_last_received(t0 + ms(10)), ms(2));
     }
 
     #[test]
     fn test_test_request_pending() {
-        let mut mgr = HeartbeatManager::new(Duration::from_secs(30));
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(Duration::from_secs(30), t0);
 
-        mgr.on_test_request_sent("TEST123".to_string());
+        mgr.on_test_request_sent("TEST123".to_string(), t0);
         assert_eq!(mgr.pending_test_request(), Some("TEST123"));
 
-        let outcome = mgr.on_message_received(true, Some("TEST123"));
+        let outcome = mgr.on_message_received(true, Some("TEST123"), t0 + ms(5));
         assert_eq!(outcome, TestRequestOutcome::Confirmed);
         assert!(mgr.pending_test_request().is_none());
     }
 
     #[test]
-    fn test_generate_test_req_id() {
-        let id1 = generate_test_req_id();
-        std::thread::sleep(std::time::Duration::from_nanos(1));
-        let id2 = generate_test_req_id();
+    fn test_on_test_request_sent_counts_as_sending() {
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(ms(100), t0);
+        mgr.on_test_request_sent("TEST-SENDS".to_string(), t0 + ms(90));
+        assert!(!mgr.should_send_heartbeat(t0 + ms(100)));
+        assert!(mgr.should_send_heartbeat(t0 + ms(190)));
+    }
 
-        assert!(id1.starts_with("TEST"));
-        assert!(id2.starts_with("TEST"));
-        // IDs may be equal if generated within the same nanosecond on fast systems
-        // The important thing is that they have the correct format
-        assert!(id1.len() > 4);
-        assert!(id2.len() > 4);
+    #[test]
+    fn test_generate_test_req_id_encodes_the_supplied_time() {
+        let at = UNIX_EPOCH + Duration::from_nanos(1_234_567_890);
+        assert_eq!(generate_test_req_id(at), "TEST1234567890");
+    }
+
+    #[test]
+    fn test_generate_test_req_id_distinct_times_give_distinct_ids() {
+        let at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let later = at + Duration::from_nanos(1);
+        assert_ne!(generate_test_req_id(at), generate_test_req_id(later));
+    }
+
+    #[test]
+    fn test_generate_test_req_id_before_the_epoch_is_zero() {
+        let before = UNIX_EPOCH - Duration::from_secs(1);
+        assert_eq!(generate_test_req_id(before), "TEST0");
     }
 
     // --- HeartBtInt = 0: heartbeating disabled -------------------------------
 
     #[test]
     fn test_zero_interval_reports_disabled() {
-        let mgr = HeartbeatManager::new(Duration::ZERO);
+        let mgr = HeartbeatManager::new(Duration::ZERO, base());
         assert!(!mgr.is_enabled());
         assert_eq!(mgr.test_request_grace(), Duration::ZERO);
     }
 
     #[test]
     fn test_zero_interval_never_sends_heartbeat_or_test_request() {
-        let mgr = HeartbeatManager::new(Duration::ZERO);
-        assert!(!mgr.should_send_heartbeat());
-        assert!(!mgr.should_send_test_request());
-
-        sleep(Duration::from_millis(20));
-        assert!(!mgr.should_send_heartbeat());
-        assert!(!mgr.should_send_test_request());
+        let t0 = base();
+        let mgr = HeartbeatManager::new(Duration::ZERO, t0);
+        for later in [t0, t0 + ms(20), t0 + Duration::from_secs(3600)] {
+            assert!(!mgr.should_send_heartbeat(later));
+            assert!(!mgr.should_send_test_request(later));
+        }
     }
 
     #[test]
     fn test_zero_interval_never_times_out() {
-        let mut mgr = HeartbeatManager::new(Duration::ZERO);
-        assert!(!mgr.is_timed_out());
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(Duration::ZERO, t0);
+        assert!(!mgr.is_timed_out(t0));
 
         // Even with a TestRequest artificially outstanding, a disabled
         // interval has no timeout to expire.
-        mgr.on_test_request_sent("TEST-ZERO".to_string());
-        sleep(Duration::from_millis(20));
-        assert!(!mgr.is_timed_out());
+        mgr.on_test_request_sent("TEST-ZERO".to_string(), t0);
+        assert!(!mgr.is_timed_out(t0 + Duration::from_secs(3600)));
     }
 
     // --- Grace period --------------------------------------------------------
 
     #[test]
     fn test_test_request_grace_is_one_fifth_of_a_long_interval() {
-        let mgr = HeartbeatManager::new(Duration::from_secs(30));
+        let mgr = HeartbeatManager::new(Duration::from_secs(30), base());
         assert_eq!(mgr.test_request_grace(), Duration::from_secs(6));
     }
 
     #[test]
     fn test_test_request_grace_uses_floor_for_short_intervals() {
-        let mgr = HeartbeatManager::new(Duration::from_millis(100));
+        let mgr = HeartbeatManager::new(ms(100), base());
         assert_eq!(mgr.test_request_grace(), MIN_TEST_REQUEST_GRACE);
     }
 
     #[test]
     fn test_should_send_test_request_waits_for_interval_plus_grace() {
-        // 2s interval -> 400ms grace, so the probe is due at 2.4s. Scaled down
-        // by using an interval whose fifth is above the floor.
-        let interval = Duration::from_millis(2000);
-        let mgr = HeartbeatManager::new(interval);
-        assert_eq!(mgr.test_request_grace(), Duration::from_millis(400));
+        // 2s interval -> 400ms grace, so the probe is due at exactly 2.4s.
+        let t0 = base();
+        let mgr = HeartbeatManager::new(ms(2000), t0);
+        assert_eq!(mgr.test_request_grace(), ms(400));
 
-        // Before interval + grace: not due.
-        sleep(Duration::from_millis(50));
-        assert!(!mgr.should_send_test_request());
+        assert!(!mgr.should_send_test_request(t0 + ms(2000)));
+        assert!(!mgr.should_send_test_request(t0 + ms(2399)));
+        assert!(mgr.should_send_test_request(t0 + ms(2400)));
     }
 
     #[test]
     fn test_should_send_test_request_boundary() {
         // 1s interval -> grace floored at 250ms, so the probe is due at 1250ms
         // of inbound silence.
-        let mgr = HeartbeatManager::new(Duration::from_secs(1));
-        assert_eq!(mgr.test_request_grace(), Duration::from_millis(250));
+        let t0 = base();
+        let mgr = HeartbeatManager::new(Duration::from_secs(1), t0);
+        assert_eq!(mgr.test_request_grace(), ms(250));
 
-        // The "not due" side is asserted at ~0ms elapsed rather than after a
-        // sleep: `sleep` only ever overshoots, so a scheduler stall could push a
-        // mid-interval sleep past the 1250ms boundary and fail a negative
-        // assertion even when the logic is correct. At construction no inbound
-        // silence has elapsed, so it cannot be due for any realistic stall.
-        assert!(
-            !mgr.should_send_test_request(),
-            "not due before interval plus grace elapses"
-        );
+        assert!(!mgr.should_send_test_request(t0 + ms(1249)));
+        assert!(mgr.should_send_test_request(t0 + ms(1250)));
+    }
 
-        // The "due" side is robust: sleeping past the boundary can only ever
-        // wait longer than requested, so once well past 1250ms it is due.
-        sleep(Duration::from_millis(1400));
-        assert!(
-            mgr.should_send_test_request(),
-            "due once interval plus grace has elapsed"
-        );
+    #[test]
+    fn test_inbound_traffic_restarts_the_test_request_timer() {
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(Duration::from_secs(1), t0);
+        let _ = mgr.on_message_received(false, None, t0 + ms(1000));
+        assert!(!mgr.should_send_test_request(t0 + ms(1250)));
+        assert!(!mgr.should_send_test_request(t0 + ms(2249)));
+        assert!(mgr.should_send_test_request(t0 + ms(2250)));
     }
 
     #[test]
     fn test_should_send_test_request_suppressed_while_pending() {
-        let mut mgr = HeartbeatManager::new(Duration::from_millis(50));
-        sleep(Duration::from_millis(320));
-        assert!(mgr.should_send_test_request());
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(ms(50), t0);
+        assert!(mgr.should_send_test_request(t0 + ms(320)));
 
-        mgr.on_test_request_sent("TEST-PENDING".to_string());
-        assert!(!mgr.should_send_test_request());
+        mgr.on_test_request_sent("TEST-PENDING".to_string(), t0 + ms(320));
+        assert!(!mgr.should_send_test_request(t0 + ms(320)));
+        assert!(!mgr.should_send_test_request(t0 + ms(10_000)));
     }
 
     #[test]
     fn test_should_send_test_request_unreachable_interval_is_never_due() {
-        let mgr = HeartbeatManager::new(Duration::MAX);
-        assert!(!mgr.should_send_test_request());
+        let t0 = base();
+        let mgr = HeartbeatManager::new(Duration::MAX, t0);
+        assert!(!mgr.should_send_test_request(t0 + Duration::from_secs(86_400)));
     }
 
     #[test]
@@ -504,115 +574,139 @@ mod tests {
         // kill, so every timing predicate has to return, not panic. An
         // unreachable interval means "effectively never": nothing is ever due
         // and the session never times out.
-        let mut mgr = HeartbeatManager::new(Duration::MAX);
-        assert!(!mgr.should_send_heartbeat());
-        assert!(!mgr.should_send_test_request());
-        assert!(!mgr.is_timed_out());
+        let t0 = base();
+        let later = t0 + Duration::from_secs(86_400);
+        let mut mgr = HeartbeatManager::new(Duration::MAX, t0);
+        assert!(!mgr.should_send_heartbeat(later));
+        assert!(!mgr.should_send_test_request(later));
+        assert!(!mgr.is_timed_out(later));
 
         // Reach the `is_timed_out` comparison against the near-MAX interval by
         // leaving a TestRequest outstanding; it must compare, not overflow.
-        mgr.on_test_request_sent("TEST-NEAR-MAX".to_string());
-        assert!(!mgr.is_timed_out());
-        assert!(!mgr.should_send_test_request());
+        mgr.on_test_request_sent("TEST-NEAR-MAX".to_string(), t0);
+        assert!(!mgr.is_timed_out(later));
+        assert!(!mgr.should_send_test_request(later));
     }
 
     // --- Timeout branches ----------------------------------------------------
 
     #[test]
     fn test_is_timed_out_false_without_pending_test_request() {
-        let mgr = HeartbeatManager::new(Duration::from_millis(10));
-        sleep(Duration::from_millis(50));
-        assert!(!mgr.is_timed_out());
+        let t0 = base();
+        let mgr = HeartbeatManager::new(ms(10), t0);
+        assert!(!mgr.is_timed_out(t0 + ms(50)));
     }
 
     #[test]
-    fn test_is_timed_out_false_before_the_interval_elapses() {
-        let mut mgr = HeartbeatManager::new(Duration::from_millis(200));
-        mgr.on_test_request_sent("TEST-EARLY".to_string());
-        sleep(Duration::from_millis(20));
-        assert!(!mgr.is_timed_out());
+    fn test_is_timed_out_exact_boundary() {
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(ms(200), t0);
+        mgr.on_test_request_sent("TEST-EARLY".to_string(), t0 + ms(100));
+        assert!(!mgr.is_timed_out(t0 + ms(120)));
+        assert!(!mgr.is_timed_out(t0 + ms(299)));
+        assert!(mgr.is_timed_out(t0 + ms(300)));
     }
 
     #[test]
     fn test_is_timed_out_true_after_silence_since_the_test_request() {
-        let mut mgr = HeartbeatManager::new(Duration::from_millis(50));
-        mgr.on_test_request_sent("TEST-SILENT".to_string());
-        sleep(Duration::from_millis(80));
-        assert!(mgr.is_timed_out());
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(ms(50), t0);
+        mgr.on_test_request_sent("TEST-SILENT".to_string(), t0);
+        assert!(mgr.is_timed_out(t0 + ms(80)));
     }
 
     // --- Clearing a pending TestRequest -------------------------------------
 
     #[test]
     fn test_application_traffic_clears_pending_test_request() {
-        let mut mgr = HeartbeatManager::new(Duration::from_millis(50));
-        mgr.on_test_request_sent("TEST-TRAFFIC".to_string());
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(ms(50), t0);
+        mgr.on_test_request_sent("TEST-TRAFFIC".to_string(), t0);
 
         // An ExecutionReport, not a Heartbeat, and carrying no TestReqID.
-        let outcome = mgr.on_message_received(false, None);
+        let outcome = mgr.on_message_received(false, None, t0 + ms(10));
         assert_eq!(outcome, TestRequestOutcome::SupersededByTraffic);
         assert!(mgr.pending_test_request().is_none());
-
-        sleep(Duration::from_millis(80));
         assert!(
-            !mgr.is_timed_out(),
+            !mgr.is_timed_out(t0 + ms(80)),
             "traffic after the TestRequest proves the peer is alive"
         );
     }
 
     #[test]
     fn test_heartbeat_without_test_req_id_clears_pending_test_request() {
-        let mut mgr = HeartbeatManager::new(Duration::from_millis(50));
-        mgr.on_test_request_sent("TEST-NO-112".to_string());
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(ms(50), t0);
+        mgr.on_test_request_sent("TEST-NO-112".to_string(), t0);
 
-        let outcome = mgr.on_message_received(true, None);
+        let outcome = mgr.on_message_received(true, None, t0 + ms(10));
         assert_eq!(outcome, TestRequestOutcome::SupersededByTraffic);
         assert!(mgr.pending_test_request().is_none());
-        assert!(!mgr.is_timed_out());
+        assert!(!mgr.is_timed_out(t0 + ms(80)));
     }
 
     #[test]
     fn test_heartbeat_with_wrong_test_req_id_clears_pending_test_request() {
-        let mut mgr = HeartbeatManager::new(Duration::from_millis(50));
-        mgr.on_test_request_sent("TEST-WANTED".to_string());
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(ms(50), t0);
+        mgr.on_test_request_sent("TEST-WANTED".to_string(), t0);
 
-        let outcome = mgr.on_message_received(true, Some("TEST-OTHER"));
+        let outcome = mgr.on_message_received(true, Some("TEST-OTHER"), t0 + ms(10));
         assert_eq!(outcome, TestRequestOutcome::SupersededByTraffic);
         assert!(mgr.pending_test_request().is_none());
-        assert!(!mgr.is_timed_out());
+        assert!(!mgr.is_timed_out(t0 + ms(80)));
     }
 
     #[test]
     fn test_non_heartbeat_with_matching_id_is_not_confirmation() {
-        let mut mgr = HeartbeatManager::new(Duration::from_millis(50));
-        mgr.on_test_request_sent("TEST-ECHO".to_string());
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(ms(50), t0);
+        mgr.on_test_request_sent("TEST-ECHO".to_string(), t0);
 
         // A TestRequest of the counterparty's own carrying the same ID is not
         // the Heartbeat we asked for, though it still proves liveness.
-        let outcome = mgr.on_message_received(false, Some("TEST-ECHO"));
+        let outcome = mgr.on_message_received(false, Some("TEST-ECHO"), t0 + ms(10));
         assert_eq!(outcome, TestRequestOutcome::SupersededByTraffic);
         assert!(mgr.pending_test_request().is_none());
     }
 
     #[test]
     fn test_on_message_received_without_pending_reports_none_pending() {
-        let mut mgr = HeartbeatManager::new(Duration::from_secs(30));
-        let outcome = mgr.on_message_received(true, Some("TEST-UNSOLICITED"));
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(Duration::from_secs(30), t0);
+        let outcome = mgr.on_message_received(true, Some("TEST-UNSOLICITED"), t0);
         assert_eq!(outcome, TestRequestOutcome::NonePending);
     }
 
     #[test]
-    fn test_reset_clears_pending_test_request_and_timers() {
-        let mut mgr = HeartbeatManager::new(Duration::from_millis(50));
-        mgr.on_test_request_sent("TEST-RESET".to_string());
-        sleep(Duration::from_millis(80));
-        assert!(mgr.is_timed_out());
+    fn test_full_probe_cycle_on_synthetic_time() {
+        // Silence, TestRequest due, sent, silence, timeout: all on synthetic
+        // instants, at the exact boundaries.
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(Duration::from_secs(30), t0);
+        let due = t0 + Duration::from_secs(36);
+        assert!(!mgr.should_send_test_request(due - ms(1)));
+        assert!(mgr.should_send_test_request(due));
 
-        mgr.reset();
+        mgr.on_test_request_sent("TEST-CYCLE".to_string(), due);
+        assert!(!mgr.is_timed_out(due + Duration::from_secs(29)));
+        assert!(mgr.is_timed_out(due + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn test_reset_clears_pending_test_request_and_timers() {
+        let t0 = base();
+        let mut mgr = HeartbeatManager::new(ms(50), t0);
+        mgr.on_test_request_sent("TEST-RESET".to_string(), t0);
+        assert!(mgr.is_timed_out(t0 + ms(80)));
+
+        mgr.reset(t0 + ms(80));
         assert!(mgr.pending_test_request().is_none());
-        assert!(!mgr.is_timed_out());
-        assert!(!mgr.should_send_test_request());
-        assert_eq!(mgr.interval(), Duration::from_millis(50));
+        assert!(!mgr.is_timed_out(t0 + ms(80)));
+        assert!(!mgr.should_send_test_request(t0 + ms(80)));
+        assert!(!mgr.should_send_heartbeat(t0 + ms(129)));
+        assert!(mgr.should_send_heartbeat(t0 + ms(130)));
+        assert_eq!(mgr.interval(), ms(50));
         assert_eq!(mgr.test_request_grace(), MIN_TEST_REQUEST_GRACE);
     }
 

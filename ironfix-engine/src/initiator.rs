@@ -1119,7 +1119,7 @@ impl<A: Application + 'static> Initiator<A> {
         };
         let runtime = Arc::new(SessionRuntime::new(
             sequences,
-            HeartbeatManager::new(self.config.heartbeat_interval),
+            HeartbeatManager::new(self.config.heartbeat_interval, std::time::Instant::now()),
         ));
         let mut factory = MessageFactory::new(&self.config, version);
         let identity = PeerIdentity::new(&self.config);
@@ -1168,8 +1168,9 @@ impl<A: Application + 'static> Initiator<A> {
             let _ = session.disconnect();
             return Err(err);
         }
-        lock_heartbeat(&runtime).on_message_sent();
-        let session = session.send_logon();
+        let logon_sent_at = std::time::Instant::now();
+        lock_heartbeat(&runtime).on_message_sent(logon_sent_at);
+        let session = session.send_logon(logon_sent_at);
 
         // Await the Logon acknowledgement. Garbled frames are skipped, and the
         // logon timeout covers the whole wait, so an ack that never arrives
@@ -1454,14 +1455,15 @@ impl<A: Application + 'static> Initiator<A> {
             };
             {
                 let mut heartbeat = lock_heartbeat(&runtime);
-                heartbeat.on_message_received(false, None);
+                let now = std::time::Instant::now();
+                heartbeat.on_message_received(false, None, now);
                 if negotiated != heartbeat.interval() {
                     tracing::info!(
                         session = %session_id,
                         heartbeat_secs = negotiated.as_secs(),
                         "using heartbeat interval confirmed by counterparty"
                     );
-                    *heartbeat = HeartbeatManager::new(negotiated);
+                    *heartbeat = HeartbeatManager::new(negotiated, now);
                 }
             }
 

@@ -20,6 +20,13 @@
 //!
 //! The states with no data ([`Disconnected`], [`Connecting`], [`Active`]) stay
 //! zero-sized, so the typestate still costs nothing for them.
+//!
+//! # Time is an input
+//!
+//! No transition reads a clock (ADR-0002, "Time source contract"). The
+//! transitions that timestamp a state ([`Session::send_logon`],
+//! [`Session::on_logon_received`], [`Session::initiate_logout`]) take the
+//! monotonic `now` from the caller and store it unchanged.
 
 use std::time::Instant;
 
@@ -164,21 +171,18 @@ impl Session<Disconnected> {
 
 impl Session<Connecting> {
     /// Transitions to the LogonSent state after sending Logon (initiator
-    /// side), recording the send instant for the logon timeout.
+    /// side), recording `now` as the send instant for the logon timeout.
     #[must_use]
-    pub fn send_logon(self) -> Session<LogonSent> {
-        self.transition(LogonSent {
-            sent_at: Instant::now(),
-        })
+    pub fn send_logon(self, now: Instant) -> Session<LogonSent> {
+        self.transition(LogonSent { sent_at: now })
     }
 
     /// Transitions to the LogonReceived state when a Logon arrives from
-    /// the counterparty (acceptor side), recording the arrival instant.
+    /// the counterparty (acceptor side), recording `now` as the arrival
+    /// instant.
     #[must_use]
-    pub fn on_logon_received(self) -> Session<LogonReceived> {
-        self.transition(LogonReceived {
-            received_at: Instant::now(),
-        })
+    pub fn on_logon_received(self, now: Instant) -> Session<LogonReceived> {
+        self.transition(LogonReceived { received_at: now })
     }
 
     /// Transitions back to Disconnected on connection failure.
@@ -251,13 +255,11 @@ impl Session<Active> {
         self.transition(Resending { begin_seq, end_seq })
     }
 
-    /// Transitions to LogoutPending state, recording the send instant for the
-    /// logout timeout.
+    /// Transitions to LogoutPending state, recording `now` as the send
+    /// instant for the logout timeout.
     #[must_use]
-    pub fn initiate_logout(self) -> Session<LogoutPending> {
-        self.transition(LogoutPending {
-            sent_at: Instant::now(),
-        })
+    pub fn initiate_logout(self, now: Instant) -> Session<LogoutPending> {
+        self.transition(LogoutPending { sent_at: now })
     }
 
     /// Transitions to Disconnected on unexpected disconnect.
@@ -317,6 +319,7 @@ impl Session<LogoutPending> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_session_state_transitions() {
@@ -324,11 +327,11 @@ mod tests {
         assert_eq!(session.session_id(), "TEST");
 
         let session = session.connect();
-        let session = session.send_logon();
+        let session = session.send_logon(Instant::now());
         let session = session.on_logon_ack();
 
         // Now in Active state
-        let session = session.initiate_logout();
+        let session = session.initiate_logout(Instant::now());
         let _session = session.on_logout_ack();
     }
 
@@ -336,11 +339,11 @@ mod tests {
     fn test_acceptor_flow() {
         let session = Session::<Disconnected>::new("ACCEPTOR");
         let session = session.accept();
-        let session = session.on_logon_received();
+        let session = session.on_logon_received(Instant::now());
         let session = session.accept_logon();
 
         // Now in Active state
-        let session = session.initiate_logout();
+        let session = session.initiate_logout(Instant::now());
         let _session = session.on_logout_ack();
     }
 
@@ -348,7 +351,7 @@ mod tests {
     fn test_acceptor_reject_flow() {
         let session = Session::<Disconnected>::new("ACCEPTOR");
         let session = session.accept();
-        let session = session.on_logon_received();
+        let session = session.on_logon_received(Instant::now());
         let _session = session.reject_logon();
     }
 
@@ -356,7 +359,7 @@ mod tests {
     fn test_acceptor_timeout_flow() {
         let session = Session::<Disconnected>::new("ACCEPTOR");
         let session = session.accept();
-        let session = session.on_logon_received();
+        let session = session.on_logon_received(Instant::now());
         let _session = session.on_timeout();
     }
 
@@ -364,7 +367,7 @@ mod tests {
     fn test_resend_flow() {
         let session = Session::<Disconnected>::new("TEST");
         let session = session.connect();
-        let session = session.send_logon();
+        let session = session.send_logon(Instant::now());
         let session = session.on_logon_ack();
 
         let session = session.start_resend(1, 5);
@@ -374,47 +377,44 @@ mod tests {
     // --- States carry their data --------------------------------------------
 
     #[test]
-    fn test_send_logon_records_the_send_instant() {
-        let before = Instant::now();
-        let session = Session::<Disconnected>::new("TEST").connect().send_logon();
-        let after = Instant::now();
-
-        assert!(session.sent_at() >= before);
-        assert!(session.sent_at() <= after);
-        assert_eq!(session.state().sent_at, session.sent_at());
-    }
-
-    #[test]
-    fn test_on_logon_received_records_the_arrival_instant() {
-        let before = Instant::now();
-        let session = Session::<Disconnected>::new("ACCEPTOR")
-            .accept()
-            .on_logon_received();
-        let after = Instant::now();
-
-        assert!(session.received_at() >= before);
-        assert!(session.received_at() <= after);
-    }
-
-    #[test]
-    fn test_initiate_logout_records_the_send_instant() {
-        let before = Instant::now();
+    fn test_send_logon_records_the_supplied_instant() {
+        let at = Instant::now() + Duration::from_secs(7);
         let session = Session::<Disconnected>::new("TEST")
             .connect()
-            .send_logon()
-            .on_logon_ack()
-            .initiate_logout();
-        let after = Instant::now();
+            .send_logon(at);
 
-        assert!(session.sent_at() >= before);
-        assert!(session.sent_at() <= after);
+        assert_eq!(session.sent_at(), at);
+        assert_eq!(session.state().sent_at, at);
+    }
+
+    #[test]
+    fn test_on_logon_received_records_the_supplied_instant() {
+        let at = Instant::now() + Duration::from_secs(3);
+        let session = Session::<Disconnected>::new("ACCEPTOR")
+            .accept()
+            .on_logon_received(at);
+
+        assert_eq!(session.received_at(), at);
+    }
+
+    #[test]
+    fn test_initiate_logout_records_the_supplied_instant() {
+        let t0 = Instant::now();
+        let logout_at = t0 + Duration::from_secs(60);
+        let session = Session::<Disconnected>::new("TEST")
+            .connect()
+            .send_logon(t0)
+            .on_logon_ack()
+            .initiate_logout(logout_at);
+
+        assert_eq!(session.sent_at(), logout_at);
     }
 
     #[test]
     fn test_start_resend_keeps_the_requested_range() {
         let session = Session::<Disconnected>::new("TEST")
             .connect()
-            .send_logon()
+            .send_logon(Instant::now())
             .on_logon_ack()
             .start_resend(7, 16);
 
@@ -429,7 +429,7 @@ mod tests {
         // and must survive the transition unchanged.
         let session = Session::<Disconnected>::new("TEST")
             .connect()
-            .send_logon()
+            .send_logon(Instant::now())
             .on_logon_ack()
             .start_resend(42, 0);
 
@@ -441,14 +441,14 @@ mod tests {
     fn test_session_id_survives_every_transition() {
         let session = Session::<Disconnected>::new("PERSISTENT")
             .connect()
-            .send_logon()
+            .send_logon(Instant::now())
             .on_logon_ack();
         assert_eq!(session.session_id(), "PERSISTENT");
 
         let session = session.start_resend(1, 2).resend_complete();
         assert_eq!(session.session_id(), "PERSISTENT");
 
-        let session = session.initiate_logout();
+        let session = session.initiate_logout(Instant::now());
         assert_eq!(session.session_id(), "PERSISTENT");
 
         let session = session.on_logout_ack();

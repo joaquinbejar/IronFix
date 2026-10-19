@@ -91,3 +91,18 @@ converted at the boundary so paused-clock tests stay deterministic.
   (extract the reactor decision logic into the core), #92 (synchronous
   `Application` / store traits for the sans-IO path), #93 (a poll-driven,
   non-Tokio driver example).
+
+## Progress
+
+- **#90 (clock injection):** done. `HeartbeatManager::new`, `on_message_sent`,
+  `on_message_received`, `should_send_heartbeat`, `should_send_test_request`,
+  `is_timed_out`, `on_test_request_sent`, `time_since_last_received`,
+  `time_since_last_sent` and `reset` take `now: Instant`;
+  `Session::send_logon`, `Session::on_logon_received` and
+  `Session::initiate_logout` take `now: Instant`; `generate_test_req_id` takes
+  the `SystemTime` it encodes. These are breaking signature changes for the
+  0.5.0 line. `ironfix-session/tests/no_clock_reads.rs` fails if a clock read
+  returns to `ironfix-session/src`. The engine call sites still pass
+  `std::time::Instant::now()`, exactly the clock the session used to read, so
+  behaviour is unchanged; switching them to the reactor's paused-clock-aware
+  `driver_now()` is left to #91, where the reactor's decision logic moves.
