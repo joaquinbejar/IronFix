@@ -40,6 +40,7 @@
 //! | `allowed_appl_versions` | [`FixVersion`] set | empty, or FIX.5.0 / FIX.5.0SP1 / FIX.5.0SP2 on a FIX 5.0 session | empty: the configured version only |
 //! | `require_ack_default_appl_ver_id` | flag | any; read by a FIX 5.0 initiator only | `false` |
 //! | `send_next_expected_msg_seq_num` | flag | `true` only on FIX.4.4 or a FIXT.1.1 session | `false` |
+//! | `gap_policy` | [`GapPolicy`] | `Discard`, or `Queue` with 1..=[`MAX_GAP_QUEUE_MESSAGES`] messages and 1..=[`MAX_GAP_QUEUE_BYTES`] bytes | `Discard` |
 //! | `reset_on_*`, `validate_*` | flag | any | see [`SessionConfig::new`] |
 //!
 //! # `HeartBtInt` (108) is whole seconds
@@ -144,6 +145,61 @@ pub const MAX_GARBLED_FRAME_LIMIT: u32 = 1024;
 /// Longest window a [`GarbledFrameLimit`] may count garbled frames over (24
 /// hours, one trading day).
 pub const MAX_GARBLED_FRAME_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Largest number of messages a [`GapPolicy::Queue`] may hold.
+///
+/// Each queued message keeps its frame in memory until the gap below it is
+/// filled, so this is a per-session ceiling on what a counterparty can make
+/// the session hold while a gap is open.
+pub const MAX_GAP_QUEUE_MESSAGES: usize = 65_536;
+
+/// Largest number of frame bytes a [`GapPolicy::Queue`] may hold (1 GiB).
+pub const MAX_GAP_QUEUE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// What the session does with a message that arrives above the expected
+/// `MsgSeqNum` (34) while a gap is open (`doc/fix_operations.md`, "Resend
+/// Request").
+///
+/// Either way the gap is requested with a `ResendRequest` (2): the
+/// counterparty cannot know what this session kept, so it resends the whole
+/// range. The policy decides only whether the messages received intact above
+/// the gap are kept until it is filled.
+///
+/// - [`GapPolicy::Discard`] (the default): an application message above the
+///   gap is dropped and taken from the counterparty's resend. An
+///   administrative message is acted on at once and its number left for the
+///   resend to gap-fill. This is the behaviour of every release before the
+///   policy existed.
+/// - [`GapPolicy::Queue`]: messages above the gap are kept, keyed by
+///   `MsgSeqNum`, and released in order through the normal in-sequence path
+///   once the expectation reaches them; the resent copies, which carry
+///   `PossDupFlag` (43) = Y, then arrive below the expectation and are
+///   ignored. An administrative message is still acted on at once (a
+///   TestRequest is answered, a ResendRequest is served) and only its number
+///   is kept, to be consumed in turn; a gapped `SequenceReset`-GapFill is
+///   kept whole and applied in turn. A Logout, a `SequenceReset`-Reset and
+///   the session's own Logout empty the queue. Past either bound, a further
+///   message is discarded as under `Discard`, and the session stays up.
+///
+/// `ironfix-engine` applies the policy; this crate only describes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum GapPolicy {
+    /// Drop application messages above a gap; the counterparty's resend
+    /// delivers them.
+    #[default]
+    Discard,
+    /// Keep messages above a gap, up to both bounds, and release them in
+    /// order once the gap is filled.
+    Queue {
+        /// Most messages held at once, 1..=[`MAX_GAP_QUEUE_MESSAGES`].
+        max_messages: usize,
+        /// Most frame bytes held at once, counted as the length of each
+        /// held frame, 1..=[`MAX_GAP_QUEUE_BYTES`]. An administrative
+        /// message, already acted on, counts as a message and holds no bytes.
+        max_bytes: usize,
+    },
+}
 
 /// Reason a session configuration cannot be used.
 ///
@@ -295,6 +351,21 @@ pub enum SessionConfigError {
         /// The session's configured `begin_string`.
         begin_string: String,
     },
+
+    /// A [`GapPolicy::Queue`] bound is zero or above its maximum.
+    #[error(
+        "gap_policy queue of {max_messages} messages and {max_bytes} bytes is outside the supported range (1..={max_messages_limit} messages and 1..={max_bytes_limit} bytes)"
+    )]
+    GapQueueOutOfRange {
+        /// The configured message bound.
+        max_messages: usize,
+        /// The configured byte bound.
+        max_bytes: usize,
+        /// The largest message bound accepted, [`MAX_GAP_QUEUE_MESSAGES`].
+        max_messages_limit: usize,
+        /// The largest byte bound accepted, [`MAX_GAP_QUEUE_BYTES`].
+        max_bytes_limit: usize,
+    },
 }
 
 /// Bound on garbled inbound frames: the session is closed once
@@ -408,6 +479,31 @@ fn validate_id(field: &'static str, value: &str) -> Result<(), SessionConfigErro
         }
     }
     Ok(())
+}
+
+/// Validates a [`GapPolicy`]: a queue needs both bounds in range.
+const fn validate_gap_policy(policy: GapPolicy) -> Result<(), SessionConfigError> {
+    match policy {
+        GapPolicy::Discard => Ok(()),
+        GapPolicy::Queue {
+            max_messages,
+            max_bytes,
+        } => {
+            if max_messages == 0
+                || max_messages > MAX_GAP_QUEUE_MESSAGES
+                || max_bytes == 0
+                || max_bytes > MAX_GAP_QUEUE_BYTES
+            {
+                return Err(SessionConfigError::GapQueueOutOfRange {
+                    max_messages,
+                    max_bytes,
+                    max_messages_limit: MAX_GAP_QUEUE_MESSAGES,
+                    max_bytes_limit: MAX_GAP_QUEUE_BYTES,
+                });
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Validates a handshake timeout: non-zero and at most [`MAX_TIMEOUT`].
@@ -715,6 +811,16 @@ pub struct SessionConfig {
     /// [`SessionConfigError::NextExpectedMsgSeqNumUnsupported`], since those
     /// versions do not define the field. Default: `false`.
     pub send_next_expected_msg_seq_num: bool,
+    /// What happens to messages that arrive above the expected `MsgSeqNum`
+    /// (34) while a gap is open: dropped and taken from the resend, or kept
+    /// and released in order once the gap is filled. See [`GapPolicy`].
+    ///
+    /// Range: [`GapPolicy::Discard`], or [`GapPolicy::Queue`] with
+    /// 1..=[`MAX_GAP_QUEUE_MESSAGES`] messages and 1..=[`MAX_GAP_QUEUE_BYTES`]
+    /// bytes; anything else is refused by [`SessionConfig::validate`] with
+    /// [`SessionConfigError::GapQueueOutOfRange`]. Default:
+    /// [`GapPolicy::Discard`].
+    pub gap_policy: GapPolicy,
 }
 
 impl SessionConfig {
@@ -761,6 +867,7 @@ impl SessionConfig {
             allowed_appl_versions: Vec::new(),
             require_ack_default_appl_ver_id: false,
             send_next_expected_msg_seq_num: false,
+            gap_policy: GapPolicy::Discard,
         }
     }
 
@@ -782,7 +889,8 @@ impl SessionConfig {
     /// limit outside [`MIN_MESSAGE_SIZE_LIMIT`]..=[`MAX_MESSAGE_SIZE_LIMIT`],
     /// an [`SessionConfig::allowed_appl_versions`] set the session cannot
     /// honour, or [`SessionConfig::send_next_expected_msg_seq_num`] on a
-    /// version that does not define `NextExpectedMsgSeqNum` (789).
+    /// version that does not define `NextExpectedMsgSeqNum` (789), or a
+    /// [`GapPolicy::Queue`] bound outside its range.
     pub fn validate(&self) -> Result<(), SessionConfigError> {
         validate_id("begin_string", &self.begin_string)?;
         validate_heartbeat_interval(self.heartbeat_interval)?;
@@ -809,7 +917,11 @@ impl SessionConfig {
             }
         }
         validate_appl_versions(&self.begin_string, &self.allowed_appl_versions)?;
-        validate_next_expected_msg_seq_num(&self.begin_string, self.send_next_expected_msg_seq_num)
+        validate_next_expected_msg_seq_num(
+            &self.begin_string,
+            self.send_next_expected_msg_seq_num,
+        )?;
+        validate_gap_policy(self.gap_policy)
     }
 
     /// Whether `version` is an application version this session accepts from
@@ -982,6 +1094,14 @@ impl SessionConfig {
         self
     }
 
+    /// Sets what happens to messages above a gap; see
+    /// [`SessionConfig::gap_policy`]. Checked by [`SessionConfig::validate`].
+    #[must_use]
+    pub const fn with_gap_policy(mut self, policy: GapPolicy) -> Self {
+        self.gap_policy = policy;
+        self
+    }
+
     /// Sets the bound on garbled inbound frames; `None` removes it.
     ///
     /// See [`SessionConfig::garbled_frame_limit`] for what the bound does and
@@ -1095,6 +1215,8 @@ pub struct SessionConfigBuilder {
     require_ack_default_appl_ver_id: bool,
     /// Use `NextExpectedMsgSeqNum` (789) on the Logon exchange.
     send_next_expected_msg_seq_num: bool,
+    /// What happens to messages above a gap.
+    gap_policy: GapPolicy,
 }
 
 impl Default for SessionConfigBuilder {
@@ -1119,6 +1241,7 @@ impl Default for SessionConfigBuilder {
             allowed_appl_versions: Vec::new(),
             require_ack_default_appl_ver_id: false,
             send_next_expected_msg_seq_num: false,
+            gap_policy: GapPolicy::Discard,
         }
     }
 }
@@ -1321,6 +1444,17 @@ impl SessionConfigBuilder {
         self
     }
 
+    /// Sets what happens to messages above a gap (default
+    /// [`GapPolicy::Discard`]); a [`GapPolicy::Queue`] bound outside its
+    /// range is refused by [`SessionConfigBuilder::build`] with
+    /// [`SessionConfigError::GapQueueOutOfRange`]. See
+    /// [`SessionConfig::gap_policy`].
+    #[must_use = "builders do nothing unless .build() is called"]
+    pub const fn gap_policy(mut self, policy: GapPolicy) -> Self {
+        self.gap_policy = policy;
+        self
+    }
+
     /// Builds the configuration, validating every knob.
     ///
     /// # Errors
@@ -1384,6 +1518,7 @@ impl SessionConfigBuilder {
             allowed_appl_versions: self.allowed_appl_versions,
             require_ack_default_appl_ver_id: self.require_ack_default_appl_ver_id,
             send_next_expected_msg_seq_num: self.send_next_expected_msg_seq_num,
+            gap_policy: self.gap_policy,
         };
         config.validate()?;
         Ok(config)
@@ -2218,6 +2353,52 @@ mod tests {
         .to_string();
         assert!(message.contains("FIX.4.2"), "{message}");
         assert!(message.contains("789"), "{message}");
+    }
+
+    #[test]
+    fn test_gap_policy_defaults_to_discard() {
+        assert_eq!(config().gap_policy, GapPolicy::Discard);
+        assert_eq!(built(required()).gap_policy, GapPolicy::Discard);
+        assert_eq!(GapPolicy::default(), GapPolicy::Discard);
+    }
+
+    #[test]
+    fn test_builder_gap_policy_queue_lands_in_the_built_config() {
+        let queue = GapPolicy::Queue {
+            max_messages: 100,
+            max_bytes: 1 << 20,
+        };
+        assert_eq!(built(required().gap_policy(queue)).gap_policy, queue);
+        assert_eq!(config().with_gap_policy(queue).gap_policy, queue);
+        let bounds = GapPolicy::Queue {
+            max_messages: MAX_GAP_QUEUE_MESSAGES,
+            max_bytes: MAX_GAP_QUEUE_BYTES,
+        };
+        assert_eq!(built(required().gap_policy(bounds)).gap_policy, bounds);
+    }
+
+    #[test]
+    fn test_gap_policy_queue_out_of_range_is_refused() {
+        let cases = [
+            (0, 1),
+            (1, 0),
+            (MAX_GAP_QUEUE_MESSAGES + 1, 1),
+            (1, MAX_GAP_QUEUE_BYTES + 1),
+        ];
+        for (max_messages, max_bytes) in cases {
+            let policy = GapPolicy::Queue {
+                max_messages,
+                max_bytes,
+            };
+            let expected = SessionConfigError::GapQueueOutOfRange {
+                max_messages,
+                max_bytes,
+                max_messages_limit: MAX_GAP_QUEUE_MESSAGES,
+                max_bytes_limit: MAX_GAP_QUEUE_BYTES,
+            };
+            assert_eq!(build_error(required().gap_policy(policy)), expected);
+            assert_eq!(config().with_gap_policy(policy).validate(), Err(expected));
+        }
     }
 
     #[test]

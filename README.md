@@ -121,7 +121,10 @@ engine wiring (#96) does not exist.
 - **One session reactor shared by both roles.** Once Logon completes, the
   engine owns the socket: heartbeats and TestRequests at the negotiated
   interval, CompID and `SendingTime` validation, sequence-gap detection with
-  bounded `ResendRequest` recovery, `SequenceReset` / gap fill, `PossDupFlag`
+  bounded `ResendRequest` recovery, an opt-in bounded queue that keeps
+  messages received above a gap and releases them in order once it is filled
+  (`SessionConfig::gap_policy`, `GapPolicy::Queue`; `Discard` is the default;
+  `doc/adr/0027-gap-queue.md`), `SequenceReset` / gap fill, `PossDupFlag`
   and `OrigSendingTime` handling, session-level `Reject`, a write timeout
   (output the stream accepts none of for that long closes the session), the
   Logout handshake (whose timeout starts once the Logout has been written

@@ -760,7 +760,8 @@ of it (bytes accepted by the local stream, not received by the
 counterparty). Nothing
 that takes a new number is written in the middle of a resend: a new number
 inside the range being answered would leave a receiver that does
-not queue gapped messages (IronFix itself, until #71) waiting for it. Until the
+not queue gapped messages (IronFix itself under the default
+`GapPolicy::Discard`) waiting for it. Until the
 resend is done, live application messages (and a Logout the consumer asks for)
 wait in the outbound queue; a Heartbeat answering a TestRequest, a session
 Reject and the session's own `ResendRequest` for an inbound gap are held back
@@ -984,6 +985,33 @@ first). Once the attempts are spent the session is logged out with a `Text` (58)
 naming the stalled sequence number, turning a silent stall into an observable,
 graceful close. Any in-sequence message clears the outstanding request, so the
 timer measures a gap that is making no progress at all, not a slow replay.
+
+**Messages above a gap: `SessionConfig::gap_policy`.** FIX lets a receiver
+either drop the messages that arrive above an open gap and take them from the
+resend, or keep them and process them in order once the gap is filled; the
+specification says nothing about bounds or about how a kept message meets a
+`SequenceReset` or a Logout. IronFix offers both, in both roles
+(`doc/adr/0027-gap-queue.md`):
+
+- `GapPolicy::Discard` (the default, and the only behaviour before #71): an
+  application message above the gap is dropped; an administrative message is
+  acted on at once (a TestRequest answered, a ResendRequest served) and its
+  number left for the resend to gap-fill; a gapped `SequenceReset`-GapFill is
+  not applied.
+- `GapPolicy::Queue { max_messages, max_bytes }`: the same `ResendRequest`
+  goes out (the counterparty cannot know what was kept), and the messages
+  above the gap are kept, keyed by `MsgSeqNum`. Application messages and
+  gapped gap fills are kept whole and released in order through the normal
+  in-sequence path (the FIXT `ApplVerID` check, the target persist before the
+  expectation moves, `from_app`); other administrative messages are still
+  acted on at once and only their number is kept and consumed in turn. A
+  second copy of a held number is dropped, and once released the resent
+  copies arrive below the expectation with `PossDupFlag` = Y and are ignored,
+  so nothing is delivered twice. Held numbers that a gap fill jumps past are
+  dropped; an accepted `SequenceReset`-Reset, a Logout from the counterparty
+  and the session's own Logout drop the whole queue. Past either bound a
+  further message is discarded as under `Discard`, the session stays up, and
+  the resend delivers it.
 
 ---
 
