@@ -26,6 +26,15 @@
 //! - **Live sends with a `MemoryStore`**: the same, each frame filed before
 //!   it is fed. [`STORED_LIVE_BLOCKS`] blocks per message (see there), plus
 //!   the store's B-tree nodes.
+//! - **Throttled live sends** (issue #82): the same as the live sends, with
+//!   an outbound throttle of [`THROTTLE_RATE`] messages per second and a
+//!   burst of [`THROTTLE_BURST`]. The orders are queued at once, so they wait
+//!   in the throttle's queue and leave one per token, released by its timer.
+//!   One block per message, as without the throttle: the queue keeps the
+//!   capacity the warm-up gave it and the release timer is reset, not
+//!   rebuilt. The window also checks it was throttled: it cannot take less
+//!   than the time the throttle needs to earn the window's tokens, a lower
+//!   bound the throttle guarantees whatever the machine.
 //! - **Replies**: the acceptor sends [`MESSAGES`] TestRequests and the
 //!   initiator answers each with a Heartbeat echoing its `TestReqID` (112).
 //!   [`REPLY_BLOCKS`] blocks per reply: the `from_admin` and `to_admin`
@@ -62,13 +71,14 @@
 //!
 //! It runs without the libtest harness (`harness = false` in `Cargo.toml`), so
 //! no other test and no harness thread allocates while it measures. It
-//! asserts counts and sizes, never timings, and holds in debug and release
-//! builds.
+//! asserts counts and sizes, and no timing but the throttled window's lower
+//! bound, and holds in debug and release builds.
 
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use ironfix_core::message::MsgType;
 use ironfix_core::types::{CompId, Timestamp};
+use ironfix_engine::throttle::{ThrottleBudget, ThrottleConfig, ThrottlePolicy};
 use ironfix_engine::{Connection, Initiator, NoOpApplication, OutboundMessage};
 use ironfix_session::SessionConfig;
 use ironfix_store::{MemoryStore, MessageStore};
@@ -127,6 +137,18 @@ const SLACK: u64 = MESSAGES / 16;
 /// Bytes each direction of the pipe holds: far less than a window's output,
 /// so the flush waits on the stream and output waits in the write buffer.
 const PIPE_BYTES: usize = 4 * 1024;
+
+/// Messages per second the throttled window's budget earns: fast enough to
+/// keep the window short, slow enough that the orders, queued at once, wait
+/// in the throttle's queue.
+const THROTTLE_RATE: u32 = 4_096;
+
+/// The throttled window's burst, in messages.
+const THROTTLE_BURST: u32 = 8;
+
+/// The throttled window's queue depth: room for every order of the window
+/// and its warm-up, so none is refused.
+const THROTTLE_DEPTH: usize = 4_096;
 
 /// Fails the test with context instead of `.unwrap()` / `.expect()`.
 #[track_caller]
@@ -406,29 +428,46 @@ struct Window {
     refused: u64,
 }
 
+/// The throttle of the throttled window: one budget of [`THROTTLE_RATE`]
+/// messages per second, with a burst of [`THROTTLE_BURST`].
+fn throttle() -> ThrottleConfig {
+    let budget = ThrottleBudget::new(THROTTLE_RATE, Duration::from_secs(1))
+        .with_burst(THROTTLE_BURST)
+        .with_policy(ThrottlePolicy::Queue {
+            max_depth: THROTTLE_DEPTH,
+        });
+    ok(
+        ThrottleConfig::builder(budget).build(),
+        "the throttle builds",
+    )
+}
+
 /// Sends `MESSAGES` live orders on `session` after `WARM_UP` and measures
-/// the window.
+/// the window, and how long it took.
 async fn measure_live(
     session: &Session,
     orders: &mut impl Iterator<Item = OutboundMessage>,
-) -> Window {
+) -> (Window, std::time::Duration) {
     for message in orders.by_ref().take(usize::try_from(WARM_UP).unwrap_or(0)) {
         ok(session.connection.send(message).await, "a warm-up order");
     }
     wait_for_frames(&session.frames, WARM_UP).await;
     let (writes, refused) = session.counts.snapshot();
+    let started = std::time::Instant::now();
     let before = blocks();
     for message in orders.by_ref().take(usize::try_from(MESSAGES).unwrap_or(0)) {
         ok(session.connection.send(message).await, "an order");
     }
     wait_for_frames(&session.frames, WARM_UP + MESSAGES).await;
     let blocks = blocks() - before;
+    let elapsed = started.elapsed();
     let (writes_after, refused_after) = session.counts.snapshot();
-    Window {
+    let window = Window {
         blocks,
         writes: writes_after - writes,
         refused: refused_after - refused,
-    }
+    };
+    (window, elapsed)
 }
 
 fn main() {
@@ -468,11 +507,13 @@ fn main() {
     };
     let mut live = window_orders();
     let mut stored_live = window_orders();
+    let mut throttled_live = window_orders();
     let warm_up_pings = test_requests(2, WARM_UP);
     let pings = test_requests(2 + WARM_UP, MESSAGES);
     let pile_up = test_requests(2 + WARM_UP + MESSAGES, PILE_UP);
     let sending = initiator(None);
     let storing = initiator(Some(Arc::new(MemoryStore::new())));
+    let throttling = initiator(None).with_throttle(throttle());
     let resending = initiator(Some(store));
 
     let _profiler = dhat::Profiler::builder().testing().build();
@@ -480,7 +521,7 @@ fn main() {
         // Live sends, with no store; then replies and the pile-up on the
         // same session.
         let mut session = log_on(sending).await;
-        let live_window = measure_live(&session, &mut live).await;
+        let (live_window, _) = measure_live(&session, &mut live).await;
 
         let base = session.frames.load(Ordering::Relaxed);
         ok(
@@ -523,7 +564,13 @@ fn main() {
 
         // Live sends with a store attached.
         let session = log_on(storing).await;
-        let stored_live_window = measure_live(&session, &mut stored_live).await;
+        let (stored_live_window, _) = measure_live(&session, &mut stored_live).await;
+        session.counter.abort();
+        drop(session);
+
+        // Live sends held back by the outbound throttle.
+        let session = log_on(throttling).await;
+        let throttled_window = measure_live(&session, &mut throttled_live).await;
         session.counter.abort();
         drop(session);
 
@@ -554,13 +601,15 @@ fn main() {
             live_window,
             reply_window,
             stored_live_window,
+            throttled_window,
             resend_window,
             largest,
             piled_up,
             retained,
         )
     });
-    let (live, reply, stored_live, resend, largest, piled_up, retained) = measured;
+    let (live, reply, stored_live, (throttled, throttled_for), resend, largest, piled_up, retained) =
+        measured;
 
     // Each window went through the write buffer with the flush waiting on
     // the stream: the stream refused writes for want of room.
@@ -598,6 +647,24 @@ fn main() {
         "{MESSAGES} live sends with a store allocated {} blocks; each must allocate \
          {STORED_LIVE_BLOCKS}, plus the store's B-tree nodes",
         stored_live.blocks
+    );
+    assert!(
+        (MESSAGES..=MESSAGES + SLACK).contains(&throttled.blocks),
+        "{MESSAGES} throttled live sends allocated {} blocks; each must allocate one (the \
+         async_trait future of to_app), as without the throttle, and the window at most {SLACK} \
+         more",
+        throttled.blocks
+    );
+    // At most THROTTLE_BURST tokens were waiting when the window began; every
+    // other order waited for one, earned every 1 s / THROTTLE_RATE.
+    let spacing = Duration::from_secs(1)
+        .as_nanos()
+        .div_ceil(u128::from(THROTTLE_RATE));
+    let throttled_floor = spacing * u128::from(MESSAGES - u64::from(THROTTLE_BURST));
+    assert!(
+        throttled_for.as_nanos() >= throttled_floor,
+        "the throttled window took {throttled_for:?}, less than the {throttled_floor} ns its \
+         tokens take: the orders were not throttled"
     );
     let replies = REPLY_BLOCKS * MESSAGES;
     assert!(

@@ -208,6 +208,28 @@ engine wiring (#96) does not exist.
   or `ResetSeqNumFlag` on the next Logon), the store still holds it, and the
   counterparty asks. `Connection::send` stays fire-and-forget and allocates
   nothing for tracking (`doc/adr/0023-outbound-veto-and-send-outcomes.md`).
+- **An optional per-session outbound throttle** in both roles, attached with
+  `with_throttle` on the `Initiator`, the `Acceptor` or the `EngineBuilder`
+  (a session an `AcceptorRegistry` routes keeps its `Acceptor`'s). A
+  `ThrottleConfig` holds up to 16 token-bucket budgets, each a rate per
+  window and a burst (default 1, which keeps a session within a venue limit
+  of `rate` per window wherever the venue places it), with an optional
+  classifier so cancels can have a budget of their own. A message that finds
+  no token is held in order, up to `max_depth`, or refused, per budget
+  (`ThrottlePolicy::Queue` or `Refuse`); a refusal reports `NotSent` with
+  `Throttled` through `send_tracked`, before a `MsgSeqNum` is spent or the
+  store touched, and a held message goes through `to_app_checked` only when
+  it is released. Administrative messages (Heartbeats and TestRequest
+  answers, ResendRequests, gap fills, Rejects, Logouts) and replays are never
+  throttled; this session's Logout goes out at once and what the throttle
+  holds then reports `DiscardedByThrottle`. `Connection::inbound_app_messages`
+  counts the counterparty's application messages, so an application can
+  refuse over-rate ones in `from_app`. The decision is synchronous over the
+  driver's clock, tested on a paused Tokio clock; a throttled send allocates
+  nothing more than an unthrottled one in steady state, and a budget's queue
+  keeps the capacity of its deepest fill until the session ends: `max_depth`
+  bounds the messages held, and the queue's allocation may round up past it
+  (128 slots for a depth of 65) (`doc/adr/0024-outbound-throttle.md`).
 - **`NextExpectedMsgSeqNum` (789) on Logon**, opt-in with
   `SessionConfig::send_next_expected_msg_seq_num` on FIX.4.4 and FIXT.1.1
   sessions (refused below FIX.4.4), in both roles. The Logon and its
@@ -309,6 +331,13 @@ around it.
   `toApp` on each resent application message and gap-fills one that throws
   `DoNotSend`; IronFix does not yet, so a gate cannot stop a stale order from
   being resent.
+- **Throttle limits.** Replays and administrative messages take no token, so
+  a venue that counts them against its limit can see a large resend, or the
+  heartbeats, on top of the budget. A budget's state does not outlive its
+  session: a reconnect starts with full budgets. The release timer has
+  Tokio's one-millisecond resolution, so a budget faster than one message per
+  millisecond keeps its rate only with a burst of at least a millisecond's
+  worth of tokens. The inbound side is a count, not an engine-enforced limit.
 - **Store limits.** There is no memory-mapped store. `FileStore`'s journal
   grows with every outbound frame until the sequence is reset: its counters
   sit in two fixed slots, so inbound traffic does not grow it, and compaction

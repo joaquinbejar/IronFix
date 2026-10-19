@@ -18,8 +18,8 @@
 //! - [`SendOutcome::NotSent`]: the engine guarantees that **no byte** of the
 //!   frame reached the stream, and no `MsgSeqNum` was spent on it. The
 //!   [`NotSentReason`] says why: refused by the application, not a message
-//!   the session carries, refused by the store, or discarded because the
-//!   session ended first.
+//!   the session carries, refused by the store, refused by the session's
+//!   outbound throttle, or discarded because the session ended first.
 //! - [`SendOutcome::Unknown`]: the frame was built and its `MsgSeqNum`
 //!   spent (it was being filed, or it was in the session's write buffer)
 //!   when the session stopped before a flush covering it completed: the
@@ -83,6 +83,7 @@
 
 use crate::application::RejectReason;
 use crate::error::EngineError;
+use crate::throttle::BudgetId;
 use ironfix_core::error::EncodeError;
 use ironfix_core::types::Timestamp;
 use tokio::sync::oneshot;
@@ -252,6 +253,27 @@ pub enum NotSentReason {
     /// takes a new number is written in the middle of a resend.
     #[non_exhaustive]
     DiscardedBehindResend {},
+    /// The session's outbound throttle refused the message (see
+    /// [`crate::throttle`]): its budget had no token, and either the budget's
+    /// policy is [`ThrottlePolicy::Refuse`](crate::ThrottlePolicy::Refuse)
+    /// or its [`ThrottlePolicy::Queue`](crate::ThrottlePolicy::Queue) already
+    /// held `max_depth` messages. It was refused before
+    /// [`Application::to_app_checked`](crate::Application::to_app_checked)
+    /// ran, before a `MsgSeqNum` was peeked and before the store was touched.
+    /// The session carries on.
+    #[non_exhaustive]
+    Throttled {
+        /// The budget that refused it.
+        budget: BudgetId,
+    },
+    /// The message was held by the outbound throttle, waiting for a token,
+    /// when this session's own Logout was framed or the session ended: no
+    /// message held by the throttle is written after the Logout.
+    #[non_exhaustive]
+    DiscardedByThrottle {
+        /// The budget that held it.
+        budget: BudgetId,
+    },
 }
 
 impl NotSentReason {

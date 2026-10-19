@@ -26,6 +26,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 dhat.workspace = true
+# The outbound throttle tests (#82) run on a paused clock
+# (`#[tokio::test(start_paused = true)]`), which needs `test-util`: a feature
+# of a dependency the crate already has, adding no crate.
+tokio = { workspace = true, features = ["test-util"] }
 
 # Installs dhat as the global allocator to count the allocations of the
 # reactor's write path, so it runs as its own binary without the libtest

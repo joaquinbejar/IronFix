@@ -191,6 +191,7 @@ use crate::reactor::{
     refuse_handshake, send_handshake_admin, session_codec, spawn_session,
 };
 use crate::stream::SessionStream;
+use crate::throttle::ThrottleConfig;
 use crate::wire::{
     self, ApplVersionGuard, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard,
     UnsupportedVersion,
@@ -287,6 +288,9 @@ pub struct Acceptor<A: Application = NoOpApplication> {
     /// concurrent Logon for a session already established is refused rather than
     /// forking it. See [`AdmissionGuard`].
     admitted: Arc<Mutex<HashSet<SessionId>>>,
+    /// The outbound throttle each admitted session gets its own budgets
+    /// from, if any.
+    throttle: Option<ThrottleConfig>,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
@@ -304,6 +308,7 @@ impl<A: Application> std::fmt::Debug for Acceptor<A> {
             .field("app_queue_capacity", &self.app_queue_capacity)
             .field("store", &self.store)
             .field("store_timeout", &self.store.timeout(self.write_timeout))
+            .field("throttle", &self.throttle)
             .finish_non_exhaustive()
     }
 }
@@ -339,6 +344,7 @@ impl<A: Application + 'static> Acceptor<A> {
             app_queue_capacity: DEFAULT_APP_QUEUE_CAPACITY,
             store: StoreAttachment::default(),
             admitted: Arc::new(Mutex::new(HashSet::new())),
+            throttle: None,
         }
     }
 
@@ -572,6 +578,43 @@ impl<A: Application + 'static> Acceptor<A> {
     pub fn with_outbound_capacity(mut self, capacity: usize) -> Self {
         self.outbound_capacity = capacity.max(1);
         self
+    }
+
+    /// Attaches an outbound throttle to every session this acceptor admits: an optional per-session rate
+    /// limit on new outbound application messages (see [`crate::throttle`]).
+    ///
+    /// Each session gets its own budgets from `throttle`, full when it
+    /// becomes Active. A new application message takes a token from the
+    /// budget the classifier puts it in; one that finds none is held, in
+    /// order, or refused, as the budget's [`ThrottlePolicy`](crate::ThrottlePolicy)
+    /// says, and a refusal reports
+    /// [`NotSentReason::Throttled`](crate::NotSentReason::Throttled) through
+    /// [`Connection::send_tracked`]. A held message goes through
+    /// `to_app_checked`, takes its `MsgSeqNum` and is filed only when it is
+    /// released. Administrative messages (Heartbeats, the replies to
+    /// TestRequests, ResendRequests, Rejects, Logouts) and resends of filed
+    /// frames are never throttled. This session's own Logout goes out at
+    /// once, and what the throttle still holds then reports
+    /// [`NotSentReason::DiscardedByThrottle`](crate::NotSentReason::DiscardedByThrottle).
+    ///
+    /// Without a throttle (the default) messages are framed as fast as they
+    /// are queued. A session routed by an
+    /// [`AcceptorRegistry`](crate::AcceptorRegistry) gets the throttle of the
+    /// `Acceptor` it is routed to: the registry holds no throttle of its own.
+    ///
+    /// # Arguments
+    /// * `throttle` - The budgets and classifier, checked by
+    ///   [`ThrottleConfigBuilder::build`](crate::ThrottleConfigBuilder::build)
+    #[must_use]
+    pub fn with_throttle(mut self, throttle: ThrottleConfig) -> Self {
+        self.throttle = Some(throttle);
+        self
+    }
+
+    /// Returns the outbound throttle attached with `with_throttle`, if any.
+    #[must_use]
+    pub const fn throttle(&self) -> Option<&ThrottleConfig> {
+        self.throttle.as_ref()
     }
 
     /// Returns the session configuration.
@@ -1612,6 +1655,7 @@ impl<A: Application + 'static> Acceptor<A> {
             write_timeout,
             outbound_capacity: self.outbound_capacity,
             app_queue_capacity: self.app_queue_capacity,
+            throttle: self.throttle.clone(),
         };
         let (command_tx, closed_rx) = spawn_session(params, admission);
 

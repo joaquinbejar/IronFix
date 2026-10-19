@@ -17,6 +17,7 @@ use crate::outbound::OutboundMessage;
 use crate::outcome::{NotSentReason, Receipt, SendOutcome};
 use ironfix_core::version::FixVersion;
 use ironfix_session::{HeartbeatManager, SequenceManager};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc, watch};
 
@@ -47,6 +48,9 @@ pub(crate) struct SessionRuntime {
     /// checked it; unset on a FIX 4.x session and when it declared none.
     /// Set at most once, during the handshake, and read-only afterwards.
     pub(crate) counterparty_default_appl_version: OnceLock<FixVersion>,
+    /// Inbound application messages the reactor has accepted in sequence and
+    /// handed to the application. Written by the reactor alone.
+    inbound_app_messages: AtomicU64,
 }
 
 impl SessionRuntime {
@@ -57,6 +61,17 @@ impl SessionRuntime {
             sequences,
             heartbeat: Mutex::new(heartbeat),
             counterparty_default_appl_version: OnceLock::new(),
+            inbound_app_messages: AtomicU64::new(0),
+        }
+    }
+
+    /// Counts one more inbound application message handed to the
+    /// application. Only the reactor calls this, so a load and a store
+    /// suffice; at `u64::MAX` the count stops moving rather than wrapping.
+    pub(crate) fn record_inbound_app_message(&self) {
+        let count = self.inbound_app_messages.load(Ordering::Relaxed);
+        if let Some(next) = count.checked_add(1) {
+            self.inbound_app_messages.store(next, Ordering::Relaxed);
         }
     }
 
@@ -167,6 +182,21 @@ impl Connection {
     /// A caller that must not wait can bound the call with
     /// `tokio::time::timeout`; a message whose `send` was abandoned that way
     /// was not queued.
+    ///
+    /// # With an outbound throttle
+    ///
+    /// With a [`ThrottleConfig`](crate::ThrottleConfig) attached, the session
+    /// goes on taking messages from the queue while it holds them back to
+    /// their budget's rate (see [`crate::throttle`]): a message its budget
+    /// cannot take now is held, in order, or refused, by the budget's
+    /// policy, so the queue does not fill because of the throttle. A refused
+    /// plain `send` is dropped with a warning (counted per budget), having
+    /// spent no `MsgSeqNum`; [`Connection::send_tracked`] reports it as
+    /// [`NotSentReason::Throttled`], so prefer `send_tracked` whenever a
+    /// throttle is attached. A Logout, whether asked for with
+    /// [`Connection::logout`] or caused by dropping every handle, goes out
+    /// at once, and the messages still held by the throttle are discarded
+    /// rather than written after it.
     pub async fn send(&self, message: OutboundMessage) -> Result<(), EngineError> {
         crate::outbound::check_sendable(&message)?;
         self.commands
@@ -204,10 +234,13 @@ impl Connection {
     ///   [`NotSentReason::Vetoed`] when `to_app_checked` refused it,
     ///   [`NotSentReason::StoreRefused`] when the store refused it under
     ///   [`StoreFailurePolicy::CloseSession`](crate::StoreFailurePolicy::CloseSession),
-    ///   [`NotSentReason::SequenceExhausted`], and, when the session ends
+    ///   [`NotSentReason::SequenceExhausted`],
+    ///   [`NotSentReason::Throttled`] when the session's outbound throttle
+    ///   refused it (see [`crate::throttle`]), and, when the session ends
     ///   first, [`NotSentReason::SessionClosed`],
-    ///   [`NotSentReason::LogoutPending`], [`NotSentReason::Discarded`] or
-    ///   [`NotSentReason::DiscardedBehindResend`];
+    ///   [`NotSentReason::LogoutPending`], [`NotSentReason::Discarded`],
+    ///   [`NotSentReason::DiscardedBehindResend`] or
+    ///   [`NotSentReason::DiscardedByThrottle`];
     /// - [`SendOutcome::Unknown`] when the frame was numbered (being filed,
     ///   or waiting in the write buffer) and the session ended before a flush
     ///   covering it completed: a number is spent when the frame is
@@ -351,6 +384,26 @@ impl Connection {
     #[must_use]
     pub fn next_target_seq(&self) -> u64 {
         self.runtime.sequences.next_target_seq().value()
+    }
+
+    /// Returns how many inbound application messages the session has
+    /// accepted in sequence and handed to
+    /// [`Application::from_app`](crate::Application::from_app) since it
+    /// became Active.
+    ///
+    /// It counts when the session reads the message, not when `from_app`
+    /// returns, so it is the counterparty's sending rate as the session sees
+    /// it. Read it twice to get the rate over any window the application
+    /// chooses: an acceptor that protects itself can then refuse
+    /// over-rate messages in `from_app`, with a `RejectReason` that the
+    /// session sends as a Reject (3). Messages refused for their application
+    /// version, and messages inside a sequence gap, are not counted; a
+    /// message the counterparty resends after a gap is counted once, when
+    /// it is accepted. The count is per session and starts at 0 on every new
+    /// session.
+    #[must_use]
+    pub fn inbound_app_messages(&self) -> u64 {
+        self.runtime.inbound_app_messages.load(Ordering::Relaxed)
     }
 
     /// Returns the default application version the counterparty declared in
