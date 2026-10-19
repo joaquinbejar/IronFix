@@ -2130,6 +2130,12 @@ impl<A: Application> Reactor<A> {
                 if resend_ready && let Some(reads) = self.reads_since_resend_step.checked_add(1) {
                     self.reads_since_resend_step = reads;
                 }
+                // The same poll can write a probe whole, leave the flush
+                // pending and return the counterparty's answer to it: arm
+                // the probe first, so the answer clears it instead of a
+                // deadline being armed afterwards for a probe already
+                // answered.
+                self.advance_probes();
                 self.on_inbound_event(framed, phase, inbound).await
             }
         }

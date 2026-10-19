@@ -1805,3 +1805,167 @@ async fn test_a_buffered_resend_request_does_not_spend_its_retries() {
     }
     assert!(!client.is_closed(), "the session stays up");
 }
+
+#[derive(Debug, Default)]
+struct ReplyBeforeFlushControl {
+    stage: AtomicU64,
+    waker: Mutex<Option<std::task::Waker>>,
+}
+
+impl ReplyBeforeFlushControl {
+    fn set_stage(&self, stage: u64) {
+        self.stage.store(stage, Ordering::SeqCst);
+        if let Some(waker) = ok(self.waker.lock(), "control lock").take() {
+            waker.wake();
+        }
+    }
+}
+
+/// A full duplex stream may expose a reply while its flush is still pending.
+/// Stage 1 holds output. Stage 2 accepts the queued frames, synthesizes the
+/// immediate matching peer reply, and holds only flush. Stage 3 resumes normal IO.
+#[derive(Debug)]
+struct ReplyBeforeFlushStream {
+    io: DuplexStream,
+    control: Arc<ReplyBeforeFlushControl>,
+    captured: BytesMut,
+    injected: BytesMut,
+    codec: FixCodec,
+}
+
+impl AsyncRead for ReplyBeforeFlushStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.injected.is_empty() {
+            let n = buf.remaining().min(self.injected.len());
+            buf.put_slice(&self.injected.split_to(n));
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ReplyBeforeFlushStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.control.stage.load(Ordering::SeqCst) == 1 {
+            *ok(self.control.waker.lock(), "control lock") = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        let result = Pin::new(&mut self.io).poll_write(cx, buf);
+        if self.control.stage.load(Ordering::SeqCst) == 2
+            && let Poll::Ready(Ok(n)) = &result {
+                self.captured.extend_from_slice(&buf[..*n]);
+                loop {
+                    let this = &mut *self;
+                    match tokio_util::codec::Decoder::decode(&mut this.codec, &mut this.captured) {
+                        Ok(Some(frame)) if field(&frame, 35).as_deref() == Some("1") => {
+                            let id = some(field(&frame, 112), "probe id");
+                            this.injected.extend_from_slice(&peer_frame(
+                                "VENUE",
+                                "CLIENT",
+                                "0",
+                                2,
+                                &[(112, &id)],
+                            ));
+                        }
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(err) => panic!("captured frame: {err}"),
+                    }
+                }
+            }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.control.stage.load(Ordering::SeqCst) == 2 {
+            *ok(self.control.waker.lock(), "control lock") = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
+/// Issue #142 follow-up: one poll of the socket writes the TestRequest
+/// whole, leaves the flush pending and returns the matching Heartbeat. The
+/// TestRequest is armed before the Heartbeat is handled, so the Heartbeat
+/// clears it and no deadline is armed afterwards for a probe already
+/// answered: the session does not time out.
+#[tokio::test]
+async fn test_an_answer_in_the_same_poll_as_the_whole_write_clears_the_test_request() {
+    let (client_io, venue_io) = tokio::io::duplex(8192);
+    let control = Arc::new(ReplyBeforeFlushControl::default());
+    let stream = ReplyBeforeFlushStream {
+        io: client_io,
+        control: control.clone(),
+        captured: BytesMut::new(),
+        injected: BytesMut::new(),
+        codec: FixCodec::new(),
+    };
+    let (app, _) = RecordingApp::new();
+    let seen_heartbeats = app.heartbeats.clone();
+    let initiator = Initiator::new(
+        client_config().with_heartbeat_interval(Duration::from_secs(1)),
+        app,
+    )
+    .with_write_timeout(Duration::from_secs(10));
+    let establishing = tokio::spawn(async move { initiator.establish(stream).await });
+    let mut venue = Framed::new(venue_io, FixCodec::new());
+    let logon = next_frame(&mut venue).await;
+    assert_eq!(field(&logon, 35).as_deref(), Some("A"));
+    ok(
+        venue
+            .send(peer_frame(
+                "VENUE",
+                "CLIENT",
+                "A",
+                1,
+                &[(98, "0"), (108, "1")],
+            ))
+            .await,
+        "ack",
+    );
+    let client = ok(ok(establishing.await, "join"), "establish");
+    control.set_stage(1);
+    ok(
+        timeout(Duration::from_secs(3), async {
+            while client.next_sender_seq() < 4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await,
+        "heartbeat and TestRequest queued",
+    );
+    control.set_stage(2);
+    ok(
+        timeout(Duration::from_secs(1), async {
+            while seen_heartbeats.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await,
+        "the matching peer reply was accepted before flush",
+    );
+    assert_eq!(
+        client.next_target_seq(),
+        3,
+        "the reply consumed peer sequence 2"
+    );
+    control.set_stage(3);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(
+        !client.is_timed_out(),
+        "a matching Heartbeat accepted in the write-completion poll must clear that TestRequest; a new probe is not due until 1250ms of fresh silence"
+    );
+}
