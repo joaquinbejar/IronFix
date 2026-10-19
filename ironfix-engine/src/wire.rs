@@ -38,7 +38,7 @@ use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::Timestamp;
 use ironfix_core::version::FixVersion;
 use ironfix_session::SessionConfig;
-use ironfix_tagvalue::{Decoder, Encoder};
+use ironfix_tagvalue::{Decoder, Encoder, FieldIndex};
 use std::time::Duration;
 
 /// Derives the [`SessionId`] from a session configuration.
@@ -1075,6 +1075,20 @@ fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
 pub(crate) fn decode_frame(frame: &[u8]) -> Result<RawMessage<'_>, DecodeError> {
     let mut decoder = Decoder::new(frame).with_checksum_validation(false);
     decoder.decode()
+}
+
+/// Decodes a framed FIX message through the session's reusable field index.
+///
+/// Same checks and errors as [`decode_frame`], plus
+/// [`DecodeError::TooManyFields`] when the message has more fields than
+/// `index` holds; the caller falls back to [`decode_frame`] then. The
+/// returned message borrows `frame` only, not `index`.
+pub(crate) fn decode_frame_into<'f>(
+    frame: &'f [u8],
+    index: &mut FieldIndex,
+) -> Result<RawMessage<'f>, DecodeError> {
+    let mut decoder = Decoder::new(frame).with_checksum_validation(false);
+    decoder.decode_into(index)?.to_raw_message()
 }
 
 /// Returns whether `frame`, which framed but failed to decode with `error`, is

@@ -33,3 +33,10 @@ harness = false
 [[test]]
 name = "sending_time_allocations"
 harness = false
+
+# Installs dhat as the global allocator to count the allocations of decoding a
+# 100-field message into a reused FieldIndex, as its own binary without the
+# libtest harness.
+[[test]]
+name = "field_index_allocations"
+harness = false

@@ -17,6 +17,11 @@
 //!   borrow the input buffer, so field values are never copied. The field index
 //!   is a `SmallVec<[FieldRef; 32]>`: it stays inline for the first 32 fields
 //!   and spills to the heap only for a message with more than 32 fields.
+//! - **Bounded, reusable field index**: [`Decoder::decode_into`] writes the
+//!   fields into a caller-owned [`FieldIndex`] of spans, allocated once and
+//!   never grown. Decoding a message that fits allocates nothing; a message
+//!   with more fields than the capacity is
+//!   [`ironfix_core::error::DecodeError::TooManyFields`].
 //! - **Dictionary-free**: [`Decoder`] is a byte scanner and does not know what
 //!   a tag means, so no schema lookup happens on the decode path. Validating a
 //!   message against a schema is a separate, opt-in pass in
@@ -57,6 +62,7 @@
 pub mod checksum;
 pub mod decoder;
 pub mod encoder;
+pub mod index;
 
 /// SOH (Start of Header), the byte that terminates every FIX field.
 ///
@@ -71,4 +77,5 @@ pub const EQUALS: u8 = b'=';
 pub use checksum::calculate_checksum;
 pub use decoder::Decoder;
 pub use encoder::Encoder;
+pub use index::{FieldIndex, FieldSpan, IndexedMessage};
 pub use ironfix_core::message::RawMessage;

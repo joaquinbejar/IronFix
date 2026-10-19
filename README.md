@@ -37,6 +37,11 @@ engine wiring (#96) does not exist.
 - **Decoding and encoding** FIX tag=value messages, including `BodyLength` (tag
   9) and `CheckSum` (tag 10) handling and length-prefixed Length/Data field
   pairs. Every malformed-input path is a typed error, never a panic.
+  `Decoder::decode_into` decodes into a caller-owned, fixed-capacity
+  `FieldIndex` reused across messages, so a message that fits allocates no
+  field index; one above the capacity is `DecodeError::TooManyFields`. The
+  engine decodes inbound frames into one index per session, sized by
+  `SessionConfig::max_inbound_fields` (`doc/adr/0028-bounded-field-index.md`).
 - **Framing** over a Tokio codec (`FixCodec`) with a bounded read buffer and an
   unconditionally verified trailer. Both engines skip garbled inbound frames (a
   bad `CheckSum` or `BodyLength`, bytes before `8=`, `MsgType` not third) as
