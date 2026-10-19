@@ -524,6 +524,8 @@ pub(crate) async fn send_handshake_admin<A: Application>(
 ///
 /// # Errors
 /// [`EngineError::Encode`] when the body has no legal wire form,
+/// [`EngineError::Codec`] with [`CodecError::MessageTooLarge`] when the frame
+/// is above the session's `max_message_size` (nothing filed, nothing spent),
 /// [`EngineError::SequenceExhausted`] when the sender counter has reached
 /// `u64::MAX`, [`EngineError::Store`] when a store write fails under the
 /// fail-closed policy, [`EngineError::WriteTimeout`] when the peer is not
@@ -546,6 +548,7 @@ async fn send_handshake(
     pending: &PendingMessage,
 ) -> Result<(), EngineError> {
     let seq = sequences.next_sender_seq().value();
+    let max_size = factory.max_message_size();
     let frame = match factory.encode(seq, pending) {
         Ok(frame) => frame,
         Err(err) => {
@@ -558,6 +561,23 @@ async fn send_handshake(
             return Err(err.into());
         }
     };
+    if frame.len() > max_size {
+        // Refused before filing, as the reactor refuses a live message
+        // (issue #139): the codec would refuse to send it, and a filed
+        // oversized frame would fail the same way on every replay of its
+        // number. Nothing is filed and no number is spent.
+        let err = EngineError::Codec(CodecError::MessageTooLarge {
+            size: frame.len(),
+            max_size,
+        });
+        if let Some(capture) = capture {
+            capture.unsent(
+                &SendOutcome::not_sent(NotSentReason::invalid(&err)),
+                FrameKind::Handshake,
+            );
+        }
+        return Err(err);
+    }
     let store = store.map(|store| (store.store, &mut store.persisted));
     if let Err(err) =
         file_and_spend(store, sequences, session_id, seq, pending.msg_type(), frame).await

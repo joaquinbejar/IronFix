@@ -30,7 +30,9 @@
 //! before it is filed and spends no number; `Sent` resolves for a frame once
 //! its last byte is written, while later output is still buffered.
 //! Issue #150, in both roles: over a stream whose flush never completes,
-//! every tracked send resolves and the write timeout closes the session.
+//! every tracked send resolves and the write timeout closes the session; a
+//! handshake Logon above `max_message_size` is refused with a typed error
+//! before it is filed.
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -2112,4 +2114,111 @@ async fn test_flush_that_never_completes_resolves_every_receipt_on_the_acceptor(
     let member = tokio::spawn(drain(framed.into_inner()));
     assert_flush_never_resolves_every_receipt(&venue, &hold).await;
     member.abort();
+}
+
+/// An application whose `to_admin` pushes a Text (58) of
+/// [`OVERSIZED_TEXT`] bytes onto every outbound Logon, taking it past
+/// [`SMALL_MAX_MESSAGE`].
+#[derive(Debug)]
+struct InflatingLogonApp;
+
+#[async_trait]
+impl Application for InflatingLogonApp {
+    async fn on_create(&self, _session_id: &SessionId) {}
+
+    async fn on_logon(&self, _session_id: &SessionId) {}
+
+    async fn on_logout(&self, _session_id: &SessionId) {}
+
+    async fn to_admin(&self, message: &mut OutboundMessage, _session_id: &SessionId) {
+        if *message.msg_type() == MsgType::Logon {
+            message.push_str(58, &"X".repeat(OVERSIZED_TEXT));
+        }
+    }
+
+    async fn from_admin(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_app(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+}
+
+/// Asserts that a handshake failed with the typed `MessageTooLarge`, and
+/// that the store filed nothing and spent no number for the oversized
+/// Logon.
+#[track_caller]
+fn assert_oversized_logon_refused<T: std::fmt::Debug>(
+    result: Result<T, ironfix_engine::EngineError>,
+    store: &MemoryStore,
+) {
+    match result {
+        Err(ironfix_engine::EngineError::Codec(
+            ironfix_transport::CodecError::MessageTooLarge { size, max_size },
+        )) => {
+            assert_eq!(max_size, SMALL_MAX_MESSAGE);
+            assert!(size > SMALL_MAX_MESSAGE, "{size}");
+        }
+        other => panic!("expected MessageTooLarge, got {other:?}"),
+    }
+    assert_eq!(store.message_count(), 0, "the oversized Logon is not filed");
+    assert_eq!(store.next_sender_seq(), 1, "no number is spent");
+}
+
+/// Follow-up to #139: an initiator's Logon above `max_message_size` is
+/// refused before it is filed, with a typed error, and nothing reaches the
+/// venue.
+#[tokio::test]
+async fn test_oversized_logon_is_refused_before_filing_on_the_initiator() {
+    let store = Arc::new(MemoryStore::new());
+    let initiator = Initiator::new(
+        member_config().with_max_message_size(SMALL_MAX_MESSAGE),
+        Arc::new(InflatingLogonApp),
+    )
+    .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_CAPACITY);
+    let result = ok(
+        timeout(STEP, initiator.establish(client_io)).await,
+        "the handshake ends",
+    );
+    assert_oversized_logon_refused(result, &store);
+    let mut venue = Framed::new(venue_io, FixCodec::new());
+    match timeout(QUIET, venue.next()).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(frame)) => panic!("nothing reaches the venue, got {frame:?}"),
+    }
+}
+
+/// Follow-up to #139: an acceptor's Logon acknowledgement above
+/// `max_message_size` is refused before it is filed, with a typed error,
+/// and no acknowledgement reaches the member.
+#[tokio::test]
+async fn test_oversized_logon_ack_is_refused_before_filing_on_the_acceptor() {
+    let store = Arc::new(MemoryStore::new());
+    let acceptor = Acceptor::new(
+        venue_config().with_max_message_size(SMALL_MAX_MESSAGE),
+        Arc::new(InflatingLogonApp),
+    )
+    .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_CAPACITY);
+    let served = tokio::spawn(async move { acceptor.serve_stream(venue_io).await });
+    let mut member = Framed::new(client_io, FixCodec::new());
+    venue_send(&mut member, frame_from("CLIENT", "VENUE", "A", 1, ACK)).await;
+    let result = joined(served, "the acceptor handshake ends").await;
+    assert_oversized_logon_refused(result, &store);
+    match timeout(QUIET, member.next()).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(frame)) => panic!("no acknowledgement reaches the member, got {frame:?}"),
+    }
 }
