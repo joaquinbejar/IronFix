@@ -424,17 +424,51 @@ completion). So while a resend is under way:
   (`Reactor::finish_resends`). A held `ResendRequest` is built then, from the
   gap as it stands, and skipped if the gap has closed; recovery is armed when
   it is held, so later gapped frames do not ask again, and its stall clock
-  restarts when it is written;
+  restarts when it is written. Recovery is armed with no attempt spent, and
+  the attempt against `max_resend_requests` is charged when the request is
+  written: a request a `to_admin` callback drops at write time never went
+  out, and with `max_resend_requests` = 1 charging it when held logged the
+  session out without ever asking (#128). Whether the written request is
+  charged belongs to the gap, not the held marker, so a gap that closes takes
+  its charge with it and a later uncharged gap reusing the marker is not
+  charged. The charge is taken when the held request is written, whatever
+  the outcome (a vetoed request costs nothing and leaves nothing owed), and
+  any attempt the gap is charged for, a stall retry included, settles it.
+  Messages released from the gap queue while a resend is under way
+  stop at the hold's bounds too, and resume once it is done;
 - the tick sends no Heartbeat or TestRequest (resend frames are traffic) and
   does not chase a stalled gap of this session's own (its request could not go
-  out before the resend ends); it still enforces the logout and heartbeat
-  deadlines.
+  out before the resend ends). What it still enforces is narrower than "the
+  heartbeat deadlines": the write timeout, the deadline of this session's own
+  Logout once written, the owed Logout's deadline, and the reply deadline of a
+  TestRequest this session sent *before* the resend started. Inbound silence
+  alone does not close the session during a resend, since no TestRequest is
+  sent to probe it (#128).
+
+Interop note: a counterparty that keys its own timeout on the echo of its
+`TestReqID` (112) alone, rather than on any inbound traffic, may time out
+during a resend longer than its heartbeat interval, because the Heartbeat
+answering its TestRequest is held behind the resend.
+
+A long run of administrative entries skipped through a slow store produces no
+bytes until the gap fill covering them is written. Writing the gap fill built
+so far at each page boundary would produce traffic without spending a new
+number. #128 declined it, and records it here as a known limit: splitting
+one fill into several changes the resend's wire shape for every
+counterparty, while the case it helps (a run of skipped entries whose page
+reads together outlast the counterparty's heartbeat interval and its
+TestRequest grace) needs a store that slow, which no test or report has
+shown and which the store's own latency already exposes.
 
 Only messages that end the session are written at once: its Logouts and the
 Rejects that precede them. Once 1024 messages are held (a counterparty
-sending TestRequests faster than the resend drains), the reactor stops
+sending TestRequests faster than the resend drains), or 4 MiB of them
+counted by their body field values plus a fixed allowance per field and per
+message (#128: a Heartbeat reply echoes a `TestReqID` up to an inbound
+frame's size, so the count bound alone let an authenticated counterparty pin
+about 1 GiB with the defaults), the reactor stops
 reading, and stops taking Rejects from the application dispatcher, until the
-resend is done (#126 review): the hold then grows past the bound by at most
+resend is done (#126 review): the hold then grows past either bound by at most
 what one inbound frame produces, and no new number is ever written in the
 middle of the resend. The first version wrote the 1025th message at once,
 under a new number, inside the range being answered. A counterparty that
@@ -446,7 +480,13 @@ base did, writing the whole resend before reading the Logout. Now a Logout
 arriving while a resend is owed marks the reply owed: the session keeps
 resending and reading, and replies once the resend and the messages held
 behind it are written, or, if the logout timeout runs out first, replies at
-once and drops the rest. This session's own Logout cannot start while it owes
+once and drops the rest. The timeout runs from the first Logout on the
+driver's clock: a repeated Logout keeps its arrival time rather than
+restarting it, and the deadline is checked between the held messages written
+after the resend as well as before every resend step (#128). Merging held
+Heartbeat replies into one carrying the latest `TestReqID` was the
+alternative to the byte budget; it was not taken, since each TestRequest is
+owed its own echo. This session's own Logout cannot start while it owes
 a resend (the consumer's waits behind it, and the stalled-gap Logout is not
 chased meanwhile), and a resend the counterparty asks for after this
 session's Logout is still answered, which FIX allows.
@@ -477,7 +517,10 @@ re-request is not charged against `max_resend_requests` (recovery already
 armed keeps its attempt count and restarts its clock; recovery armed by it
 starts implied), and it is made at most once per expected number, so a
 counterparty that keeps answering with a fill that starts too low cannot make
-it loop; the usual retries and Logout then bound the gap. Applying `NewSeqNo`
+it loop; the usual retries and Logout then bound the gap. It is made only in
+the Active phase: once this session's Logout is out, `begin_logout` has
+cleared recovery to stop asking, and a re-request would reopen it (#128).
+Applying `NewSeqNo`
 from such a fill was the alternative; it would depart from the letter of
 "ignore" and was not taken.
 

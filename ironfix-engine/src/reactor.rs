@@ -194,9 +194,10 @@
 //! wait in the command queue, Heartbeat replies, session Rejects and this
 //! session's own `ResendRequest` are held back and written right after it,
 //! and no idle Heartbeat or TestRequest is sent meanwhile. Once 1024 messages
-//! are held, the reactor stops reading until the resend is done rather than
-//! write one of them early. A Logout from the counterparty is answered once
-//! the resend it is owed is done, within the logout timeout. Only messages
+//! or 4 MiB are held, the reactor stops reading until the resend is done
+//! rather than write one of them early. A Logout from the counterparty is
+//! answered once the resend it is owed is done, within the logout timeout
+//! counted from its first Logout and checked between held messages too. Only messages
 //! that end the session are written at once. Whatever a closing session left
 //! in the write buffer (its last Logout, typically) is written out before the
 //! socket is dropped, for as long as the stream keeps taking bytes within the
@@ -1228,6 +1229,11 @@ pub(crate) struct ResendState {
     limit: u32,
     /// How long a request may make no progress before it is retried.
     timeout: Duration,
+    /// Whether the `ResendRequest` held behind a resend of ours for this gap
+    /// costs an attempt when it is written. It lives here, with the gap, not
+    /// on the held marker: when the gap closes, the flag goes with it, and a
+    /// later uncharged gap reusing the marker is not charged (issue #128).
+    charge_on_write: bool,
 }
 
 impl ResendState {
@@ -1242,6 +1248,7 @@ impl ResendState {
             attempts: 1,
             limit: config.resend_attempt_limit(),
             timeout: config.resend_timeout,
+            charge_on_write: false,
         }
     }
 
@@ -1284,6 +1291,9 @@ impl ResendState {
     /// Records that another request for this same gap has gone out.
     fn record_retry(&mut self) {
         self.requested_at = Instant::now();
+        // Any charged request settles what a held one owed: a later held
+        // request in this gap is charged only if armed again (issue #128).
+        self.charge_on_write = false;
         // `attempts` never passes `limit` (a u32) by more than the one
         // request `can_retry` allowed, so this cannot overflow; if it ever
         // did, the count stays at its ceiling, which already refuses a retry.
@@ -2144,6 +2154,9 @@ struct Reactor<A: Application> {
     /// Messages that take a new number, held back while a resend is under
     /// way and written in order once it is done ([`Reactor::finish_resends`]).
     deferred: VecDeque<DeferredSend>,
+    /// What `deferred` holds, by [`DeferredSend::held_bytes`]: reading stops
+    /// at [`MAX_DEFERRED_BYTES`] as it does at [`MAX_DEFERRED_SENDS`].
+    deferred_bytes: usize,
     /// A Logout the counterparty sent while a resend was owed: replied to
     /// once the resend is done, or when the logout timeout runs out.
     logout_owed: Option<OwedLogout>,
@@ -2366,7 +2379,7 @@ async fn run_reactor<A: Application + 'static>(
         // could only be held past the bound or written in the middle of the
         // resend, under a new number. The write timeout bounds a counterparty
         // that neither reads nor stops sending.
-        let hold_full = resending && ctx.deferred.len() >= MAX_DEFERRED_SENDS;
+        let hold_full = resending && ctx.hold_full();
         // Reading also pauses for one pass once a resend that has room has
         // waited through MAX_READS_PER_RESEND_STEP inbound frames, and while
         // the replies to inbound frames have piled up past the read ceiling.
@@ -2775,7 +2788,38 @@ enum DeferredSend {
     /// The `ResendRequest` for the gap recovery tracks. It is built when it is
     /// written, from the gap as it stands then, and skipped if the gap has
     /// closed meanwhile.
+    ///
+    /// Whether writing it costs a [`SessionConfig::max_resend_requests`]
+    /// attempt is the gap's to say (`ResendState::charge_on_write`): the
+    /// attempt is charged when the request is written, not when it is held,
+    /// so a request a `to_admin` callback drops costs none (issue #128).
     ResendRequest,
+}
+
+impl DeferredSend {
+    /// What this entry counts against [`MAX_DEFERRED_BYTES`]: the body field
+    /// values plus a fixed allowance per field and per message for the tags,
+    /// delimiters and header the frame adds. A `ResendRequest` marker is
+    /// built later from fixed fields and counts the allowance only.
+    fn held_bytes(&self) -> usize {
+        match self {
+            Self::Message(pending, _) => pending
+                .message()
+                .fields()
+                .iter()
+                .map(|field| match field {
+                    outbound::OutboundField::Raw { value, .. }
+                    | outbound::OutboundField::Data { value, .. } => {
+                        value.len() + HELD_FIELD_OVERHEAD
+                    }
+                })
+                // A sum past `usize::MAX` cannot be held anyway: it counts
+                // as a full hold.
+                .try_fold(HELD_MESSAGE_OVERHEAD, usize::checked_add)
+                .unwrap_or(usize::MAX),
+            Self::ResendRequest => HELD_MESSAGE_OVERHEAD,
+        }
+    }
 }
 
 /// Most messages held back behind a resend before the reactor stops reading.
@@ -2789,11 +2833,33 @@ enum DeferredSend {
 /// write timeout.
 const MAX_DEFERRED_SENDS: usize = 1_024;
 
+/// Most bytes held back behind a resend before the reactor stops reading,
+/// counted by [`DeferredSend::held_bytes`] (issue #128).
+///
+/// The count bound alone lets the hold reach `MAX_DEFERRED_SENDS` times
+/// `max_message_size`: a Heartbeat reply echoes the counterparty's
+/// `TestReqID` (112) and a session Reject can carry its text, both up to an
+/// inbound frame's size, so an authenticated counterparty that keeps this
+/// session resending could pin about 1 GiB with the defaults. Reading stops
+/// once either bound is reached, so the hold grows past this one by at most
+/// what one inbound frame produces (one reply, bounded by
+/// `max_message_size`, and the `ResendRequest` marker).
+const MAX_DEFERRED_BYTES: usize = 4 * 1024 * 1024;
+
+/// Per-field allowance in [`DeferredSend::held_bytes`]: the tag, `=` and SOH.
+const HELD_FIELD_OVERHEAD: usize = 16;
+
+/// Per-message allowance in [`DeferredSend::held_bytes`]: the header and
+/// trailer the frame adds, and the entry itself.
+const HELD_MESSAGE_OVERHEAD: usize = 128;
+
 /// A Logout the counterparty sent while this session still owed it a resend:
 /// the reply waits for the resend, within the logout timeout.
 #[derive(Debug, Clone)]
 struct OwedLogout {
-    /// When the counterparty's Logout arrived.
+    /// When the counterparty's first Logout arrived, on the driver's clock
+    /// ([`driver_now`]). A repeated Logout keeps it: the logout timeout runs
+    /// from the first (issue #128).
     since: Instant,
     /// Its `Text` (58), bounded, for the close reason.
     text: Option<String>,
@@ -3335,8 +3401,8 @@ impl<A: Application> Reactor<A> {
     /// range being answered, and a counterparty that does not queue gapped
     /// messages (IronFix itself under `GapPolicy::Discard`) would be left
     /// waiting for it. The
-    /// hold has no overflow path: once it holds [`MAX_DEFERRED_SENDS`], the
-    /// reactor stops reading (and taking application Rejects) until the
+    /// hold has no overflow path: once it holds [`MAX_DEFERRED_SENDS`] or
+    /// [`MAX_DEFERRED_BYTES`], the reactor stops reading (and taking application Rejects) until the
     /// resend is done, so it grows past the bound by at most what one inbound
     /// frame produces. Messages that end the session (its Logouts, and the
     /// Rejects that precede them) go through [`Reactor::send_now`] instead.
@@ -3367,8 +3433,7 @@ impl<A: Application> Reactor<A> {
         receipt: Option<Receipt>,
     ) -> Result<Sent, EngineError> {
         if self.resend_in_progress() {
-            self.deferred
-                .push_back(DeferredSend::Message(pending, receipt));
+            self.hold(DeferredSend::Message(pending, receipt));
             return Ok(Sent::Deferred);
         }
         self.send_now_tracked(framed, pending, receipt).await
@@ -4084,12 +4149,17 @@ impl<A: Application> Reactor<A> {
         }
         // Behind a resend of ours the request waits too, as a marker built
         // when it is written; recovery is armed now, so the gapped frames
-        // that follow do not ask again.
+        // that follow do not ask again. It is armed with no attempt spent:
+        // the attempt is charged when the request is written
+        // ([`Reactor::finish_resends`]), so a request a `to_admin` callback
+        // drops then costs none (issue #128).
         if self.resend_in_progress() {
             let high_water = self
                 .resend
                 .map_or(high_water, |state| state.high_water.max(high_water));
-            self.resend = Some(ResendState::first(expected, high_water, &self.config));
+            let mut state = ResendState::implied(expected, high_water, &self.config);
+            state.charge_on_write = true;
+            self.resend = Some(state);
             self.defer_resend_request();
             return Ok(phase);
         }
@@ -4716,7 +4786,12 @@ impl<A: Application> Reactor<A> {
                             .get_field_str(36)
                             .and_then(|value| value.parse::<u64>().ok())
                             .filter(|new_seq| *new_seq > expected);
+                        // Only an Active session re-requests: once this
+                        // session's Logout is out it has stopped asking
+                        // (`begin_logout` cleared recovery), and a request
+                        // now would reopen what it closed (issue #128).
                         if let Some(new_seq) = spans
+                            && matches!(phase, Phase::Active(_))
                             && self.spanning_rerequested != Some(expected)
                         {
                             return self
@@ -5030,15 +5105,35 @@ impl<A: Application> Reactor<A> {
         framed: &mut FixFramed,
         phase: Phase,
     ) -> Result<Phase, SessionClosed> {
-        while let Some(next) = self.deferred.pop_front() {
+        loop {
+            // The owed Logout's deadline is checked between held frames as
+            // well: writing up to MAX_DEFERRED_SENDS of them (each filed
+            // first) must not run past it (issue #128). When it has run out,
+            // what is still held is dropped and the reply goes out now.
+            if self.owed_logout_due() {
+                return self.cut_resend_for_owed_logout(framed, phase).await;
+            }
+            let Some(next) = self.unhold() else {
+                break;
+            };
             let request = matches!(next, DeferredSend::ResendRequest);
             let (pending, receipt) = match next {
                 DeferredSend::Message(pending, receipt) => (pending, receipt),
                 DeferredSend::ResendRequest => match self.resend {
                     Some(state) => (self.factory.resend_request(state.expected, 0), None),
+                    // The gap closed while the request was held.
                     None => continue,
                 },
             };
+            // The held request is consumed by this write, whatever its
+            // outcome: the charge it owed is taken now, and paid only if the
+            // request goes out. A request `to_admin` vetoes costs nothing and
+            // leaves no charge behind for a later request in the same gap.
+            let charge = request
+                && self
+                    .resend
+                    .as_mut()
+                    .is_some_and(|state| std::mem::take(&mut state.charge_on_write));
             match self.send_now_tracked(framed, pending, receipt).await {
                 Err(EngineError::Store(err)) => {
                     return Err(self.close_on_store_failure(phase, &err));
@@ -5048,9 +5143,14 @@ impl<A: Application> Reactor<A> {
                     return Err(closed(send_failure_reason(&err)));
                 }
                 Ok(Sent::Yes) if request => {
-                    // The stall clock runs from when the request went out.
+                    // The stall clock runs from when the request went out,
+                    // and a charged request pays its attempt now that it has.
                     if let Some(state) = self.resend.as_mut() {
-                        state.restart_clock();
+                        if charge {
+                            state.record_retry();
+                        } else {
+                            state.restart_clock();
+                        }
                     }
                     self.drop_held_logon_for_a_request();
                 }
@@ -5060,7 +5160,8 @@ impl<A: Application> Reactor<A> {
         if self.logout_owed.is_some() {
             return self.reply_owed_logout(framed, phase, false).await;
         }
-        Ok(phase)
+        // Messages queued above a gap whose release paused on a full hold.
+        self.release_ready(framed, phase).await
     }
 
     /// Replies at once to a Logout the counterparty sent while a resend was
@@ -5074,11 +5175,7 @@ impl<A: Application> Reactor<A> {
         framed: &mut FixFramed,
         phase: Phase,
     ) -> Result<Phase, SessionClosed> {
-        let due = self
-            .logout_owed
-            .as_ref()
-            .is_some_and(|owed| owed.since.elapsed() >= self.config.logout_timeout);
-        if !due {
+        if !self.owed_logout_due() {
             return Ok(phase);
         }
         tracing::warn!(
@@ -5142,16 +5239,61 @@ impl<A: Application> Reactor<A> {
         Err(closed(reason))
     }
 
+    /// Whether a Logout the counterparty sent while a resend was owed has
+    /// waited the logout timeout since it (the first of them) arrived.
+    fn owed_logout_due(&self) -> bool {
+        self.logout_owed.as_ref().is_some_and(|owed| {
+            driver_now().duration_since(owed.since) >= self.config.logout_timeout
+        })
+    }
+
+    /// Holds `entry` back behind the resend under way, counting its bytes.
+    fn hold(&mut self, entry: DeferredSend) {
+        let bytes = entry.held_bytes();
+        self.deferred_bytes = match self.deferred_bytes.checked_add(bytes) {
+            Some(total) => total,
+            // Unreachable while reading stops at MAX_DEFERRED_BYTES; a full
+            // count still stops reading.
+            None => {
+                debug_assert!(false, "held bytes overflowed usize");
+                usize::MAX
+            }
+        };
+        self.deferred.push_back(entry);
+        #[cfg(test)]
+        tests::note_held(self.deferred.len(), self.deferred_bytes);
+    }
+
+    /// Takes the oldest held entry, uncounting its bytes.
+    fn unhold(&mut self) -> Option<DeferredSend> {
+        let entry = self.deferred.pop_front()?;
+        self.deferred_bytes = match self.deferred_bytes.checked_sub(entry.held_bytes()) {
+            Some(total) => total,
+            None => {
+                debug_assert!(false, "held bytes underflowed");
+                0
+            }
+        };
+        Some(entry)
+    }
+
+    /// Whether the hold has reached either of its bounds,
+    /// [`MAX_DEFERRED_SENDS`] or [`MAX_DEFERRED_BYTES`]: reading stops until
+    /// the resend is done.
+    fn hold_full(&self) -> bool {
+        self.deferred.len() >= MAX_DEFERRED_SENDS || self.deferred_bytes >= MAX_DEFERRED_BYTES
+    }
+
     /// Holds a `ResendRequest` back behind the resend under way, unless one is
     /// already held: it is built when it is written, from the gap as it
-    /// stands then.
+    /// stands then, and charged as the gap it is written for says.
     fn defer_resend_request(&mut self) {
         if !self
             .deferred
             .iter()
             .any(|held| matches!(held, DeferredSend::ResendRequest))
         {
-            self.deferred.push_back(DeferredSend::ResendRequest);
+            self.hold(DeferredSend::ResendRequest);
         }
     }
 
@@ -5172,6 +5314,7 @@ impl<A: Application> Reactor<A> {
     /// one with `reason`.
     fn discard_deferred(&mut self, reason: &NotSentReason) {
         let capture = self.writer.capture.as_ref();
+        self.deferred_bytes = 0;
         for held in self.deferred.drain(..) {
             if let DeferredSend::Message(_, receipt) = held {
                 settle(capture, FrameKind::Session, receipt, || {
@@ -5466,6 +5609,12 @@ impl<A: Application> Reactor<A> {
     ) -> Result<Phase, SessionClosed> {
         let mut phase = self.release_held_logon(phase).await?;
         loop {
+            // Behind a resend, a released message's reply is held too: once
+            // the hold is full, releasing pauses as reading does, and resumes
+            // when the resend is done ([`Reactor::finish_resends`]).
+            if self.resend_in_progress() && self.hold_full() {
+                return Ok(phase);
+            }
             let expected = self.runtime.sequences.next_target_seq().value();
             let Some(queue) = self.gap_queue.as_mut() else {
                 return Ok(phase);
@@ -6177,11 +6326,16 @@ impl<A: Application> Reactor<A> {
                 Err(self.local_logout_complete(raw))
             }
             Phase::Active(session) => {
-                let text = bounded_peer_text(raw.get_field_str(58));
-                self.logout_owed = Some(OwedLogout {
-                    since: Instant::now(),
-                    text,
-                });
+                // A repeated Logout keeps the first one's arrival time and
+                // text: the logout timeout runs from the first, so a
+                // counterparty that keeps logging out cannot keep pushing
+                // the reply back (issue #128).
+                if self.logout_owed.is_none() {
+                    self.logout_owed = Some(OwedLogout {
+                        since: driver_now(),
+                        text: bounded_peer_text(raw.get_field_str(58)),
+                    });
+                }
                 // A resend this session owes is finished first: FIX gives
                 // the remote end the chance to fill any gap before it
                 // replies to a Logout. The reply waits, bounded by the
@@ -6413,6 +6567,7 @@ where
         resends: VecDeque::new(),
         reads_since_resend_step: 0,
         deferred: VecDeque::new(),
+        deferred_bytes: 0,
         logout_owed: None,
         spanning_rerequested: None,
         logout_sent: false,
@@ -6450,6 +6605,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// The largest hold seen on this thread, as (messages, bytes): the
+        /// engines of a current-thread test run on the test's thread.
+        static PEAK_HELD: std::cell::Cell<(usize, usize)> =
+            const { std::cell::Cell::new((0, 0)) };
+    }
+
+    /// Records the hold's size after an entry is held ([`Reactor::hold`]).
+    pub(super) fn note_held(messages: usize, bytes: usize) {
+        PEAK_HELD.with(|peak| {
+            let (most_messages, most_bytes) = peak.get();
+            peak.set((most_messages.max(messages), most_bytes.max(bytes)));
+        });
+    }
+
+    /// Forgets the largest hold seen on this thread.
+    pub(super) fn reset_peak_held() {
+        PEAK_HELD.with(|peak| peak.set((0, 0)));
+    }
+
+    /// The largest hold seen on this thread since the last reset.
+    pub(super) fn peak_held() -> (usize, usize) {
+        PEAK_HELD.with(std::cell::Cell::get)
+    }
 
     thread_local! {
         /// Set by a test to start every writer created on this thread
@@ -6994,5 +7174,196 @@ mod tests {
         real.record_retry();
         real.record_progress(4);
         assert_eq!(real.attempts, 1, "progress resets a real request's budget");
+    }
+}
+
+#[cfg(test)]
+mod release_hold_tests {
+    //! Issue #128 review: messages released from the gap queue
+    //! (`GapPolicy::Queue`) while a resend is under way respect the hold's
+    //! bounds. Each released FIXT.1.1 report names an `ApplVerID` (1128) the
+    //! session refuses, so each draws a session Reject, held behind the
+    //! resend. Without the bound the release holds all of them at once.
+
+    use super::tests::{peak_held, reset_peak_held};
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use ironfix_core::types::CompId;
+    use ironfix_session::GapPolicy;
+    use ironfix_store::MemoryStore;
+    use ironfix_tagvalue::Encoder as TagEncoder;
+
+    /// Gapped reports queued above the gap: well past the count bound.
+    const QUEUED: u64 = 2_000;
+
+    type PeerFramed = Framed<tokio::io::DuplexStream, FixCodec>;
+
+    fn frame(
+        sender: &str,
+        target: &str,
+        msg_type: &str,
+        seq: u64,
+        body: &[(u32, &str)],
+    ) -> BytesMut {
+        let mut encoder = TagEncoder::new("FIXT.1.1");
+        encoder.put_str(35, msg_type);
+        encoder.put_str(49, sender);
+        encoder.put_str(56, target);
+        encoder.put_uint(34, seq);
+        encoder.put_str(52, Timestamp::now().format_millis().as_str());
+        for (tag, value) in body {
+            encoder.put_str(*tag, value);
+        }
+        let mut out = BytesMut::new();
+        let Ok(()) = encoder.finish_into(&mut out) else {
+            panic!("test frame must encode")
+        };
+        out
+    }
+
+    fn field(frame: &[u8], tag: u32) -> Option<String> {
+        let mut decoder = ironfix_tagvalue::Decoder::new(frame);
+        let message = decoder.decode().ok()?;
+        message.get_field_str(tag).map(str::to_string)
+    }
+
+    async fn next<S>(stream: &mut S) -> BytesMut
+    where
+        S: futures_util::Stream<Item = Result<BytesMut, CodecError>> + Unpin,
+    {
+        match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(err))) => panic!("a frame: {err:?}"),
+            Ok(None) => panic!("the engine hung up"),
+            Err(_) => panic!("no frame within 30s"),
+        }
+    }
+
+    async fn released_rejects_respect_the_hold(acceptor: bool) {
+        reset_peak_held();
+        let (me, them) = if acceptor {
+            ("VENUE", "CLIENT")
+        } else {
+            ("CLIENT", "VENUE")
+        };
+        let (Ok(sender), Ok(target)) = (CompId::new(me), CompId::new(them)) else {
+            unreachable!("valid CompIDs")
+        };
+        let config = SessionConfig::new(sender, target, "FIX.5.0SP2")
+            .with_heartbeat_interval(Duration::from_secs(30))
+            .with_gap_policy(GapPolicy::Queue {
+                max_messages: 4_096,
+                max_bytes: 16 * 1024 * 1024,
+            });
+        let store = Arc::new(MemoryStore::new());
+        let padding = "x".repeat(500);
+        let report_body = [
+            (37, "E"),
+            (17, "E"),
+            (150, "0"),
+            (39, "0"),
+            (58, padding.as_str()),
+        ];
+        for seq in 2..=301u64 {
+            let report = frame(me, them, "8", seq, &report_body);
+            let Ok(()) = store.store(seq, &MsgType::ExecutionReport, &report).await else {
+                panic!("seed a report")
+            };
+        }
+        let (Ok(()), Ok(())) = (
+            store.set_next_sender_seq(302).await,
+            store.set_next_target_seq(3).await,
+        ) else {
+            panic!("seed the counters")
+        };
+        let (peer_io, engine_io) = tokio::io::duplex(4 * 1024);
+        let store_dyn = Arc::clone(&store) as Arc<dyn MessageStore>;
+        let engine = tokio::spawn(async move {
+            if acceptor {
+                crate::Acceptor::new(config, Arc::new(crate::NoOpApplication))
+                    .with_store(store_dyn)
+                    .serve_stream(engine_io)
+                    .await
+            } else {
+                crate::Initiator::new(config, Arc::new(crate::NoOpApplication))
+                    .with_store(store_dyn)
+                    .establish(engine_io)
+                    .await
+            }
+        });
+        let mut framed: PeerFramed = Framed::new(peer_io, FixCodec::new());
+        if !acceptor {
+            let _logon = next(&mut framed).await;
+        }
+        let logon = frame(them, me, "A", 3, &[(98, "0"), (108, "30"), (1137, "9")]);
+        let Ok(()) = framed.send(logon).await else {
+            panic!("the peer's Logon")
+        };
+        if acceptor {
+            let _ack = next(&mut framed).await;
+        }
+        let Ok(Ok(Ok(connection))) = tokio::time::timeout(Duration::from_secs(5), engine).await
+        else {
+            panic!("the session is established")
+        };
+        let (mut sink, mut stream) = framed.split();
+        let writer = tokio::spawn(async move {
+            let request = frame(them, me, "2", 4, &[(7, "2"), (16, "0")]);
+            let Ok(()) = sink.send(request).await else {
+                panic!("the ResendRequest")
+            };
+            // 5 is missing: these queue above the gap.
+            let refused = [(1128, "2"), (37, "E"), (17, "E"), (150, "0"), (39, "0")];
+            for seq in 6..6 + QUEUED {
+                let Ok(()) = sink.send(frame(them, me, "8", seq, &refused)).await else {
+                    panic!("a queued report")
+                };
+            }
+            // Filling the gap releases them, each drawing a Reject.
+            let Ok(()) = sink.send(frame(them, me, "0", 5, &[])).await else {
+                panic!("the missing 5")
+            };
+            sink
+        });
+        // The engine reads all of it while its resend waits on the pipe.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut rejects = 0u64;
+        let mut last_seq = 0u64;
+        while rejects < QUEUED {
+            let frame = next(&mut stream).await;
+            let seq = field(&frame, 34)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            assert!(seq > last_seq, "numbers in order");
+            last_seq = seq;
+            match field(&frame, 35).as_deref() {
+                Some("3") => rejects += 1,
+                Some("4" | "8" | "2") => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let Ok(Ok(_sink)) = tokio::time::timeout(Duration::from_secs(5), writer).await else {
+            panic!("the peer's writes complete")
+        };
+        let (messages, bytes) = peak_held();
+        assert!(
+            messages <= MAX_DEFERRED_SENDS + 2,
+            "the release stops at the count bound: {messages} held"
+        );
+        assert!(
+            bytes <= MAX_DEFERRED_BYTES + 1024 * 1024,
+            "the release stops at the byte bound: {bytes} held"
+        );
+        assert!(!connection.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_acceptor_released_rejects_respect_the_hold() {
+        released_rejects_respect_the_hold(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_initiator_released_rejects_respect_the_hold() {
+        released_rejects_respect_the_hold(false).await;
     }
 }
