@@ -36,6 +36,7 @@ use std::fmt;
 /// When the engine found an [`InboundLoss`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum InboundLossCause {
     /// At the start of a session, from the attached store: the previous
     /// session, in this process or one that crashed, accepted messages that

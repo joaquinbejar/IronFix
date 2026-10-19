@@ -255,9 +255,12 @@ pub trait Application: Send + Sync {
     ///   before [`Application::on_session_closed`]
     ///   ([`InboundLossCause::DispatcherStopped`](crate::InboundLossCause::DispatcherStopped)).
     ///
-    /// The engine records the span as reported only once this returns: a
-    /// crash before that reports it again at the next start. A span reported
-    /// at close is not reported again at the next start.
+    /// The engine records the span as reported only after this returns, by
+    /// persisting the watermark up to its end: a crash before that write
+    /// lands reports it again at the next start. A span reported at close
+    /// is not reported again at the next start **once that write has
+    /// succeeded**; if it fails (logged), the next start reports it again.
+    /// Without a store nothing is persisted and no start report is made.
     ///
     /// The span can include administrative messages and messages whose
     /// `from_app` had returned just before a crash; see [`crate::loss`]. To
