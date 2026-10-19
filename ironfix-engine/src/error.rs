@@ -326,9 +326,11 @@ pub enum EngineError {
     /// A write to the counterparty did not complete within the write timeout.
     ///
     /// A peer that stops reading parks a socket write forever once its receive
-    /// window closes, which would take the reactor's liveness timers with it.
-    /// The write is therefore bounded and its expiry closes the session, which
-    /// is the same verdict heartbeat detection would have reached.
+    /// window closes. A handshake write is therefore bounded, and its expiry
+    /// fails the call with this error. An established session never waits
+    /// inside a write; output the stream accepts none of for the write
+    /// timeout closes the session for the same reason, which is the same
+    /// verdict heartbeat detection would have reached.
     #[error("write timed out after {0:?}")]
     WriteTimeout(Duration),
 

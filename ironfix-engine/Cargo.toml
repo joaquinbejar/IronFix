@@ -25,3 +25,11 @@ bytes.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+dhat.workspace = true
+
+# Installs dhat as the global allocator to count the allocations of the
+# reactor's write path, so it runs as its own binary without the libtest
+# harness: no other test and no harness thread allocates while it measures.
+[[test]]
+name = "allocations"
+harness = false

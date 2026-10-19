@@ -2,7 +2,8 @@
 
 - **Status:** Accepted (issue #79, in the plan the owner approved; the handling
   of a gapped Logon was decided in the #79 protocol review, see "A gapped Logon
-  or acknowledgement")
+  or acknowledgement"). Amended by issue #126: the reactor's writes, in
+  "Writing a resend".
 - **Date:** 2026-10-18
 
 ## Context
@@ -255,12 +256,157 @@ hold (both missed messages, with or without 789), each blocked writing while
 neither read, until the write timeout closed both sessions (found in review).
 
 Resends are now queued (`Reactor::queue_resend`) and written by the reactor
-loop one frame per pass (`Reactor::resend_step`), reading the store a page at a
-time; a page read is a step of its own and spends cooperative budget, so a run
-of skipped entries cannot keep the reactor from yielding. While a resend is
-queued, the loop's only read is the one before each resend frame: any frame the
-counterparty has already sent is read first, so each side keeps draining the
-other whatever branch the loop picks, and inbound frames take the normal path.
+loop in steps (`Reactor::resend_step`), reading the store a page at a time; a
+page read is a step of its own and spends cooperative budget, so a run of
+skipped entries cannot keep the reactor from yielding.
+
+**The reactor never waits inside a write (#126).** The first version of this
+section wrote one resend frame per pass with a blocking `send`, after reading
+any frame the counterparty had already sent. That narrowed the bilateral
+deadlock without removing it: a read that finds nothing does not mean the
+counterparty is not about to send, so both sides could still enter a blocking
+write of one frame with both directions full (frames larger than the socket
+buffers, or a high-latency link), neither reading, until the write timeout
+closed both. The bilateral tests of 9 MB per side timed out intermittently on
+the Linux CI runners with the symptom of this deadlock (neither backlog
+arriving, the write timeout closing the sessions); the pipe tests below
+reproduce it on every run. It also made a resend run only
+when inbound was idle, so a counterparty that sent without pause held it, and
+everything behind it, back; and every resent frame was its own flush, so its
+own write(2) and TCP segment. What the reactor does instead:
+
+- **Every write is a feed.** Each frame the reactor writes (a resent frame, a
+  gap fill, a live application message, a Heartbeat, a Reject, a Logout) is
+  appended to the `Framed` write buffer through a codec of its own with the
+  session's `max_message_size` (`Writer::feed`); no socket call is made. The
+  buffer is written front to back, so the order on the wire is the order of
+  feeding, and nothing about numbering changes: a new message is still
+  filed, persisted and spent before it is fed (ADR-0005, with "write the
+  bytes" now meaning "feed them").
+- **The flush is a branch of its own.** One branch of the loop polls, on the
+  same `&mut framed`, the flush of the write buffer and then the next
+  inbound read (`poll_socket`), enabled while output waits or reading is
+  allowed. A flush the counterparty is not taking never stops the reading,
+  so two sides writing to each other at once always drain each other. A
+  completed flush calls the heartbeat manager's `on_message_sent` once,
+  whatever number of frames it carried.
+- **Live frames are written through.** After a live frame (an application
+  message, a Heartbeat reply, a Reject, a Logout) is fed, the flush is polled
+  once without waiting, and polled again before the next command is taken
+  (a write-through can come back empty although the stream has room when
+  the task's cooperative budget ran out; by the next command the budget is
+  fresh). A live frame therefore waits in the buffer only while the stream
+  is not taking bytes, never while the next message's `to_app`, framing and
+  store call (an fsync, under some sync policies) run first. The first
+  version let the command branch beat the flush, and about 40% of frames left
+  only after a later frame's store call (#126 perf review). Under
+  backpressure frames still accumulate and leave together.
+- **A resend step feeds up to a high-water mark.** A step feeds frames until
+  the write buffer holds 64 KiB, 64 frames have been fed, a page must be
+  read, or the resend is done, so one write carries many resent frames. A
+  frame is added only below the mark, so the buffer exceeds it by one frame
+  at most.
+- **Live messages stop at a lower mark.** The command queue is not read past
+  16 KiB of waiting output, which is what holds `Connection::send` back
+  while the counterparty reads slowly, and bounds what a fresh message (a
+  Heartbeat echoing a `TestReqID` (112), a message whose `SendingTime` (52)
+  should be current) queues behind. The trade-off: under backpressure live
+  frames are batched in smaller writes than a resend's; when the stream takes
+  bytes, each live frame is its own write, as before #126.
+- **Reads and resend steps alternate in a bounded ratio.** Before each resend
+  step the socket is polled once without waiting, and a frame the
+  counterparty has already sent is handled instead, so a resend never holds
+  reading back (a Logout that arrived is seen before the resend runs on);
+  after 16 inbound frames in a row the resend gets its step regardless, so a
+  counterparty that sends without pause cannot hold it back either. The flush
+  is polled before every read. Because a step can feed the rest of a resend
+  at once, the owed Logout's deadline is checked before every step as well
+  as on the tick, so a resend never runs on past it.
+- **Reading pauses on piled-up replies, and the buffer gives its peak back.**
+  Reading pauses while the replies to inbound frames have piled up 64 KiB
+  past the frame that took the buffer over 64 KiB (resends and live sends
+  cannot get there), so a counterparty that sends faster than it reads cannot
+  grow the buffer. The first version put the ceiling one `max_message_size`
+  above the mark: a TestRequest flood grew the buffer to 2 MiB at the default
+  1 MiB maximum, and up to about 128 MiB at the 64 MiB one (#126 perf
+  review). The buffer is sized for 64 KiB when the reactor starts, and a
+  completed flush replaces a buffer grown past 128 KiB with one of 64 KiB:
+  one allocation per shrink, never one per message.
+- **The write timeout is "no progress".** It was the bound on one blocking
+  write; it is now how long waiting output may go with the stream accepting
+  none of it, checked on the 100 ms tick. The tick polls the flush once
+  before it looks, so time the reactor spent inside an inline await (a store
+  call, a callback, `persist_counters`), with nobody polling the flush, is
+  not taken for a stall when the stream takes the bytes once polled. The
+  first version only recorded progress when the socket branch polled, so a
+  store call longer than the write timeout closed a session whose
+  counterparty was reading normally (#126 protocol review); a store timeout
+  left at its default, the write timeout, did the same under `Continue`.
+  "Progress" means bytes the local stream accepted (for TCP, copied into the
+  kernel's send buffer), not bytes the counterparty received; a stream that
+  buffers on its own (TLS) hides a counterparty that stopped reading until
+  its own buffer is full. A stall is detected about two ticks after the
+  timeout, later if the reactor is inside an inline await when it runs out.
+  Progress since the last tick also counts as sending for the heartbeat
+  clock, and no idle Heartbeat is generated while output waits. The Logon
+  handshakes, which exchange one frame at a time before the reactor exists,
+  keep a blocking write bounded by the same timeout.
+- **A Logout is sent when it has been written whole.** The Logout this
+  session initiates is fed like any frame, and the session moves to a
+  reactor phase `LogoutQueued` (it behaves as one logging out: no new
+  application message, an inbound Logout completes the exchange). Only once
+  the stream has accepted its last byte does the typestate move to
+  `LogoutPending`, whose `sent_at` the logout timeout runs from. The first
+  version started the timer when the Logout was fed: behind output the
+  counterparty was not taking, the logout timeout fired first, the close
+  counted as graceful and `reset_on_logout` reset the sequence numbers, so
+  the next Logon went out at `MsgSeqNum` 1 without `ResetSeqNumFlag` (141)
+  and was refused as too low (#126 protocol review). Now such a Logout is
+  bounded by the write timeout, and a close whose own Logout (or Logout
+  reply) was never written whole is not graceful, so no reset runs.
+- **A closing session flushes what it left.** The messages that end a session
+  (its Logout, the reply to the counterparty's, the Reject before an
+  identity Logout) are fed like any other, so before the socket is dropped
+  the write buffer is written out, for as long as the stream keeps accepting
+  bytes within the write timeout (starting from what was left of it when
+  the session closed), reading and dropping inbound frames meanwhile so a
+  counterparty flushing its own last output is not left waiting. A slow but
+  steady reader therefore still gets the last Logout. A session closed by a
+  write failure or by the write timeout does not try again.
+- **One hook for a completed flush.** `Reactor::on_flushed` is the one place
+  a completed flush is observed, wherever it completes (the socket branch, a
+  write-through, the tick, the close); it receives the range of new
+  `MsgSeqNum`s the flush covered (resent frames and gap fills re-occupy old
+  numbers and are not among them). Per-message send outcomes (#68) resolve
+  there.
+
+Live sends go through the same writer as resends rather than keeping a
+blocking `send`: a blocking write of a live frame while the counterparty's
+direction is full deadlocks two sides sending to each other under load just as
+a resend did, and one writer keeps a single ordering rule for everything on the
+wire.
+
+Tested in `ironfix-engine/tests/writer_tests.rs`: a real `Initiator` against a
+real `Acceptor` over a 256-byte `tokio::io::duplex` pipe, which makes the
+crossing deterministic, resends a 200-message backlog of 1.6 KB frames each
+way, with 789 and with `ResendRequest`s, and sends 200 such live messages each
+way; the same recoveries run over loopback TCP with 4 KiB socket buffers on a
+multi-threaded runtime. Against the reactor that wrote with a blocking `send`,
+the pipe tests fail every time, closed by the write timeout. A resend of 300
+padded reports, many steps long, is written while the counterparty keeps
+20 000 Heartbeats coming, with reads between the steps (before #126 it was
+written only after all of them). The review's probes are regression tests:
+a store slower than the write timeout with a reading counterparty, a Logout
+and a Logout reply stuck behind output the counterparty does not take (with
+`reset_on_logout`), and a TestRequest flood that fills the hold during a
+resend; each fails against the first version. So do 256 live frames that must
+leave in 256 writes. Further tests cover a slow but steady reader, the final
+Logout under backpressure, the owed Logout's deadline before each step, and
+the write timeout's close reason and timing. The heap allocations of a live
+send (with and without a store), of a reply and of a resent frame, and the
+heap a reply pile-up holds and keeps, are counted with `dhat`
+(`ironfix-engine/tests/allocations.rs`); the per-frame counts are those of the
+reactor before #126.
 
 **Nothing that takes a new number is written in the middle of a resend.** A
 new number reaching the counterparty inside the range being answered is
@@ -285,9 +431,14 @@ completion). So while a resend is under way:
   deadlines.
 
 Only messages that end the session are written at once: its Logouts and the
-Rejects that precede them. Past 1024 held messages (a counterparty sending
-TestRequests faster than the resend drains), a new one is written at once, so
-the hold stays bounded.
+Rejects that precede them. Once 1024 messages are held (a counterparty
+sending TestRequests faster than the resend drains), the reactor stops
+reading, and stops taking Rejects from the application dispatcher, until the
+resend is done (#126 review): the hold then grows past the bound by at most
+what one inbound frame produces, and no new number is ever written in the
+middle of the resend. The first version wrote the 1025th message at once,
+under a new number, inside the range being answered. A counterparty that
+neither reads nor stops sending is closed by the write timeout.
 
 **A Logout from the counterparty waits for the resend it is owed.** FIX gives
 the remote end the chance to fill any gap before it answers a Logout, and the
@@ -352,13 +503,26 @@ past it.
   `SessionParams::held_logon`, `ResendState::implied`, the resend queue
   (`ResendJob`, `Reactor::queue_resend`, `Reactor::resend_step`), the held
   messages (`DeferredSend`, `Reactor::finish_resends`), the owed Logout and
-  `Reactor::release_held_logon` are crate-private.
-- **Behaviour, every session (whatever the flag):** a resend is written one
-  frame per reactor pass between inbound reads, ahead of every message that
-  takes a new number (application messages, Heartbeat replies, Rejects, this
-  session's own `ResendRequest`); `Connection::send` waits for the whole
-  resend once the outbound queue is full; a counterparty's Logout is answered
-  after the resend it is owed, within the logout timeout; and a
+  `Reactor::release_held_logon` are crate-private. #126 adds only
+  crate-private items (`Writer`, `poll_socket`, `flush_on_close`, the
+  `LogoutQueued` phase, `Reactor::on_flushed`) and changes no public
+  signature; what changes in public is documented behaviour:
+  `with_write_timeout` on both engines, `Connection::send`,
+  `Connection::logout` and `Connection::next_sender_seq`.
+- **Behaviour, every session (whatever the flag):** the reactor never waits
+  inside a write: every frame is fed to the write buffer, which a branch of
+  the loop flushes while it goes on reading (#126, see "Writing a resend");
+  a resend is fed a few frames per step, alternating with inbound reads in a
+  bounded ratio, ahead of every message that takes a new number (application
+  messages, Heartbeat replies, Rejects, this session's own `ResendRequest`);
+  a live frame is written through as soon as the stream takes it;
+  `Connection::send` waits for the whole resend once the outbound queue is
+  full, and is held back while the counterparty reads slowly; the write
+  timeout is how long output may go with the stream accepting none of it; a
+  session's own Logout starts its logout timeout once written whole, and a
+  close whose Logout never got out is not graceful; reading stops while a
+  resend's hold is full; a counterparty's Logout
+  is answered after the resend it is owed, within the logout timeout; and a
   possible-duplicate gap fill below the expectation whose `NewSeqNo` spans
   numbers still missing makes the session re-request them (see "A gap fill
   that spans the expectation").

@@ -333,9 +333,9 @@ moves a counter.
 
 The resend is queued as the session reactor opens, right after the
 `ResendRequest` for a gap the Logon exchange found, if one was requested, and
-written like the answer to any `ResendRequest`: one frame per pass of the
-reactor loop, between inbound reads, ahead of any live application message
-(see "Resend Request").
+written like the answer to any `ResendRequest`: in steps of the reactor loop
+that alternate with inbound reads, ahead of any live application message (see
+"Resend Request").
 
 *A gapped Logon or acknowledgement, held.* 789 is the Logon sender's built-in
 `ResendRequest`: the counterparty that reads this session's 789 resends the
@@ -710,13 +710,20 @@ above. A counterparty asking for business traffic then receives a gap fill
 rather than the traffic.
 
 **How a resend is written.** A valid request is queued and answered by the
-session reactor one frame per pass of its loop, reading the store a page at a
-time; before each resend frame the reactor reads any frame the counterparty
-has already sent, which then takes the normal inbound path. Two sides that
-owe each other more than the socket buffers hold, and resend at once, keep
-draining each other instead of both blocking on a full socket until the write
-timeout. Nothing that takes a new number is written in the middle of a resend:
-a new number inside the range being answered would leave a receiver that does
+session reactor in steps, reading the store a page at a time. The reactor
+never waits inside a write: each step feeds frames to the session's write
+buffer, up to 64 KiB, and one branch of the loop flushes that buffer while it
+goes on reading inbound frames, which take the normal inbound path. Two sides
+that owe each other more than the socket buffers hold, and resend at once,
+therefore keep draining each other instead of both blocking on a full socket
+until the write timeout. A frame the counterparty has already sent is read
+before each resend step, and a step comes after at most 16 inbound frames in
+a row, so neither the reading nor the resend can hold the other back. The
+write timeout is how long the output may wait with the stream accepting none
+of it (bytes accepted by the local stream, not received by the
+counterparty). Nothing
+that takes a new number is written in the middle of a resend: a new number
+inside the range being answered would leave a receiver that does
 not queue gapped messages (IronFix itself, until #71) waiting for it. Until the
 resend is done, live application messages (and a Logout the consumer asks for)
 wait in the outbound queue; a Heartbeat answering a TestRequest, a session
@@ -725,8 +732,9 @@ and written, in order, right after it (a held `ResendRequest` is built then,
 from the gap as it stands, and skipped if the gap has closed); and no
 Heartbeat or TestRequest is sent for idleness, since resend frames are
 traffic. Only messages that end the session (its Logouts, and the Rejects
-before them) are written at once, and past 1024 held messages a new one is
-written at once too, so the hold stays bounded. A Logout from the counterparty
+before them) are written at once; once 1024 messages are held, the session
+stops reading until the resend is done rather than write one of them early,
+so the hold stays bounded. A Logout from the counterparty
 waits for the resend it is owed (FIX gives the remote end the chance to fill
 any gap first): the reply goes out once the resend and the messages held
 behind it are written, or when `SessionConfig::logout_timeout` runs out,
