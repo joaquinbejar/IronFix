@@ -1196,7 +1196,7 @@ mod tests {
             pending.reject_negotiation(NegotiationRejectCode::Unspecified, "x".repeat(70_000)),
             Err(FixpError::ReasonTooLong {
                 len: 70_000,
-                max: 65_535,
+                max: 65_534,
             })
         );
         assert_eq!(pending.status(), SessionStatus::NegotiationPending);

@@ -92,6 +92,14 @@ pub enum FixpDecodeError {
         /// The schema field name.
         field: &'static str,
     },
+
+    /// A variable-length field declares a `Length` of `0xFFFF`, the SBE
+    /// `uint16` null value, which is not a valid length.
+    #[error("variable-length field at offset {offset} declares the uint16 null length 0xFFFF")]
+    NullVarDataLength {
+        /// Offset of the length prefix in the input, in bytes.
+        offset: usize,
+    },
 }
 
 /// A message that cannot be encoded.
@@ -105,7 +113,8 @@ pub enum FixpEncodeError {
         field: &'static str,
         /// The field length in bytes.
         len: usize,
-        /// The largest encodable length in bytes (65 535).
+        /// The largest encodable length in bytes (65 534: `0xFFFF` is the
+        /// SBE `uint16` null value).
         max: usize,
     },
 
@@ -178,7 +187,8 @@ pub enum FixpError {
     ReasonTooLong {
         /// Reason length in bytes.
         len: usize,
-        /// The largest encodable length in bytes (65 535).
+        /// The largest encodable length in bytes (65 534: `0xFFFF` is the
+        /// SBE `uint16` null value).
         max: usize,
     },
 
@@ -238,7 +248,7 @@ mod tests {
         let long = FixpEncodeError::VarDataTooLong {
             field: "Reason",
             len: 70_000,
-            max: 65_535,
+            max: 65_534,
         };
         assert!(long.to_string().contains("70000"));
         let state = FixpError::InvalidState {

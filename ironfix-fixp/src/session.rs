@@ -3886,7 +3886,7 @@ mod flow_tests {
             client.terminate(TerminationCode::Finished, "x".repeat(65_536), origin),
             Err(FixpError::ReasonTooLong {
                 len: 65_536,
-                max: 65_535
+                max: 65_534
             })
         );
         assert_eq!(client.status(), SessionStatus::Established);
