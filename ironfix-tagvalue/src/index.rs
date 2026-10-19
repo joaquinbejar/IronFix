@@ -80,12 +80,28 @@ impl FieldSpan {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FieldIndex {
     /// Spans of the last decoded message, in wire order.
     spans: Vec<FieldSpan>,
     /// Maximum number of spans; never exceeded, so `spans` never reallocates.
     capacity: usize,
+}
+
+impl Clone for FieldIndex {
+    /// Clones the index with its full backing storage reserved.
+    ///
+    /// A derived `Clone` would clone the `Vec`, which reserves only the
+    /// entries it holds: the clone would keep the logical capacity but
+    /// reallocate on its next decode.
+    fn clone(&self) -> Self {
+        let mut spans = Vec::with_capacity(self.capacity.max(self.spans.len()));
+        spans.extend(self.spans.iter().cloned());
+        Self {
+            spans,
+            capacity: self.capacity,
+        }
+    }
 }
 
 impl FieldIndex {
@@ -350,6 +366,18 @@ mod tests {
             Err(DecodeError::TooManyFields { capacity: 0 })
         );
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_clone_keeps_the_backing_capacity() {
+        let empty = FieldIndex::with_capacity(100).clone();
+        assert!(empty.spans.capacity() >= 100);
+        let mut partial = FieldIndex::with_capacity(100);
+        assert_eq!(partial.push(8, 2..9), Ok(()));
+        let partial = partial.clone();
+        assert!(partial.spans.capacity() >= 100);
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial.capacity(), 100);
     }
 
     #[test]

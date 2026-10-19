@@ -13,6 +13,8 @@
 //! 100-field message [`FRAMES`] times into the same index, reads every field
 //! back, and the number of blocks allocated must be zero.
 //!
+//! A clone of an empty index must also decode without allocating.
+//!
 //! As a control, the same message through [`Decoder::decode`] must allocate:
 //! its `SmallVec<[FieldRef; 32]>` spills above 32 fields, which is the
 //! allocation the index exists to remove.
@@ -90,6 +92,17 @@ fn main() {
         allocated, 0,
         "decoding a {FIELDS}-field message {FRAMES} times into a reused FieldIndex allocated \
          {allocated} heap blocks; it must allocate none"
+    );
+
+    // A clone of an empty index keeps its reserved storage: decoding into it
+    // allocates nothing either (a derived `Clone` reallocated here).
+    let mut cloned = FieldIndex::with_capacity(FIELDS).clone();
+    let before = blocks();
+    black_box(decode_indexed(&frame, &mut cloned));
+    let cloned_blocks = blocks() - before;
+    assert_eq!(
+        cloned_blocks, 0,
+        "decoding into a cloned FieldIndex allocated {cloned_blocks} heap blocks; it must allocate none"
     );
 
     // Control: the SmallVec path spills above 32 fields.

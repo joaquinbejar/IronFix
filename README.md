@@ -42,6 +42,9 @@ engine wiring (#96) does not exist.
   field index; one above the capacity is `DecodeError::TooManyFields`. The
   engine decodes inbound frames into one index per session, sized by
   `SessionConfig::max_inbound_fields` (`doc/adr/0028-bounded-field-index.md`).
+  Only that scratch index is reused: the engine still hands on a `RawMessage`,
+  which allocates for a message above 32 fields, so the inbound path is not
+  allocation-free end to end.
 - **Framing** over a Tokio codec (`FixCodec`) with a bounded read buffer and an
   unconditionally verified trailer. Both engines skip garbled inbound frames (a
   bad `CheckSum` or `BodyLength`, bytes before `8=`, `MsgType` not third) as

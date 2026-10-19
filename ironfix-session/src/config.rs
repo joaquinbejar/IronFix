@@ -695,7 +695,11 @@ pub struct SessionConfig {
     ///
     /// The index is allocated once per session, so an inbound message with at
     /// most this many fields is decoded without a per-message allocation for
-    /// its field index. A message with more fields is **not** rejected: it is
+    /// its field index. Only that scratch index is reused: the engine still
+    /// hands each message on as a `RawMessage`, whose
+    /// `SmallVec<[FieldRef; 32]>` allocates for any message above 32 fields,
+    /// so the inbound path is not allocation-free end to end. A message with
+    /// more fields than this bound is **not** rejected: it is
     /// decoded again through the unbounded path, which allocates, and the
     /// engine counts and logs the fallback. The bound on hostile input
     /// remains [`SessionConfig::max_message_size`].
@@ -1086,6 +1090,9 @@ impl SessionConfig {
     }
 
     /// Sets the capacity of the inbound field index, in fields per message.
+    ///
+    /// Only the scratch index is reused; the `RawMessage` handed on still
+    /// allocates above 32 fields.
     ///
     /// [`MIN_INBOUND_FIELDS`]..=[`MAX_INBOUND_FIELDS`]. Checked by
     /// [`SessionConfig::validate`], not here. See
