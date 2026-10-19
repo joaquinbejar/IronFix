@@ -310,6 +310,79 @@ impl tracing::Subscriber for LogCapture {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
+std::thread_local! {
+    /// The capture that events on this thread are recorded into, if any.
+    static ACTIVE_CAPTURE: std::cell::RefCell<Option<LogCapture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The global subscriber behind [`capture_logs`]. It is installed once per
+/// test binary and stays for the binary's life, and it reports every
+/// callsite as `sometimes`. So `tracing` never caches a callsite as
+/// disabled, as it can for a scoped subscriber when another test thread
+/// registers that callsite first with no subscriber installed. Whether an
+/// event is recorded is decided per event, by the calling thread's capture.
+struct CaptureRouter;
+
+impl CaptureRouter {
+    fn with_active<R>(f: impl FnOnce(&LogCapture) -> R) -> Option<R> {
+        ACTIVE_CAPTURE.with(|active| active.borrow().as_ref().map(f))
+    }
+}
+
+impl tracing::Subscriber for CaptureRouter {
+    fn register_callsite(
+        &self,
+        _metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        Self::with_active(|_| ()).is_some()
+    }
+
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        Self::with_active(|capture| tracing::Subscriber::new_span(capture, span))
+            .unwrap_or_else(|| tracing::span::Id::from_u64(1))
+    }
+
+    fn record(&self, span: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+        let _ = Self::with_active(|capture| tracing::Subscriber::record(capture, span, values));
+    }
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let _ = Self::with_active(|capture| tracing::Subscriber::event(capture, event));
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+/// Runs `f` and returns what the crate logged on this thread meanwhile.
+///
+/// Unlike `tracing::subscriber::with_default`, this cannot miss an event
+/// because another test thread registered its callsite first (see
+/// [`CaptureRouter`]).
+pub(crate) fn capture_logs(f: impl FnOnce()) -> LogCapture {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        // Only fails if another global default exists; no test sets one.
+        let _ = tracing::subscriber::set_global_default(CaptureRouter);
+    });
+    // Callsites registered before the router existed were cached against
+    // no subscriber; recompute them now that it is installed.
+    tracing::callsite::rebuild_interest_cache();
+    let capture = LogCapture::default();
+    ACTIVE_CAPTURE.with(|active| *active.borrow_mut() = Some(capture.clone()));
+    f();
+    ACTIVE_CAPTURE.with(|active| *active.borrow_mut() = None);
+    capture
+}
+
 /// A role that can send application messages.
 pub(crate) trait Sender {
     fn send_app(&mut self, now: Instant) -> Result<Option<ironfix_core::SeqNum>, crate::FixpError>;
