@@ -136,9 +136,10 @@ README.
 
 `SendOutcome` has three classes, which never collapse into one another:
 
-- **`Sent { seq, sending_time, filed }`**: a flush that covers the frame
-  completed. `Sent` means **flushed**, handed to the stream in full, not
-  queued, not buffered and not acknowledged. Whether the store confirmed it
+- **`Sent { seq, sending_time, filed }`**: the stream accepted the whole
+  frame, its last byte included (amended by #139; it used to wait for a
+  completed flush). `Sent` means handed to the stream in full, not queued,
+  not buffered and **not acknowledged** by the counterparty. Whether the store confirmed it
   filed the frame is reported separately, in `filed`, because under
   `StoreFailurePolicy::Continue` a frame whose filing failed still goes out.
   `filed` false means filing was **not confirmed**, not that the frame is
@@ -158,9 +159,11 @@ README.
   after the failure, so a restart resets instead; only if the marker write
   fails too is the replay still possible.
 - **`Unknown { seq, reason }`**: the frame was numbered (being filed, or in
-  the session's write buffer) and the session ended before a flush covering
-  it completed: a failed write (`Transport`), output that made no progress
-  for the write timeout (`WriteTimeout`), a closing flush that did not drain,
+  the session's write buffer) and the session ended before the stream was
+  confirmed to have accepted the whole frame (whole-frame acceptance not
+  confirmed): a failed write (`Transport`), output that made no progress
+  for the write timeout (`WriteTimeout`), a closing flush that stopped
+  before the frame's last byte was accepted,
   or a reactor stopped mid-way (`Interrupted`). A number is spent when the
   frame is buffered, so a frame that never left the buffer is `Unknown`, not
   `NotSent`: the engine cannot say no byte of it reached the stream. The
@@ -202,7 +205,7 @@ crate can match outcomes but not construct them, so a test double of a
 `Connection` cannot return one yet; a constructor can be added later without
 a break.
 
-### Resolution on flush (#126)
+### Resolution on flush (#126), then per frame (#139)
 
 The reactor writes through a buffer (#126): a frame is fed to it, and the
 buffer is written out, and the stream flushed, while the reactor goes on
@@ -228,6 +231,25 @@ reading. Outcomes follow the buffer:
 A completed flush resolves every frame it wrote at once, so `Sent` for one
 message can arrive after later messages were buffered, and a burst that the
 stream takes in one flush resolves together.
+
+**Amendment (#139).** Waiting for a full drain left the latency of `Sent`
+unbounded under a long resend or a slow reader, and turned frames already
+accepted in full into `Unknown` when a later write failed. The pending FIFO
+now lives in the `Writer`, and each entry records its frame's end offset in
+the outbound byte stream (a checked running count of fed bytes).
+`Writer::wrote` keeps a checked running count of accepted bytes and resolves
+every entry whose end it has reached as `Sent`, front to back, in the poll
+that recorded the progress: the boundary is **the stream accepted the whole
+frame**, which can precede the completion of `poll_flush`. A completed flush
+still resolves any entry left (`Reactor::resolve_sent`), and failures
+resolve only what the stream had not accepted whole. The frame observer
+(#70) is unchanged and still resolves per completed flush, so for a frame
+accepted whole before a write failure the receipt says `Sent` while the
+observer says `Unknown`.
+
+#139 also measures a frame that spends a number against `max_message_size`
+before `file_and_spend`: an oversized message is `NotSent` with `Invalid`,
+spends no number and touches no store.
 
 ## Consequences
 

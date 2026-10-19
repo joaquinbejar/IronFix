@@ -12,8 +12,8 @@
 //! fate and reports it as one of three classes, which never collapse into one
 //! another:
 //!
-//! - [`SendOutcome::Sent`]: the frame was written to the stream by a flush
-//!   that completed. It carries the `MsgSeqNum` (34) and `SendingTime` (52)
+//! - [`SendOutcome::Sent`]: the stream accepted the whole frame, its last
+//!   byte included. It carries the `MsgSeqNum` (34) and `SendingTime` (52)
 //!   the counterparty reads, and whether the store filed it.
 //! - [`SendOutcome::NotSent`]: the engine guarantees that **no byte** of the
 //!   frame reached the stream, and no `MsgSeqNum` was spent on it. The
@@ -22,7 +22,8 @@
 //!   outbound throttle, or discarded because the session ended first.
 //! - [`SendOutcome::Unknown`]: the frame was built and its `MsgSeqNum`
 //!   spent (it was being filed, or it was in the session's write buffer)
-//!   when the session stopped before a flush covering it completed: the
+//!   when the session stopped before the stream was confirmed to have
+//!   accepted the whole frame: the
 //!   counterparty may have read all of it, part of it, or none. A number is
 //!   spent when its frame is buffered, so a frame buffered behind output the
 //!   counterparty was not taking is `Unknown` too, never `NotSent`.
@@ -62,10 +63,14 @@
 //!
 //! `Sent` resolves only after the frame went through the store step of the
 //! write order (see the [`persistence`](crate::persistence) module) **and**
-//! a flush that covers it completed. The session writes through a buffer:
+//! the stream accepted the whole frame. The session writes through a buffer:
 //! a frame is appended to it, and the buffer is written out, and the stream
-//! flushed, while the session goes on reading. A completed flush resolves
-//! every tracked frame it wrote at once, in the order they were sent. Its
+//! flushed, while the session goes on reading. Each tracked frame resolves
+//! as soon as the stream has accepted its last byte, in the order they were
+//! sent, even while later frames are still buffered and before the stream's
+//! own flush completes; a completed flush resolves any left. Do not infer
+//! a completed flush from `Sent`: a buffered caller stream or a TLS stream
+//! can accept a frame long before its flush completes. Its
 //! `filed` field says whether the store confirmed it filed the frame: it is
 //! false without a store, and false under
 //! [`StoreFailurePolicy::Continue`](crate::StoreFailurePolicy::Continue) when
@@ -73,9 +78,15 @@
 //! filing was not confirmed, not that the store lacks the frame: a store can
 //! save it and still return an error, so a `ResendRequest` covering it is
 //! answered with the frame if the store holds it and with a
-//! `SequenceReset`-GapFill if it does not. Flushed means handed to the stream in full: the
-//! bytes may still sit in an operating-system or TLS buffer, and nothing at
-//! the FIX layer says the counterparty has processed them.
+//! `SequenceReset`-GapFill if it does not. Accepted means handed to the
+//! stream in full: the bytes may still sit in an operating-system or TLS
+//! buffer, and `Sent` is **not** an acknowledgement: nothing at the FIX layer
+//! says the counterparty has received or processed them.
+//!
+//! The frame observer ([`FrameObserver`](crate::FrameObserver)) still
+//! reports its write results per completed flush. For a frame the stream
+//! accepted whole before a write failed, the receipt is `Sent` while the
+//! observer reports it `Unknown`; the two can disagree in that case.
 //!
 //! # Constructing outcomes
 //!
@@ -102,7 +113,8 @@ use tokio::sync::oneshot;
 #[must_use = "a send outcome says whether the message reached the counterparty; an Unknown one \
               may be live and must be reconciled"]
 pub enum SendOutcome {
-    /// The frame was written to the stream by a flush that completed.
+    /// The stream accepted the whole frame, its last byte included. Not an
+    /// acknowledgement from the counterparty.
     #[non_exhaustive]
     Sent {
         /// The `MsgSeqNum` (34) the frame carries.
@@ -131,8 +143,8 @@ pub enum SendOutcome {
         reason: NotSentReason,
     },
     /// The frame was numbered, and was being filed or waiting in the write
-    /// buffer, when the session stopped before a flush covering it
-    /// completed: the counterparty may have read all, part or none of it.
+    /// buffer, when the session stopped before the stream was confirmed to
+    /// have accepted the whole frame: the counterparty may have read all, part or none of it.
     /// **The order may be live**: do not resubmit it blindly (see the
     /// [module documentation](self)).
     ///
@@ -162,7 +174,8 @@ impl SendOutcome {
         }
     }
 
-    /// Returns whether a flush that covers the frame completed.
+    /// Returns whether the stream accepted the whole frame (`Sent`). Not an
+    /// acknowledgement from the counterparty, and not a completed flush.
     #[must_use]
     pub const fn is_sent(&self) -> bool {
         matches!(self, Self::Sent { .. })
@@ -343,11 +356,12 @@ const fn encode_tag(error: &EncodeError) -> Option<u32> {
 pub enum UnknownReason {
     /// The waiting output made no progress for the session's write timeout
     /// (`with_write_timeout` on the `Initiator` or the `Acceptor`): the
-    /// counterparty stopped reading. Also reported for the closing session's
-    /// last flush when it stops progressing.
+    /// counterparty stopped reading before the stream accepted the whole
+    /// frame. Also reported when the closing session's last flush stops
+    /// progressing with the frame not accepted whole.
     WriteTimeout,
-    /// The stream failed while the frame was waiting to be written or being
-    /// written, or the codec refused the frame after it was numbered and
+    /// The stream failed before it had accepted the whole frame (while the
+    /// frame was waiting to be written or being written), or the codec refused the frame after it was numbered and
     /// filed.
     Transport,
     /// The session reactor stopped after the frame was numbered, while it
@@ -365,7 +379,7 @@ enum Stage {
     /// Numbered `seq` and being filed: the store may hold it.
     Filing(u64),
     /// Numbered `seq`, filed, and fed to the write buffer, waiting for the
-    /// flush that writes it.
+    /// stream to accept its last byte.
     Writing(u64),
 }
 
@@ -431,8 +445,8 @@ impl Receipt {
     }
 
     /// Records that the frame numbered `seq` has been fed to the write
-    /// buffer: from here on, a frame no completed flush covered is
-    /// [`SendOutcome::Unknown`].
+    /// buffer: from here on, a frame the stream was not confirmed to have
+    /// accepted whole is [`SendOutcome::Unknown`].
     pub(crate) const fn writing(&mut self, seq: u64) {
         self.stage = Stage::Writing(seq);
     }

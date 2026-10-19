@@ -229,15 +229,19 @@
 //! captured right after it was encoded and whether the store filed it, and is
 //! resolved exactly once:
 //!
-//! - `Sent` by [`Reactor::resolve_sent`], from [`Reactor::on_flushed`], for
-//!   every pending receipt: a completed flush wrote everything fed before
-//!   it;
+//! - `Sent` by [`Writer::wrote`] as soon as the stream has accepted the
+//!   frame's last byte (its end offset in the outbound byte stream, recorded
+//!   when it was fed), even while later output is still buffered (issue
+//!   #139); and by [`Reactor::resolve_sent`], from [`Reactor::on_flushed`],
+//!   for any receipt still pending: a completed flush wrote everything fed
+//!   before it;
 //! - `Unknown` with `Transport` or `WriteTimeout` when the write fails or the
 //!   write timeout runs out ([`Reactor::close_on_write_failure`]), or when
 //!   the closing session's last flush does not drain the buffer: the number
 //!   was spent when the frame was buffered;
 //! - `NotSent` where the path stops before that (a veto, an unframeable
-//!   body, a store refusal), and `Discarded`, `DiscardedBehindResend` or
+//!   body, a frame above `max_message_size`, which is measured before it is
+//!   filed so it spends no number and touches no store, a store refusal), and `Discarded`, `DiscardedBehindResend` or
 //!   `LogoutPending` for whatever is still queued when the loop ends
 //!   ([`Reactor::discard_unsent`]).
 //!
@@ -1425,6 +1429,39 @@ struct Writer {
     /// flush that covers it or the failure that ends the session. Empty and
     /// unallocated without an observer.
     observed: VecDeque<(u64, FrameKind)>,
+    /// Bytes fed to the write buffer since the session started, or `None`
+    /// once the count could not be kept (it would need 16 EiB of output).
+    fed_bytes: Option<u64>,
+    /// Bytes the stream has accepted from the write buffer since the session
+    /// started, or `None` once the count could not be kept. A tracked frame
+    /// whose end offset this has reached has been written whole
+    /// ([`Writer::resolve_accepted`]).
+    accepted_bytes: Option<u64>,
+    /// Tracked frames fed to the write buffer and not yet written whole, in
+    /// the order they were fed; each resolves `Sent` as soon as the stream
+    /// has accepted its last byte ([`Writer::wrote`]), or with the flush or
+    /// the failure that ends the session ([`PendingReceipt`]).
+    receipts: VecDeque<PendingReceipt>,
+}
+
+/// Adds `n` bytes to a running byte count, checked. A count that cannot be
+/// kept becomes `None` and stays so: receipts then wait for a completed
+/// flush, as they did before issue #139, rather than resolving early.
+const fn add_bytes(count: Option<u64>, n: usize) -> Option<u64> {
+    match count {
+        Some(count) => {
+            // usize is at most 64 bits on every supported target.
+            let n = n as u64;
+            match count.checked_add(n) {
+                Some(sum) => Some(sum),
+                None => {
+                    debug_assert!(false, "running byte count overflowed u64");
+                    None
+                }
+            }
+        }
+        None => None,
+    }
 }
 
 /// Watches one frame fed to the write buffer until the stream has accepted
@@ -1547,6 +1584,9 @@ impl Writer {
             crossed_at: None,
             capture: None,
             observed: VecDeque::new(),
+            fed_bytes: Some(0),
+            accepted_bytes: Some(0),
+            receipts: VecDeque::new(),
         }
     }
 
@@ -1630,11 +1670,40 @@ impl Writer {
         let before = framed.write_buffer().len();
         self.codec.encode(frame, framed.write_buffer_mut())?;
         let after = framed.write_buffer().len();
+        // `after >= before`: encode only appends.
+        if let Some(added) = after.checked_sub(before) {
+            self.fed_bytes = add_bytes(self.fed_bytes, added);
+        }
         if before < WRITE_BUFFER_HIGH_WATER && after >= WRITE_BUFFER_HIGH_WATER {
             self.crossed_at = Some(after);
         }
         self.pending = true;
         Ok(())
+    }
+
+    /// Resolves as [`SendOutcome::Sent`] every pending receipt whose frame
+    /// the stream has accepted to its last byte, front to back, without
+    /// waiting for the rest of the buffer to drain (issue #139): under a
+    /// long resend or a slow reader the buffer may not empty for a long
+    /// time, while the frames ahead in it are already written. A receipt
+    /// with no known end offset waits for the flush.
+    fn resolve_accepted(&mut self) {
+        let Some(accepted) = self.accepted_bytes else {
+            return;
+        };
+        while self
+            .receipts
+            .front()
+            .is_some_and(|pending| pending.end.is_some_and(|end| accepted >= end))
+        {
+            if let Some(pending) = self.receipts.pop_front() {
+                pending.receipt.resolve(SendOutcome::Sent {
+                    seq: pending.seq,
+                    sending_time: pending.sending_time,
+                    filed: pending.filed,
+                });
+            }
+        }
     }
 
     /// Records that the frame just fed carries the new `MsgSeqNum` `seq`.
@@ -1664,9 +1733,11 @@ impl Writer {
     }
 
     /// Records that the stream accepted `moved` bytes from the front of the
-    /// buffer.
-    const fn wrote(&mut self, moved: usize) {
+    /// buffer, and resolves the tracked frames it has now written whole.
+    fn wrote(&mut self, moved: usize) {
         self.progressed = true;
+        self.accepted_bytes = add_bytes(self.accepted_bytes, moved);
+        self.resolve_accepted();
         self.logout.wrote(moved);
         self.test_request.wrote(moved);
         self.resend_request.wrote(moved);
@@ -2022,10 +2093,6 @@ struct Reactor<A: Application> {
     /// Why this session sent its own Logout, once it has: reported in the
     /// close reason when the exchange completes or times out.
     logout_cause: Option<LogoutCause>,
-    /// Tracked frames fed to the write buffer and not yet flushed, in the
-    /// order they were fed; resolved by the flush that covers them or by the
-    /// failure that ends the session ([`PendingReceipt`]).
-    receipts: VecDeque<PendingReceipt>,
     /// How long waiting output may make no progress before the session is
     /// closed ([`Writer::on_tick`]).
     write_timeout: Duration,
@@ -2556,6 +2623,11 @@ enum WriteFailure {
     /// The body has no legal wire form. **No sequence number was spent**, so
     /// the session is intact and the message can simply be dropped.
     Encode(EncodeError),
+    /// The encoded frame exceeds the session's `max_message_size`: the codec
+    /// would refuse to feed it. Checked before the store is touched, so **no
+    /// sequence number was spent and nothing was filed**; the session is
+    /// intact and the message is dropped (issue #139).
+    Oversized(CodecError),
     /// The session cannot continue.
     Fatal(EngineError),
 }
@@ -2616,6 +2688,11 @@ struct PendingReceipt {
     sending_time: Timestamp,
     /// Whether the store filed it.
     filed: bool,
+    /// The writer's running count of fed bytes right after this frame was
+    /// fed: once the stream has accepted that many bytes, its last byte has
+    /// been written and it resolves `Sent`. `None` only if the count could
+    /// not be kept; it then waits for a completed flush.
+    end: Option<u64>,
     /// The caller's receipt, marked as written.
     receipt: Receipt,
 }
@@ -2903,22 +2980,25 @@ impl<A: Application> Reactor<A> {
         self.resolve_sent();
     }
 
-    /// Resolves every pending receipt as [`SendOutcome::Sent`]: a completed
-    /// flush wrote everything fed before it, so every tracked frame waiting
-    /// in the buffer was in it. No sequence number is compared, so nothing
+    /// Resolves every receipt still pending as [`SendOutcome::Sent`]: a
+    /// completed flush wrote everything fed before it, so every tracked frame
+    /// waiting in the buffer was in it. Most have already resolved, frame by
+    /// frame, in [`Writer::wrote`]; this catches the rest (a receipt with no
+    /// known end offset, or a stream that flushed without reporting bytes). No sequence number is compared, so nothing
     /// here depends on numbers only going up.
     ///
     /// Called only from [`Reactor::on_flushed`]: a frame is reported sent
     /// once it has been flushed, never when it is buffered.
     fn resolve_sent(&mut self) {
         debug_assert!(
-            self.receipts
+            self.writer
+                .receipts
                 .iter()
-                .zip(self.receipts.iter().skip(1))
+                .zip(self.writer.receipts.iter().skip(1))
                 .all(|(earlier, later)| earlier.seq < later.seq),
             "pending receipts are fed in MsgSeqNum order"
         );
-        for pending in self.receipts.drain(..) {
+        for pending in self.writer.receipts.drain(..) {
             pending.receipt.resolve(SendOutcome::Sent {
                 seq: pending.seq,
                 sending_time: pending.sending_time,
@@ -2933,7 +3013,7 @@ impl<A: Application> Reactor<A> {
     /// number spent on it.
     fn fail_receipts(&mut self, reason: UnknownReason) {
         self.writer.fail_observed(reason);
-        for pending in self.receipts.drain(..) {
+        for pending in self.writer.receipts.drain(..) {
             pending.receipt.resolve(SendOutcome::Unknown {
                 seq: pending.seq,
                 reason,
@@ -3041,7 +3121,9 @@ impl<A: Application> Reactor<A> {
     ///
     /// # Errors
     /// [`WriteFailure::Encode`] leaves the session untouched — nothing was
-    /// written and nothing was spent. [`WriteFailure::Fatal`] does not: a
+    /// written and nothing was spent. So does [`WriteFailure::Oversized`]: a
+    /// frame that spends a number is measured against `max_message_size`
+    /// before it is filed, and refused as not sent. [`WriteFailure::Fatal`] does not: a
     /// frame above `max_message_size`, an exhausted sender counter, or a
     /// store write that failed under [`StoreFailurePolicy::CloseSession`] (in
     /// which case nothing was written and nothing spent) ends the session.
@@ -3069,6 +3151,19 @@ impl<A: Application> Reactor<A> {
             }
         };
         let mut filed = false;
+        if spend && frame.len() > self.config.max_message_size {
+            // Refused before filing: the codec would refuse to feed it, and
+            // a filed oversized frame would fail the same way on every replay
+            // of its number. Nothing is filed and no number is spent.
+            let err = CodecError::MessageTooLarge {
+                size: frame.len(),
+                max_size: self.config.max_message_size,
+            };
+            settle(self.writer.capture.as_ref(), kind, receipt, || {
+                SendOutcome::not_sent(NotSentReason::invalid(&EngineError::Codec(err.clone())))
+            });
+            return Err(WriteFailure::Oversized(err));
+        }
         if spend {
             // Marked before the store is touched: a filing that is
             // interrupted may still have reached the store.
@@ -3115,10 +3210,11 @@ impl<A: Application> Reactor<A> {
             self.writer.fed_new(seq);
             if let Some(mut receipt) = receipt.take() {
                 receipt.writing(seq);
-                self.receipts.push_back(PendingReceipt {
+                self.writer.receipts.push_back(PendingReceipt {
                     seq,
                     sending_time: precision.truncate(stamped),
                     filed,
+                    end: self.writer.fed_bytes,
                     receipt,
                 });
             }
@@ -3264,6 +3360,15 @@ impl<A: Application> Reactor<A> {
                 );
                 Ok(Sent::Dropped)
             }
+            Err(WriteFailure::Oversized(err)) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    msg_type = %pending.msg_type(),
+                    error = %err,
+                    "dropping outbound message above max_message_size; no sequence number spent"
+                );
+                Ok(Sent::Dropped)
+            }
             Err(WriteFailure::Fatal(err)) => Err(err),
         }
     }
@@ -3381,6 +3486,9 @@ impl<A: Application> Reactor<A> {
                 );
                 Ok(())
             }
+            // Only a frame that spends a number is measured before the feed;
+            // a gap fill spends none, so the codec's refusal is fatal instead.
+            Err(WriteFailure::Oversized(err)) => Err(EngineError::Codec(err)),
             Err(WriteFailure::Fatal(err)) => Err(err),
         }
     }
@@ -6233,7 +6341,6 @@ where
         spanning_rerequested: None,
         logout_sent: false,
         logout_cause: None,
-        receipts: VecDeque::new(),
         write_timeout,
         writer,
         app_tx,

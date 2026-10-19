@@ -315,9 +315,11 @@ impl Connection {
     /// [`crate::outcome`]):
     ///
     /// - [`SendOutcome::Sent`] once the frame has been through the store step
-    ///   and a flush that covers it has completed (the session writes through
-    ///   a buffer, so that may be after later frames were buffered), with the
-    ///   `MsgSeqNum` (34) and
+    ///   and the stream has accepted the whole frame, its last byte included
+    ///   (the session writes through a buffer, so that may be while later
+    ///   frames are still buffered, and before the stream's own flush
+    ///   completes; it is not an acknowledgement from the counterparty), with
+    ///   the `MsgSeqNum` (34) and
     ///   `SendingTime` (52) the counterparty reads, and `filed`, which says
     ///   whether the store confirmed it filed the frame (false without a
     ///   store, and under
@@ -341,8 +343,8 @@ impl Connection {
     ///   [`NotSentReason::DiscardedBehindResend`] or
     ///   [`NotSentReason::DiscardedByThrottle`];
     /// - [`SendOutcome::Unknown`] when the frame was numbered (being filed,
-    ///   or waiting in the write buffer) and the session ended before a flush
-    ///   covering it completed: a number is spent when the frame is
+    ///   or waiting in the write buffer) and the session ended before the
+    ///   stream was confirmed to have accepted the whole frame: a number is spent when the frame is
     ///   buffered, so this is never `NotSent`. **The
     ///   order may be live**: do not resubmit it blindly. Reconcile it by
     ///   `ClOrdID` (11) after the next Logon, through the `ExecutionReport`
