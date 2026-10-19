@@ -231,7 +231,7 @@ fn duplicate_negotiate_does_not_keep_sending_after_reject() {
     );
 }
 
-/// Replays a whole request, numbering each message, and returns the numbers.
+/// Replays a whole request and returns the numbers it delivered.
 fn replay_all(client: &mut FixpClient, now: Instant, request: &RetransmitRequest) -> Vec<u64> {
     client.handle_message(
         &SessionMessage::Retransmission(Retransmission {
@@ -242,12 +242,14 @@ fn replay_all(client: &mut FixpClient, now: Instant, request: &RetransmitRequest
         }),
         now,
     );
+    // A number already received live is discarded, not delivered again.
     (0..request.count)
-        .map(|_| match client.on_application_message(now) {
+        .filter_map(|_| match client.on_application_message(now) {
             Delivery::Accept {
                 seq: Some(seq),
                 retransmitted: true,
-            } => seq.value(),
+            } => Some(seq.value()),
+            Delivery::Discard => None,
             other => panic!("a retransmitted message, got {other:?}"),
         })
         .collect()
@@ -302,6 +304,12 @@ fn reconnects_keep_one_overflow_gap_and_lose_no_number() {
     );
     for missing in (1..64).step_by(2) {
         assert!(recovered.contains(&missing), "sequence {missing} was lost");
+    }
+    for live in (2..=64).step_by(2) {
+        assert!(
+            !recovered.contains(&live),
+            "sequence {live} was delivered twice"
+        );
     }
 }
 
@@ -372,4 +380,184 @@ fn repeated_negotiate_in_negotiated_closes() {
 #[test]
 fn repeated_negotiate_in_establish_pending_closes() {
     repeated_negotiate_before_bound_closes(true);
+}
+
+fn replay_all_deliveries(
+    client: &mut FixpClient,
+    now: Instant,
+    request: RetransmitRequest,
+) -> Vec<Delivery> {
+    client.handle_message(
+        &SessionMessage::Retransmission(Retransmission {
+            session_id: ID,
+            request_timestamp: request.timestamp,
+            next_seq_no: request.from_seq_no,
+            count: request.count,
+        }),
+        now,
+    );
+    (0..request.count)
+        .map(|_| client.on_application_message(now))
+        .collect()
+}
+
+fn prepare_separated_gaps(client: &mut FixpClient, now: Instant, end: u64) -> Vec<Delivery> {
+    let mut live = Vec::new();
+    for missing in (1..end).step_by(2) {
+        let next = missing + 1;
+        seq(client, now, next);
+        drain(client);
+        if client.status() == SessionStatus::Negotiated {
+            client.on_transport_closed();
+            drain(client);
+            establish(client, now, next);
+            drain(client);
+        }
+        assert_eq!(client.status(), SessionStatus::Established);
+        live.push(client.on_application_message(now));
+        drain(client);
+    }
+    client.on_transport_closed();
+    drain(client);
+    establish(client, now, end + 1);
+    live
+}
+
+#[test]
+fn overflow_recovery_never_accepts_an_already_accepted_sequence() {
+    let now = Instant::now();
+    let cfg = FixpConfig::builder()
+        .max_pending_gaps(NonZeroUsize::new(1).expect("one"))
+        .build()
+        .expect("config");
+    let mut client = client(now, cfg);
+    let live = prepare_separated_gaps(&mut client, now, 6);
+    let mut accepted = live.clone();
+    let mut pending = requests(drain(&mut client)).into_iter().next();
+    let mut recovered = Vec::new();
+    while let Some(request) = pending {
+        recovered.extend(replay_all_deliveries(&mut client, now, request));
+        pending = requests(drain(&mut client)).into_iter().next();
+    }
+    assert!(!client.has_pending_recovery());
+    accepted.extend(recovered.clone());
+    let mut unique = std::collections::BTreeSet::new();
+    for delivery in accepted {
+        if let Delivery::Accept { seq: Some(seq), .. } = delivery {
+            assert!(
+                unique.insert(seq),
+                "Recoverable sequence {} accepted twice; live={live:?}; recovery={recovered:?}",
+                seq
+            );
+        }
+    }
+}
+
+#[test]
+fn widened_recovery_is_bounded_and_recovers_every_missing_sequence() {
+    let now = Instant::now();
+    let cfg = FixpConfig::builder()
+        .max_pending_gaps(NonZeroUsize::new(1).expect("one"))
+        .build()
+        .expect("config");
+    let mut client = client(now, cfg);
+    prepare_separated_gaps(&mut client, now, 64);
+    let mut pending = requests(drain(&mut client)).into_iter().next();
+    let mut starts = Vec::new();
+    let mut recovered = std::collections::BTreeSet::new();
+    while let Some(request) = pending {
+        starts.push(request.from_seq_no);
+        for delivery in replay_all_deliveries(&mut client, now, request) {
+            if let Delivery::Accept { seq: Some(seq), .. } = delivery {
+                recovered.insert(seq);
+            }
+        }
+        pending = requests(drain(&mut client)).into_iter().next();
+    }
+    assert!(!client.has_pending_recovery());
+    assert!(starts.len() <= 2, "{starts:?}");
+    for missing in (1..64).step_by(2) {
+        assert!(recovered.contains(&SeqNum::new(missing)), "{missing}");
+    }
+}
+
+#[test]
+fn overflow_recovery_never_reemits_an_already_delivered_not_applied_event() {
+    let now = Instant::now();
+    let cfg = FixpConfig::builder()
+        .max_pending_gaps(NonZeroUsize::new(1).expect("one"))
+        .build()
+        .expect("config");
+    let mut client = client(now, cfg);
+    let acknowledgement = SessionMessage::NotApplied(NotApplied {
+        from_seq_no: 99,
+        count: 1,
+    });
+    let mut outputs = Vec::new();
+    for missing in [1, 3, 5] {
+        let next = missing + 1;
+        seq(&mut client, now, next);
+        outputs.extend(drain(&mut client));
+        if client.status() == SessionStatus::Negotiated {
+            client.on_transport_closed();
+            outputs.extend(drain(&mut client));
+            establish(&mut client, now, next);
+            outputs.extend(drain(&mut client));
+        }
+        if next == 4 {
+            client.handle_message(&acknowledgement, now);
+        } else {
+            assert!(matches!(
+                client.on_application_message(now),
+                Delivery::Accept { .. }
+            ));
+        }
+        outputs.extend(drain(&mut client));
+    }
+    client.on_transport_closed();
+    outputs.extend(drain(&mut client));
+    establish(&mut client, now, 7);
+    let mut pending = requests(drain(&mut client)).into_iter().next();
+    while let Some(request) = pending {
+        client.handle_message(
+            &SessionMessage::Retransmission(Retransmission {
+                session_id: ID,
+                request_timestamp: request.timestamp,
+                next_seq_no: request.from_seq_no,
+                count: request.count,
+            }),
+            now,
+        );
+        for seq in request.from_seq_no..request.from_seq_no + u64::from(request.count) {
+            if seq == 4 {
+                client.handle_message(&acknowledgement, now);
+            } else {
+                assert!(matches!(
+                    client.on_application_message(now),
+                    Delivery::Accept { .. }
+                ));
+            }
+        }
+        let batch_outputs = drain(&mut client);
+        pending = requests(batch_outputs.clone()).into_iter().next();
+        outputs.extend(batch_outputs);
+    }
+    assert!(!client.has_pending_recovery());
+    let acknowledgements: Vec<_> = outputs
+        .into_iter()
+        .filter(|o| {
+            matches!(
+                o,
+                Output::Event(Event::NotApplied {
+                    from_seq_no: 99,
+                    count: 1
+                })
+            )
+        })
+        .collect();
+    assert_eq!(
+        acknowledgements.len(),
+        1,
+        "same numbered NotApplied delivered twice, with no inbound sequence or retransmitted metadata: {acknowledgements:?}"
+    );
 }

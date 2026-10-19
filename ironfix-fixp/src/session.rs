@@ -281,6 +281,13 @@ struct Gap {
     end: u64,
 }
 
+/// Most runs of numbers already received that the overflow gap may hold
+/// ([`Session::hold_refused_gap`]): 256 runs of two `u64` each, 4 KiB. Past
+/// it a refused gap is not admitted at all and the binding terminates with
+/// `inbound_next` left before it, so no number is lost or delivered twice;
+/// the session then cannot resume until it is renegotiated.
+const MAX_OVERFLOW_RECEIVED_RUNS: usize = 256;
+
 /// This side's RetransmitRequest in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Outstanding {
@@ -344,6 +351,11 @@ pub(crate) struct Session {
     start_pending: bool,
     /// Unrecovered gaps of a Recoverable inbound flow, in order.
     missing: VecDeque<Gap>,
+    /// Runs of numbers already received inside the overflow gap (the one
+    /// gap above `max_pending_gaps`, widened over them), in order: their
+    /// retransmissions are discarded, so every number is delivered exactly
+    /// once (section 3.4.4). At most [`MAX_OVERFLOW_RECEIVED_RUNS`].
+    overflow_received: VecDeque<Gap>,
     outstanding: Option<Outstanding>,
     replay: Option<Replay>,
     /// A Retransmission has switched the context to retransmitted messages
@@ -373,6 +385,7 @@ impl Session {
             },
             start_pending: remote_flow.is_sequenced(),
             missing: VecDeque::new(),
+            overflow_received: VecDeque::new(),
             outstanding: None,
             replay: None,
             awaiting_resume: false,
@@ -631,11 +644,18 @@ impl Session {
                 },
                 None => false,
             };
+            let duplicate = self.received_in_overflow(seq);
             let bound = if complete {
                 self.complete_outstanding(core, binding, now)
             } else {
                 Bound::Stay
             };
+            // Section 3.4.4: exactly once. A number the overflow gap was
+            // widened over arrived live already; its retransmission is
+            // discarded.
+            if duplicate {
+                return (Delivery::Discard, bound);
+            }
             return (
                 Delivery::Accept {
                     seq: Some(SeqNum::new(seq)),
@@ -782,20 +802,24 @@ impl Session {
             from: SeqNum::new(expected),
             count,
         });
-        self.inbound_next = Some(next);
+        if self.remote_flow != FlowType::Recoverable {
+            self.inbound_next = Some(next);
+        }
         match self.remote_flow {
             // Section 4.6.1: accept what follows the gap, request the gap.
             FlowType::Recoverable => {
                 if !self.record_gap(core.config(), expected, next) {
-                    // `inbound_next` already stands past this gap, so it is
-                    // kept as the one gap above the bound: the binding
-                    // terminates now (no further gap is admitted while the
-                    // queue is over its bound), and after re-establishment
-                    // it is requested once the gaps before it are recovered.
-                    // Dropping it would lose `expected..next` for good.
-                    self.hold_refused_gap(core.config(), expected, next);
+                    // Past the bound the gap is kept in the one overflow gap,
+                    // so it is requested once the gaps before it are
+                    // recovered, and the binding terminates. Only if even the
+                    // overflow is full does `inbound_next` stay before it, so
+                    // the gap is never skipped.
+                    if self.hold_refused_gap(core.config(), expected, next) {
+                        self.inbound_next = Some(next);
+                    }
                     return self.violation(core, binding, "too many unrecovered sequence gaps");
                 }
+                self.inbound_next = Some(next);
                 self.request_missing(core, binding, now)
             }
             // Section 4.8.2: report the gap with NotApplied, keep accepting.
@@ -837,12 +861,41 @@ impl Session {
     /// which then arrive again as retransmitted messages: more than was
     /// missing is requested, never less, and the gap list stays bounded
     /// across any number of reconnects.
-    fn hold_refused_gap(&mut self, config: &FixpConfig, from: u64, end: u64) {
+    fn hold_refused_gap(&mut self, config: &FixpConfig, from: u64, end: u64) -> bool {
         let overflowing = self.missing.len() > config.max_pending_gaps().get();
         match self.missing.back_mut() {
-            Some(last) if overflowing => last.end = last.end.max(end),
+            Some(last) if overflowing => {
+                // `last.end..from` was received live: remember it, so its
+                // retransmission is discarded rather than delivered again.
+                if last.end < from {
+                    if self.overflow_received.len() >= MAX_OVERFLOW_RECEIVED_RUNS {
+                        return false;
+                    }
+                    self.overflow_received.push_back(Gap {
+                        from: last.end,
+                        end: from,
+                    });
+                }
+                last.end = last.end.max(end);
+            }
             _ => self.missing.push_back(Gap { from, end }),
         }
+        true
+    }
+
+    /// Whether `seq`, retransmitted inside the overflow gap, was already
+    /// received live. Runs wholly below `seq` are dropped as it passes them.
+    fn received_in_overflow(&mut self, seq: u64) -> bool {
+        while self
+            .overflow_received
+            .front()
+            .is_some_and(|run| run.end <= seq)
+        {
+            self.overflow_received.pop_front();
+        }
+        self.overflow_received
+            .front()
+            .is_some_and(|run| run.from <= seq)
     }
 
     /// Marks the first `count` sequence numbers of the first gap recovered
@@ -860,6 +913,9 @@ impl Session {
             Some(from) if from < front.end => front.from = from,
             Some(_) | None => {
                 self.missing.pop_front();
+                if self.missing.is_empty() {
+                    self.overflow_received.clear();
+                }
             }
         }
     }
@@ -3935,5 +3991,41 @@ mod flow_tests {
             })
         );
         assert_eq!(client.status(), SessionStatus::Established);
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    #[test]
+    fn test_overflow_received_runs_are_capped() {
+        let Ok(config) = FixpConfig::builder()
+            .max_pending_gaps(NonZeroUsize::MIN)
+            .build()
+        else {
+            panic!("invalid config");
+        };
+        let mut session = Session::new(
+            SessionId::from_bytes([1; 16]),
+            FlowType::Idempotent,
+            FlowType::Recoverable,
+        );
+        assert!(session.record_gap(&config, 1, 2));
+        // Each refused gap past the first is one number missed after one
+        // received: one received run each, up to the cap.
+        let mut from = 3;
+        assert!(session.hold_refused_gap(&config, from, from + 1));
+        for _ in 0..MAX_OVERFLOW_RECEIVED_RUNS {
+            from += 2;
+            assert!(session.hold_refused_gap(&config, from, from + 1));
+        }
+        assert_eq!(session.overflow_received.len(), MAX_OVERFLOW_RECEIVED_RUNS);
+        assert!(
+            !session.hold_refused_gap(&config, from + 2, from + 3),
+            "past the cap the gap is not admitted"
+        );
+        assert_eq!(session.missing.len(), 2, "one gap plus one overflow gap");
     }
 }
