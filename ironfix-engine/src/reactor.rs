@@ -237,6 +237,7 @@
 //! session down rather than wrapping.
 
 use crate::application::{Application, RejectReason, SessionId};
+use crate::close::{CloseReason, LogoutCause, bounded_peer_text};
 use crate::connection::{Command, SessionRuntime};
 use crate::error::EngineError;
 use crate::garbled::{GarbledFrameWindow, GarbledVerdict};
@@ -734,18 +735,52 @@ enum Phase {
 }
 
 /// Terminal outcome of the reactor loop.
+///
+/// Whether the close is graceful (it ended through a Logout exchange) is the
+/// reason's own [`CloseReason::is_graceful`], so the flag that decides
+/// `reset_on_logout` and the reason reported to the application cannot
+/// disagree.
 struct SessionClosed {
-    /// Human-readable close reason (logged).
-    reason: String,
-    /// True when the session ended through a Logout exchange.
-    graceful: bool,
+    /// Why the session ended: logged, and reported to the application and
+    /// the connection.
+    reason: CloseReason,
 }
 
 /// Builds a [`SessionClosed`] outcome.
-fn closed(reason: impl Into<String>, graceful: bool) -> SessionClosed {
-    SessionClosed {
-        reason: reason.into(),
-        graceful,
+#[must_use]
+const fn closed(reason: CloseReason) -> SessionClosed {
+    SessionClosed { reason }
+}
+
+/// The close reason for a fatal error out of a send: a store failure under
+/// the fail-closed policy, an exhausted counter, a frame the codec would not
+/// take, or a failed write.
+#[must_use]
+fn send_failure_reason(err: &EngineError) -> CloseReason {
+    match err {
+        EngineError::Store(_) => CloseReason::StoreFailure {},
+        EngineError::SequenceExhausted(exhausted) => CloseReason::SequenceExhausted {
+            counter: exhausted.counter,
+        },
+        EngineError::WriteTimeout(timeout) => CloseReason::WriteTimeout { timeout: *timeout },
+        EngineError::Io(io) => CloseReason::TransportError {
+            kind: Some(io.kind()),
+        },
+        EngineError::Codec(codec) => codec_failure_reason(codec),
+        _ => CloseReason::Internal {},
+    }
+}
+
+/// The close reason for a fatal codec error, read or write.
+#[must_use]
+const fn codec_failure_reason(err: &CodecError) -> CloseReason {
+    match err {
+        CodecError::MessageTooLarge { size, max_size } => CloseReason::MessageTooLarge {
+            size: *size,
+            max_size: *max_size,
+        },
+        CodecError::Io(_) => CloseReason::TransportError { kind: None },
+        _ => CloseReason::FramingError {},
     }
 }
 
@@ -768,7 +803,9 @@ fn teardown(phase: Phase) {
 /// condition rather than something to paper over.
 fn exhausted(phase: Phase, err: SequenceExhausted) -> SessionClosed {
     teardown(phase);
-    closed(err.to_string(), false)
+    closed(CloseReason::SequenceExhausted {
+        counter: err.counter,
+    })
 }
 
 /// One inbound application message on its way to the dispatcher task.
@@ -1262,6 +1299,13 @@ impl Writer {
         self.logout.unwritten()
     }
 
+    /// Whether the Logout fed last has been written whole, without taking
+    /// the flag ([`Reactor::advance_logout`] takes it).
+    #[must_use]
+    const fn logout_written(&self) -> bool {
+        self.logout.written
+    }
+
     /// Records that the stream accepted `moved` bytes from the front of the
     /// buffer.
     const fn wrote(&mut self, moved: usize) {
@@ -1589,6 +1633,9 @@ struct Reactor<A: Application> {
     /// Whether this session's own Logout has been fed: messages still queued
     /// behind it when the session closes report `LogoutPending`.
     logout_sent: bool,
+    /// Why this session sent its own Logout, once it has: reported in the
+    /// close reason when the exchange completes or times out.
+    logout_cause: Option<LogoutCause>,
     /// Tracked frames fed to the write buffer and not yet flushed, in the
     /// order they were fed; resolved by the flush that covers them or by the
     /// failure that ends the session ([`PendingReceipt`]).
@@ -1742,9 +1789,10 @@ async fn run_reactor<A: Application + 'static>(
         // succeeded. Treating its absence otherwise as a close keeps the
         // reactor panic-free rather than relying on that.
         let Some(current) = phase.take() else {
-            break opening_failure
-                .take()
-                .unwrap_or_else(|| closed("internal error: session phase lost", false));
+            break opening_failure.take().unwrap_or_else(|| {
+                tracing::error!(session = %ctx.session_id, "internal error: session phase lost");
+                closed(CloseReason::Internal {})
+            });
         };
         // Every counter change of the previous event (or of the handshake, on
         // the first pass) is persisted before the next event is handled; under
@@ -1836,7 +1884,12 @@ async fn run_reactor<A: Application + 'static>(
                 None => {
                     // All handles dropped: log out gracefully.
                     commands_open = false;
-                    ctx.on_command(&mut framed, current, Command::Logout).await
+                    ctx.on_command(
+                        &mut framed,
+                        current,
+                        Command::Logout(LogoutCause::HandlesDropped),
+                    )
+                    .await
                 }
             },
             // Not held back by the marks: a Reject answers an inbound
@@ -1913,17 +1966,18 @@ async fn run_reactor<A: Application + 'static>(
     // been written. One still in the buffer never reached the counterparty:
     // the close is not graceful, so `reset_on_logout` does not reset a stream
     // the counterparty still expects to continue.
-    if outcome.graceful && ctx.writer.logout_unwritten() {
+    if outcome.reason.is_graceful() && ctx.writer.logout_unwritten() {
         tracing::warn!(
             session = %ctx.session_id,
             reason = %outcome.reason,
             "the session's Logout was not written before the close: not a graceful close"
         );
-        outcome.graceful = false;
+        outcome.reason = outcome.reason.unwritten();
     }
+    let graceful = outcome.reason.is_graceful();
 
     let mut write_counters = true;
-    if ctx.config.reset_on_disconnect || (outcome.graceful && ctx.config.reset_on_logout) {
+    if ctx.config.reset_on_disconnect || (graceful && ctx.config.reset_on_logout) {
         ctx.runtime.sequences.reset();
         // The stored messages go with the counters. Leaving them behind would
         // file the next session's messages on top of this one's, and a resend
@@ -1996,9 +2050,15 @@ async fn run_reactor<A: Application + 'static>(
         }
     }
 
-    ctx.application.on_logout(&ctx.session_id).await;
+    // Recorded before the callback, so a `Connection` the callback reads sees
+    // it, and before the closed flag, so `close_reason` is set once
+    // `wait_closed` returns.
+    let _ = ctx.runtime.close_reason.set(outcome.reason.clone());
+    ctx.application
+        .on_session_closed(&ctx.session_id, &outcome.reason)
+        .await;
     let _ = closed_tx.send(true);
-    if outcome.graceful {
+    if graceful {
         tracing::info!(session = %ctx.session_id, reason = %outcome.reason, "FIX session closed");
     } else {
         tracing::warn!(session = %ctx.session_id, reason = %outcome.reason, "FIX session closed");
@@ -2147,11 +2207,39 @@ const MAX_DEFERRED_SENDS: usize = 1_024;
 struct OwedLogout {
     /// When the counterparty's Logout arrived.
     since: Instant,
-    /// Its `Text` (58), for the close reason.
-    text: String,
+    /// Its `Text` (58), bounded, for the close reason.
+    text: Option<String>,
 }
 
 impl<A: Application> Reactor<A> {
+    /// Why this session sent its own Logout. Every path to
+    /// [`Phase::LogoutQueued`] records it; a missing one reads as a plain
+    /// request rather than failing the close.
+    fn take_logout_cause(&mut self) -> LogoutCause {
+        // `begin_logout` records the cause in the same step that moves the
+        // phase to LogoutQueued, so it is always present here. Debug builds
+        // assert that invariant; release builds keep the fallback, because
+        // reporting a plain request is better than a panic, which would
+        // abort the process under `panic = "abort"`.
+        debug_assert!(
+            self.logout_cause.is_some(),
+            "a Logout exchange of ours ended with no recorded cause"
+        );
+        self.logout_cause
+            .take()
+            .unwrap_or(LogoutCause::Requested { text: None })
+    }
+
+    /// The close of a Logout exchange this session started, completed by
+    /// the counterparty's Logout `raw`, whose `Text` (58) is kept bounded.
+    fn local_logout_complete(&mut self, raw: &RawMessage<'_>) -> SessionClosed {
+        let cause = self.take_logout_cause();
+        closed(CloseReason::LocalLogout {
+            cause,
+            peer_text: bounded_peer_text(raw.get_field_str(58)),
+        })
+    }
+
     /// Persists whichever sequence counter changed since it was last written.
     ///
     /// The counters are the store's other job: they are what lets a later
@@ -2210,11 +2298,13 @@ impl<A: Application> Reactor<A> {
     /// failed, and the fail-closed policy writes nothing it could not file. The
     /// log line carries the store's error, which never contains frame bytes.
     fn close_on_store_failure(&self, phase: Phase, err: &StoreError) -> SessionClosed {
+        tracing::warn!(
+            session = %self.session_id,
+            error = %err,
+            "store failure under the fail-closed policy"
+        );
         teardown(phase);
-        closed(
-            format!("store failure under the fail-closed policy: {err}"),
-            false,
-        )
+        closed(CloseReason::StoreFailure {})
     }
 
     /// Handles what one poll of the socket came to: a completed or failed
@@ -2233,9 +2323,11 @@ impl<A: Application> Reactor<A> {
                 self.on_flushed(framed);
                 Ok(phase)
             }
-            SocketEvent::Flushed(Err(err)) => {
-                Err(self.close_on_write_failure(phase, &err, UnknownReason::Transport))
-            }
+            SocketEvent::Flushed(Err(err)) => Err(self.close_on_write_failure(
+                phase,
+                codec_failure_reason(&err),
+                UnknownReason::Transport,
+            )),
             SocketEvent::Inbound(inbound) => {
                 if resend_ready && let Some(reads) = self.reads_since_resend_step.checked_add(1) {
                     self.reads_since_resend_step = reads;
@@ -2370,13 +2462,14 @@ impl<A: Application> Reactor<A> {
     fn close_on_write_failure(
         &mut self,
         phase: Phase,
-        err: &dyn std::fmt::Display,
+        close: CloseReason,
         reason: UnknownReason,
     ) -> SessionClosed {
+        tracing::warn!(session = %self.session_id, reason = %close, "write failed");
         self.writer.failed = true;
         self.fail_receipts(reason);
         teardown(phase);
-        closed(format!("write failed: {err}"), false)
+        closed(close)
     }
 
     /// Frames `pending` under `seq` and feeds it to the write buffer, behind
@@ -2718,7 +2811,11 @@ impl<A: Application> Reactor<A> {
         // next command is taken the task has yielded and the budget is fresh.
         // Frames then wait only while the stream is not taking bytes.
         if let Err(err) = self.write_through(framed) {
-            return Err(self.close_on_write_failure(phase, &err, UnknownReason::Transport));
+            return Err(self.close_on_write_failure(
+                phase,
+                codec_failure_reason(&err),
+                UnknownReason::Transport,
+            ));
         }
         match command {
             Command::Send { message, receipt } => {
@@ -2741,9 +2838,9 @@ impl<A: Application> Reactor<A> {
                 self.send_application(framed, phase, budget, message, receipt)
                     .await
             }
-            Command::Logout => match phase {
+            Command::Logout(cause) => match phase {
                 Phase::LogoutQueued(_) | Phase::LogoutPending(_) => Ok(phase),
-                Phase::Active(session) => self.begin_logout(framed, session, None).await,
+                Phase::Active(session) => self.begin_logout(framed, session, cause).await,
             },
         }
     }
@@ -2871,7 +2968,7 @@ impl<A: Application> Reactor<A> {
             }
             Err(err) => {
                 teardown(phase);
-                Err(closed(format!("send failed: {err}"), false))
+                Err(closed(send_failure_reason(&err)))
             }
         }
     }
@@ -2912,7 +3009,11 @@ impl<A: Application> Reactor<A> {
             return Ok(phase);
         }
         if let Err(err) = self.write_through(framed) {
-            return Err(self.close_on_write_failure(phase, &err, UnknownReason::Transport));
+            return Err(self.close_on_write_failure(
+                phase,
+                codec_failure_reason(&err),
+                UnknownReason::Transport,
+            ));
         }
         let now = driver_now();
         let Some((budget, HeldSend { message, receipt })) = self
@@ -2968,13 +3069,18 @@ impl<A: Application> Reactor<A> {
         &mut self,
         framed: &mut FixFramed,
         session: Session<Active>,
-        text: Option<&str>,
+        cause: LogoutCause,
     ) -> Result<Phase, SessionClosed> {
-        let logout = self.factory.logout(text);
+        let text = match &cause {
+            LogoutCause::Requested { text } => text.clone(),
+            LogoutCause::ResendStalled { .. } => Some(cause.to_string()),
+            _ => None,
+        };
+        let logout = self.factory.logout(text.as_deref());
         match self.send_now(framed, logout).await {
             Err(err) => {
                 let _ = session.disconnect();
-                Err(closed(format!("send failed: {err}"), false))
+                Err(closed(send_failure_reason(&err)))
             }
             // The Logout never reached the wire — a `to_admin` callback left it
             // unframeable. Staying Active is the honest verdict: arming the
@@ -2992,6 +3098,7 @@ impl<A: Application> Reactor<A> {
                 self.resend = None;
                 self.held_logon = None;
                 self.logout_sent = true;
+                self.logout_cause = Some(cause);
                 // Nothing that takes a new number follows this session's own
                 // Logout: what the throttle holds is discarded now, not left
                 // to wait for a token it can no longer use.
@@ -3023,7 +3130,11 @@ impl<A: Application> Reactor<A> {
             None => {}
             Some(Ok(())) => self.on_flushed(framed),
             Some(Err(err)) => {
-                return Err(self.close_on_write_failure(phase, &err, UnknownReason::Transport));
+                return Err(self.close_on_write_failure(
+                    phase,
+                    codec_failure_reason(&err),
+                    UnknownReason::Transport,
+                ));
             }
         }
         let phase = self.advance_logout(phase);
@@ -3032,8 +3143,10 @@ impl<A: Application> Reactor<A> {
             WriteCheck::Fine => {}
             WriteCheck::Progressed => lock_heartbeat(&self.runtime).on_message_sent(),
             WriteCheck::Stalled => {
-                let err = EngineError::WriteTimeout(self.write_timeout);
-                return Err(self.close_on_write_failure(phase, &err, UnknownReason::WriteTimeout));
+                let close = CloseReason::WriteTimeout {
+                    timeout: self.write_timeout,
+                };
+                return Err(self.close_on_write_failure(phase, close, UnknownReason::WriteTimeout));
             }
         }
 
@@ -3045,7 +3158,8 @@ impl<A: Application> Reactor<A> {
             && session.sent_at().elapsed() >= self.config.logout_timeout
         {
             teardown(phase);
-            return Err(closed("logout ack timeout", true));
+            let cause = self.take_logout_cause();
+            return Err(closed(CloseReason::LogoutTimeout { cause }));
         }
 
         // While a resend is under way only the deadlines are checked. Resend
@@ -3058,10 +3172,7 @@ impl<A: Application> Reactor<A> {
             let phase = self.cut_resend_for_owed_logout(framed, phase).await?;
             if lock_heartbeat(&self.runtime).is_timed_out() {
                 teardown(phase);
-                return Err(closed(
-                    "heartbeat timeout: no response to TestRequest",
-                    false,
-                ));
+                return Err(closed(CloseReason::HeartbeatTimeout {}));
             }
             return Ok(phase);
         }
@@ -3090,10 +3201,7 @@ impl<A: Application> Reactor<A> {
 
         if timed_out {
             teardown(phase);
-            return Err(closed(
-                "heartbeat timeout: no response to TestRequest",
-                false,
-            ));
+            return Err(closed(CloseReason::HeartbeatTimeout {}));
         }
         if send_test_request && self.unwritten_test_request.is_none() {
             let test_req_id = generate_test_req_id();
@@ -3101,7 +3209,7 @@ impl<A: Application> Reactor<A> {
             match self.send(framed, request).await {
                 Err(err) => {
                     teardown(phase);
-                    return Err(closed(format!("send failed: {err}"), false));
+                    return Err(closed(send_failure_reason(&err)));
                 }
                 // Only a TestRequest that actually went out starts the timeout
                 // countdown, and only once it is written whole
@@ -3122,7 +3230,7 @@ impl<A: Application> Reactor<A> {
             let heartbeat = self.factory.heartbeat(None);
             if let Err(err) = self.send(framed, heartbeat).await {
                 teardown(phase);
-                return Err(closed(format!("send failed: {err}"), false));
+                return Err(closed(send_failure_reason(&err)));
             }
         }
         Ok(phase)
@@ -3150,7 +3258,7 @@ impl<A: Application> Reactor<A> {
     ) -> Result<Phase, SessionClosed> {
         if let Err(err) = self.send(framed, reject).await {
             teardown(phase);
-            return Err(closed(format!("send failed: {err}"), false));
+            return Err(closed(send_failure_reason(&err)));
         }
         Ok(phase)
     }
@@ -3197,7 +3305,7 @@ impl<A: Application> Reactor<A> {
             }
             Err(err) => {
                 teardown(phase);
-                return Err(closed(format!("send failed: {err}"), false));
+                return Err(closed(send_failure_reason(&err)));
             }
             // The ResendRequest never went out; leaving the range unmarked lets
             // the next frame on the same gap try again, instead of suppressing
@@ -3259,7 +3367,7 @@ impl<A: Application> Reactor<A> {
             Err(EngineError::Store(err)) => return Err(self.close_on_store_failure(phase, &err)),
             Err(err) => {
                 teardown(phase);
-                return Err(closed(format!("send failed: {err}"), false));
+                return Err(closed(send_failure_reason(&err)));
             }
             Ok(Sent::Dropped) => return Ok(phase),
             Ok(Sent::Yes | Sent::Deferred) => {}
@@ -3341,17 +3449,17 @@ impl<A: Application> Reactor<A> {
         resend: ResendState,
     ) -> Result<Phase, SessionClosed> {
         if !resend.can_retry() {
-            let reason = format!(
-                "resend of MsgSeqNum {} unanswered after {} request(s)",
-                resend.expected, resend.attempts
-            );
-            tracing::warn!(session = %self.session_id, reason = %reason, "abandoning stalled resend");
+            let cause = LogoutCause::ResendStalled {
+                expected: resend.expected,
+                attempts: resend.attempts,
+            };
+            tracing::warn!(session = %self.session_id, reason = %cause, "abandoning stalled resend");
             return match phase {
                 // A logout already in flight cannot be reissued; let its own
                 // deadline (or, while it is still queued, the write timeout)
                 // close the session.
                 Phase::LogoutQueued(_) | Phase::LogoutPending(_) => Ok(phase),
-                Phase::Active(session) => self.begin_logout(framed, session, Some(&reason)).await,
+                Phase::Active(session) => self.begin_logout(framed, session, cause).await,
             };
         }
 
@@ -3360,7 +3468,7 @@ impl<A: Application> Reactor<A> {
         match self.send(framed, request).await {
             Err(err) => {
                 teardown(phase);
-                return Err(closed(format!("send failed: {err}"), false));
+                return Err(closed(send_failure_reason(&err)));
             }
             // The retry never went out; leave the state untouched so the next
             // stall tick tries again rather than counting a request the peer
@@ -3390,11 +3498,12 @@ impl<A: Application> Reactor<A> {
         expected: u64,
         received: u64,
     ) -> SessionClosed {
-        let reason = format!("MsgSeqNum too low: expected {expected}, received {received}");
-        let logout = self.factory.logout(Some(&reason));
+        let reason = CloseReason::SequenceTooLow { expected, received };
+        let text = reason.to_string();
+        let logout = self.factory.logout(Some(&text));
         let _ = self.send_now(framed, logout).await;
         teardown(phase);
-        closed(reason, false)
+        closed(reason)
     }
 
     /// Accounts for `skipped` garbled inbound frames: the ones the codec
@@ -3432,7 +3541,7 @@ impl<A: Application> Reactor<A> {
     /// Logon can still hold `Password` (554).
     #[cold]
     #[inline(never)]
-    fn note_garbled(&mut self, skipped: u64, cause: &'static str) -> Option<String> {
+    fn note_garbled(&mut self, skipped: u64, cause: &'static str) -> Option<CloseReason> {
         tracing::warn!(
             session = %self.session_id,
             skipped,
@@ -3446,11 +3555,10 @@ impl<A: Application> Reactor<A> {
                 // Whole milliseconds rather than `Duration`'s Debug form, which
                 // can print `µs`: this text goes out in Logout `Text` (58).
                 let limit = window.limit();
-                Some(format!(
-                    "garbled frame limit reached: {} garbled inbound frames within {} ms",
-                    limit.max(),
-                    limit.window().as_millis()
-                ))
+                Some(CloseReason::GarbledFrameLimit {
+                    max: limit.max().get(),
+                    window: limit.window(),
+                })
             }
         }
     }
@@ -3463,8 +3571,8 @@ impl<A: Application> Reactor<A> {
     /// works, so an Active session first sends a Logout with `Text` (58)
     /// "message too large", letting the counterparty learn why it was cut off.
     /// An I/O failure gets no Logout: the socket is what failed. The close
-    /// reason recorded here is a string for the log only; a typed close reason
-    /// on the [`Connection`](crate::Connection) is issue #69's job.
+    /// reason is [`CloseReason::MessageTooLarge`] or
+    /// [`CloseReason::TransportError`].
     ///
     /// Known limit: the oversized frame's bytes are still arriving when the
     /// socket is dropped after the Logout, so the close can send RST and the
@@ -3480,8 +3588,9 @@ impl<A: Application> Reactor<A> {
             let logout = self.factory.logout(Some("message too large"));
             let _ = self.send_now(framed, logout).await;
         }
+        tracing::warn!(session = %self.session_id, error = %error, "fatal codec error");
         teardown(phase);
-        closed(format!("codec error: {error}"), false)
+        closed(codec_failure_reason(&error))
     }
 
     /// Ends a session whose inbound link has garbled
@@ -3501,15 +3610,16 @@ impl<A: Application> Reactor<A> {
         &mut self,
         framed: &mut FixFramed,
         phase: Phase,
-        reason: String,
+        reason: CloseReason,
     ) -> SessionClosed {
         tracing::warn!(session = %self.session_id, reason = %reason, "closing the session");
         if matches!(phase, Phase::Active(_)) {
-            let logout = self.factory.logout(Some(&reason));
+            let text = reason.to_string();
+            let logout = self.factory.logout(Some(&text));
             let _ = self.send_now(framed, logout).await;
         }
         teardown(phase);
-        closed(reason, false)
+        closed(reason)
     }
 
     /// Rejects an inbound message whose identity fields do not match the
@@ -3529,13 +3639,14 @@ impl<A: Application> Reactor<A> {
         let detail = mismatch.to_string();
         tracing::warn!(session = %self.session_id, detail = %detail, "inbound identity mismatch");
 
-        let reason = RejectReason::new(9, detail.clone()).with_ref_tag(mismatch.tag);
+        let tag = mismatch.tag;
+        let reason = RejectReason::new(9, detail.clone()).with_ref_tag(tag);
         let reject = self.factory.session_reject(ref_seq, ref_msg_type, &reason);
         let _ = self.send_now(framed, reject).await;
         let logout = self.factory.logout(Some(&detail));
         let _ = self.send_now(framed, logout).await;
         teardown(phase);
-        closed(detail, false)
+        closed(CloseReason::IdentityMismatch { tag })
     }
 
     /// Rejects an inbound message whose `SendingTime` (52) is missing,
@@ -3566,7 +3677,7 @@ impl<A: Application> Reactor<A> {
         let logout = self.factory.logout(Some(&detail));
         let _ = self.send_now(framed, logout).await;
         teardown(phase);
-        closed(detail, false)
+        closed(CloseReason::SendingTime {})
     }
 
     /// Consumes the MsgSeqNum of a `SequenceReset` that is being rejected.
@@ -3973,7 +4084,7 @@ impl<A: Application> Reactor<A> {
                 Ok(ResendProgress::Done) => return Ok(phase),
                 Err(err) => {
                     teardown(phase);
-                    return Err(closed(format!("resend failed: {err}"), false));
+                    return Err(closed(send_failure_reason(&err)));
                 }
             }
         }
@@ -4013,7 +4124,7 @@ impl<A: Application> Reactor<A> {
                 }
                 Err(err) => {
                     teardown(phase);
-                    return Err(closed(format!("send failed: {err}"), false));
+                    return Err(closed(send_failure_reason(&err)));
                 }
                 Ok(Sent::Yes) if request => {
                     // The stall clock runs from when the request went out.
@@ -4065,8 +4176,10 @@ impl<A: Application> Reactor<A> {
     ///
     /// A reply the store refused under the fail-closed policy was never
     /// written: the exchange is incomplete, so the close is not graceful and
-    /// does not trigger `reset_on_logout`. Any other failure to reply keeps
-    /// the close graceful, as the counterparty has already logged out.
+    /// does not trigger `reset_on_logout`. A reply that is dropped (a
+    /// `to_admin` callback left it unframeable) or fails to feed is never
+    /// written either: the close is [`CloseReason::LogoutUnwritten`], not
+    /// graceful, and does not reset.
     async fn reply_owed_logout(
         &mut self,
         framed: &mut FixFramed,
@@ -4078,16 +4191,34 @@ impl<A: Application> Reactor<A> {
             let reason = self.reason_behind_resend();
             self.discard_deferred(&reason);
         }
-        let text = self.logout_owed.take().map_or_else(
-            || "logout initiated by counterparty".to_string(),
-            |owed| owed.text,
-        );
+        let text = self.logout_owed.take().and_then(|owed| owed.text);
         let logout = self.factory.logout(None);
-        if let Err(EngineError::Store(err)) = self.send_now(framed, logout).await {
-            return Err(self.close_on_store_failure(phase, &err));
-        }
+        let reason = CloseReason::PeerLogout { text };
+        let reason = match self.send_now(framed, logout).await {
+            Err(EngineError::Store(err)) => return Err(self.close_on_store_failure(phase, &err)),
+            // Fed to the write buffer: graceful once it is written whole,
+            // which the close-time check of the write mark decides.
+            Ok(Sent::Yes) => reason,
+            // The stream accepted the whole reply before the failure (a
+            // flush that failed after the write, typically): the peer can
+            // decode it, so the exchange is complete and the close stays
+            // graceful.
+            Err(_) if self.writer.logout_written() => reason,
+            // No reply reached the buffer, or not all of it reached the
+            // stream: a `to_admin` callback left it
+            // unframeable, or feeding it failed. The counterparty never sees
+            // our Logout, so the close is not graceful and
+            // `reset_on_logout` does not reset.
+            Ok(Sent::Dropped | Sent::Deferred) | Err(_) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    "the reply to the counterparty's Logout was not sent: not a graceful close"
+                );
+                reason.unwritten()
+            }
+        };
         teardown(phase);
-        Err(closed(format!("logout by counterparty: {text}"), true))
+        Err(closed(reason))
     }
 
     /// Holds a `ResendRequest` back behind the resend under way, unless one is
@@ -4158,7 +4289,7 @@ impl<A: Application> Reactor<A> {
         let discarded = std::iter::from_fn(|| commands.try_recv().ok())
             .filter_map(|command| match command {
                 Command::Send { receipt, .. } => Some(receipt),
-                Command::Logout => None,
+                Command::Logout(_) => None,
             })
             .map(|receipt| outcome::resolve(receipt, || SendOutcome::not_sent(reason.clone())))
             .count();
@@ -4354,7 +4485,7 @@ impl<A: Application> Reactor<A> {
             Some(Err(err)) => Err(self.close_on_fatal_codec_error(framed, phase, err).await),
             None => {
                 teardown(phase);
-                Err(closed("transport closed by peer", false))
+                Err(closed(CloseReason::TransportClosed {}))
             }
         }
     }
@@ -4795,15 +4926,11 @@ impl<A: Application> Reactor<A> {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
                 teardown(phase);
-                return Err(closed(
-                    "application queue full: the application is not consuming inbound \
-                     messages fast enough",
-                    false,
-                ));
+                return Err(closed(CloseReason::ApplicationQueueFull {}));
             }
             Err(mpsc::error::TrySendError::Closed(())) => {
                 teardown(phase);
-                return Err(closed("application dispatcher stopped", false));
+                return Err(closed(CloseReason::DispatcherStopped {}));
             }
         };
         let Some(next) = seq.checked_add(1) else {
@@ -4871,7 +4998,7 @@ impl<A: Application> Reactor<A> {
                 let heartbeat = self.factory.heartbeat(test_req_id);
                 if let Err(err) = self.send(framed, heartbeat).await {
                     teardown(phase);
-                    return Err(closed(format!("send failed: {err}"), false));
+                    return Err(closed(send_failure_reason(&err)));
                 }
                 Ok(phase)
             }
@@ -4895,7 +5022,7 @@ impl<A: Application> Reactor<A> {
                 Phase::LogoutPending(session) => {
                     // Typestate: LogoutPending -> Disconnected.
                     let _ = session.on_logout_ack();
-                    Err(closed("logout complete", true))
+                    Err(self.local_logout_complete(raw))
                 }
                 // The counterparty's Logout arrived while ours was still
                 // being written (its last bytes accepted in this same poll,
@@ -4905,13 +5032,10 @@ impl<A: Application> Reactor<A> {
                 Phase::LogoutQueued(session) => {
                     // Typestate: Active -> LogoutPending -> Disconnected.
                     let _ = session.initiate_logout().on_logout_ack();
-                    Err(closed("logout complete", true))
+                    Err(self.local_logout_complete(raw))
                 }
                 Phase::Active(session) => {
-                    let text = raw
-                        .get_field_str(58)
-                        .unwrap_or("logout initiated by counterparty")
-                        .to_string();
+                    let text = bounded_peer_text(raw.get_field_str(58));
                     self.logout_owed = Some(OwedLogout {
                         since: Instant::now(),
                         text,
@@ -5119,6 +5243,7 @@ where
         logout_owed: None,
         spanning_rerequested: None,
         logout_sent: false,
+        logout_cause: None,
         receipts: VecDeque::new(),
         write_timeout,
         writer,

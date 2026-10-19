@@ -9,6 +9,7 @@
 //! This module defines the callback interface for handling FIX messages,
 //! following the QuickFIX pattern with async support.
 
+use crate::close::CloseReason;
 use crate::outbound::OutboundMessage;
 use async_trait::async_trait;
 use ironfix_core::message::RawMessage;
@@ -152,9 +153,44 @@ pub trait Application: Send + Sync {
 
     /// Called on logout.
     ///
+    /// Called once for every session that reached Active, whatever ended it,
+    /// through the default [`Application::on_session_closed`]. Override that
+    /// method to learn why the session ended.
+    ///
     /// # Arguments
     /// * `session_id` - The session identifier
     async fn on_logout(&self, session_id: &SessionId);
+
+    /// Called once when a session ends, with the reason it ended.
+    ///
+    /// The engine calls this, not [`Application::on_logout`], on every close
+    /// path: after the reactor of a session that reached Active has drained
+    /// the application queue (before
+    /// [`Connection::wait_closed`](crate::Connection::wait_closed) returns),
+    /// and also when a Logon handshake fails after
+    /// [`Application::on_create`] has run, with
+    /// [`CloseReason::LogonFailed`] (or [`CloseReason::ConnectFailed`] when
+    /// the dial itself fails). A handshake whose future the caller drops
+    /// before it completes gets no call: nothing can run asynchronously
+    /// from a drop.
+    ///
+    /// The default forwards to [`Application::on_logout`] when the session
+    /// had reached Active ([`CloseReason::was_active`]), which is exactly
+    /// when `on_logout` was called before this method existed, so an
+    /// implementation that does not override it sees no change. An override
+    /// replaces that call: it runs `on_logout` itself if it still wants it.
+    ///
+    /// The reason never carries a frame or any credential; see
+    /// [`crate::close`].
+    ///
+    /// # Arguments
+    /// * `session_id` - The session identifier
+    /// * `reason` - Why the session ended
+    async fn on_session_closed(&self, session_id: &SessionId, reason: &CloseReason) {
+        if reason.was_active() {
+            self.on_logout(session_id).await;
+        }
+    }
 
     /// Called before an administrative message (Logon, Heartbeat, Logout, …)
     /// is encoded.

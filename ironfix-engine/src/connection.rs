@@ -12,6 +12,7 @@
 //! read/write reactor runs in a background task.
 
 use crate::application::SessionId;
+use crate::close::{CloseReason, LogoutCause};
 use crate::error::EngineError;
 use crate::outbound::OutboundMessage;
 use crate::outcome::{NotSentReason, Receipt, SendOutcome};
@@ -32,8 +33,44 @@ pub(crate) enum Command {
         /// so a plain [`Connection::send`] allocates nothing for it.
         receipt: Option<Receipt>,
     },
-    /// Initiate a graceful logout.
-    Logout,
+    /// Initiate a graceful logout, for the cause given.
+    Logout(LogoutCause),
+}
+
+/// The most bytes [`Connection::logout_with_text`] accepts for `Text` (58).
+pub const MAX_LOGOUT_TEXT_LEN: usize = 1024;
+
+/// Checks a Logout `Text` (58) given to [`Connection::logout_with_text`].
+///
+/// The text must be 1 to [`MAX_LOGOUT_TEXT_LEN`] bytes of printable ASCII
+/// (0x20 to 0x7E): `Text` is a FIX `String`, a non-ASCII text needs
+/// `EncodedText` (355) and a declared `MessageEncoding` (347), which the
+/// session does not set, and a control character (SOH among them) would
+/// break the frame.
+///
+/// # Errors
+/// [`EngineError::InvalidField`] for tag 58. The reason never quotes the
+/// text.
+pub(crate) fn check_logout_text(text: &str) -> Result<(), EngineError> {
+    let refuse = |reason: &str| {
+        Err(EngineError::InvalidField {
+            tag: 58,
+            reason: reason.to_string(),
+        })
+    };
+    if text.is_empty() {
+        return refuse("value is empty; a FIX field carries at least one byte");
+    }
+    if text.len() > MAX_LOGOUT_TEXT_LEN {
+        return refuse("Logout text is longer than MAX_LOGOUT_TEXT_LEN (1024) bytes");
+    }
+    if !text.bytes().all(|byte| (0x20..=0x7E).contains(&byte)) {
+        return refuse(
+            "Logout text must be printable ASCII: no SOH or other control character, and no \
+             non-ASCII character (that needs EncodedText (355))",
+        );
+    }
+    Ok(())
 }
 
 /// Session runtime state shared between the reactor and connection handles.
@@ -51,6 +88,9 @@ pub(crate) struct SessionRuntime {
     /// Inbound application messages the reactor has accepted in sequence and
     /// handed to the application. Written by the reactor alone.
     inbound_app_messages: AtomicU64,
+    /// Why the session ended: set once by the reactor as it closes, before
+    /// the closed flag is raised.
+    pub(crate) close_reason: OnceLock<CloseReason>,
 }
 
 impl SessionRuntime {
@@ -62,6 +102,7 @@ impl SessionRuntime {
             heartbeat: Mutex::new(heartbeat),
             counterparty_default_appl_version: OnceLock::new(),
             inbound_app_messages: AtomicU64::new(0),
+            close_reason: OnceLock::new(),
         }
     }
 
@@ -283,7 +324,9 @@ impl Connection {
             receipt: Some(receipt),
         };
         if self.commands.send(command).await.is_err() {
-            return SendOutcome::not_sent(NotSentReason::SessionClosed {});
+            return SendOutcome::not_sent(NotSentReason::SessionClosed {
+                reason: self.close_reason(),
+            });
         }
         // Every receipt answers, explicitly or as it is dropped, before the
         // session reports itself closed. Waiting on the close as well means a
@@ -326,9 +369,49 @@ impl Connection {
     /// Returns [`EngineError::Closed`] if the session is already closed.
     pub async fn logout(&self) -> Result<(), EngineError> {
         self.commands
-            .send(Command::Logout)
+            .send(Command::Logout(LogoutCause::Requested { text: None }))
             .await
             .map_err(|_| EngineError::Closed)
+    }
+
+    /// Initiates a graceful logout whose Logout (5) carries `text` in
+    /// `Text` (58).
+    ///
+    /// Everything [`Connection::logout`] says applies. The text is checked
+    /// before anything is queued: 1 to [`MAX_LOGOUT_TEXT_LEN`] bytes of
+    /// printable ASCII. A `to_admin` callback still sees, and may change, the
+    /// Logout before it is framed. The text is reported back in
+    /// [`LogoutCause::Requested`] in the session's [`CloseReason`].
+    ///
+    /// Only the first Logout counts. If this session's Logout is already
+    /// queued or sent (an earlier `logout`, dropped handles, a stalled
+    /// resend), this call still returns `Ok(())`, but its text is dropped
+    /// and nothing more goes on the wire; the close reason keeps the first
+    /// cause.
+    ///
+    /// # Errors
+    /// [`EngineError::InvalidField`] (tag 58) for an empty text, one longer
+    /// than [`MAX_LOGOUT_TEXT_LEN`], or one with a byte outside 0x20 to 0x7E
+    /// (SOH, any other control character, any non-ASCII character);
+    /// [`EngineError::Closed`] if the session is already closed.
+    pub async fn logout_with_text(&self, text: &str) -> Result<(), EngineError> {
+        check_logout_text(text)?;
+        self.commands
+            .send(Command::Logout(LogoutCause::Requested {
+                text: Some(text.to_string()),
+            }))
+            .await
+            .map_err(|_| EngineError::Closed)
+    }
+
+    /// Returns why the session ended, once it has.
+    ///
+    /// `None` while the session is open. Once [`Connection::wait_closed`]
+    /// has returned it is `Some`, unless the session's task ended without
+    /// closing (a panic under a non-aborting profile).
+    #[must_use]
+    pub fn close_reason(&self) -> Option<CloseReason> {
+        self.runtime.close_reason.get().cloned()
     }
 
     /// Waits until the session is closed.
@@ -433,5 +516,54 @@ impl Connection {
             .counterparty_default_appl_version
             .get()
             .copied()
+    }
+}
+
+/// Reports a Logon handshake that failed after `on_create` ran to
+/// [`Application::on_session_closed`](crate::Application::on_session_closed)
+/// as [`CloseReason::LogonFailed`], and hands the result back unchanged.
+///
+/// The detail stays in the [`EngineError`] the caller receives: the reason
+/// carries none of it, since a refused Logon can carry `Password` (554).
+pub(crate) async fn report_handshake<A: crate::Application + ?Sized>(
+    application: &A,
+    session_id: &SessionId,
+    result: Result<Connection, EngineError>,
+) -> Result<Connection, EngineError> {
+    if result.is_err() {
+        application
+            .on_session_closed(session_id, &CloseReason::LogonFailed {})
+            .await;
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_logout_text_accepts_printable_ascii() {
+        assert!(check_logout_text("end of day").is_ok());
+        assert!(check_logout_text(&"x".repeat(MAX_LOGOUT_TEXT_LEN)).is_ok());
+    }
+
+    #[test]
+    fn test_check_logout_text_refuses_invalid_text() {
+        for bad in [
+            String::new(),
+            "a\u{1}b".to_string(),
+            "line\nbreak".to_string(),
+            "caf\u{e9}".to_string(),
+            "x".repeat(MAX_LOGOUT_TEXT_LEN + 1),
+        ] {
+            assert!(
+                matches!(
+                    check_logout_text(&bad),
+                    Err(EngineError::InvalidField { tag: 58, .. })
+                ),
+                "accepted {bad:?}"
+            );
+        }
     }
 }

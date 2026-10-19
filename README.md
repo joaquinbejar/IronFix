@@ -125,7 +125,15 @@ engine wiring (#96) does not exist.
   and `OrigSendingTime` handling, session-level `Reject`, a write timeout
   (output the stream accepts none of for that long closes the session), the
   Logout handshake (whose timeout starts once the Logout has been written
-  whole; a close whose Logout never got out is not graceful), and
+  whole; a close whose Logout never got out is not graceful;
+  `Connection::logout_with_text` puts a checked `Text` (58) on it), a typed
+  `CloseReason` for every close (peer or local Logout with the peer's
+  `Text`, logout timeout, heartbeat or write timeout, transport closed or
+  failed, MsgSeqNum too low, garbled-frame limit, identity, `SendingTime`,
+  store failure, a failed dial or handshake, and more) handed to
+  `Application::on_session_closed` (whose default forwards to `on_logout`
+  for a session that reached Active) and read with
+  `Connection::close_reason()` (`doc/adr/0025-typed-close-reason.md`), and
   `FIXT.1.1` BeginString with `ApplVerID`
   for FIX 5.0 sessions. A FIX 5.0 session also checks the application version
   its counterparty declares and uses against its own version plus

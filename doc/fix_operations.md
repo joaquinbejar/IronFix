@@ -488,6 +488,42 @@ loop. Every session keeps its own sequence numbers, store and heartbeat.
 3. Close TCP connection
 4. Persist session state for recovery
 
+**IronFix behaviour** (both roles, issue #69, ADR-0025):
+
+- `Connection::logout()` sends a Logout without `Text`;
+  `Connection::logout_with_text(text)` sends one with `Text` (58). The text
+  is checked before anything is queued: 1 to 1024 bytes
+  (`connection::MAX_LOGOUT_TEXT_LEN`) of printable ASCII, 0x20 to 0x7E. SOH,
+  any other control character and any non-ASCII character are refused with
+  `EngineError::InvalidField` for tag 58: a non-ASCII text needs
+  `EncodedText` (355) and `MessageEncoding` (347), which the session does
+  not set. The spec here is silent on a length bound; 1024 bytes is the
+  engine's.
+- A counterparty's Logout is answered with a Logout without `Text`, after
+  any resend owed to it, within the logout timeout. Its `Text` is kept,
+  never parsed, bounded to 1024 characters (`close::MAX_PEER_TEXT_LEN`),
+  every character outside printable ASCII (0x20 to 0x7E) replaced with `?`
+  so no control character or newline reaches a log or the application.
+  `logout_with_text` called once this session's Logout is already queued or
+  sent returns `Ok(())` and its text is dropped: only the first Logout
+  counts.
+- Every close reports a typed `CloseReason` to
+  `Application::on_session_closed` and to `Connection::close_reason()`:
+  `LocalLogout { cause, peer_text }` (our Logout acknowledged; `cause` is
+  `Requested { text }`, `HandlesDropped` or `ResendStalled { expected,
+  attempts }`), `PeerLogout { text }`, `LogoutTimeout { cause }`,
+  `LogoutUnwritten` (the exchange ended with our own Logout never written
+  whole), and the abnormal closes: heartbeat timeout, write timeout,
+  transport closed or failed (`io::ErrorKind` when known), message too
+  large, MsgSeqNum too low (expected, received), garbled-frame limit,
+  identity mismatch (the tag), `SendingTime`, store failure, sequence
+  exhausted, application queue full. After `on_create`, a TCP connect that
+  fails or times out reports `ConnectFailed { kind, timed_out }`, and a
+  Logon handshake that fails reports `LogonFailed`. `CloseReason::is_graceful()` is the
+  flag `reset_on_logout` uses: true for the first three only.
+- No reason carries a frame: `Password` (554), `NewPassword` (925) and
+  `RawData` (96) never appear in one.
+
 ---
 
 ### Heartbeat (MsgType = 0)

@@ -239,7 +239,13 @@ pub enum NotSentReason {
     /// The session was already closed, or closed before the message could be
     /// queued. It never reached the session reactor.
     #[non_exhaustive]
-    SessionClosed {},
+    SessionClosed {
+        /// Why the session ended, when it had recorded its
+        /// [`CloseReason`](crate::CloseReason) by the time the message was
+        /// refused (the queue can close a moment before the reason is
+        /// recorded, and `None` then says nothing about the reason).
+        reason: Option<crate::close::CloseReason>,
+    },
     /// This session's own Logout had been framed when the reactor reached
     /// the message: the session is on its way out, and a new application
     /// message would arrive after the Logout the counterparty has already
