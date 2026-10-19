@@ -22,6 +22,13 @@
 //!   `ironfix-engine`, which owns the socket
 //! - **Heartbeat handling**: [`HeartbeatManager`], `Instant`-based timing for
 //!   heartbeat and TestRequest deadlines and `HeartBtInt` negotiation
+//! - **No clock reads**: nothing in this crate reads a clock (ADR-0002,
+//!   "Time source contract"). Every time-dependent method and every
+//!   timestamping transition takes `now` from the caller, and
+//!   [`generate_test_req_id`] takes the wall-clock time it encodes, so the
+//!   same logic runs under any driver and is deterministic in tests. A guard
+//!   test (`tests/no_clock_reads.rs`) fails the build if a clock read creeps
+//!   back into `src/`
 //! - **Configuration**: [`SessionConfig`] and its validating
 //!   [`config::SessionConfigBuilder`], including the opt-in
 //!   [`GarbledFrameLimit`] on garbled inbound frames and, on a FIX 5.0
