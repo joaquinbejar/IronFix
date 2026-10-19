@@ -387,9 +387,13 @@ Implemented and tested, receiving side only (sections 4.7.1, 4.7.2, 6.3):
   for ever
   (`test_finished_receiving_after_a_retransmit_reject_follows_the_reported_loss`).
 - Finalized sessions (section 4.7.2): once FinishedReceiving has gone out,
-  the binding ending with a Terminate exchange (the counterparty's
-  Terminate answered, or this side's answered) finalizes the logical
-  session. When the binding is over (the transport reported closed, or the
+  the binding ending with a graceful Terminate exchange (a counterparty
+  Terminate with code `Finished` answered, or this side's `Finished`
+  answered with `Finished`) finalizes the logical session; an error
+  Terminate in either direction does not. This code check is local policy
+  (see the decisions table)
+  (`test_an_error_terminate_after_finished_receiving_does_not_finalize`,
+  `test_an_error_answer_to_our_finished_terminate_does_not_finalize`). When the binding is over (the transport reported closed, or the
   closing deadline passed) the role reports `Event::SessionFinalized` and
   moves to `SessionStatus::Finalized`, which accepts no command: the client
   refuses `establish`, and the server keeps the identifier
@@ -439,6 +443,8 @@ Implemented and tested:
 
 ## Decisions where the specification is open or inconsistent
 
+Page numbers are the printed pages of the [v1.1 Draft Standard PDF](https://github.com/FIXTradingCommunity/fixp-specification/blob/master/v1-1/doc/publication/FIXP-Technical-Draft-Standard-v1.1.pdf).
+
 | Topic | Specification | Decision |
 |---|---|---|
 | RetransmitRequest for numbers not yet sent | 4.6.2.3 and Appendix A 7.3.5: RetransmitReject `OutOfRange`; 6.3: a violation | RetransmitReject `OutOfRange`; a zero `Count` too |
@@ -456,12 +462,12 @@ Implemented and tested:
 | Context `NextSeqNo` | Optional in 3.5.3, required in the schema | Required on the wire; `u64::MAX`, the SBE null, means "no number" |
 | `NextSeqNo` in Establish on an Idempotent flow | 4.3.1: "re-establishment of a recoverable flow only"; Appendix A 7.1.10 sends it | Sent on every sequenced flow, first establishment included |
 | `FinishedSending` without `LastSeqNo` on a sequenced flow | 4.7.1: it must be populated | A protocol violation |
-| Application messages after FinishedReceiving | 6.3 forbids them for the responder; Appendix A 7.4.1 and 7.4.6 (informative) show a half-close; 4.7.2: they are likely lost | Refused with `FixpError::FinishedReceivingSent`; the normative 6.3 wins |
-| A provider serving one batch per request | 4.6.2.2 allows several batches per request and makes asking again the requester's responsibility | Opt-in `RetransmitStallPolicy::ReRequestAfterBatch`; the default still waits |
-| FinishedReceiving after a RetransmitReject | 4.7.2 answers once everything up to `LastSeqNo` is accounted for; nothing on a refused range | Sent; the loss is reported by `Event::RetransmitRejected`, not as a violation |
-| When a session is finalized | 4.7.2: FinishedReceiving, then the Terminate of the finalization's initiator | When the binding ends with a Terminate exchange after this side sent FinishedReceiving; not on a transport failure |
+| Application messages after FinishedReceiving | 6.3 (p. 39) forbids them for the responder; Appendix A 7.4.1 (p. 69, informative) shows a half-close; 4.7.2 (p. 31): they are likely lost | Refused with `FixpError::FinishedReceivingSent`; the normative 6.3 takes precedence over the informative appendix |
+| A provider serving one batch per request | 4.6.2.2 (p. 28) allows several batches per request and makes asking for the remainder the requester's responsibility; 6.3 (p. 39) forbids overlapping requests, hence the pacing trade-off | Opt-in `RetransmitStallPolicy::ReRequestAfterBatch`; the default still waits |
+| FinishedReceiving after a RetransmitReject | 4.6.2.3 and 4.7.2 (p. 31) neither mandate nor forbid it | **Local policy**: sent, after the loss is reported by `Event::RetransmitRejected`; not a violation |
+| When a session is finalized | 4.7.2 (p. 31; [text](https://github.com/FIXTradingCommunity/fixp-specification/blob/master/v1-1/doc/04PointToPointSessionProtocol.md)): FinishedReceiving, then unbinding; no exception by Terminate code | **Local policy**, conservative, not a check the specification mandates: finalized only when every Terminate of the closing exchange carries `Finished` (the counterparty's, or this side's and its answer) after this side sent FinishedReceiving. An error Terminate either way, or a transport failure, leaves the session negotiated |
 | Re-establishing or renegotiating a finalized identifier | 6.3: a violation | Server: EstablishmentReject `Unnegotiated` or NegotiationReject `DuplicateId`, then the transport closed; client: `establish` refused locally |
-| Leaving sequenced mode | 3.5.4 names a context switch; Appendix A 7.3.1.1: any session message | Any session message this side sends other than a Sequence |
+| Leaving sequenced mode | 3.5.4 names a context switch; Appendix A 7.3.1.1 (p. 56): any session message | Any session message this side sends other than a Sequence |
 
 ## Not implemented
 

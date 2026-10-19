@@ -1270,7 +1270,12 @@ impl Session {
                 });
                 core.close_transport();
                 self.release_binding_state();
-                self.finalize_if_finished();
+                // Both sides must have ended gracefully: an error code in
+                // the answer ends the binding, not the session (local
+                // policy; section 4.7.2 names no code).
+                if *code == TerminationCode::Finished && message.code == TerminationCode::Finished {
+                    self.finalize_if_finished();
+                }
                 Bound::Unbind
             }
             // Section 4.4.1: answer with a Terminate, the last message sent.
@@ -1287,8 +1292,15 @@ impl Session {
                 });
                 self.release_binding_state();
                 // Section 4.7.2: the finalization's initiator unbinds after
-                // FinishedReceiving, which ends the logical session.
-                self.finalize_if_finished();
+                // FinishedReceiving, which ends the logical session. Only a
+                // graceful Terminate does: an error code ends the binding,
+                // not the session, and the counterparty may come back.
+                // Section 4.7.2 ties finalization to unbinding after
+                // FinishedReceiving without naming a code; `Finished` only
+                // is this crate's conservative policy, not a spec check.
+                if message.code == TerminationCode::Finished {
+                    self.finalize_if_finished();
+                }
                 binding.state = BindState::Closing {
                     deadline: now.checked_add(binding.local_keepalive),
                 };
@@ -4332,6 +4344,68 @@ mod flow_tests {
             session_id: SESSION
         }));
         assert_eq!(client.status(), SessionStatus::Finalized);
+    }
+
+    #[test]
+    fn test_an_error_terminate_after_finished_receiving_does_not_finalize() {
+        // Section 4.7.2 finalizes on the initiator's graceful Terminate; an
+        // error Terminate ends the binding only, so the session stays
+        // negotiated and may be established again.
+        let origin = Instant::now();
+        let (mut client, _server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        client.handle_message(&finished_sending(Some(0)), origin);
+        assert_eq!(sent(&drain(&mut client)), vec![finished_receiving()]);
+        client.handle_message(
+            &SessionMessage::Terminate(Terminate {
+                session_id: SESSION,
+                code: TerminationCode::UnspecifiedError,
+                reason: String::new(),
+            }),
+            origin,
+        );
+        let _ = drain(&mut client);
+        client.on_transport_closed();
+        let outputs = drain(&mut client);
+        assert_eq!(events(&outputs), vec![Event::TransportClosed]);
+        assert_eq!(client.status(), SessionStatus::Negotiated);
+        assert_eq!(client.establish(origin), Ok(()));
+    }
+
+    #[test]
+    fn test_an_error_answer_to_our_finished_terminate_does_not_finalize() {
+        // This side terminates gracefully after FinishedReceiving, but the
+        // counterparty answers with an error code: the binding ends, the
+        // session is not finalized (local policy, section 4.7.2).
+        let origin = Instant::now();
+        let (mut client, _server) =
+            established_pair(origin, FlowType::Idempotent, FlowType::Recoverable);
+        client.handle_message(&finished_sending(Some(0)), origin);
+        assert_eq!(sent(&drain(&mut client)), vec![finished_receiving()]);
+        assert_eq!(
+            client.terminate(TerminationCode::Finished, "", origin),
+            Ok(())
+        );
+        let _ = drain(&mut client);
+        client.handle_message(
+            &SessionMessage::Terminate(Terminate {
+                session_id: SESSION,
+                code: TerminationCode::UnspecifiedError,
+                reason: String::new(),
+            }),
+            origin,
+        );
+        let outputs = drain(&mut client);
+        assert!(closes(&outputs));
+        assert!(
+            !events(&outputs)
+                .iter()
+                .any(|event| matches!(event, Event::SessionFinalized { .. }))
+        );
+        client.on_transport_closed();
+        assert_eq!(events(&drain(&mut client)), vec![Event::TransportClosed]);
+        assert_eq!(client.status(), SessionStatus::Negotiated);
+        assert_eq!(client.establish(origin), Ok(()));
     }
 
     #[test]
