@@ -930,6 +930,9 @@ impl tracing::Subscriber for CloseReasons {
 async fn test_a_resend_the_peer_never_reads_is_closed_by_the_write_timeout() {
     let reasons = CloseReasons::default();
     let _subscriber = tracing::subscriber::set_default(reasons.clone());
+    // Tests in this binary run in parallel and tracing caches callsite
+    // interest globally; rebuild it so no callsite skips this subscriber.
+    tracing::callsite::rebuild_interest_cache();
     let write_timeout = Duration::from_millis(300);
     let (client_io, venue_io) = tokio::io::duplex(PIPE_BYTES);
     let (venue_app, _venue_rx) = RecordingApp::new();
@@ -1231,6 +1234,9 @@ async fn test_the_final_logout_gets_out_under_backpressure() {
 async fn test_a_logout_that_never_left_is_not_a_graceful_close() {
     let reasons = CloseReasons::default();
     let _subscriber = tracing::subscriber::set_default(reasons.clone());
+    // Tests in this binary run in parallel and tracing caches callsite
+    // interest globally; rebuild it so no callsite skips this subscriber.
+    tracing::callsite::rebuild_interest_cache();
     let write_timeout = Duration::from_millis(600);
     let (client_io, venue_io) = tokio::io::duplex(PIPE_BYTES);
     let (venue_app, _venue_rx) = RecordingApp::new();

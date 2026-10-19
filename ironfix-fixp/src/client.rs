@@ -1423,8 +1423,7 @@ mod tests {
     fn test_tracing_output_never_contains_credentials() {
         // Captures every log line both roles emit through a handshake with
         // credentials both ways, a violation and a termination.
-        let capture = crate::testkit::LogCapture::default();
-        tracing::subscriber::with_default(capture.clone(), || {
+        let capture = crate::testkit::capture_logs(|| {
             let origin = Instant::now();
             let mut client = FixpClient::new(
                 config(),
