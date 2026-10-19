@@ -48,8 +48,12 @@ transport bound to the session. After `Output::CloseTransport` the session
 considers that transport gone: what still arrives on it is reported as
 `Event::Ignored` (no second violation, no second close), and `negotiate`,
 `establish` and `on_transport_opened` fail with `FixpError::TransportClosing`
-until the driver calls `on_transport_closed`
+until the driver calls `on_transport_closed`. Application messages are
+reported the same way, as `Event::Ignored` with the message name
+`application message`, both on a closing transport and after the
+counterparty's Terminate (section 4.4)
 (`test_messages_after_an_unbind_are_ignored_until_the_transport_closes`,
+`test_messages_after_a_terminate_are_ignored`,
 `test_client_session_messages_before_establishment`,
 `test_server_session_messages_before_establishment_are_violations`). A server
 session that comes back on a new transport is told with `on_transport_opened`,
@@ -81,8 +85,8 @@ enumeration values (`codec::tests::test_every_session_message_round_trips`,
 | 12 | Retransmission | Sent per batch by the provider; validated against the request by the requester | see Recoverable flow |
 | 13 | RetransmitReject | Sent for refused requests; received, abandons the requested range | see Recoverable flow |
 | 14 | Terminate | Both directions; see Termination | see Termination |
-| 15 | FinishedSending | Received: answered with FinishedReceiving once everything up to `LastSeqNo` is accounted for. Never sent | see Finalization |
-| 16 | FinishedReceiving | Sent in answer to FinishedSending; received, a violation (this side never sends FinishedSending) | see Finalization |
+| 15 | FinishedSending | Received: answered with FinishedReceiving once everything up to `LastSeqNo` is accounted for; the session is finalized when the binding then ends with a Terminate. Never sent | see Finalization |
+| 16 | FinishedReceiving | Sent in answer to FinishedSending, after which this side sends no application message; received, a violation (this side never sends FinishedSending) | see Finalization |
 | 17 | Applied | Received: numbered as an application message, reported as `Event::Applied` whatever this side's flow. Never sent by the session | `test_applied_is_reported_and_numbered`, `test_applied_is_reported_whatever_this_side_flow` |
 | 18 | NotApplied | Sent on an Idempotent inbound gap; received: numbered, reported, a violation unless this side's flow is Idempotent | see Idempotent flow |
 | 19 | MessageTemplate | Accepted at any time and passed over; counts as traffic | `test_message_template_is_accepted_while_established`, `test_client_session_messages_before_establishment` |
@@ -159,6 +163,17 @@ Implemented and tested:
   retransmission batch) is preceded by a Sequence; later ones are numbered
   implicitly (`test_send_application_opens_with_a_sequence_then_numbers_implicitly`,
   `test_gap_on_a_recoverable_flow_is_recovered_end_to_end`).
+- Leaving sequenced mode: any session message this side sends other than
+  a Sequence (RetransmitRequest, RetransmitReject, FinishedReceiving, a
+  Retransmission header) makes the next application message go behind a
+  Sequence. This follows Appendix A 7.3.1.1, which reads section 3.5.4
+  broadly; a redundant Sequence is only a heartbeat, so the broad reading
+  is never wrong on the wire
+  (`test_a_retransmit_request_leaves_sequenced_mode`,
+  `test_a_retransmit_reject_leaves_sequenced_mode`,
+  `test_finished_receiving_leaves_sequenced_mode`,
+  `test_one_batch_per_request_provider_is_asked_again` in
+  `tests/loopback.rs`).
 - Outbound on an Unsequenced flow: no number; on a None flow: refused
   (`test_send_application_on_an_unsequenced_flow_has_no_number`,
   `test_send_application_on_a_none_flow_is_refused`).
@@ -229,6 +244,17 @@ Implemented and tested, as the requester:
     (`test_default_stall_policy_waits_for_a_paced_ironfix_provider`,
     `test_default_stall_policy_asks_again_after_an_interrupted_batch`,
     `test_default_stall_policy_asks_again_when_the_cut_follows_the_stall`).
+  - `ReRequestAfterBatch`: everything the default does, and also asks
+    again `retransmit_timeout` after a batch that arrived in full while the
+    request is still short of its `Count`, for a provider that serves one
+    batch per request (section 4.6.2.2). A batch still short of its own
+    `Count` is waited for. Against a provider pacing several batches for
+    one request more slowly than `retransmit_timeout`, the new request is
+    premature and a strict provider terminates with `ReRequestInProgress`
+    (`test_after_batch_stall_policy_asks_again_after_a_complete_short_batch`,
+    `test_after_batch_stall_policy_waits_while_a_batch_is_incomplete`,
+    `test_one_batch_per_request_provider_is_asked_again` in
+    `tests/loopback.rs`).
   - `EventOnly`: never asks again (`test_event_only_stall_policy_never_asks_again`).
   - `Terminate`: terminates with `UnspecifiedError`; the gap is requested
     again after re-establishment, when no retransmission can be in progress
@@ -237,7 +263,8 @@ Implemented and tested, as the requester:
     but still considers its request in progress sees the default policy's
     new request as premature, and a strict one terminates with
     `ReRequestInProgress`; a provider that answers with one complete short
-    batch and expects a new request is never asked again under the default.
+    batch and expects a new request is never asked again under the default
+    (use `ReRequestAfterBatch` with it).
 - At most `max_pending_gaps` separate gaps; one more terminates
   (`test_too_many_unrecovered_gaps_terminate`).
 - Unrecovered gaps survive the transport and are requested again after
@@ -329,7 +356,7 @@ Implemented and tested:
 
 ## Finalization (section 4.7)
 
-Implemented and tested, receiving side only:
+Implemented and tested, receiving side only (sections 4.7.1, 4.7.2, 6.3):
 
 - A counterparty's FinishedSending is reported
   (`Event::PeerFinishedSending`) and answered with FinishedReceiving once
@@ -345,6 +372,36 @@ Implemented and tested, receiving side only:
 - A repeated FinishedSending (its heartbeat role, section 4.7.1) gets no
   second answer (Appendix A 7.4.2); an application message after it is a
   violation (section 6.3).
+- After FinishedReceiving this side sends no application message:
+  `send_application` returns `FixpError::FinishedReceivingSent`, with
+  nothing queued and no number spent. Section 6.3 forbids it for the
+  responder; the half-close of Appendix A 7.4.1 and 7.4.6 (informative) is
+  declined, and per section 4.7.2 such a message would likely be lost to
+  the counterparty's Terminate. Before FinishedReceiving goes out (a gap
+  still being recovered) sending is allowed
+  (`test_no_application_message_after_finished_receiving`).
+- A RetransmitReject that gives up part of the range up to `LastSeqNo` is
+  not a violation: FinishedReceiving still goes out, after
+  `Event::RetransmitRejected` has reported the loss, since nothing more can
+  be recovered and the counterparty would otherwise repeat FinishedSending
+  for ever
+  (`test_finished_receiving_after_a_retransmit_reject_follows_the_reported_loss`).
+- Finalized sessions (section 4.7.2): once FinishedReceiving has gone out,
+  the binding ending with a Terminate exchange (the counterparty's
+  Terminate answered, or this side's answered) finalizes the logical
+  session. When the binding is over (the transport reported closed, or the
+  closing deadline passed) the role reports `Event::SessionFinalized` and
+  moves to `SessionStatus::Finalized`, which accepts no command: the client
+  refuses `establish`, and the server keeps the identifier
+  (`session_id()`), refuses `on_transport_opened`, answers an Establish for
+  it with EstablishmentReject `Unnegotiated` and a Negotiate for it with
+  NegotiationReject `DuplicateId`, each a protocol violation that closes
+  the transport (section 6.3). A binding that ends any other way (a
+  transport failure, an error Terminate, this side's Terminate going
+  unanswered) does not finalize: the counterparty may come back to finish
+  (`test_a_finalized_client_cannot_establish_again`,
+  `test_a_finalized_client_is_marked_when_its_closing_deadline_lapses`,
+  `test_a_finalized_server_refuses_the_session_id`).
 - After it, a Sequence or Context announcing numbers past `LastSeqNo`
   terminates (section 6.3, Appendix A 7.4.5) and no gap is opened for
   numbers the counterparty never sent; one equal to `LastSeqNo + 1`
@@ -399,12 +456,19 @@ Implemented and tested:
 | Context `NextSeqNo` | Optional in 3.5.3, required in the schema | Required on the wire; `u64::MAX`, the SBE null, means "no number" |
 | `NextSeqNo` in Establish on an Idempotent flow | 4.3.1: "re-establishment of a recoverable flow only"; Appendix A 7.1.10 sends it | Sent on every sequenced flow, first establishment included |
 | `FinishedSending` without `LastSeqNo` on a sequenced flow | 4.7.1: it must be populated | A protocol violation |
+| Application messages after FinishedReceiving | 6.3 forbids them for the responder; Appendix A 7.4.1 and 7.4.6 (informative) show a half-close; 4.7.2: they are likely lost | Refused with `FixpError::FinishedReceivingSent`; the normative 6.3 wins |
+| A provider serving one batch per request | 4.6.2.2 allows several batches per request and makes asking again the requester's responsibility | Opt-in `RetransmitStallPolicy::ReRequestAfterBatch`; the default still waits |
+| FinishedReceiving after a RetransmitReject | 4.7.2 answers once everything up to `LastSeqNo` is accounted for; nothing on a refused range | Sent; the loss is reported by `Event::RetransmitRejected`, not as a violation |
+| When a session is finalized | 4.7.2: FinishedReceiving, then the Terminate of the finalization's initiator | When the binding ends with a Terminate exchange after this side sent FinishedReceiving; not on a transport failure |
+| Re-establishing or renegotiating a finalized identifier | 6.3: a violation | Server: EstablishmentReject `Unnegotiated` or NegotiationReject `DuplicateId`, then the transport closed; client: `establish` refused locally |
+| Leaving sequenced mode | 3.5.4 names a context switch; Appendix A 7.3.1.1: any session message | Any session message this side sends other than a Sequence |
 
 ## Not implemented
 
 - **Sending a finalization** (section 4.7): this side never sends
-  FinishedSending, so it never finalizes a logical session itself, and does
-  not mark one finalized after answering the counterparty's.
+  FinishedSending, so it never starts the finalization of a logical
+  session. Finalization started by the counterparty is answered and
+  recorded (see Finalization).
 - **Multiplexing** (section 3.5.3): one session per transport.
 - **Datagram transports** (section 3.5.2): a stream is assumed; no Sequence at
   the start of each datagram.

@@ -206,6 +206,13 @@ pub enum FixpError {
         /// The command that was refused.
         operation: &'static str,
     },
+
+    /// This side has answered the counterparty's FinishedSending with
+    /// FinishedReceiving, after which it sends no application message
+    /// (FIXP v1.1 section 6.3): the counterparty is about to Terminate and
+    /// the message would likely be lost (section 4.7.2).
+    #[error("no application message may be sent after FinishedReceiving")]
+    FinishedReceivingSent,
 }
 
 #[cfg(test)]

@@ -230,6 +230,15 @@ pub enum Event {
     },
     /// The driver reported the transport closed.
     TransportClosed,
+    /// The logical session is finalized (FIXP v1.1 section 4.7.2): this side
+    /// answered the counterparty's FinishedSending with FinishedReceiving and
+    /// the binding ended with a Terminate. The session identifier may never
+    /// be established or negotiated again (section 6.3); the session object
+    /// moves to [`SessionStatus::Finalized`].
+    SessionFinalized {
+        /// The finalized session.
+        session_id: SessionId,
+    },
     /// A message was ignored without answering: a response that matches no
     /// outstanding request (FIXP v1.1 Appendix A 7.1.7.5 and 7.1.12.8),
     /// anything after a Terminate (section 4.4), or anything still arriving
@@ -302,4 +311,8 @@ pub enum SessionStatus {
     Closing,
     /// Both: the session is over; this object accepts no more commands.
     Closed,
+    /// Both: the logical session is finalized (FIXP v1.1 section 4.7.2).
+    /// It accepts no more commands, and its identifier may not be
+    /// established or negotiated again (section 6.3).
+    Finalized,
 }

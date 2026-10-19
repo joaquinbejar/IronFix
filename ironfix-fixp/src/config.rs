@@ -94,9 +94,23 @@ pub enum RetransmitStallPolicy {
     /// one terminates with `ReRequestInProgress`. Conversely, a provider that
     /// answers with one short but complete batch and expects a new request
     /// (one reading of section 4.6.2.2) is never asked again under this
-    /// policy; use `Terminate` with such a counterparty.
+    /// policy; use `Terminate` or `ReRequestAfterBatch` with such a
+    /// counterparty.
     #[default]
     ReRequestAfterContextSwitch,
+    /// Everything `ReRequestAfterContextSwitch` does, and also ask again for
+    /// what is still missing when the last batch arrived in full, the
+    /// request is still short of its `Count`, and `retransmit_timeout` has
+    /// passed since that batch's last message: the provider answered with
+    /// one complete batch and waits for a new request (one reading of
+    /// section 4.6.2.2).
+    ///
+    /// Use it with a provider that serves one batch per request. Against a
+    /// provider that paces several batches for one request more slowly than
+    /// `retransmit_timeout` (IronFix's own may, as its driver decides), the
+    /// new request is premature, and a strict provider terminates with
+    /// `ReRequestInProgress` (sections 4.6.1, 4.6.4, 6.3).
+    ReRequestAfterBatch,
 }
 
 /// Configuration of a FIXP session, either role.

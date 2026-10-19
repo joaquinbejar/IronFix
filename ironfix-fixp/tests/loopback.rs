@@ -16,7 +16,8 @@
 use ironfix_core::{SeqNum, Timestamp};
 use ironfix_fixp::{
     ClockAnchor, Credentials, Delivery, Event, FixpClient, FixpConfig, FixpServer, FlowType,
-    Output, SessionId, SessionMessage, SessionStatus, TerminationCode, is_session_message,
+    Output, RetransmitStallPolicy, SessionId, SessionMessage, SessionStatus, TerminationCode,
+    is_session_message,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroU32;
@@ -430,4 +431,160 @@ fn test_fixp_session_end_to_end() {
     // Nothing in any output ever showed the credentials.
     let rendered = format!("{:?} {:?} {:?}", client.events, server.events, server.seen);
     assert!(!rendered.contains("secret"), "{rendered}");
+}
+
+/// A provider that answers each RetransmitRequest with one batch of at most
+/// two messages and then stops serving it (FIXP v1.1 section 4.6.2.2, read
+/// as one batch per request). A requester configured with
+/// `RetransmitStallPolicy::ReRequestAfterBatch` asks again for the rest
+/// after `retransmit_timeout` and recovers every message; each request
+/// leaves the requester's sequenced mode, so its next application message
+/// goes behind a Sequence and is still numbered right (Appendix A 7.3.1.1).
+#[test]
+fn test_one_batch_per_request_provider_is_asked_again() {
+    let origin = Instant::now();
+    let retransmit_timeout = Duration::from_millis(300);
+    let requester_config = match FixpConfig::builder()
+        .keepalive_interval(Duration::from_secs(1))
+        .retransmit_timeout(retransmit_timeout)
+        .retransmit_stall_policy(RetransmitStallPolicy::ReRequestAfterBatch)
+        .build()
+    {
+        Ok(config) => config,
+        Err(error) => panic!("invalid config: {error}"),
+    };
+    let mut client = Side::new(FixpClient::new(
+        requester_config,
+        anchor(origin),
+        SESSION,
+        FlowType::Idempotent,
+        None,
+    ));
+    let mut server = Side::new(FixpServer::new(config(), anchor(origin), origin));
+    assert!(client.role.negotiate(origin).is_ok());
+    let mut wire = VecDeque::new();
+    client.flush(&mut wire);
+    server.inbox.extend(wire);
+    pump(&mut client, &mut server, origin);
+    assert!(
+        server
+            .role
+            .accept_negotiation(FlowType::Recoverable, None, origin)
+            .is_ok()
+    );
+    let mut wire = VecDeque::new();
+    server.flush(&mut wire);
+    client.inbox.extend(wire);
+    pump(&mut client, &mut server, origin);
+    assert!(client.role.establish(origin).is_ok());
+    let mut wire = VecDeque::new();
+    client.flush(&mut wire);
+    server.inbox.extend(wire);
+    pump(&mut client, &mut server, origin);
+    assert!(server.role.accept_establishment(origin).is_ok());
+    let mut wire = VecDeque::new();
+    server.flush(&mut wire);
+    client.inbox.extend(wire);
+    pump(&mut client, &mut server, origin);
+    assert_eq!(client.role.status(), SessionStatus::Established);
+
+    // One order, numbered 1, in sequenced mode.
+    let mut wire = VecDeque::new();
+    assert_eq!(
+        client.send(b"order-1", origin, &mut wire),
+        Some(SeqNum::new(1))
+    );
+    server.inbox.extend(wire);
+    pump(&mut client, &mut server, origin);
+
+    // Five reports are lost with the connection; the re-establishment
+    // reveals them.
+    let mut lost = VecDeque::new();
+    for report in [
+        b"report-1",
+        b"report-2",
+        b"report-3",
+        b"report-4",
+        b"report-5",
+    ] {
+        server.send(report, origin, &mut lost);
+    }
+    drop(lost);
+    client.role.on_transport_closed();
+    server.role.on_transport_closed();
+    client.flush(&mut VecDeque::new());
+    server.flush(&mut VecDeque::new());
+    let mut now = origin + Duration::from_millis(100);
+    assert!(server.role.on_transport_opened(now).is_ok());
+    assert!(client.role.establish(now).is_ok());
+    let mut wire = VecDeque::new();
+    client.flush(&mut wire);
+    server.inbox.extend(wire);
+    pump(&mut client, &mut server, now);
+    assert!(server.role.accept_establishment(now).is_ok());
+    let mut wire = VecDeque::new();
+    server.flush(&mut wire);
+    client.inbox.extend(wire);
+
+    // Serve one batch per request until nothing is missing.
+    let mut requests = 0;
+    loop {
+        let mut to_server = VecDeque::new();
+        client.process(now, &mut to_server);
+        server.inbox.extend(to_server);
+        let mut to_client = VecDeque::new();
+        server.process(now, &mut to_client);
+        if let Some(Event::RetransmitRequested { from, count }) = server.events.pop() {
+            requests += 1;
+            server.serve_retransmission(from.value(), count.min(2), now, &mut to_client);
+            if count > 2 {
+                assert!(server.role.end_retransmission().is_ok());
+            }
+        }
+        client.inbox.extend(to_client);
+        pump(&mut client, &mut server, now);
+        if !client.role.has_pending_recovery() {
+            break;
+        }
+        assert!(requests < 10, "recovery does not progress");
+        now += retransmit_timeout;
+        client.role.handle_timeout(now);
+        server.role.handle_timeout(now);
+    }
+    assert_eq!(requests, 3, "batches of 2, 2 and 1");
+    assert!(client.events.contains(&Event::RecoveryComplete));
+    let retransmitted: Vec<_> = client
+        .delivered
+        .iter()
+        .filter(|(_, retransmitted, _)| *retransmitted)
+        .map(|(seq, _, _)| *seq)
+        .collect();
+    assert_eq!(
+        retransmitted,
+        (1..=5)
+            .map(|seq| Some(SeqNum::new(seq)))
+            .collect::<Vec<_>>()
+    );
+
+    // The requests left sequenced mode: the next order goes behind a
+    // Sequence and the server numbers it 2.
+    let mut wire = VecDeque::new();
+    assert_eq!(
+        client.send(b"order-2", now, &mut wire),
+        Some(SeqNum::new(2))
+    );
+    assert!(matches!(wire.front(), Some(Frame::Session(_))));
+    server.inbox.extend(wire);
+    pump(&mut client, &mut server, now);
+    assert_eq!(
+        server.delivered.last().map(|(seq, _, _)| *seq),
+        Some(Some(SeqNum::new(2)))
+    );
+    assert!(
+        !server
+            .events
+            .iter()
+            .chain(client.events.iter())
+            .any(|event| matches!(event, Event::ProtocolViolation { .. }))
+    );
 }

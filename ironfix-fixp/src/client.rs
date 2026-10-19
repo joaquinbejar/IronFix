@@ -34,7 +34,8 @@ use crate::messages::{
 use crate::output::{Event, HandshakeStage, SessionStatus};
 use crate::role::bound_api;
 use crate::session::{
-    Binding, Bound, Classified, Core, HandshakeMessage, PeerMessage, Session, classify,
+    APPLICATION_MESSAGE, Binding, Bound, Classified, Core, HandshakeMessage, PeerMessage, Session,
+    classify,
 };
 use crate::types::{Credentials, EstablishmentRejectCode, FlowType, Nanotime, SessionId};
 use ironfix_core::SeqNum;
@@ -48,6 +49,8 @@ enum ClosedReason {
     Unnegotiated,
     ProtocolViolation,
     TransportClosed,
+    /// The logical session is finalized (FIXP v1.1 section 4.7.2).
+    Finalized,
 }
 
 #[derive(Debug)]
@@ -80,7 +83,14 @@ impl ClientState {
             Self::Negotiated { .. } => SessionStatus::Negotiated,
             Self::Establishing { .. } => SessionStatus::Establishing,
             Self::Bound { binding, .. } => binding.status(),
-            Self::Closed(_) => SessionStatus::Closed,
+            Self::Closed(ClosedReason::Finalized) => SessionStatus::Finalized,
+            Self::Closed(
+                ClosedReason::NegotiationRejected
+                | ClosedReason::NegotiationTimedOut
+                | ClosedReason::Unnegotiated
+                | ClosedReason::ProtocolViolation
+                | ClosedReason::TransportClosed,
+            ) => SessionStatus::Closed,
         }
     }
 }
@@ -311,7 +321,7 @@ impl FixpClient {
                 mut binding,
             } => match session.on_timeout(&mut self.core, &mut binding, now) {
                 Bound::Stay => ClientState::Bound { session, binding },
-                Bound::Unbind => ClientState::Negotiated { session },
+                Bound::Unbind => self.unbound(session),
             },
             other @ (ClientState::Idle
             | ClientState::Negotiated { .. }
@@ -353,7 +363,7 @@ impl FixpClient {
             ClientState::Bound { mut session, .. } => {
                 session.release_binding_state();
                 self.core.event(Event::TransportClosed);
-                ClientState::Negotiated { session }
+                self.unbound(session)
             }
             ClientState::Closed(reason) => ClientState::Closed(reason),
         };
@@ -391,7 +401,7 @@ impl FixpClient {
         }
         let state = std::mem::replace(&mut self.state, ClientState::Idle);
         self.state = match state {
-            ClientState::Bound { session, .. } => ClientState::Negotiated { session },
+            ClientState::Bound { session, .. } => self.unbound(session),
             other @ (ClientState::Idle
             | ClientState::Negotiating { .. }
             | ClientState::Negotiated { .. }
@@ -402,12 +412,33 @@ impl FixpClient {
 
     fn application_before_established(&mut self) {
         // Still arriving on a transport this side asked to close: nothing to
-        // answer, it is simply dropped.
+        // answer, and reported like a session message would be.
         if self.core.transport_closing() {
+            self.core
+                .ignore(APPLICATION_MESSAGE, "the transport is closing");
+            return;
+        }
+        if let ClientState::Closed(_) = self.state {
+            self.core
+                .ignore(APPLICATION_MESSAGE, "the session is closed");
             return;
         }
         let state = std::mem::replace(&mut self.state, ClientState::Idle);
         self.state = self.violation(state, "application message before establishment");
+    }
+
+    /// Where a bound client goes when its binding ends: negotiated, ready to
+    /// be established again, unless the logical session is finalized
+    /// (FIXP v1.1 section 4.7.2), whose identifier may not be established
+    /// again (section 6.3).
+    fn unbound(&mut self, session: Box<Session>) -> ClientState {
+        if session.is_finalized() {
+            self.core.event(Event::SessionFinalized {
+                session_id: session.id(),
+            });
+            return ClientState::Closed(ClosedReason::Finalized);
+        }
+        ClientState::Negotiated { session }
     }
 
     // ----- message handling --------------------------------------------------
@@ -424,7 +455,7 @@ impl FixpClient {
                 mut binding,
             } => match session.on_peer(&mut self.core, &mut binding, message, now) {
                 Bound::Stay => ClientState::Bound { session, binding },
-                Bound::Unbind => ClientState::Negotiated { session },
+                Bound::Unbind => self.unbound(session),
             },
             ClientState::Closed(reason) => ClientState::Closed(reason),
             unbound @ (ClientState::Idle
@@ -670,7 +701,7 @@ impl FixpClient {
                 mut binding,
             } => {
                 let _ = session.violation(&mut self.core, &mut binding, reason);
-                ClientState::Negotiated { session }
+                self.unbound(session)
             }
             ClientState::Closed(closed) => ClientState::Closed(closed),
             unbound @ (ClientState::Idle
@@ -1264,7 +1295,13 @@ mod tests {
             })]
         );
         assert_eq!(client.on_application_message(origin), Delivery::Discard);
-        assert!(drain(&mut client).is_empty());
+        assert_eq!(
+            drain(&mut client),
+            vec![Output::Event(Event::Ignored {
+                message: "application message",
+                reason: "the transport is closing",
+            })]
+        );
         // A closed client ignores everything.
         client.on_transport_closed();
         let _ = drain(&mut client);

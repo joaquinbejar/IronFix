@@ -61,8 +61,8 @@ use crate::messages::{
 use crate::output::{Event, HandshakeStage, SessionStatus, TerminatedBy};
 use crate::role::bound_api;
 use crate::session::{
-    Binding, Bound, Classified, Core, HandshakeMessage, PeerMessage, Session, check_reason,
-    classify,
+    APPLICATION_MESSAGE, Binding, Bound, Classified, Core, HandshakeMessage, PeerMessage, Session,
+    check_reason, classify,
 };
 use crate::types::{
     Credentials, EstablishmentRejectCode, FlowType, Nanotime, NegotiationRejectCode, SessionId,
@@ -77,6 +77,9 @@ enum ClosedReason {
     HandshakeTimedOut,
     ProtocolViolation,
     TransportClosed,
+    /// The logical session is finalized (FIXP v1.1 section 4.7.2); its
+    /// identifier may not be negotiated or established again (section 6.3).
+    Finalized(SessionId),
 }
 
 #[derive(Debug)]
@@ -119,7 +122,13 @@ impl ServerState {
             Self::Negotiated { .. } => SessionStatus::Negotiated,
             Self::EstablishPending { .. } => SessionStatus::EstablishPending,
             Self::Bound { binding, .. } => binding.status(),
-            Self::Closed(_) => SessionStatus::Closed,
+            Self::Closed(ClosedReason::Finalized(_)) => SessionStatus::Finalized,
+            Self::Closed(
+                ClosedReason::NegotiationRejected
+                | ClosedReason::HandshakeTimedOut
+                | ClosedReason::ProtocolViolation
+                | ClosedReason::TransportClosed,
+            ) => SessionStatus::Closed,
         }
     }
 }
@@ -153,7 +162,8 @@ impl FixpServer {
         self.state.status()
     }
 
-    /// The session identifier, once a Negotiate has named it.
+    /// The session identifier, once a Negotiate has named it. A finalized
+    /// session keeps it, so a driver can refuse to route it again.
     #[must_use]
     pub fn session_id(&self) -> Option<SessionId> {
         match &self.state {
@@ -161,7 +171,14 @@ impl FixpServer {
             ServerState::Negotiated { session, .. }
             | ServerState::EstablishPending { session, .. }
             | ServerState::Bound { session, .. } => Some(session.id()),
-            ServerState::AwaitingNegotiate { .. } | ServerState::Closed(_) => None,
+            ServerState::Closed(ClosedReason::Finalized(session_id)) => Some(*session_id),
+            ServerState::AwaitingNegotiate { .. }
+            | ServerState::Closed(
+                ClosedReason::NegotiationRejected
+                | ClosedReason::HandshakeTimedOut
+                | ClosedReason::ProtocolViolation
+                | ClosedReason::TransportClosed,
+            ) => None,
         }
     }
 
@@ -538,10 +555,7 @@ impl FixpServer {
                 mut binding,
             } => match session.on_timeout(&mut self.core, &mut binding, now) {
                 Bound::Stay => ServerState::Bound { session, binding },
-                Bound::Unbind => ServerState::Negotiated {
-                    session,
-                    deadline: None,
-                },
+                Bound::Unbind => self.unbound(session),
             },
             other @ ServerState::Closed(_) => other,
         };
@@ -590,10 +604,7 @@ impl FixpServer {
             ServerState::Bound { mut session, .. } => {
                 session.release_binding_state();
                 self.core.event(Event::TransportClosed);
-                ServerState::Negotiated {
-                    session,
-                    deadline: None,
-                }
+                self.unbound(session)
             }
             ServerState::Closed(reason) => ServerState::Closed(reason),
         };
@@ -636,10 +647,7 @@ impl FixpServer {
             ServerState::Closed(ClosedReason::TransportClosed),
         );
         self.state = match state {
-            ServerState::Bound { session, .. } => ServerState::Negotiated {
-                session,
-                deadline: None,
-            },
+            ServerState::Bound { session, .. } => self.unbound(session),
             other @ (ServerState::AwaitingNegotiate { .. }
             | ServerState::NegotiationPending { .. }
             | ServerState::Negotiated { .. }
@@ -650,8 +658,15 @@ impl FixpServer {
 
     fn application_before_established(&mut self) {
         // Still arriving on a transport this side asked to close: nothing to
-        // answer, it is simply dropped.
+        // answer, and reported like a session message would be.
         if self.core.transport_closing() {
+            self.core
+                .ignore(APPLICATION_MESSAGE, "the transport is closing");
+            return;
+        }
+        if let ServerState::Closed(_) = self.state {
+            self.core
+                .ignore(APPLICATION_MESSAGE, "the session is closed");
             return;
         }
         let state = std::mem::replace(
@@ -659,6 +674,23 @@ impl FixpServer {
             ServerState::Closed(ClosedReason::TransportClosed),
         );
         self.state = self.violation(state, "application message before establishment");
+    }
+
+    /// Where a bound server goes when its binding ends: negotiated, waiting
+    /// for the client to establish again, unless the logical session is
+    /// finalized (FIXP v1.1 section 4.7.2), whose identifier may not be
+    /// established again (section 6.3).
+    fn unbound(&mut self, session: Box<Session>) -> ServerState {
+        if session.is_finalized() {
+            self.core.event(Event::SessionFinalized {
+                session_id: session.id(),
+            });
+            return ServerState::Closed(ClosedReason::Finalized(session.id()));
+        }
+        ServerState::Negotiated {
+            session,
+            deadline: None,
+        }
     }
 
     /// Restores `state` and refuses a command that is illegal in it.
@@ -686,10 +718,7 @@ impl FixpServer {
                 mut binding,
             } => match session.on_peer(&mut self.core, &mut binding, message, now) {
                 Bound::Stay => ServerState::Bound { session, binding },
-                Bound::Unbind => ServerState::Negotiated {
-                    session,
-                    deadline: None,
-                },
+                Bound::Unbind => self.unbound(session),
             },
             ServerState::Closed(reason) => ServerState::Closed(reason),
             unbound @ (ServerState::AwaitingNegotiate { .. }
@@ -814,6 +843,20 @@ impl FixpServer {
                         .ignore(Negotiate::NAME, "the transport is being unbound");
                 }
                 ServerState::Bound { session, binding }
+            }
+            // Section 6.3: reusing a finalized session identifier is a
+            // violation; it is refused as a duplicate.
+            ServerState::Closed(ClosedReason::Finalized(session_id)) => {
+                if m.session_id == session_id {
+                    self.refuse_negotiate(
+                        m,
+                        NegotiationRejectCode::DuplicateId,
+                        "session finalized",
+                    );
+                    self.core
+                        .violation_unbound("Negotiate for a finalized session");
+                }
+                ServerState::Closed(ClosedReason::Finalized(session_id))
             }
             ServerState::Closed(reason) => ServerState::Closed(reason),
         }
@@ -944,6 +987,20 @@ impl FixpServer {
                 }
                 ServerState::Bound { session, binding }
             }
+            // Section 6.3: establishing a finalized session is a violation.
+            // `Unnegotiated` tells the client to negotiate a new session.
+            ServerState::Closed(ClosedReason::Finalized(session_id)) => {
+                if m.session_id == session_id {
+                    self.refuse_establish(
+                        m,
+                        EstablishmentRejectCode::Unnegotiated,
+                        "session finalized",
+                    );
+                    self.core
+                        .violation_unbound("Establish for a finalized session");
+                }
+                ServerState::Closed(ClosedReason::Finalized(session_id))
+            }
             ServerState::Closed(reason) => ServerState::Closed(reason),
         }
     }
@@ -976,10 +1033,7 @@ impl FixpServer {
                 mut binding,
             } => {
                 let _ = session.violation(&mut self.core, &mut binding, reason);
-                ServerState::Negotiated {
-                    session,
-                    deadline: None,
-                }
+                self.unbound(session)
             }
             ServerState::Closed(reason) => ServerState::Closed(reason),
             unbound @ (ServerState::AwaitingNegotiate { .. }
@@ -1518,10 +1572,16 @@ mod tests {
         );
         assert_eq!(
             drain(&mut server),
-            vec![Output::Event(Event::Ignored {
-                message: "Terminate",
-                reason: "the transport is closing",
-            })]
+            vec![
+                Output::Event(Event::Ignored {
+                    message: "application message",
+                    reason: "the transport is closing",
+                }),
+                Output::Event(Event::Ignored {
+                    message: "Terminate",
+                    reason: "the transport is closing",
+                }),
+            ]
         );
         // On a fresh transport a Terminate before establishment closes it.
         server.on_transport_closed();
