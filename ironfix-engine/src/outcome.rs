@@ -22,7 +22,8 @@
 //!   outbound throttle, or discarded because the session ended first.
 //! - [`SendOutcome::Unknown`]: the frame was built and its `MsgSeqNum`
 //!   spent (it was being filed, or it was in the session's write buffer)
-//!   when the session stopped before a flush covering it completed: the
+//!   when the session stopped before the stream was confirmed to have
+//!   accepted the whole frame: the
 //!   counterparty may have read all of it, part of it, or none. A number is
 //!   spent when its frame is buffered, so a frame buffered behind output the
 //!   counterparty was not taking is `Unknown` too, never `NotSent`.
@@ -142,8 +143,8 @@ pub enum SendOutcome {
         reason: NotSentReason,
     },
     /// The frame was numbered, and was being filed or waiting in the write
-    /// buffer, when the session stopped before a flush covering it
-    /// completed: the counterparty may have read all, part or none of it.
+    /// buffer, when the session stopped before the stream was confirmed to
+    /// have accepted the whole frame: the counterparty may have read all, part or none of it.
     /// **The order may be live**: do not resubmit it blindly (see the
     /// [module documentation](self)).
     ///
@@ -173,7 +174,8 @@ impl SendOutcome {
         }
     }
 
-    /// Returns whether a flush that covers the frame completed.
+    /// Returns whether the stream accepted the whole frame (`Sent`). Not an
+    /// acknowledgement from the counterparty, and not a completed flush.
     #[must_use]
     pub const fn is_sent(&self) -> bool {
         matches!(self, Self::Sent { .. })
@@ -354,11 +356,12 @@ const fn encode_tag(error: &EncodeError) -> Option<u32> {
 pub enum UnknownReason {
     /// The waiting output made no progress for the session's write timeout
     /// (`with_write_timeout` on the `Initiator` or the `Acceptor`): the
-    /// counterparty stopped reading. Also reported for the closing session's
-    /// last flush when it stops progressing.
+    /// counterparty stopped reading before the stream accepted the whole
+    /// frame. Also reported when the closing session's last flush stops
+    /// progressing with the frame not accepted whole.
     WriteTimeout,
-    /// The stream failed while the frame was waiting to be written or being
-    /// written, or the codec refused the frame after it was numbered and
+    /// The stream failed before it had accepted the whole frame (while the
+    /// frame was waiting to be written or being written), or the codec refused the frame after it was numbered and
     /// filed.
     Transport,
     /// The session reactor stopped after the frame was numbered, while it
@@ -376,7 +379,7 @@ enum Stage {
     /// Numbered `seq` and being filed: the store may hold it.
     Filing(u64),
     /// Numbered `seq`, filed, and fed to the write buffer, waiting for the
-    /// flush that writes it.
+    /// stream to accept its last byte.
     Writing(u64),
 }
 
@@ -442,8 +445,8 @@ impl Receipt {
     }
 
     /// Records that the frame numbered `seq` has been fed to the write
-    /// buffer: from here on, a frame no completed flush covered is
-    /// [`SendOutcome::Unknown`].
+    /// buffer: from here on, a frame the stream was not confirmed to have
+    /// accepted whole is [`SendOutcome::Unknown`].
     pub(crate) const fn writing(&mut self, seq: u64) {
         self.stage = Stage::Writing(seq);
     }

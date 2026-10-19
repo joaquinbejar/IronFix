@@ -159,9 +159,11 @@ README.
   after the failure, so a restart resets instead; only if the marker write
   fails too is the replay still possible.
 - **`Unknown { seq, reason }`**: the frame was numbered (being filed, or in
-  the session's write buffer) and the session ended before the stream
-  accepted all of it: a failed write (`Transport`), output that made no progress
-  for the write timeout (`WriteTimeout`), a closing flush that did not drain,
+  the session's write buffer) and the session ended before the stream was
+  confirmed to have accepted the whole frame (whole-frame acceptance not
+  confirmed): a failed write (`Transport`), output that made no progress
+  for the write timeout (`WriteTimeout`), a closing flush that stopped
+  before the frame's last byte was accepted,
   or a reactor stopped mid-way (`Interrupted`). A number is spent when the
   frame is buffered, so a frame that never left the buffer is `Unknown`, not
   `NotSent`: the engine cannot say no byte of it reached the stream. The

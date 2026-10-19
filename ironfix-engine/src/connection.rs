@@ -343,8 +343,8 @@ impl Connection {
     ///   [`NotSentReason::DiscardedBehindResend`] or
     ///   [`NotSentReason::DiscardedByThrottle`];
     /// - [`SendOutcome::Unknown`] when the frame was numbered (being filed,
-    ///   or waiting in the write buffer) and the session ended before a flush
-    ///   covering it completed: a number is spent when the frame is
+    ///   or waiting in the write buffer) and the session ended before the
+    ///   stream was confirmed to have accepted the whole frame: a number is spent when the frame is
     ///   buffered, so this is never `NotSent`. **The
     ///   order may be live**: do not resubmit it blindly. Reconcile it by
     ///   `ClOrdID` (11) after the next Logon, through the `ExecutionReport`
