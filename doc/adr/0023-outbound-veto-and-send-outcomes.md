@@ -153,8 +153,10 @@ README.
   for an administrative MsgType, the MsgType) and never quotes a field value,
   plus the tag itself. `StoreRefused` carries `state_unknown`, always true
   today: a failed store write may have landed, which within the process the
-  owed reset erases, but which a restart can replay (the owed record is in
-  memory only, #111).
+  owed reset erases, but which a restart could replay. Since ADR-0029 (#111)
+  the owed record is mirrored by the store's durable marker, written right
+  after the failure, so a restart resets instead; only if the marker write
+  fails too is the replay still possible.
 - **`Unknown { seq, reason }`**: the frame was numbered (being filed, or in
   the session's write buffer) and the session ended before a flush covering
   it completed: a failed write (`Transport`), output that made no progress
@@ -264,4 +266,4 @@ stream takes in one flush resolves together.
   checks that the reported `SendingTime` is the one on the wire in both
   precisions.
 - **Not done:** gating replays (a follow-up issue); durability of the owed
-  reset across a restart (#111); a typed close reason (#69).
+  reset across a restart (#111, since done in ADR-0029); a typed close reason (#69).

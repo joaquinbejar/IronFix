@@ -1,7 +1,7 @@
 # ADR-0022 — FileStore: a writer thread, a dense index, counter slots and compaction
 
 - **Status:** Accepted (issue #112, revised in the #112 review round;
-  amends ADR-0006)
+  amends ADR-0006; the slot layout is amended by ADR-0029)
 - **Date:** 2026-10-18
 
 ## Context
@@ -413,7 +413,9 @@ used with this build.
   without blocking the dropping thread.
 - **On disk:** journals are version 2, 12 KiB larger than an empty version-1
   journal; version-1 journals are refused; builds from before this change
-  refuse version-2 journals.
+  refuse version-2 journals. (ADR-0029 later moved the format to version 3,
+  adding the owed-reset flag to each counter slot; version 2 is refused in
+  turn.)
 - **Threads:** one OS thread per open store, with a 256 KiB stack.
 - **Dependencies:** `ironfix-store` gains `crossbeam-channel` (a workspace
   dependency) and, as a dev-dependency, `dhat` for the allocation test. The

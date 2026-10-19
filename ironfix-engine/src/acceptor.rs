@@ -422,8 +422,9 @@ impl<A: Application + 'static> Acceptor<A> {
     /// **One store, one engine.** The store must belong to this acceptor alone:
     /// two engines, or two processes, writing to one store would interleave two
     /// sequence streams in it. The record of a reset owed to the next session
-    /// is held in memory by the acceptor, not in the store, so a restart
-    /// forgets it (#111).
+    /// is held by the acceptor and mirrored by a durable marker in the store
+    /// ([`MessageStore::set_reset_owed`]), so a restart over the same store
+    /// still makes and declares it (#111, ADR-0029).
     ///
     /// **Nothing reaches the store before the Logon is authenticated.** A Logon
     /// refused before `from_admin` has accepted it (wrong version, encryption,
@@ -1611,7 +1612,22 @@ impl<A: Application + 'static> Acceptor<A> {
 
             // The ticket pays only this reset: a store write that fails while
             // the acknowledgement is filed owes another.
-            reset_ticket = (reset && self.store.store().is_some()).then(|| self.store.owe_reset());
+            //
+            // The intent is made durable in the store before the reset is
+            // acted on (ADR-0029): a crash from here until the
+            // acknowledgement is sent leaves the store's marker set, and the
+            // next session resets and declares the reset again.
+            reset_ticket = if reset && self.store.store().is_some() {
+                match self.store.owe_durably(&session_id, write_timeout).await {
+                    Ok(ticket) => Some(ticket),
+                    Err(err) => {
+                        let _ = session.reject_logon();
+                        return Err(err.into());
+                    }
+                }
+            } else {
+                None
+            };
             let Seeded {
                 sequences,
                 persisted,
@@ -1803,10 +1819,16 @@ impl<A: Application + 'static> Acceptor<A> {
         }
 
         // The acknowledgement that declared the reset is on the wire: that
-        // reset is paid. A store write that failed during this handshake was
-        // owed after the ticket was taken, and stays owed.
-        if let Some(ticket) = reset_ticket {
-            self.store.reset_paid(ticket);
+        // reset is paid, and the store's durable marker is cleared unless
+        // something is still owed. A store write that failed during this
+        // handshake was owed after the ticket was taken, and stays owed.
+        if let Err(err) = self
+            .store
+            .settle(&session_id, reset_ticket, write_timeout)
+            .await
+        {
+            let _ = session.reject_logon();
+            return Err(err.into());
         }
 
         // Typestate: LogonReceived -> Active.

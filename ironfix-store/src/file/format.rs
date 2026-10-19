@@ -5,7 +5,8 @@
 ******************************************************************************/
 
 //! The on-disk format of a [`FileStore`](super::FileStore) journal: format
-//! version 2 (ADR-0022), the only one this build reads and writes.
+//! version 3 (ADR-0022, with the owed-reset flag of ADR-0029), the only one
+//! this build reads and writes.
 //!
 //! All integers are little-endian.
 //!
@@ -15,10 +16,10 @@
 //! |---|---|---|
 //! | 0 | 44 | header |
 //! | 44 | 4 052 | zero bytes |
-//! | 4 096 | 36 | counter slot 0 |
-//! | 4 132 | 4 060 | zero bytes |
-//! | 8 192 | 36 | counter slot 1 |
-//! | 8 228 | 4 060 | zero bytes |
+//! | 4 096 | 44 | counter slot 0 |
+//! | 4 140 | 4 052 | zero bytes |
+//! | 8 192 | 44 | counter slot 1 |
+//! | 8 236 | 4 052 | zero bytes |
 //! | 12 288 | | records, back to back, to the end of the file |
 //!
 //! The header and each counter slot sit alone in their own 4 KiB block, so
@@ -30,7 +31,7 @@
 //! | Offset | Size | Field |
 //! |---|---|---|
 //! | 0 | 8 | magic, `IRFXJRNL` |
-//! | 8 | 2 | format version, `2` |
+//! | 8 | 2 | format version, `3` |
 //! | 10 | 2 | reserved, `0` |
 //! | 12 | 8 | creation time, whole seconds since the Unix epoch |
 //! | 20 | 4 | creation time, nanoseconds within the second |
@@ -41,7 +42,7 @@
 //! The header's counters are the ones the journal was written with (created,
 //! reset or compacted); the counter slots supersede them.
 //!
-//! # Counter slot (36 bytes)
+//! # Counter slot (44 bytes)
 //!
 //! | Offset | Size | Field |
 //! |---|---|---|
@@ -49,7 +50,22 @@
 //! | 8 | 8 | next sender `MsgSeqNum` |
 //! | 16 | 8 | next target `MsgSeqNum` |
 //! | 24 | 8 | durable boundary: the file offset up to which the records were on stable storage when the slot was written |
-//! | 32 | 4 | CRC-32 of bytes 0..32 |
+//! | 32 | 8 | flags: bit 0 is the owed-reset marker; every other bit is 0 |
+//! | 40 | 4 | CRC-32 of bytes 0..40 |
+//!
+//! A slot with any other flag bit set is treated as invalid, like one that
+//! fails its CRC.
+//!
+//! # Owed-reset marker
+//!
+//! The marker (ADR-0029) is the engine's intent to reset the sequence. It is
+//! carried by every slot written, so the newest valid slot says whether a
+//! reset is owed. Setting or clearing it writes it into **both** slots, each
+//! write flushed before the next, whatever the sync policy: once set, a slot
+//! torn or damaged afterwards still leaves the other one carrying it, and
+//! both slots failing their check refuses the journal. A reset or a
+//! compaction carries the marker into the new journal's slots: only an
+//! explicit clear removes it.
 //!
 //! # Records
 //!
@@ -117,10 +133,13 @@
 //!
 //! # Other versions
 //!
-//! Version 1, the format of #78 (counters as appended records), existed only
-//! in development builds and was never released. It is refused with
-//! [`StoreError::Corrupted`] naming the version, as is any version other than
-//! 2.
+//! Version 1, the format of #78 (counters as appended records), and version
+//! 2, the format of #112 (36-byte counter slots without the owed-reset flag),
+//! existed only in development builds and were never released. Each is
+//! refused with [`StoreError::Corrupted`] naming the version, as is any
+//! version other than 3. A version-2 journal is not migrated: reading it as
+//! "no reset owed" would be exactly the loss of intent version 3 exists to
+//! prevent.
 
 use crate::file::crc32::crc32;
 use crate::stored::StoredMessage;
@@ -136,7 +155,7 @@ use crate::file::index::Index;
 const MAGIC: [u8; 8] = *b"IRFXJRNL";
 
 /// The format version this module reads and writes.
-pub(crate) const VERSION: u16 = 2;
+pub(crate) const VERSION: u16 = 3;
 
 /// Length of the journal header, in bytes.
 pub(crate) const HEADER_LEN: usize = 44;
@@ -165,10 +184,13 @@ pub(crate) const DATA_START: u64 = 12_288;
 const PREFIX_LEN: usize = 3 * BLOCK_LEN;
 
 /// Length of a counter slot, in bytes.
-pub(crate) const SLOT_LEN: usize = 36;
+pub(crate) const SLOT_LEN: usize = 44;
 
 /// Length of the part of a counter slot its CRC covers, in bytes.
-const SLOT_CHECKED_LEN: usize = 32;
+const SLOT_CHECKED_LEN: usize = 40;
+
+/// The flag bit of a counter slot that carries the owed-reset marker.
+const FLAG_RESET_OWED: u64 = 1;
 
 // The layout constants agree: the prefix is three blocks, the header fits the
 // first one, and each slot starts its own block and fits in it.
@@ -326,6 +348,8 @@ pub(crate) struct Slot {
     /// The file offset up to which the records were on stable storage when
     /// the slot was written, in bytes.
     pub(crate) durable_end: u64,
+    /// Whether a sequence reset is owed (ADR-0029).
+    pub(crate) reset_owed: bool,
 }
 
 /// What a journal holds, as recovered by [`scan`].
@@ -359,6 +383,8 @@ pub(crate) struct Scan {
     /// The durable boundary of the newest valid slot: how far the journal is
     /// known to be on stable storage, whatever the scan read past it.
     pub(crate) boundary: u64,
+    /// The owed-reset marker of the newest valid slot.
+    pub(crate) reset_owed: bool,
 }
 
 /// One decoded record body.
@@ -509,7 +535,8 @@ pub(crate) fn decode_header(bytes: &[u8; HEADER_LEN]) -> Result<Header, StoreErr
     if version != VERSION {
         return Err(corrupted(format!(
             "journal format version {version} is not supported; this build reads version \
-             {VERSION} only (version 1 was a development format that was never released)"
+             {VERSION} only (versions 1 and 2 were development formats that were never \
+             released, and are not migrated)"
         )));
     }
     let _reserved = input.u16()?;
@@ -539,13 +566,15 @@ pub(crate) fn encode_slot(slot: &Slot) -> [u8; SLOT_LEN] {
     out.put(&slot.next_sender.to_le_bytes());
     out.put(&slot.next_target.to_le_bytes());
     out.put(&slot.durable_end.to_le_bytes());
+    let flags = if slot.reset_owed { FLAG_RESET_OWED } else { 0 };
+    out.put(&flags.to_le_bytes());
     let crc = crc32(out.written());
     out.put(&crc.to_le_bytes());
     bytes
 }
 
 /// Decodes a counter slot, or `None` if it fails its CRC (a torn or damaged
-/// slot).
+/// slot) or sets a flag bit this version does not define.
 #[must_use]
 pub(crate) fn decode_slot(bytes: &[u8; SLOT_LEN]) -> Option<Slot> {
     let (checked, crc) = bytes.split_at(SLOT_CHECKED_LEN);
@@ -554,11 +583,20 @@ pub(crate) fn decode_slot(bytes: &[u8; SLOT_LEN]) -> Option<Slot> {
         return None;
     }
     let mut input = Reader::new(checked);
+    let generation = input.u64().ok()?;
+    let next_sender = input.u64().ok()?;
+    let next_target = input.u64().ok()?;
+    let durable_end = input.u64().ok()?;
+    let flags = input.u64().ok()?;
+    if flags & !FLAG_RESET_OWED != 0 {
+        return None;
+    }
     Some(Slot {
-        generation: input.u64().ok()?,
-        next_sender: input.u64().ok()?,
-        next_target: input.u64().ok()?,
-        durable_end: input.u64().ok()?,
+        generation,
+        next_sender,
+        next_target,
+        durable_end,
+        reset_owed: flags & FLAG_RESET_OWED != 0,
     })
 }
 
@@ -594,9 +632,10 @@ pub(crate) fn newest_slot(images: &SlotImages) -> Result<(usize, Slot), StoreErr
     }
 }
 
-/// Two slots for a journal that starts from the given counters, with every
-/// record up to `durable_end` on stable storage: generations `first` and
-/// `first + 1`. Returns them with the next generation to use.
+/// Two slots for a journal that starts from the given counters and
+/// owed-reset marker, with every record up to `durable_end` on stable
+/// storage: generations `first` and `first + 1`. Returns them with the next
+/// generation to use.
 ///
 /// # Errors
 /// [`StoreError::Io`] if the generation sequence is exhausted.
@@ -605,6 +644,7 @@ pub(crate) fn fresh_slots(
     next_sender: u64,
     next_target: u64,
     durable_end: u64,
+    reset_owed: bool,
 ) -> Result<(SlotImages, u64), StoreError> {
     let exhausted = || {
         StoreError::Io(
@@ -619,6 +659,7 @@ pub(crate) fn fresh_slots(
             next_sender,
             next_target,
             durable_end,
+            reset_owed,
         })
     };
     Ok(([slot(first), slot(second)], next))
@@ -1008,6 +1049,7 @@ pub(crate) fn scan<R: Read>(
         end,
         truncation,
         dead_bytes: replay.dead_bytes,
+        reset_owed: slot.reset_owed,
         slots_stale,
         boundary,
     })
@@ -1382,6 +1424,7 @@ mod tests {
             next_sender,
             next_target,
             durable_end,
+            reset_owed: false,
         }
     }
 
@@ -1392,7 +1435,7 @@ mod tests {
     /// The slots a new journal starts with: counters 7 and 9, generations 0
     /// and 1.
     fn fresh() -> SlotImages {
-        ok(fresh_slots(0, 7, 9, DATA_START), "fresh slots").0
+        ok(fresh_slots(0, 7, 9, DATA_START, false), "fresh slots").0
     }
 
     fn journal_with(slots: &SlotImages, records: &[Vec<u8>]) -> Vec<u8> {
@@ -1484,7 +1527,7 @@ mod tests {
 
     #[test]
     fn test_header_with_another_version_is_corrupted_naming_it() {
-        for version in [1u16, 3] {
+        for version in [1u16, 2, 4] {
             let encoded = encode_versioned_header(&header(), version);
             assert!(matches!(
                 decode_header(&encoded),

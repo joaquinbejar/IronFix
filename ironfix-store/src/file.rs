@@ -17,7 +17,7 @@
 //! # Layout
 //!
 //! One journal file, `<directory>/<name>.journal` (see [`FileStoreConfig`]),
-//! in format version 2: a header recording the creation time, two **counter
+//! in format version 3: a header recording the creation time, two **counter
 //! slots** holding both sequence counters, then a sequence of
 //! length-prefixed, CRC-checked records, each a filed frame, or a filed frame
 //! together with the next sender number (one
@@ -29,10 +29,17 @@
 //! replaces the earlier one. The byte layout is documented in the `format`
 //! module source and in ADR-0022.
 //!
+//! Each counter slot also carries the **owed-reset marker**
+//! ([`MessageStore::set_reset_owed`], ADR-0029): the engine's durable intent
+//! to reset the sequence. Setting or clearing it writes both slots, each
+//! flushed whatever the [`SyncPolicy`]; a reset and a compaction carry it into
+//! the new journal.
+//!
 //! A journal in any other format version is refused with
 //! [`StoreError::Corrupted`] naming the version. That includes version 1, a
-//! development format (counters as appended records) that was never
-//! released: it is not migrated.
+//! development format (counters as appended records), and version 2, the
+//! slots without the marker; neither was ever released, and neither is
+//! migrated.
 //!
 //! # Memory
 //!
@@ -115,7 +122,7 @@
 //!   their damage is never a torn tail); a well-formed record header
 //!   declaring a body larger than the configured limit; a record that passes
 //!   its CRC but does not decode; both counter slots failing their check; a
-//!   header that is not a version-2 journal header. Under
+//!   header that is not a version-3 journal header. Under
 //!   [`SyncPolicy::Never`] and in a repair, a cut below the boundary writes
 //!   one new counter slot with the new end as its boundary, beside the newest
 //!   one, which is left as it is.
@@ -208,7 +215,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{BufReader, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio::runtime::Handle;
 
@@ -300,6 +307,8 @@ struct Shared {
     next_sender: AtomicU64,
     /// Next target sequence number.
     next_target: AtomicU64,
+    /// The owed-reset marker (ADR-0029).
+    reset_owed: AtomicBool,
     /// Creation time of the journal.
     creation_time: RwLock<SystemTime>,
     /// The last cut made since the store was opened, if any.
@@ -312,6 +321,7 @@ impl Shared {
         Self {
             next_sender: AtomicU64::new(1),
             next_target: AtomicU64::new(1),
+            reset_owed: AtomicBool::new(false),
             creation_time: RwLock::new(SystemTime::UNIX_EPOCH),
             truncation: SyncMutex::new(None),
         }
@@ -327,6 +337,7 @@ impl Shared {
     /// Publishes the state of a journal loaded from disk, and records the cut
     /// its recovery made. A clean load keeps the last cut on record.
     fn install(&self, scan: &format::Scan) {
+        self.reset_owed.store(scan.reset_owed, Ordering::SeqCst);
         self.publish(
             scan.header.creation_time,
             scan.next_sender,
@@ -451,6 +462,8 @@ enum Command {
     SetNextSender(u64),
     /// `set_next_target_seq`.
     SetNextTarget(u64),
+    /// `set_reset_owed`.
+    SetResetOwed(bool),
     /// `reset_to` (and `reset`).
     ResetTo {
         /// The next sender number after the reset.
@@ -541,6 +554,8 @@ struct Journal {
     next_sender: u64,
     /// Next target sequence number.
     next_target: u64,
+    /// The owed-reset marker every slot written carries (ADR-0029).
+    reset_owed: bool,
     /// The generation the next counter write takes.
     next_generation: u64,
     /// Both counter slots, as written.
@@ -733,6 +748,7 @@ impl Journal {
             creation_time: scan.header.creation_time,
             next_sender: scan.next_sender,
             next_target: scan.next_target,
+            reset_owed: scan.reset_owed,
             next_generation: scan.next_generation,
             slots: scan.slots,
             active_slot: scan.active,
@@ -847,6 +863,7 @@ impl Journal {
             next_sender,
             next_target,
             durable_end: self.durable_end,
+            reset_owed: self.reset_owed,
         });
         if let Err(err) = write_at(&mut self.file, &image, offset) {
             let restored = self
@@ -868,6 +885,58 @@ impl Journal {
         self.next_target = next_target;
         self.shared.next_sender.store(next_sender, Ordering::SeqCst);
         self.shared.next_target.store(next_target, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Sets or clears the owed-reset marker (ADR-0029): writes it into
+    /// **both** counter slots, with the current counters, each write flushed
+    /// before the next whatever the sync policy, and publishes it.
+    ///
+    /// Two slots, so that once the marker is set a slot torn or damaged
+    /// afterwards still leaves the other one carrying it; both failing their
+    /// check refuses the journal. A journal left unusable by a failed write
+    /// is refreshed first (see [`Journal::reload`]), since the marker is
+    /// typically set right after such a failure. Nothing is written when both
+    /// slots already carry `owed`.
+    ///
+    /// A failure leaves the marker set in memory if it was set before or was
+    /// being set: after a failure the slots may carry either value, and
+    /// reporting a reset owed that is not is the safe direction.
+    fn set_reset_owed(&mut self, owed: bool) -> Result<(), StoreError> {
+        if !self.pending.is_clear() {
+            self.reload()?;
+        }
+        let carried = self
+            .slots
+            .iter()
+            .all(|image| format::decode_slot(image).is_some_and(|slot| slot.reset_owed == owed));
+        if carried && self.reset_owed == owed {
+            self.shared.reset_owed.store(owed, Ordering::SeqCst);
+            return Ok(());
+        }
+        let previous = self.reset_owed;
+        self.reset_owed = owed;
+        for _ in 0..2 {
+            let written = self
+                .write_counters(self.next_sender, self.next_target)
+                .and_then(|()| {
+                    // `write_counters` flushed already if the policy flushes
+                    // every write; otherwise the slot is flushed here.
+                    if self.durable_slot == self.active_slot {
+                        Ok(())
+                    } else {
+                        self.flush()
+                    }
+                });
+            if let Err(err) = written {
+                self.reset_owed = previous || owed;
+                self.shared
+                    .reset_owed
+                    .store(self.reset_owed, Ordering::SeqCst);
+                return Err(err);
+            }
+        }
+        self.shared.reset_owed.store(owed, Ordering::SeqCst);
         Ok(())
     }
 
@@ -975,7 +1044,7 @@ impl Journal {
             next_target,
         };
         let (slots, next_generation) =
-            format::fresh_slots(0, next_sender, next_target, DATA_START)?;
+            format::fresh_slots(0, next_sender, next_target, DATA_START, self.reset_owed)?;
         write_replacement(&self.config, &header, &slots, &mut self.probe)?;
         // The rename is the commit point: past it, the journal on disk is the
         // new one whether or not what follows works.
@@ -1068,6 +1137,7 @@ impl Journal {
             self.next_sender,
             self.next_target,
             live,
+            self.reset_owed,
         )?;
         let mut replacement = Replacement::create(&self.config, &header, &slots)?;
         let mut index = Index::new();
@@ -1197,6 +1267,7 @@ impl Journal {
         self.creation_time = scan.header.creation_time;
         self.next_sender = scan.next_sender;
         self.next_target = scan.next_target;
+        self.reset_owed = scan.reset_owed;
         self.next_generation = self.next_generation.max(scan.next_generation);
         self.slots = scan.slots;
         self.active_slot = scan.active;
@@ -1254,6 +1325,10 @@ impl Journal {
             Command::SetNextTarget(next_target) => {
                 self.usable()?;
                 self.write_counters(self.next_sender, next_target)?;
+                Ok(Answer::Done)
+            }
+            Command::SetResetOwed(owed) => {
+                self.set_reset_owed(owed)?;
                 Ok(Answer::Done)
             }
             Command::ResetTo {
@@ -1445,6 +1520,7 @@ fn restamp_slots(
         next_sender: scan.next_sender,
         next_target: scan.next_target,
         durable_end: scan.end,
+        reset_owed: scan.reset_owed,
     });
     write_at(file, &image, slot_offset(position)?)
         .map_err(|err| io_error("cannot write the journal's counter slot", &err))?;
@@ -1770,7 +1846,7 @@ fn open_journal(
             next_sender: 1,
             next_target: 1,
         };
-        let (slots, _) = format::fresh_slots(0, 1, 1, DATA_START)?;
+        let (slots, _) = format::fresh_slots(0, 1, 1, DATA_START, false)?;
         write_replacement(&config, &header, &slots, &mut probe)?;
         flush_directory(config.directory())?;
         probe.dir_flush();
@@ -1849,7 +1925,7 @@ impl FileStore {
     /// # Errors
     /// [`StoreError::Io`] if the journal is missing or cannot be opened, cut,
     /// flushed or locked, and outside a Tokio runtime;
-    /// [`StoreError::Corrupted`] if its header is not a version-2 journal
+    /// [`StoreError::Corrupted`] if its header is not a version-3 journal
     /// header, or both of its counter slots are unreadable.
     pub async fn repair(config: FileStoreConfig) -> Result<Option<Truncation>, StoreError> {
         let store = Self::open_with(config, DamageRule::Salvage, false).await?;
@@ -2165,6 +2241,19 @@ impl MessageStore for FileStore {
 
     fn next_target_seq(&self) -> u64 {
         self.shared.next_target.load(Ordering::SeqCst)
+    }
+
+    /// The marker as the newest valid counter slot carries it, as loaded at
+    /// open or by the last refresh, and as last set since.
+    fn reset_owed(&self) -> bool {
+        self.shared.reset_owed.load(Ordering::SeqCst)
+    }
+
+    /// Writes the marker into both counter slots, flushing each, whatever the
+    /// [`SyncPolicy`]; a store left unusable by a failed write is refreshed
+    /// first. A reset and a compaction carry the marker into the new journal.
+    async fn set_reset_owed(&self, owed: bool) -> Result<(), StoreError> {
+        self.done(Command::SetResetOwed(owed)).await
     }
 
     /// Overwrites the counter slot that does not hold the last durable
@@ -3961,20 +4050,25 @@ mod v2_tests {
 
     #[tokio::test]
     async fn test_file_store_unsupported_format_version_is_corrupted() {
-        let dir = TempDir::new("version-3");
-        let config = dir.config();
-        drop(open(config.clone()).await);
-        let mut bytes = journal_bytes(&config);
-        bytes[8..10].copy_from_slice(&3u16.to_le_bytes());
-        let crc = crc32::crc32(&bytes[..HEADER_LEN - 4]);
-        bytes[HEADER_LEN - 4..HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
-        write_journal(&config, &bytes);
-        assert!(matches!(
-            FileStore::open(config.clone()).await,
-            Err(StoreError::Corrupted { reason })
-                if reason.contains("version 3 is not supported")
-        ));
-        assert_eq!(journal_bytes(&config), bytes, "refused, not changed");
+        // Version 2 (#112, no owed-reset flag) was never released and is not
+        // migrated; version 4 does not exist yet.
+        for version in [2u16, 4] {
+            let dir = TempDir::new(&format!("version-{version}"));
+            let config = dir.config();
+            drop(open(config.clone()).await);
+            let mut bytes = journal_bytes(&config);
+            bytes[8..10].copy_from_slice(&version.to_le_bytes());
+            let crc = crc32::crc32(&bytes[..HEADER_LEN - 4]);
+            bytes[HEADER_LEN - 4..HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+            write_journal(&config, &bytes);
+            assert!(matches!(
+                FileStore::open(config.clone()).await,
+                Err(StoreError::Corrupted { reason })
+                    if reason.contains(&format!("version {version} is not supported"))
+                        && reason.contains("never")
+            ));
+            assert_eq!(journal_bytes(&config), bytes, "refused, not changed");
+        }
     }
 
     /// Rewrites the format version in the header of `config`'s journal, and
@@ -4445,5 +4539,209 @@ mod v2_tests {
             "one slot write, at open"
         );
         assert_eq!(store.next_target_seq(), 2);
+    }
+
+    // ---- Owed-reset marker (issue #111, ADR-0029) ----
+
+    /// Whether both slots on disk decode and carry the marker as `owed`.
+    fn marker_on_disk(config: &FileStoreConfig) -> [Option<bool>; 2] {
+        slots_on_disk(config).map(|slot| slot.map(|slot| slot.reset_owed))
+    }
+
+    #[tokio::test]
+    async fn test_file_store_reset_owed_marker_survives_reopen_reset_and_compaction() {
+        let dir = TempDir::new("marker-durable");
+        let config = dir.config();
+        {
+            let store = open(config.clone()).await;
+            assert!(!store.reset_owed(), "a new journal owes nothing");
+            file(&store, 1).await;
+            ok(store.set_reset_owed(true).await, "set the marker");
+            assert!(store.reset_owed());
+            assert_eq!(marker_on_disk(&config), [Some(true), Some(true)]);
+        }
+        {
+            let store = open(config.clone()).await;
+            assert!(store.reset_owed(), "the marker survives a reopen");
+            assert_eq!(store.next_sender_seq(), 2, "the counters are untouched");
+            // A reset made under the marker keeps it: the reset is not yet
+            // declared to the counterparty.
+            ok(store.reset_to(2, 2).await, "reset");
+            assert!(store.reset_owed());
+            file(&store, 2).await;
+            ok(store.compact().await, "compact");
+            assert!(store.reset_owed(), "a compaction keeps the marker");
+            ok(store.set_next_target_seq(3).await, "counter write");
+        }
+        {
+            let store = open(config.clone()).await;
+            assert!(store.reset_owed());
+            assert_eq!(store.next_target_seq(), 3);
+            ok(store.set_reset_owed(false).await, "clear the marker");
+            assert_eq!(marker_on_disk(&config), [Some(false), Some(false)]);
+        }
+        let store = open(config).await;
+        assert!(!store.reset_owed(), "the clear survives a reopen");
+    }
+
+    #[tokio::test]
+    async fn test_file_store_reset_owed_marker_is_flushed_under_every_policy() {
+        for policy in [SyncPolicy::Never, SyncPolicy::EveryWrite] {
+            let dir = TempDir::new("marker-flush");
+            let config = dir.config().with_sync_policy(policy);
+            let store = open(config.clone()).await;
+            let (journal, _) = store.flushes().await;
+            ok(store.set_reset_owed(true).await, "set the marker");
+            let (after, _) = store.flushes().await;
+            assert_eq!(after - journal, 2, "{policy:?}: one flush per slot");
+            // Setting it again writes nothing.
+            ok(store.set_reset_owed(true).await, "set it again");
+            assert_eq!(store.flushes().await.0, after, "{policy:?}: no write");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_store_reset_owed_marker_crash_between_the_two_slot_writes() {
+        let dir = TempDir::new("marker-torn");
+        let config = dir.config();
+        let (before, after);
+        {
+            let store = open(config.clone()).await;
+            file(&store, 1).await;
+            before = journal_bytes(&config);
+            ok(store.set_reset_owed(true).await, "set the marker");
+            after = journal_bytes(&config);
+        }
+        // The first write goes to the slot that does not hold the newest
+        // checkpoint; the second to the other one.
+        let first = usize::from(newest_on_disk_of(&before) == 0);
+        let second = 1 - first;
+        let first_range = slot_bytes(first);
+
+        // A crash at every byte of the first slot write: until it is whole the
+        // previous checkpoint is the newest valid slot and nothing is owed;
+        // the call had not returned, so the engine has not acted on it.
+        for cut in 0..=format::SLOT_LEN {
+            let mut torn = before.clone();
+            torn[first_range.start..first_range.start + cut]
+                .copy_from_slice(&after[first_range.start..first_range.start + cut]);
+            write_journal(&config, &torn);
+            let store = open(config.clone()).await;
+            assert_eq!(
+                store.reset_owed(),
+                cut == format::SLOT_LEN,
+                "torn at byte {cut}"
+            );
+            assert_eq!(store.next_sender_seq(), 2, "torn at byte {cut}");
+        }
+
+        // A crash during the second slot write: the first one already carries
+        // the marker, so it is owed whatever the second holds.
+        let second_range = slot_bytes(second);
+        for cut in 0..=format::SLOT_LEN {
+            let mut torn = before.clone();
+            torn[first_range.clone()].copy_from_slice(&after[first_range.clone()]);
+            torn[second_range.start..second_range.start + cut]
+                .copy_from_slice(&after[second_range.start..second_range.start + cut]);
+            write_journal(&config, &torn);
+            let store = open(config.clone()).await;
+            assert!(store.reset_owed(), "torn at byte {cut} of the second slot");
+        }
+    }
+
+    /// The position of the newest valid slot in a journal image.
+    fn newest_on_disk_of(bytes: &[u8]) -> usize {
+        let mut images = [[0u8; format::SLOT_LEN]; 2];
+        for (position, image) in images.iter_mut().enumerate() {
+            image.copy_from_slice(&bytes[slot_bytes(position)]);
+        }
+        match format::newest_slot(&images) {
+            Ok((position, _)) => position,
+            Err(err) => panic!("no valid slot: {err:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_file_store_reset_owed_marker_damaged_slot_fails_closed() {
+        let dir = TempDir::new("marker-damage");
+        let config = dir.config();
+        {
+            let store = open(config.clone()).await;
+            file(&store, 1).await;
+            ok(store.set_reset_owed(true).await, "set the marker");
+        }
+        let marked = journal_bytes(&config);
+
+        // Either slot damaged after the marker was set: the other one still
+        // carries it, so the reset stays owed.
+        for position in 0..2 {
+            let mut damaged = marked.clone();
+            damaged[SLOT_OFFSETS[position] as usize + 33] ^= 0xFF;
+            write_journal(&config, &damaged);
+            let store = open(config.clone()).await;
+            assert!(store.reset_owed(), "slot {position} damaged");
+        }
+
+        // A flag bit this version does not define makes the slot invalid,
+        // even with a valid CRC: it is not read as "nothing owed".
+        let mut unknown = marked.clone();
+        let newest = newest_on_disk_of(&marked);
+        let range = slot_bytes(newest);
+        unknown[range.start + 32] = 0x03;
+        let crc = crc32::crc32(&unknown[range.start..range.start + 40]);
+        unknown[range.start + 40..range.end].copy_from_slice(&crc.to_le_bytes());
+        write_journal(&config, &unknown);
+        {
+            let store = open(config.clone()).await;
+            assert!(store.reset_owed(), "the other slot carries the marker");
+        }
+
+        // Both slots damaged: the journal is refused, never opened as owing
+        // nothing.
+        let mut both = marked.clone();
+        for offset in SLOT_OFFSETS {
+            both[offset as usize + 33] ^= 0xFF;
+        }
+        write_journal(&config, &both);
+        assert!(matches!(
+            FileStore::open(config.clone()).await,
+            Err(StoreError::Corrupted { reason }) if reason.contains("both counter slots")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_file_store_reset_owed_marker_on_a_journal_left_unusable_refreshes_it() {
+        let dir = TempDir::new("marker-unusable");
+        let config = dir.config();
+        let store = open(config.clone()).await;
+        ok(store.set_next_target_seq(5).await, "target 5");
+        store.fail_next_flush().await;
+        assert!(store.set_next_target_seq(6).await.is_err());
+        assert!(store.set_next_target_seq(7).await.is_err(), "unusable");
+        // Setting the marker refreshes the journal first, then writes it.
+        ok(store.set_reset_owed(true).await, "set the marker");
+        assert!(store.reset_owed());
+        assert_eq!(store.next_target_seq(), 5, "the failed write is undone");
+        drop(store);
+        let store = open(config).await;
+        assert!(store.reset_owed());
+    }
+
+    #[tokio::test]
+    async fn test_file_store_reset_owed_marker_failed_flush_reports_it_owed() {
+        let dir = TempDir::new("marker-flush-fails");
+        let config = dir.config();
+        let store = open(config.clone()).await;
+        store.fail_next_flush().await;
+        assert!(store.set_reset_owed(true).await.is_err());
+        // The slots may carry either value after the failure: the marker is
+        // reported set, the safe direction.
+        assert!(store.reset_owed());
+        // A clear that fails leaves it set too.
+        ok(store.refresh().await, "refresh");
+        ok(store.set_reset_owed(true).await, "set the marker");
+        store.fail_next_flush().await;
+        assert!(store.set_reset_owed(false).await.is_err());
+        assert!(store.reset_owed());
     }
 }

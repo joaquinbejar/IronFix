@@ -408,14 +408,18 @@ around it.
   frames filed again under the same number. A compaction blocks the store's
   calls while it copies the journal
   (`doc/adr/0022-file-store-writer-thread-and-compaction.md`). Opening it
-  still reads the whole journal, and a journal in the unreleased version-1
-  format is refused, not migrated. Only its `SyncPolicy::EveryWrite` (the
+  still reads the whole journal, and a journal in the unreleased version-1 or
+  version-2 format is refused, not migrated. Only its `SyncPolicy::EveryWrite` (the
   default) makes every acknowledged write survive an OS crash or a power
   loss; `EveryN` and `Never` survive a process crash only. Its guarantees reach the wire only under
   `StoreFailurePolicy::CloseSession`, and are stated for Unix only
   (`doc/adr/0006-file-store.md`). The record of a reset owed to the next
-  session lives in the engine's memory, not in the store, so a crash forgets
-  it (#111). Inbound
+  session is mirrored by a durable marker in the store (format version 3 of
+  the `FileStore` journal), set before the reset is acted on and cleared once
+  it has been declared, so a crash or restart over the same store still resets
+  and declares `ResetSeqNumFlag` (141) = Y at 1 (#111,
+  `doc/adr/0029-durable-owed-reset.md`). A crash after a resetting Logon ack
+  arrives and before the marker is durable is not covered. Inbound
   application messages are delivered at most once: a crash, or a session
   close whose application queue does not drain in time, loses the messages
   still queued. The close logs the lost range; nothing reports a loss across

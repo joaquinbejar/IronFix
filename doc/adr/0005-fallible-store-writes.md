@@ -230,7 +230,9 @@ replaying old orders), and after a successful owed reset our Logon at 1 is
 too low for a counterparty that did not reset. That reset is paid once that
 Logon is acknowledged, so a connect that fails before then still owes it. It
 lives in the `Initiator`, not in the store: a process restart forgets it, and
-the next session starts from the counters the store still holds.
+the next session starts from the counters the store still holds. (Superseded
+in part by ADR-0029: the record is now mirrored by a durable marker in the
+store, which a restart reads back.)
 
 ### Cancellation and timeouts
 

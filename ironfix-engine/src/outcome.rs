@@ -223,9 +223,11 @@ pub enum NotSentReason {
     /// **Across a restart.** A failed or timed-out store write leaves the
     /// store's state unknown: the frame may have been filed after all. Within
     /// the process the engine owes the next session a sequence reset, which
-    /// erases it. That record lives in memory only (issue #111), so after a
-    /// restart a store that did file the frame can replay it in answer to a
-    /// `ResendRequest`, under the number this session never spent.
+    /// erases it. The record is mirrored by the store's durable owed-reset
+    /// marker, written right after the failure (issue #111, ADR-0029), so a
+    /// restart resets too. Only if the store also fails that marker write
+    /// (logged as a warning) can a store that did file the frame replay it
+    /// after a restart, under the number this session never spent.
     #[non_exhaustive]
     StoreRefused {
         /// Whether the store's state after the failure is unknown. Always
