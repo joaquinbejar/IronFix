@@ -105,8 +105,9 @@ pub const MAX_THROTTLE_BUDGETS: usize = 16;
 /// A held message is kept whole in memory until it is released, so the bound
 /// is also what one budget can hold: `max_depth` times the size of the
 /// largest message the application sends. A budget's queue keeps the
-/// capacity its deepest fill gave it for the rest of the session (at most
-/// `max_depth` entries), so filling and draining it again allocates
+/// capacity its deepest fill gave it for the rest of the session: `max_depth`
+/// bounds the messages held, and the allocation may round up past it (128
+/// slots for a depth of 65), so filling and draining it again allocates
 /// nothing; that capacity is given back when the session ends.
 pub const MAX_THROTTLE_QUEUE_DEPTH: usize = 65_536;
 
@@ -569,8 +570,12 @@ struct Bucket<T> {
     spacing: Duration,
     /// Most tokens.
     burst: u32,
-    /// Tokens held now (as of `refilled_at`).
+    /// Tokens held now (as of `refilled_at`), the reserved ones included.
     tokens: u32,
+    /// Tokens reserved by messages that may go but whose frame is not fed
+    /// yet: still in the bucket, so the clock runs as if they had not been
+    /// taken, and taken only at the feed ([`Throttle::charge_at`]).
+    reserved: u32,
     /// When the tokens were last brought up to date: the instant the last
     /// earned token was earned, or the last time the bucket was found full.
     refilled_at: Instant,
@@ -589,6 +594,7 @@ impl<T> Bucket<T> {
             spacing: budget.spacing(),
             burst: budget.burst.max(1),
             tokens: budget.burst.max(1),
+            reserved: 0,
             refilled_at: now,
             max_depth: match budget.policy {
                 ThrottlePolicy::Queue { max_depth } => Some(max_depth),
@@ -642,12 +648,21 @@ impl<T> Bucket<T> {
         }
     }
 
-    /// Takes a token at `now`, if there is one.
-    fn take(&mut self, now: Instant) -> bool {
+    /// Tokens free to reserve: held and not reserved.
+    fn available(&self) -> u32 {
+        self.tokens.saturating_sub(self.reserved)
+    }
+
+    /// Reserves a token at `now`, if one is free. The token stays in the
+    /// bucket until the frame is fed, so the clock is not moved.
+    fn reserve(&mut self, now: Instant) -> bool {
         self.refill(now);
-        match self.tokens.checked_sub(1) {
-            Some(left) => {
-                self.tokens = left;
+        if self.available() == 0 {
+            return false;
+        }
+        match self.reserved.checked_add(1) {
+            Some(reserved) => {
+                self.reserved = reserved;
                 true
             }
             None => false,
@@ -660,7 +675,7 @@ impl<T> Bucket<T> {
     fn ready_at(&mut self, now: Instant) -> Option<Instant> {
         self.queue.front()?;
         self.refill(now);
-        if self.tokens > 0 {
+        if self.available() > 0 {
             return Some(now);
         }
         // `refilled_at` is never after `now` and `spacing` is at most a day,
@@ -711,7 +726,8 @@ impl<T> Throttle<T> {
 
     /// Decides what becomes of `item`, a new message of `budget`, at `now`.
     ///
-    /// It takes a token and goes now only when its budget holds nothing
+    /// It reserves a token (taken at the feed, [`Throttle::charge_at`]) and
+    /// goes now only when its budget holds nothing
     /// already, so it never overtakes a message of its own budget. Otherwise
     /// it is held, under [`ThrottlePolicy::Queue`] with room left, or refused.
     pub(crate) fn admit(&mut self, budget: BudgetId, item: T, now: Instant) -> Admission<T> {
@@ -720,7 +736,7 @@ impl<T> Throttle<T> {
             // A configuration always holds the default budget.
             return Admission::Now(item);
         };
-        if bucket.queue.is_empty() && bucket.take(now) {
+        if bucket.queue.is_empty() && bucket.reserve(now) {
             return Admission::Now(item);
         }
         match bucket.max_depth {
@@ -738,7 +754,7 @@ impl<T> Throttle<T> {
 
     /// Releases, at `now`, the held message that may go: of the budgets
     /// whose head can take a token, the head that was handed in first. Its
-    /// token is taken. `None` when no held message may go yet.
+    /// token is reserved, and taken by [`Throttle::charge_at`] at the feed. `None` when no held message may go yet.
     pub(crate) fn release(&mut self, now: Instant) -> Option<(BudgetId, T)> {
         let mut first: Option<(usize, u64)> = None;
         for (slot, bucket) in self.buckets.iter_mut().enumerate() {
@@ -746,7 +762,7 @@ impl<T> Throttle<T> {
                 continue;
             };
             bucket.refill(now);
-            if bucket.tokens == 0 {
+            if bucket.available() == 0 {
                 continue;
             }
             if first.is_none_or(|(_, earliest)| ticket < earliest) {
@@ -755,7 +771,7 @@ impl<T> Throttle<T> {
         }
         let (slot, _) = first?;
         let bucket = self.buckets.get_mut(slot)?;
-        if !bucket.take(now) {
+        if !bucket.reserve(now) {
             return None;
         }
         let (_, item) = bucket.queue.pop_front()?;
@@ -787,33 +803,33 @@ impl<T> Throttle<T> {
             .min()
     }
 
-    /// Charges, at `now`, the token a message of `budget` took earlier and
-    /// whose frame is only now fed: the time spent in between (the outbound
-    /// gate, the store) must not earn a token on top of it. The bucket is
-    /// brought up to date at `now`; if that fills it, the token is taken from
-    /// the refill and the clock restarts at `now`, exactly as if the token had
-    /// been taken at `now`. A wait too short to fill the bucket changes
-    /// nothing, which is also what taking it at `now` gives.
+    /// Takes, at `now`, the token a message of `budget` reserved when it was
+    /// admitted or released, now that its frame is fed. The bucket is brought
+    /// up to date at `now` first, with the reserved token still in it, so the
+    /// result is exactly what taking the token at `now` gives, whatever the
+    /// time spent in between (the outbound gate, the store): a full bucket
+    /// earned nothing meanwhile and its clock restarts at `now`.
     pub(crate) fn charge_at(&mut self, budget: BudgetId, now: Instant) {
-        if let Some(bucket) = self.bucket_mut(budget) {
+        if let Some(bucket) = self.bucket_mut(budget)
+            && let Some(reserved) = bucket.reserved.checked_sub(1)
+        {
             bucket.refill(now);
-            if bucket.tokens >= bucket.burst
-                && let Some(left) = bucket.burst.checked_sub(1)
-            {
+            bucket.reserved = reserved;
+            if let Some(left) = bucket.tokens.checked_sub(1) {
                 bucket.tokens = left;
-                bucket.refilled_at = now;
             }
         }
     }
 
-    /// Gives back the token a message of `budget` took and did not use: the
-    /// outbound gate vetoed it, or its body could not be framed. Never above
-    /// the budget's burst.
+    /// Releases the token a message of `budget` reserved and did not use:
+    /// the outbound gate vetoed it, or its body could not be framed. The
+    /// token was never taken, so the bucket is as if the message had not
+    /// been sent.
     pub(crate) fn refund(&mut self, budget: BudgetId) {
         if let Some(bucket) = self.bucket_mut(budget)
-            && let Some(tokens) = bucket.tokens.checked_add(1)
+            && let Some(reserved) = bucket.reserved.checked_sub(1)
         {
-            bucket.tokens = tokens.min(bucket.burst);
+            bucket.reserved = reserved;
         }
     }
 
@@ -834,6 +850,28 @@ impl<T> Throttle<T> {
                 let id = u8::try_from(slot).map_or(BudgetId::DEFAULT, BudgetId::new);
                 bucket.queue.drain(..).map(move |(_, item)| (id, item))
             })
+    }
+}
+
+#[cfg(test)]
+impl<T> Throttle<T> {
+    /// [`Throttle::admit`] for a message fed at once: a reserved token is
+    /// charged at `now`.
+    fn admit_sent(&mut self, budget: BudgetId, item: T, now: Instant) -> Admission<T> {
+        let admission = self.admit(budget, item, now);
+        if matches!(admission, Admission::Now(_)) {
+            self.charge_at(budget, now);
+        }
+        admission
+    }
+
+    /// [`Throttle::release`] for a message fed at once.
+    fn release_sent(&mut self, now: Instant) -> Option<(BudgetId, T)> {
+        let released = self.release(now);
+        if let Some((budget, _)) = &released {
+            self.charge_at(*budget, now);
+        }
+        released
     }
 }
 
@@ -1089,24 +1127,27 @@ mod tests {
         let t0 = Instant::now();
         let mut throttle = single(ThrottleBudget::new(4, SECOND).with_burst(3), t0);
         for item in 0..3 {
-            assert_now(throttle.admit(BudgetId::DEFAULT, item, t0), item);
+            assert_now(throttle.admit_sent(BudgetId::DEFAULT, item, t0), item);
         }
-        assert_held(throttle.admit(BudgetId::DEFAULT, 3, t0));
-        assert_held(throttle.admit(BudgetId::DEFAULT, 4, t0));
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 3, t0));
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 4, t0));
         assert_eq!(throttle.held(), 2);
 
         let spacing = Duration::from_millis(250);
         assert_eq!(throttle.next_release(t0), Some(t0 + spacing));
         let just_before = t0 + spacing - Duration::from_nanos(1);
-        assert!(throttle.release(just_before).is_none(), "not earned yet");
+        assert!(
+            throttle.release_sent(just_before).is_none(),
+            "not earned yet"
+        );
         assert_eq!(
-            throttle.release(t0 + spacing),
+            throttle.release_sent(t0 + spacing),
             Some((BudgetId::DEFAULT, 3)),
             "the head goes first"
         );
         assert_eq!(throttle.next_release(t0 + spacing), Some(t0 + 2 * spacing));
         assert_eq!(
-            throttle.release(t0 + 2 * spacing),
+            throttle.release_sent(t0 + 2 * spacing),
             Some((BudgetId::DEFAULT, 4))
         );
         assert_eq!(throttle.held(), 0);
@@ -1117,15 +1158,15 @@ mod tests {
     fn test_throttle_next_release_is_now_when_a_token_is_waiting() {
         let t0 = Instant::now();
         let mut throttle = single(ThrottleBudget::new(1, SECOND), t0);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
-        assert_held(throttle.admit(BudgetId::DEFAULT, 2, t0));
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 1, t0), 1);
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 2, t0));
         let later = t0 + 5 * SECOND;
         assert_eq!(
             throttle.next_release(later),
             Some(later),
             "a token was earned while the release waited"
         );
-        assert_eq!(throttle.release(later), Some((BudgetId::DEFAULT, 2)));
+        assert_eq!(throttle.release_sent(later), Some((BudgetId::DEFAULT, 2)));
     }
 
     #[test]
@@ -1137,14 +1178,14 @@ mod tests {
                 .with_policy(ThrottlePolicy::Refuse),
             t0,
         );
-        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 2, t0), 2);
-        assert_refused(throttle.admit(BudgetId::DEFAULT, 3, t0), 3);
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 1, t0), 1);
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 2, t0), 2);
+        assert_refused(throttle.admit_sent(BudgetId::DEFAULT, 3, t0), 3);
         assert_eq!(throttle.held(), 0);
         assert_eq!(throttle.next_release(t0), None);
         let half = t0 + Duration::from_millis(500);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 4, half), 4);
-        assert_refused(throttle.admit(BudgetId::DEFAULT, 5, half), 5);
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 4, half), 4);
+        assert_refused(throttle.admit_sent(BudgetId::DEFAULT, 5, half), 5);
     }
 
     #[test]
@@ -1154,27 +1195,11 @@ mod tests {
             ThrottleBudget::new(1, SECOND).with_policy(ThrottlePolicy::Queue { max_depth: 2 }),
             t0,
         );
-        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
-        assert_held(throttle.admit(BudgetId::DEFAULT, 2, t0));
-        assert_held(throttle.admit(BudgetId::DEFAULT, 3, t0));
-        assert_refused(throttle.admit(BudgetId::DEFAULT, 4, t0), 4);
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 1, t0), 1);
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 2, t0));
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 3, t0));
+        assert_refused(throttle.admit_sent(BudgetId::DEFAULT, 4, t0), 4);
         assert_eq!(throttle.held(), 2);
-    }
-
-    #[test]
-    fn test_throttle_new_message_never_overtakes_one_held_in_its_budget() {
-        let t0 = Instant::now();
-        let mut throttle = single(ThrottleBudget::new(1, SECOND).with_burst(2), t0);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 2, t0), 2);
-        assert_held(throttle.admit(BudgetId::DEFAULT, 3, t0));
-        // A token comes back (a veto): the next message still queues behind
-        // the one held, and the held one takes the token.
-        throttle.refund(BudgetId::DEFAULT);
-        assert_held(throttle.admit(BudgetId::DEFAULT, 4, t0));
-        assert_eq!(throttle.release(t0), Some((BudgetId::DEFAULT, 3)));
-        assert!(throttle.release(t0).is_none(), "one token, one release");
-        assert_eq!(throttle.release(t0 + SECOND), Some((BudgetId::DEFAULT, 4)));
     }
 
     #[test]
@@ -1187,10 +1212,10 @@ mod tests {
         let mut throttle: Throttle<u32> = Throttle::new(&config, t0);
         let orders = BudgetId::DEFAULT;
         let cancels = BudgetId::new(1);
-        assert_now(throttle.admit(orders, 1, t0), 1);
-        assert_held(throttle.admit(orders, 2, t0));
-        assert_now(throttle.admit(cancels, 100, t0), 100);
-        assert_now(throttle.admit(cancels, 101, t0), 101);
+        assert_now(throttle.admit_sent(orders, 1, t0), 1);
+        assert_held(throttle.admit_sent(orders, 2, t0));
+        assert_now(throttle.admit_sent(cancels, 100, t0), 100);
+        assert_now(throttle.admit_sent(cancels, 101, t0), 101);
         assert_eq!(throttle.held(), 1, "only the order waits");
         assert_eq!(
             throttle.next_release(t0),
@@ -1207,42 +1232,20 @@ mod tests {
         );
         let mut throttle: Throttle<u32> = Throttle::new(&config, t0);
         let (a, b) = (BudgetId::DEFAULT, BudgetId::new(1));
-        assert_now(throttle.admit(a, 1, t0), 1);
-        assert_now(throttle.admit(b, 2, t0), 2);
-        assert_held(throttle.admit(b, 3, t0));
-        assert_held(throttle.admit(a, 4, t0));
-        assert_held(throttle.admit(b, 5, t0));
+        assert_now(throttle.admit_sent(a, 1, t0), 1);
+        assert_now(throttle.admit_sent(b, 2, t0), 2);
+        assert_held(throttle.admit_sent(b, 3, t0));
+        assert_held(throttle.admit_sent(a, 4, t0));
+        assert_held(throttle.admit_sent(b, 5, t0));
         // Both budgets earn their token at the same moment: the message
         // handed in first goes first, whatever its budget.
         let t1 = t0 + SECOND;
-        assert_eq!(throttle.release(t1), Some((b, 3)));
-        assert_eq!(throttle.release(t1), Some((a, 4)));
-        assert!(throttle.release(t1).is_none());
-        assert_eq!(throttle.release(t0 + 2 * SECOND), Some((b, 5)));
+        assert_eq!(throttle.release_sent(t1), Some((b, 3)));
+        assert_eq!(throttle.release_sent(t1), Some((a, 4)));
+        assert!(throttle.release_sent(t1).is_none());
+        assert_eq!(throttle.release_sent(t0 + 2 * SECOND), Some((b, 5)));
     }
 
-    #[test]
-    fn test_throttle_charge_at_feed_does_not_bank_the_wait() {
-        let t0 = Instant::now();
-        let mut throttle = single(ThrottleBudget::new(1, SECOND), t0);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
-        // The frame is fed two windows later: the token counts from then.
-        let fed = t0 + 2 * SECOND;
-        throttle.charge_at(BudgetId::DEFAULT, fed);
-        assert_held(throttle.admit(BudgetId::DEFAULT, 2, fed));
-        assert_eq!(throttle.next_release(fed), Some(fed + SECOND));
-
-        let mut throttle = single(ThrottleBudget::new(1, SECOND).with_burst(3), t0);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
-        throttle.charge_at(BudgetId::DEFAULT, t0 + Duration::from_millis(500));
-        assert_now(throttle.admit(BudgetId::DEFAULT, 2, t0), 2);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 3, t0), 3);
-        assert_held(throttle.admit(BudgetId::DEFAULT, 4, t0));
-    }
-
-    /// Filling and draining a queue again and again, at a depth just past a
-    /// power of two, never reallocates it once warmed: the queue keeps its
-    /// capacity.
     #[test]
     fn test_throttle_queue_cycles_without_reallocating() {
         let t0 = Instant::now();
@@ -1251,16 +1254,16 @@ mod tests {
                 .with_policy(ThrottlePolicy::Queue { max_depth: 65 }),
             t0,
         );
-        assert_now(throttle.admit(BudgetId::DEFAULT, 99, t0), 99);
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 99, t0), 99);
         let mut capacity = None;
         let mut at = t0;
         for _ in 0..10 {
             for item in 0..65 {
-                assert_held(throttle.admit(BudgetId::DEFAULT, item, t0));
+                assert_held(throttle.admit_sent(BudgetId::DEFAULT, item, t0));
             }
             for _ in 0..65 {
                 at += Duration::from_nanos(1);
-                assert!(throttle.release(at).is_some());
+                assert!(throttle.release_sent(at).is_some());
             }
             let now = throttle
                 .buckets
@@ -1275,28 +1278,98 @@ mod tests {
     }
 
     #[test]
+    fn test_throttle_new_message_never_overtakes_one_held_in_its_budget() {
+        let t0 = Instant::now();
+        let mut throttle = single(ThrottleBudget::new(1, SECOND).with_burst(2), t0);
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 1, t0), 1);
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 2, t0), 2);
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 3, t0));
+        // A token is earned: the next message still queues behind the one
+        // held, and the held one takes the token.
+        let t1 = t0 + SECOND;
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 4, t1));
+        assert_eq!(throttle.release_sent(t1), Some((BudgetId::DEFAULT, 3)));
+        assert!(
+            throttle.release_sent(t1).is_none(),
+            "one token, one release"
+        );
+        assert_eq!(
+            throttle.release_sent(t1 + SECOND),
+            Some((BudgetId::DEFAULT, 4))
+        );
+    }
+
+    /// A message admitted at `t0` whose frame is fed `delay` later: the next
+    /// token is due one spacing after the feed, whatever the delay.
+    #[track_caller]
+    fn assert_feed_after(delay: Duration) {
+        let t0 = Instant::now();
+        let mut throttle = single(ThrottleBudget::new(1, SECOND), t0);
+        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
+        let fed = t0 + delay;
+        throttle.charge_at(BudgetId::DEFAULT, fed);
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 2, fed));
+        assert_eq!(
+            throttle.next_release(fed),
+            Some(fed + SECOND),
+            "fed {delay:?} after admission"
+        );
+        assert!(
+            throttle
+                .release_sent(fed + SECOND - Duration::from_nanos(1))
+                .is_none()
+        );
+        assert_eq!(
+            throttle.release_sent(fed + SECOND),
+            Some((BudgetId::DEFAULT, 2))
+        );
+    }
+
+    #[test]
+    fn test_throttle_token_is_taken_at_the_feed_for_any_delay() {
+        for delay in [
+            Duration::ZERO,
+            SECOND / 4,
+            SECOND / 2,
+            SECOND * 3 / 4,
+            SECOND,
+            2 * SECOND,
+        ] {
+            assert_feed_after(delay);
+        }
+    }
+
+    #[test]
+    fn test_throttle_reserved_token_is_not_free_to_another_message() {
+        let t0 = Instant::now();
+        let mut throttle = single(ThrottleBudget::new(1, SECOND), t0);
+        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
+        // Before the feed, a second message finds the token reserved.
+        assert_held(throttle.admit(BudgetId::DEFAULT, 2, t0 + 2 * SECOND));
+    }
+
+    #[test]
+    fn test_throttle_refund_releases_the_reservation_and_keeps_the_progress() {
+        let t0 = Instant::now();
+        let mut throttle = single(ThrottleBudget::new(1, SECOND).with_burst(2), t0);
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 1, t0), 1);
+        // Half a token earned, then a message reserves the last token and is
+        // vetoed: the token is free again, and the half still counts.
+        let half = t0 + Duration::from_millis(500);
+        assert_now(throttle.admit(BudgetId::DEFAULT, 2, half), 2);
+        throttle.refund(BudgetId::DEFAULT);
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 3, half), 3);
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 4, half));
+        assert_eq!(throttle.next_release(half), Some(t0 + SECOND));
+    }
+
+    #[test]
     fn test_throttle_refund_at_a_full_bucket_grants_nothing() {
         let t0 = Instant::now();
         let mut throttle = single(ThrottleBudget::new(1, SECOND), t0);
         throttle.refund(BudgetId::DEFAULT);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
-        assert_held(throttle.admit(BudgetId::DEFAULT, 2, t0));
-    }
-
-    #[test]
-    fn test_throttle_refund_during_partial_progress_keeps_the_progress() {
-        let t0 = Instant::now();
-        let mut throttle = single(ThrottleBudget::new(1, SECOND).with_burst(2), t0);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 2, t0), 2);
-        // Half a token earned, then one given back.
-        let half = t0 + Duration::from_millis(500);
-        assert_held(throttle.admit(BudgetId::DEFAULT, 3, half));
-        throttle.refund(BudgetId::DEFAULT);
-        assert_eq!(throttle.release(half), Some((BudgetId::DEFAULT, 3)));
-        // The half token still counts: the next one is due at t0 + 1 s.
-        assert_held(throttle.admit(BudgetId::DEFAULT, 4, half));
-        assert_eq!(throttle.next_release(half), Some(t0 + SECOND));
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 1, t0), 1);
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 2, t0));
     }
 
     #[test]
@@ -1305,9 +1378,9 @@ mod tests {
         let mut throttle = single(ThrottleBudget::new(1, SECOND).with_burst(2), t0);
         throttle.refund(BudgetId::DEFAULT);
         throttle.refund(BudgetId::new(7));
-        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t0), 1);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 2, t0), 2);
-        assert_held(throttle.admit(BudgetId::DEFAULT, 3, t0));
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 1, t0), 1);
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 2, t0), 2);
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 3, t0));
     }
 
     #[test]
@@ -1316,9 +1389,9 @@ mod tests {
         let mut throttle = single(ThrottleBudget::new(1, SECOND).with_burst(2), t0);
         // An hour idle: the bucket is full (2), not 3600 tokens deep.
         let later = t0 + Duration::from_secs(3_600);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 1, later), 1);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 2, later), 2);
-        assert_held(throttle.admit(BudgetId::DEFAULT, 3, later));
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 1, later), 1);
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 2, later), 2);
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 3, later));
         assert_eq!(throttle.next_release(later), Some(later + SECOND));
     }
 
@@ -1327,9 +1400,9 @@ mod tests {
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_secs(10);
         let mut throttle = single(ThrottleBudget::new(1, SECOND), t1);
-        assert_now(throttle.admit(BudgetId::DEFAULT, 1, t1), 1);
-        assert_held(throttle.admit(BudgetId::DEFAULT, 2, t0));
-        assert!(throttle.release(t0).is_none());
+        assert_now(throttle.admit_sent(BudgetId::DEFAULT, 1, t1), 1);
+        assert_held(throttle.admit_sent(BudgetId::DEFAULT, 2, t0));
+        assert!(throttle.release_sent(t0).is_none());
         assert_eq!(throttle.next_release(t0), Some(t1 + SECOND));
     }
 
@@ -1342,10 +1415,10 @@ mod tests {
         );
         let mut throttle: Throttle<u32> = Throttle::new(&config, t0);
         let (a, b) = (BudgetId::DEFAULT, BudgetId::new(1));
-        assert_now(throttle.admit(a, 1, t0), 1);
-        assert_now(throttle.admit(b, 2, t0), 2);
-        assert_held(throttle.admit(a, 3, t0));
-        assert_held(throttle.admit(b, 4, t0));
+        assert_now(throttle.admit_sent(a, 1, t0), 1);
+        assert_now(throttle.admit_sent(b, 2, t0), 2);
+        assert_held(throttle.admit_sent(a, 3, t0));
+        assert_held(throttle.admit_sent(b, 4, t0));
         let drained: Vec<_> = throttle.drain().collect();
         assert_eq!(drained, [(a, 3), (b, 4)]);
         assert_eq!(throttle.held(), 0);
@@ -1367,13 +1440,13 @@ mod tests {
             let mut item = 0;
             let mut at = t0;
             while at < t0 + 10 * per {
-                match throttle.admit(BudgetId::DEFAULT, item, at) {
+                match throttle.admit_sent(BudgetId::DEFAULT, item, at) {
                     Admission::Now(_) => sent.push(at),
                     Admission::Held => {
                         let Some(next) = throttle.next_release(at) else {
                             panic!("a held message has a release time");
                         };
-                        let Some(_) = throttle.release(next) else {
+                        let Some(_) = throttle.release_sent(next) else {
                             panic!("a release at the named instant releases");
                         };
                         sent.push(next);

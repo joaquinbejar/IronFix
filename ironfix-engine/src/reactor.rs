@@ -208,7 +208,8 @@
 //! taken from the command queue goes through [`Reactor::admit_through_throttle`]
 //! before anything else happens to it: the classifier names its budget and
 //! [`Throttle::admit`], a synchronous decision over the driver's `now`, either
-//! takes a token (the message goes on to the outbound gate at once), holds it
+//! reserves a token (the message goes on to the outbound gate at once, and
+//! the token is taken when its frame is fed, [`Throttle::charge_at`]), holds it
 //! in its budget's queue, or refuses it (`NotSent` with `Throttled`, nothing
 //! peeked, spent or filed). A held message is released by a branch of the
 //! loop, one per pass, on a single timer moved to the instant the next token
@@ -2765,9 +2766,9 @@ impl<A: Application> Reactor<A> {
                 Ok(phase)
             }
             Ok(Sent::Yes | Sent::Deferred) => {
-                // The token was taken before the gate and the store were
-                // awaited; it is charged at the instant the frame was fed, so
-                // that wait earns nothing on top of it.
+                // The token was only reserved before the gate and the store
+                // were awaited; it is taken now, at the instant the frame was
+                // fed, as if the message had been admitted now.
                 if let (Some(budget), Some(throttle)) = (budget, self.throttle.as_mut()) {
                     throttle.state.charge_at(budget, driver_now());
                 }

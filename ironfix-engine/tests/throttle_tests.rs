@@ -1341,11 +1341,10 @@ async fn test_vetoed_message_gives_its_token_back() {
     assert_discarded_by_throttle(&outcome(held).await, BudgetId::DEFAULT);
 }
 
-/// A gate that holds the first message longer than the window does not let
-/// the next one out right behind it: the token is charged when the frame is
-/// fed, so the next message still waits a full spacing after it.
-#[tokio::test(start_paused = true)]
-async fn test_slow_gate_does_not_let_the_next_message_out_early() {
+/// The gate holds the first message for `delay`; the next message, queued
+/// meanwhile, must still leave a full spacing after the first is fed: the
+/// token counts from the feed, whatever the delay.
+async fn assert_next_waits_a_full_spacing_after_a_delayed_feed(delay: Duration) {
     let (app, _rx) = ThrottleApp::new();
     let (connection, mut peer, handshake) = start(
         Role::Initiator,
@@ -1360,7 +1359,7 @@ async fn test_slow_gate_does_not_let_the_next_message_out_early() {
         "the gated message reaches to_app_checked",
     );
     let next = track(&connection, order("NEXT-1")).await;
-    tokio::time::sleep(2 * SECOND).await;
+    tokio::time::sleep(delay).await;
     app.release.notify_one();
     let frame = frame_of_type(&mut peer.framed, "D").await;
     assert_eq!(field(&frame, 11).as_deref(), Some("GATE"));
@@ -1370,11 +1369,31 @@ async fn test_slow_gate_does_not_let_the_next_message_out_early() {
     let gap = fed.elapsed();
     assert!(
         gap >= SECOND && gap < SECOND + RELEASE_SLACK,
-        "the next message left {gap:?} after the gated one"
+        "gate delay {delay:?}: the next message left {gap:?} after the gated one"
     );
     assert_eq!(sent(&outcome(gated).await), first);
     assert_eq!(sent(&outcome(next).await), first + 1);
     log_out(&connection, &mut peer).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_gate_delay_of_a_quarter_window_keeps_the_spacing() {
+    assert_next_waits_a_full_spacing_after_a_delayed_feed(SECOND / 4).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_gate_delay_of_half_a_window_keeps_the_spacing() {
+    assert_next_waits_a_full_spacing_after_a_delayed_feed(SECOND / 2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_gate_delay_of_three_quarters_of_a_window_keeps_the_spacing() {
+    assert_next_waits_a_full_spacing_after_a_delayed_feed(SECOND * 3 / 4).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_gate_delay_longer_than_the_window_keeps_the_spacing() {
+    assert_next_waits_a_full_spacing_after_a_delayed_feed(2 * SECOND).await;
 }
 
 /// A plain `send` goes through the same throttle: one refused is dropped,

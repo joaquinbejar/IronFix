@@ -227,8 +227,9 @@ engine wiring (#96) does not exist.
   refuse over-rate ones in `from_app`. The decision is synchronous over the
   driver's clock, tested on a paused Tokio clock; a throttled send allocates
   nothing more than an unthrottled one in steady state, and a budget's queue
-  keeps the capacity of its deepest fill (at most `max_depth` messages) until
-  the session ends (`doc/adr/0024-outbound-throttle.md`).
+  keeps the capacity of its deepest fill until the session ends: `max_depth`
+  bounds the messages held, and the queue's allocation may round up past it
+  (128 slots for a depth of 65) (`doc/adr/0024-outbound-throttle.md`).
 - **`NextExpectedMsgSeqNum` (789) on Logon**, opt-in with
   `SessionConfig::send_next_expected_msg_seq_num` on FIX.4.4 and FIXT.1.1
   sessions (refused below FIX.4.4), in both roles. The Logon and its
