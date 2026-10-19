@@ -1110,7 +1110,8 @@ pub(crate) fn decode_frame_into<'f>(
 /// MsgType field whose value is unacceptable: the field sits where it should,
 /// and FIX answers an invalid MsgType with a Reject (reason 11), not by
 /// treating the message as garbled. None of these is garbled: the reactor
-/// drops them with a warning, as it always has, and does not count them.
+/// answers them with a session Reject ([`malformed_reject`]) and does not
+/// count them.
 #[must_use]
 pub(crate) fn decode_is_garbled(error: &DecodeError, frame: &[u8]) -> bool {
     match error {
@@ -1168,6 +1169,256 @@ pub(crate) const fn decode_defect(error: &DecodeError) -> &'static str {
         DecodeError::InvalidFieldValue { .. } => "invalid field value",
         DecodeError::InvalidUtf8(_) => "invalid UTF-8",
         _ => "malformed message",
+    }
+}
+
+/// What a positional read of the standard header of a framed but undecodable
+/// frame found.
+///
+/// The frame's body failed to decode, so no [`RawMessage`] exists; the session
+/// still needs `MsgSeqNum` (34) to reference the frame in a Reject and to
+/// sequence it, and `PossDupFlag` (43) to recognise a resend of a number it
+/// has already consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MalformedHeader<'a> {
+    /// `MsgSeqNum` (34), when the header carries it exactly once as a valid
+    /// number before the first defect or the first non-header field.
+    pub(crate) seq: Option<u64>,
+    /// Whether the header carries `PossDupFlag` (43) = `Y`.
+    pub(crate) poss_dup: bool,
+    /// The frame's MsgType (35), when it is a valid one.
+    pub(crate) msg_type: Option<&'a str>,
+}
+
+/// The DATA tag paired with a standard-header Length tag, whose value may
+/// contain SOH: SecureDataLen (90) / SecureData (91) and XmlDataLen (212) /
+/// XmlData (213).
+const fn header_data_tag(length_tag: u32) -> Option<u32> {
+    match length_tag {
+        90 => Some(91),
+        212 => Some(213),
+        _ => None,
+    }
+}
+
+/// Parses 1 to `max_len` ASCII digits into a `u64`, with checked arithmetic.
+fn parse_ascii_u64(bytes: &[u8], max_len: usize) -> Option<u64> {
+    if bytes.is_empty() || bytes.len() > max_len {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for &byte in bytes {
+        let digit = match byte {
+            b'0'..=b'9' => u64::from(byte.checked_sub(b'0')?),
+            _ => return None,
+        };
+        value = value.checked_mul(10)?.checked_add(digit)?;
+    }
+    Some(value)
+}
+
+/// Reads `MsgSeqNum` (34), `PossDupFlag` (43) and MsgType (35) by position
+/// from a frame whose header is sound but whose body does not decode.
+///
+/// The scan walks the fields in order, `8`, `9`, `35`, then the standard
+/// header, and stops at the first field that is not a standard header field
+/// or does not parse as `tag=value<SOH>`. A 34 past that point is not read:
+/// it is either in the body, where the decoded path does not accept it
+/// either ([`header_seq_num`]), or behind a defect, where nothing can be
+/// trusted. A 34 that appears twice, or whose value is not a number, is
+/// unreadable. The header Length/Data pairs (90/91, 212/213) are skipped by
+/// their declared count, bounded by the frame.
+///
+/// No allocation; values are never copied or logged.
+#[must_use]
+pub(crate) fn scan_malformed_header(frame: &[u8]) -> MalformedHeader<'_> {
+    let mut found = MalformedHeader {
+        seq: None,
+        poss_dup: false,
+        msg_type: None,
+    };
+    let mut seq_seen = false;
+    let mut seq_repeated = false;
+    let mut pending_data: Option<(u32, usize)> = None;
+    let mut rest = frame;
+    let mut position: usize = 0;
+    while let Some(eq) = rest.iter().position(|&byte| byte == b'=') {
+        let Some(tag) = rest
+            .get(..eq)
+            .and_then(|bytes| parse_ascii_u64(bytes, 9))
+            .and_then(|tag| u32::try_from(tag).ok())
+        else {
+            break;
+        };
+        let Some(after_eq) = eq.checked_add(1).and_then(|start| rest.get(start..)) else {
+            break;
+        };
+        let value_len = match pending_data.take() {
+            Some((data_tag, declared)) if data_tag == tag => {
+                if after_eq.get(declared) != Some(&SOH) {
+                    break;
+                }
+                declared
+            }
+            _ => match after_eq.iter().position(|&byte| byte == SOH) {
+                Some(end) => end,
+                None => break,
+            },
+        };
+        let Some(value) = after_eq.get(..value_len) else {
+            break;
+        };
+        let in_place = match position {
+            0 => tag == 8,
+            1 => tag == 9,
+            2 => tag == 35,
+            _ => is_standard_header_tag(tag) && !matches!(tag, 8 | 9 | 35),
+        };
+        if !in_place {
+            break;
+        }
+        match tag {
+            35 => {
+                found.msg_type = std::str::from_utf8(value)
+                    .ok()
+                    .filter(|text| text.parse::<MsgType>().is_ok());
+            }
+            34 => {
+                seq_repeated |= seq_seen;
+                seq_seen = true;
+                found.seq = parse_ascii_u64(value, 20);
+            }
+            43 => found.poss_dup = value == b"Y",
+            _ => {}
+        }
+        if let Some(data_tag) = header_data_tag(tag) {
+            match parse_ascii_u64(value, 9).and_then(|count| usize::try_from(count).ok()) {
+                Some(declared) => pending_data = Some((data_tag, declared)),
+                None => break,
+            }
+        }
+        let Some(next) = value_len
+            .checked_add(1)
+            .and_then(|skip| after_eq.get(skip..))
+        else {
+            break;
+        };
+        rest = next;
+        position = match position.checked_add(1) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    if seq_repeated {
+        found.seq = None;
+    }
+    found
+}
+
+/// The session-level Reject for a framed message whose body does not decode:
+/// `SessionRejectReason` (373), `RefTagID` (371) when a tag can be named, and
+/// a fixed `Text` (58).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MalformedReject {
+    /// `SessionRejectReason` (373). Every code used exists from FIX 4.2 on.
+    pub(crate) code: u32,
+    /// `RefTagID` (371), when the defect names a tag.
+    pub(crate) ref_tag: Option<u32>,
+    /// A fixed label, never the frame's bytes.
+    pub(crate) text: &'static str,
+}
+
+/// Maps the decode failure of a framed message whose header is sound to the
+/// session-level Reject it gets.
+///
+/// Only codes FIX 4.2 already defines are used (0, 4, 6 and 11; FIX 4.2
+/// defines 0 to 11, `ironfix-dictionary/spec/FIX42.xml`), so the mapping is
+/// the same on every version that carries 373. FIX 4.0 and FIX 4.1 have no
+/// 373 and get `RefSeqNum` and the `Text` alone
+/// ([`MessageFactory::session_reject`]).
+///
+/// - an invalid tag (not a number, or no `=`): 0, "Invalid tag number";
+/// - a Length field with no value: 4, "Tag specified without a value",
+///   `RefTagID` = the Length tag;
+/// - a Length field whose value is not a byte count, a Length/Data pair
+///   whose count the frame cannot satisfy, an unterminated field: 6,
+///   "Incorrect data format for value", `RefTagID` = the tag;
+/// - a MsgType (35) value that is not a valid message type: 11, "Invalid
+///   MsgType", `RefTagID` = 35;
+/// - anything else: 6, without `RefTagID`.
+#[must_use]
+pub(crate) fn malformed_reject(error: &DecodeError, frame: &[u8]) -> MalformedReject {
+    match error {
+        DecodeError::InvalidTag(_) => MalformedReject {
+            code: 0,
+            ref_tag: None,
+            text: "malformed message: invalid tag number",
+        },
+        DecodeError::InvalidFieldValue { tag, .. } if field_is_empty(frame, *tag) => {
+            MalformedReject {
+                code: 4,
+                ref_tag: Some(*tag),
+                text: "malformed message: tag specified without a value",
+            }
+        }
+        DecodeError::InvalidFieldValue { tag, .. } => MalformedReject {
+            code: 6,
+            ref_tag: Some(*tag),
+            text: "malformed message: incorrect data format for value",
+        },
+        DecodeError::InvalidDataLength { data_tag, .. } => MalformedReject {
+            code: 6,
+            ref_tag: Some(*data_tag),
+            text: "malformed message: data length does not match the data field",
+        },
+        DecodeError::UnterminatedField { tag } => MalformedReject {
+            code: 6,
+            ref_tag: Some(*tag),
+            text: "malformed message: unterminated field",
+        },
+        DecodeError::InvalidMsgType(_) | DecodeError::InvalidUtf8(_) => MalformedReject {
+            code: 11,
+            ref_tag: Some(35),
+            text: "malformed message: invalid MsgType",
+        },
+        _ => MalformedReject {
+            code: 6,
+            ref_tag: None,
+            text: "malformed message: body does not decode",
+        },
+    }
+}
+
+/// Whether the field whose value failed to parse as `tag`'s byte count is
+/// empty (`tag=<SOH>`).
+///
+/// The failing field is found by position with the decoder's own walk, so
+/// Length/Data pairs are framed by count exactly as during the decode (a
+/// DATA payload that happens to contain `<SOH>95=<SOH>` is skipped, not
+/// matched) and tags are parsed numerically (a zero-padded `095=` is tag
+/// 95). Every successful step advances the walk, so it ends. The decoder may
+/// allocate the reason string of the error it returns; this runs only on the
+/// malformed path.
+fn field_is_empty(frame: &[u8], tag: u32) -> bool {
+    let mut decoder = Decoder::new(frame);
+    loop {
+        let start = decoder.offset();
+        match decoder.next_field() {
+            Ok(Some(_)) => {}
+            Err(DecodeError::InvalidFieldValue { tag: failed, .. }) if failed == tag => {
+                let Some(field) = frame.get(start..) else {
+                    return false;
+                };
+                let Some(eq) = field.iter().position(|&byte| byte == b'=') else {
+                    return false;
+                };
+                return eq
+                    .checked_add(1)
+                    .and_then(|value_start| field.get(value_start))
+                    == Some(&SOH);
+            }
+            Ok(None) | Err(_) => return false,
+        }
     }
 }
 
@@ -1740,18 +1991,65 @@ impl MessageFactory {
     ) -> PendingMessage {
         let mut message = OutboundMessage::new(MsgType::Reject);
         message.push_uint(45, ref_seq);
-        if let Some(ref_tag) = reason.ref_tag {
-            message.push_uint(371, u64::from(ref_tag));
+        // FIX 4.0 and FIX 4.1 define the Reject as RefSeqNum (45) and Text
+        // (58) only: RefTagID (371), RefMsgType (372) and SessionRejectReason
+        // (373) arrived with FIX 4.2 (QuickFIX `FIX40.xml` / `FIX41.xml`), so
+        // a strict counterparty of those versions would refuse them. The
+        // reason travels in Text there.
+        if self.reject_has_reason_fields() {
+            if let Some(ref_tag) = reason.ref_tag {
+                message.push_uint(371, u64::from(ref_tag));
+            }
+            if !ref_msg_type.is_empty() {
+                message.push_str(372, ref_msg_type);
+            }
+            if let Some(code) = ref_appl_ver_id {
+                message.push_str(REF_APPL_VER_ID, code);
+            }
+            message.push_uint(373, u64::from(reason.code));
         }
-        message.push_str(372, ref_msg_type);
-        if let Some(code) = ref_appl_ver_id {
-            message.push_str(REF_APPL_VER_ID, code);
-        }
-        message.push_uint(373, u64::from(reason.code));
         if !reason.text.is_empty() {
             message.push_str(58, &reason.text);
         }
         PendingMessage::plain(message)
+    }
+
+    /// Whether this session's Reject (35=3) carries RefTagID (371),
+    /// RefMsgType (372) and SessionRejectReason (373): FIX 4.2 and later.
+    ///
+    /// The match names every version, so a new [`FixVersion`] does not
+    /// compile until its Reject layout is decided.
+    #[must_use]
+    const fn reject_has_reason_fields(&self) -> bool {
+        match self.version {
+            FixVersion::Fix40 | FixVersion::Fix41 => false,
+            FixVersion::Fix42
+            | FixVersion::Fix43
+            | FixVersion::Fix44
+            | FixVersion::Fix50
+            | FixVersion::Fix50Sp1
+            | FixVersion::Fix50Sp2
+            | FixVersion::Fixt11 => true,
+        }
+    }
+
+    /// Builds the session-level Reject (35=3) for a framed message whose body
+    /// does not decode: `RefSeqNum` (45) = `ref_seq`, and on FIX 4.2 and later
+    /// `RefMsgType` (372) when the frame's MsgType was valid, then `RefTagID`
+    /// (371) and `SessionRejectReason` (373) from the [`MalformedReject`]. The
+    /// `Text` (58) is the defect's fixed label and never carries field bytes.
+    #[must_use]
+    pub(crate) fn malformed_reject(
+        &self,
+        ref_seq: u64,
+        ref_msg_type: Option<&str>,
+        reject: MalformedReject,
+    ) -> PendingMessage {
+        let mut reason = RejectReason::new(reject.code, reject.text);
+        if let Some(tag) = reject.ref_tag {
+            reason = reason.with_ref_tag(tag);
+        }
+        self.session_reject(ref_seq, ref_msg_type.unwrap_or(""), &reason)
     }
 }
 
@@ -3655,5 +3953,124 @@ mod tests {
                 Ok(())
             );
         }
+    }
+
+    /// Frames `body` behind `8=FIX.4.4|9=n|` with a correct checksum.
+    fn malformed_frame(body: &[u8]) -> Vec<u8> {
+        let mut frame = format!("8=FIX.4.4\x019={}\x01", body.len()).into_bytes();
+        frame.extend_from_slice(body);
+        let sum = frame.iter().map(|&byte| u64::from(byte)).sum::<u64>() % 256;
+        frame.extend_from_slice(format!("10={sum:03}\x01").as_bytes());
+        frame
+    }
+
+    #[test]
+    fn test_scan_malformed_header_reads_seq_poss_dup_and_msg_type() {
+        let frame = malformed_frame(b"35=D\x0149=A\x0156=B\x0134=17\x0143=Y\x01abc=1\x01");
+        assert_eq!(
+            scan_malformed_header(&frame),
+            MalformedHeader {
+                seq: Some(17),
+                poss_dup: true,
+                msg_type: Some("D"),
+            }
+        );
+    }
+
+    #[test]
+    fn test_scan_malformed_header_stops_at_the_body_and_at_a_defect() {
+        // A 34 after a body field is not the header MsgSeqNum.
+        let body_only = malformed_frame(b"35=0\x0149=A\x0111=X\x0134=5\x01abc=1\x01");
+        assert_eq!(scan_malformed_header(&body_only).seq, None);
+        // A 34 behind a defect in the header cannot be trusted.
+        let behind = malformed_frame(b"35=0\x01abc=1\x0134=5\x01");
+        assert_eq!(scan_malformed_header(&behind).seq, None);
+        // A repeated or non-numeric 34 is unreadable.
+        let repeated = malformed_frame(b"35=0\x0134=5\x0134=6\x01abc=1\x01");
+        assert_eq!(scan_malformed_header(&repeated).seq, None);
+        let text = malformed_frame(b"35=0\x0134=5a\x01abc=1\x01");
+        assert_eq!(scan_malformed_header(&text).seq, None);
+        let overflow = malformed_frame(b"35=0\x0134=99999999999999999999\x01abc=1\x01");
+        assert_eq!(scan_malformed_header(&overflow).seq, None);
+        // An invalid MsgType is not reported.
+        let empty_type = malformed_frame(b"35=\x0134=3\x01");
+        let header = scan_malformed_header(&empty_type);
+        assert_eq!((header.seq, header.msg_type), (Some(3), None));
+    }
+
+    #[test]
+    fn test_scan_malformed_header_skips_header_data_by_count() {
+        // SecureData (91) holds an SOH and a fake 34; the real 34 follows it.
+        let frame = malformed_frame(b"35=0\x0190=7\x0191=a\x0134=99\x0134=4\x01abc=1\x01");
+        assert_eq!(scan_malformed_header(&frame).seq, Some(4));
+        // A count past the frame stops the scan without panicking.
+        let short = malformed_frame(b"35=0\x0190=999\x0191=a\x0134=4\x01");
+        assert_eq!(scan_malformed_header(&short).seq, None);
+    }
+
+    #[test]
+    fn test_malformed_reject_maps_each_defect() {
+        let cases: [(&[u8], u32, Option<u32>); 6] = [
+            (b"35=0\x0134=2\x01abc=1\x01", 0, None),
+            (b"35=0\x0134=2\x0195=\x0196=x\x01", 4, Some(95)),
+            (b"35=0\x0134=2\x0195=40\x0196=x\x01", 6, Some(96)),
+            (b"35=\x0134=2\x01", 11, Some(35)),
+            // A DATA payload spelling `<SOH>95=<SOH>` is framed by count and
+            // never matched: the failing 95 holds a non-count value, so 6.
+            (
+                b"35=0\x0134=2\x0195=7\x0196=\x0195=\x01xx\x0195=abc\x0196=q\x01",
+                6,
+                Some(95),
+            ),
+            // A zero-padded tag is the same tag: an empty `095=` is 4.
+            (b"35=0\x0134=2\x01095=\x0196=x\x01", 4, Some(95)),
+        ];
+        for (body, code, ref_tag) in cases {
+            let frame = malformed_frame(body);
+            let Err(err) = decode_frame(&frame) else {
+                panic!("fixture must not decode");
+            };
+            assert!(!decode_is_garbled(&err, &frame), "{err:?}");
+            let reject = malformed_reject(&err, &frame);
+            assert_eq!((reject.code, reject.ref_tag), (code, ref_tag), "{err:?}");
+            assert!(!reject.text.contains('x'), "the Text quotes no value");
+        }
+    }
+
+    #[test]
+    fn test_reject_layout_follows_the_session_version() {
+        let reject = MalformedReject {
+            code: 0,
+            ref_tag: Some(35),
+            text: "malformed message: invalid tag number",
+        };
+        for (begin_string, has_reason) in [
+            ("FIX.4.0", false),
+            ("FIX.4.1", false),
+            ("FIX.4.2", true),
+            ("FIX.4.4", true),
+        ] {
+            let mut factory = factory_for(begin_string);
+            let pending = factory.malformed_reject(7, Some("D"), reject);
+            let frame = framed(&mut factory, 3, &pending);
+            let raw = decode(&frame);
+            assert_eq!(raw.get_field_str(45), Some("7"), "{begin_string}");
+            assert_eq!(
+                raw.get_field_str(58),
+                Some("malformed message: invalid tag number")
+            );
+            for tag in [371, 372, 373] {
+                assert_eq!(
+                    raw.get_field_str(tag).is_some(),
+                    has_reason,
+                    "{begin_string} tag {tag}"
+                );
+            }
+        }
+        // No RefMsgType when the MsgType was invalid.
+        let mut factory = factory();
+        let pending = factory.malformed_reject(7, None, reject);
+        let frame = framed(&mut factory, 3, &pending);
+        assert_eq!(decode(&frame).get_field_str(372), None);
     }
 }

@@ -197,6 +197,10 @@ pub enum CloseReason {
         /// The configured window.
         window: Duration,
     },
+    /// An inbound message had no readable `MsgSeqNum` (34) in its standard
+    /// header. A Logout saying so was sent first; no number was consumed.
+    #[non_exhaustive]
+    MsgSeqNumMissing {},
     /// An inbound message carried the wrong counterparty identity (49/56,
     /// or 50/57, 142/143 when configured). A Reject and a Logout were sent
     /// first.
@@ -400,6 +404,7 @@ impl fmt::Display for CloseReason {
             Self::IdentityMismatch { tag } => {
                 write!(f, "counterparty identity mismatch on tag {tag}")
             }
+            Self::MsgSeqNumMissing {} => f.write_str("MsgSeqNum (34) missing"),
             Self::SendingTime {} => f.write_str("SendingTime (52) problem"),
             Self::StoreFailure {} => f.write_str("store failure under the fail-closed policy"),
             Self::SequenceExhausted { counter } => {

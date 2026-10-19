@@ -1072,9 +1072,12 @@ FIX 4.x session (which carries no `ApplVerID` to reject).
 
 | Code | Emitted when |
 |---|---|
+| 0 | A framed message whose body has an invalid tag (see *Malformed Messages and Missing MsgSeqNum*); the number is consumed |
+| 4 | A framed message with a Length field (for example `RawDataLength` (95)) and no value, `RefTagID` = that tag; the number is consumed |
+| 11 | A framed message whose MsgType (35) value is invalid, `RefTagID` = 35, no `RefMsgType`; the number is consumed |
 | 1 | `SequenceReset` without `NewSeqNo` (36); `ResendRequest` without `BeginSeqNo` (7) or `EndSeqNo` (16); inbound `SendingTime` (52) absent; FIX 5.0, initiator in strict mode only: a Logon acknowledgement without `DefaultApplVerID` (1137), `RefTagID` = 1137, followed by a Logout |
 | 5 | `SequenceReset` whose `NewSeqNo` would rewind or fails to advance; `ResendRequest` whose range is outside what we have sent; initiator, with `send_next_expected_msg_seq_num`: a Logon acknowledgement whose `NextExpectedMsgSeqNum` (789) is 0, `RefTagID` = 789, followed by a Logout |
-| 6 | `SequenceReset` with a malformed `GapFillFlag` (123) that is present but neither `Y` nor `N`; inbound `SendingTime` (52) present but not a `UTCTimestamp`; initiator, with `send_next_expected_msg_seq_num`: a Logon acknowledgement whose `NextExpectedMsgSeqNum` (789) is not a number, `RefTagID` = 789, followed by a Logout |
+| 6 | A framed message whose body does not decode for another reason (a non-numeric Length value, a Length/Data pair the frame cannot satisfy, an unterminated field), `RefTagID` = the tag when one can be named; the number is consumed. `SequenceReset` with a malformed `GapFillFlag` (123) that is present but neither `Y` nor `N`; inbound `SendingTime` (52) present but not a `UTCTimestamp`; initiator, with `send_next_expected_msg_seq_num`: a Logon acknowledgement whose `NextExpectedMsgSeqNum` (789) is not a number, `RefTagID` = 789, followed by a Logout |
 | 9 | Inbound `SenderCompID`/`TargetCompID` (and `SenderSubID`/`TargetSubID` when configured) do not match the session configuration, **or** appear outside the standard header |
 | 10 | Inbound `SendingTime` (52) differs from the local clock by more than the configured tolerance |
 | 13 | FIX 5.0 only: `ApplVerID` (1128) more than once in the standard header of an inbound application message, or `DefaultApplVerID` (1137) more than once on the Logon acknowledgement (initiator); with `send_next_expected_msg_seq_num`, `NextExpectedMsgSeqNum` (789) more than once on the Logon acknowledgement (initiator, followed by a Logout); `RefTagID` = the repeated tag |
@@ -1855,8 +1858,9 @@ Rationale:
 on the session's own BeginString, during the Logon handshake and in the session
 reactor, and both also treat a frame whose header frames but does not decode as
 garbled. A message whose header decodes but whose body does not is **not**
-garbled: in session it is dropped with a fixed-label warning, consumes no
-`MsgSeqNum` and does not count toward the bound, as before; during the
+garbled and does not count toward the bound: in session it is answered with a
+session Reject that consumes its `MsgSeqNum` (see *Malformed Messages and
+Missing MsgSeqNum* below); during the
 handshake it is skipped under the same deadline, because it cannot be read as
 a Logon either. A garbled frame:
 
@@ -1931,14 +1935,87 @@ ends a `Framed` stream.
   which has no anchor: it frames a read that starts after a plausible
   boundary as it is, so garbage delivered in separate reads can count once
   per read. Neither engine builds one.
-- A framed message whose body does not decode is dropped without a Reject,
-  because no `MsgSeqNum` can be read to reference. A peer that answers the
-  resulting `ResendRequest` by resending the same bytes has them dropped again,
-  so that gap can stall until the bounded resend gives up and logs out.
 - After the "message too large" Logout, and after the garbled-limit Logout,
   the socket is dropped while the peer's input may still be arriving. Closing a
   socket with unread input can make the kernel send RST, and the peer may then
   lose the Logout. This holds until a graceful drain exists.
+
+### Malformed Messages and Missing MsgSeqNum
+
+**Scope**: `ironfix-engine`, the in-session reactor shared by `Initiator` and
+`Acceptor`. The Logon handshakes are not covered: a malformed Logon or Logon
+acknowledgement is skipped under the logon timeout, as described above.
+
+**FIX convention** (FIX Session Layer, June 2020,
+<https://www.fixtrading.org/wp-content/uploads/download-manager-files/FIX_Session_Layer_June_2020.pdf>):
+a message that frames correctly (BeginString, BodyLength and CheckSum sound,
+so it is not garbled) but whose content is invalid is rejected, the rejection
+is logged, and NextNumIn is incremented (§4.5.4): the session-level Reject
+(35=3) references its `MsgSeqNum` and **consumes** that number, so the
+counterparty does not resend it. A message received without `MsgSeqNum` (34)
+cannot be sequenced or referenced: §4.5.3 "Missing sequence number" (printed
+page 27) requires a Logout with `Text`, then termination of the session.
+
+**What IronFix implements**
+
+*A malformed body behind a sound header* (an invalid tag, a Length field with
+no value or a non-numeric one, a Length/Data pair the frame cannot satisfy, an
+unterminated field, an invalid MsgType value). `MsgSeqNum` (34) and
+`PossDupFlag` (43) are read from the standard header by position: the scan
+walks `8`, `9`, `35`, then standard-header fields, and stops at the first
+field that is not one or does not parse, so a 34 in the body or behind a
+defect is not read, and a repeated or non-numeric 34 is unreadable. The
+header Length/Data pairs (90/91, 212/213) are skipped by count. With a 34:
+
+- **next in sequence**: a Reject goes out and the number is consumed. As for
+  every Reject that consumes a number, `MsgSeqNum + 1` is persisted as the
+  next target before the expectation moves; a failed write under
+  `StoreFailurePolicy::CloseSession` closes the session instead;
+- **below the expectation with 43=Y**: a duplicate of a number already
+  consumed, for example the counterparty's resend of a message already
+  rejected. Dropped, with no second Reject;
+- **below the expectation without 43=Y**: the usual MsgSeqNum-too-low Logout
+  and close;
+- **above the expectation**: the gap is requested and the message is not
+  acted on; its resend is rejected when it arrives in order. Under
+  `GapPolicy::Queue` it is not queued.
+
+Without a readable 34, see below.
+
+The Reject carries `RefSeqNum` (45) and, from FIX 4.2 on, `RefMsgType` (372)
+when the MsgType is valid, `SessionRejectReason` (373) and `RefTagID` (371):
+
+| Defect | 373 | 371 |
+|---|---|---|
+| Invalid tag (not a number, no `=`) | 0 | none |
+| Length field with no value | 4 | the Length tag |
+| Length value not a byte count; Length/Data pair the frame cannot satisfy; unterminated field | 6 | the Length tag, the Data tag, the field's tag |
+| Invalid MsgType (35) value | 11 | 35 |
+| Any other body decode failure | 6 | none |
+
+All four codes exist from FIX 4.2 on (`spec/FIX42.xml` defines 0 to 11), so
+the mapping is the same on every version that carries 373. FIX 4.0 and FIX
+4.1 define the Reject as `RefSeqNum` (45) and `Text` (58) only, so on those
+sessions **every** Reject the engine sends, not only this one, omits 371,
+372 and 373 and carries the reason in `Text`. The `Text` is a fixed label
+("malformed message: invalid tag number" and so on) and never quotes field
+bytes; the log line carries the session, the number and the same static
+defect label, never the frame, which may carry `Password` (554). Such a
+message does not refresh the heartbeat clock or clear a pending TestRequest:
+its identity fields (49/56) cannot be checked, so it is not proof of life. It
+does not count toward `garbled_frame_limit`.
+
+*A message without a readable header `MsgSeqNum` (34)*, whether its body
+decoded or not, is answered with a Logout whose `Text` is
+`MsgSeqNum (34) missing`, and the session closes with
+`CloseReason::MsgSeqNumMissing`. Nothing is consumed, and nothing reaches the
+`Application`. A 34 that appears only after the body is treated as missing.
+
+**Known limits**
+
+- The identity (49/56) of a message whose body does not decode is not
+  checked before it is rejected, because the header is not decoded as a whole.
+  It consumes a number only from the connected counterparty's stream.
 
 ### Repeating groups in dictionary validation
 
