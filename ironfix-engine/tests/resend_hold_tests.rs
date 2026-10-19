@@ -891,3 +891,74 @@ async fn test_acceptor_no_heartbeat_inside_a_long_resend() {
 async fn test_initiator_no_heartbeat_inside_a_long_resend() {
     no_heartbeat_inside_a_long_resend(Role::Initiator).await;
 }
+
+/// With `max_resend_requests` = 1: while the engine resends, an ordinary gap
+/// opens (its request held, to be charged) and closes again; then a
+/// possible-duplicate gap fill below the expectation spans past it, opening
+/// a new gap whose re-request is not charged. The held request is written
+/// for the new gap, which must not inherit the closed gap's charge: when it
+/// stalls, one real request still goes out instead of a Logout.
+///
+/// Real time: the resend retry timeout reads `std::time::Instant`.
+async fn closed_gap_charge_does_not_outlive_it(role: Role) {
+    let mut setup = Setup::new(role);
+    setup.store = Some(Arc::new(SlowStore::backlog(role, 300, 500).await));
+    setup.config = setup
+        .config
+        .with_max_resend_requests(1)
+        .with_resend_timeout(Duration::from_millis(300));
+    let (mut framed, connection) = setup.open(3).await;
+    ok(framed.send(resend_all(role, 4)).await, "the ResendRequest");
+    ok(
+        framed.send(role.peer_msg("0", 6, &[])).await,
+        "a gapped Heartbeat",
+    );
+    ok(
+        framed.send(role.peer_msg("0", 5, &[])).await,
+        "the missing 5",
+    );
+    ok(
+        framed.send(role.peer_msg("0", 6, &[])).await,
+        "6 again: the gap closed",
+    );
+    ok(
+        framed
+            .send(role.peer_msg(
+                "4",
+                6,
+                &[
+                    (43, "Y"),
+                    (122, "20261019-12:00:00.000"),
+                    (123, "Y"),
+                    (36, "9"),
+                ],
+            ))
+            .await,
+        "a spanning possible-duplicate gap fill",
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    read_resend(&mut framed, 300).await;
+    let rerequest = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&rerequest), "2", "the uncharged re-request");
+    assert_eq!(field(&rerequest, 7).as_deref(), Some("7"));
+    let retry = next_frame(&mut framed).await;
+    assert_eq!(
+        msg_type_of(&retry),
+        "2",
+        "a real retry, not a Logout: the re-request cost no attempt"
+    );
+    assert_eq!(field(&retry, 7).as_deref(), Some("7"));
+    assert!(!connection.is_closed());
+}
+
+/// A closed gap's charge does not pass to a later uncharged gap (acceptor).
+#[tokio::test]
+async fn test_acceptor_closed_gap_charge_does_not_outlive_it() {
+    closed_gap_charge_does_not_outlive_it(Role::Acceptor).await;
+}
+
+/// A closed gap's charge does not pass to a later uncharged gap (initiator).
+#[tokio::test]
+async fn test_initiator_closed_gap_charge_does_not_outlive_it() {
+    closed_gap_charge_does_not_outlive_it(Role::Initiator).await;
+}

@@ -428,7 +428,11 @@ completion). So while a resend is under way:
   the attempt against `max_resend_requests` is charged when the request is
   written: a request a `to_admin` callback drops at write time never went
   out, and with `max_resend_requests` = 1 charging it when held logged the
-  session out without ever asking (#128);
+  session out without ever asking (#128). Whether the written request is
+  charged belongs to the gap, not the held marker, so a gap that closes takes
+  its charge with it and a later uncharged gap reusing the marker is not
+  charged. Messages released from the gap queue while a resend is under way
+  stop at the hold's bounds too, and resume once it is done;
 - the tick sends no Heartbeat or TestRequest (resend frames are traffic) and
   does not chase a stalled gap of this session's own (its request could not go
   out before the resend ends). What it still enforces is narrower than "the
