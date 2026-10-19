@@ -1315,6 +1315,186 @@ async fn test_acceptor_garbled_frames_during_the_handshake_do_not_count_toward_t
 }
 
 // ---------------------------------------------------------------------------
+// Malformed inbound messages (issue #102)
+// ---------------------------------------------------------------------------
+
+/// A client frame with a sound header (`35`, `49`, `56`, `34` = `seq`, `52`,
+/// then `extra_header` verbatim) followed by `body` verbatim, framed with a
+/// correct BodyLength and CheckSum.
+fn client_malformed(msg_type: &str, seq: u64, extra_header: &str, body: &[u8]) -> BytesMut {
+    let ts = Timestamp::now().format_millis();
+    let mut content = format!(
+        "35={msg_type}\x0149=CLIENT\x0156=VENUE\x0134={seq}\x0152={}\x01{extra_header}",
+        ts.as_str()
+    )
+    .into_bytes();
+    content.extend_from_slice(body);
+    raw_frame(&content)
+}
+
+/// Asserts that `frame` is a session Reject of `ref_seq` with reason `code`
+/// and `RefTagID` `ref_tag`, whose Text quotes no field bytes.
+#[track_caller]
+fn assert_malformed_reject(frame: &[u8], ref_seq: u64, code: &str, ref_tag: Option<&str>) {
+    assert_eq!(msg_type_of(frame), "3", "a malformed message gets a Reject");
+    assert_eq!(field(frame, 45), Some(ref_seq.to_string()));
+    assert_eq!(field(frame, 373).as_deref(), Some(code));
+    assert_eq!(field(frame, 371).as_deref(), ref_tag);
+    let text = some(field(frame, 58), "the Reject carries a Text");
+    assert!(text.starts_with("malformed message"), "{text}");
+    assert!(
+        !text.contains("SECRET"),
+        "the Text never quotes field bytes"
+    );
+}
+
+/// The acceptor answers a malformed-body message with a Reject that consumes
+/// its number, maps each defect to its SessionRejectReason, and processes the
+/// next message in sequence.
+#[tokio::test]
+async fn test_acceptor_malformed_body_frames_are_rejected_and_consume_their_numbers() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    );
+    let (mut framed, connection) = establish(acceptor, 30).await;
+
+    ok(
+        framed
+            .send(client_malformed("0", 2, "", b"SECRET=1\x01"))
+            .await,
+        "send an invalid tag",
+    );
+    let reject = next_frame(&mut framed).await;
+    assert_malformed_reject(&reject, 2, "0", None);
+    assert_eq!(field(&reject, 372).as_deref(), Some("0"));
+
+    ok(
+        framed
+            .send(client_malformed("0", 3, "", b"95=\x0196=SECRET\x01"))
+            .await,
+        "send an empty Length",
+    );
+    let reject = next_frame(&mut framed).await;
+    assert_malformed_reject(&reject, 3, "4", Some("95"));
+
+    ok(
+        framed
+            .send(client_malformed("0", 4, "", b"95=40\x0196=SECRET\x01"))
+            .await,
+        "send a Length/Data mismatch",
+    );
+    let reject = next_frame(&mut framed).await;
+    assert_malformed_reject(&reject, 4, "6", Some("96"));
+
+    ok(
+        framed.send(client_malformed("", 5, "", b"")).await,
+        "send an empty MsgType",
+    );
+    let reject = next_frame(&mut framed).await;
+    assert_malformed_reject(&reject, 5, "11", Some("35"));
+    assert_eq!(
+        field(&reject, 372),
+        None,
+        "an invalid MsgType is not echoed"
+    );
+
+    ok(
+        framed.send(client_msg("1", 6, &[(112, "AFTER")])).await,
+        "send a valid TestRequest",
+    );
+    let reply = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&reply), "0");
+    assert_eq!(field(&reply, 112).as_deref(), Some("AFTER"));
+    assert!(!connection.is_closed());
+    assert_eq!(connection.next_target_seq(), 7);
+}
+
+/// A PossDupFlag (43) = Y resend of a number the acceptor already rejected is
+/// a duplicate: no second Reject, nothing consumed.
+#[tokio::test]
+async fn test_acceptor_poss_dup_resend_of_a_rejected_number_is_a_duplicate() {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    );
+    let (mut framed, connection) = establish(acceptor, 30).await;
+
+    ok(
+        framed
+            .send(client_malformed("0", 2, "", b"SECRET=1\x01"))
+            .await,
+        "send a malformed-body frame",
+    );
+    let reject = next_frame(&mut framed).await;
+    assert_malformed_reject(&reject, 2, "0", None);
+
+    let ts = Timestamp::now().format_millis();
+    let poss_dup = format!("43=Y\x01122={}\x01", ts.as_str());
+    let mut burst = client_malformed("0", 2, &poss_dup, b"SECRET=1\x01");
+    burst.extend_from_slice(&client_msg("1", 3, &[(112, "NEXT")]));
+    ok(
+        framed.send(burst).await,
+        "resend the same number as a possible duplicate, then a valid message",
+    );
+    let reply = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&reply), "0", "no second Reject");
+    assert_eq!(field(&reply, 112).as_deref(), Some("NEXT"));
+    assert!(!connection.is_closed());
+    assert_eq!(connection.next_target_seq(), 4);
+}
+
+/// Establishes a session, sends `frame`, and expects the acceptor to log out
+/// naming the missing MsgSeqNum (34) and close.
+async fn assert_acceptor_missing_seq_num_logs_out(frame: BytesMut) {
+    let (venue_app, _venue_rx) = RecordingApp::new();
+    let acceptor = Acceptor::new(
+        venue_config(Duration::from_secs(30)),
+        Arc::clone(&venue_app),
+    );
+    let (mut framed, connection) = establish(acceptor, 30).await;
+
+    ok(framed.send(frame).await, "send a frame without MsgSeqNum");
+    let logout = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&logout), "5");
+    assert_eq!(
+        field(&logout, 58).as_deref(),
+        Some("MsgSeqNum (34) missing")
+    );
+    ok(
+        timeout(Duration::from_secs(5), connection.wait_closed()).await,
+        "closed within 5s",
+    );
+    assert!(matches!(
+        connection.close_reason(),
+        Some(ironfix_engine::CloseReason::MsgSeqNumMissing { .. })
+    ));
+    read_until_closed(&mut framed).await;
+}
+
+/// A decodable message without MsgSeqNum (34) ends in Logout and close.
+#[tokio::test]
+async fn test_acceptor_frame_without_msg_seq_num_logs_out() {
+    let ts = Timestamp::now().format_millis();
+    let body = format!("35=0\x0149=CLIENT\x0156=VENUE\x0152={}\x01", ts.as_str());
+    assert_acceptor_missing_seq_num_logs_out(raw_frame(body.as_bytes())).await;
+}
+
+/// A malformed-body message with no MsgSeqNum (34) in its header ends in
+/// Logout and close.
+#[tokio::test]
+async fn test_acceptor_malformed_body_without_msg_seq_num_logs_out() {
+    let ts = Timestamp::now().format_millis();
+    let body = format!(
+        "35=0\x0149=CLIENT\x0156=VENUE\x0152={}\x01SECRET=1\x01",
+        ts.as_str()
+    );
+    assert_acceptor_missing_seq_num_logs_out(raw_frame(body.as_bytes())).await;
+}
+
+// ---------------------------------------------------------------------------
 // The acceptor's message store
 // ---------------------------------------------------------------------------
 

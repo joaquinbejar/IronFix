@@ -180,7 +180,9 @@ These only show in recovery mode: without it the first garbled frame ends a
 - A framed message whose body does not decode is dropped without a Reject (no
   `MsgSeqNum` can be read to reference). A peer that answers the resulting
   `ResendRequest` with the same bytes has them dropped again, so that gap can
-  stall until the bounded resend gives up. A follow-up issue covers this.
+  stall until the bounded resend gives up. Superseded by issue #102: such a
+  message now gets a session Reject that consumes its number (see
+  `doc/fix_operations.md`, "Malformed Messages and Missing MsgSeqNum").
 - After the "message too large" Logout, and after the garbled-limit Logout, the
   socket is dropped while the peer's input may still be arriving. Closing a
   socket with unread input can send RST, and the peer may then lose the Logout.
@@ -195,7 +197,7 @@ behind it is counted while `Framed` goes on waiting for bytes. The read is
 synchronous and the common case ends there: only a non-zero count reaches the
 cold path, and only a configured limit reads the clock. A frame whose header
 does not decode joins the same path with a count of one; a malformed body behind
-a sound header is dropped with a fixed-label warning and does not. A garbled
+a sound header does not (since #102 it is rejected, not dropped). A garbled
 frame:
 
 - consumes no `MsgSeqNum`. The next valid frame with a higher number is a gap

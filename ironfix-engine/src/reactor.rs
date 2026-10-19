@@ -33,6 +33,31 @@
 //! and its number is consumed as for any rejected message. A message without
 //! 1128 is in the counterparty's default version, checked at the handshake.
 //!
+//! # Malformed inbound messages
+//!
+//! A frame whose header is sound but whose body does not decode is a message,
+//! not garbage: it is answered with a session Reject (35=3), as the FIX
+//! Session Layer requires for an invalid message. `MsgSeqNum` (34) and
+//! `PossDupFlag` (43) are read from the standard header by position
+//! ([`wire::scan_malformed_header`]), and the number is sequenced like any
+//! other: next in sequence, it is rejected and **consumed** (persisted, then
+//! the expectation moves); below the expectation with 43=Y, it is a duplicate
+//! and dropped; below it without 43=Y, the session closes as for any
+//! MsgSeqNum too low; above it, the gap is requested and the frame is not
+//! acted on, so its resend is rejected when it arrives in order. The Reject
+//! carries `RefSeqNum` (45) and, from FIX 4.2 on, `RefMsgType` (372) when the
+//! MsgType is valid, `SessionRejectReason` (373) and `RefTagID` (371)
+//! ([`wire::malformed_reject`]); FIX 4.0 and 4.1 get 45 and `Text` (58) only.
+//! The `Text` is a fixed label and no log line carries the frame's bytes. Such
+//! a frame does not refresh the heartbeat clock: its identity fields cannot be
+//! checked, so it is not proof of life.
+//!
+//! A message with no readable `MsgSeqNum` (34) in its standard header, whether
+//! it decoded or not, cannot be sequenced or referenced: the session sends a
+//! Logout naming the missing field and disconnects
+//! ([`CloseReason::MsgSeqNumMissing`]), per the FIX Session Layer test cases
+//! for a message received without `MsgSeqNum`.
+//!
 //! # Bounded recovery
 //!
 //! A gap is answered with a `ResendRequest` (2), and a request that goes
@@ -57,8 +82,9 @@
 //! counts it, and the reactor reads the count before each inbound frame and on
 //! every tick. A frame whose header does not decode (`MsgType` (35) not third,
 //! `BodyLength` invalid) is garbled too and is handled the same way. A
-//! malformed body behind a sound header (an invalid tag, a bad data length) is
-//! not garbled: it is dropped with a warning and not counted. A garbled frame
+//! malformed body behind a sound header (an invalid tag, a bad data length, an
+//! invalid MsgType value) is not garbled and is not counted; see "Malformed
+//! inbound messages" below. A garbled frame
 //! is ignored, as FIX requires. It consumes no `MsgSeqNum` (34),
 //! so the next valid frame with a higher number is a gap and gets the usual
 //! `ResendRequest`. It does not refresh the heartbeat clock, because garbled
@@ -3818,6 +3844,116 @@ impl<A: Application> Reactor<A> {
         closed(reason)
     }
 
+    /// Terminates the session on an inbound message with no readable
+    /// `MsgSeqNum` (34) in its standard header.
+    ///
+    /// Such a message cannot be sequenced, and a Reject could not reference
+    /// it, so the FIX Session Layer test cases prescribe a Logout naming the
+    /// missing field, then a disconnect. Nothing is consumed. `msg_type` is
+    /// logged only when the frame decoded (a validated MsgType), never any
+    /// other field.
+    async fn close_on_missing_seq_num(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        msg_type: &str,
+    ) -> SessionClosed {
+        tracing::warn!(
+            session = %self.session_id,
+            msg_type,
+            "inbound message without a readable header MsgSeqNum (34): logging out"
+        );
+        let reason = CloseReason::MsgSeqNumMissing {};
+        let text = reason.to_string();
+        let logout = self.factory.logout(Some(&text));
+        let _ = self.send_now(framed, logout).await;
+        teardown(phase);
+        closed(reason)
+    }
+
+    /// Handles a framed message whose header is sound but whose body does
+    /// not decode: see "Malformed inbound messages" in the module docs.
+    ///
+    /// `MsgSeqNum` (34) is read by position. Missing, the session logs out.
+    /// Next in sequence, `MsgSeqNum + 1` is persisted as the next target
+    /// number before the expectation moves, exactly as for any message
+    /// answered with a session Reject, then the Reject goes out and the
+    /// session stays up. A duplicate (below the expectation, 43=Y) is
+    /// dropped; a number below it without 43=Y closes the session; a number
+    /// above it requests the gap and is not acted on. Logs carry the defect's
+    /// static label and the number, never field bytes.
+    async fn on_malformed(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        error: &DecodeError,
+        frame: &[u8],
+    ) -> Result<Phase, SessionClosed> {
+        let header = wire::scan_malformed_header(frame);
+        let defect = wire::decode_defect(error);
+        let Some(seq) = header.seq else {
+            return Err(self
+                .close_on_missing_seq_num(framed, phase, header.msg_type.unwrap_or(""))
+                .await);
+        };
+        match self.runtime.sequences.validate_incoming(seq) {
+            SequenceResult::Ok => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    seq,
+                    defect,
+                    "rejecting a message whose body does not decode: MsgSeqNum consumed"
+                );
+                let Some(next) = seq.checked_add(1) else {
+                    return Err(exhausted(
+                        phase,
+                        SequenceExhausted {
+                            counter: SequenceCounter::Target,
+                        },
+                    ));
+                };
+                if let Err(err) = self.persist_target(next).await {
+                    return Err(self.close_on_store_failure(phase, &err));
+                }
+                if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
+                    return Err(exhausted(phase, err));
+                }
+                self.note_inbound_progress();
+                let reject = self.factory.malformed_reject(
+                    seq,
+                    header.msg_type,
+                    wire::malformed_reject(error, frame),
+                );
+                self.send_reject(framed, phase, reject).await
+            }
+            SequenceResult::TooLow { expected, received } => {
+                if header.poss_dup {
+                    tracing::debug!(
+                        session = %self.session_id,
+                        seq,
+                        defect,
+                        "dropping a possible-duplicate resend of an already-consumed number \
+                         whose body does not decode"
+                    );
+                    return Ok(phase);
+                }
+                Err(self
+                    .close_on_too_low(framed, phase, expected, received)
+                    .await)
+            }
+            SequenceResult::Gap { expected, received } => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    seq,
+                    defect,
+                    "message whose body does not decode is beyond a gap: requesting the gap, \
+                     the message is rejected when its resend arrives in order"
+                );
+                self.request_resend(framed, phase, expected, received).await
+            }
+        }
+    }
+
     /// Accounts for `skipped` garbled inbound frames: the ones the codec
     /// skipped since the last check, or one frame that framed but did not
     /// decode. `cause` names which, for the log.
@@ -5197,18 +5333,10 @@ impl<A: Application> Reactor<A> {
                     .await;
             }
             // A malformed body behind a sound header (an invalid tag, a bad
-            // data length) is not garbled. It keeps the behaviour it always
-            // had: dropped with a warning, no MsgSeqNum consumed, not counted
-            // toward the limit. No Reject can be sent without a decoded
-            // MsgSeqNum to reference.
-            Err(err) => {
-                tracing::warn!(
-                    session = %self.session_id,
-                    defect = wire::decode_defect(&err),
-                    "dropping a message whose body does not decode: no MsgSeqNum consumed"
-                );
-                return Ok(phase);
-            }
+            // data length, an invalid MsgType value) is not garbled and is
+            // not counted toward the limit: it is a message, and gets a
+            // session Reject under its positionally read MsgSeqNum.
+            Err(err) => return self.on_malformed(framed, phase, &err, &frame).await,
         };
         let msg_type = raw.msg_type().clone();
 
@@ -5218,12 +5346,9 @@ impl<A: Application> Reactor<A> {
         // the session sequence number. Both Initiator and Acceptor share this
         // reactor, so this closes the gap for in-session traffic on both.
         let Some(seq) = wire::header_seq_num(&raw) else {
-            tracing::warn!(
-                session = %self.session_id,
-                msg_type = %msg_type,
-                "dropping message without a valid header MsgSeqNum (34)"
-            );
-            return Ok(phase);
+            return Err(self
+                .close_on_missing_seq_num(framed, phase, msg_type.as_str())
+                .await);
         };
 
         // Identity before session state: foreign traffic must not advance

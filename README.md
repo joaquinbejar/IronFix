@@ -52,7 +52,10 @@ engine wiring (#96) does not exist.
   no `MsgSeqNum`, is not counted as proof of life, and its gap is recovered by
   `ResendRequest`. An optional `garbled_frame_limit` logs out a link that keeps
   garbling. A frame above `max_message_size` still closes the session, after a
-  Logout saying "message too large".
+  Logout saying "message too large". A message whose header is sound but
+  whose body does not decode is not garbled: it gets a session `Reject` that
+  consumes its `MsgSeqNum`, and a message with no header `MsgSeqNum` gets a
+  Logout and a disconnect.
 - **SOFH framing** in `ironfix-sofh`: the FIX Simple Open Framing Header v1.0
   (the Draft Standard of December 2016), the binary counterpart of
   `FixCodec`. `SofhHeader` encodes and decodes the 6-byte big-endian header
@@ -154,7 +157,7 @@ engine wiring (#96) does not exist.
   `Connection::logout_with_text` puts a checked `Text` (58) on it), a typed
   `CloseReason` for every close (peer or local Logout with the peer's
   `Text`, logout timeout, heartbeat or write timeout, transport closed or
-  failed, MsgSeqNum too low, garbled-frame limit, identity, `SendingTime`,
+  failed, MsgSeqNum too low or missing, garbled-frame limit, identity, `SendingTime`,
   store failure, a failed dial or handshake, and more) handed to
   `Application::on_session_closed` (whose default forwards to `on_logout`
   for a session that reached Active) and read with

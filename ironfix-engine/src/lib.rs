@@ -131,8 +131,9 @@
 //! requires: it consumes no `MsgSeqNum`, does not refresh the heartbeat clock,
 //! is logged as a count and never as bytes, and the gap it leaves is recovered
 //! by the usual `ResendRequest`. A message whose body does not decode behind a
-//! sound header is not garbled: it is dropped with a warning, as before, and
-//! not counted. During the Logon handshake both kinds are skipped, so a
+//! sound header is not garbled: in session it gets a session Reject that
+//! consumes its `MsgSeqNum`, and it is not counted; a message with no header
+//! `MsgSeqNum` gets a Logout and a disconnect. During the Logon handshake both kinds are skipped, so a
 //! counterparty that never sends an intact Logon ends in
 //! [`EngineError::LogonTimeout`]. The optional
 //! [`SessionConfig::garbled_frame_limit`] logs out a session whose link keeps
