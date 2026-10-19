@@ -86,35 +86,50 @@
 //!
 //! # The allocation matrix (issue #81, deferred from #76)
 //!
-//! The full profile is one session with every ingredient together: a
-//! `FileStore`, a frame observer, TLS, and session-level Rejects (35=3)
-//! between accepted messages. In its window the initiator sends [`MESSAGES`]
-//! orders while the acceptor sends [`MESSAGES`] ExecutionReports, of which
-//! the application refuses the even-numbered half in `from_app`, each refusal
-//! answered by a Reject. Control windows, each adding one ingredient, name
-//! where every block comes from, and the report gives each component and the
-//! profile in blocks per message and per frame (orders, Rejects and messages
-//! received together). Measured with this test on macOS, debug and release
-//! alike within a few blocks:
+//! The full profile is one session with every ingredient together: TLS, a
+//! `FileStore`, a frame observer, and session-level Rejects (35=3) between
+//! accepted messages. The Rejects come from the session's own validation,
+//! before the application: the matrix sessions are FIX.5.0SP2 over FIXT.1.1,
+//! and every even-numbered ExecutionReport the acceptor sends carries an
+//! `ApplVerID` (1128) of 7 (FIX.5.0), which the session does not accept. The
+//! reactor answers each with a Reject (`SessionRejectReason` 18), consumes
+//! its number and keeps the session up, and the frame never reaches
+//! `from_app`: the window asserts that `from_app` saw exactly the valid
+//! frames and that the observer saw one outbound 35=3 per invalid frame.
+//! (A bad `SendingTime` or a CompID mismatch is answered with a Reject and a
+//! Logout, which ends the session, so neither can sit between accepted
+//! messages; on FIX 4.4 the reactor validates no application message before
+//! `from_app`.) In the window the initiator sends [`MESSAGES`] orders while
+//! the acceptor sends [`MESSAGES`] ExecutionReports, 512 of them invalid.
+//!
+//! Control windows, each adding one ingredient, name where every block comes
+//! from; the report gives each component and the profile in blocks per
+//! message and per frame (orders, Rejects and messages received together).
+//! Measured with this test on macOS, debug and release alike within a few
+//! blocks:
 //!
 //! | Component | Blocks |
 //! |---|---|
 //! | `to_app` future (`async_trait`), per order | 1 |
 //! | `FileStore` filing, per order | 1 |
-//! | inbound delivery: the `from_app` future (`async_trait`); the dispatcher's `mpsc` amortised | 1 |
-//! | `FileStore`, per message received (the receive cursor) | 1 |
-//! | Reject reply: the refusal's text, the `RefMsgType` copy, the Reject body's field list and four values, the `to_admin` future; the rejection `mpsc` amortised | 8 |
-//! | `FileStore` filing, per Reject | 1 |
-//! | `RawMessage` spill (11 fields, 32 held inline) | 0 |
+//! | delivery of a valid message: the `from_app` future (`async_trait`); the dispatcher's `mpsc` amortised | 1 |
+//! | `FileStore`, per message delivered (the receive cursor) | 1 |
+//! | session Reject of an invalid message, never delivered | 16 |
+//! | of which: the Reject body, its field list and 6 values (45, 371, 372, 1130, 373, 58), measured by building it | 8 |
+//! | of which: the `to_admin` future (`async_trait`) | 1 |
+//! | of which: the `ApplVerID` problem's two owned strings (the code, the accepted versions) | 2 |
+//! | of which, by difference: the reason text formatted from the problem | 5 |
+//! | `FileStore`, per Reject: the target number persisted, the Reject filed | 2 |
+//! | `RawMessage` spill (at most 12 fields, 32 held inline) | 0 |
 //! | frame observer | 0 |
-//! | rustls, both endpoints, per order | about 1.6 to 1.9 |
-//! | rustls, both endpoints, per refused message and its Reject | about 2.1 |
+//! | rustls, both endpoints, per order | about 2 |
+//! | rustls, both endpoints, per invalid message and its Reject | about 2.1 |
 //!
 //! The profile without TLS (1024 sent, 1024 received, 512 rejected) costs
-//! about 8750 blocks, 3.41 per frame, and the components predict it within
+//! about 12330 blocks, 4.81 per frame, and the components predict it within
 //! a few blocks; the test asserts that they agree within 4 x [`SLACK`]. With
-//! TLS it costs about 11850, 4.6 per frame: the rustls share is about 3100
-//! blocks, 1.2 per frame.
+//! TLS it costs about 15445, 6.03 per frame: the rustls share is about 3115
+//! blocks, 1.21 per frame.
 //!
 //! What cannot be measured in a meaningful way: the engine's own half of
 //! the rustls share. dhat counts every thread of the process, and the
@@ -224,11 +239,10 @@ const REPLY_BLOCKS: u64 = 4;
 /// Blocks rebuilding one stored frame as a resend costs.
 const REBUILD_BLOCKS: u64 = 4;
 
-/// Blocks the reactor's answer to one `from_app` refusal costs: the
-/// refusal's text (the application's `RejectReason`), the copy of
-/// `RefMsgType` (372) the reactor takes, the Reject body's field list and
-/// its four values (45, 372, 373, 58), and the `to_admin` future.
-const REJECT_REPLY_BLOCKS: i128 = 8;
+/// Blocks a session-invalid application message costs, from the frame to
+/// the Reject the reactor answers it with (measured; named in the module
+/// documentation).
+const SESSION_REJECT_BLOCKS: i128 = 16;
 
 /// Blocks a window may allocate beyond its per-frame cost: allocations that
 /// do not recur per frame.
@@ -352,8 +366,26 @@ impl AsyncWrite for CountingStream {
 /// A frame from `sender` to `target`: MsgType, the CompIDs, `MsgSeqNum`,
 /// `SendingTime`, then `body`.
 fn frame(sender: &str, target: &str, msg_type: &str, seq: u64, body: &[(u32, &str)]) -> BytesMut {
-    let mut encoder = Encoder::new("FIX.4.4");
+    frame_in("FIX.4.4", sender, target, msg_type, seq, &[], body)
+}
+
+/// A frame under `begin_string` from `sender` to `target`: MsgType, then
+/// `header` (where `ApplVerID` (1128) belongs), the CompIDs, `MsgSeqNum`,
+/// `SendingTime`, then `body`.
+fn frame_in(
+    begin_string: &str,
+    sender: &str,
+    target: &str,
+    msg_type: &str,
+    seq: u64,
+    header: &[(u32, &str)],
+    body: &[(u32, &str)],
+) -> BytesMut {
+    let mut encoder = Encoder::new(begin_string);
     encoder.put_str(35, msg_type);
+    for (tag, value) in header {
+        encoder.put_str(*tag, value);
+    }
     encoder.put_str(49, sender);
     encoder.put_str(56, target);
     encoder.put_uint(34, seq);
@@ -531,6 +563,15 @@ struct Session<V = DuplexStream> {
 /// Logs `initiator` on to a scripted acceptor that acknowledges with
 /// `MsgSeqNum` 1 and then only counts frames.
 async fn log_on<A: Application + 'static>(initiator: Initiator<A>) -> Session {
+    log_on_with(
+        initiator,
+        frame("VENUE", "CLIENT", "A", 1, &[(98, "0"), (108, "30")]),
+    )
+    .await
+}
+
+/// [`log_on`] with `ack` as the acceptor's Logon acknowledgement.
+async fn log_on_with<A: Application + 'static>(initiator: Initiator<A>, ack: BytesMut) -> Session {
     let (client_io, venue_io) = tokio::io::duplex(PIPE_BYTES);
     let counts = Arc::new(IoCounts::default());
     let client_io = CountingStream {
@@ -541,7 +582,6 @@ async fn log_on<A: Application + 'static>(initiator: Initiator<A>) -> Session {
         let mut framed = Framed::new(venue_io, FixCodec::new());
         let logon = some(framed.next().await, "the Logon arrives");
         ok(logon, "the Logon decodes");
-        let ack = frame("VENUE", "CLIENT", "A", 1, &[(98, "0"), (108, "30")]);
         ok(framed.send(ack).await, "the venue acknowledges");
         framed.into_inner()
     });
@@ -570,6 +610,8 @@ struct CountingObserver {
     inbound: AtomicU64,
     outbound: AtomicU64,
     written: AtomicU64,
+    /// Outbound session-level Rejects (35=3).
+    rejects: AtomicU64,
 }
 
 impl FrameObserver for CountingObserver {
@@ -577,8 +619,11 @@ impl FrameObserver for CountingObserver {
         self.inbound.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn on_outbound(&self, _frame: &[u8], _observation: &Observation<'_>) {
+    fn on_outbound(&self, frame: &[u8], _observation: &Observation<'_>) {
         self.outbound.fetch_add(1, Ordering::Relaxed);
+        if frame.windows(6).any(|window| window == b"\x0135=3\x01") {
+            self.rejects.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn on_outbound_result(&self, result: &OutboundResult, _observation: &Observation<'_>) {
@@ -714,12 +759,15 @@ fn eprint_counts(windows: &[(&str, &Window)]) {
     }
 }
 
-/// Which inbound application messages the [`Inbound`] application refuses
-/// in `from_app`; the reactor answers each refusal with a session-level
-/// Reject (35=3).
+/// Which of the acceptor's ExecutionReports carry an `ApplVerID` (1128) the
+/// FIX.5.0SP2 session does not accept. The reactor answers each such frame
+/// itself with a session-level Reject (35=3, `SessionRejectReason` 18),
+/// consumes its `MsgSeqNum` and keeps the session up; the frame never
+/// reaches `from_app`. A frame without 1128 is in the session's default
+/// version and is delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Refuse {
-    /// None: every message is accepted, and nothing goes back.
+enum Invalid {
+    /// None: every frame is delivered.
     None,
     /// Every one.
     All,
@@ -728,21 +776,28 @@ enum Refuse {
     EvenSeq,
 }
 
-/// An application that counts the inbound application messages it is given
-/// and refuses those `refuse` names, allocating nothing of its own but the
-/// refusal's text.
+impl Invalid {
+    const fn applies(self, seq: u64) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::EvenSeq => seq.is_multiple_of(2),
+        }
+    }
+}
+
+/// An application that counts the inbound application messages `from_app`
+/// is given, and accepts them all.
 #[derive(Debug)]
 struct Inbound {
-    refuse: Refuse,
     seen: Arc<AtomicU64>,
 }
 
 impl Inbound {
-    fn new(refuse: Refuse) -> (Self, Arc<AtomicU64>) {
+    fn new() -> (Self, Arc<AtomicU64>) {
         let seen = Arc::new(AtomicU64::new(0));
         (
             Self {
-                refuse,
                 seen: Arc::clone(&seen),
             },
             seen,
@@ -760,35 +815,60 @@ impl Application for Inbound {
         Ok(())
     }
     async fn to_app(&self, _: &mut OutboundMessage, _: &SessionId) {}
-    async fn from_app(&self, message: &RawMessage<'_>, _: &SessionId) -> Result<(), RejectReason> {
-        let refused = match self.refuse {
-            Refuse::None => false,
-            Refuse::All => true,
-            Refuse::EvenSeq => message
-                .get_field_str(34)
-                .and_then(|seq| seq.parse::<u64>().ok())
-                .is_some_and(|seq| seq % 2 == 0),
-        };
+    async fn from_app(&self, _: &RawMessage<'_>, _: &SessionId) -> Result<(), RejectReason> {
         self.seen.fetch_add(1, Ordering::Relaxed);
-        if refused {
-            Err(RejectReason::new(99, "refused"))
-        } else {
-            Ok(())
-        }
+        Ok(())
     }
 }
 
-/// `count` ExecutionReports from the acceptor, numbered from `first`, in one
-/// buffer: 11 fields each, well under the 32 a `RawMessage` holds inline.
-fn executions(first: u64, count: u64) -> BytesMut {
+/// The FIX version of the matrix sessions: FIX.5.0SP2 over FIXT.1.1, where
+/// the reactor validates each application message's `ApplVerID` (1128)
+/// before `from_app`.
+const MATRIX_VERSION: &str = "FIX.5.0SP2";
+
+/// An initiator from CLIENT to VENUE in [`MATRIX_VERSION`] driving
+/// `application`.
+fn matrix_initiator<A: Application + 'static>(application: A) -> Initiator<A> {
+    let comp = |value: &str| ok(CompId::new(value), "CompId");
+    let config = SessionConfig::new(comp("CLIENT"), comp("VENUE"), MATRIX_VERSION)
+        .with_heartbeat_interval(Duration::from_secs(30));
+    Initiator::new(config, Arc::new(application))
+}
+
+/// The acceptor's FIXT.1.1 Logon acknowledgement, declaring FIX.5.0SP2
+/// (`DefaultApplVerID` (1137) = 9).
+fn matrix_ack() -> BytesMut {
+    frame_in(
+        "FIXT.1.1",
+        "VENUE",
+        "CLIENT",
+        "A",
+        1,
+        &[],
+        &[(98, "0"), (108, "30"), (1137, "9")],
+    )
+}
+
+/// `count` FIXT.1.1 ExecutionReports from the acceptor, numbered from
+/// `first`, in one buffer: those `invalid` names carry `ApplVerID` (1128) = 7
+/// (FIX.5.0), which the session does not accept. 11 or 12 fields each, well
+/// under the 32 a `RawMessage` holds inline.
+fn executions(first: u64, count: u64, invalid: Invalid) -> BytesMut {
     let mut wire = BytesMut::new();
     for seq in first..first + count {
         let id = format!("EXEC-{seq:06}");
-        wire.extend_from_slice(&frame(
+        let header: &[(u32, &str)] = if invalid.applies(seq) {
+            &[(1128, "7")]
+        } else {
+            &[]
+        };
+        wire.extend_from_slice(&frame_in(
+            "FIXT.1.1",
             "VENUE",
             "CLIENT",
             "8",
             seq,
+            header,
             &[(37, id.as_str()), (17, id.as_str()), (39, "0")],
         ));
     }
@@ -796,7 +876,7 @@ fn executions(first: u64, count: u64) -> BytesMut {
 }
 
 /// How many of the `count` messages numbered from `first` have an even
-/// `MsgSeqNum`, and so are refused under [`Refuse::EvenSeq`].
+/// `MsgSeqNum`, and so are session-invalid under [`Invalid::EvenSeq`].
 fn even_in(first: u64, count: u64) -> u64 {
     u64::try_from((first..first + count).filter(|seq| seq % 2 == 0).count()).unwrap_or(u64::MAX)
 }
@@ -832,7 +912,8 @@ struct Traffic {
     sent: u64,
     /// Application messages it received.
     received: u64,
-    /// Of those, the ones `from_app` refused, each answered by a Reject.
+    /// Of those, the session-invalid ones the reactor answered with a
+    /// Reject, never delivered to `from_app`.
     rejected: u64,
 }
 
@@ -846,9 +927,10 @@ impl Traffic {
 
 /// Measures one window of mixed traffic on `session`, after a warm-up of the
 /// same shape: `orders` live orders out while the acceptor sends the
-/// executions of `inbound`, which the [`Inbound`] application counts in
-/// `seen` and refuses per its policy. Waits until the acceptor has counted
-/// every order and Reject and the application every execution.
+/// executions of `inbound`. The valid ones reach the [`Inbound`]
+/// application, which counts them in `seen`; the reactor answers each
+/// session-invalid one with a Reject. Waits until the acceptor has counted
+/// every order and Reject and the application every delivered execution.
 async fn measure_traffic<V: AsyncWrite>(
     session: &mut Session<V>,
     seen: &AtomicU64,
@@ -871,7 +953,7 @@ async fn measure_traffic<V: AsyncWrite>(
     let mut result = None;
     for (index, (batch, wire, traffic)) in [warm, measured].into_iter().enumerate() {
         out_total += traffic.sent + traffic.rejected;
-        in_total += traffic.received;
+        in_total += traffic.received - traffic.rejected;
         let (writes, refused) = session.counts.snapshot();
         let before = blocks();
         let connection = &session.connection;
@@ -892,6 +974,13 @@ async fn measure_traffic<V: AsyncWrite>(
         tokio::join!(send, inbound);
         wait_for_frames(&session.frames, out_total).await;
         wait_for_count(seen, in_total).await;
+        // Every Reject is out, so every frame before it was processed: a
+        // session-invalid frame that reached from_app would show here.
+        assert_eq!(
+            seen.load(Ordering::Relaxed),
+            in_total,
+            "only the valid executions reach from_app"
+        );
         if index == 1 {
             let (writes_after, refused_after) = session.counts.snapshot();
             result = Some(Window {
@@ -908,7 +997,7 @@ async fn measure_traffic<V: AsyncWrite>(
 /// run time, on the `ring` provider (a dev-dependency). No key is committed.
 #[cfg(feature = "tls")]
 mod tls_profile {
-    use super::{CountingStream, IoCounts, Session, count_frames, frame, ok, some};
+    use super::{CountingStream, IoCounts, Session, count_frames, ok, some};
     use futures_util::{SinkExt, StreamExt};
     use ironfix_engine::tls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use ironfix_engine::tls::rustls::{self, ClientConfig, RootCertStore, ServerConfig};
@@ -965,6 +1054,7 @@ mod tls_profile {
     /// over a counting stream, so the window still sees its writes.
     pub(super) async fn log_on<A: Application + 'static>(
         initiator: Initiator<A>,
+        ack: bytes::BytesMut,
         pipe_bytes: usize,
         client: Arc<ClientConfig>,
         server: Arc<ServerConfig>,
@@ -983,7 +1073,6 @@ mod tls_profile {
             let mut framed = Framed::new(tls, FixCodec::new());
             let logon = some(framed.next().await, "the Logon arrives");
             ok(logon, "the Logon decodes");
-            let ack = frame("VENUE", "CLIENT", "A", 1, &[(98, "0"), (108, "30")]);
             ok(framed.send(ack).await, "the venue acknowledges");
             framed.into_inner()
         });
@@ -1022,25 +1111,28 @@ mod tls_profile {
 
 /// Every window of the allocation matrix (issue #81).
 struct Matrix<'a> {
-    /// Live sends, no store: the `to_app` future per order.
+    /// Live sends, FIX.4.4, no store: the `to_app` future per order.
     live: &'a Window,
-    /// Live sends with a `FileStore`.
+    /// Live sends with a `FileStore`, FIX.5.0SP2.
     file_live: &'a Window,
-    /// Inbound application messages, all accepted, no store.
+    /// Valid inbound application messages, all delivered, no store.
     accepted: &'a Window,
-    /// Inbound application messages, all refused, no store.
+    /// Session-invalid inbound application messages (a refused `ApplVerID`
+    /// (1128)), each answered by the reactor with a Reject, no store.
     rejected: &'a Window,
     /// The same two with a `FileStore`.
     file_accepted: &'a Window,
     file_rejected: &'a Window,
     /// The full profile without TLS: `FileStore`, frame observer, orders out
-    /// and executions in, the even-numbered ones refused.
+    /// and executions in, the even-numbered ones session-invalid.
     plain: &'a Window,
     /// The traffic of the two profile windows.
     mixed: Traffic,
-    /// With the `tls` feature: live sends over TLS, refused inbound over TLS
-    /// (no store either), and the full profile over TLS.
+    /// With the `tls` feature: live sends over TLS, session-invalid inbound
+    /// over TLS (no store either), and the full profile over TLS.
     tls: Option<&'a (Window, Window, Window)>,
+    /// Blocks one Reject body costs, built through the public API.
+    reject_body: u64,
 }
 
 /// `blocks / count` with two decimals, in integer arithmetic.
@@ -1063,20 +1155,22 @@ fn check_matrix(matrix: &Matrix<'_>) {
     use std::io::Write as _;
     let m = MESSAGES;
     let mixed = matrix.mixed;
+    let full_m = i128::from(m);
     let to_app = total(matrix.live);
     let store_order = total(matrix.file_live) - to_app;
-    let inbound = total(matrix.accepted);
-    let store_inbound = total(matrix.file_accepted) - inbound;
-    let reject = total(matrix.rejected) - inbound;
-    let store_reject = total(matrix.file_rejected) - total(matrix.file_accepted) - reject;
+    let delivery = total(matrix.accepted);
+    let store_delivered = total(matrix.file_accepted) - delivery;
+    let reject = total(matrix.rejected);
+    let store_reject = total(matrix.file_rejected) - reject;
     let rejected = i128::from(mixed.rejected);
-    let full_m = i128::from(m);
+    let delivered = i128::from(mixed.received - mixed.rejected);
     // What the plain profile should cost if the components add up: every
-    // order filed, every message received filed, and every refused one
-    // answered with a filed Reject. The frame observer adds nothing.
+    // order filed, every valid message delivered and its number filed, and
+    // every session-invalid one answered with a filed Reject. The frame
+    // observer adds nothing.
     let predicted = total(matrix.file_live)
-        + total(matrix.file_accepted)
-        + rejected * (total(matrix.file_rejected) - total(matrix.file_accepted)) / full_m;
+        + (total(matrix.file_accepted) * delivered + total(matrix.file_rejected) * rejected)
+            / full_m;
     let plain = total(matrix.plain);
 
     let mut lines = vec![
@@ -1090,28 +1184,32 @@ fn check_matrix(matrix: &Matrix<'_>) {
             per(store_order, m)
         ),
         format!(
-            "  inbound delivery (the async_trait from_app future; the dispatcher's mpsc \
-             amortised), per message: {}",
-            per(inbound, m)
+            "  delivery of a valid message (the async_trait from_app future; the \
+             dispatcher's mpsc amortised): {}",
+            per(delivery, m)
         ),
         format!(
-            "  FileStore, per message received:                {}",
-            per(store_inbound, m)
+            "  FileStore, per message delivered:               {}",
+            per(store_delivered, m)
         ),
         format!(
-            "  Reject reply (the refusal's text, the RefMsgType copy, the Reject body's field \
-             list and 4 values, the async_trait to_admin future; the rejection mpsc amortised), \
-             per Reject: {}",
-            per(reject, m)
+            "  session Reject of an invalid message, never delivered: {}, of which the \
+             Reject body (field list and 6 values) {}, the async_trait to_admin future 1, \
+             the ApplVerID problem's 2 owned strings 2, and, by difference, the reason text \
+             formatted from it {}",
+            per(reject, m),
+            matrix.reject_body,
+            SESSION_REJECT_BLOCKS - i128::from(matrix.reject_body) - 3
         ),
         format!(
-            "  FileStore filing, per Reject:                   {}",
+            "  FileStore, per Reject (its number and the Reject filed): {}",
             per(store_reject, m)
         ),
-        "  RawMessage spill: none (11 fields, 32 inline)".to_string(),
+        "  RawMessage spill: none (at most 12 fields, 32 inline)".to_string(),
         format!(
-            "  plain profile (FileStore + observer + Rejects): sent {}, received {}, \
-             rejected {}: {plain} blocks, predicted {predicted}, {} per frame",
+            "  plain profile (FileStore + observer + session Rejects): sent {}, received {}, \
+             rejected {} (35=3 sent by the reactor, none delivered): {plain} blocks, \
+             predicted {predicted}, {} per frame",
             mixed.sent,
             mixed.received,
             mixed.rejected,
@@ -1119,8 +1217,8 @@ fn check_matrix(matrix: &Matrix<'_>) {
         ),
     ];
     if let Some((tls_live, tls_rejected, full)) = matrix.tls {
-        let tls_order = total(tls_live) - to_app;
-        let tls_reject = total(tls_rejected) - total(matrix.rejected);
+        let tls_order = total(tls_live) - total(matrix.file_live) + store_order;
+        let tls_reject = total(tls_rejected) - reject;
         let full_total = total(full);
         let rustls = full_total - plain;
         lines.push(format!(
@@ -1128,12 +1226,12 @@ fn check_matrix(matrix: &Matrix<'_>) {
             per(tls_order, m)
         ));
         lines.push(format!(
-            "  rustls, both endpoints, per refused message and its Reject (control): {}",
+            "  rustls, both endpoints, per invalid message and its Reject (control): {}",
             per(tls_reject, m)
         ));
         lines.push(format!(
-            "  FULL PROFILE (TLS + FileStore + observer + Rejects): sent {}, received {}, \
-             rejected {}: {full_total} blocks, {} per frame; rustls share (both endpoints) \
+            "  FULL PROFILE (TLS + FileStore + observer + session Rejects): sent {}, received \
+             {}, rejected {}: {full_total} blocks, {} per frame; rustls share (both endpoints) \
              {rustls} blocks, {} per frame",
             mixed.sent,
             mixed.received,
@@ -1152,17 +1250,24 @@ fn check_matrix(matrix: &Matrix<'_>) {
             tls_order + tls_reject + 2 * slack
         );
     }
-    // Each component, at its documented rate. The store's are about one
-    // block a call either way: a few B-tree-free pages and queue blocks per
-    // window move them by less than the slack.
+    let mut stderr = io::stderr().lock();
+    for line in &lines {
+        let _ = writeln!(stderr, "{line}");
+    }
+    drop(stderr);
+    // Each component, at its documented rate.
     let slack = i128::from(SLACK);
     for (name, measured, expected) in [
         ("the to_app future", to_app, 1),
         ("FileStore filing per order", store_order, 1),
-        ("inbound delivery", inbound, 1),
-        ("FileStore per message received", store_inbound, 1),
-        ("the Reject reply", reject, REJECT_REPLY_BLOCKS),
-        ("FileStore filing per Reject", store_reject, 1),
+        ("delivery of a valid message", delivery, 1),
+        ("FileStore per message delivered", store_delivered, 1),
+        ("the session Reject", reject, SESSION_REJECT_BLOCKS),
+        (
+            "FileStore per Reject (the target number persisted, the Reject filed)",
+            store_reject,
+            2,
+        ),
     ] {
         let expected = expected * full_m;
         assert!(
@@ -1170,11 +1275,6 @@ fn check_matrix(matrix: &Matrix<'_>) {
             "{name}: {measured} blocks for {m} messages, expected {expected} within {slack}"
         );
     }
-    let mut stderr = io::stderr().lock();
-    for line in &lines {
-        let _ = writeln!(stderr, "{line}");
-    }
-    drop(stderr);
     let tolerance = i128::from(4 * SLACK);
     assert!(
         (plain - predicted).abs() <= tolerance,
@@ -1245,8 +1345,9 @@ fn main() {
         initiator(None).with_frame_observer(Arc::clone(&pooled_observer) as Arc<dyn FrameObserver>);
 
     // The allocation matrix (issue #81, deferred from #76): controls, then
-    // the full profile. One FileStore journal per session, in a directory
-    // of this process's own, removed at the end.
+    // the full profile, on FIX.5.0SP2 sessions so that the Rejects come from
+    // the reactor's own validation. One FileStore journal per session, in a
+    // directory of this process's own, removed at the end.
     let store_dir =
         std::env::temp_dir().join(format!("ironfix-allocations-{}", std::process::id()));
     let stores = runtime.block_on(async {
@@ -1277,8 +1378,12 @@ fn main() {
         rejected,
         ..none
     };
-    let warm_up_executions = executions(2, WARM_UP);
-    let window_executions = executions(2 + WARM_UP, MESSAGES);
+    let valid_warm_up = executions(2, WARM_UP, Invalid::None);
+    let valid_window = executions(2 + WARM_UP, MESSAGES, Invalid::None);
+    let invalid_warm_up = executions(2, WARM_UP, Invalid::All);
+    let invalid_window = executions(2 + WARM_UP, MESSAGES, Invalid::All);
+    let mixed_warm_up_wire = executions(2, WARM_UP, Invalid::EvenSeq);
+    let mixed_window_wire = executions(2 + WARM_UP, MESSAGES, Invalid::EvenSeq);
     let empty = BytesMut::new();
     let mixed_warm_up = Traffic {
         sent: WARM_UP,
@@ -1291,33 +1396,33 @@ fn main() {
         rejected: even_in(2 + WARM_UP, MESSAGES),
     };
     // Each session of the matrix, with what it counts.
-    let file_live = initiator(None).with_store(live_store);
-    let (app, accepted_seen) = Inbound::new(Refuse::None);
-    let accepting = initiator_with(None, app);
-    let (app, rejected_seen) = Inbound::new(Refuse::All);
-    let rejecting = initiator_with(None, app);
-    let (app, file_accepted_seen) = Inbound::new(Refuse::None);
-    let file_accepting = initiator_with(None, app).with_store(accepted_store);
-    let (app, file_rejected_seen) = Inbound::new(Refuse::All);
-    let file_rejecting = initiator_with(None, app).with_store(rejected_store);
+    let file_live = matrix_initiator(NoOpApplication).with_store(live_store);
+    let (app, accepted_seen) = Inbound::new();
+    let accepting = matrix_initiator(app);
+    let (app, rejected_seen) = Inbound::new();
+    let rejecting = matrix_initiator(app);
+    let (app, file_accepted_seen) = Inbound::new();
+    let file_accepting = matrix_initiator(app).with_store(accepted_store);
+    let (app, file_rejected_seen) = Inbound::new();
+    let file_rejecting = matrix_initiator(app).with_store(rejected_store);
     let plain_observer = Arc::new(CountingObserver::default());
-    let (app, plain_seen) = Inbound::new(Refuse::EvenSeq);
-    let plain = initiator_with(None, app)
+    let (app, plain_seen) = Inbound::new();
+    let plain = matrix_initiator(app)
         .with_store(plain_store)
         .with_frame_observer(Arc::clone(&plain_observer) as Arc<dyn FrameObserver>);
     let full_observer = Arc::new(CountingObserver::default());
-    let (app, full_seen) = Inbound::new(Refuse::EvenSeq);
-    let full = initiator_with(None, app)
+    let (app, full_seen) = Inbound::new();
+    let full = matrix_initiator(app)
         .with_store(full_store)
         .with_frame_observer(Arc::clone(&full_observer) as Arc<dyn FrameObserver>);
     #[cfg(feature = "tls")]
     let (tls_client, tls_server) = tls_profile::configs();
     #[cfg(feature = "tls")]
-    let tls_live = initiator(None);
+    let tls_live = matrix_initiator(NoOpApplication);
     #[cfg(feature = "tls")]
-    let (app, tls_rejected_seen) = Inbound::new(Refuse::All);
+    let (app, tls_rejected_seen) = Inbound::new();
     #[cfg(feature = "tls")]
-    let tls_rejecting = initiator_with(None, app);
+    let tls_rejecting = matrix_initiator(app);
     #[cfg(not(feature = "tls"))]
     drop((full, Arc::clone(&full_seen)));
     let matrix_orders = || {
@@ -1476,10 +1581,29 @@ fn main() {
         retained,
     ) = measured;
 
+    // One Reject body as the reactor builds it for a refused ApplVerID
+    // (1128), through the same public API: RefSeqNum, RefTagID, RefMsgType,
+    // RefApplVerID, SessionRejectReason and a Text of the reactor's length.
+    let reject_body_blocks = {
+        let text = "ApplVerID (1128) 7 names FIX.5.0, which this session does not accept \
+                    (accepted: FIX.5.0SP2)";
+        let before = blocks();
+        let mut body = OutboundMessage::new(MsgType::Reject);
+        body.push_uint(45, 2)
+            .push_uint(371, 1128)
+            .push_str(372, "8")
+            .push_str(1130, "7")
+            .push_uint(373, 18)
+            .push_str(58, text);
+        let counted = blocks() - before;
+        drop(body);
+        counted
+    };
+
     // The allocation matrix (issue #81): the controls, then the full
     // profile with every ingredient together.
     let matrix = runtime.block_on(async move {
-        let mut session = log_on(file_live).await;
+        let mut session = log_on_with(file_live, matrix_ack()).await;
         let file_live = measure_traffic(
             &mut session,
             &AtomicU64::new(0),
@@ -1492,22 +1616,35 @@ fn main() {
         drop(session);
 
         let mut inbound_windows = Vec::new();
-        for (initiator, seen, rejects) in [
+        for (initiator, seen, invalid) in [
             (accepting, accepted_seen, false),
             (rejecting, rejected_seen, true),
             (file_accepting, file_accepted_seen, false),
             (file_rejecting, file_rejected_seen, true),
         ] {
-            let warm = inbound_only(WARM_UP, if rejects { WARM_UP } else { 0 });
-            let window = inbound_only(MESSAGES, if rejects { MESSAGES } else { 0 });
-            let mut session = log_on(initiator).await;
+            let (warm_wire, window_wire, warm, window) = if invalid {
+                (
+                    &invalid_warm_up,
+                    &invalid_window,
+                    inbound_only(WARM_UP, WARM_UP),
+                    inbound_only(MESSAGES, MESSAGES),
+                )
+            } else {
+                (
+                    &valid_warm_up,
+                    &valid_window,
+                    inbound_only(WARM_UP, 0),
+                    inbound_only(MESSAGES, 0),
+                )
+            };
+            let mut session = log_on_with(initiator, matrix_ack()).await;
             inbound_windows.push(
                 measure_traffic(
                     &mut session,
                     &seen,
                     &mut no_orders,
-                    (&warm_up_executions, warm),
-                    (&window_executions, window),
+                    (warm_wire, warm),
+                    (window_wire, window),
                 )
                 .await,
             );
@@ -1515,13 +1652,13 @@ fn main() {
             drop(session);
         }
 
-        let mut session = log_on(plain).await;
+        let mut session = log_on_with(plain, matrix_ack()).await;
         let plain = measure_traffic(
             &mut session,
             &plain_seen,
             &mut plain_orders,
-            (&warm_up_executions, mixed_warm_up),
-            (&window_executions, mixed),
+            (&mixed_warm_up_wire, mixed_warm_up),
+            (&mixed_window_wire, mixed),
         )
         .await;
         session.counter.abort();
@@ -1531,6 +1668,7 @@ fn main() {
         let tls = {
             let mut session = tls_profile::log_on(
                 tls_live,
+                matrix_ack(),
                 PIPE_BYTES,
                 Arc::clone(&tls_client),
                 Arc::clone(&tls_server),
@@ -1549,6 +1687,7 @@ fn main() {
 
             let mut session = tls_profile::log_on(
                 tls_rejecting,
+                matrix_ack(),
                 PIPE_BYTES,
                 Arc::clone(&tls_client),
                 Arc::clone(&tls_server),
@@ -1558,20 +1697,21 @@ fn main() {
                 &mut session,
                 &tls_rejected_seen,
                 &mut no_orders,
-                (&warm_up_executions, inbound_only(WARM_UP, WARM_UP)),
-                (&window_executions, inbound_only(MESSAGES, MESSAGES)),
+                (&invalid_warm_up, inbound_only(WARM_UP, WARM_UP)),
+                (&invalid_window, inbound_only(MESSAGES, MESSAGES)),
             )
             .await;
             session.counter.abort();
             drop(session);
 
-            let mut session = tls_profile::log_on(full, PIPE_BYTES, tls_client, tls_server).await;
+            let mut session =
+                tls_profile::log_on(full, matrix_ack(), PIPE_BYTES, tls_client, tls_server).await;
             let full = measure_traffic(
                 &mut session,
                 &full_seen,
                 &mut full_orders,
-                (&warm_up_executions, mixed_warm_up),
-                (&window_executions, mixed),
+                (&mixed_warm_up_wire, mixed_warm_up),
+                (&mixed_window_wire, mixed),
             )
             .await;
             session.counter.abort();
@@ -1599,16 +1739,21 @@ fn main() {
         plain: &plain,
         mixed,
         tls: tls.as_ref(),
+        reject_body: reject_body_blocks,
     });
-    assert!(
-        plain_observer.outbound.load(Ordering::Relaxed) > mixed.sent + mixed.rejected,
-        "the observer of the plain profile saw every order and Reject"
+    // The reactor sent one Reject per session-invalid frame, warm-up and
+    // window together, and nothing else that is a Reject.
+    let expected_rejects = mixed_warm_up.rejected + mixed.rejected;
+    assert_eq!(
+        plain_observer.rejects.load(Ordering::Relaxed),
+        expected_rejects,
+        "the plain profile sent one 35=3 per session-invalid frame"
     );
     #[cfg(feature = "tls")]
-    assert!(
-        full_observer.outbound.load(Ordering::Relaxed) > mixed.sent + mixed.rejected
-            && full_observer.inbound.load(Ordering::Relaxed) > mixed.received,
-        "the observer of the full profile saw every frame"
+    assert_eq!(
+        full_observer.rejects.load(Ordering::Relaxed),
+        expected_rejects,
+        "the full profile sent one 35=3 per session-invalid frame"
     );
     #[cfg(not(feature = "tls"))]
     let _ = &full_observer;
