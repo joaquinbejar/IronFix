@@ -1071,6 +1071,17 @@ impl<A: Application + 'static> Initiator<A> {
         // the session unable to vouch for its own counters, so it is refused
         // here rather than started from a number that could collide with a
         // stream still on file.
+        // Inbound messages the previous session accepted but may not have
+        // delivered are reported before anything else touches the store: a
+        // reset would erase the numbers (issue #105, ADR-0030).
+        if let Err(err) = self
+            .store
+            .report_inbound_loss(self.application.as_ref(), &session_id, self.write_timeout)
+            .await
+        {
+            let _ = session.disconnect();
+            return Err(err.into());
+        }
         let reset_logon = self.config.reset_on_logon || self.store.reset_is_owed();
         // Owed from before the reset until the Logon declaring it is
         // acknowledged: a connect dropped while the reset is pending leaves it

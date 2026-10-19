@@ -1574,6 +1574,18 @@ impl<A: Application + 'static> Acceptor<A> {
             // fails closed whatever the policy. A reset is owed from before it
             // is awaited until the acknowledgement declaring it is sent, so a
             // serve dropped or failed in between leaves it owed.
+            //
+            // Before the store is touched, inbound messages the previous
+            // session accepted but may not have delivered are reported: a
+            // reset would erase the numbers (issue #105, ADR-0030).
+            if let Err(err) = self
+                .store
+                .report_inbound_loss(self.application.as_ref(), &session_id, write_timeout)
+                .await
+            {
+                let _ = session.reject_logon();
+                return Err(err.into());
+            }
             reset = inbound_reset || self.config.reset_on_logon || self.store.reset_is_owed();
 
             // A 789 describes the stream the initiator expects to continue. A

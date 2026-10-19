@@ -223,7 +223,9 @@ inbound message numbered M, with `CloseSession`:
 | fsync, before socket send | Frame N and N+1 are durable (under `EveryWrite`): N is never reused, and a resend of N replays the filed frame. |
 | socket send, before peer confirmation | As above. |
 | inbound M read, before the target counter write | The counter still expects M: the peer's resend of M is accepted. |
-| target counter write (M+1), before the application handled M | Durable under `EveryWrite` before M is acted on (ADR-0005), so the restart expects M+1: M is lost to the application (at most once, ADR-0005; reporting it is #105). |
+| target counter write (M+1), before the application handled M | Durable under `EveryWrite` before M is acted on (ADR-0005), so the restart expects M+1: M is lost to the application (at most once, ADR-0005), and **reported** at the next start through `Application::on_inbound_lost`, as part of the span above the inbound application watermark (ADR-0030, #105). Not redelivered. |
+| `from_app` returned for M, before the watermark write | The watermark still stands below M: M is reported as possibly lost although the application saw it (the residual window of ADR-0030). |
+| watermark write for M | M is not reported. |
 | an administrative or locally rejected inbound message | Its M+1 is written like any other, so the receive cursor after a restart includes it. |
 | reset (`reset_to`), before the rename | The previous stream, complete; the leftover `.tmp` is removed at open. The engine recorded the reset as owed before awaiting it, but that record is in memory (see the unmet row). |
 | reset, after the rename | The new stream, complete, under every policy. |
@@ -409,5 +411,6 @@ dependency, `FileStore::sync`, `FileStore::close`, `FileStore::repair`, and
   private to the crate's own tests; the fsync interception #89 asks for,
   usable from `ironfix-engine` tests, is not provided here. The durable
   owed-reset intent is ADR-0029 (#111): a flag in the counter slots, format
-  version 3.
+  version 3. The inbound application watermark is ADR-0030 (#105): a field
+  in the counter slots, format version 4.
 - No performance claim is made (ADR-0001).

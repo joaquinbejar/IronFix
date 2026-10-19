@@ -35,6 +35,8 @@ pub struct MemoryStore {
     next_target_seq: AtomicU64,
     /// The owed-reset marker; a reset keeps it.
     reset_owed: AtomicBool,
+    /// The inbound application watermark; a reset clears it.
+    app_watermark: AtomicU64,
     /// Store creation time.
     creation_time: SystemTime,
 }
@@ -48,6 +50,7 @@ impl MemoryStore {
             next_sender_seq: AtomicU64::new(1),
             next_target_seq: AtomicU64::new(1),
             reset_owed: AtomicBool::new(false),
+            app_watermark: AtomicU64::new(0),
             creation_time: SystemTime::now(),
         }
     }
@@ -64,6 +67,7 @@ impl MemoryStore {
             next_sender_seq: AtomicU64::new(sender_seq),
             next_target_seq: AtomicU64::new(target_seq),
             reset_owed: AtomicBool::new(false),
+            app_watermark: AtomicU64::new(0),
             creation_time: SystemTime::now(),
         }
     }
@@ -194,6 +198,7 @@ impl MessageStore for MemoryStore {
         messages.clear();
         self.next_sender_seq.store(1, Ordering::SeqCst);
         self.next_target_seq.store(1, Ordering::SeqCst);
+        self.app_watermark.store(0, Ordering::SeqCst);
         Ok(())
     }
 
@@ -206,6 +211,20 @@ impl MessageStore for MemoryStore {
     /// Never fails: the marker is an atomic in this process. A reset keeps it.
     async fn set_reset_owed(&self, owed: bool) -> Result<(), StoreError> {
         self.reset_owed.store(owed, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Reports the watermark as last set in this process: like the marker,
+    /// it survives an engine restart over the same store, not a process
+    /// restart.
+    fn app_watermark(&self) -> u64 {
+        self.app_watermark.load(Ordering::SeqCst)
+    }
+
+    /// Never fails: the watermark is an atomic in this process. A reset
+    /// clears it.
+    async fn set_app_watermark(&self, watermark: u64) -> Result<(), StoreError> {
+        self.app_watermark.store(watermark, Ordering::SeqCst);
         Ok(())
     }
 
@@ -247,6 +266,21 @@ mod tests {
         assert!(store.reset_owed(), "reset_to keeps the marker");
         ok(store.set_reset_owed(false).await, "clear the marker");
         assert!(!store.reset_owed());
+    }
+
+    #[tokio::test]
+    async fn test_memory_store_app_watermark_is_kept_until_a_reset_clears_it() {
+        let store = MemoryStore::new();
+        assert_eq!(store.app_watermark(), 0, "a new store has no watermark");
+        ok(store.set_app_watermark(7).await, "set the watermark");
+        assert_eq!(store.app_watermark(), 7);
+        ok(store.set_next_target_seq(9).await, "a counter write");
+        assert_eq!(store.app_watermark(), 7, "a counter write keeps it");
+        ok(store.reset().await, "reset");
+        assert_eq!(store.app_watermark(), 0, "a reset clears it");
+        ok(store.set_app_watermark(4).await, "set it again");
+        ok(store.reset_to(2, 2).await, "reset_to");
+        assert_eq!(store.app_watermark(), 0, "reset_to clears it");
     }
 
     #[tokio::test]

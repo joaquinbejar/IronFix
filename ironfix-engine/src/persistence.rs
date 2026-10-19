@@ -65,21 +65,36 @@
 //!
 //! The same messages can be lost while the process runs, without a crash: when
 //! the session closes, the dispatcher gets a bounded time to finish its queue
-//! and is then aborted. The engine logs, at error level, the range of
-//! `MsgSeqNum`s it had handed over and `from_app` had not finished.
+//! and is then aborted.
 //!
 //! Under [`StoreFailurePolicy::CloseSession`] a message whose counter write
 //! failed is never handed over; under [`StoreFailurePolicy::Continue`] it is.
 //!
-//! What this does **not** provide: the engine does not detect or report, after
-//! a restart, the inbound messages lost across a crash, so the "lost message
-//! is reported" requirement of issue #89 is not met for inbound traffic.
-//! Reporting needs a completion signal from the dispatcher back to the
-//! reactor, a durable application watermark (a new defaulted
-//! [`MessageStore`] method), and a typed report at restart of the numbers
-//! between that watermark and the persisted target. At-least-once delivery
-//! additionally needs an inbound journal, or redelivery through a
-//! `ResendRequest`. Both are tracked in issue #105.
+//! # A lost inbound message is reported, not redelivered
+//!
+//! The loss is reported (issue #105, `doc/adr/0030-inbound-loss-report.md`):
+//!
+//! - **The watermark.** The dispatcher persists the inbound application
+//!   watermark ([`MessageStore::set_app_watermark`]) after `from_app` returns
+//!   for each message, and after the reactor has processed the
+//!   administrative messages accepted since, so the stored watermark is the
+//!   highest number up to which every accepted message was acted on. A
+//!   failed write follows the policy: under
+//!   [`StoreFailurePolicy::CloseSession`] the dispatcher stops delivering
+//!   and the session closes.
+//! - **At start.** Before the store is seeded, a session with a store
+//!   reports the span between the stored watermark and the stored next
+//!   target through [`Application::on_inbound_lost`], then writes the
+//!   watermark up to it.
+//! - **At close.** A dispatcher aborted after its drain timeout, or stopped
+//!   by a failed watermark write, has its unfinished span reported the same
+//!   way before `on_session_closed`, and the watermark is written up to it,
+//!   so the next start does not report it again.
+//! - **A reset clears it.** A store reset sets the watermark to 0 (none):
+//!   the span it described belongs to the stream the reset replaced.
+//!
+//! The engine keeps no inbound journal and does not ask the counterparty to
+//! resend numbers it has accepted, so delivery stays at most once.
 //!
 //! # A reset that could not be made
 //!
@@ -193,8 +208,9 @@
 //! A store failure never logs frame bytes: an outbound Logon carries
 //! `Password` (554).
 
-use crate::application::SessionId;
+use crate::application::{Application, SessionId};
 use crate::error::EngineError;
+use crate::loss::{InboundLoss, InboundLossCause};
 use ironfix_core::error::StoreError;
 use ironfix_core::message::MsgType;
 use ironfix_session::SequenceManager;
@@ -291,6 +307,8 @@ enum StoreWrite<'m> {
     NextSender(u64),
     /// Persisting the next target sequence number.
     NextTarget(u64),
+    /// Persisting the inbound application watermark (ADR-0030).
+    AppWatermark(u64),
 }
 
 /// Runs one store call bounded by `timeout`, reporting an overrun as
@@ -459,6 +477,27 @@ impl<'s> SessionStore<'s> {
         }
     }
 
+    /// Persists the inbound application watermark (ADR-0030).
+    ///
+    /// A failure is handled like any other mutation's: it owes a reset (the
+    /// store cannot say the failed write changed nothing), and the policy
+    /// decides whether it closes the session. A watermark that did not land
+    /// leaves the stored one lower, so the next start reports more as
+    /// possibly lost, never less.
+    ///
+    /// # Errors
+    /// The store's error under [`StoreFailurePolicy::CloseSession`].
+    pub(crate) async fn persist_app_watermark(
+        self,
+        session_id: &SessionId,
+        watermark: u64,
+    ) -> Result<(), StoreError> {
+        match self.mutate(self.store.set_app_watermark(watermark)).await {
+            Ok(()) => Ok(()),
+            Err(err) => self.on_failure(session_id, StoreWrite::AppWatermark(watermark), err),
+        }
+    }
+
     /// Resets the store and sets both counters through one
     /// [`MessageStore::reset_to`] call, for a sequence reset the counterparty
     /// declared on its Logon acknowledgement.
@@ -525,6 +564,13 @@ impl<'s> SessionStore<'s> {
                 next,
                 error = %err,
                 "cannot persist the next target sequence number: continuing"
+            ),
+            StoreWrite::AppWatermark(watermark) => tracing::warn!(
+                session = %session_id,
+                watermark,
+                error = %err,
+                "cannot persist the inbound application watermark: continuing; the next \
+                 session start may report messages from_app has seen as possibly lost"
             ),
         }
         Ok(())
@@ -810,6 +856,55 @@ impl StoreAttachment {
     /// stays owed.
     pub(crate) fn reset_paid(&self, ticket: ResetTicket) {
         self.reset_owed.pay(ticket);
+    }
+
+    /// Reports to `application` the inbound span the previous session
+    /// accepted above the store's application watermark, then records it as
+    /// reported by writing the watermark up to the stored next target
+    /// (issue #105, ADR-0030). Nothing happens without a store, or when the
+    /// store's watermark covers everything it accepted.
+    ///
+    /// Called by both roles before the store is seeded (a reset would erase
+    /// the numbers), with the values the store holds when the session
+    /// starts. The callback runs before the write, so a crash in between
+    /// reports the span again, never not at all. Nothing is redelivered.
+    ///
+    /// # Errors
+    /// The store's error, under [`StoreFailurePolicy::CloseSession`] only:
+    /// the session is then refused, and the span is reported again by the
+    /// next one.
+    pub(crate) async fn report_inbound_loss<A: Application + ?Sized>(
+        &self,
+        application: &A,
+        session_id: &SessionId,
+        write_timeout: Duration,
+    ) -> Result<(), StoreError> {
+        let Some(store) = self.store.as_deref() else {
+            return Ok(());
+        };
+        let Some(loss) = InboundLoss::between(
+            store.app_watermark(),
+            store.next_target_seq(),
+            InboundLossCause::FoundAtStart,
+        ) else {
+            return Ok(());
+        };
+        tracing::warn!(
+            session = %session_id,
+            first = loss.first(),
+            last = loss.last(),
+            "inbound messages accepted by the previous session may not have reached from_app: \
+             reporting the span to the application; they are not redelivered"
+        );
+        application.on_inbound_lost(session_id, &loss).await;
+        SessionStore::new(
+            store,
+            self.policy,
+            self.timeout(write_timeout),
+            &self.reset_owed,
+        )
+        .persist_app_watermark(session_id, loss.last())
+        .await
     }
 
     /// The owed-reset record, shared with a session's reactor so its

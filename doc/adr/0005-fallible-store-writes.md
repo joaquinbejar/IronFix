@@ -287,41 +287,35 @@ plus the message `from_app` is handling.
 
 The same messages can be lost **while the process runs**, without a crash:
 when the session closes, the dispatcher gets `APP_DRAIN_TIMEOUT` (5 s) to
-finish its queue and is then aborted. The dispatcher records the number of
-each message it finishes, the reactor records the first and last numbers it
-handed over, and on an abort the engine logs at error level the range it
-handed over and `from_app` did not finish (the range can include the numbers
-of administrative messages processed in between). A typed close reason for it
-is #69.
+finish its queue and is then aborted. Since ADR-0030 the span it did not
+finish is reported to the application (`on_inbound_lost`, cause
+`DispatcherStopped`) before `on_session_closed`, and logged.
 
 Under `CloseSession` a message whose target write failed is never handed over.
 Under `Continue` it is handed over anyway.
 
-**What this does not provide.** The engine does not detect or report, after a
-restart, the inbound messages lost across a crash, so #89's requirement that a
-lost message be reported is **not met** for inbound traffic by this change.
-Reporting needs:
-
-- a completion signal from the dispatcher back to the reactor;
-- a durable application watermark W, through a new defaulted `MessageStore`
-  method;
-- a typed report at restart of W+1 up to the persisted target minus one.
-
-At-least-once delivery additionally needs an inbound journal, or redelivery
-through a `ResendRequest` from W+1 with `PossDupFlag` handling. Both are
-tracked in #105.
+**Amended by ADR-0030 (#105): the loss is reported.** Delivery stays at
+most once, and the loss is now reported through
+`Application::on_inbound_lost`: at the next start, the span between a durable
+inbound application watermark (a defaulted `MessageStore` method, persisted by
+the dispatcher after `from_app` returns) and the persisted target; at close,
+the span an aborted or stopped dispatcher did not finish. Nothing is
+redelivered (option 1 of #105, the owner's choice); at-least-once delivery
+would still need an inbound journal or a `ResendRequest` for numbers already
+accepted.
 
 ### Not done
 
 - **Filing inbound frames** (an optional `store_inbound` with a default no-op,
   for audit and for takeover by a replicated store) is deferred: it costs an
   allocation and a store call per inbound frame, and no consumer needs it yet.
-- **Reporting or redelivering inbound messages lost across a crash** is #105.
+- **Reporting inbound messages lost across a crash** is done by ADR-0030
+  (#105); **redelivering** them is not.
 - The close reason is a log string; a typed close outcome on `Connection` is
   #69.
-- The dispatcher-abort log line is not asserted by a test: capturing a
-  `tracing` event needs a subscriber in the engine's dev-dependencies, which
-  needs approval. The range computation is unit-tested.
+- The dispatcher-abort report is asserted through `on_inbound_lost`
+  (ADR-0030); the log line itself is not, since capturing a `tracing` event
+  needs a subscriber in the engine's dev-dependencies.
 
 ## Consequences
 

@@ -1,6 +1,7 @@
 # ADR-0029 — A durable owed-reset marker in the store
 
-- **Status:** Proposed (issue #111)
+- **Status:** Proposed (issue #111); the journal format moved on to version
+  4 with ADR-0030
 - **Date:** 2026-10-19
 
 ## Context

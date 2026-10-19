@@ -174,6 +174,14 @@
 //! an application handler never delays a socket read, a heartbeat, or
 //! timeout detection.
 //!
+//! The dispatcher also keeps the inbound application watermark (issue #105,
+//! ADR-0030): after each `from_app` returns, and after the reactor reports
+//! the administrative messages it has processed since, it persists the
+//! highest number up to which every accepted message was acted on. A session
+//! whose dispatcher is aborted at close, or stopped by a failed watermark
+//! write, reports the unfinished span through
+//! [`Application::on_inbound_lost`] before `on_session_closed`.
+//!
 //! A resend (the answer to a `ResendRequest`, or the resend a counterparty's
 //! `NextExpectedMsgSeqNum` (789) asks for) is queued and fed to the write
 //! buffer in steps. Steps and inbound reads alternate in a bounded ratio: a
@@ -269,6 +277,7 @@ use crate::connection::{Command, SessionRuntime};
 use crate::error::EngineError;
 use crate::gap_queue::{GapQueue, Gapped, Insert};
 use crate::garbled::{GarbledFrameWindow, GarbledVerdict};
+use crate::loss::{InboundLoss, InboundLossCause};
 use crate::observer::{Capture, FrameKind, OutboundResult};
 use crate::outbound;
 use crate::outcome::{self, NotSentReason, Receipt, SendOutcome, UnknownReason};
@@ -959,90 +968,213 @@ struct AppRejection {
     reason: RejectReason,
 }
 
-/// Runs `from_app` off the reactor.
-///
-/// Messages arrive in the order the reactor validated them, and this task is
-/// their only consumer, so the application sees them in ascending `MsgSeqNum`
-/// order. A rejection travels back to the reactor, which numbers and sends the
-/// session-level Reject; nothing here touches session state.
-///
-/// The task ends when the reactor drops the queue's sender, which every exit
-/// path of [`run_reactor`] does.
-///
-/// After each message it stores that message's `MsgSeqNum` in `completed`, so
-/// that if the task has to be aborted the reactor can name the messages it
-/// handed over and `from_app` never finished.
-async fn run_app_dispatcher<A: Application>(
+/// What the application dispatcher sends back to the reactor.
+#[derive(Debug)]
+enum DispatcherEvent {
+    /// A rejection `from_app` returned, to be sent as a session-level Reject.
+    Reject(AppRejection),
+    /// A watermark write failed under
+    /// [`StoreFailurePolicy::CloseSession`]: the dispatcher has stopped
+    /// delivering, and the session must close.
+    StoreFailed(StoreError),
+}
+
+/// Where the dispatcher persists the inbound application watermark: the
+/// attached store under the session's policy and timeout, or nowhere.
+struct WatermarkSink {
+    /// The attached store, if any.
+    store: Option<Arc<dyn MessageStore>>,
+    /// What a failed write means.
+    policy: StoreFailurePolicy,
+    /// Bound on each store call.
+    timeout: Duration,
+    /// The owed-reset record a failed write adds to.
+    owed: Arc<OwedReset>,
+}
+
+impl WatermarkSink {
+    /// Persists `watermark`, if a store is attached.
+    ///
+    /// # Errors
+    /// The store's error under [`StoreFailurePolicy::CloseSession`].
+    async fn write(&self, session_id: &SessionId, watermark: u64) -> Result<(), StoreError> {
+        match self.store.as_deref() {
+            Some(store) => {
+                SessionStore::new(store, self.policy, self.timeout, &self.owed)
+                    .persist_app_watermark(session_id, watermark)
+                    .await
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+/// The application dispatcher's state: what it delivers to, and how far it
+/// has accounted for the inbound stream.
+struct AppDispatcher<A: Application> {
+    /// The application.
     application: Arc<A>,
+    /// The session, for the callbacks and the log lines.
     session_id: SessionId,
-    mut frames: mpsc::Receiver<AppFrame>,
-    rejections: mpsc::Sender<AppRejection>,
+    /// Rejections and store failures, back to the reactor.
+    events: mpsc::Sender<DispatcherEvent>,
+    /// The watermark as last published in memory, read by the reactor at
+    /// close to name what the dispatcher did not finish.
     completed: Arc<AtomicU64>,
-) {
-    while let Some(AppFrame { frame, seq }) = frames.recv().await {
+    /// Where the watermark is persisted.
+    sink: WatermarkSink,
+    /// The watermark last written (or attempted) to the store.
+    written: u64,
+}
+
+impl<A: Application> AppDispatcher<A> {
+    /// Accounts for every inbound message up to `mark`: publishes it in
+    /// memory, then persists it, unless it is not above what was written.
+    ///
+    /// Returns `false` when the write failed under
+    /// [`StoreFailurePolicy::CloseSession`]: the reactor has been told, and
+    /// the dispatcher must stop delivering.
+    async fn account(&mut self, mark: u64) -> bool {
+        if mark <= self.written {
+            return true;
+        }
+        self.completed.store(mark, Ordering::Release);
+        self.written = mark;
+        match self.sink.write(&self.session_id, mark).await {
+            Ok(()) => true,
+            Err(err) => {
+                // The reactor closes the session; if it is already gone, the
+                // session it would have closed no longer exists.
+                let _ = self.events.send(DispatcherEvent::StoreFailed(err)).await;
+                false
+            }
+        }
+    }
+
+    /// Runs `from_app` on one frame, then accounts for it and sends back the
+    /// rejection it returned, if any. Returns `false` when the dispatcher
+    /// must stop: a failed watermark write, or a reactor that is gone.
+    async fn deliver(&mut self, AppFrame { frame, seq }: AppFrame) -> bool {
         // The reactor decoded this frame already; a failure here cannot
         // happen, and inventing a session action for it is not this task's
         // job.
         let Ok(raw) = wire::decode_frame(&frame) else {
             tracing::warn!(
-                session = %session_id,
+                session = %self.session_id,
                 seq,
                 "dropping an application message that no longer decodes"
             );
-            completed.store(seq, Ordering::Release);
-            continue;
+            return self.account(seq).await;
         };
-        let delivered = application.from_app(&raw, &session_id).await;
-        completed.store(seq, Ordering::Release);
+        let delivered = self.application.from_app(&raw, &self.session_id).await;
+        if !self.account(seq).await {
+            return false;
+        }
         if let Err(reason) = delivered {
             let rejection = AppRejection {
                 ref_seq: seq,
                 ref_msg_type: raw.msg_type().clone(),
                 reason,
             };
-            if rejections.send(rejection).await.is_err() {
+            if self
+                .events
+                .send(DispatcherEvent::Reject(rejection))
+                .await
+                .is_err()
+            {
                 // The reactor is gone; the session it would have rejected
                 // into no longer exists.
-                break;
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Runs `from_app` off the reactor, and keeps the inbound application
+/// watermark (ADR-0030).
+///
+/// Messages arrive in the order the reactor validated them, and this task is
+/// their only consumer, so the application sees them in ascending `MsgSeqNum`
+/// order. A rejection travels back to the reactor, which numbers and sends the
+/// session-level Reject; nothing here touches session state.
+///
+/// The watermark is the highest number up to which every accepted inbound
+/// message was acted on. It moves after each `from_app` returns, and when the
+/// reactor publishes on `marks` the number up to which it has processed
+/// everything (administrative messages included). A published mark is taken
+/// only once every frame queued before it has been delivered: the reactor
+/// queues a frame before it publishes a mark covering it, so draining the
+/// queue after seeing the mark finds every such frame. The session's opening
+/// position is persisted by the reactor itself before it acts on any inbound
+/// message, so it is durable before any target write can move past it.
+///
+/// The task ends when the reactor drops the queue's sender, which every exit
+/// path of [`run_reactor`] does; it accounts for the last published mark
+/// before it ends. It also ends, delivering nothing more, when a watermark
+/// write fails under [`StoreFailurePolicy::CloseSession`].
+async fn run_app_dispatcher<A: Application>(
+    mut dispatcher: AppDispatcher<A>,
+    mut frames: mpsc::Receiver<AppFrame>,
+    mut marks: watch::Receiver<u64>,
+) {
+    // The opening mark was persisted by the reactor before it acted on any
+    // inbound message (`Reactor::persist_opening_watermark`); `written`
+    // starts there. The channel is not read here: a later mark the reactor
+    // may already have published must wait, like any other, until the
+    // frames queued before it are delivered.
+    let mut marks_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            frame = frames.recv() => match frame {
+                Some(frame) => {
+                    if !dispatcher.deliver(frame).await {
+                        return;
+                    }
+                }
+                None => break,
+            },
+            changed = marks.changed(), if marks_open => {
+                if changed.is_err() {
+                    marks_open = false;
+                    continue;
+                }
+                let mark = *marks.borrow_and_update();
+                // Every frame queued before the mark was published is
+                // visible now: deliver them before accounting for it.
+                while let Ok(frame) = frames.try_recv() {
+                    if !dispatcher.deliver(frame).await {
+                        return;
+                    }
+                }
+                if !dispatcher.account(mark).await {
+                    return;
+                }
             }
         }
     }
+    // The queue is closed and empty: the last mark the reactor published
+    // covers everything it accepted.
+    let last = *marks.borrow();
+    let _ = dispatcher.account(last).await;
 }
 
 /// Everything the reactor loop owns besides the socket and the session.
 struct ReactorChannels {
     /// Commands from [`Connection`](crate::Connection) handles.
     commands: mpsc::Receiver<Command>,
-    /// Rejections coming back from the application dispatcher.
-    app_rejects: mpsc::Receiver<AppRejection>,
+    /// Rejections and store failures coming back from the application
+    /// dispatcher.
+    app_rejects: mpsc::Receiver<DispatcherEvent>,
     /// Closed-flag channel observed by [`Connection::wait_closed`](crate::Connection::wait_closed).
     closed: watch::Sender<bool>,
     /// The application dispatcher, joined on close so `on_logout` follows the
     /// last `from_app` rather than racing it.
     dispatcher: JoinHandle<()>,
-    /// The `MsgSeqNum` of the last message the dispatcher finished with, or 0.
+    /// The inbound application watermark as the dispatcher last published
+    /// it in memory.
     app_completed: Arc<AtomicU64>,
-}
-
-/// The `MsgSeqNum` range of the application messages handed to the dispatcher
-/// that it did not finish, given the `(first, last)` numbers handed over and
-/// the last number it finished with (0 for none).
-///
-/// Messages reach the dispatcher in ascending `MsgSeqNum` order and it
-/// finishes them in that order, so what it did not finish is one range: from
-/// just past the last finished number (or from the first handed over, if it
-/// finished none of them) to the last handed over. The range can include the
-/// numbers of administrative messages processed in between; it names the
-/// span, not each lost message.
-#[must_use]
-fn undelivered_range(handed: Option<(u64, u64)>, completed: u64) -> Option<(u64, u64)> {
-    let (first, last) = handed?;
-    let start = if completed >= first {
-        completed.checked_add(1)?
-    } else {
-        first
-    };
-    (start <= last).then_some((start, last))
 }
 
 /// Bookkeeping for an outstanding `ResendRequest` (2).
@@ -1847,8 +1979,12 @@ struct Reactor<A: Application> {
     /// Set when the close-time store reset fails, for the engine that owns
     /// the store to perform on its next session.
     reset_owed: Arc<OwedReset>,
-    /// The first and last `MsgSeqNum` handed to the application dispatcher.
-    app_handed: Option<(u64, u64)>,
+    /// Publishes to the application dispatcher the number up to which every
+    /// accepted inbound message has been processed or handed over
+    /// ([`Reactor::publish_accounted`]).
+    accounted: watch::Sender<u64>,
+    /// The number last published on `accounted`.
+    published: u64,
     /// The outstanding ResendRequest, if a gap is being recovered.
     ///
     /// The logout deadline is *not* tracked here: `Session<LogoutPending>`
@@ -2006,11 +2142,20 @@ async fn run_reactor<A: Application + 'static>(
     // the path below, which runs `on_logout`, the close-time reset and the
     // last counter writes. A failure leaves no phase, and the first pass of
     // the loop ends the session with it.
-    let (mut phase, mut opening_failure) =
-        match ctx.open(&mut framed, Phase::Active(session), opening).await {
+    // The opening watermark is made durable before anything else: once the
+    // first inbound message is acted on, its target write must never be on
+    // the store with no watermark below it, or a crash would leave W = 0
+    // ("none") and the loss would go unreported (ADR-0030).
+    let (mut phase, mut opening_failure) = match ctx.persist_opening_watermark().await {
+        Err(err) => (
+            None,
+            Some(ctx.close_on_store_failure(Phase::Active(session), &err)),
+        ),
+        Ok(()) => match ctx.open(&mut framed, Phase::Active(session), opening).await {
             Ok(phase) => (Some(phase), None),
             Err(outcome) => (None, Some(outcome)),
-        };
+        },
+    };
     let mut commands_open = true;
     let mut rejects_open = true;
     // Whether the latest pass of the loop started with a resend under way,
@@ -2163,8 +2308,9 @@ async fn run_reactor<A: Application + 'static>(
             // ceiling bounds those. Holding it would stall the dispatcher and
             // fill the application queue while inbound is still read. Behind
             // a full hold it waits, as reading does.
-            rejection = app_rejects.recv(), if rejects_open && !hold_full => match rejection {
-                Some(rejection) => {
+            event = app_rejects.recv(), if rejects_open && !hold_full => match event {
+                Some(DispatcherEvent::StoreFailed(err)) => Err(ctx.close_on_store_failure(current, &err)),
+                Some(DispatcherEvent::Reject(rejection)) => {
                     let ref_msg_type = rejection.ref_msg_type.as_str().to_string();
                     ctx.send_session_reject(
                         &mut framed,
@@ -2192,7 +2338,10 @@ async fn run_reactor<A: Application + 'static>(
             },
         };
         match result {
-            Ok(next) => phase = Some(next),
+            Ok(next) => {
+                ctx.publish_accounted();
+                phase = Some(next);
+            }
             Err(outcome) => break outcome,
         }
     };
@@ -2241,6 +2390,39 @@ async fn run_reactor<A: Application + 'static>(
         outcome.reason = outcome.reason.unwritten();
     }
     let graceful = outcome.reason.is_graceful();
+
+    // Closing the queue is what stops the dispatcher; joining it is what keeps
+    // `on_logout` from running beside a `from_app` still in flight. A wedged
+    // handler bounds the wait rather than the shutdown — and is then aborted, so
+    // it cannot outlive `on_logout`/`wait_closed`. Awaiting `&mut dispatcher`
+    // keeps ownership of the handle across the timeout: dropping it would only
+    // detach the task, leaving the stuck handler running.
+    //
+    // This runs before the close-time reset, so the dispatcher's last
+    // watermark write lands before the reset that clears it, and the span
+    // below is named in the numbers of the stream it belongs to.
+    //
+    // Aborting loses the messages still queued, and the one in `from_app`:
+    // their numbers are consumed, so the counterparty will not send them again.
+    // So does a dispatcher stopped by a failed watermark write. The span is
+    // reported to the application (issue #105, ADR-0030).
+    ctx.publish_accounted();
+    let next_target = ctx.runtime.sequences.next_target_seq().value();
+    let (closed_queue, _) = mpsc::channel(1);
+    drop(std::mem::replace(&mut ctx.app_tx, closed_queue));
+    if timeout(APP_DRAIN_TIMEOUT, &mut dispatcher).await.is_err() {
+        dispatcher.abort();
+        tracing::warn!(
+            session = %ctx.session_id,
+            "application dispatcher did not drain before the session closed; aborting it"
+        );
+    }
+    let accounted = app_completed.load(Ordering::Acquire);
+    if let Some(loss) =
+        InboundLoss::between(accounted, next_target, InboundLossCause::DispatcherStopped)
+    {
+        ctx.report_unfinished(&loss).await;
+    }
 
     let mut write_counters = true;
     if ctx.config.reset_on_disconnect || (graceful && ctx.config.reset_on_logout) {
@@ -2311,36 +2493,6 @@ async fn run_reactor<A: Application + 'static>(
             error = %err,
             "cannot persist the sequence numbers as the session closes"
         );
-    }
-
-    // Closing the queue is what stops the dispatcher; joining it is what keeps
-    // `on_logout` from running beside a `from_app` still in flight. A wedged
-    // handler bounds the wait rather than the shutdown — and is then aborted, so
-    // it cannot outlive `on_logout`/`wait_closed`. Awaiting `&mut dispatcher`
-    // keeps ownership of the handle across the timeout: dropping it would only
-    // detach the task, leaving the stuck handler running.
-    //
-    // Aborting loses the messages still queued, and the one in `from_app`:
-    // their numbers are consumed, so the counterparty will not send them again.
-    // The range is logged, since nothing else will report it (issue #105).
-    drop(ctx.app_tx);
-    if timeout(APP_DRAIN_TIMEOUT, &mut dispatcher).await.is_err() {
-        dispatcher.abort();
-        let completed = app_completed.load(Ordering::Acquire);
-        match undelivered_range(ctx.app_handed, completed) {
-            Some((first, last)) => tracing::error!(
-                session = %ctx.session_id,
-                first,
-                last,
-                "application dispatcher did not drain before the session closed and was \
-                 aborted: application messages in MsgSeqNum range first..=last were accepted \
-                 but from_app did not finish with them"
-            ),
-            None => tracing::warn!(
-                session = %ctx.session_id,
-                "application dispatcher did not drain before the session closed; aborting it"
-            ),
-        }
     }
 
     // Recorded before the callback, so a `Connection` the callback reads sees
@@ -2590,6 +2742,102 @@ impl<A: Application> Reactor<A> {
     /// No Logout is sent: it would have to be filed through the store that just
     /// failed, and the fail-closed policy writes nothing it could not file. The
     /// log line carries the store's error, which never contains frame bytes.
+    /// Publishes to the application dispatcher the number up to which every
+    /// accepted inbound message has been processed (administrative) or handed
+    /// over (application): one below the next expected target number.
+    ///
+    /// Called after every pass of the loop. The dispatcher persists it as the
+    /// inbound application watermark once it has delivered every frame
+    /// queued before it, so administrative messages, gap fills and rejected
+    /// application messages move the watermark too, and a session that ends
+    /// on one of them reports nothing at the next start. Only an advance is
+    /// published: an atomic load and a comparison on every pass, one channel
+    /// write per advance the dispatcher has not already accounted for.
+    fn publish_accounted(&mut self) {
+        let Some(mark) = self
+            .runtime
+            .sequences
+            .next_target_seq()
+            .value()
+            .checked_sub(1)
+        else {
+            return;
+        };
+        if mark > self.published {
+            self.published = mark;
+            self.accounted.send_replace(mark);
+        }
+    }
+
+    /// Persists the session's opening position (everything the handshake
+    /// processed, one below the next expected target) as the inbound
+    /// application watermark, before the reactor acts on any inbound message.
+    ///
+    /// Written here, in the reactor's own order, and not by the dispatcher:
+    /// a write left pending on the dispatcher could land after the target
+    /// write of the first application message, and a crash in between would
+    /// leave the stored watermark at 0, which reads as "none", hiding the
+    /// loss.
+    ///
+    /// # Errors
+    /// The store's error under [`StoreFailurePolicy::CloseSession`].
+    async fn persist_opening_watermark(&self) -> Result<(), StoreError> {
+        let Some(store) = self.store.as_deref() else {
+            return Ok(());
+        };
+        if self.published == 0 {
+            return Ok(());
+        }
+        SessionStore::new(
+            store,
+            self.store_policy,
+            self.store_timeout,
+            &self.reset_owed,
+        )
+        .persist_app_watermark(&self.session_id, self.published)
+        .await
+    }
+
+    /// Reports the span the application dispatcher did not finish when the
+    /// session closed, then records it as reported by writing the watermark
+    /// up to it, so the next start does not report it again.
+    ///
+    /// The session is over: a failed write is logged whatever the policy,
+    /// and the next start reports the span again.
+    async fn report_unfinished(&self, loss: &InboundLoss) {
+        tracing::error!(
+            session = %self.session_id,
+            first = loss.first(),
+            last = loss.last(),
+            "application messages in MsgSeqNum range first..=last were accepted but from_app \
+             did not finish with them before the session closed; they are not redelivered"
+        );
+        self.application
+            .on_inbound_lost(&self.session_id, loss)
+            .await;
+        let Some(store) = self.store.as_deref() else {
+            return;
+        };
+        // Through the session binding, so a failure owes a reset like any
+        // failed mutation; its policy error is only logged here.
+        let written = SessionStore::new(
+            store,
+            self.store_policy,
+            self.store_timeout,
+            &self.reset_owed,
+        )
+        .persist_app_watermark(&self.session_id, loss.last())
+        .await;
+        if let Err(err) = written {
+            tracing::warn!(
+                session = %self.session_id,
+                error = %err,
+                "cannot record the reported inbound span in the store: the next session start \
+                 reports it again"
+            );
+        }
+    }
+
     fn close_on_store_failure(&self, phase: Phase, err: &StoreError) -> SessionClosed {
         tracing::warn!(
             session = %self.session_id,
@@ -5612,7 +5860,7 @@ impl<A: Application> Reactor<A> {
     ///   the write succeeded). A crash, or a dispatcher aborted at close,
     ///   before `from_app` has finished with it loses it to the application:
     ///   inbound delivery is at most once (see the `persistence` module). The
-    ///   handed-over range is recorded so an abort can log what it lost.
+    ///   loss is reported, not redelivered (ADR-0030).
     async fn deliver_app(
         &mut self,
         phase: Phase,
@@ -5656,10 +5904,6 @@ impl<A: Application> Reactor<A> {
         // The reactor is the only writer of this count, which is why the
         // record is a plain load and store rather than an atomic add.
         self.runtime.record_inbound_app_message();
-        self.app_handed = Some(match self.app_handed {
-            Some((first, _)) => (first, seq),
-            None => (seq, seq),
-        });
         Ok(phase)
     }
 
@@ -5929,13 +6173,38 @@ where
 
     // The dispatcher stops when the reactor drops `app_tx`, which `run_reactor`
     // does on every exit path.
-    let app_completed = Arc::new(AtomicU64::new(0));
+    //
+    // The handshake has processed everything below the next target number,
+    // and nothing has been handed over yet: that is where the watermark
+    // starts, in memory and (written by the reactor before it acts on anything,
+    // `Reactor::persist_opening_watermark`) in the store.
+    let opening_mark = match runtime.sequences.next_target_seq().value().checked_sub(1) {
+        Some(mark) => mark,
+        None => {
+            // `SequenceManager` numbers from 1: a next target of 0 names no
+            // message, and nothing below it can have been accepted.
+            debug_assert!(false, "the next target sequence number is never 0");
+            0
+        }
+    };
+    let app_completed = Arc::new(AtomicU64::new(opening_mark));
+    let (accounted, marks) = watch::channel(opening_mark);
     let dispatcher = tokio::spawn(run_app_dispatcher(
-        Arc::clone(&application),
-        session_id.clone(),
+        AppDispatcher {
+            application: Arc::clone(&application),
+            session_id: session_id.clone(),
+            events: reject_tx,
+            completed: Arc::clone(&app_completed),
+            sink: WatermarkSink {
+                store: store.clone(),
+                policy: store_policy,
+                timeout: store_timeout,
+                owed: Arc::clone(&reset_owed),
+            },
+            written: opening_mark,
+        },
         app_rx,
-        reject_tx,
-        Arc::clone(&app_completed),
+        marks,
     ));
 
     let reactor = Reactor {
@@ -5952,7 +6221,8 @@ where
         store_timeout,
         persisted,
         reset_owed,
-        app_handed: None,
+        accounted,
+        published: opening_mark,
         resend: None,
         unwritten_test_request: None,
         held_logon: None,
@@ -5997,42 +6267,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_undelivered_range_nothing_handed_over() {
-        assert_eq!(undelivered_range(None, 0), None);
-        assert_eq!(undelivered_range(None, 7), None);
-    }
-
-    #[test]
-    fn test_undelivered_range_none_finished_is_everything_handed_over() {
-        // The dispatcher finished nothing in this session: the range starts at
-        // the first number handed over, not at 1.
-        assert_eq!(undelivered_range(Some((5, 9)), 0), Some((5, 9)));
-    }
-
-    #[test]
-    fn test_undelivered_range_starts_past_the_last_finished() {
-        assert_eq!(undelivered_range(Some((5, 9)), 6), Some((7, 9)));
-        // Admin numbers between application messages fall inside the span.
-        assert_eq!(undelivered_range(Some((5, 12)), 8), Some((9, 12)));
-    }
-
-    #[test]
-    fn test_undelivered_range_all_finished_is_none() {
-        assert_eq!(undelivered_range(Some((5, 9)), 9), None);
-        assert_eq!(undelivered_range(Some((5, 5)), 5), None);
-    }
-
-    #[test]
-    fn test_undelivered_range_is_checked_at_the_top_of_the_space() {
-        // A finished number at u64::MAX leaves nothing past it; the
-        // arithmetic must not wrap to a range starting at 0.
-        assert_eq!(
-            undelivered_range(Some((u64::MAX, u64::MAX)), u64::MAX),
-            None
-        );
-    }
 
     /// A session configuration allowing `limit` ResendRequests per gap.
     fn config_with_limit(limit: u32) -> SessionConfig {
