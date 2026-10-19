@@ -345,7 +345,8 @@ pub trait MessageStore: Send + Sync {
     /// (141) = Y, a `reset_on_logout` / `reset_on_disconnect` close, a reset
     /// an earlier session owed), and after a store mutation that failed; it
     /// clears it only once the reset has been made and the Logon or
-    /// acknowledgement declaring it has been exchanged. `Ok` must mean the
+    /// acknowledgement declaring it has been exchanged, or right after a
+    /// successful close-time reset when nothing else is owed. `Ok` must mean the
     /// marker is as durable as the store's counters can be made: a durable
     /// store flushes it before it returns, whatever its own sync policy.
     ///
