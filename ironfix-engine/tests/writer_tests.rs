@@ -34,6 +34,9 @@
 //! - no new `MsgSeqNum` is written in the middle of a resend when the
 //!   messages held behind it fill the hold: reading stops instead;
 //! - the owed Logout's deadline is checked before every resend step.
+//! - a TestRequest's reply deadline and a ResendRequest's retry clock start
+//!   when the frame is written whole, not when it is queued behind a large
+//!   report (issue #142).
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -1610,4 +1613,195 @@ async fn test_live_frames_are_written_through_one_write_each() {
         ORDERS,
         "each order went out in a write of its own, as soon as it was fed"
     );
+}
+
+/// A scripted counterparty that reads its end of a pipe slowly: at most
+/// `chunk` bytes per `pause`, so output written to it drains at a known rate.
+struct SlowReader {
+    io: DuplexStream,
+    buf: BytesMut,
+    codec: FixCodec,
+    chunk: usize,
+    pause: Duration,
+}
+
+impl SlowReader {
+    /// Takes over the venue's end of the pipe once the handshake is done,
+    /// keeping whatever the framed reader had already buffered.
+    fn new(framed: Framed<DuplexStream, FixCodec>, chunk: usize, pause: Duration) -> Self {
+        let parts = framed.into_parts();
+        Self {
+            io: parts.io,
+            buf: parts.read_buf,
+            codec: FixCodec::new(),
+            chunk,
+            pause,
+        }
+    }
+
+    /// The next frame, read at the slow rate; `None` once the stream ends.
+    async fn next(&mut self) -> Option<BytesMut> {
+        use tokio::io::AsyncReadExt;
+        use tokio_util::codec::Decoder as _;
+        loop {
+            if let Some(frame) = ok(self.codec.decode(&mut self.buf), "a frame decodes") {
+                return Some(frame);
+            }
+            tokio::time::sleep(self.pause).await;
+            let mut chunk = vec![0_u8; self.chunk];
+            let read = ok(self.io.read(&mut chunk).await, "the pipe reads");
+            if read == 0 {
+                return None;
+            }
+            self.buf
+                .extend_from_slice(chunk.get(..read).unwrap_or_default());
+        }
+    }
+
+    /// Writes `frame` to the initiator at once.
+    async fn send(&mut self, frame: BytesMut) {
+        ok(self.io.write_all(&frame).await, "the venue writes");
+    }
+}
+
+/// Logs a client on over a 1 KiB pipe with `config`; the venue acknowledges
+/// with `HeartBtInt` (108) `heartbeat_secs`. Returns the connection and the
+/// venue's end, read from then on at 1 KiB every 50 ms.
+async fn log_on_behind_a_slow_reader(
+    config: SessionConfig,
+    heartbeat_secs: &str,
+) -> (Connection, SlowReader) {
+    let (client_io, venue_io) = tokio::io::duplex(1024);
+    let (client_app, _client_rx) = RecordingApp::new();
+    let initiator =
+        Initiator::new(config, Arc::clone(&client_app)).with_write_timeout(Duration::from_secs(10));
+    let established = tokio::spawn(async move { initiator.establish(client_io).await });
+    let mut venue = Framed::new(venue_io, FixCodec::new());
+    let logon = next_frame(&mut venue).await;
+    assert_eq!(field(&logon, 35).as_deref(), Some("A"));
+    ok(
+        venue
+            .send(peer_frame(
+                "VENUE",
+                "CLIENT",
+                "A",
+                1,
+                &[(98, "0"), (108, heartbeat_secs)],
+            ))
+            .await,
+        "the venue acknowledges",
+    );
+    let client = ok(
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), established).await,
+                "handshake within 5s",
+            ),
+            "initiator task joins",
+        ),
+        "the initiator establishes the session",
+    );
+    (
+        client,
+        SlowReader::new(venue, 1024, Duration::from_millis(50)),
+    )
+}
+
+/// A report of about `bytes` bytes of `Text` (58).
+fn large_report(bytes: usize) -> OutboundMessage {
+    let mut report = OutboundMessage::new(MsgType::ExecutionReport);
+    report.push_str(58, &"r".repeat(bytes));
+    report
+}
+
+/// Issue #142: a TestRequest's reply deadline starts when the TestRequest is
+/// written whole, not when it is fed. With `HeartBtInt` 1 s the client sends
+/// a TestRequest after about 2 s of inbound silence and times out 1 s after
+/// it was sent. A 60 KB report sent at once drains at about 20 KB/s, so the
+/// TestRequest fed at about 2 s waits behind it for about another second and
+/// reaches the venue at about 3 s. The venue answers it at once: the session
+/// stays up. (Before the fix the deadline ran from the feed and could expire
+/// while the TestRequest was still buffered.)
+#[tokio::test]
+async fn test_a_buffered_test_request_does_not_time_out_the_session() {
+    let config = client_config().with_heartbeat_interval(Duration::from_secs(1));
+    let (client, mut venue) = log_on_behind_a_slow_reader(config, "1").await;
+    ok(
+        client.send(large_report(60_000)).await,
+        "the report is queued",
+    );
+    let started = tokio::time::Instant::now();
+    let test_req_id = loop {
+        let frame = some(venue.next().await, "the stream stays open");
+        if field(&frame, 35).as_deref() == Some("1") {
+            break some(field(&frame, 112), "the TestRequest carries a TestReqID");
+        }
+    };
+    assert!(
+        started.elapsed() > Duration::from_millis(2_500),
+        "the TestRequest waited behind the report past its reply deadline"
+    );
+    venue
+        .send(peer_frame(
+            "VENUE",
+            "CLIENT",
+            "0",
+            2,
+            &[(112, test_req_id.as_str())],
+        ))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !client.is_closed(),
+        "a TestRequest still buffered behind the report did not time the session out"
+    );
+}
+
+/// Issue #142: a ResendRequest's retry clock starts when the request is
+/// written whole. With a single request allowed and a 300 ms retry timeout,
+/// the client's ResendRequest is queued behind a 60 KB report that drains in
+/// about 3 s. Its clock starts once it reaches the venue, which fills the gap
+/// at once: no Logout follows and the session stays up. (Before the fix the
+/// clock ran from the feed, so the retries were spent and a Logout queued
+/// before the request ever reached the wire.)
+#[tokio::test]
+async fn test_a_buffered_resend_request_does_not_spend_its_retries() {
+    let mut config = client_config();
+    config.resend_timeout = Duration::from_millis(300);
+    config.max_resend_requests = 1;
+    let (client, mut venue) = log_on_behind_a_slow_reader(config, "30").await;
+    ok(
+        client.send(large_report(60_000)).await,
+        "the report is queued",
+    );
+    // Let the report be fed first, then open a gap: 2 is missing, so the
+    // client asks for it behind the report.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    venue.send(peer_frame("VENUE", "CLIENT", "0", 3, &[])).await;
+    loop {
+        let frame = some(venue.next().await, "the stream stays open");
+        match field(&frame, 35).as_deref() {
+            Some("2") => break,
+            Some("5") => panic!("a Logout came before the ResendRequest reached the venue"),
+            _ => {}
+        }
+    }
+    let orig = Timestamp::now().format_millis();
+    venue
+        .send(peer_frame(
+            "VENUE",
+            "CLIENT",
+            "4",
+            2,
+            &[(43, "Y"), (122, orig.as_str()), (123, "Y"), (36, "4")],
+        ))
+        .await;
+    if let Ok(Some(frame)) = timeout(Duration::from_millis(800), venue.next()).await {
+        assert_ne!(
+            field(&frame, 35).as_deref(),
+            Some("5"),
+            "no Logout once the gap is filled"
+        );
+    }
+    assert!(!client.is_closed(), "the session stays up");
 }
