@@ -6,7 +6,7 @@
 
 //! The gap queue: messages received above the expected `MsgSeqNum` (34) while
 //! a gap is open, kept under
-//! [`GapPolicy::Queue`](ironfix_session::GapPolicy::Queue) and released in
+//! [`GapPolicy::Queue`] and released in
 //! order once the gap is filled (issue #71, ADR-0027).
 //!
 //! This module is the bookkeeping only: a map keyed by `MsgSeqNum`, bounded by
@@ -35,6 +35,7 @@ pub(crate) enum Gapped {
 
 impl Gapped {
     /// The bytes this entry counts against the byte bound.
+    #[must_use]
     fn len(&self) -> usize {
         match self {
             Self::Frame(frame) => frame.len(),
@@ -140,12 +141,25 @@ impl GapQueue {
                 break;
             }
             let held = entry.remove();
-            self.bytes = self.bytes.saturating_sub(held.len());
+            self.bytes = match self.bytes.checked_sub(held.len()) {
+                Some(bytes) => bytes,
+                None => {
+                    // `bytes` is the sum of the held lengths, so it always
+                    // covers the one removed. Were it ever short, the count
+                    // restarts from what is still held rather than wrap.
+                    debug_assert!(false, "gap queue byte count below a held frame");
+                    self.entries.values().map(Gapped::len).sum()
+                }
+            };
             if seq == expected {
                 ready.next = Some(held);
                 break;
             }
-            ready.superseded += 1;
+            ready.superseded = match ready.superseded.checked_add(1) {
+                Some(count) => count,
+                // Bounded by `max_messages`, far below `usize::MAX`.
+                None => usize::MAX,
+            };
         }
         if self.entries.is_empty() {
             self.overflow_reported = false;

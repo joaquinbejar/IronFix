@@ -629,3 +629,113 @@ async fn test_acceptor_frames_past_a_held_logon_are_released_under_queue() {
     assert_eq!(field(&heartbeat, 112).as_deref(), Some("AFTER"));
     assert_eq!(connection.next_target_seq(), 10);
 }
+
+/// Asserts the engine writes nothing for 300 ms.
+async fn assert_silent(framed: &mut Peer, what: &str) {
+    if let Ok(Some(Ok(frame))) = timeout(Duration::from_millis(300), framed.next()).await {
+        panic!(
+            "{what}: unexpected MsgType {} at {:?}",
+            msg_type_of(&frame),
+            field(&frame, 34)
+        );
+    }
+}
+
+/// A gapped TestRequest sent twice under the same number is answered once:
+/// the second copy finds its number queued and is dropped, not acted on.
+async fn repeated_gapped_test_request_is_answered_once(role: Role) {
+    let mut live = Live::open(role, queue(16)).await;
+    live.send(app(role, 3)).await;
+    live.expect_resend_request("2").await;
+    live.send(peer_msg(role, "1", 4, &[(112, "TWICE")])).await;
+    let heartbeat = next_frame(&mut live.framed).await;
+    assert_eq!(msg_type_of(&heartbeat), "0");
+    assert_eq!(field(&heartbeat, 112).as_deref(), Some("TWICE"));
+    live.send(peer_msg(role, "1", 4, &[(112, "TWICE")])).await;
+    assert_silent(&mut live.framed, "the repeated TestRequest is not answered").await;
+    live.send(resent(role, 2)).await;
+    live.expect_app(&["2", "3"]).await;
+    live.ping(5).await;
+}
+
+#[tokio::test]
+async fn test_initiator_repeated_gapped_test_request_is_answered_once() {
+    repeated_gapped_test_request_is_answered_once(Role::Initiator).await;
+}
+
+#[tokio::test]
+async fn test_acceptor_repeated_gapped_test_request_is_answered_once() {
+    repeated_gapped_test_request_is_answered_once(Role::Acceptor).await;
+}
+
+/// An administrative frame on a number an application message already
+/// claimed in the queue does not run: the TestRequest at 3 is not answered,
+/// and the queued application message at 3 is the one released.
+async fn admin_frame_on_a_claimed_number_does_not_run(role: Role) {
+    let mut live = Live::open(role, queue(16)).await;
+    live.send(app(role, 3)).await;
+    live.expect_resend_request("2").await;
+    live.send(peer_msg(role, "1", 3, &[(112, "CLAIMED")])).await;
+    assert_silent(&mut live.framed, "the TestRequest on a claimed number").await;
+    live.send(resent(role, 2)).await;
+    live.expect_app(&["2", "3"]).await;
+    live.ping(4).await;
+}
+
+#[tokio::test]
+async fn test_initiator_admin_frame_on_a_claimed_number_does_not_run() {
+    admin_frame_on_a_claimed_number_does_not_run(Role::Initiator).await;
+}
+
+#[tokio::test]
+async fn test_acceptor_admin_frame_on_a_claimed_number_does_not_run() {
+    admin_frame_on_a_claimed_number_does_not_run(Role::Acceptor).await;
+}
+
+/// Ported from the PR #151 protocol probes: a possible-duplicate copy of a
+/// gapped number, with the same `TestReqID`, triggers no second admin action.
+/// With `app_first` the number was claimed by an application message, which
+/// is the one released; otherwise by a TestRequest answered once.
+async fn possdup_copy_of_a_held_number_is_not_acted_on(role: Role, app_first: bool) {
+    let mut live = Live::open(role, queue(16)).await;
+    if app_first {
+        live.send(app(role, 3)).await;
+        live.expect_resend_request("2").await;
+    } else {
+        live.send(peer_msg(role, "1", 3, &[(112, "FIRST")])).await;
+        live.expect_resend_request("2").await;
+        let heartbeat = next_frame(&mut live.framed).await;
+        assert_eq!(field(&heartbeat, 112).as_deref(), Some("FIRST"));
+    }
+    live.send(peer_msg(role, "1", 3, &[(43, "Y"), (112, "FIRST")]))
+        .await;
+    assert_silent(&mut live.framed, "a copy of a held number").await;
+    live.send(resent(role, 2)).await;
+    if app_first {
+        live.expect_app(&["2", "3"]).await;
+    } else {
+        live.expect_app(&["2"]).await;
+    }
+    assert_eq!(live.connection.next_target_seq(), 4);
+    live.ping(4).await;
+}
+
+#[tokio::test]
+async fn test_initiator_possdup_copy_of_a_gapped_test_request_is_dropped() {
+    possdup_copy_of_a_held_number_is_not_acted_on(Role::Initiator, false).await;
+}
+
+#[tokio::test]
+async fn test_acceptor_possdup_copy_of_a_gapped_test_request_is_dropped() {
+    possdup_copy_of_a_held_number_is_not_acted_on(Role::Acceptor, false).await;
+}
+
+#[tokio::test]
+async fn test_initiator_app_first_wins_over_an_admin_copy_of_its_number() {
+    possdup_copy_of_a_held_number_is_not_acted_on(Role::Initiator, true).await;
+}
+
+#[tokio::test]
+async fn test_acceptor_app_first_wins_over_an_admin_copy_of_its_number() {
+    possdup_copy_of_a_held_number_is_not_acted_on(Role::Acceptor, true).await;
+}

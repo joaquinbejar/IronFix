@@ -184,6 +184,7 @@ pub const MAX_GAP_QUEUE_BYTES: usize = 1024 * 1024 * 1024;
 /// `ironfix-engine` applies the policy; this crate only describes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum GapPolicy {
     /// Drop application messages above a gap; the counterparty's resend
     /// delivers them.

@@ -4945,20 +4945,29 @@ impl<A: Application> Reactor<A> {
     /// way out releases nothing more. Past a bound the message is dropped, as
     /// under `Discard`, and the session stays up: the open-ended
     /// `ResendRequest` covers it.
-    fn queue_gapped(&mut self, phase: &Phase, seq: u64, entry: Gapped) {
+    ///
+    /// Returns whether a message with this number was already queued: the
+    /// new one is then a copy and must not be acted on either, so a repeated
+    /// gapped TestRequest is not answered twice and an administrative frame
+    /// on a number an application message already claimed does not run. An
+    /// overflow returns `false`: the message is acted on as under `Discard`.
+    fn queue_gapped(&mut self, phase: &Phase, seq: u64, entry: Gapped) -> bool {
         if !matches!(phase, Phase::Active(_)) || self.logout_owed.is_some() {
-            return;
+            return false;
         }
         let Some(queue) = self.gap_queue.as_mut() else {
-            return;
+            return false;
         };
         match queue.insert(seq, entry) {
-            Insert::Queued => {}
-            Insert::Duplicate => tracing::debug!(
-                session = %self.session_id,
-                seq,
-                "a message with this number is already queued above the gap: dropping the copy"
-            ),
+            Insert::Queued => false,
+            Insert::Duplicate => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    seq,
+                    "a message with this number is already queued above the gap: dropping the copy"
+                );
+                true
+            }
             Insert::Overflow => {
                 if queue.first_overflow() {
                     tracing::warn!(
@@ -4968,6 +4977,7 @@ impl<A: Application> Reactor<A> {
                          it drains; the resend delivers them"
                     );
                 }
+                false
             }
         }
     }
@@ -5288,8 +5298,11 @@ impl<A: Application> Reactor<A> {
                     self.queue_gapped(&phase, seq, Gapped::Frame(frame.clone()));
                     return Ok(phase);
                 }
-                if msg_type != MsgType::Logout {
-                    self.queue_gapped(&phase, seq, Gapped::Processed);
+                if msg_type != MsgType::Logout && self.queue_gapped(&phase, seq, Gapped::Processed)
+                {
+                    // A copy of a number already held: dropped, not acted
+                    // on a second time.
+                    return Ok(phase);
                 }
                 self.dispatch_admin(framed, phase, &raw, seq).await
             }

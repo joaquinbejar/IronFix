@@ -87,7 +87,11 @@ Constraints any answer keeps:
    progress is noted for each, so the `ResendRequest` state clears once the
    expectation passes its water mark.
 5. **Duplicates.** A second message for a number already held is dropped,
-   whether or not it carries `PossDupFlag` = Y: the first copy is kept. Once a
+   whether or not it carries `PossDupFlag` = Y: the first copy is kept, and
+   an administrative copy is not acted on either (a repeated gapped
+   TestRequest is answered once; a TestRequest on a number an application
+   message already holds does not run). An administrative message refused by
+   an overflow is still acted on, as under `Discard`. Once a
    queued number is released, the counterparty's resent copy arrives below the
    expectation with `PossDupFlag` = Y and is ignored as before (a gap fill
    over it too). No number reaches `from_app` twice.
