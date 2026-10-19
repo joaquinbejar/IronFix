@@ -1145,8 +1145,11 @@ never quotes a field value), `StoreRefused` (filing failed or timed out under
 while this session's own Logout was pending, or waiting behind a resend the
 counterparty asked for after that Logout when the session ended), `Discarded`
 (still in the outbound queue when the session ended with no resend under way,
-whether or not this session's Logout was ahead of it) and
-`DiscardedBehindResend` (waiting behind a resend when the session ended).
+whether or not this session's Logout was ahead of it),
+`DiscardedBehindResend` (waiting behind a resend when the session ended), and,
+with an outbound throttle (see below), `Throttled` (refused by its budget) and
+`DiscardedByThrottle` (held by the throttle when this session's Logout was
+framed or the session ended).
 
 A `StoreRefused` frame is not sent within the process, but a failed or
 timed-out store write leaves the store's state unknown: the frame may have been
@@ -1183,6 +1186,73 @@ session closes is written by the closing flush and reports `Sent` if that
 flush drains the buffer, `Unknown` otherwise. Every tracked message resolves,
 at the latest as its session closes and before `Connection::wait_closed`
 returns, and `send_tracked` cannot outlive the session.
+
+### Outbound throttle
+
+This is engine behaviour, not a FIX message: the FIX session layer defines no
+message rate. Venues publish per-session message limits, and the engine offers
+an optional throttle to stay within them (issue #82,
+`doc/adr/0024-outbound-throttle.md`). Without one, application messages are
+framed as fast as they are queued.
+
+**Configuration.** `with_throttle(ThrottleConfig)` on the `Initiator`, the
+`Acceptor` or the `EngineBuilder` (a session routed by an `AcceptorRegistry`
+keeps its `Acceptor`'s). A `ThrottleConfig` holds one to 16 budgets, each a
+token bucket: `rate` messages (at least 1) per window `per` (above zero, at
+most one day), a `burst` (at least 1, default 1) and a `ThrottlePolicy`:
+`Queue { max_depth }` (1 to 65 536, default 1024) or `Refuse`. An optional
+classifier puts each message in a budget, by MsgType or by anything in its
+body, so cancels (`OrderCancelRequest`, F) can have a budget of their own and
+never wait behind new orders. `ThrottleConfigBuilder::build` checks every
+value and names the budget at fault.
+
+**The bucket.** A budget starts full when the session becomes Active and earns
+one token every `per / rate`, rounded up to whole nanoseconds, up to `burst`.
+Over any interval of length `per`, at most `burst + rate - 1` messages go
+through a budget: the default burst of 1 keeps a session within a venue limit
+of `rate` per `per`, wherever the venue places its window. A message takes a
+token when it is about to be framed; one that finds none is held, in order
+behind the messages its budget already holds, up to `max_depth`, or refused
+(`Refuse`, or a full queue). A refusal reports `NotSent` with `Throttled`
+through `Connection::send_tracked` (a plain `send` is dropped with a debug
+log), before `to_app_checked` runs, before a `MsgSeqNum` (34) is peeked and
+before the store is touched: it leaves no gap. A held message goes through
+`to_app_checked`, takes its number and is filed only when it is released, and
+gives its token back if the gate vetoes it.
+
+**Order.** Within a budget, messages leave in the order they were handed in.
+Across budgets, a message whose budget has a token goes ahead of one held in
+another. Messages released at the same moment leave in the order they were
+handed in. `MsgSeqNum` is assigned when a message is framed, so the numbers on
+the wire stay unique and in order.
+
+**Never throttled.** Logon, Logout, Heartbeat (including the answer to a
+TestRequest), TestRequest, ResendRequest, SequenceReset and every gap fill,
+Reject and XmlMessage take no token and never wait, so heartbeat timing is
+unaffected; nor do replays (the answer to a `ResendRequest`, the 789 resend),
+which resend frames that went through the throttle when first sent. A
+message the throttle holds waits behind a resend like any new message. Two
+consequences: a venue that counts resent messages against its limit can see a
+large resend exceed it, and one that counts every message sees the
+administrative ones on top of the budget.
+
+**Logout and close.** This session's own Logout goes out at once, and the
+messages the throttle still holds report `NotSent` with `DiscardedByThrottle`:
+none is written after the Logout. The same holds when the session ends any
+other way. A released message whose write is partial, or fails, is `Unknown`.
+
+**Timer resolution.** A held message waits on Tokio's timer, which has a
+resolution of one millisecond. A budget whose tokens come faster than one per
+millisecond keeps its rate while messages are held only with a burst of at
+least `rate * 1 ms / per` (10 for 10 000 per second); with less, it releases
+at most `burst` messages per millisecond, never faster than its rate, and the
+session warns at start.
+
+**Inbound.** `Connection::inbound_app_messages` counts the application
+messages the session has accepted in sequence and handed to `from_app`; read
+twice it gives the counterparty's rate over any window, so an acceptor can
+refuse over-rate messages in `from_app` (the engine then sends a session-level
+Reject). The engine itself does not limit inbound traffic.
 
 ## Pre-Trade Messages
 
@@ -1971,6 +2041,11 @@ ADR-0011.
   `Connection::send_tracked` reports `Sent`, `NotSent` or `Unknown` per
   message. See "Outbound application messages: veto and send outcomes"
   above.
+- [x] Outbound throttle (engine, both roles, opt-in with `with_throttle`):
+  token-bucket budgets with an optional classifier, `Queue { max_depth }` or
+  `Refuse` per budget, refusals reported as `NotSent` with `Throttled`;
+  administrative messages and replays are never throttled; the inbound
+  application count is exposed. See "Outbound throttle" above.
 - [x] `NextExpectedMsgSeqNum` (789) on Logon, opt-in
   (`SessionConfig::send_next_expected_msg_seq_num`, FIX.4.4 and FIXT.1.1 only)
   in both roles: declared on the Logon and its acknowledgement; a

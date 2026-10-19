@@ -62,6 +62,23 @@
 //!   ResendRequest, SequenceReset, Reject, XmlMessage) go through
 //!   `to_admin` and cannot be vetoed. See
 //!   `doc/adr/0023-outbound-veto-and-send-outcomes.md`.
+//! - **[`throttle`]**: an optional per-session rate limit on new outbound
+//!   application messages, attached with `with_throttle` on the
+//!   [`Initiator`], the [`Acceptor`] or the [`EngineBuilder`]. A
+//!   [`ThrottleConfig`] holds one or more token-bucket budgets
+//!   ([`ThrottleBudget`]: a rate per window and a burst) and an optional
+//!   classifier that puts each message in one, so cancels can have a budget
+//!   of their own. A message that finds no token is held, in order, up to a
+//!   bounded depth, or refused, per the budget's [`ThrottlePolicy`]; a
+//!   refusal reports [`NotSentReason::Throttled`], before a `MsgSeqNum` is
+//!   spent or the store touched, and a held message goes through
+//!   `to_app_checked` only when it is released. Administrative messages and
+//!   resends are never throttled; this session's Logout goes out at once and
+//!   what the throttle holds then reports
+//!   [`NotSentReason::DiscardedByThrottle`]. [`Connection::inbound_app_messages`]
+//!   counts the counterparty's application messages, so an application can
+//!   refuse over-rate ones in `from_app`. See
+//!   `doc/adr/0024-outbound-throttle.md`.
 //! - **[`EngineBuilder`]**: fluent configuration that terminates in a
 //!   ready-to-run [`Initiator`], [`Acceptor`] or [`AcceptorRegistry`].
 //!
@@ -174,6 +191,7 @@ pub mod persistence;
 mod reactor;
 pub mod registry;
 mod stream;
+pub mod throttle;
 mod wire;
 
 pub use acceptor::Acceptor;
@@ -186,6 +204,10 @@ pub use outbound::{OutboundField, OutboundMessage};
 pub use outcome::{NotSentReason, SendOutcome, UnknownReason};
 pub use persistence::StoreFailurePolicy;
 pub use registry::{AcceptorRegistry, LogonIdentity, LookupError, SessionLookup};
+pub use throttle::{
+    BudgetId, ThrottleBudget, ThrottleConfig, ThrottleConfigBuilder, ThrottleConfigError,
+    ThrottlePolicy,
+};
 
 // Re-exported for convenience: the per-session configuration consumed by
 // [`Initiator`].

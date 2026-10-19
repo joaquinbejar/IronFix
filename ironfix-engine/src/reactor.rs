@@ -202,6 +202,30 @@
 //!   `LogoutPending` for whatever is still queued when the loop ends
 //!   ([`Reactor::discard_unsent`]).
 //!
+//! # The outbound throttle
+//!
+//! With a [`ThrottleConfig`] attached, every new outbound application message
+//! taken from the command queue goes through [`Reactor::admit_through_throttle`]
+//! before anything else happens to it: the classifier names its budget and
+//! [`Throttle::admit`], a synchronous decision over the driver's `now`, either
+//! takes a token (the message goes on to the outbound gate at once), holds it
+//! in its budget's queue, or refuses it (`NotSent` with `Throttled`, nothing
+//! peeked, spent or filed). A held message is released by a branch of the
+//! loop, one per pass, on a single timer moved to the instant the next token
+//! is earned ([`Throttle::next_release`]), under the same conditions a command
+//! is taken: no resend under way and room under the live mark, and only while
+//! the session is Active. A message whose token is already there is released
+//! without the timer, whose deadlines Tokio rounds up to the millisecond, so
+//! a burst, or a budget faster than one message per millisecond, keeps its
+//! rate. It then goes through `to_app_checked` and the write
+//! path as a command would ([`Reactor::send_application`]); one the gate
+//! vetoes gives its token back. Commands go on being taken while messages are
+//! held, so a message of another budget, and every administrative message,
+//! never waits behind them. Once this session's own Logout is framed, or the
+//! session closes, what the throttle holds resolves `NotSent` with
+//! `DiscardedByThrottle` ([`Reactor::discard_throttled`]). Administrative
+//! frames, replays and gap fills never go through the throttle.
+//!
 //! All sequence arithmetic goes through the checked
 //! [`SequenceManager::try_allocate_sender_seq`] /
 //! [`SequenceManager::try_increment_target_seq`]; an exhausted counter tears the
@@ -218,6 +242,7 @@ use crate::persistence::{
     timed,
 };
 use crate::stream::SessionStream;
+use crate::throttle::{Admission, BudgetId, Throttle, ThrottleConfig};
 use crate::wire::{
     self, ApplVersionGuard, ApplVersionProblem, MessageFactory, PeerIdentity, PendingMessage,
     SendingTimeGuard, SendingTimeProblem,
@@ -1509,6 +1534,46 @@ struct Reactor<A: Application> {
     /// Garbled-frame count against [`SessionConfig::garbled_frame_limit`], or
     /// `None` when no limit is configured.
     garbled: Option<GarbledFrameWindow>,
+    /// The outbound throttle, when one is attached: the budgets new
+    /// application messages are held to, and the messages they hold.
+    throttle: Option<OutboundThrottle>,
+}
+
+/// A new outbound application message held by the outbound throttle until
+/// its budget earns a token, with its receipt.
+#[derive(Debug)]
+struct HeldSend {
+    /// The message, not yet through `to_app_checked`.
+    message: outbound::OutboundMessage,
+    /// Where its outcome goes, for a tracked send.
+    receipt: Option<Receipt>,
+}
+
+/// The session's outbound throttle: its configuration, which classifies each
+/// message, and the run-time budgets.
+#[derive(Debug)]
+struct OutboundThrottle {
+    /// The budgets and the classifier.
+    config: ThrottleConfig,
+    /// The tokens, and the messages held for them.
+    state: Throttle<HeldSend>,
+    /// Whether the classifier has named a budget the configuration does not
+    /// define: logged once per session, the message going to the default
+    /// budget.
+    unknown_budget_logged: bool,
+}
+
+/// When the outbound throttle may release the next message it holds
+/// ([`Reactor::next_throttle_release`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThrottleRelease {
+    /// Nothing to release: no throttle, nothing held, or a session that may
+    /// not release now.
+    Idle,
+    /// A held message has its token already.
+    Now,
+    /// The next held message's token is earned at this instant.
+    At(Instant),
 }
 
 /// What the Logon exchange left for the reactor to do before anything else.
@@ -1572,6 +1637,15 @@ async fn run_reactor<A: Application + 'static>(
     let mut resending = false;
     let mut tick = interval(TICK_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // When the outbound throttle earns the token its next held message waits
+    // for. One timer for the whole session, moved to each new instant, so a
+    // throttled send costs no timer allocation; its branch is enabled only
+    // while a held message waits for a token still to come. A message whose
+    // token is already there does not go through the timer, which rounds
+    // every deadline up to the next millisecond: it is released by an
+    // always-ready branch, so a budget faster than one message per
+    // millisecond, or a burst, is not slowed down to the timer's resolution.
+    let mut release_timer = std::pin::pin!(tokio::time::sleep_until(tokio::time::Instant::now()));
 
     // Garbled frames skipped while the Logon handshake was reading are
     // reported, not counted against the limit: the handshake is bounded by
@@ -1635,6 +1709,26 @@ async fn run_reactor<A: Application + 'static>(
             && !ctx.writer.reads_paused(waiting)
             && !(resend_ready && ctx.reads_since_resend_step >= MAX_READS_PER_RESEND_STEP);
         let flushing = ctx.writer.pending;
+        // A message the outbound throttle holds is released under the same
+        // conditions a new command is taken (no resend under way, room under
+        // the live mark), and only while the session is Active: once this
+        // session's Logout is framed, nothing held is written after it.
+        let release = if !resending && live_room && matches!(current, Phase::Active(_)) {
+            ctx.next_throttle_release()
+        } else {
+            ThrottleRelease::Idle
+        };
+        let release_now = matches!(release, ThrottleRelease::Now);
+        let release_later = match release {
+            ThrottleRelease::At(at) => {
+                let at = tokio::time::Instant::from_std(at);
+                if release_timer.deadline() != at {
+                    release_timer.as_mut().reset(at);
+                }
+                true
+            }
+            ThrottleRelease::Idle | ThrottleRelease::Now => false,
+        };
         let result = tokio::select! {
             // Both directions in one poll on the same socket: the flush of
             // the waiting output, then the next inbound frame. A flush the
@@ -1652,6 +1746,17 @@ async fn run_reactor<A: Application + 'static>(
                 Some(event) => ctx.on_socket_event(&mut framed, current, event, resend_ready).await,
                 None => ctx.resend_step(&mut framed, current).await,
             },
+            // A message the outbound throttle holds has its token: released
+            // like a command is taken, one per pass, among the other ready
+            // branches.
+            () = std::future::ready(()), if release_now => {
+                ctx.on_throttle_release(&mut framed, current).await
+            }
+            // The outbound throttle earned the token its oldest held message
+            // was waiting for.
+            () = &mut release_timer, if release_later => {
+                ctx.on_throttle_release(&mut framed, current).await
+            }
             command = commands.recv(), if commands_open && !resending && live_room => match command {
                 Some(command) => ctx.on_command(&mut framed, current, command).await,
                 None => {
@@ -2528,20 +2633,195 @@ impl<A: Application> Reactor<A> {
                     });
                     return Ok(phase);
                 }
-                if let Err(err) = self
-                    .send_tracked(framed, PendingMessage::application(message), receipt)
+                let Some((budget, message, receipt)) =
+                    self.admit_through_throttle(message, receipt)
+                else {
+                    return Ok(phase);
+                };
+                self.send_application(framed, phase, budget, message, receipt)
                     .await
-                {
-                    teardown(phase);
-                    return Err(closed(format!("send failed: {err}"), false));
-                }
-                Ok(phase)
             }
             Command::Logout => match phase {
                 Phase::LogoutQueued(_) | Phase::LogoutPending(_) => Ok(phase),
                 Phase::Active(session) => self.begin_logout(framed, session, None).await,
             },
         }
+    }
+
+    /// Puts a new outbound application message through the outbound throttle,
+    /// when one is attached.
+    ///
+    /// Returns the message to frame now, with the budget whose token it took
+    /// (`None` without a throttle), or `None` when the throttle holds it until
+    /// its budget earns a token, or refused it. A refusal is resolved here,
+    /// as [`NotSentReason::Throttled`], before `to_app_checked` runs and
+    /// before a sequence number is peeked or the store touched; a refused
+    /// plain send is logged at debug level with its budget and MsgType only.
+    /// The decision is [`Throttle::admit`], which reads no clock: the time is
+    /// the driver's, read here.
+    fn admit_through_throttle(
+        &mut self,
+        message: outbound::OutboundMessage,
+        receipt: Option<Receipt>,
+    ) -> Option<(Option<BudgetId>, outbound::OutboundMessage, Option<Receipt>)> {
+        let Some(throttle) = self.throttle.as_mut() else {
+            return Some((None, message, receipt));
+        };
+        let budget = match throttle.config.classify_checked(&message) {
+            Ok(budget) => budget,
+            Err(named) => {
+                if !throttle.unknown_budget_logged {
+                    throttle.unknown_budget_logged = true;
+                    tracing::warn!(
+                        session = %self.session_id,
+                        budget = %named,
+                        "the throttle classifier named a budget the configuration does not \
+                         define: holding the message to the default budget (logged once)"
+                    );
+                }
+                BudgetId::DEFAULT
+            }
+        };
+        match throttle
+            .state
+            .admit(budget, HeldSend { message, receipt }, driver_now())
+        {
+            Admission::Now(HeldSend { message, receipt }) => Some((Some(budget), message, receipt)),
+            Admission::Held => {
+                tracing::trace!(
+                    session = %self.session_id,
+                    budget = %budget,
+                    held = throttle.state.held(),
+                    "outbound application message held by the throttle"
+                );
+                None
+            }
+            Admission::Refused(HeldSend { message, receipt }) => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    budget = %budget,
+                    msg_type = %message.msg_type(),
+                    "outbound application message refused by the throttle; no sequence number spent"
+                );
+                outcome::resolve(receipt, || {
+                    SendOutcome::not_sent(NotSentReason::Throttled { budget })
+                });
+                None
+            }
+        }
+    }
+
+    /// Frames and feeds a new outbound application message that may go now:
+    /// the outbound gate, the store step and the write, through
+    /// [`Reactor::send_tracked`]. A message the gate vetoed, or whose body
+    /// could not be framed, gives back the token it took from `budget`: it
+    /// never reached the wire.
+    ///
+    /// # Errors
+    /// A send failure is terminal for the session, as for any frame.
+    async fn send_application(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        budget: Option<BudgetId>,
+        message: outbound::OutboundMessage,
+        receipt: Option<Receipt>,
+    ) -> Result<Phase, SessionClosed> {
+        match self
+            .send_tracked(framed, PendingMessage::application(message), receipt)
+            .await
+        {
+            Ok(Sent::Dropped) => {
+                if let (Some(budget), Some(throttle)) = (budget, self.throttle.as_mut()) {
+                    throttle.state.refund(budget);
+                }
+                Ok(phase)
+            }
+            Ok(Sent::Yes | Sent::Deferred) => Ok(phase),
+            Err(err) => {
+                teardown(phase);
+                Err(closed(format!("send failed: {err}"), false))
+            }
+        }
+    }
+
+    /// When the outbound throttle may release the next message it holds, on
+    /// the driver's clock: [`ThrottleRelease::Idle`] without a throttle or
+    /// with nothing held. The clock is read only while a message is held.
+    fn next_throttle_release(&mut self) -> ThrottleRelease {
+        let Some(throttle) = self.throttle.as_mut() else {
+            return ThrottleRelease::Idle;
+        };
+        if throttle.state.held() == 0 {
+            return ThrottleRelease::Idle;
+        }
+        let now = driver_now();
+        match throttle.state.next_release(now) {
+            None => ThrottleRelease::Idle,
+            Some(at) if at <= now => ThrottleRelease::Now,
+            Some(at) => ThrottleRelease::At(at),
+        }
+    }
+
+    /// Releases the message the outbound throttle has earned a token for,
+    /// and frames it as a new command would be: a frame still waiting goes
+    /// first if the stream takes it now, then the message goes through the
+    /// outbound gate, the store step and the write. The loop enables this
+    /// only while the session is Active, no resend is under way and the
+    /// waiting output is under the live mark; a session whose Logout has
+    /// been framed releases nothing, whatever the loop decided, and discards
+    /// what is held.
+    async fn on_throttle_release(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+    ) -> Result<Phase, SessionClosed> {
+        if !matches!(phase, Phase::Active(_)) {
+            self.discard_throttled();
+            return Ok(phase);
+        }
+        if let Err(err) = self.write_through(framed) {
+            return Err(self.close_on_write_failure(phase, &err, UnknownReason::Transport));
+        }
+        let now = driver_now();
+        let Some((budget, HeldSend { message, receipt })) = self
+            .throttle
+            .as_mut()
+            .and_then(|throttle| throttle.state.release(now))
+        else {
+            return Ok(phase);
+        };
+        self.send_application(framed, phase, Some(budget), message, receipt)
+            .await
+    }
+
+    /// Resolves every message the outbound throttle still holds as
+    /// [`NotSentReason::DiscardedByThrottle`]: none was framed and no number
+    /// was spent on it. Called once this session's own Logout is framed, so
+    /// that no held message is written after it, and as the session closes.
+    /// The count, tracked or not, is logged.
+    fn discard_throttled(&mut self) {
+        let Some(throttle) = self.throttle.as_mut() else {
+            return;
+        };
+        if throttle.state.held() == 0 {
+            return;
+        }
+        let discarded = throttle
+            .state
+            .drain()
+            .map(|(budget, held)| {
+                outcome::resolve(held.receipt, || {
+                    SendOutcome::not_sent(NotSentReason::DiscardedByThrottle { budget })
+                });
+            })
+            .count();
+        tracing::warn!(
+            session = %self.session_id,
+            discarded,
+            "outbound application message(s) held by the throttle were discarded: none was \
+             framed and no sequence number was spent on them"
+        );
     }
 
     /// Sends a Logout (35=5): feeds it, and moves the session to
@@ -2581,6 +2861,10 @@ impl<A: Application> Reactor<A> {
                 self.resend = None;
                 self.held_logon = None;
                 self.logout_sent = true;
+                // Nothing that takes a new number follows this session's own
+                // Logout: what the throttle holds is discarded now, not left
+                // to wait for a token it can no longer use.
+                self.discard_throttled();
                 // Typestate: Active -> LogoutPending once the Logout is
                 // written (at once if it was written through). The new state
                 // records that moment, which is what `on_tick` times through
@@ -3718,6 +4002,9 @@ impl<A: Application> Reactor<A> {
     /// warning, since nothing else reports them. Frames already fed to the
     /// write buffer are not here: they are resolved by the close's last flush.
     fn discard_unsent(&mut self, commands: &mut mpsc::Receiver<Command>, behind_resend: bool) {
+        // Taken from the queue before anything still in it, so resolved
+        // first.
+        self.discard_throttled();
         let held = self.reason_behind_resend();
         self.discard_deferred(&held);
         let reason = if behind_resend {
@@ -4400,6 +4687,7 @@ impl<A: Application> Reactor<A> {
             frame: frame.clone(),
             seq,
         });
+        self.runtime.record_inbound_app_message();
         self.app_handed = Some(match self.app_handed {
             Some((first, _)) => (first, seq),
             None => (seq, seq),
@@ -4570,6 +4858,9 @@ pub(crate) struct SessionParams<A: Application> {
     pub(crate) outbound_capacity: usize,
     /// Capacity of the inbound application queue.
     pub(crate) app_queue_capacity: usize,
+    /// The outbound throttle, when the engine has one: the session gets its
+    /// own budgets, full, from it.
+    pub(crate) throttle: Option<ThrottleConfig>,
 }
 
 /// Wires the channels, spawns the application dispatcher and the reactor task,
@@ -4616,6 +4907,7 @@ where
         write_timeout,
         outbound_capacity,
         app_queue_capacity,
+        throttle,
     } = params;
 
     let (command_tx, command_rx) = mpsc::channel(outbound_capacity);
@@ -4624,6 +4916,28 @@ where
     let (reject_tx, reject_rx) = mpsc::channel(app_queue_capacity);
     let garbled = config.garbled_frame_limit.map(GarbledFrameWindow::new);
     let writer = Writer::new(config.max_message_size);
+    // A budget whose tokens come faster than the release timer's resolution
+    // keeps its rate only with a burst of a millisecond's worth of tokens.
+    if let Some(config) = &throttle {
+        for (budget, settings, needed) in config.timer_limited() {
+            tracing::warn!(
+                session = %session_id,
+                budget = %budget,
+                rate = settings.rate(),
+                per_ms = u64::try_from(settings.per().as_millis()).unwrap_or(u64::MAX),
+                burst = settings.burst(),
+                needed,
+                "throttle budget earns tokens faster than the 1 ms release timer: with this burst, \
+                 at most `burst` held messages leave per millisecond, below its rate"
+            );
+        }
+    }
+    // The budgets start full as the session becomes Active.
+    let throttle = throttle.map(|config| OutboundThrottle {
+        state: Throttle::new(&config, driver_now()),
+        config,
+        unknown_budget_logged: false,
+    });
 
     // The dispatcher stops when the reactor drops `app_tx`, which `run_reactor`
     // does on every exit path.
@@ -4664,6 +4978,7 @@ where
         writer,
         app_tx,
         garbled,
+        throttle,
     };
 
     let channels = ReactorChannels {

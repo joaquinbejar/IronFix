@@ -24,13 +24,17 @@
 //! [`SessionConfig::logon_timeout`] instead. A [`MessageStore`] set with
 //! [`EngineBuilder::with_store`] is attached by every terminal method; since a
 //! store belongs to exactly one session, a registry of several sessions takes
-//! its stores per session through [`AcceptorRegistry::register`] instead.
+//! its stores per session through [`AcceptorRegistry::register`] instead. An
+//! outbound throttle set with [`EngineBuilder::with_throttle`] is attached by
+//! every terminal method too, to every session: each session gets its own
+//! budgets from it.
 
 use crate::acceptor::Acceptor;
 use crate::application::{Application, NoOpApplication};
 use crate::error::EngineError;
 use crate::initiator::Initiator;
 use crate::registry::AcceptorRegistry;
+use crate::throttle::ThrottleConfig;
 use ironfix_session::config::SessionConfig;
 use ironfix_store::MessageStore;
 use std::sync::Arc;
@@ -52,6 +56,8 @@ pub struct EngineBuilder<A: Application = NoOpApplication> {
     connect_timeout: Duration,
     /// Message store attached by both terminal methods, if any.
     store: Option<Arc<dyn MessageStore>>,
+    /// Outbound throttle attached by every terminal method, if any.
+    throttle: Option<ThrottleConfig>,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
@@ -62,6 +68,7 @@ impl<A: Application> std::fmt::Debug for EngineBuilder<A> {
             .field("sessions", &self.sessions)
             .field("connect_timeout", &self.connect_timeout)
             .field("store", &self.store.is_some())
+            .field("throttle", &self.throttle)
             .finish_non_exhaustive()
     }
 }
@@ -81,6 +88,7 @@ impl EngineBuilder<NoOpApplication> {
             sessions: Vec::new(),
             connect_timeout: Duration::from_secs(30),
             store: None,
+            throttle: None,
         }
     }
 }
@@ -94,6 +102,7 @@ impl<A: Application + 'static> EngineBuilder<A> {
             sessions: self.sessions,
             connect_timeout: self.connect_timeout,
             store: self.store,
+            throttle: self.throttle,
         }
     }
 
@@ -132,6 +141,18 @@ impl<A: Application + 'static> EngineBuilder<A> {
         self
     }
 
+    /// Attaches an outbound throttle to the engine a terminal method
+    /// produces: [`Initiator::with_throttle`] for
+    /// [`EngineBuilder::into_initiator`], [`Acceptor::with_throttle`] for
+    /// [`EngineBuilder::into_acceptor`], and the same on every [`Acceptor`]
+    /// of [`EngineBuilder::into_acceptor_registry`]. Every session gets its
+    /// own budgets from it; see [`crate::throttle`] for what it holds back.
+    #[must_use]
+    pub fn with_throttle(mut self, throttle: ThrottleConfig) -> Self {
+        self.throttle = Some(throttle);
+        self
+    }
+
     /// Returns whether a message store has been set.
     #[must_use]
     pub const fn has_store(&self) -> bool {
@@ -167,6 +188,10 @@ impl<A: Application + 'static> EngineBuilder<A> {
         let config = self.single_session()?;
         let initiator =
             Initiator::new(config, self.application).with_connect_timeout(self.connect_timeout);
+        let initiator = match self.throttle {
+            Some(throttle) => initiator.with_throttle(throttle),
+            None => initiator,
+        };
         Ok(match self.store {
             Some(store) => initiator.with_store(store),
             None => initiator,
@@ -183,6 +208,10 @@ impl<A: Application + 'static> EngineBuilder<A> {
     pub fn into_acceptor(self) -> Result<Acceptor<A>, EngineError> {
         let config = self.single_session()?;
         let acceptor = Acceptor::new(config, self.application);
+        let acceptor = match self.throttle {
+            Some(throttle) => acceptor.with_throttle(throttle),
+            None => acceptor,
+        };
         Ok(match self.store {
             Some(store) => acceptor.with_store(store),
             None => acceptor,
@@ -221,6 +250,10 @@ impl<A: Application + 'static> EngineBuilder<A> {
         let registry = AcceptorRegistry::new();
         for config in self.sessions {
             let acceptor = Acceptor::new(config, Arc::clone(&self.application));
+            let acceptor = match &self.throttle {
+                Some(throttle) => acceptor.with_throttle(throttle.clone()),
+                None => acceptor,
+            };
             let acceptor = match &self.store {
                 Some(store) => acceptor.with_store(Arc::clone(store)),
                 None => acceptor,
@@ -415,6 +448,48 @@ mod tests {
                 assert!(detail.contains("overlaps"), "got {detail}");
             }
             other => panic!("the same session twice must be refused: {other:?}"),
+        }
+    }
+
+    /// A one-budget throttle for the builder tests.
+    fn throttle() -> ThrottleConfig {
+        use crate::throttle::ThrottleBudget;
+        match ThrottleConfig::builder(ThrottleBudget::new(10, Duration::from_secs(1))).build() {
+            Ok(throttle) => throttle,
+            Err(err) => panic!("the test throttle must build: {err}"),
+        }
+    }
+
+    #[test]
+    fn test_engine_builder_throttle_reaches_every_terminal_method() {
+        // Set before the application, so it survives `with_application`.
+        let builder = || {
+            EngineBuilder::new()
+                .with_throttle(throttle())
+                .with_application(NoOpApplication)
+                .add_session(session())
+        };
+        assert!(format!("{:?}", builder()).contains("ThrottleConfig"));
+
+        match builder().into_initiator() {
+            Ok(initiator) => assert!(initiator.throttle().is_some()),
+            Err(err) => panic!("one session builds an initiator: {err}"),
+        }
+        match builder().into_acceptor() {
+            Ok(acceptor) => assert!(acceptor.throttle().is_some()),
+            Err(err) => panic!("one session builds an acceptor: {err}"),
+        }
+        match builder().into_acceptor_registry() {
+            Ok(registry) => assert_eq!(registry.session_ids().len(), 1),
+            Err(err) => panic!("one session builds a registry: {err}"),
+        }
+    }
+
+    #[test]
+    fn test_engine_builder_without_throttle_attaches_none() {
+        match EngineBuilder::new().add_session(session()).into_initiator() {
+            Ok(initiator) => assert!(initiator.throttle().is_none()),
+            Err(err) => panic!("one session builds an initiator: {err}"),
         }
     }
 
