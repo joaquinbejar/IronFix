@@ -248,7 +248,7 @@ engine wiring (#96) does not exist.
   then one `Written` or `Unknown` result per outbound frame, and `NotSent`
   for a message that never reached the stream. It runs inline, must be cheap
   and must not panic, receives credentials raw (redaction is the observer's
-  job), and allocates nothing per frame
+  job), and allocates nothing per valid frame
   (`doc/adr/0026-frame-observer.md`).
 - **`NextExpectedMsgSeqNum` (789) on Logon**, opt-in with
   `SessionConfig::send_next_expected_msg_seq_num` on FIX.4.4 and FIXT.1.1

@@ -1094,3 +1094,172 @@ async fn test_codec_refused_replay_reports_a_result() {
     ));
     recorder.assert_one_result_per_frame();
 }
+
+/// A stream that, once `hold` is set, accepts every write and never
+/// completes a flush.
+struct FlushNever {
+    inner: DuplexStream,
+    hold: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl tokio::io::AsyncRead for FlushNever {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for FlushNever {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.hold.load(std::sync::atomic::Ordering::SeqCst) {
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Counts frames and results, and the most frames ever awaiting a result.
+#[derive(Debug, Default)]
+struct Unresolved {
+    outbound: std::sync::atomic::AtomicU64,
+    results: std::sync::atomic::AtomicU64,
+    peak: std::sync::atomic::AtomicU64,
+}
+
+impl FrameObserver for Unresolved {
+    fn on_inbound(&self, _: &[u8], _: &Observation<'_>) {}
+
+    fn on_outbound(&self, _: &[u8], _: &Observation<'_>) {
+        use std::sync::atomic::Ordering;
+        let outbound = self.outbound.fetch_add(1, Ordering::SeqCst) + 1;
+        let waiting = outbound.saturating_sub(self.results.load(Ordering::SeqCst));
+        self.peak.fetch_max(waiting, Ordering::SeqCst);
+    }
+
+    fn on_outbound_result(&self, result: &OutboundResult, _: &Observation<'_>) {
+        if !matches!(result, OutboundResult::NotSent { .. }) {
+            self.results
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Regression (PR #149 review): a stream that takes every byte but never
+/// completes a flush cannot grow the frames awaiting a write result without
+/// bound. Live sends stop at the observer's limit, the stream then makes no
+/// progress, the write timeout closes the session, and every observed frame
+/// gets its result.
+#[tokio::test]
+async fn test_flush_that_never_completes_bounds_the_unresolved_frames() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let observer = Arc::new(Unresolved::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_write_timeout(QUIET)
+        .with_outbound_capacity(16)
+        .with_frame_observer(Arc::clone(&observer) as Arc<dyn FrameObserver>);
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_CAPACITY);
+    let hold = Arc::new(AtomicBool::new(false));
+    let stream = FlushNever {
+        inner: client_io,
+        hold: Arc::clone(&hold),
+    };
+    let venue = tokio::spawn(async move {
+        let mut framed = Framed::new(venue_io, FixCodec::new());
+        let polled = ok(timeout(STEP, framed.next()).await, "the Logon arrives");
+        ok(some(polled, "the stream is open"), "the Logon frames");
+        ok(framed.send(venue_msg("A", 1, ACK)).await, "the venue acks");
+        // Read and drop everything from here on, so the pipe never fills.
+        let mut io = framed.into_inner();
+        let mut sink = vec![0u8; 64 * 1024];
+        while let Ok(read) = tokio::io::AsyncReadExt::read(&mut io, &mut sink).await {
+            if read == 0 {
+                break;
+            }
+        }
+    });
+    let member = ok(initiator.establish(stream).await, "the member logs on");
+    hold.store(true, Ordering::SeqCst);
+    let sender = {
+        let member = member.clone();
+        tokio::spawn(async move {
+            for index in 0..20_000u32 {
+                if member.send(order(&format!("F-{index}"))).await.is_err() {
+                    break;
+                }
+            }
+        })
+    };
+    ok(
+        timeout(Duration::from_secs(30), member.wait_closed()).await,
+        "the write timeout closes a session whose flush never completes",
+    );
+    let _ = timeout(STEP, sender).await;
+    venue.abort();
+    let peak = observer.peak.load(Ordering::SeqCst);
+    assert!(
+        peak <= 8192 + 64,
+        "frames awaiting a write result stay bounded: {peak}"
+    );
+    assert_eq!(
+        observer.outbound.load(Ordering::SeqCst),
+        observer.results.load(Ordering::SeqCst),
+        "every observed frame got its result at the close"
+    );
+}
+
+/// Regression (PR #149 review): a caller that times out its handshake while
+/// the Logon write is under way still gets the observed Logon's result,
+/// `Unknown` with `Interrupted`.
+#[tokio::test]
+async fn test_cancelled_handshake_write_reports_interrupted() {
+    let recorder = Arc::new(Recorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    // One byte of room: the Logon write cannot complete.
+    let (client_io, _venue_io) = tokio::io::duplex(1);
+    assert!(
+        timeout(Duration::from_millis(100), initiator.establish(client_io))
+            .await
+            .is_err(),
+        "the handshake is cancelled mid-write"
+    );
+    assert_eq!(
+        recorder.outbound_kinds(),
+        vec![(FrameKind::Handshake, Some(1))]
+    );
+    let results = recorder.results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(matches!(
+        &results[0],
+        (
+            FrameKind::Handshake,
+            Some(1),
+            OutboundResult::Unknown {
+                reason: UnknownReason::Interrupted,
+                ..
+            }
+        )
+    ));
+    recorder.assert_one_result_per_frame();
+}

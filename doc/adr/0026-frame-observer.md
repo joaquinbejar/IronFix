@@ -24,8 +24,11 @@ Constraints any answer keeps:
 - additive only at v0.4.1;
 - no typestate, sequence, heartbeat or store change; the observer cannot
   change what the session does;
-- no per-frame allocation from the hook, and one branch per frame without an
-  observer (`ironfix-engine/tests/allocations.rs` measures it);
+- no per-frame allocation from the hook for valid frames in steady state,
+  and one branch per frame without an observer
+  (`ironfix-engine/tests/allocations.rs` measures it); a malformed inbound
+  frame may allocate the decoder's bounded diagnostic string while its
+  `MsgSeqNum` is looked for, dropped at once;
 - the engine still never logs a frame (`Password` (554), `NewPassword` (925),
   `RawData` (96)).
 
@@ -75,6 +78,17 @@ Constraints any answer keeps:
    `MsgSeqNum`; the outcome is built once and shared with the tracked
    receipt, if any. A frame numbered and filed but refused by the codec
    reports `Unknown`, as its tracked outcome does.
+   A handshake write cancelled by the caller (dropping or timing out
+   `connect`, `establish`, `serve` or `serve_stream`) reports `Unknown` with
+   `Interrupted` through a drop guard. A reactor task dropped by a runtime
+   shutting down reports nothing more: that is the one limit.
+9. **Bounded pending results.** A stream can accept every byte and leave its
+   flush pending, so the byte marks alone do not bound the frames awaiting a
+   result. With an observer, no live message is taken and no resend step fed
+   while 4096 frames await one, and reading pauses at 8192. Nothing new is
+   then written, the stream makes no progress, and the write timeout closes
+   the session, resolving them `Unknown`. Without an observer the queue is
+   empty and nothing changes.
 6. **Panics** are not caught. The release profile is `panic = "abort"`, so an
    observer that panics takes the process down; this is documented on the
    trait. Catching with `catch_unwind` would cost an unwind boundary per
@@ -86,7 +100,9 @@ Constraints any answer keeps:
 8. **Attachment:** `with_frame_observer(Arc<dyn FrameObserver>)` and
    `has_frame_observer()` on `Initiator`, `Acceptor` and `EngineBuilder`
    (which attaches it in every terminal method, each `Acceptor` of a registry
-   included). Each session binds the observer to its `SessionId` once.
+   included). The observer is bound to the session's `SessionId` (an `Arc`
+   clone plus a `SessionId` clone) a few times per session: for the
+   handshake reads, each handshake write and the reactor. Never per frame.
 
 ## Consequences
 

@@ -527,6 +527,9 @@ async fn send_handshake(
     if let Some(capture) = capture {
         capture.outbound(frame, FrameKind::Handshake, seq);
     }
+    // A caller that cancels the handshake (drops it, or times it out) while
+    // this write is under way still owes the observer the frame's result.
+    let mut owed = OwedHandshakeResult { capture, seq };
     let (result, written) = match timeout(write_timeout, framed.send(frame)).await {
         Err(_) => (
             Err(EngineError::WriteTimeout(write_timeout)),
@@ -542,10 +545,34 @@ async fn send_handshake(
         ),
         Ok(Ok(())) => (Ok(()), OutboundResult::Written),
     };
-    if let Some(capture) = capture {
+    if let Some(capture) = owed.capture.take() {
         capture.result(&written, FrameKind::Handshake, Some(seq));
     }
     result
+}
+
+/// The write result an observed handshake frame is owed until its write
+/// ends: reported [`OutboundResult::Unknown`] with
+/// [`UnknownReason::Interrupted`] if the write is cancelled first.
+struct OwedHandshakeResult<'c> {
+    /// The observer, until the result is reported.
+    capture: Option<&'c Capture>,
+    /// The frame's `MsgSeqNum`.
+    seq: u64,
+}
+
+impl Drop for OwedHandshakeResult<'_> {
+    fn drop(&mut self) {
+        if let Some(capture) = self.capture.take() {
+            capture.result(
+                &OutboundResult::Unknown {
+                    reason: UnknownReason::Interrupted,
+                },
+                FrameKind::Handshake,
+                Some(self.seq),
+            );
+        }
+    }
 }
 
 /// Sends the messages that refuse a Logon handshake (a Reject, then a Logout),
@@ -1324,6 +1351,22 @@ const SHRINK_ABOVE: usize = 2 * WRITE_BUFFER_HIGH_WATER;
 /// capacity it grew to.
 const OBSERVED_CAPACITY: usize = 4 * MAX_FRAMES_PER_RESEND_STEP;
 
+/// Observed frames awaiting their write result above which no live message
+/// is taken and no resend step fed ([`Writer::observed_full`]).
+///
+/// The byte marks bound what waits in the write buffer, but a stream can
+/// accept every byte and leave its flush pending, emptying the buffer while
+/// the frames it took still wait for the flush that reports them written.
+/// This bound is the same backpressure for that queue. Once nothing new is
+/// fed the stream makes no progress, so the write timeout closes a session
+/// whose flush never completes.
+const OBSERVED_LIVE_LIMIT: usize = 4096;
+
+/// Observed frames awaiting their write result above which reading pauses
+/// ([`Writer::observed_reads_paused`]), so replies to inbound frames cannot
+/// grow the queue past it by more than one frame's replies.
+const OBSERVED_READ_LIMIT: usize = 2 * OBSERVED_LIVE_LIMIT;
+
 impl Writer {
     /// A writer framing outbound bytes under `max_message_size`, with no
     /// output waiting.
@@ -1376,6 +1419,23 @@ impl Writer {
             self.observed.push_back((seq, kind));
         }
         Ok(())
+    }
+
+    /// Whether the observed frames awaiting a write result have reached
+    /// [`OBSERVED_LIVE_LIMIT`]: no more live messages are taken and no resend
+    /// step is fed until a flush resolves them. Always false without an
+    /// observer.
+    #[must_use]
+    fn observed_full(&self) -> bool {
+        self.observed.len() >= OBSERVED_LIVE_LIMIT
+    }
+
+    /// Whether the observed frames awaiting a write result have reached
+    /// [`OBSERVED_READ_LIMIT`]: reading pauses, so replies to inbound frames
+    /// cannot grow the queue either. Always false without an observer.
+    #[must_use]
+    fn observed_reads_paused(&self) -> bool {
+        self.observed.len() >= OBSERVED_READ_LIMIT
     }
 
     /// Reports every observed frame not yet resolved with `result`, in the
@@ -1976,8 +2036,12 @@ async fn run_reactor<A: Application + 'static>(
         // back while the counterparty reads slowly.
         resending = ctx.resend_in_progress();
         let waiting = framed.write_buffer().len();
-        let resend_ready = resending && waiting < WRITE_BUFFER_HIGH_WATER;
-        let live_room = waiting < LIVE_HIGH_WATER;
+        // With a frame observer, the frames awaiting their write result
+        // are bounded too: a stream that takes every byte but never
+        // completes a flush empties the byte buffer while that queue grows.
+        let observed_room = !ctx.writer.observed_full();
+        let resend_ready = resending && waiting < WRITE_BUFFER_HIGH_WATER && observed_room;
+        let live_room = waiting < LIVE_HIGH_WATER && observed_room;
         // While a resend is under way and the messages held behind it fill
         // the hold, nothing more is read: a reply to the next inbound frame
         // could only be held past the bound or written in the middle of the
@@ -1989,6 +2053,7 @@ async fn run_reactor<A: Application + 'static>(
         // the replies to inbound frames have piled up past the read ceiling.
         let read = !hold_full
             && !ctx.writer.reads_paused(waiting)
+            && !ctx.writer.observed_reads_paused()
             && !(resend_ready && ctx.reads_since_resend_step >= MAX_READS_PER_RESEND_STEP);
         let flushing = ctx.writer.pending;
         // A message the outbound throttle holds is released under the same

@@ -1326,7 +1326,7 @@ be cheap, must not block and must not panic (`panic = "abort"` in release).
 It receives raw bytes, **credentials included** (`Password` (554),
 `NewPassword` (925), `RawData` (96)); redaction is the observer's
 responsibility. Without an observer a frame costs one branch, and the hook
-allocates nothing per frame.
+allocates nothing per valid frame in steady state.
 
 ## Pre-Trade Messages
 

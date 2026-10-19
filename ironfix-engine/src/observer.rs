@@ -62,8 +62,14 @@
 //! codec (above `max_message_size`) is reported [`OutboundResult::Unknown`]
 //! without having been observed, as its tracked send outcome is.
 //!
-//! The classes are the ones [`SendOutcome`] uses. A
-//! reactor task dropped by a runtime shutting down reports nothing more.
+//! The classes are the ones [`SendOutcome`] uses.
+//!
+//! **Cancellation.** A handshake frame whose write is cancelled, because the
+//! caller dropped or timed out its `connect`, `establish`, `serve` or
+//! `serve_stream` while the write was under way, is reported
+//! [`OutboundResult::Unknown`] with [`UnknownReason::Interrupted`]. A reactor
+//! task dropped by a runtime shutting down reports nothing more for the
+//! frames it still holds.
 //!
 //! # Contract for the observer
 //!
@@ -74,9 +80,11 @@
 //! another task holds for long. Copy the bytes into a queue of your own (a
 //! pre-allocated ring, a bounded channel) and do the heavy work elsewhere.
 //!
-//! The frame is a borrowed slice, valid only for the call. The engine
-//! allocates nothing to make an observation, and with no observer attached a
-//! frame costs one branch.
+//! The frame is a borrowed slice, valid only for the call. For valid frames
+//! in steady state the engine allocates nothing to make an observation. An
+//! inbound frame whose header fields do not decode may allocate a bounded
+//! diagnostic string while its `MsgSeqNum` is looked for, dropped at once.
+//! With no observer attached a frame costs one branch.
 //!
 //! **The observer must not panic.** The engine does not catch a panic from
 //! it: the release profile is `panic = "abort"`, so a panic takes the whole
@@ -109,6 +117,7 @@ use std::time::Instant;
 /// Which way a frame travels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum Direction {
     /// Read from the counterparty.
     Inbound,
@@ -119,6 +128,7 @@ pub enum Direction {
 /// What kind of frame an [`Observation`] is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum FrameKind {
     /// A frame of the Logon handshake, before the session is Active: the
     /// Logons themselves, frames read while waiting for one, and the Rejects
@@ -239,6 +249,7 @@ pub enum OutboundResult {
 
 impl OutboundResult {
     /// The result a send outcome maps to, with the `MsgSeqNum` it carries.
+    #[must_use]
     pub(crate) fn from_outcome(outcome: &SendOutcome) -> (Self, Option<u64>) {
         match outcome {
             SendOutcome::Sent { seq, .. } => (Self::Written, Some(*seq)),
@@ -357,7 +368,9 @@ const HEADER_SCAN_FIELDS: usize = 16;
 /// count its `LENGTH` field declares, so a `34=` inside its bytes is never
 /// read. `None` when 34 is not among those fields, is not a number, or does
 /// not fit a `u64`, and as soon as a field does not decode. Allocates
-/// nothing. Only an observation reads it; no decision does.
+/// nothing for a valid frame; a field that does not decode may allocate the
+/// decoder's bounded diagnostic, dropped at once. Only an observation reads
+/// it; no decision does.
 #[must_use]
 fn peek_msg_seq_num(frame: &[u8]) -> Option<u64> {
     let mut decoder = Decoder::new(frame);
