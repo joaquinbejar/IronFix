@@ -148,7 +148,18 @@ impl GapQueue {
                     // covers the one removed. Were it ever short, the count
                     // restarts from what is still held rather than wrap.
                     debug_assert!(false, "gap queue byte count below a held frame");
-                    self.entries.values().map(Gapped::len).sum()
+                    let recount = self
+                        .entries
+                        .values()
+                        .try_fold(0_usize, |total, held| total.checked_add(held.len()));
+                    match recount {
+                        Some(total) => total,
+                        // The recount cannot overflow either (every held
+                        // frame is in memory at once). Were it to, the
+                        // count is pinned at the top, which refuses every
+                        // further insert as an overflow: fail closed.
+                        None => usize::MAX,
+                    }
                 }
             };
             if seq == expected {
