@@ -199,7 +199,7 @@
 //! ```
 
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
-use crate::connection::{Connection, SessionRuntime};
+use crate::connection::{Connection, SessionRuntime, report_handshake};
 use crate::error::EngineError;
 use crate::next_expected::{self, NextExpectedPlan};
 use crate::persistence::{
@@ -658,21 +658,24 @@ impl<A: Application + 'static> Initiator<A> {
         // Typestate: Disconnected -> Connecting.
         let session = Session::<Disconnected>::new(session_id.to_string()).connect();
 
-        let stream = match timeout(self.connect_timeout, TcpStream::connect(addr)).await {
+        let result = match timeout(self.connect_timeout, TcpStream::connect(addr)).await {
             Err(_) => {
                 let _ = session.disconnect();
-                return Err(EngineError::ConnectTimeout(self.connect_timeout));
+                Err(EngineError::ConnectTimeout(self.connect_timeout))
             }
             Ok(Err(err)) => {
                 let _ = session.disconnect();
-                return Err(err.into());
+                Err(err.into())
             }
-            Ok(Ok(stream)) => stream,
+            // The only way to a TCP session: it sets TCP_NODELAY.
+            Ok(Ok(stream)) => {
+                self.logon(version, session, SessionStream::tcp(stream))
+                    .await
+            }
         };
-
-        // The only way to a TCP session: it sets TCP_NODELAY.
-        self.logon(version, session, SessionStream::tcp(stream))
-            .await
+        // `on_create` has run: a failure from here is reported to the
+        // application as well as returned.
+        report_handshake(&*self.application, &session_id, result).await
     }
 
     /// Establishes a session on a byte stream the caller has already
@@ -770,8 +773,10 @@ impl<A: Application + 'static> Initiator<A> {
         // connected; what `Connecting` means is that the Logon is not sent.
         let session = Session::<Disconnected>::new(session_id.to_string()).connect();
 
-        self.logon(version, session, SessionStream::erased(stream))
-            .await
+        let result = self
+            .logon(version, session, SessionStream::erased(stream))
+            .await;
+        report_handshake(&*self.application, &session_id, result).await
     }
 
     /// The checks [`Initiator::connect`] and [`Initiator::establish`] make

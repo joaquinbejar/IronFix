@@ -178,7 +178,7 @@
 //! ```
 
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
-use crate::connection::{Connection, SessionRuntime};
+use crate::connection::{Connection, SessionRuntime, report_handshake};
 use crate::error::EngineError;
 use crate::next_expected;
 use crate::persistence::{
@@ -956,25 +956,28 @@ impl<A: Application + 'static> Acceptor<A> {
         // Await the inbound Logon. Garbled frames are skipped, and the logon
         // timeout covers the whole wait, so a Logon that never arrives intact
         // is a LogonTimeout.
-        let logon_frame =
+        // `on_create` has run: a failure from here is reported to the
+        // application as well as returned.
+        let result =
             match read_handshake_frame(&mut framed, self.config.logon_timeout, &session_id).await {
-                HandshakeRead::Frame(frame) => frame,
+                HandshakeRead::Frame(logon_frame) => {
+                    self.complete_handshake(version, session, framed, logon_frame, None)
+                        .await
+                }
                 HandshakeRead::TimedOut => {
                     let _ = session.disconnect();
-                    return Err(EngineError::LogonTimeout(self.config.logon_timeout));
+                    Err(EngineError::LogonTimeout(self.config.logon_timeout))
                 }
                 HandshakeRead::Closed => {
                     let _ = session.disconnect();
-                    return Err(EngineError::Closed);
+                    Err(EngineError::Closed)
                 }
                 HandshakeRead::Codec(err) => {
                     let _ = session.disconnect();
-                    return Err(err.into());
+                    Err(err.into())
                 }
             };
-
-        self.complete_handshake(version, session, framed, logon_frame, None)
-            .await
+        report_handshake(&*self.application, &session_id, result).await
     }
 
     /// Runs this session's handshake on a Logon that was read, and routed to
@@ -1019,17 +1022,20 @@ impl<A: Application + 'static> Acceptor<A> {
         // bytes already read stay in the `Framed` buffer for the new codec.
         *framed.codec_mut() = session_codec(&self.config, version);
         let max_size = self.config.max_message_size;
-        if logon_frame.len() > max_size {
+        let result = if logon_frame.len() > max_size {
             let _ = session.disconnect();
-            return Err(CodecError::MessageTooLarge {
+            Err(CodecError::MessageTooLarge {
                 size: logon_frame.len(),
                 max_size,
             }
-            .into());
-        }
-
-        self.complete_handshake(version, session, framed, logon_frame, authenticated)
-            .await
+            .into())
+        } else {
+            self.complete_handshake(version, session, framed, logon_frame, authenticated)
+                .await
+        };
+        // `on_create` has run: a failure from here is reported to the
+        // application as well as returned.
+        report_handshake(&*self.application, &session_id, result).await
     }
 
     /// The acceptor half of the Logon handshake, from a Logon frame that has

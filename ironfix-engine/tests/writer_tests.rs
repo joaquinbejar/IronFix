@@ -964,7 +964,7 @@ async fn test_a_resend_the_peer_never_reads_is_closed_by_the_write_timeout() {
     );
     assert_eq!(
         reasons.reasons(),
-        vec!["write failed: write timed out after 300ms".to_string()],
+        vec!["write timeout: no output accepted for 300 ms".to_string()],
         "closed by the write timeout"
     );
     drop(framed);
@@ -1276,7 +1276,7 @@ async fn test_a_logout_that_never_left_is_not_a_graceful_close() {
     );
     assert_eq!(
         reasons.reasons(),
-        vec!["write failed: write timed out after 600ms".to_string()]
+        vec!["write timeout: no output accepted for 600 ms".to_string()]
     );
     drop(framed);
 }

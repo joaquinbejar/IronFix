@@ -45,6 +45,17 @@
 //!   when the frame was buffered (or being filed) and no completed flush
 //!   covered it, an order that may be live and must be reconciled, not
 //!   blindly resubmitted. [`Connection::send`] stays fire-and-forget.
+//! - **[`close`]**: why a session ended. Every close path reports a typed
+//!   [`CloseReason`] (a Logout of ours or the counterparty's, with its
+//!   `Text` (58), a logout or heartbeat or write timeout, the transport
+//!   closing or failing, a MsgSeqNum too low, the garbled-frame limit, an
+//!   identity or `SendingTime` problem, a store failure, and more) to
+//!   [`Application::on_session_closed`], whose default forwards to
+//!   `on_logout` for a session that reached Active, and to
+//!   [`Connection::close_reason`]. [`CloseReason::is_graceful`] is the flag
+//!   `reset_on_logout` follows. [`Connection::logout_with_text`] sends a
+//!   Logout carrying a checked `Text` (58). See
+//!   `doc/adr/0025-typed-close-reason.md`.
 //! - **[`OutboundMessage`]**: the body you hand to [`Connection::send`]; the
 //!   engine stamps the header, `MsgSeqNum` and trailer.
 //! - **[`Application`]**: the QuickFIX-shaped callback trait
@@ -180,6 +191,7 @@
 pub mod acceptor;
 pub mod application;
 pub mod builder;
+pub mod close;
 pub mod connection;
 pub mod error;
 mod garbled;
@@ -197,6 +209,7 @@ mod wire;
 pub use acceptor::Acceptor;
 pub use application::{Application, NoOpApplication, RejectReason, SendVerdict, SessionId};
 pub use builder::EngineBuilder;
+pub use close::{CloseReason, LogoutCause, LogoutInitiator};
 pub use connection::Connection;
 pub use error::EngineError;
 pub use initiator::Initiator;
