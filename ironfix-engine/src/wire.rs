@@ -1719,6 +1719,70 @@ impl PendingMessage {
     }
 }
 
+/// How a session writes and reads the open-ended ("to infinity") `EndSeqNo`
+/// (16) of a ResendRequest (35=2), decided by its FIX version.
+///
+/// FIX 4.0 and FIX 4.1 define infinity as `999999`; FIX 4.2 replaced it with
+/// `0`, which every later version (FIXT.1.1 included) keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndSeqNoInfinity {
+    /// `16=999999`: FIX 4.0 and FIX 4.1.
+    Nines,
+    /// `16=0`: FIX 4.2 and later.
+    Zero,
+}
+
+impl EndSeqNoInfinity {
+    /// The FIX 4.0 / 4.1 open-ended `EndSeqNo`.
+    pub(crate) const NINES: u64 = 999_999;
+
+    /// Returns the convention a session in `version` uses.
+    ///
+    /// The match names every version, so a new [`FixVersion`] does not
+    /// compile until it has been given a convention.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn for_version(version: FixVersion) -> Self {
+        match version {
+            FixVersion::Fix40 | FixVersion::Fix41 => Self::Nines,
+            FixVersion::Fix42
+            | FixVersion::Fix43
+            | FixVersion::Fix44
+            | FixVersion::Fix50
+            | FixVersion::Fix50Sp1
+            | FixVersion::Fix50Sp2
+            | FixVersion::Fixt11 => Self::Zero,
+        }
+    }
+
+    /// The `EndSeqNo` this session writes for an open-ended request.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn sentinel(self) -> u64 {
+        match self {
+            Self::Nines => Self::NINES,
+            Self::Zero => 0,
+        }
+    }
+
+    /// Whether an inbound `EndSeqNo` means "to infinity".
+    ///
+    /// On FIX 4.0 / 4.1 both `999999` and `0` do: a literal `0` cannot name a
+    /// range there (it is below every valid `BeginSeqNo`), so reading it as
+    /// the later versions' sentinel answers rather than rejects a peer that
+    /// mixes conventions. On FIX 4.2 and later only `0` does; `999999` stays a
+    /// literal bound, which the reply clamps to our next outbound number
+    /// anyway, so it is answered in full unless we have sent more than that.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_open_ended(self, end_seq: u64) -> bool {
+        match self {
+            Self::Nines => end_seq == Self::NINES || end_seq == 0,
+            Self::Zero => end_seq == 0,
+        }
+    }
+}
+
 /// Builds outbound messages and frames them with the session header stamped.
 #[derive(Debug)]
 pub(crate) struct MessageFactory {
@@ -1950,13 +2014,28 @@ impl MessageFactory {
         PendingMessage::plain(message)
     }
 
-    /// Builds a ResendRequest (35=2) for `begin_seq..end_seq`
-    /// (`end_seq` = 0 means "up to infinity").
+    /// Builds a ResendRequest (35=2) for `begin_seq..end_seq`.
+    ///
+    /// `end_seq` = 0 means "up to infinity" and is written as this session's
+    /// open-ended `EndSeqNo` (16): `999999` on FIX 4.0 and 4.1, `0` on FIX 4.2
+    /// and later (see [`EndSeqNoInfinity`]).
     #[must_use]
     pub(crate) fn resend_request(&self, begin_seq: u64, end_seq: u64) -> PendingMessage {
+        let end_seq = match end_seq {
+            0 => EndSeqNoInfinity::for_version(self.version).sentinel(),
+            bounded => bounded,
+        };
         let mut message = OutboundMessage::new(MsgType::ResendRequest);
         message.push_uint(7, begin_seq).push_uint(16, end_seq);
         PendingMessage::plain(message)
+    }
+
+    /// Whether an inbound ResendRequest's `EndSeqNo` (16) means "to infinity"
+    /// on this session (see [`EndSeqNoInfinity::is_open_ended`]).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_open_ended_end_seq_no(&self, end_seq: u64) -> bool {
+        EndSeqNoInfinity::for_version(self.version).is_open_ended(end_seq)
     }
 
     /// Builds a SequenceReset-GapFill (35=4, 123=Y) that answers a
@@ -2777,6 +2856,66 @@ mod tests {
                 precision,
                 "{version}"
             );
+        }
+    }
+
+    #[test]
+    fn test_end_seq_no_infinity_is_999999_only_before_fix42() {
+        use EndSeqNoInfinity::{Nines, Zero};
+        let expected = [
+            (FixVersion::Fix40, Nines),
+            (FixVersion::Fix41, Nines),
+            (FixVersion::Fix42, Zero),
+            (FixVersion::Fix43, Zero),
+            (FixVersion::Fix44, Zero),
+            (FixVersion::Fix50, Zero),
+            (FixVersion::Fix50Sp1, Zero),
+            (FixVersion::Fix50Sp2, Zero),
+            (FixVersion::Fixt11, Zero),
+        ];
+        assert_eq!(expected.map(|(version, _)| version), FixVersion::ALL);
+        for (version, convention) in expected {
+            assert_eq!(
+                EndSeqNoInfinity::for_version(version),
+                convention,
+                "{version}"
+            );
+        }
+        assert_eq!(Nines.sentinel(), 999_999);
+        assert_eq!(Zero.sentinel(), 0);
+        // FIX 4.0 / 4.1 also read 0 as infinity; later versions keep 999999
+        // a literal bound.
+        assert!(Nines.is_open_ended(999_999) && Nines.is_open_ended(0));
+        assert!(!Nines.is_open_ended(999_998));
+        assert!(Zero.is_open_ended(0) && !Zero.is_open_ended(999_999));
+    }
+
+    /// An open-ended ResendRequest encodes and decodes with the version's
+    /// sentinel; a bounded one keeps its bound on every version.
+    #[test]
+    fn test_resend_request_end_seq_no_round_trips_per_version() {
+        let versions = WHOLE_SECOND_VERSIONS
+            .iter()
+            .map(|v| (*v, "999999"))
+            .chain(MILLISECOND_VERSIONS.iter().map(|v| (*v, "0")));
+        for (begin_string, infinity) in versions {
+            let mut factory = factory_for(begin_string);
+            for (end_seq, wire) in [(0, infinity), (9, "9")] {
+                let pending = factory.resend_request(3, end_seq);
+                let frame = framed(&mut factory, 7, &pending);
+                let raw = decode(&frame);
+                // FIX 5.0 and later frame under FIXT.1.1.
+                let header = wire_version(begin_string)
+                    .ok()
+                    .map(FixVersion::begin_string);
+                assert_eq!(raw.get_field_str(8), header);
+                assert_eq!(raw.get_field_str(35), Some("2"));
+                assert_eq!(raw.get_field_str(7), Some("3"));
+                assert_eq!(raw.get_field_str(16), Some(wire), "{begin_string}");
+                let parsed = raw.get_field_str(16).and_then(|s| s.parse::<u64>().ok());
+                let open = parsed.is_some_and(|v| factory.is_open_ended_end_seq_no(v));
+                assert_eq!(open, end_seq == 0, "{begin_string}");
+            }
         }
     }
 

@@ -1216,9 +1216,9 @@ pub(crate) struct ResendState {
     /// gap start, never a number already consumed.
     expected: u64,
     /// The top of the outstanding range: the highest sequence number seen while
-    /// the gap has been open. The request is open-ended (`EndSeqNo` = 0), so
-    /// this is the water mark the expectation must cross for the gap to be
-    /// considered closed — clearing recovery on the first in-order message
+    /// the gap has been open. The request is open-ended (`EndSeqNo` 0, or
+    /// 999999 on FIX 4.0 and 4.1), so this is the water mark the expectation
+    /// must cross for the gap to be considered closed — clearing recovery on the first in-order message
     /// instead would forget that later numbers in the range are still missing.
     high_water: u64,
     /// When the most recent request for this gap was sent.
@@ -4940,8 +4940,9 @@ impl<A: Application> Reactor<A> {
     /// replayed and the whole range is one gap fill.
     ///
     /// Either way the reply is bounded by `EndSeqNo` (16) so the counterparty
-    /// is never advanced past what it asked for, and `16=0` means "up to
-    /// infinity" (`doc/fix_operations.md`, "Resend Request").
+    /// is never advanced past what it asked for, and `16=0` (`999999` on FIX
+    /// 4.0 and 4.1) means "up to infinity" (`doc/fix_operations.md`, "Resend
+    /// Request").
     ///
     /// Nothing here allocates a sender sequence number. A replayed message
     /// re-occupies the number it was first sent under, and a gap fill occupies
@@ -4987,7 +4988,9 @@ impl<A: Application> Reactor<A> {
                 .send_session_reject(framed, phase, seq, ref_msg_type, &reason)
                 .await;
         }
-        if end_seq != 0 && end_seq < begin_seq {
+        // FIX 4.0 / 4.1 write "to infinity" as 999999, later versions as 0.
+        let open_ended = self.factory.is_open_ended_end_seq_no(end_seq);
+        if !open_ended && end_seq < begin_seq {
             let reason = RejectReason::new(
                 5,
                 format!("ResendRequest EndSeqNo {end_seq} is below BeginSeqNo {begin_seq}"),
@@ -5000,12 +5003,19 @@ impl<A: Application> Reactor<A> {
 
         // The reply covers begin_seq..new_seq, never beyond EndSeqNo + 1 and
         // never beyond what we have actually sent.
-        let new_seq = match end_seq {
-            0 => next_sender,
-            _ => end_seq
-                .checked_add(1)
-                .map_or(next_sender, |bound| bound.min(next_sender)),
+        let new_seq = if open_ended {
+            next_sender
+        } else {
+            match end_seq.checked_add(1) {
+                Some(bound) => bound.min(next_sender),
+                // `end_seq` = u64::MAX: no bound below infinity.
+                None => next_sender,
+            }
         };
+        debug_assert!(
+            new_seq > begin_seq,
+            "begin_seq < next_sender was checked above"
+        );
 
         self.queue_resend(begin_seq, new_seq);
         Ok(phase)

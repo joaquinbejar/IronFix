@@ -488,8 +488,14 @@ impl DemoSession {
         self.encoder.put_str(49, &self.sender_comp_id);
         self.encoder.put_str(56, &self.target_comp_id);
         self.encoder.put_uint(34, seq.value());
-        self.encoder
-            .put_str(52, Timestamp::now().format_millis().as_str());
+        // SendingTime (52) is `time`, whole seconds, on FIX 4.0 and 4.1;
+        // `UTCTimestamp` with milliseconds from FIX 4.2 (#134).
+        let now = Timestamp::now();
+        if matches!(self.version, FixVersion::Fix40 | FixVersion::Fix41) {
+            self.encoder.put_str(52, now.format_seconds().as_str());
+        } else {
+            self.encoder.put_str(52, now.format_millis().as_str());
+        }
         Ok(())
     }
 
@@ -581,6 +587,30 @@ mod tests {
                 "{version} framed as {:?}",
                 String::from_utf8_lossy(&frame[..12.min(frame.len())])
             );
+        }
+    }
+
+    /// SendingTime (52) is whole seconds on FIX 4.0 and 4.1, milliseconds
+    /// from FIX 4.2 (#134, #137).
+    #[test]
+    fn sending_time_precision_follows_the_version() {
+        for version in FixVersion::ALL {
+            if version == FixVersion::Fixt11 {
+                continue;
+            }
+            for frame in three_frames(version) {
+                let sending_time = field(&frame, 52).expect("every frame carries 52");
+                let expected_len = if matches!(version, FixVersion::Fix40 | FixVersion::Fix41) {
+                    17
+                } else {
+                    21
+                };
+                assert_eq!(
+                    sending_time.len(),
+                    expected_len,
+                    "{version}: {sending_time}"
+                );
+            }
         }
     }
 
