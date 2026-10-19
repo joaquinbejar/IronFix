@@ -12,8 +12,8 @@
 //! fate and reports it as one of three classes, which never collapse into one
 //! another:
 //!
-//! - [`SendOutcome::Sent`]: the frame was written to the stream by a flush
-//!   that completed. It carries the `MsgSeqNum` (34) and `SendingTime` (52)
+//! - [`SendOutcome::Sent`]: the stream accepted the whole frame, its last
+//!   byte included. It carries the `MsgSeqNum` (34) and `SendingTime` (52)
 //!   the counterparty reads, and whether the store filed it.
 //! - [`SendOutcome::NotSent`]: the engine guarantees that **no byte** of the
 //!   frame reached the stream, and no `MsgSeqNum` was spent on it. The
@@ -62,10 +62,12 @@
 //!
 //! `Sent` resolves only after the frame went through the store step of the
 //! write order (see the [`persistence`](crate::persistence) module) **and**
-//! a flush that covers it completed. The session writes through a buffer:
+//! the stream accepted the whole frame. The session writes through a buffer:
 //! a frame is appended to it, and the buffer is written out, and the stream
-//! flushed, while the session goes on reading. A completed flush resolves
-//! every tracked frame it wrote at once, in the order they were sent. Its
+//! flushed, while the session goes on reading. Each tracked frame resolves
+//! as soon as the stream has accepted its last byte, in the order they were
+//! sent, even while later frames are still buffered and before the stream's
+//! own flush completes; a completed flush resolves any left. Its
 //! `filed` field says whether the store confirmed it filed the frame: it is
 //! false without a store, and false under
 //! [`StoreFailurePolicy::Continue`](crate::StoreFailurePolicy::Continue) when
@@ -73,9 +75,15 @@
 //! filing was not confirmed, not that the store lacks the frame: a store can
 //! save it and still return an error, so a `ResendRequest` covering it is
 //! answered with the frame if the store holds it and with a
-//! `SequenceReset`-GapFill if it does not. Flushed means handed to the stream in full: the
-//! bytes may still sit in an operating-system or TLS buffer, and nothing at
-//! the FIX layer says the counterparty has processed them.
+//! `SequenceReset`-GapFill if it does not. Accepted means handed to the
+//! stream in full: the bytes may still sit in an operating-system or TLS
+//! buffer, and `Sent` is **not** an acknowledgement: nothing at the FIX layer
+//! says the counterparty has received or processed them.
+//!
+//! The frame observer ([`FrameObserver`](crate::FrameObserver)) still
+//! reports its write results per completed flush. For a frame the stream
+//! accepted whole before a write failed, the receipt is `Sent` while the
+//! observer reports it `Unknown`; the two can disagree in that case.
 //!
 //! # Constructing outcomes
 //!
@@ -102,7 +110,8 @@ use tokio::sync::oneshot;
 #[must_use = "a send outcome says whether the message reached the counterparty; an Unknown one \
               may be live and must be reconciled"]
 pub enum SendOutcome {
-    /// The frame was written to the stream by a flush that completed.
+    /// The stream accepted the whole frame, its last byte included. Not an
+    /// acknowledgement from the counterparty.
     #[non_exhaustive]
     Sent {
         /// The `MsgSeqNum` (34) the frame carries.
