@@ -191,9 +191,10 @@ engine wiring (#96) does not exist.
   message's fate as a `SendOutcome`: `Sent` with the `MsgSeqNum` and
   `SendingTime` (in the session's precision) the counterparty reads, once a
   flush of the session's write buffer covering the frame completes, and
-  `filed`, which says whether the store accepted it (false without a store,
-  and under `StoreFailurePolicy::Continue` after a failed filing, when a
-  resend of it is gap-filled); `NotSent` with a `NotSentReason` when no byte
+  `filed`, which says whether the store confirmed it filed the frame (false
+  without a store, and under `StoreFailurePolicy::Continue` after a failed
+  or timed out filing; false means filing was not confirmed, so the frame
+  may or may not be replayed, since a store can fail after saving it); `NotSent` with a `NotSentReason` when no byte
   reached the stream and no number was spent (vetoed, invalid, refused by
   the store under `CloseSession`, sequence exhausted, session closed, Logout
   pending, or discarded when the session ended, in the queue or behind a

@@ -66,12 +66,14 @@
 //! a frame is appended to it, and the buffer is written out, and the stream
 //! flushed, while the session goes on reading. A completed flush resolves
 //! every tracked frame it wrote at once, in the order they were sent. Its
-//! `filed` field says whether the store accepted the frame: it is false
-//! without a store, and false under
+//! `filed` field says whether the store confirmed it filed the frame: it is
+//! false without a store, and false under
 //! [`StoreFailurePolicy::Continue`](crate::StoreFailurePolicy::Continue) when
-//! the filing failed and the frame went out anyway. A frame that was not
-//! filed cannot be replayed: a `ResendRequest` covering it is answered with a
-//! `SequenceReset`-GapFill. Flushed means handed to the stream in full: the
+//! the filing failed or timed out and the frame went out anyway. False means
+//! filing was not confirmed, not that the store lacks the frame: a store can
+//! save it and still return an error, so a `ResendRequest` covering it is
+//! answered with the frame if the store holds it and with a
+//! `SequenceReset`-GapFill if it does not. Flushed means handed to the stream in full: the
 //! bytes may still sit in an operating-system or TLS buffer, and nothing at
 //! the FIX layer says the counterparty has processed them.
 //!
@@ -109,12 +111,16 @@ pub enum SendOutcome {
         /// session writes on the wire: whole seconds on FIX 4.0 and FIX 4.1,
         /// milliseconds on every later version.
         sending_time: Timestamp,
-        /// Whether the attached store filed the frame. False without a store,
-        /// and false under
+        /// Whether the attached store confirmed it filed the frame. True means
+        /// the store accepted it, so a `ResendRequest` (2) covering it replays
+        /// it while the store holds it. False means filing was **not
+        /// confirmed**: always without a store, and under
         /// [`StoreFailurePolicy::Continue`](crate::StoreFailurePolicy::Continue)
-        /// when the filing failed and the frame went out anyway: such a frame
-        /// cannot be replayed, and a `ResendRequest` (2) covering it is
-        /// answered with a `SequenceReset`-GapFill.
+        /// when the store call returned an error or timed out and the frame
+        /// went out anyway. A store can fail after it saved the frame, so an
+        /// unconfirmed frame may or may not be replayed: a `ResendRequest`
+        /// covering it is answered with the frame if the store holds it, and
+        /// with a `SequenceReset`-GapFill if it does not.
         filed: bool,
     },
     /// No byte of the frame reached the stream, and no `MsgSeqNum` was spent

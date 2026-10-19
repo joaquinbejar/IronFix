@@ -136,7 +136,11 @@
 //! Until then the session behaves as one logging out but its logout timeout
 //! has not started (the write timeout bounds the wait); a close whose own
 //! Logout was never written whole is not graceful, so `reset_on_logout` does
-//! not reset a stream the counterparty still expects to continue.
+//! not reset a stream the counterparty still expects to continue. The same
+//! holds for the two probes that wait on an answer: a TestRequest's reply
+//! deadline and a ResendRequest's retry clock start once the frame is written
+//! whole, so output buffered ahead of it under backpressure does not use them
+//! up (issue #142).
 //!
 //! A slow `from_app` cannot delay the reactor either: inbound application
 //! messages are handed to a separate dispatcher task over a bounded queue, so
@@ -1105,16 +1109,82 @@ struct Writer {
     /// what the next completed flush covers ([`Reactor::on_flushed`]).
     /// Resent frames and gap fills re-occupy old numbers and are not counted.
     fed_new: Option<(u64, u64)>,
-    /// Bytes the stream must still accept before the last Logout fed is
-    /// written whole, while it is in the buffer.
-    logout_ahead: Option<usize>,
-    /// Set once that Logout has been written whole; taken by
+    /// The last Logout fed, watched until it is written whole; taken by
     /// [`Reactor::advance_logout`].
-    logout_written: bool,
+    logout: WriteMark,
+    /// The last TestRequest fed, watched until it is written whole: its
+    /// reply deadline starts only then ([`Reactor::advance_probes`]).
+    test_request: WriteMark,
+    /// The last ResendRequest fed, watched until it is written whole: its
+    /// retry clock starts only then ([`Reactor::advance_probes`]).
+    resend_request: WriteMark,
     /// The buffer's length right after the frame that took it to
     /// [`WRITE_BUFFER_HIGH_WATER`] or past: the base of the read ceiling
     /// while the buffer stays there ([`Writer::reads_paused`]).
     crossed_at: Option<usize>,
+}
+
+/// Watches one frame fed to the write buffer until the stream has accepted
+/// its last byte: only then has it been sent. A frame still buffered behind
+/// earlier output has not reached the counterparty, so nothing that waits on
+/// the counterparty's answer to it (the logout timeout, a TestRequest's reply
+/// deadline, a ResendRequest's retry clock) may start before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WriteMark {
+    /// Bytes the stream must still accept before the frame is written whole,
+    /// while it is in the buffer.
+    ahead: Option<usize>,
+    /// Set once the frame has been written whole; taken by its consumer.
+    written: bool,
+}
+
+impl WriteMark {
+    /// A mark watching nothing.
+    #[must_use]
+    const fn new() -> Self {
+        Self {
+            ahead: None,
+            written: false,
+        }
+    }
+
+    /// Watches the frame just fed, the last one in the buffer of `framed`.
+    fn mark(&mut self, framed: &FixFramed) {
+        self.ahead = Some(framed.write_buffer().len());
+        self.written = false;
+    }
+
+    /// Whether the frame watched has not been written whole.
+    #[must_use]
+    const fn unwritten(&self) -> bool {
+        self.ahead.is_some()
+    }
+
+    /// Records that the stream accepted `moved` bytes from the front of the
+    /// buffer.
+    const fn wrote(&mut self, moved: usize) {
+        if let Some(ahead) = self.ahead {
+            match ahead.checked_sub(moved) {
+                Some(left) if left > 0 => self.ahead = Some(left),
+                _ => {
+                    self.ahead = None;
+                    self.written = true;
+                }
+            }
+        }
+    }
+
+    /// Records a completed flush: the frame watched, if any, is written.
+    const fn flushed(&mut self) {
+        if self.ahead.take().is_some() {
+            self.written = true;
+        }
+    }
+
+    /// Whether the frame watched has been written whole since the last call.
+    const fn take_written(&mut self) -> bool {
+        std::mem::replace(&mut self.written, false)
+    }
 }
 
 /// What a tick found on the write side.
@@ -1146,8 +1216,9 @@ impl Writer {
             stalled_since: None,
             failed: false,
             fed_new: None,
-            logout_ahead: None,
-            logout_written: false,
+            logout: WriteMark::new(),
+            test_request: WriteMark::new(),
+            resend_request: WriteMark::new(),
             crossed_at: None,
         }
     }
@@ -1182,29 +1253,22 @@ impl Writer {
 
     /// Watches the frame just fed, a Logout, until it is written whole.
     fn mark_logout(&mut self, framed: &FixFramed) {
-        self.logout_ahead = Some(framed.write_buffer().len());
-        self.logout_written = false;
+        self.logout.mark(framed);
     }
 
     /// Whether a Logout fed has not been written whole.
     #[must_use]
     const fn logout_unwritten(&self) -> bool {
-        self.logout_ahead.is_some()
+        self.logout.unwritten()
     }
 
     /// Records that the stream accepted `moved` bytes from the front of the
     /// buffer.
     const fn wrote(&mut self, moved: usize) {
         self.progressed = true;
-        if let Some(ahead) = self.logout_ahead {
-            match ahead.checked_sub(moved) {
-                Some(left) if left > 0 => self.logout_ahead = Some(left),
-                _ => {
-                    self.logout_ahead = None;
-                    self.logout_written = true;
-                }
-            }
-        }
+        self.logout.wrote(moved);
+        self.test_request.wrote(moved);
+        self.resend_request.wrote(moved);
     }
 
     /// Records a completed flush: nothing is waiting any more. Returns the
@@ -1217,9 +1281,9 @@ impl Writer {
         self.progressed = false;
         self.stalled_since = None;
         self.crossed_at = None;
-        if self.logout_ahead.take().is_some() {
-            self.logout_written = true;
-        }
+        self.logout.flushed();
+        self.test_request.flushed();
+        self.resend_request.flushed();
         if framed.write_buffer().is_empty() && framed.write_buffer().capacity() > SHRINK_ABOVE {
             *framed.write_buffer_mut() = BytesMut::with_capacity(WRITE_BUFFER_HIGH_WATER);
         }
@@ -1497,6 +1561,10 @@ struct Reactor<A: Application> {
     /// carries the instant the Logout went out, so the phase itself is the
     /// deadline.
     resend: Option<ResendState>,
+    /// The `TestReqID` (112) of a TestRequest fed but not yet written whole:
+    /// its reply deadline starts once it is ([`Reactor::advance_probes`]).
+    /// While it is set no other TestRequest is sent.
+    unwritten_test_request: Option<String>,
     /// The `MsgSeqNum` of a gapped Logon or acknowledgement held until the
     /// `NextExpectedMsgSeqNum` (789) resend fills the gap below it, then
     /// consumed ([`Reactor::release_held_logon`]).
@@ -1688,6 +1756,7 @@ async fn run_reactor<A: Application + 'static>(
         // A Logout of ours written whole since the last pass has now been
         // sent: its logout timeout starts.
         let current = ctx.advance_logout(current);
+        ctx.advance_probes();
         // Nothing below waits on the socket: every handler only appends to
         // the write buffer (a live frame is also written through at once when
         // the stream takes it), and the socket branch writes the rest out
@@ -2171,6 +2240,12 @@ impl<A: Application> Reactor<A> {
                 if resend_ready && let Some(reads) = self.reads_since_resend_step.checked_add(1) {
                     self.reads_since_resend_step = reads;
                 }
+                // The same poll can write a probe whole, leave the flush
+                // pending and return the counterparty's answer to it: arm
+                // the probe first, so the answer clears it instead of a
+                // deadline being armed afterwards for a probe already
+                // answered.
+                self.advance_probes();
                 self.on_inbound_event(framed, phase, inbound).await
             }
         }
@@ -2263,11 +2338,28 @@ impl<A: Application> Reactor<A> {
     /// phase is handed back as it is.
     fn advance_logout(&mut self, phase: Phase) -> Phase {
         match phase {
-            Phase::LogoutQueued(session) if std::mem::take(&mut self.writer.logout_written) => {
+            Phase::LogoutQueued(session) if self.writer.logout.take_written() => {
                 // Typestate: Active -> LogoutPending, as the Logout is sent.
                 Phase::LogoutPending(session.initiate_logout())
             }
             phase => phase,
+        }
+    }
+
+    /// Starts the deadlines of the probes written whole since the last pass:
+    /// a TestRequest's reply deadline and a ResendRequest's retry clock run
+    /// from when the frame reached the stream, not from when it was fed, so
+    /// output buffered ahead of it under backpressure does not use them up.
+    fn advance_probes(&mut self) {
+        if self.writer.test_request.take_written()
+            && let Some(test_req_id) = self.unwritten_test_request.take()
+        {
+            lock_heartbeat(&self.runtime).on_test_request_sent(test_req_id);
+        }
+        if self.writer.resend_request.take_written()
+            && let Some(state) = self.resend.as_mut()
+        {
+            state.restart_clock();
         }
     }
 
@@ -2494,8 +2586,11 @@ impl<A: Application> Reactor<A> {
         let seq = self.runtime.sequences.next_sender_seq().value();
         match self.write_at(framed, seq, &pending, true, receipt).await {
             Ok(()) => {
-                if pending.msg_type() == &MsgType::Logout {
-                    self.writer.mark_logout(framed);
+                match pending.msg_type() {
+                    MsgType::Logout => self.writer.mark_logout(framed),
+                    MsgType::TestRequest => self.writer.test_request.mark(framed),
+                    MsgType::ResendRequest => self.writer.resend_request.mark(framed),
+                    _ => {}
                 }
                 self.write_through(framed)?;
                 Ok(Sent::Yes)
@@ -2932,6 +3027,7 @@ impl<A: Application> Reactor<A> {
             }
         }
         let phase = self.advance_logout(phase);
+        self.advance_probes();
         match self.writer.on_tick(driver_now(), self.write_timeout) {
             WriteCheck::Fine => {}
             WriteCheck::Progressed => lock_heartbeat(&self.runtime).on_message_sent(),
@@ -2973,8 +3069,12 @@ impl<A: Application> Reactor<A> {
         // A gap that is making no progress is chased on its own clock,
         // independent of the heartbeat: gapped frames keep the heartbeat alive,
         // so this is the only thing that bounds an unsatisfied resend.
+        // A request still buffered has not reached the counterparty: its
+        // clock starts once it is written whole ([`Reactor::advance_probes`]),
+        // and the write timeout bounds how long it may wait.
         if let Some(resend) = self.resend
             && resend.is_stalled()
+            && !self.writer.resend_request.unwritten()
         {
             return self.on_resend_stalled(framed, phase, resend).await;
         }
@@ -2995,7 +3095,7 @@ impl<A: Application> Reactor<A> {
                 false,
             ));
         }
-        if send_test_request {
+        if send_test_request && self.unwritten_test_request.is_none() {
             let test_req_id = generate_test_req_id();
             let request = self.factory.test_request(&test_req_id);
             match self.send(framed, request).await {
@@ -3004,9 +3104,15 @@ impl<A: Application> Reactor<A> {
                     return Err(closed(format!("send failed: {err}"), false));
                 }
                 // Only a TestRequest that actually went out starts the timeout
-                // countdown. Arming it for a dropped probe would time the
-                // session out waiting for an answer to a frame never sent.
-                Ok(Sent::Yes) => lock_heartbeat(&self.runtime).on_test_request_sent(test_req_id),
+                // countdown, and only once it is written whole
+                // ([`Reactor::advance_probes`]): fed behind earlier output
+                // under backpressure, it has not reached the counterparty.
+                // Arming it for a dropped probe would time the session out
+                // waiting for an answer to a frame never sent.
+                Ok(Sent::Yes) => {
+                    self.unwritten_test_request = Some(test_req_id);
+                    self.advance_probes();
+                }
                 Ok(Sent::Dropped | Sent::Deferred) => {}
             }
         } else if send_heartbeat && !self.writer.pending {
@@ -5005,6 +5111,7 @@ where
         reset_owed,
         app_handed: None,
         resend: None,
+        unwritten_test_request: None,
         held_logon: None,
         resends: VecDeque::new(),
         reads_since_resend_step: 0,
@@ -5338,7 +5445,7 @@ mod tests {
         assert!(writer.logout_unwritten(), "one byte of it is left");
         writer.wrote(31);
         assert!(!writer.logout_unwritten());
-        assert!(std::mem::take(&mut writer.logout_written));
+        assert!(writer.logout.take_written());
     }
 
     #[test]

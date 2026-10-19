@@ -223,9 +223,12 @@ impl Connection {
     ///   a buffer, so that may be after later frames were buffered), with the
     ///   `MsgSeqNum` (34) and
     ///   `SendingTime` (52) the counterparty reads, and `filed`, which says
-    ///   whether the store accepted the frame (false without a store, and
-    ///   under [`StoreFailurePolicy::Continue`](crate::StoreFailurePolicy::Continue)
-    ///   after a failed filing: such a frame is gap-filled, not replayed);
+    ///   whether the store confirmed it filed the frame (false without a
+    ///   store, and under
+    ///   [`StoreFailurePolicy::Continue`](crate::StoreFailurePolicy::Continue)
+    ///   after a failed or timed out filing: filing is then not confirmed,
+    ///   and the frame may or may not be replayed, since a store can fail
+    ///   after saving it);
     /// - [`SendOutcome::NotSent`] when no byte of it reached the stream and no
     ///   number was spent: the reason is
     ///   [`NotSentReason::Invalid`] for a message `send` would refuse with an
