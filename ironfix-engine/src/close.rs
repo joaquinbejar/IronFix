@@ -12,10 +12,15 @@
 //! [`Application::on_session_closed`](crate::Application::on_session_closed)
 //! before [`Connection::wait_closed`](crate::Connection::wait_closed)
 //! returns; [`Connection::close_reason`](crate::Connection::close_reason)
-//! reads it afterwards. A handshake that fails after `on_create` has run
-//! reports [`CloseReason::LogonFailed`] to the application; the caller gets
+//! reads it afterwards. A dial that fails after `on_create` has run reports
+//! [`CloseReason::ConnectFailed`], and a Logon handshake that fails reports
+//! [`CloseReason::LogonFailed`], to the application; the caller gets
 //! the detailed [`EngineError`](crate::EngineError) from `connect` or
-//! `serve`, and no `Connection` exists.
+//! `serve`, and no `Connection` exists. A handshake whose future the caller
+//! drops (cancelled, for example by a `tokio::time::timeout` around
+//! `connect`) gets no close callback: there is no `async` drop to run it
+//! from, so an application that tracks `on_create` must treat its own
+//! cancellation as the end of that session.
 //!
 //! # Graceful or not
 //!
@@ -32,7 +37,8 @@
 //!
 //! Structured data only: sequence numbers, a tag, a size, an
 //! [`std::io::ErrorKind`]. The one free text is the `Text` (58) of a Logout,
-//! the counterparty's (bounded to [`MAX_PEER_TEXT_LEN`] bytes, never parsed)
+//! the counterparty's (bounded to [`MAX_PEER_TEXT_LEN`] characters, each one
+//! outside printable ASCII replaced with `?`, never parsed)
 //! or the one this session sent. No reason carries a frame or any part of
 //! one: `Password` (554), `NewPassword` (925) and `RawData` (96) cannot
 //! appear in it.
@@ -48,6 +54,7 @@ pub const MAX_PEER_TEXT_LEN: usize = 1024;
 /// Who started a Logout exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum LogoutInitiator {
     /// This session sent the first Logout.
     Local,
@@ -64,7 +71,10 @@ pub enum LogoutCause {
     /// asked for it.
     #[non_exhaustive]
     Requested {
-        /// The `Text` (58) the Logout carried, when one was given.
+        /// The `Text` (58) the caller asked for, when one was given. A
+        /// `to_admin` callback can change or remove tag 58 before the Logout
+        /// is framed, so this is the requested text, not necessarily the
+        /// text on the wire.
         text: Option<String>,
     },
     /// Every [`Connection`](crate::Connection) handle was dropped.
@@ -211,7 +221,20 @@ pub enum CloseReason {
     /// The application dispatcher task stopped.
     #[non_exhaustive]
     DispatcherStopped {},
-    /// The Logon handshake failed after `on_create` had run. Reported to
+    /// [`Initiator::connect`](crate::Initiator::connect) could not dial the
+    /// counterparty after `on_create` had run: the TCP connect failed or
+    /// timed out. Reported to
+    /// [`Application::on_session_closed`](crate::Application::on_session_closed)
+    /// only; the caller receives the [`EngineError`](crate::EngineError).
+    #[non_exhaustive]
+    ConnectFailed {
+        /// The connect error's kind; `None` when it timed out.
+        kind: Option<std::io::ErrorKind>,
+        /// Whether the connect timeout ran out.
+        timed_out: bool,
+    },
+    /// The Logon handshake failed after `on_create` had run (the transport
+    /// was already connected). Reported to
     /// [`Application::on_session_closed`](crate::Application::on_session_closed)
     /// only: no `Connection` exists, and the caller of `connect`, `establish`
     /// or `serve` receives the detailed [`EngineError`](crate::EngineError).
@@ -235,12 +258,12 @@ impl CloseReason {
     }
 
     /// Whether the session reached Active before it ended: false only for
-    /// [`CloseReason::LogonFailed`]. The default
+    /// [`CloseReason::ConnectFailed`] and [`CloseReason::LogonFailed`]. The default
     /// [`Application::on_session_closed`](crate::Application::on_session_closed)
     /// forwards to `on_logout` exactly when this is true.
     #[must_use]
     pub const fn was_active(&self) -> bool {
-        !matches!(self, Self::LogonFailed { .. })
+        !matches!(self, Self::ConnectFailed { .. } | Self::LogonFailed { .. })
     }
 
     /// The reason a graceful close becomes when this session's own Logout
@@ -268,16 +291,20 @@ impl CloseReason {
     }
 }
 
-/// Keeps at most [`MAX_PEER_TEXT_LEN`] bytes of a counterparty's text, cut at
-/// a character boundary; an empty text is no text.
+/// Keeps at most [`MAX_PEER_TEXT_LEN`] characters of a counterparty's text,
+/// each one outside printable ASCII (0x20 to 0x7E) replaced with `?`, so no
+/// control character, newline or non-ASCII character reaches a log line or
+/// the application; an empty text is no text. The result is ASCII, so its
+/// length in bytes is its length in characters.
 #[must_use]
 pub(crate) fn bounded_peer_text(text: Option<&str>) -> Option<String> {
     let text = text.filter(|text| !text.is_empty())?;
-    let mut end = text.len().min(MAX_PEER_TEXT_LEN);
-    while !text.is_char_boundary(end) {
-        end = end.checked_sub(1)?;
-    }
-    text.get(..end).map(str::to_string)
+    Some(
+        text.chars()
+            .take(MAX_PEER_TEXT_LEN)
+            .map(|c| if (' '..='~').contains(&c) { c } else { '?' })
+            .collect(),
+    )
 }
 
 impl fmt::Display for LogoutCause {
@@ -358,6 +385,13 @@ impl fmt::Display for CloseReason {
                  enough",
             ),
             Self::DispatcherStopped {} => f.write_str("application dispatcher stopped"),
+            Self::ConnectFailed {
+                timed_out: true, ..
+            } => f.write_str("connect timed out"),
+            Self::ConnectFailed {
+                kind: Some(kind), ..
+            } => write!(f, "connect failed: {kind}"),
+            Self::ConnectFailed { .. } => f.write_str("connect failed"),
             Self::LogonFailed {} => f.write_str("Logon handshake failed"),
             Self::Internal {} => f.write_str("internal error"),
         }
@@ -433,13 +467,21 @@ mod tests {
         assert_eq!(bounded_peer_text(None), None);
         assert_eq!(bounded_peer_text(Some("")), None);
         assert_eq!(bounded_peer_text(Some("bye")).as_deref(), Some("bye"));
-        let long = "é".repeat(MAX_PEER_TEXT_LEN);
+        let long = "x".repeat(MAX_PEER_TEXT_LEN + 10);
         let cut = bounded_peer_text(Some(&long)).unwrap_or_default();
-        assert!(cut.len() <= MAX_PEER_TEXT_LEN);
         assert_eq!(cut.len(), MAX_PEER_TEXT_LEN);
-        let odd = format!("a{}", "é".repeat(MAX_PEER_TEXT_LEN));
-        let cut = bounded_peer_text(Some(&odd)).unwrap_or_default();
-        assert_eq!(cut.len(), MAX_PEER_TEXT_LEN - 1);
+        let wide = "é".repeat(MAX_PEER_TEXT_LEN + 1);
+        let cut = bounded_peer_text(Some(&wide)).unwrap_or_default();
+        assert_eq!(cut, "?".repeat(MAX_PEER_TEXT_LEN));
+    }
+
+    #[test]
+    fn test_bounded_peer_text_escapes_unprintable_characters() {
+        assert_eq!(
+            bounded_peer_text(Some("a\u{1}b\nc\rd\te\u{7f}f caf\u{e9}")).as_deref(),
+            Some("a?b?c?d?e?f caf?")
+        );
+        assert_eq!(bounded_peer_text(Some("~ !")).as_deref(), Some("~ !"));
     }
 
     #[test]

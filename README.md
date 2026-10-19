@@ -130,7 +130,7 @@ engine wiring (#96) does not exist.
   `CloseReason` for every close (peer or local Logout with the peer's
   `Text`, logout timeout, heartbeat or write timeout, transport closed or
   failed, MsgSeqNum too low, garbled-frame limit, identity, `SendingTime`,
-  store failure, a failed handshake, and more) handed to
+  store failure, a failed dial or handshake, and more) handed to
   `Application::on_session_closed` (whose default forwards to `on_logout`
   for a session that reached Active) and read with
   `Connection::close_reason()` (`doc/adr/0025-typed-close-reason.md`), and

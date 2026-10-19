@@ -55,8 +55,9 @@ Constraints any answer keeps:
    default that calls `on_logout` when `CloseReason::was_active()`. The
    engine calls it, instead of `on_logout`, on every close of an Active
    session, and also when a Logon handshake fails after `on_create`
-   (`CloseReason::LogonFailed`), which the default does not forward: exactly
-   the calls `on_logout` received before.
+   (`CloseReason::LogonFailed`), or a TCP dial fails or times out after it
+   (`CloseReason::ConnectFailed { kind, timed_out }`). The default forwards
+   neither: exactly the calls `on_logout` received before.
 5. **`Connection::close_reason() -> Option<CloseReason>`**, backed by a
    `OnceLock` in the shared runtime set before the callback and before the
    closed flag, so it is `Some` once `wait_closed` returns.
@@ -67,7 +68,14 @@ Constraints any answer keeps:
    `EngineError::InvalidField { tag: 58 }`. ASCII only because a non-ASCII
    `Text` belongs in `EncodedText` (355) under a declared `MessageEncoding`
    (347), which the session does not set. The counterparty's `Text` is kept
-   up to `MAX_PEER_TEXT_LEN` (1024) bytes, cut at a character boundary.
+   up to `MAX_PEER_TEXT_LEN` (1024) characters, each one outside printable
+   ASCII replaced with `?`, so no control character or newline reaches a log
+   line or the application. A `logout_with_text` made once this session's
+   Logout is already queued or sent returns `Ok(())` and its text is
+   dropped; the close reason keeps the first cause.
+7. A missing `LogoutCause` when our exchange ends is an invariant breach:
+   `debug_assert!` in debug builds, a `Requested { text: None }` fallback in
+   release builds (a panic would abort the process).
 
 ## Options considered
 
@@ -84,7 +92,7 @@ Constraints any answer keeps:
 ## Consequences
 
 - Public surface, additive: `close` module, `CloseReason`, `LogoutCause`,
-  `LogoutInitiator`, `MAX_PEER_TEXT_LEN`, `connection::MAX_LOGOUT_TEXT_LEN`,
+  `LogoutInitiator`, `CloseReason::ConnectFailed`, `MAX_PEER_TEXT_LEN`, `connection::MAX_LOGOUT_TEXT_LEN`,
   `Application::on_session_closed` (defaulted),
   `Connection::close_reason`, `Connection::logout_with_text`, and the
   `reason` field of the `#[non_exhaustive]` `NotSentReason::SessionClosed`.

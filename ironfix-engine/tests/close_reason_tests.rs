@@ -922,3 +922,121 @@ async fn test_unwritten_logout_is_not_graceful() {
         other => panic!("expected LogoutUnwritten, got {other:?}"),
     }
 }
+
+/// A dial that fails after `on_create` reports `ConnectFailed` with the I/O
+/// error's kind, and the default does not forward it to `on_logout`.
+#[tokio::test]
+async fn test_connect_failure_reports_connect_failed() {
+    // Bind then drop a listener, so nothing listens on the port.
+    let listener = ok(tokio::net::TcpListener::bind("127.0.0.1:0").await, "bind");
+    let addr = ok(listener.local_addr(), "address");
+    drop(listener);
+
+    let app = Arc::new(RecordingApp::default());
+    let initiator = Initiator::new(client_config(), Arc::clone(&app));
+    assert!(matches!(
+        initiator.connect(addr).await,
+        Err(EngineError::Io(_))
+    ));
+    match app.reason() {
+        CloseReason::ConnectFailed {
+            kind, timed_out, ..
+        } => {
+            assert!(!timed_out);
+            assert_eq!(kind, Some(std::io::ErrorKind::ConnectionRefused));
+        }
+        other => panic!("expected ConnectFailed, got {other:?}"),
+    }
+    assert!(!app.reason().was_active());
+
+    let legacy = Arc::new(LegacyApp::default());
+    let initiator = Initiator::new(client_config(), Arc::clone(&legacy));
+    assert!(initiator.connect(addr).await.is_err());
+    assert_eq!(legacy.events(), ["create"], "no on_logout before Active");
+}
+
+/// A peer Logout Text with control characters reaches the reason escaped.
+#[tokio::test]
+async fn test_peer_logout_text_is_escaped() {
+    let app = Arc::new(RecordingApp::default());
+    let initiator = Initiator::new(client_config(), Arc::clone(&app));
+    let (connection, mut peer) = initiator_session(initiator, "30", PIPE_CAPACITY).await;
+    send(&mut peer, venue_msg("5", 2, &[(58, "line1\nline2\tend")])).await;
+    let _reply = next_of(&mut peer, "5").await;
+    match closed_with(&connection, &app).await {
+        CloseReason::PeerLogout { text, .. } => {
+            assert_eq!(text.as_deref(), Some("line1?line2?end"));
+        }
+        other => panic!("expected PeerLogout, got {other:?}"),
+    }
+}
+
+/// Leaves this session's Logout reply unframeable: an empty `Text` (58)
+/// has no legal wire form, so the reply is dropped.
+#[derive(Debug, Default)]
+struct UnframeableReplyApp {
+    inner: RecordingApp,
+}
+
+#[async_trait]
+impl Application for UnframeableReplyApp {
+    async fn on_create(&self, id: &SessionId) {
+        self.inner.on_create(id).await;
+    }
+    async fn on_logon(&self, id: &SessionId) {
+        self.inner.on_logon(id).await;
+    }
+    async fn on_logout(&self, id: &SessionId) {
+        self.inner.on_logout(id).await;
+    }
+    async fn on_session_closed(&self, id: &SessionId, reason: &CloseReason) {
+        self.inner.on_session_closed(id, reason).await;
+    }
+    async fn to_admin(&self, message: &mut OutboundMessage, _: &SessionId) {
+        if message.msg_type() == &MsgType::Logout {
+            message.push_str(58, "");
+        }
+    }
+    async fn from_admin(&self, _: &RawMessage<'_>, _: &SessionId) -> Result<(), RejectReason> {
+        Ok(())
+    }
+    async fn to_app(&self, _: &mut OutboundMessage, _: &SessionId) {}
+    async fn from_app(&self, _: &RawMessage<'_>, _: &SessionId) -> Result<(), RejectReason> {
+        Ok(())
+    }
+}
+
+/// A reply to the peer's Logout that is dropped before it is framed never
+/// reaches the peer: the close is `LogoutUnwritten`, not graceful, and
+/// `reset_on_logout` does not reset the store (codex review of PR #148).
+#[tokio::test]
+async fn test_dropped_logout_reply_is_not_graceful() {
+    let app = Arc::new(UnframeableReplyApp::default());
+    let store = Arc::new(MemoryStore::new());
+    let mut config = client_config();
+    config.reset_on_logout = true;
+    let initiator = Initiator::new(config, Arc::clone(&app)).with_store(store.clone());
+    let (connection, mut peer) = initiator_session(initiator, "30", PIPE_CAPACITY).await;
+    send(&mut peer, venue_msg("5", 2, &[])).await;
+    let reason = closed_with(&connection, &app.inner).await;
+    let reply = ok(timeout(STEP, peer.next()).await, "the peer sees the close");
+    assert!(reply.is_none(), "no Logout reply reached the peer");
+    assert!(!reason.is_graceful(), "got {reason:?}");
+    assert!(matches!(
+        reason,
+        CloseReason::LogoutUnwritten {
+            initiator: LogoutInitiator::Peer,
+            ..
+        }
+    ));
+    assert_eq!(
+        store.next_sender_seq(),
+        2,
+        "no reset: the sender counter is kept"
+    );
+    assert_eq!(
+        store.next_target_seq(),
+        3,
+        "no reset: the target counter is kept"
+    );
+}

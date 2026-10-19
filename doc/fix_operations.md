@@ -501,8 +501,12 @@ loop. Every session keeps its own sequence numbers, store and heartbeat.
   engine's.
 - A counterparty's Logout is answered with a Logout without `Text`, after
   any resend owed to it, within the logout timeout. Its `Text` is kept,
-  never parsed, bounded to 1024 bytes (`close::MAX_PEER_TEXT_LEN`, cut at a
-  character boundary).
+  never parsed, bounded to 1024 characters (`close::MAX_PEER_TEXT_LEN`),
+  every character outside printable ASCII (0x20 to 0x7E) replaced with `?`
+  so no control character or newline reaches a log or the application.
+  `logout_with_text` called once this session's Logout is already queued or
+  sent returns `Ok(())` and its text is dropped: only the first Logout
+  counts.
 - Every close reports a typed `CloseReason` to
   `Application::on_session_closed` and to `Connection::close_reason()`:
   `LocalLogout { cause, peer_text }` (our Logout acknowledged; `cause` is
@@ -513,8 +517,9 @@ loop. Every session keeps its own sequence numbers, store and heartbeat.
   transport closed or failed (`io::ErrorKind` when known), message too
   large, MsgSeqNum too low (expected, received), garbled-frame limit,
   identity mismatch (the tag), `SendingTime`, store failure, sequence
-  exhausted, application queue full. A Logon handshake that fails after
-  `on_create` reports `LogonFailed`. `CloseReason::is_graceful()` is the
+  exhausted, application queue full. After `on_create`, a TCP connect that
+  fails or times out reports `ConnectFailed { kind, timed_out }`, and a
+  Logon handshake that fails reports `LogonFailed`. `CloseReason::is_graceful()` is the
   flag `reset_on_logout` uses: true for the first three only.
 - No reason carries a frame: `Password` (554), `NewPassword` (925) and
   `RawData` (96) never appear in one.

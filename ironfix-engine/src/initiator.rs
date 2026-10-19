@@ -199,6 +199,7 @@
 //! ```
 
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
+use crate::close::CloseReason;
 use crate::connection::{Connection, SessionRuntime, report_handshake};
 use crate::error::EngineError;
 use crate::next_expected::{self, NextExpectedPlan};
@@ -661,11 +662,25 @@ impl<A: Application + 'static> Initiator<A> {
         let result = match timeout(self.connect_timeout, TcpStream::connect(addr)).await {
             Err(_) => {
                 let _ = session.disconnect();
-                Err(EngineError::ConnectTimeout(self.connect_timeout))
+                let reason = CloseReason::ConnectFailed {
+                    kind: None,
+                    timed_out: true,
+                };
+                self.application
+                    .on_session_closed(&session_id, &reason)
+                    .await;
+                return Err(EngineError::ConnectTimeout(self.connect_timeout));
             }
             Ok(Err(err)) => {
                 let _ = session.disconnect();
-                Err(err.into())
+                let reason = CloseReason::ConnectFailed {
+                    kind: Some(err.kind()),
+                    timed_out: false,
+                };
+                self.application
+                    .on_session_closed(&session_id, &reason)
+                    .await;
+                return Err(err.into());
             }
             // The only way to a TCP session: it sets TCP_NODELAY.
             Ok(Ok(stream)) => {

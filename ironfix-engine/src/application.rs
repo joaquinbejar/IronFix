@@ -169,7 +169,10 @@ pub trait Application: Send + Sync {
     /// [`Connection::wait_closed`](crate::Connection::wait_closed) returns),
     /// and also when a Logon handshake fails after
     /// [`Application::on_create`] has run, with
-    /// [`CloseReason::LogonFailed`].
+    /// [`CloseReason::LogonFailed`] (or [`CloseReason::ConnectFailed`] when
+    /// the dial itself fails). A handshake whose future the caller drops
+    /// before it completes gets no call: nothing can run asynchronously
+    /// from a drop.
     ///
     /// The default forwards to [`Application::on_logout`] when the session
     /// had reached Active ([`CloseReason::was_active`]), which is exactly

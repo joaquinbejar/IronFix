@@ -747,6 +747,7 @@ struct SessionClosed {
 }
 
 /// Builds a [`SessionClosed`] outcome.
+#[must_use]
 const fn closed(reason: CloseReason) -> SessionClosed {
     SessionClosed { reason }
 }
@@ -754,6 +755,7 @@ const fn closed(reason: CloseReason) -> SessionClosed {
 /// The close reason for a fatal error out of a send: a store failure under
 /// the fail-closed policy, an exhausted counter, a frame the codec would not
 /// take, or a failed write.
+#[must_use]
 fn send_failure_reason(err: &EngineError) -> CloseReason {
     match err {
         EngineError::Store(_) => CloseReason::StoreFailure {},
@@ -770,7 +772,8 @@ fn send_failure_reason(err: &EngineError) -> CloseReason {
 }
 
 /// The close reason for a fatal codec error, read or write.
-fn codec_failure_reason(err: &CodecError) -> CloseReason {
+#[must_use]
+const fn codec_failure_reason(err: &CodecError) -> CloseReason {
     match err {
         CodecError::MessageTooLarge { size, max_size } => CloseReason::MessageTooLarge {
             size: *size,
@@ -2206,6 +2209,15 @@ impl<A: Application> Reactor<A> {
     /// [`Phase::LogoutQueued`] records it; a missing one reads as a plain
     /// request rather than failing the close.
     fn take_logout_cause(&mut self) -> LogoutCause {
+        // `begin_logout` records the cause in the same step that moves the
+        // phase to LogoutQueued, so it is always present here. Debug builds
+        // assert that invariant; release builds keep the fallback, because
+        // reporting a plain request is better than a panic, which would
+        // abort the process under `panic = "abort"`.
+        debug_assert!(
+            self.logout_cause.is_some(),
+            "a Logout exchange of ours ended with no recorded cause"
+        );
         self.logout_cause
             .take()
             .unwrap_or(LogoutCause::Requested { text: None })
@@ -4157,8 +4169,10 @@ impl<A: Application> Reactor<A> {
     ///
     /// A reply the store refused under the fail-closed policy was never
     /// written: the exchange is incomplete, so the close is not graceful and
-    /// does not trigger `reset_on_logout`. Any other failure to reply keeps
-    /// the close graceful, as the counterparty has already logged out.
+    /// does not trigger `reset_on_logout`. A reply that is dropped (a
+    /// `to_admin` callback left it unframeable) or fails to feed is never
+    /// written either: the close is [`CloseReason::LogoutUnwritten`], not
+    /// graceful, and does not reset.
     async fn reply_owed_logout(
         &mut self,
         framed: &mut FixFramed,
@@ -4172,11 +4186,26 @@ impl<A: Application> Reactor<A> {
         }
         let text = self.logout_owed.take().and_then(|owed| owed.text);
         let logout = self.factory.logout(None);
-        if let Err(EngineError::Store(err)) = self.send_now(framed, logout).await {
-            return Err(self.close_on_store_failure(phase, &err));
-        }
+        let reason = CloseReason::PeerLogout { text };
+        let reason = match self.send_now(framed, logout).await {
+            Err(EngineError::Store(err)) => return Err(self.close_on_store_failure(phase, &err)),
+            // Fed to the write buffer: graceful once it is written whole,
+            // which the close-time check of the write mark decides.
+            Ok(Sent::Yes) => reason,
+            // No reply reached the buffer: a `to_admin` callback left it
+            // unframeable, or feeding it failed. The counterparty never sees
+            // our Logout, so the close is not graceful and
+            // `reset_on_logout` does not reset.
+            Ok(Sent::Dropped | Sent::Deferred) | Err(_) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    "the reply to the counterparty's Logout was not sent: not a graceful close"
+                );
+                reason.unwritten()
+            }
+        };
         teardown(phase);
-        Err(closed(CloseReason::PeerLogout { text }))
+        Err(closed(reason))
     }
 
     /// Holds a `ResendRequest` back behind the resend under way, unless one is

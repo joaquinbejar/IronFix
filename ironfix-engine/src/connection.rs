@@ -383,6 +383,12 @@ impl Connection {
     /// Logout before it is framed. The text is reported back in
     /// [`LogoutCause::Requested`] in the session's [`CloseReason`].
     ///
+    /// Only the first Logout counts. If this session's Logout is already
+    /// queued or sent (an earlier `logout`, dropped handles, a stalled
+    /// resend), this call still returns `Ok(())`, but its text is dropped
+    /// and nothing more goes on the wire; the close reason keeps the first
+    /// cause.
+    ///
     /// # Errors
     /// [`EngineError::InvalidField`] (tag 58) for an empty text, one longer
     /// than [`MAX_LOGOUT_TEXT_LEN`], or one with a byte outside 0x20 to 0x7E
