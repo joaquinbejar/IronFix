@@ -1263,3 +1263,77 @@ async fn test_cancelled_handshake_write_reports_interrupted() {
     ));
     recorder.assert_one_result_per_frame();
 }
+
+/// Regression (PR #149 review, codex's probe): timer-driven writes respect
+/// the bound on frames awaiting a write result. 8191 TestRequest replies and
+/// one ResendRequest reach the read limit with a gap still open; with
+/// `resend_timeout` 0 a retry is due on every tick, and none may be written.
+/// The stream then makes no progress and the write timeout closes the
+/// session.
+#[tokio::test]
+async fn test_resend_retry_cannot_bypass_a_full_observation_backlog() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let observer = Arc::new(Unresolved::default());
+    let config = member_config()
+        .with_resend_timeout(Duration::ZERO)
+        .with_max_resend_requests(10_000);
+    let initiator = Initiator::new(config, Arc::new(GateApp::default()))
+        .with_write_timeout(QUIET)
+        .with_frame_observer(Arc::clone(&observer) as Arc<dyn FrameObserver>);
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_CAPACITY);
+    let hold = Arc::new(AtomicBool::new(false));
+    let stream = FlushNever {
+        inner: client_io,
+        hold: Arc::clone(&hold),
+    };
+    let venue = async move {
+        let mut framed = Framed::new(venue_io, FixCodec::new());
+        let polled = ok(timeout(STEP, framed.next()).await, "the Logon arrives");
+        ok(some(polled, "the stream is open"), "the Logon frames");
+        ok(framed.send(venue_msg("A", 1, ACK)).await, "the venue acks");
+        framed
+    };
+    let (member, venue) = tokio::join!(initiator.establish(stream), venue);
+    let member = ok(member, "the member logs on");
+    hold.store(true, Ordering::SeqCst);
+    let (mut sink, mut source) = venue.split();
+    let reader = tokio::spawn(async move { while source.next().await.is_some() {} });
+    for seq in 2..8193 {
+        ok(
+            sink.send(venue_msg("1", seq, &[(112, "PROBE")])).await,
+            "a TestRequest",
+        );
+    }
+    // 8193 is missing, so recovery stays armed once reading stops.
+    ok(
+        sink.send(venue_msg("0", 8194, &[])).await,
+        "the gapped frame",
+    );
+    ok(
+        timeout(Duration::from_secs(10), async {
+            while observer.outbound.load(Ordering::SeqCst) < 8259 && member.close_reason().is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await,
+        "the session closes, or the retries pass the bound",
+    );
+    let observed = observer.outbound.load(Ordering::SeqCst);
+    assert!(
+        observed <= 8257,
+        "timer retries bypass the bound: {observed} frames observed, close {:?}",
+        member.close_reason()
+    );
+    closed(&member, "the write timeout closes the session").await;
+    assert!(matches!(
+        member.close_reason(),
+        Some(ironfix_engine::CloseReason::WriteTimeout { .. })
+    ));
+    assert_eq!(
+        observer.outbound.load(Ordering::SeqCst),
+        observer.results.load(Ordering::SeqCst),
+        "every observed frame got its result at the close"
+    );
+    reader.abort();
+}

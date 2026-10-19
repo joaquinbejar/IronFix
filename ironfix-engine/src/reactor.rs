@@ -3459,6 +3459,20 @@ impl<A: Application> Reactor<A> {
             return Ok(phase);
         }
 
+        // With a frame observer and the frames awaiting a write result at
+        // their bound, the tick writes nothing new either (no ResendRequest
+        // retry, TestRequest or Heartbeat): a stream that takes every byte
+        // but never completes a flush must stop making progress, so the
+        // write timeout can close the session. Only the deadlines are
+        // checked.
+        if self.writer.observed_full() {
+            if lock_heartbeat(&self.runtime).is_timed_out() {
+                teardown(phase);
+                return Err(closed(CloseReason::HeartbeatTimeout {}));
+            }
+            return Ok(phase);
+        }
+
         // A gap that is making no progress is chased on its own clock,
         // independent of the heartbeat: gapped frames keep the heartbeat alive,
         // so this is the only thing that bounds an unsatisfied resend.

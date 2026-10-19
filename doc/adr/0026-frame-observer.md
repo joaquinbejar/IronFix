@@ -82,13 +82,6 @@ Constraints any answer keeps:
    `connect`, `establish`, `serve` or `serve_stream`) reports `Unknown` with
    `Interrupted` through a drop guard. A reactor task dropped by a runtime
    shutting down reports nothing more: that is the one limit.
-9. **Bounded pending results.** A stream can accept every byte and leave its
-   flush pending, so the byte marks alone do not bound the frames awaiting a
-   result. With an observer, no live message is taken and no resend step fed
-   while 4096 frames await one, and reading pauses at 8192. Nothing new is
-   then written, the stream makes no progress, and the write timeout closes
-   the session, resolving them `Unknown`. Without an observer the queue is
-   empty and nothing changes.
 6. **Panics** are not caught. The release profile is `panic = "abort"`, so an
    observer that panics takes the process down; this is documented on the
    trait. Catching with `catch_unwind` would cost an unwind boundary per
@@ -102,7 +95,16 @@ Constraints any answer keeps:
    (which attaches it in every terminal method, each `Acceptor` of a registry
    included). The observer is bound to the session's `SessionId` (an `Arc`
    clone plus a `SessionId` clone) a few times per session: for the
-   handshake reads, each handshake write and the reactor. Never per frame.
+   handshake reads, each handshake write and the reactor. The active reactor
+   reuses its binding.
+9. **Bounded pending results.** A stream can accept every byte and leave its
+   flush pending, so the byte marks alone do not bound the frames awaiting a
+   result. With an observer, no live message is taken and no resend step fed
+   while 4096 frames await one, the tick writes no ResendRequest retry,
+   TestRequest or Heartbeat, and reading pauses at 8192. Nothing new is
+   then written, the stream makes no progress, and the write timeout closes
+   the session, resolving them `Unknown`. Without an observer the queue is
+   empty and nothing changes.
 
 ## Consequences
 
