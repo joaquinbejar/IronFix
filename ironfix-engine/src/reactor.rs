@@ -1566,6 +1566,16 @@ const OBSERVED_LIVE_LIMIT: usize = 4096;
 /// grow the queue past it by more than one frame's replies.
 const OBSERVED_READ_LIMIT: usize = 2 * OBSERVED_LIVE_LIMIT;
 
+/// Tracked receipts awaiting their write result above which no live message
+/// is taken ([`Writer::receipts_full`]), issue #150.
+///
+/// Only a live tracked send adds a receipt, so stopping live sends is enough
+/// to hold the queue at this bound. As for [`OBSERVED_LIVE_LIMIT`], a stream
+/// that accepts every byte but never completes a flush then makes no
+/// progress, and the write timeout closes the session, resolving every
+/// receipt still pending as [`SendOutcome::Unknown`].
+const RECEIPT_LIVE_LIMIT: usize = 4096;
+
 impl Writer {
     /// A writer framing outbound bytes under `max_message_size`, with no
     /// output waiting.
@@ -1630,6 +1640,14 @@ impl Writer {
     #[must_use]
     fn observed_full(&self) -> bool {
         self.observed.len() >= OBSERVED_LIVE_LIMIT
+    }
+
+    /// Whether the tracked receipts awaiting a write result have reached
+    /// [`RECEIPT_LIVE_LIMIT`]: no more live messages are taken until the
+    /// stream accepts their frames or a failure resolves them.
+    #[must_use]
+    fn receipts_full(&self) -> bool {
+        self.receipts.len() >= RECEIPT_LIVE_LIMIT
     }
 
     /// Whether the observed frames awaiting a write result have reached
@@ -2294,7 +2312,9 @@ async fn run_reactor<A: Application + 'static>(
         // completes a flush empties the byte buffer while that queue grows.
         let observed_room = !ctx.writer.observed_full();
         let resend_ready = resending && waiting < WRITE_BUFFER_HIGH_WATER && observed_room;
-        let live_room = waiting < LIVE_HIGH_WATER && observed_room;
+        // Tracked receipts are bounded the same way (issue #150); only a
+        // live send adds one, so only live sends stop.
+        let live_room = waiting < LIVE_HIGH_WATER && observed_room && !ctx.writer.receipts_full();
         // While a resend is under way and the messages held behind it fill
         // the hold, nothing more is read: a reply to the next inbound frame
         // could only be held past the bound or written in the middle of the
@@ -3210,6 +3230,12 @@ impl<A: Application> Reactor<A> {
             self.writer.fed_new(seq);
             if let Some(mut receipt) = receipt.take() {
                 receipt.writing(seq);
+                // Only a live tracked send reaches here, and none is taken
+                // once the queue is full (issue #150).
+                debug_assert!(
+                    self.writer.receipts.len() < RECEIPT_LIVE_LIMIT,
+                    "a tracked send was admitted past RECEIPT_LIVE_LIMIT"
+                );
                 self.writer.receipts.push_back(PendingReceipt {
                     seq,
                     sending_time: precision.truncate(stamped),
@@ -6384,6 +6410,27 @@ mod tests {
             unreachable!("CLIENT and VENUE are valid CompIDs")
         };
         SessionConfig::new(sender, target, "FIX.4.4").with_max_resend_requests(limit)
+    }
+
+    #[test]
+    fn test_writer_receipts_full_at_the_live_limit() {
+        let mut writer = Writer::new(4096);
+        let mut waiting = Vec::with_capacity(RECEIPT_LIVE_LIMIT);
+        for seq in 1..=RECEIPT_LIVE_LIMIT as u64 {
+            assert!(!writer.receipts_full(), "room below the limit at {seq}");
+            let (receipt, rx) = Receipt::new();
+            waiting.push(rx);
+            writer.receipts.push_back(PendingReceipt {
+                seq,
+                sending_time: Timestamp::now(),
+                filed: false,
+                end: None,
+                receipt,
+            });
+        }
+        assert!(writer.receipts_full(), "no live send past the limit");
+        writer.receipts.clear();
+        assert!(!writer.receipts_full());
     }
 
     #[test]
