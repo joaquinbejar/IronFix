@@ -431,7 +431,10 @@ completion). So while a resend is under way:
   session out without ever asking (#128). Whether the written request is
   charged belongs to the gap, not the held marker, so a gap that closes takes
   its charge with it and a later uncharged gap reusing the marker is not
-  charged. Messages released from the gap queue while a resend is under way
+  charged. The charge is taken when the held request is written, whatever
+  the outcome (a vetoed request costs nothing and leaves nothing owed), and
+  any attempt the gap is charged for, a stall retry included, settles it.
+  Messages released from the gap queue while a resend is under way
   stop at the hold's bounds too, and resume once it is done;
 - the tick sends no Heartbeat or TestRequest (resend frames are traffic) and
   does not chase a stalled gap of this session's own (its request could not go

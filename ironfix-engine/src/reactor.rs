@@ -1291,6 +1291,9 @@ impl ResendState {
     /// Records that another request for this same gap has gone out.
     fn record_retry(&mut self) {
         self.requested_at = Instant::now();
+        // Any charged request settles what a held one owed: a later held
+        // request in this gap is charged only if armed again (issue #128).
+        self.charge_on_write = false;
         // `attempts` never passes `limit` (a u32) by more than the one
         // request `can_retry` allowed, so this cannot overflow; if it ever
         // did, the count stays at its ceiling, which already refuses a retry.
@@ -5122,6 +5125,15 @@ impl<A: Application> Reactor<A> {
                     None => continue,
                 },
             };
+            // The held request is consumed by this write, whatever its
+            // outcome: the charge it owed is taken now, and paid only if the
+            // request goes out. A request `to_admin` vetoes costs nothing and
+            // leaves no charge behind for a later request in the same gap.
+            let charge = request
+                && self
+                    .resend
+                    .as_mut()
+                    .is_some_and(|state| std::mem::take(&mut state.charge_on_write));
             match self.send_now_tracked(framed, pending, receipt).await {
                 Err(EngineError::Store(err)) => {
                     return Err(self.close_on_store_failure(phase, &err));
@@ -5132,10 +5144,9 @@ impl<A: Application> Reactor<A> {
                 }
                 Ok(Sent::Yes) if request => {
                     // The stall clock runs from when the request went out,
-                    // and a gap whose request is charged pays its attempt
-                    // only now that it has.
+                    // and a charged request pays its attempt now that it has.
                     if let Some(state) = self.resend.as_mut() {
-                        if std::mem::take(&mut state.charge_on_write) {
+                        if charge {
                             state.record_retry();
                         } else {
                             state.restart_clock();

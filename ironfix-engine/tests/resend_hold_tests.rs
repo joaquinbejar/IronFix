@@ -962,3 +962,88 @@ async fn test_acceptor_closed_gap_charge_does_not_outlive_it() {
 async fn test_initiator_closed_gap_charge_does_not_outlive_it() {
     closed_gap_charge_does_not_outlive_it(Role::Initiator).await;
 }
+
+/// With `max_resend_requests` = 2: while the engine resends, a gap opens and
+/// its held request is vetoed by `to_admin`. The stall retry then goes out
+/// (attempt 1). A second resend is asked for, and during it a spanning
+/// possible-duplicate fill draws an uncharged re-request in the same gap,
+/// held and written after it. The vetoed request's charge must not attach to
+/// it: when the gap stalls again one more retry goes out, not a Logout.
+///
+/// Real time: the resend retry timeout reads `std::time::Instant`.
+async fn vetoed_charge_does_not_outlive_its_request(role: Role) {
+    let mut setup = Setup::new(role);
+    setup.store = Some(Arc::new(SlowStore::backlog(role, 300, 500).await));
+    setup.config = setup
+        .config
+        .with_max_resend_requests(2)
+        .with_resend_timeout(Duration::from_millis(300));
+    setup.app = Arc::new(App {
+        drop_first_resend_request: true,
+        ..App::default()
+    });
+    let (mut framed, connection) = setup.open(3).await;
+    ok(framed.send(resend_all(role, 4)).await, "the ResendRequest");
+    ok(
+        framed.send(role.peer_msg("0", 6, &[])).await,
+        "a gapped Heartbeat",
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    read_resend(&mut framed, 300).await;
+    // The held request was vetoed; the stall retry is attempt 1.
+    let retry = next_frame(&mut framed).await;
+    assert_eq!(msg_type_of(&retry), "2", "the stall retry");
+    assert_eq!(field(&retry, 7).as_deref(), Some("5"));
+    assert_eq!(seq_of(&retry), 303);
+    // A second resend, and inside it a spanning fill below the expectation.
+    ok(
+        framed.send(resend_all(role, 7)).await,
+        "a second ResendRequest",
+    );
+    ok(
+        framed
+            .send(role.peer_msg(
+                "4",
+                4,
+                &[
+                    (43, "Y"),
+                    (122, "20261019-12:00:00.000"),
+                    (123, "Y"),
+                    (36, "9"),
+                ],
+            ))
+            .await,
+        "a spanning possible-duplicate gap fill",
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut rerequest = None;
+    while rerequest.is_none() {
+        let frame = next_frame(&mut framed).await;
+        if !poss_dup(&frame) {
+            rerequest = Some(frame);
+        }
+    }
+    let rerequest = rerequest.unwrap_or_default();
+    assert_eq!(msg_type_of(&rerequest), "2", "the uncharged re-request");
+    assert_eq!(field(&rerequest, 7).as_deref(), Some("5"));
+    let last = next_frame(&mut framed).await;
+    assert_eq!(
+        msg_type_of(&last),
+        "2",
+        "attempt 2, not a Logout: the vetoed request's charge did not carry over"
+    );
+    assert_eq!(field(&last, 7).as_deref(), Some("5"));
+    assert!(!connection.is_closed());
+}
+
+/// A vetoed held request leaves no charge behind (acceptor).
+#[tokio::test]
+async fn test_acceptor_vetoed_charge_does_not_outlive_its_request() {
+    vetoed_charge_does_not_outlive_its_request(Role::Acceptor).await;
+}
+
+/// A vetoed held request leaves no charge behind (initiator).
+#[tokio::test]
+async fn test_initiator_vetoed_charge_does_not_outlive_its_request() {
+    vetoed_charge_does_not_outlive_its_request(Role::Initiator).await;
+}
