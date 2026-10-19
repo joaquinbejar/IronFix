@@ -1040,3 +1040,86 @@ async fn test_dropped_logout_reply_is_not_graceful() {
         "no reset: the target counter is kept"
     );
 }
+
+/// A stream whose writes succeed and whose flush fails once `fail` is set.
+#[derive(Debug)]
+struct FailFlushAfterWrite {
+    inner: DuplexStream,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl tokio::io::AsyncRead for FailFlushAfterWrite {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for FailFlushAfterWrite {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return std::task::Poll::Ready(Err(std::io::Error::other(
+                "injected flush failure after an accepted write",
+            )));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A Logout reply the stream accepted whole, whose flush then failed, did
+/// reach the peer: the close stays a graceful `PeerLogout` (codex review of
+/// PR #148 at 353d844).
+#[tokio::test]
+async fn test_whole_logout_reply_with_failed_flush_stays_graceful() {
+    let app = Arc::new(RecordingApp::default());
+    let store = Arc::new(MemoryStore::new());
+    let mut config = client_config();
+    config.reset_on_logout = true;
+    let initiator = Initiator::new(config, Arc::clone(&app)).with_store(store.clone());
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_CAPACITY);
+    let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stream = FailFlushAfterWrite {
+        inner: client_io,
+        fail: Arc::clone(&fail),
+    };
+    let establishing = tokio::spawn(async move { initiator.establish(stream).await });
+    let mut peer = Framed::new(venue_io, FixCodec::new());
+    assert_eq!(msg_type_of(&next_frame(&mut peer).await), "A");
+    send(&mut peer, venue_msg("A", 1, &[(98, "0"), (108, "30")])).await;
+    let connection = ok(ok(establishing.await, "join"), "establish");
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    send(&mut peer, venue_msg("5", 2, &[])).await;
+    let reply = next_frame(&mut peer).await;
+    assert_eq!(
+        msg_type_of(&reply),
+        "5",
+        "the peer received the whole reply"
+    );
+    assert_eq!(field(&reply, 34).as_deref(), Some("2"));
+    let reason = closed_with(&connection, &app).await;
+    assert!(
+        matches!(reason, CloseReason::PeerLogout { .. }),
+        "the whole reply reached the peer, got {reason:?}"
+    );
+    assert!(reason.is_graceful());
+    assert_eq!(store.next_sender_seq(), 1, "reset_on_logout ran");
+}

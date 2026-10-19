@@ -1299,6 +1299,13 @@ impl Writer {
         self.logout.unwritten()
     }
 
+    /// Whether the Logout fed last has been written whole, without taking
+    /// the flag ([`Reactor::advance_logout`] takes it).
+    #[must_use]
+    const fn logout_written(&self) -> bool {
+        self.logout.written
+    }
+
     /// Records that the stream accepted `moved` bytes from the front of the
     /// buffer.
     const fn wrote(&mut self, moved: usize) {
@@ -4192,7 +4199,13 @@ impl<A: Application> Reactor<A> {
             // Fed to the write buffer: graceful once it is written whole,
             // which the close-time check of the write mark decides.
             Ok(Sent::Yes) => reason,
-            // No reply reached the buffer: a `to_admin` callback left it
+            // The stream accepted the whole reply before the failure (a
+            // flush that failed after the write, typically): the peer can
+            // decode it, so the exchange is complete and the close stays
+            // graceful.
+            Err(_) if self.writer.logout_written() => reason,
+            // No reply reached the buffer, or not all of it reached the
+            // stream: a `to_admin` callback left it
             // unframeable, or feeding it failed. The counterparty never sees
             // our Logout, so the close is not graceful and
             // `reset_on_logout` does not reset.

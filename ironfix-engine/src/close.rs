@@ -47,8 +47,11 @@ use ironfix_session::sequence::SequenceCounter;
 use std::fmt;
 use std::time::Duration;
 
-/// The most bytes of a counterparty's Logout `Text` (58) a [`CloseReason`]
-/// keeps; a longer text is cut at the last character boundary below it.
+/// The most characters of a counterparty's Logout `Text` (58) a
+/// [`CloseReason`] keeps. The text is escaped character by character: each
+/// one outside printable ASCII (0x20 to 0x7E) becomes `?`, so the kept text
+/// is ASCII and at most this many bytes; characters past the limit are
+/// dropped.
 pub const MAX_PEER_TEXT_LEN: usize = 1024;
 
 /// Who started a Logout exchange.
@@ -124,9 +127,11 @@ pub enum CloseReason {
         cause: LogoutCause,
     },
     /// A Logout exchange ended but this session's own Logout (its request,
-    /// or its reply) was still in the write buffer and was never written
-    /// whole. Not graceful: `reset_on_logout` does not reset, and the
-    /// counterparty may have seen no Logout from this session.
+    /// or its reply) never reached the stream whole: it was still in the
+    /// write buffer, or the reply was dropped before it was framed (a
+    /// `to_admin` callback left it unframeable) or failed to feed. Not
+    /// graceful: `reset_on_logout` does not reset, and the counterparty may
+    /// have seen no Logout from this session.
     #[non_exhaustive]
     LogoutUnwritten {
         /// Who started the exchange.
