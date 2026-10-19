@@ -1732,6 +1732,8 @@ pub(crate) struct MessageFactory {
     /// Reused across every message: [`Encoder::clear`] rewinds it while
     /// retaining its buffer, so framing does not allocate per message.
     encoder: Encoder,
+    /// The session's `max_message_size`: the largest frame the codec feeds.
+    max_message_size: usize,
 }
 
 impl MessageFactory {
@@ -1747,7 +1749,16 @@ impl MessageFactory {
             sender_location_id: config.sender_location_id.clone(),
             target_location_id: config.target_location_id.clone(),
             encoder: Encoder::new(version.begin_string()),
+            max_message_size: config.max_message_size,
         }
+    }
+
+    /// The session's `max_message_size`, in bytes: a frame longer than this
+    /// is refused before it is filed or spends a number.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn max_message_size(&self) -> usize {
+        self.max_message_size
     }
 
     /// Returns the precision this session writes `SendingTime` (52) and

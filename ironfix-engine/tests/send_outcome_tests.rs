@@ -29,6 +29,10 @@
 //! Issue #139, in both roles: a message above `max_message_size` is refused
 //! before it is filed and spends no number; `Sent` resolves for a frame once
 //! its last byte is written, while later output is still buffered.
+//! Issue #150, in both roles: over a stream whose flush never completes,
+//! every tracked send resolves and the write timeout closes the session; a
+//! handshake Logon above `max_message_size` is refused with a typed error
+//! before it is filed.
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -1963,4 +1967,258 @@ async fn test_sent_resolves_per_frame_behind_a_slow_reader_on_the_acceptor() {
     assert_sent_per_frame(&venue, &mut member).await;
     drop(member);
     closed(&venue, "the session closes once the member is gone").await;
+}
+
+/// A stream that accepts every byte but, once `hold` is set, never completes
+/// a flush (issue #150).
+struct FlushNever {
+    inner: DuplexStream,
+    hold: Arc<AtomicBool>,
+}
+
+impl tokio::io::AsyncRead for FlushNever {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for FlushNever {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.hold.load(Ordering::SeqCst) {
+            return std::task::Poll::Pending;
+        }
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Tracked sends issued concurrently in the flush tests: more than the
+/// reactor's pending-receipt limit (4096), so a queue that grew with every
+/// tracked send would cross it.
+const FLUSH_NEVER_SENDS: usize = 6_000;
+
+/// Reads and drops everything `io` delivers, so the pipe never fills.
+async fn drain(mut io: DuplexStream) {
+    let mut sink = vec![0u8; 64 * 1024];
+    while let Ok(read) = tokio::io::AsyncReadExt::read(&mut io, &mut sink).await {
+        if read == 0 {
+            break;
+        }
+    }
+}
+
+/// Issue #150: once `hold` is set, the stream behind `sender` takes every
+/// byte and never completes a flush. [`FLUSH_NEVER_SENDS`] tracked sends are
+/// issued at once; every one resolves (`Sent` once its bytes are accepted,
+/// `Unknown` or `NotSent` at the close), the session closes on its write
+/// timeout, and no receipt is left waiting. In debug builds the reactor
+/// asserts that the pending-receipt queue never passes its limit.
+async fn assert_flush_never_resolves_every_receipt(sender: &Connection, hold: &AtomicBool) {
+    hold.store(true, Ordering::SeqCst);
+    let sends: Vec<JoinHandle<SendOutcome>> = (0..FLUSH_NEVER_SENDS)
+        .map(|index| {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send_tracked(order(&format!("F-{index}"))).await })
+        })
+        .collect();
+    ok(
+        timeout(Duration::from_secs(30), sender.wait_closed()).await,
+        "the write timeout closes a session whose flush never completes",
+    );
+    let (mut written, mut unknown, mut not_sent) = (0usize, 0usize, 0usize);
+    for send in sends {
+        let outcome = ok(
+            ok(
+                timeout(STEP, send).await,
+                "every tracked send resolves after the close",
+            ),
+            "the tracked send task completes",
+        );
+        match outcome {
+            SendOutcome::Sent { .. } => written += 1,
+            SendOutcome::Unknown { .. } => unknown += 1,
+            SendOutcome::NotSent { .. } => not_sent += 1,
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+    assert_eq!(written + unknown + not_sent, FLUSH_NEVER_SENDS);
+    assert!(written > 0, "frames whose bytes were accepted resolve Sent");
+}
+
+#[tokio::test]
+async fn test_flush_that_never_completes_resolves_every_receipt_on_the_initiator() {
+    let (app, _rx) = GateApp::new();
+    let initiator = Initiator::new(member_config(), app)
+        .with_write_timeout(QUIET)
+        .with_outbound_capacity(16);
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_CAPACITY);
+    let hold = Arc::new(AtomicBool::new(false));
+    let stream = FlushNever {
+        inner: client_io,
+        hold: Arc::clone(&hold),
+    };
+    let venue = tokio::spawn(async move {
+        let mut framed = Framed::new(venue_io, FixCodec::new());
+        let logon = next_frame(&mut framed).await;
+        assert_eq!(field(&logon, 35).as_deref(), Some("A"));
+        venue_send(&mut framed, venue_msg("A", 1, ACK)).await;
+        drain(framed.into_inner()).await;
+    });
+    let member = ok(initiator.establish(stream).await, "the member logs on");
+    assert_flush_never_resolves_every_receipt(&member, &hold).await;
+    venue.abort();
+}
+
+#[tokio::test]
+async fn test_flush_that_never_completes_resolves_every_receipt_on_the_acceptor() {
+    let (app, _rx) = GateApp::new();
+    let acceptor = Acceptor::new(venue_config(), app)
+        .with_write_timeout(QUIET)
+        .with_outbound_capacity(16);
+    let (venue_io, client_io) = tokio::io::duplex(PIPE_CAPACITY);
+    let hold = Arc::new(AtomicBool::new(false));
+    let stream = FlushNever {
+        inner: venue_io,
+        hold: Arc::clone(&hold),
+    };
+    let served = tokio::spawn(async move { acceptor.serve_stream(stream).await });
+    let mut framed = Framed::new(client_io, FixCodec::new());
+    venue_send(&mut framed, frame_from("CLIENT", "VENUE", "A", 1, ACK)).await;
+    let ack = next_frame(&mut framed).await;
+    assert_eq!(field(&ack, 35).as_deref(), Some("A"));
+    let venue = ok(
+        joined(served, "the acceptor handshake ends").await,
+        "the acceptor logs on",
+    );
+    let member = tokio::spawn(drain(framed.into_inner()));
+    assert_flush_never_resolves_every_receipt(&venue, &hold).await;
+    member.abort();
+}
+
+/// An application whose `to_admin` pushes a Text (58) of
+/// [`OVERSIZED_TEXT`] bytes onto every outbound Logon, taking it past
+/// [`SMALL_MAX_MESSAGE`].
+#[derive(Debug)]
+struct InflatingLogonApp;
+
+#[async_trait]
+impl Application for InflatingLogonApp {
+    async fn on_create(&self, _session_id: &SessionId) {}
+
+    async fn on_logon(&self, _session_id: &SessionId) {}
+
+    async fn on_logout(&self, _session_id: &SessionId) {}
+
+    async fn to_admin(&self, message: &mut OutboundMessage, _session_id: &SessionId) {
+        if *message.msg_type() == MsgType::Logon {
+            message.push_str(58, &"X".repeat(OVERSIZED_TEXT));
+        }
+    }
+
+    async fn from_admin(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+
+    async fn to_app(&self, _message: &mut OutboundMessage, _session_id: &SessionId) {}
+
+    async fn from_app(
+        &self,
+        _message: &RawMessage<'_>,
+        _session_id: &SessionId,
+    ) -> Result<(), RejectReason> {
+        Ok(())
+    }
+}
+
+/// Asserts that a handshake failed with the typed `MessageTooLarge`, and
+/// that the store filed nothing and spent no number for the oversized
+/// Logon.
+#[track_caller]
+fn assert_oversized_logon_refused<T: std::fmt::Debug>(
+    result: Result<T, ironfix_engine::EngineError>,
+    store: &MemoryStore,
+) {
+    match result {
+        Err(ironfix_engine::EngineError::Codec(
+            ironfix_transport::CodecError::MessageTooLarge { size, max_size },
+        )) => {
+            assert_eq!(max_size, SMALL_MAX_MESSAGE);
+            assert!(size > SMALL_MAX_MESSAGE, "{size}");
+        }
+        other => panic!("expected MessageTooLarge, got {other:?}"),
+    }
+    assert_eq!(store.message_count(), 0, "the oversized Logon is not filed");
+    assert_eq!(store.next_sender_seq(), 1, "no number is spent");
+}
+
+/// Follow-up to #139: an initiator's Logon above `max_message_size` is
+/// refused before it is filed, with a typed error, and nothing reaches the
+/// venue.
+#[tokio::test]
+async fn test_oversized_logon_is_refused_before_filing_on_the_initiator() {
+    let store = Arc::new(MemoryStore::new());
+    let initiator = Initiator::new(
+        member_config().with_max_message_size(SMALL_MAX_MESSAGE),
+        Arc::new(InflatingLogonApp),
+    )
+    .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_CAPACITY);
+    let result = ok(
+        timeout(STEP, initiator.establish(client_io)).await,
+        "the handshake ends",
+    );
+    assert_oversized_logon_refused(result, &store);
+    let mut venue = Framed::new(venue_io, FixCodec::new());
+    match timeout(QUIET, venue.next()).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(frame)) => panic!("nothing reaches the venue, got {frame:?}"),
+    }
+}
+
+/// Follow-up to #139: an acceptor's Logon acknowledgement above
+/// `max_message_size` is refused before it is filed, with a typed error,
+/// and no acknowledgement reaches the member.
+#[tokio::test]
+async fn test_oversized_logon_ack_is_refused_before_filing_on_the_acceptor() {
+    let store = Arc::new(MemoryStore::new());
+    let acceptor = Acceptor::new(
+        venue_config().with_max_message_size(SMALL_MAX_MESSAGE),
+        Arc::new(InflatingLogonApp),
+    )
+    .with_store(Arc::clone(&store) as Arc<dyn MessageStore>);
+    let (client_io, venue_io) = tokio::io::duplex(PIPE_CAPACITY);
+    let served = tokio::spawn(async move { acceptor.serve_stream(venue_io).await });
+    let mut member = Framed::new(client_io, FixCodec::new());
+    venue_send(&mut member, frame_from("CLIENT", "VENUE", "A", 1, ACK)).await;
+    let result = joined(served, "the acceptor handshake ends").await;
+    assert_oversized_logon_refused(result, &store);
+    match timeout(QUIET, member.next()).await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(frame)) => panic!("no acknowledgement reaches the member, got {frame:?}"),
+    }
 }
