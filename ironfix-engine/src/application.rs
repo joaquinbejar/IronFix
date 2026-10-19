@@ -126,6 +126,11 @@ impl RejectReason {
 /// moved off the reactor: the message they hand back is the one that gets a
 /// sequence number. A slow implementation delays the session's own timers.
 ///
+/// [`Application::to_app_resend`] runs inline too, on each filed application
+/// frame a resend is about to replay, because its verdict decides whether
+/// that number is resent or gap-filled. While it is pending the session
+/// pauses entirely, as for any inline callback.
+///
 /// [`Application::from_admin`] also runs inline, because its verdict decides
 /// what the session does next — whether a `SequenceReset` is applied, whether
 /// the Logon is accepted — and that decision cannot be taken before the
@@ -477,9 +482,15 @@ pub trait Application: Send + Sync {
     /// administrative messages never reach this method: they are gap-filled
     /// on a resend whatever it would say.
     ///
-    /// The verdict is awaited while the resend holds every new message back,
-    /// so a slow gate delays the session's new traffic; build it with
-    /// [`SendVerdict::ready`] when the decision can be taken at once.
+    /// **The session waits with it.** The verdict is awaited inline by the
+    /// session reactor, as [`SendVerdict::new`] documents for every inline
+    /// gate: while it is pending the session reads nothing from the socket
+    /// (a counterparty's Logout included), flushes nothing it has buffered
+    /// (earlier replays included), runs none of its timers, and answers no
+    /// Heartbeat or TestRequest, so a slow decision can time the session
+    /// out. Every new message also stays held behind the resend. Build the
+    /// verdict with [`SendVerdict::ready`] when the decision can be taken at
+    /// once, and bound any decision that must wait.
     ///
     /// A wrapper that delegates to an inner application must forward this
     /// method too, or the inner gate is skipped for replays.

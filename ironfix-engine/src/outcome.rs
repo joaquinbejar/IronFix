@@ -54,7 +54,9 @@
 //!   survive a restart, and an [`ironfix_store::FileStore`] that does not sync
 //!   every write may lose it to an operating-system crash;
 //! - the counterparty asks for it, with a `ResendRequest` (2) or a
-//!   `NextExpectedMsgSeqNum` (789) at or below it.
+//!   `NextExpectedMsgSeqNum` (789) at or below it;
+//! - [`Application::to_app_resend`](crate::Application::to_app_resend)
+//!   allows the replay (the default does); a veto gap-fills it instead.
 //!
 //! Otherwise a `ResendRequest` covering it is answered with a
 //! `SequenceReset`-GapFill, or never made.
@@ -77,8 +79,9 @@
 //! the filing failed or timed out and the frame went out anyway. False means
 //! filing was not confirmed, not that the store lacks the frame: a store can
 //! save it and still return an error, so a `ResendRequest` covering it is
-//! answered with the frame if the store holds it and with a
-//! `SequenceReset`-GapFill if it does not. Accepted means handed to the
+//! answered with the frame if the store holds it and
+//! [`Application::to_app_resend`](crate::Application::to_app_resend) allows
+//! it, and with a `SequenceReset`-GapFill otherwise. Accepted means handed to the
 //! stream in full: the bytes may still sit in an operating-system or TLS
 //! buffer, and `Sent` is **not** an acknowledgement: nothing at the FIX layer
 //! says the counterparty has received or processed them.
@@ -125,14 +128,17 @@ pub enum SendOutcome {
         sending_time: Timestamp,
         /// Whether the attached store confirmed it filed the frame. True means
         /// the store accepted it, so a `ResendRequest` (2) covering it replays
-        /// it while the store holds it. False means filing was **not
+        /// it while the store holds it, unless
+        /// [`Application::to_app_resend`](crate::Application::to_app_resend)
+        /// vetoes the replay, which gap-fills it. False means filing was **not
         /// confirmed**: always without a store, and under
         /// [`StoreFailurePolicy::Continue`](crate::StoreFailurePolicy::Continue)
         /// when the store call returned an error or timed out and the frame
         /// went out anyway. A store can fail after it saved the frame, so an
         /// unconfirmed frame may or may not be replayed: a `ResendRequest`
-        /// covering it is answered with the frame if the store holds it, and
-        /// with a `SequenceReset`-GapFill if it does not.
+        /// covering it is answered with the frame if the store holds it and
+        /// `to_app_resend` allows it, and with a `SequenceReset`-GapFill
+        /// otherwise.
         filed: bool,
     },
     /// No byte of the frame reached the stream, and no `MsgSeqNum` was spent
@@ -151,7 +157,9 @@ pub enum SendOutcome {
     /// The `MsgSeqNum` stays spent. The frame is replayed under it, with
     /// `PossDupFlag` (43) = Y, only if it was filed, the store was not reset
     /// at the close or by the next Logon's `ResetSeqNumFlag` (141), the store
-    /// still holds it, and the counterparty asks for it. The session closes:
+    /// still holds it, the counterparty asks for it, and
+    /// [`Application::to_app_resend`](crate::Application::to_app_resend)
+    /// allows the replay (a veto gap-fills it). The session closes:
     /// a stream whose write did not complete cannot carry the next frame.
     #[non_exhaustive]
     Unknown {

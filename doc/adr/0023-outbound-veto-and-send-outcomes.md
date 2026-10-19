@@ -164,8 +164,10 @@ same, a risk gate closed after a send (a kill switch engaged after an
   (43) and `OrigSendingTime` (122) handling `wire::resend_frame` gave it
   before; replay order is unchanged; and the resend still runs ahead of new
   numbers: the gate is awaited inside the resend, while every new message is
-  held behind it (#79, #128), so a slow gate delays new traffic rather than
-  letting it overtake the resend.
+  held behind it (#79, #128), so new traffic never overtakes the resend.
+  Like every inline callback (see `SendVerdict::new`), a pending verdict
+  pauses the whole session: no socket reads, no flush of buffered frames,
+  no timers. A gate should decide at once with `SendVerdict::ready`.
 - **Semver.** One defaulted trait method: additive, a minor bump.
 - **Tests.** `ironfix-engine/tests/replay_gate_tests.rs`: both roles, both
   resend paths, a veto at the start, in the middle and at the end of a

@@ -209,7 +209,7 @@
 //! heartbeats and timeout detection for as long as the call takes. Each call is
 //! bounded by the store timeout, and an overrun is a failed write under the
 //! [`StoreFailurePolicy`]. `to_admin`, `to_app_checked` (and through it
-//! `to_app`) and `from_admin` also run inline.
+//! `to_app`), `to_app_resend` and `from_admin` also run inline.
 //!
 //! # The outbound gate and send outcomes
 //!
