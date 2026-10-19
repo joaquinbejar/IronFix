@@ -33,6 +33,7 @@ use crate::acceptor::Acceptor;
 use crate::application::{Application, NoOpApplication};
 use crate::error::EngineError;
 use crate::initiator::Initiator;
+use crate::observer::FrameObserver;
 use crate::registry::AcceptorRegistry;
 use crate::throttle::ThrottleConfig;
 use ironfix_session::config::SessionConfig;
@@ -58,6 +59,8 @@ pub struct EngineBuilder<A: Application = NoOpApplication> {
     store: Option<Arc<dyn MessageStore>>,
     /// Outbound throttle attached by every terminal method, if any.
     throttle: Option<ThrottleConfig>,
+    /// Frame observer attached by every terminal method, if any.
+    observer: Option<Arc<dyn FrameObserver>>,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
@@ -69,6 +72,7 @@ impl<A: Application> std::fmt::Debug for EngineBuilder<A> {
             .field("connect_timeout", &self.connect_timeout)
             .field("store", &self.store.is_some())
             .field("throttle", &self.throttle)
+            .field("frame_observer", &self.observer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -89,6 +93,7 @@ impl EngineBuilder<NoOpApplication> {
             connect_timeout: Duration::from_secs(30),
             store: None,
             throttle: None,
+            observer: None,
         }
     }
 }
@@ -103,6 +108,7 @@ impl<A: Application + 'static> EngineBuilder<A> {
             connect_timeout: self.connect_timeout,
             store: self.store,
             throttle: self.throttle,
+            observer: self.observer,
         }
     }
 
@@ -153,6 +159,25 @@ impl<A: Application + 'static> EngineBuilder<A> {
         self
     }
 
+    /// Attaches a frame observer to the engine a terminal method produces:
+    /// [`Initiator::with_frame_observer`] for
+    /// [`EngineBuilder::into_initiator`], [`Acceptor::with_frame_observer`]
+    /// for [`EngineBuilder::into_acceptor`], and the same on every
+    /// [`Acceptor`] of [`EngineBuilder::into_acceptor_registry`]. See
+    /// [`crate::observer`]: it runs inline, must be cheap and must not
+    /// panic, and it receives raw bytes, credentials included.
+    #[must_use]
+    pub fn with_frame_observer(mut self, observer: Arc<dyn FrameObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Returns whether a frame observer has been set.
+    #[must_use]
+    pub const fn has_frame_observer(&self) -> bool {
+        self.observer.is_some()
+    }
+
     /// Returns whether a message store has been set.
     #[must_use]
     pub const fn has_store(&self) -> bool {
@@ -192,6 +217,10 @@ impl<A: Application + 'static> EngineBuilder<A> {
             Some(throttle) => initiator.with_throttle(throttle),
             None => initiator,
         };
+        let initiator = match self.observer {
+            Some(observer) => initiator.with_frame_observer(observer),
+            None => initiator,
+        };
         Ok(match self.store {
             Some(store) => initiator.with_store(store),
             None => initiator,
@@ -210,6 +239,10 @@ impl<A: Application + 'static> EngineBuilder<A> {
         let acceptor = Acceptor::new(config, self.application);
         let acceptor = match self.throttle {
             Some(throttle) => acceptor.with_throttle(throttle),
+            None => acceptor,
+        };
+        let acceptor = match self.observer {
+            Some(observer) => acceptor.with_frame_observer(observer),
             None => acceptor,
         };
         Ok(match self.store {
@@ -252,6 +285,10 @@ impl<A: Application + 'static> EngineBuilder<A> {
             let acceptor = Acceptor::new(config, Arc::clone(&self.application));
             let acceptor = match &self.throttle {
                 Some(throttle) => acceptor.with_throttle(throttle.clone()),
+                None => acceptor,
+            };
+            let acceptor = match &self.observer {
+                Some(observer) => acceptor.with_frame_observer(Arc::clone(observer)),
                 None => acceptor,
             };
             let acceptor = match &self.store {
@@ -482,6 +519,34 @@ mod tests {
         match builder().into_acceptor_registry() {
             Ok(registry) => assert_eq!(registry.session_ids().len(), 1),
             Err(err) => panic!("one session builds a registry: {err}"),
+        }
+    }
+
+    #[test]
+    fn test_engine_builder_frame_observer_reaches_every_terminal_method() {
+        struct Quiet;
+        impl FrameObserver for Quiet {
+            fn on_inbound(&self, _: &[u8], _: &crate::observer::Observation<'_>) {}
+            fn on_outbound(&self, _: &[u8], _: &crate::observer::Observation<'_>) {}
+        }
+        let observer: Arc<dyn FrameObserver> = Arc::new(Quiet);
+        let builder = || {
+            EngineBuilder::new()
+                .add_session(session())
+                .with_frame_observer(Arc::clone(&observer))
+        };
+        assert!(builder().has_frame_observer());
+        match builder().into_initiator() {
+            Ok(initiator) => assert!(initiator.has_frame_observer()),
+            Err(err) => panic!("one session must build an initiator: {err}"),
+        }
+        match builder().into_acceptor() {
+            Ok(acceptor) => assert!(acceptor.has_frame_observer()),
+            Err(err) => panic!("one session must build an acceptor: {err}"),
+        }
+        match EngineBuilder::new().add_session(session()).into_initiator() {
+            Ok(initiator) => assert!(!initiator.has_frame_observer()),
+            Err(err) => panic!("one session must build an initiator: {err}"),
         }
     }
 

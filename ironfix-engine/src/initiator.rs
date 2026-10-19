@@ -203,6 +203,7 @@ use crate::close::CloseReason;
 use crate::connection::{Connection, SessionRuntime, report_handshake};
 use crate::error::EngineError;
 use crate::next_expected::{self, NextExpectedPlan};
+use crate::observer::{Capture, FrameObserver};
 use crate::persistence::{
     PersistedCounters, SeedPlan, Seeded, StoreAttachment, StoreFailurePolicy, seed_session,
 };
@@ -268,6 +269,8 @@ pub struct Initiator<A: Application = NoOpApplication> {
     store: StoreAttachment,
     /// The outbound throttle each session gets its own budgets from, if any.
     throttle: Option<ThrottleConfig>,
+    /// The frame observer every session of this engine reports to, if any.
+    observer: Option<Arc<dyn FrameObserver>>,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
@@ -286,6 +289,7 @@ impl<A: Application> std::fmt::Debug for Initiator<A> {
             .field("store", &self.store)
             .field("store_timeout", &self.store.timeout(self.write_timeout))
             .field("throttle", &self.throttle)
+            .field("frame_observer", &self.observer.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -330,6 +334,7 @@ impl<A: Application + 'static> Initiator<A> {
             app_queue_capacity: DEFAULT_APP_QUEUE_CAPACITY,
             store: StoreAttachment::default(),
             throttle: None,
+            observer: None,
         }
     }
 
@@ -559,6 +564,39 @@ impl<A: Application + 'static> Initiator<A> {
     #[must_use]
     pub const fn throttle(&self) -> Option<&ThrottleConfig> {
         self.throttle.as_ref()
+    }
+
+    /// Attaches a capture hook that sees every frame each session of this
+    /// engine reads and writes, handshake included, with its write result
+    /// (issue #70).
+    ///
+    /// The observer runs synchronously on the session's task: it must be
+    /// cheap, must not block and must not panic (the release profile aborts
+    /// on a panic). It receives **raw bytes, credentials included**
+    /// (`Password` (554), `NewPassword` (925), `RawData` (96)); redacting
+    /// them is the observer's responsibility. See [`crate::observer`] for
+    /// what is observed and when.
+    ///
+    /// Without an observer (the default) a frame costs one branch.
+    ///
+    /// # Arguments
+    /// * `observer` - The capture hook
+    #[must_use]
+    pub fn with_frame_observer(mut self, observer: Arc<dyn FrameObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Returns whether a frame observer is attached.
+    #[must_use]
+    pub const fn has_frame_observer(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    /// The attached frame observer bound to `session_id`, if any.
+    #[must_use]
+    fn capture(&self, session_id: &SessionId) -> Option<Capture> {
+        Capture::bind(self.observer.as_ref(), session_id)
     }
 
     /// How this connect decides its starting sequence numbers (see
@@ -922,6 +960,7 @@ impl<A: Application + 'static> Initiator<A> {
             &runtime.sequences,
             store.as_mut(),
             write_timeout,
+            self.capture(&session_id).as_ref(),
             logon,
         )
         .await
@@ -935,22 +974,28 @@ impl<A: Application + 'static> Initiator<A> {
         // Await the Logon acknowledgement. Garbled frames are skipped, and the
         // logon timeout covers the whole wait, so an ack that never arrives
         // intact is a LogonTimeout.
-        let ack =
-            match read_handshake_frame(&mut framed, self.config.logon_timeout, &session_id).await {
-                HandshakeRead::Frame(frame) => frame,
-                HandshakeRead::TimedOut => {
-                    let _ = session.on_logon_reject();
-                    return Err(EngineError::LogonTimeout(self.config.logon_timeout));
-                }
-                HandshakeRead::Closed => {
-                    let _ = session.on_logon_reject();
-                    return Err(EngineError::Closed);
-                }
-                HandshakeRead::Codec(err) => {
-                    let _ = session.on_logon_reject();
-                    return Err(err.into());
-                }
-            };
+        let ack = match read_handshake_frame(
+            &mut framed,
+            self.config.logon_timeout,
+            &session_id,
+            self.capture(&session_id).as_ref(),
+        )
+        .await
+        {
+            HandshakeRead::Frame(frame) => frame,
+            HandshakeRead::TimedOut => {
+                let _ = session.on_logon_reject();
+                return Err(EngineError::LogonTimeout(self.config.logon_timeout));
+            }
+            HandshakeRead::Closed => {
+                let _ = session.on_logon_reject();
+                return Err(EngineError::Closed);
+            }
+            HandshakeRead::Codec(err) => {
+                let _ = session.on_logon_reject();
+                return Err(err.into());
+            }
+        };
 
         // (gap start, high-water) of a gap detected in the Logon ack itself.
         let mut pending_resend: Option<(u64, u64)> = None;
@@ -1031,6 +1076,7 @@ impl<A: Application + 'static> Initiator<A> {
                     &runtime.sequences,
                     store.as_mut(),
                     write_timeout,
+                    self.capture(&session_id).as_ref(),
                     &detail,
                     [reject, logout],
                 )
@@ -1057,6 +1103,7 @@ impl<A: Application + 'static> Initiator<A> {
                     &runtime.sequences,
                     store.as_mut(),
                     write_timeout,
+                    self.capture(&session_id).as_ref(),
                     &detail,
                     [reject, logout],
                 )
@@ -1076,6 +1123,7 @@ impl<A: Application + 'static> Initiator<A> {
                     &runtime.sequences,
                     store.as_mut(),
                     write_timeout,
+                    self.capture(&session_id).as_ref(),
                     &reason.text,
                     [logout],
                 )
@@ -1120,6 +1168,7 @@ impl<A: Application + 'static> Initiator<A> {
                         &runtime.sequences,
                         store.as_mut(),
                         write_timeout,
+                        self.capture(&session_id).as_ref(),
                         &detail,
                         [reject, logout],
                     )
@@ -1168,6 +1217,7 @@ impl<A: Application + 'static> Initiator<A> {
                         &runtime.sequences,
                         store.as_mut(),
                         write_timeout,
+                        self.capture(&session_id).as_ref(),
                         &detail,
                         [reject, logout],
                     )
@@ -1192,6 +1242,7 @@ impl<A: Application + 'static> Initiator<A> {
                         &runtime.sequences,
                         store.as_mut(),
                         write_timeout,
+                        self.capture(&session_id).as_ref(),
                         &detail,
                         [reject, logout],
                     )
@@ -1316,6 +1367,7 @@ impl<A: Application + 'static> Initiator<A> {
                                     &runtime.sequences,
                                     store.as_mut(),
                                     write_timeout,
+                                    self.capture(&session_id).as_ref(),
                                     &detail,
                                     [reject, logout],
                                 )
@@ -1330,6 +1382,7 @@ impl<A: Application + 'static> Initiator<A> {
                                     &runtime.sequences,
                                     store.as_mut(),
                                     write_timeout,
+                                    self.capture(&session_id).as_ref(),
                                     &detail,
                                     [logout],
                                 )
@@ -1480,6 +1533,7 @@ impl<A: Application + 'static> Initiator<A> {
             outbound_capacity: self.outbound_capacity,
             app_queue_capacity: self.app_queue_capacity,
             throttle: self.throttle.clone(),
+            capture: self.capture(&session_id),
         };
         let (command_tx, closed_rx) = spawn_session(params, ());
 

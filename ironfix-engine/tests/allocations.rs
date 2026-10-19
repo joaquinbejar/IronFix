@@ -35,6 +35,11 @@
 //!   rebuilt. The window also checks it was throttled: it cannot take less
 //!   than the time the throttle needs to earn the window's tokens, a lower
 //!   bound the throttle guarantees whatever the machine.
+//! - **Observed live sends** (issue #70): the same as the live sends, with a
+//!   frame observer attached that only counts what it sees. One block per
+//!   message, as without it: the observer gets borrowed slices, and the
+//!   queue of frames awaiting their write result keeps the capacity it was
+//!   given.
 //! - **Replies**: the acceptor sends [`MESSAGES`] TestRequests and the
 //!   initiator answers each with a Heartbeat echoing its `TestReqID` (112).
 //!   [`REPLY_BLOCKS`] blocks per reply: the `from_admin` and `to_admin`
@@ -79,7 +84,10 @@ use futures_util::{SinkExt, StreamExt};
 use ironfix_core::message::MsgType;
 use ironfix_core::types::{CompId, Timestamp};
 use ironfix_engine::throttle::{ThrottleBudget, ThrottleConfig, ThrottlePolicy};
-use ironfix_engine::{Connection, Initiator, NoOpApplication, OutboundMessage};
+use ironfix_engine::{
+    Connection, FrameObserver, Initiator, NoOpApplication, Observation, OutboundMessage,
+    OutboundResult,
+};
 use ironfix_session::SessionConfig;
 use ironfix_store::{MemoryStore, MessageStore};
 use ironfix_tagvalue::Encoder;
@@ -417,6 +425,30 @@ async fn log_on(initiator: Initiator<NoOpApplication>) -> Session {
     }
 }
 
+/// A frame observer that counts what it is given and allocates nothing.
+#[derive(Debug, Default)]
+struct CountingObserver {
+    inbound: AtomicU64,
+    outbound: AtomicU64,
+    written: AtomicU64,
+}
+
+impl FrameObserver for CountingObserver {
+    fn on_inbound(&self, _frame: &[u8], _observation: &Observation<'_>) {
+        self.inbound.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_outbound(&self, _frame: &[u8], _observation: &Observation<'_>) {
+        self.outbound.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn on_outbound_result(&self, result: &OutboundResult, _observation: &Observation<'_>) {
+        if matches!(result, OutboundResult::Written) {
+            self.written.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// What one window measured.
 #[derive(Debug)]
 struct Window {
@@ -514,6 +546,10 @@ fn main() {
     let sending = initiator(None);
     let storing = initiator(Some(Arc::new(MemoryStore::new())));
     let throttling = initiator(None).with_throttle(throttle());
+    let mut observed_live = window_orders();
+    let observer = Arc::new(CountingObserver::default());
+    let observing =
+        initiator(None).with_frame_observer(Arc::clone(&observer) as Arc<dyn FrameObserver>);
     let resending = initiator(Some(store));
 
     let _profiler = dhat::Profiler::builder().testing().build();
@@ -574,6 +610,12 @@ fn main() {
         session.counter.abort();
         drop(session);
 
+        // Live sends with a frame observer attached.
+        let session = log_on(observing).await;
+        let (observed_window, _) = measure_live(&session, &mut observed_live).await;
+        session.counter.abort();
+        drop(session);
+
         // Resent frames: the warm-up asks for the first WARM_UP stored
         // orders, the window for the next MESSAGES.
         let mut session = log_on(resending).await;
@@ -602,14 +644,24 @@ fn main() {
             reply_window,
             stored_live_window,
             throttled_window,
+            observed_window,
             resend_window,
             largest,
             piled_up,
             retained,
         )
     });
-    let (live, reply, stored_live, (throttled, throttled_for), resend, largest, piled_up, retained) =
-        measured;
+    let (
+        live,
+        reply,
+        stored_live,
+        (throttled, throttled_for),
+        observed,
+        resend,
+        largest,
+        piled_up,
+        retained,
+    ) = measured;
 
     // Each window went through the write buffer with the flush waiting on
     // the stream: the stream refused writes for want of room.
@@ -654,6 +706,26 @@ fn main() {
          async_trait future of to_app), as without the throttle, and the window at most {SLACK} \
          more",
         throttled.blocks
+    );
+    assert!(
+        (MESSAGES..=MESSAGES + SLACK).contains(&observed.blocks),
+        "{MESSAGES} observed live sends allocated {} blocks; each must allocate one (the \
+         async_trait future of to_app), as without the observer, and the window at most {SLACK} \
+         more",
+        observed.blocks
+    );
+    let outbound = observer.outbound.load(Ordering::Relaxed);
+    assert!(
+        outbound > WARM_UP + MESSAGES,
+        "the observer saw the Logon and every order: {outbound}"
+    );
+    assert!(
+        observer.inbound.load(Ordering::Relaxed) >= 1,
+        "the observer saw the acknowledgement"
+    );
+    assert!(
+        observer.written.load(Ordering::Relaxed) > WARM_UP + MESSAGES,
+        "every order was reported written"
     );
     // At most THROTTLE_BURST tokens were waiting when the window began; every
     // other order waited for one, earned every 1 s / THROTTLE_RATE.

@@ -239,6 +239,17 @@ engine wiring (#96) does not exist.
   keeps the capacity of its deepest fill until the session ends: `max_depth`
   bounds the messages held, and the queue's allocation may round up past it
   (128 slots for a depth of 65) (`doc/adr/0024-outbound-throttle.md`).
+- **Frame capture** (issue #70). `with_frame_observer` on the `Initiator`,
+  the `Acceptor` or the `EngineBuilder` attaches a synchronous
+  `FrameObserver` that receives the exact bytes of every inbound frame once
+  framed (before the session acts on it) and every outbound frame once built
+  (before any byte is written), handshake, replays and gap fills included,
+  with direction, kind, `MsgSeqNum`, a monotonic `Instant` and the session;
+  then one `Written` or `Unknown` result per outbound frame, and `NotSent`
+  for a message that never reached the stream. It runs inline, must be cheap
+  and must not panic, receives credentials raw (redaction is the observer's
+  job), and allocates nothing per valid frame in steady state
+  (`doc/adr/0026-frame-observer.md`).
 - **`NextExpectedMsgSeqNum` (789) on Logon**, opt-in with
   `SessionConfig::send_next_expected_msg_seq_num` on FIX.4.4 and FIXT.1.1
   sessions (refused below FIX.4.4), in both roles. The Logon and its

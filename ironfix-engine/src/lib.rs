@@ -133,6 +133,18 @@
 //! garbling. Only a frame above `max_message_size` (after a Logout saying so)
 //! or an I/O error still ends the session at the codec.
 //!
+//! ## Frame capture
+//!
+//! [`Initiator::with_frame_observer`], [`Acceptor::with_frame_observer`] and
+//! [`EngineBuilder::with_frame_observer`] attach a [`FrameObserver`]: a
+//! synchronous capture hook that receives the exact bytes of every inbound
+//! frame once framed and every outbound frame once built, with an
+//! [`Observation`], then an [`OutboundResult`] per outbound frame. It runs
+//! inline on the session's task, must be cheap and must not panic, and it
+//! receives raw bytes, credentials included: redaction is its own
+//! responsibility. See [`observer`] and ADR-0026
+//! (`doc/adr/0026-frame-observer.md`).
+//!
 //! ## Transports
 //!
 //! A session runs over any byte stream that is
@@ -197,6 +209,7 @@ pub mod error;
 mod garbled;
 pub mod initiator;
 mod next_expected;
+pub mod observer;
 pub mod outbound;
 pub mod outcome;
 pub mod persistence;
@@ -213,6 +226,7 @@ pub use close::{CloseReason, LogoutCause, LogoutInitiator};
 pub use connection::Connection;
 pub use error::EngineError;
 pub use initiator::Initiator;
+pub use observer::{Direction, FrameKind, FrameObserver, Observation, OutboundResult};
 pub use outbound::{OutboundField, OutboundMessage};
 pub use outcome::{NotSentReason, SendOutcome, UnknownReason};
 pub use persistence::StoreFailurePolicy;
