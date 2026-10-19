@@ -1389,15 +1389,35 @@ pub(crate) fn malformed_reject(error: &DecodeError, frame: &[u8]) -> MalformedRe
     }
 }
 
-/// Whether `frame` carries `tag` with an empty value (`<SOH>tag=<SOH>`).
+/// Whether the field whose value failed to parse as `tag`'s byte count is
+/// empty (`tag=<SOH>`).
 ///
-/// Cold path: only a frame already being rejected gets here, so the one
-/// small allocation for the pattern is acceptable.
+/// The failing field is found by position with the decoder's own walk, so
+/// Length/Data pairs are framed by count exactly as during the decode (a
+/// DATA payload that happens to contain `<SOH>95=<SOH>` is skipped, not
+/// matched) and tags are parsed numerically (a zero-padded `095=` is tag
+/// 95). Every successful step advances the walk, so it ends; no allocation.
 fn field_is_empty(frame: &[u8], tag: u32) -> bool {
-    let pattern = format!("\u{1}{tag}=\u{1}");
-    frame
-        .windows(pattern.len())
-        .any(|window| window == pattern.as_bytes())
+    let mut decoder = Decoder::new(frame);
+    loop {
+        let start = decoder.offset();
+        match decoder.next_field() {
+            Ok(Some(_)) => {}
+            Err(DecodeError::InvalidFieldValue { tag: failed, .. }) if failed == tag => {
+                let Some(field) = frame.get(start..) else {
+                    return false;
+                };
+                let Some(eq) = field.iter().position(|&byte| byte == b'=') else {
+                    return false;
+                };
+                return eq
+                    .checked_add(1)
+                    .and_then(|value_start| field.get(value_start))
+                    == Some(&SOH);
+            }
+            Ok(None) | Err(_) => return false,
+        }
+    }
 }
 
 /// Length of a whole-second `UTCTimestamp`, `YYYYMMDD-HH:MM:SS`, in bytes.
@@ -3988,11 +4008,20 @@ mod tests {
 
     #[test]
     fn test_malformed_reject_maps_each_defect() {
-        let cases: [(&[u8], u32, Option<u32>); 4] = [
+        let cases: [(&[u8], u32, Option<u32>); 6] = [
             (b"35=0\x0134=2\x01abc=1\x01", 0, None),
             (b"35=0\x0134=2\x0195=\x0196=x\x01", 4, Some(95)),
             (b"35=0\x0134=2\x0195=40\x0196=x\x01", 6, Some(96)),
             (b"35=\x0134=2\x01", 11, Some(35)),
+            // A DATA payload spelling `<SOH>95=<SOH>` is framed by count and
+            // never matched: the failing 95 holds a non-count value, so 6.
+            (
+                b"35=0\x0134=2\x0195=7\x0196=\x0195=\x01xx\x0195=abc\x0196=q\x01",
+                6,
+                Some(95),
+            ),
+            // A zero-padded tag is the same tag: an empty `095=` is 4.
+            (b"35=0\x0134=2\x01095=\x0196=x\x01", 4, Some(95)),
         ];
         for (body, code, ref_tag) in cases {
             let frame = malformed_frame(body);

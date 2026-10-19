@@ -1946,14 +1946,15 @@ ends a `Framed` stream.
 `Acceptor`. The Logon handshakes are not covered: a malformed Logon or Logon
 acknowledgement is skipped under the logon timeout, as described above.
 
-**FIX convention**: a message that frames correctly (BeginString, BodyLength
-and CheckSum sound, so it is not garbled) but whose content is invalid is
-answered with a session-level Reject (35=3) that references its `MsgSeqNum`
-and **consumes** that number, so the counterparty does not resend it. A
-message received without `MsgSeqNum` (34) cannot be sequenced or referenced:
-the FIX Session Layer test cases (the "receive message standard header" case,
-`MsgSeqNum` missing) prescribe a Logout naming the problem, then a
-disconnect.
+**FIX convention** (FIX Session Layer, June 2020,
+<https://www.fixtrading.org/wp-content/uploads/download-manager-files/FIX_Session_Layer_June_2020.pdf>):
+a message that frames correctly (BeginString, BodyLength and CheckSum sound,
+so it is not garbled) but whose content is invalid is rejected, the rejection
+is logged, and NextNumIn is incremented (§4.5.4): the session-level Reject
+(35=3) references its `MsgSeqNum` and **consumes** that number, so the
+counterparty does not resend it. A message received without `MsgSeqNum` (34)
+cannot be sequenced or referenced: §4.5.3 "Missing sequence number" (printed
+page 27) requires a Logout with `Text`, then termination of the session.
 
 **What IronFix implements**
 

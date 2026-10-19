@@ -36,8 +36,9 @@
 //! # Malformed inbound messages
 //!
 //! A frame whose header is sound but whose body does not decode is a message,
-//! not garbage: it is answered with a session Reject (35=3), as the FIX
-//! Session Layer requires for an invalid message. `MsgSeqNum` (34) and
+//! not garbage: it is answered with a session Reject (35=3) and NextNumIn is
+//! incremented, as FIX Session Layer (June 2020) §4.5.4 requires for a
+//! rejected message. `MsgSeqNum` (34) and
 //! `PossDupFlag` (43) are read from the standard header by position
 //! ([`wire::scan_malformed_header`]), and the number is sequenced like any
 //! other: next in sequence, it is rejected and **consumed** (persisted, then
@@ -55,8 +56,8 @@
 //! A message with no readable `MsgSeqNum` (34) in its standard header, whether
 //! it decoded or not, cannot be sequenced or referenced: the session sends a
 //! Logout naming the missing field and disconnects
-//! ([`CloseReason::MsgSeqNumMissing`]), per the FIX Session Layer test cases
-//! for a message received without `MsgSeqNum`.
+//! ([`CloseReason::MsgSeqNumMissing`]), per FIX Session Layer (June 2020)
+//! §4.5.3 "Missing sequence number": Logout with `Text`, then terminate.
 //!
 //! # Bounded recovery
 //!
@@ -3848,8 +3849,9 @@ impl<A: Application> Reactor<A> {
     /// `MsgSeqNum` (34) in its standard header.
     ///
     /// Such a message cannot be sequenced, and a Reject could not reference
-    /// it, so the FIX Session Layer test cases prescribe a Logout naming the
-    /// missing field, then a disconnect. Nothing is consumed. `msg_type` is
+    /// it. FIX Session Layer (June 2020) §4.5.3 "Missing sequence number"
+    /// requires a Logout with `Text` naming the problem, then termination of
+    /// the session. Nothing is consumed. `msg_type` is
     /// logged only when the frame decoded (a validated MsgType), never any
     /// other field.
     async fn close_on_missing_seq_num(
@@ -3874,8 +3876,10 @@ impl<A: Application> Reactor<A> {
     /// Handles a framed message whose header is sound but whose body does
     /// not decode: see "Malformed inbound messages" in the module docs.
     ///
-    /// `MsgSeqNum` (34) is read by position. Missing, the session logs out.
-    /// Next in sequence, `MsgSeqNum + 1` is persisted as the next target
+    /// `MsgSeqNum` (34) is read by position. Missing, the session logs out
+    /// (FIX Session Layer, June 2020, §4.5.3). Next in sequence, the message
+    /// is rejected, the rejection is logged and NextNumIn is incremented
+    /// (§4.5.4): `MsgSeqNum + 1` is persisted as the next target
     /// number before the expectation moves, exactly as for any message
     /// answered with a session Reject, then the Reject goes out and the
     /// session stays up. A duplicate (below the expectation, 43=Y) is
