@@ -680,12 +680,30 @@ impl<P: SessionPayloads> SessionCore<P> {
 
     /// Takes the resend at the head of the queue to advance it; hand it back
     /// with [`Self::resume_replay`] if it is not done.
+    ///
+    /// # Contract
+    ///
+    /// - A job taken here is returned with [`Self::resume_replay`] to this
+    ///   same `SessionCore`, or dropped because it is finished.
+    /// - At most one job is checked out at a time.
+    /// - While a job is checked out, the caller finishes or resumes it before
+    ///   it admits more replays ([`Self::queue_replay`]) or queries the
+    ///   replay state ([`Self::replaying`], [`Self::queued_replays`],
+    ///   [`Self::replays`], [`Self::gap_release_paused`]).
+    ///
+    /// The core does not check this. If it is broken, the replay state is
+    /// misreported: a checked-out job is not in the queue, so the queue can
+    /// read as empty or shorter than it is, a new range can be queued or
+    /// merged ahead of the one under way, and a job resumed into another
+    /// core is answered there.
     pub fn take_replay(&mut self) -> Option<ReplayJob<P::Replay>> {
         self.replays.pop_front()
     }
 
     /// Puts back, at the head, a resend taken by [`Self::take_replay`] that
-    /// is not done yet.
+    /// is not done yet. `job` must be the one job checked out of this same
+    /// `SessionCore`; see the contract on [`Self::take_replay`] and what
+    /// breaking it misreports.
     pub fn resume_replay(&mut self, job: ReplayJob<P::Replay>) {
         self.replays.push_front(job);
     }
