@@ -481,9 +481,9 @@ pub struct RawMessage<'a> {
 /// (spilling to the heap above 32 fields), or borrowed from a buffer the
 /// caller owns and reuses ([`RawMessage::with_field_slice`]), which never
 /// allocates per message.
-// The inline variant is the `SmallVec` a `RawMessage` always held, so the
-// message is no larger than before; boxing it would allocate per message,
-// which is what this store exists to avoid.
+// The inline variant is the `SmallVec` a `RawMessage` always held; the enum
+// adds a tag, 8 bytes on aarch64 (840 to 848). Boxing the inline variant
+// would allocate per message, which is what this store exists to avoid.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 enum FieldStore<'a> {
