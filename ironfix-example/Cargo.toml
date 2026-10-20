@@ -129,6 +129,10 @@ name = "fast_server_lockfree"
 path = "examples/fast_server_lockfree.rs"
 
 [[example]]
+name = "fix44_poll_client"
+path = "examples/fix44_poll_client.rs"
+
+[[example]]
 name = "fix44_tls_server"
 path = "examples/fix44_tls_server.rs"
 required-features = ["tls"]
