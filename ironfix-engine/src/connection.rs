@@ -507,7 +507,7 @@ impl Connection {
             .heartbeat
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_timed_out(std::time::Instant::now())
+            .is_timed_out(crate::reactor::driver_now())
     }
 
     /// Returns the next outgoing (sender) sequence number.

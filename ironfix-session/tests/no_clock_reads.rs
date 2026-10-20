@@ -18,6 +18,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("lib.rs", include_str!("../src/lib.rs")),
     ("config.rs", include_str!("../src/config.rs")),
     ("heartbeat.rs", include_str!("../src/heartbeat.rs")),
+    ("sans_io.rs", include_str!("../src/sans_io.rs")),
     ("sequence.rs", include_str!("../src/sequence.rs")),
     ("state.rs", include_str!("../src/state.rs")),
 ];

@@ -1157,7 +1157,7 @@ impl<A: Application + 'static> Initiator<A> {
         };
         let runtime = Arc::new(SessionRuntime::new(
             sequences,
-            HeartbeatManager::new(self.config.heartbeat_interval, std::time::Instant::now()),
+            HeartbeatManager::new(self.config.heartbeat_interval, crate::reactor::driver_now()),
         ));
         let mut factory = MessageFactory::new(&self.config, version);
         let identity = PeerIdentity::new(&self.config);
@@ -1206,7 +1206,7 @@ impl<A: Application + 'static> Initiator<A> {
             let _ = session.disconnect();
             return Err(err);
         }
-        let logon_sent_at = std::time::Instant::now();
+        let logon_sent_at = crate::reactor::driver_now();
         lock_heartbeat(&runtime).on_message_sent(logon_sent_at);
         let session = session.send_logon(logon_sent_at);
 
@@ -1493,7 +1493,7 @@ impl<A: Application + 'static> Initiator<A> {
             };
             {
                 let mut heartbeat = lock_heartbeat(&runtime);
-                let now = std::time::Instant::now();
+                let now = crate::reactor::driver_now();
                 heartbeat.on_message_received(false, None, now);
                 if negotiated != heartbeat.interval() {
                     tracing::info!(

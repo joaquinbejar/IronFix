@@ -106,3 +106,24 @@ converted at the boundary so paused-clock tests stay deterministic.
   `std::time::Instant::now()`, exactly the clock the session used to read, so
   behaviour is unchanged; switching them to the reactor's paused-clock-aware
   `driver_now()` is left to #91, where the reactor's decision logic moves.
+- **#91 stage 1 (sans-IO core, liveness family):** the core lives in
+  `ironfix-session` as the `sans_io` module, not a new crate: it needs only
+  `ironfix-core` and the session's own state, and the crate's dependencies are
+  unchanged. It decides and never acts: no I/O, no clock read (it is covered
+  by `tests/no_clock_reads.rs`), no `.await`; the driver supplies `now` and a
+  summary of its output, and builds and encodes the frame it is told to send.
+  Stage 1 extracts the per-tick liveness decisions: `decide_liveness`
+  (heartbeat timeout, TestRequest after inbound silence, idle Heartbeat, gated
+  by `LivenessGate::{DeadlinesOnly, Probe}`), `logout_timed_out` (the logout
+  deadline from `Session<LogoutPending>::sent_at`) and `test_request_reply_id`
+  (the `TestReqID` a Heartbeat echoes). The reactor's `on_tick` and its
+  TestRequest reply now call them. Additive public surface only. The engine's
+  session clock moved to `driver_now()` in the same change: every instant the
+  heartbeat manager and the Logon/Logout typestate timestamps see (reactor,
+  both handshakes, and `Connection::is_timed_out`) now comes from Tokio's
+  clock converted at the boundary, so a paused-clock test drives them; with a
+  running clock Tokio's `Instant` is the system monotonic clock, so nothing
+  visible on the wire changes. Remaining stages: sequence validation and gap
+  recovery (including `ResendState`, whose stall clock still reads
+  `std::time::Instant`), resend replay, the Logout handshake, the two Logon
+  handshakes, then the driver reduced to I/O and callbacks.

@@ -1292,7 +1292,7 @@ impl<A: Application + 'static> Acceptor<A> {
         let store_timeout = self.store.timeout(write_timeout);
 
         // Typestate: Connecting -> LogonReceived.
-        let session = session.on_logon_received(std::time::Instant::now());
+        let session = session.on_logon_received(crate::reactor::driver_now());
 
         // (gap start, high-water) of a gap detected in the inbound Logon.
         let mut pending_resend: Option<(u64, u64)> = None;
@@ -1700,7 +1700,7 @@ impl<A: Application + 'static> Acceptor<A> {
             }
             runtime = Arc::new(SessionRuntime::new(
                 sequences,
-                HeartbeatManager::new(self.config.heartbeat_interval, std::time::Instant::now()),
+                HeartbeatManager::new(self.config.heartbeat_interval, crate::reactor::driver_now()),
             ));
             if let Some(declared) = declared_appl_version {
                 runtime.record_counterparty_default_appl_version(declared);
@@ -1711,7 +1711,7 @@ impl<A: Application + 'static> Acceptor<A> {
 
             {
                 let mut heartbeat = lock_heartbeat(&runtime);
-                let now = std::time::Instant::now();
+                let now = crate::reactor::driver_now();
                 heartbeat.on_message_received(false, None, now);
                 if Duration::from_secs(requested_heartbeat_secs) != heartbeat.interval() {
                     tracing::info!(
@@ -1869,7 +1869,7 @@ impl<A: Application + 'static> Acceptor<A> {
                 let _ = session.reject_logon();
                 return Err(err);
             }
-            lock_heartbeat(&runtime).on_message_sent(std::time::Instant::now());
+            lock_heartbeat(&runtime).on_message_sent(crate::reactor::driver_now());
         }
 
         // The acknowledgement that declared the reset is on the wire: that

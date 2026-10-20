@@ -307,6 +307,9 @@ use ironfix_core::validation::InboundRejection;
 use ironfix_core::version::FixVersion;
 use ironfix_session::config::MAX_INBOUND_FIELDS;
 use ironfix_session::heartbeat::generate_test_req_id;
+use ironfix_session::sans_io::{
+    LivenessAction, LivenessGate, decide_liveness, logout_timed_out, test_request_reply_id,
+};
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
 use ironfix_session::{
     Active, HeartbeatManager, LogoutPending, SequenceManager, Session, SessionConfig,
@@ -354,8 +357,12 @@ const GARBLED_FRAMING: &str = "framing: BeginString, BodyLength or CheckSum";
 /// The driver's monotonic time, for the decision logic that takes `now`.
 ///
 /// Read from Tokio's clock and converted at this boundary, per ADR-0002, so a
-/// paused-clock test drives the decisions deterministically.
-fn driver_now() -> Instant {
+/// paused-clock test drives the decisions deterministically. Every instant
+/// the session's clock sees (the heartbeat manager, the Logon and Logout
+/// timestamps of the typestate, and the [`Connection`](crate::Connection)
+/// getter that reads the heartbeat state) comes from here, so all of them
+/// share one clock (issue #91).
+pub(crate) fn driver_now() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
@@ -3111,7 +3118,7 @@ impl<A: Application> Reactor<A> {
     /// the heartbeat clock counts as sending.
     fn on_flushed(&mut self, framed: &mut FixFramed) {
         let covered = self.writer.flushed(framed);
-        lock_heartbeat(&self.runtime).on_message_sent(Instant::now());
+        lock_heartbeat(&self.runtime).on_message_sent(driver_now());
         if let Some((first, last)) = covered {
             tracing::trace!(session = %self.session_id, first, last, "flushed");
         }
@@ -3192,7 +3199,7 @@ impl<A: Application> Reactor<A> {
         match phase {
             Phase::LogoutQueued(session) if self.writer.logout.take_written() => {
                 // Typestate: Active -> LogoutPending, as the Logout is sent.
-                Phase::LogoutPending(session.initiate_logout(Instant::now()))
+                Phase::LogoutPending(session.initiate_logout(driver_now()))
             }
             phase => phase,
         }
@@ -3206,7 +3213,7 @@ impl<A: Application> Reactor<A> {
         if self.writer.test_request.take_written()
             && let Some(test_req_id) = self.unwritten_test_request.take()
         {
-            lock_heartbeat(&self.runtime).on_test_request_sent(test_req_id, Instant::now());
+            lock_heartbeat(&self.runtime).on_test_request_sent(test_req_id, driver_now());
         }
         if self.writer.resend_request.take_written()
             && let Some(state) = self.resend.as_mut()
@@ -3992,7 +3999,7 @@ impl<A: Application> Reactor<A> {
         self.advance_probes();
         match self.writer.on_tick(driver_now(), self.write_timeout) {
             WriteCheck::Fine => {}
-            WriteCheck::Progressed => lock_heartbeat(&self.runtime).on_message_sent(Instant::now()),
+            WriteCheck::Progressed => lock_heartbeat(&self.runtime).on_message_sent(driver_now()),
             WriteCheck::Stalled => {
                 let close = CloseReason::WriteTimeout {
                     timeout: self.write_timeout,
@@ -4006,7 +4013,7 @@ impl<A: Application> Reactor<A> {
         // second copy of it to drift. A Logout still queued has no deadline
         // yet; the write timeout bounds how long it may wait.
         if let Phase::LogoutPending(session) = &phase
-            && session.sent_at().elapsed() >= self.config.logout_timeout
+            && logout_timed_out(session, driver_now(), self.config.logout_timeout)
         {
             teardown(phase);
             let cause = self.take_logout_cause();
@@ -4021,11 +4028,7 @@ impl<A: Application> Reactor<A> {
         // the resend is done, or now if the logout timeout has run out.
         if self.resend_in_progress() {
             let phase = self.cut_resend_for_owed_logout(framed, phase).await?;
-            if lock_heartbeat(&self.runtime).is_timed_out(Instant::now()) {
-                teardown(phase);
-                return Err(closed(CloseReason::HeartbeatTimeout {}));
-            }
-            return Ok(phase);
+            return self.check_liveness_deadline(phase);
         }
 
         // With a frame observer and the frames awaiting a write result at
@@ -4035,11 +4038,7 @@ impl<A: Application> Reactor<A> {
         // write timeout can close the session. Only the deadlines are
         // checked.
         if self.writer.observed_full() {
-            if lock_heartbeat(&self.runtime).is_timed_out(Instant::now()) {
-                teardown(phase);
-                return Err(closed(CloseReason::HeartbeatTimeout {}));
-            }
-            return Ok(phase);
+            return self.check_liveness_deadline(phase);
         }
 
         // A gap that is making no progress is chased on its own clock,
@@ -4055,49 +4054,65 @@ impl<A: Application> Reactor<A> {
             return self.on_resend_stalled(framed, phase, resend).await;
         }
 
-        let (timed_out, send_test_request, send_heartbeat) = {
-            let heartbeat = lock_heartbeat(&self.runtime);
-            let now = Instant::now();
-            (
-                heartbeat.is_timed_out(now),
-                heartbeat.should_send_test_request(now),
-                heartbeat.should_send_heartbeat(now),
-            )
+        // The guard is a std mutex: the decision is copied out and the guard
+        // dropped at the end of this statement, before any await below.
+        // Output still waiting to be written is traffic the counterparty is
+        // about to receive, so an idle Heartbeat is due only once nothing is
+        // waiting.
+        let gate = LivenessGate::Probe {
+            test_request_unwritten: self.unwritten_test_request.is_some(),
+            output_waiting: self.writer.pending,
         };
-
-        if timed_out {
-            teardown(phase);
-            return Err(closed(CloseReason::HeartbeatTimeout {}));
-        }
-        if send_test_request && self.unwritten_test_request.is_none() {
-            let test_req_id = generate_test_req_id(std::time::SystemTime::now());
-            let request = self.factory.test_request(&test_req_id);
-            match self.send(framed, request).await {
-                Err(err) => {
+        let action = decide_liveness(&lock_heartbeat(&self.runtime), driver_now(), gate);
+        match action {
+            LivenessAction::Idle => {}
+            LivenessAction::CloseHeartbeatTimeout => {
+                teardown(phase);
+                return Err(closed(CloseReason::HeartbeatTimeout {}));
+            }
+            LivenessAction::SendTestRequest => {
+                let test_req_id = generate_test_req_id(std::time::SystemTime::now());
+                let request = self.factory.test_request(&test_req_id);
+                match self.send(framed, request).await {
+                    Err(err) => {
+                        teardown(phase);
+                        return Err(closed(send_failure_reason(&err)));
+                    }
+                    // Only a TestRequest that actually went out starts the timeout
+                    // countdown, and only once it is written whole
+                    // ([`Reactor::advance_probes`]): fed behind earlier output
+                    // under backpressure, it has not reached the counterparty.
+                    // Arming it for a dropped probe would time the session out
+                    // waiting for an answer to a frame never sent.
+                    Ok(Sent::Yes) => {
+                        self.unwritten_test_request = Some(test_req_id);
+                        self.advance_probes();
+                    }
+                    Ok(Sent::Dropped | Sent::Deferred) => {}
+                }
+            }
+            LivenessAction::SendHeartbeat => {
+                let heartbeat = self.factory.heartbeat(None);
+                if let Err(err) = self.send(framed, heartbeat).await {
                     teardown(phase);
                     return Err(closed(send_failure_reason(&err)));
                 }
-                // Only a TestRequest that actually went out starts the timeout
-                // countdown, and only once it is written whole
-                // ([`Reactor::advance_probes`]): fed behind earlier output
-                // under backpressure, it has not reached the counterparty.
-                // Arming it for a dropped probe would time the session out
-                // waiting for an answer to a frame never sent.
-                Ok(Sent::Yes) => {
-                    self.unwritten_test_request = Some(test_req_id);
-                    self.advance_probes();
-                }
-                Ok(Sent::Dropped | Sent::Deferred) => {}
             }
-        } else if send_heartbeat && !self.writer.pending {
-            // Output still waiting to be written is traffic the counterparty
-            // is about to receive, so an idle Heartbeat is due only once
-            // nothing is waiting.
-            let heartbeat = self.factory.heartbeat(None);
-            if let Err(err) = self.send(framed, heartbeat).await {
-                teardown(phase);
-                return Err(closed(send_failure_reason(&err)));
-            }
+        }
+        Ok(phase)
+    }
+
+    /// The liveness check of a tick that may write nothing new: only the
+    /// heartbeat deadline is decided ([`LivenessGate::DeadlinesOnly`]).
+    fn check_liveness_deadline(&self, phase: Phase) -> Result<Phase, SessionClosed> {
+        let action = decide_liveness(
+            &lock_heartbeat(&self.runtime),
+            driver_now(),
+            LivenessGate::DeadlinesOnly,
+        );
+        if action == LivenessAction::CloseHeartbeatTimeout {
+            teardown(phase);
+            return Err(closed(CloseReason::HeartbeatTimeout {}));
         }
         Ok(phase)
     }
@@ -6044,7 +6059,7 @@ impl<A: Application> Reactor<A> {
         let outcome = lock_heartbeat(&self.runtime).on_message_received(
             msg_type == MsgType::Heartbeat,
             test_req_id,
-            Instant::now(),
+            driver_now(),
         );
         match outcome {
             TestRequestOutcome::Confirmed => tracing::debug!(
@@ -6393,7 +6408,7 @@ impl<A: Application> Reactor<A> {
                 // nothing to echo, and an empty field has no legal wire form,
                 // so the Heartbeat is sent without TestReqID rather than the
                 // session being torn down over the peer's mistake.
-                let test_req_id = raw.get_field_str(112).filter(|id| !id.is_empty());
+                let test_req_id = test_request_reply_id(raw.get_field_str(112));
                 let heartbeat = self.factory.heartbeat(test_req_id);
                 if let Err(err) = self.send(framed, heartbeat).await {
                     teardown(phase);
@@ -6447,7 +6462,7 @@ impl<A: Application> Reactor<A> {
             // close whose Logout never got out is not graceful.
             Phase::LogoutQueued(session) => {
                 // Typestate: Active -> LogoutPending -> Disconnected.
-                let _ = session.initiate_logout(Instant::now()).on_logout_ack();
+                let _ = session.initiate_logout(driver_now()).on_logout_ack();
                 Err(self.local_logout_complete(raw))
             }
             Phase::Active(session) => {
