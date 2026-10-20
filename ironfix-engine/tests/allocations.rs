@@ -50,12 +50,13 @@
 //!   [`UNPOOLED_BLOCKS`] blocks each (that window is measured too).
 //! - **Pooled live sends through a ready gate**: the same, for an
 //!   application whose `to_app_checked` decides at once with
-//!   `SendVerdict::ready` and calls no `to_app`. No block per message from
-//!   the message, the gate or the frame; what is left is the command queue:
-//!   `tokio::sync::mpsc` grows its slot list by one block about every
-//!   [`QUEUE_SENDS_PER_BLOCK`] sends, so the send path is not yet zero
-//!   allocation. The window asserts that rate, with a fixed allowance of
-//!   [`GATED_FIXED`] blocks, not the general [`SLACK`] that would hide it.
+//!   `SendVerdict::ready` and calls no `to_app`. No block per message: not
+//!   from the message, the gate or the frame, nor from the command queue,
+//!   a ring sized to the outbound capacity when the session starts (before
+//!   it, `tokio::sync::mpsc` grew its slot list by one block about every 128
+//!   sends). Measured: 0 blocks for [`MESSAGES`] sends. The window allows
+//!   [`GATED_FIXED`] non-recurring blocks, not the general [`SLACK`] that
+//!   would hide a per-send cost.
 //! - **Pooled throttled and observed live sends**: the pooled live sends
 //!   with the throttle, then with the frame observer, of the windows above.
 //!   One block per message each. The throttle holds the whole window at
@@ -227,12 +228,8 @@ const RETAINED_AFTER_DRAIN: i128 = 16 * 1024;
 /// future.
 const UNPOOLED_BLOCKS: u64 = 6;
 
-/// Sends per block the command queue (`tokio::sync::mpsc`) allocates as it
-/// grows its slot list: measured, about one block every 128 sends.
-const QUEUE_SENDS_PER_BLOCK: u64 = 128;
-
-/// Non-recurring blocks the ready-gate window may allocate beyond the command
-/// queue's rate.
+/// Non-recurring blocks the ready-gate window may allocate: a send through
+/// a ready gate allocates none.
 const GATED_FIXED: u64 = 4;
 
 /// Blocks answering a TestRequest costs.
@@ -1903,12 +1900,10 @@ fn main() {
             window.blocks
         );
     }
-    let gated_ceiling = MESSAGES / QUEUE_SENDS_PER_BLOCK + GATED_FIXED;
     assert!(
-        gated.blocks <= gated_ceiling,
-        "{MESSAGES} pooled live sends through a ready gate allocated {} blocks; only the \
-         command queue may allocate, one block per {QUEUE_SENDS_PER_BLOCK} sends, plus at most \
-         {GATED_FIXED}: at most {gated_ceiling}",
+        gated.blocks <= GATED_FIXED,
+        "{MESSAGES} pooled live sends through a ready gate allocated {} blocks; a send must \
+         allocate nothing, with at most {GATED_FIXED} non-recurring blocks in the window",
         gated.blocks
     );
     let unpooled_floor = UNPOOLED_BLOCKS * MESSAGES;

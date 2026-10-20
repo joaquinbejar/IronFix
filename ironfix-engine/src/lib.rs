@@ -264,6 +264,7 @@ pub mod acceptor;
 pub mod application;
 pub mod builder;
 pub mod close;
+mod command_queue;
 pub mod connection;
 pub mod error;
 #[cfg(feature = "fixp")]

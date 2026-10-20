@@ -311,9 +311,11 @@ TCP or any caller stream behind its optional `fixp` feature (#96).
   still allocates is stated, not hidden: one boxed future per message for
   the `#[async_trait]` `to_app` call made by the default `to_app_checked`
   (an application whose `to_app_checked` decides at once with
-  `SendVerdict::ready` avoids it), about one block per 128 sends as the
-  `tokio::sync::mpsc` command queue grows (so a send is not yet zero
-  allocation), and a store's own allocations. These are
+  `SendVerdict::ready`, or a `SyncApplication` through
+  `SyncApplicationAdapter`, avoids it), and a store's own allocations. The
+  command queue is a ring sized to the outbound capacity at session start,
+  so a pooled message sent through a gate that decides at once allocates
+  nothing: 0 blocks for 1024 sends, no store attached. These are
   block counts from `ironfix-engine/tests/allocations.rs` (dhat), not
   timings (`doc/adr/0008-pooled-outbound-messages.md`).
 - **`NextExpectedMsgSeqNum` (789) on Logon**, opt-in with

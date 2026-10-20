@@ -13,6 +13,7 @@
 
 use crate::application::SessionId;
 use crate::close::{CloseReason, LogoutCause};
+use crate::command_queue::CommandSender;
 use crate::error::EngineError;
 use crate::outbound::{OutboundMessage, OutboundPool};
 use crate::outcome::{NotSentReason, Receipt, SendOutcome};
@@ -22,7 +23,7 @@ use ironfix_session::sans_io::LogoutTextError;
 use ironfix_session::{HeartbeatManager, SequenceManager};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 /// Commands sent from a [`Connection`] handle to the session reactor.
 #[derive(Debug)]
@@ -147,7 +148,7 @@ pub struct Connection {
     /// Session identifier.
     pub(crate) session_id: SessionId,
     /// Command channel to the reactor.
-    pub(crate) commands: mpsc::Sender<Command>,
+    pub(crate) commands: CommandSender<Command>,
     /// Closed-flag observation channel.
     pub(crate) closed: watch::Receiver<bool>,
     /// Shared session runtime state.
@@ -189,9 +190,10 @@ impl Connection {
     /// application whose `to_app_checked` decides at once
     /// ([`SendVerdict::ready`](crate::SendVerdict::ready)) and calls no
     /// `to_app` avoids it. The command queue the message travels
-    /// (`tokio::sync::mpsc`) still allocates about one block per 128 sends as
-    /// it grows, so a send is not yet allocation-free. A store adds its own (see
-    /// `doc/adr/0008-pooled-outbound-messages.md`).
+    /// is a ring sized to the session's outbound capacity, allocated once
+    /// when the session starts, so a pooled message sent through a gate that
+    /// decides at once allocates nothing on its way to the wire. A store adds
+    /// its own (see `doc/adr/0008-pooled-outbound-messages.md`).
     ///
     /// # Bounds
     ///
