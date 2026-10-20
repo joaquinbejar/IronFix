@@ -99,7 +99,9 @@ pub use sans_io::{
     provisional_counters, reset_flag_contradicts, screen_next_expected, seed_from_initial,
     seed_from_store,
 };
-pub use sans_io::{DEFAULT_BUDGET, Throttle, ThrottleAdmission, ThrottleRelease, TokenBucketSpec};
+pub use sans_io::{
+    DEFAULT_BUDGET, Throttle, ThrottleAdmission, ThrottleDrain, ThrottleRelease, TokenBucketSpec,
+};
 pub use sans_io::{
     EndSeqNoInfinity, EntryScreen, GapFillRange, MAX_HELD_BYTES, MAX_HELD_SENDS,
     MAX_QUEUED_REPLAYS, MAX_READS_PER_REPLAY_STEP, OpeningReplay, PageRead, PageRequest,

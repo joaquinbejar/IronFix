@@ -184,7 +184,7 @@ pub use crate::session_core::{
     HeldEntry, HeldLogonRelease, ReplayJob, SessionCore, SessionPayloads,
 };
 pub use crate::throttle::{
-    DEFAULT_BUDGET, Throttle, ThrottleAdmission, ThrottleRelease, TokenBucketSpec,
+    DEFAULT_BUDGET, Throttle, ThrottleAdmission, ThrottleDrain, ThrottleRelease, TokenBucketSpec,
 };
 
 use crate::config::SessionConfig;
