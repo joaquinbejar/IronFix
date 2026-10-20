@@ -81,7 +81,11 @@ pub enum LogonRole {
 /// after it ([`LogonStage::Admitted`]); then, once `from_admin` has
 /// accepted, `DefaultApplVerID` (1137), `ResetSeqNumFlag` (141), `HeartBtInt`
 /// (108) and `NextExpectedMsgSeqNum` (789) ([`LogonStage::Authenticated`]).
-/// The store is touched only after the last of them.
+/// The store is never touched before `from_admin` accepts. After that, an
+/// accepted Logon resets or seeds the store only once the last of these
+/// checks passes; a Logon refused at [`LogonStage::Authenticated`] is
+/// answered with a Logout that is filed in the store
+/// ([`LogonRefusal::Filed`]), numbered from counters that never reset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum LogonStage {
