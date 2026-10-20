@@ -196,6 +196,7 @@ use crate::stream::SessionStream;
 use crate::throttle::ThrottleConfig;
 use crate::tls::{self, DEFAULT_TLS_HANDSHAKE_TIMEOUT, PeerInfo};
 use crate::validation::InboundValidation;
+use crate::wire::HeaderReject as _;
 use crate::wire::{
     self, ApplVersionGuard, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard,
     UnsupportedVersion,
@@ -1463,7 +1464,7 @@ impl<A: Application + 'static> Acceptor<A> {
             // sequence a session, and the handshake is the cheapest place to
             // refuse it. The peer is not authenticated yet (matching CompIDs
             // prove nothing), so with a store attached it gets no reply.
-            if let Err(problem) = sending_time.validate(&raw) {
+            if let Err(problem) = sending_time.validate(&raw, wire::wall_clock_millis()) {
                 let detail = problem.to_string();
                 let reason = problem.reject_reason();
                 let reject = factory.session_reject(logon_seq, MsgType::Logon.as_str(), &reason);

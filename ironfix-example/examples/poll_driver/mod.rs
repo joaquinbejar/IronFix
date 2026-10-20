@@ -25,8 +25,10 @@
 //! ([`ResendReplay`], [`replay_field`]); what a `SequenceReset` does
 //! ([`screen_sequence_reset`], [`decide_sequence_reset`]); when a gap is
 //! requested ([`SessionCore::decide_gap_request`]); and what a tick does
-//! ([`SessionCore::decide_tick`]). This driver keeps the socket, the buffers,
-//! the encoding, and the order of the calls.
+//! ([`SessionCore::decide_tick`]); and whether a frame's header is acceptable
+//! ([`header_seq_num`], [`PeerIdentity`], [`SendingTimeGuard`]). This driver
+//! keeps the socket, the buffers, the encoding, the clocks, and the order of
+//! the calls.
 //!
 //! It is an example, not a second engine: one initiator session, FIX 4.4,
 //! no TLS, no throttle, no gap queue (gapped messages are discarded and
@@ -47,6 +49,7 @@ use ironfix_core::version::FixVersion;
 use ironfix_engine::application::{RejectReason, SessionId};
 use ironfix_engine::{OutboundField, OutboundMessage, SyncApplication};
 use ironfix_session::SessionConfig;
+use ironfix_session::header::{PeerIdentity, SendingTimeGuard, header_seq_num};
 use ironfix_session::heartbeat::{HeartbeatManager, generate_test_req_id};
 use ironfix_session::sans_io::{
     EndSeqNoInfinity, EntryScreen, GapDisposition, GapRequest, InboundRoute, LivenessAction,
@@ -104,6 +107,8 @@ pub struct PollSession<A: SyncApplication, S: SyncMessageStore> {
     sequences: SequenceManager,
     heartbeat: HeartbeatManager,
     core: SessionCore<()>,
+    identity: PeerIdentity,
+    sending_time: SendingTimeGuard,
     stage: Stage,
     app: A,
     store: S,
@@ -135,6 +140,8 @@ impl<A: SyncApplication, S: SyncMessageStore> PollSession<A, S> {
         sequences.set_sender_seq(store.next_sender_seq());
         sequences.set_target_seq(store.next_target_seq());
         let heartbeat = HeartbeatManager::new(config.heartbeat_interval, now);
+        let identity = PeerIdentity::new(&config);
+        let sending_time = SendingTimeGuard::new(&config);
         let session = Session::new(session_id.to_string())
             .connect()
             .send_logon(now);
@@ -148,6 +155,8 @@ impl<A: SyncApplication, S: SyncMessageStore> PollSession<A, S> {
             sequences,
             heartbeat,
             core: SessionCore::new(),
+            identity,
+            sending_time,
             stage: Stage::LogonSent(session),
             app,
             store,
@@ -291,13 +300,23 @@ impl<A: SyncApplication, S: SyncMessageStore> PollSession<A, S> {
             Ok(raw) => raw,
             Err(err) => return self.fail(format!("inbound frame does not decode: {err}"), now),
         };
+        // The header checks of the core, in the Tokio driver's order:
+        // MsgSeqNum (34) in the standard header, the counterparty's
+        // identity, then SendingTime (52), all before the message counts as
+        // proof of life.
         let msg_type = raw.msg_type().clone();
-        let Some(seq) = raw
-            .get_field_str(34)
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(seq) = header_seq_num(&raw) else {
             return self.fail("inbound message without MsgSeqNum (34)".to_string(), now);
         };
+        if let Err(mismatch) = self.identity.validate(&raw) {
+            return self.fail(mismatch.to_string(), now);
+        }
+        if let Err(problem) = self
+            .sending_time
+            .validate(&raw, Timestamp::now().as_millis())
+        {
+            return self.fail(problem.to_string(), now);
+        }
         let _ = self.heartbeat.on_message_received(
             msg_type == MsgType::Heartbeat,
             raw.get_field_str(112),

@@ -508,3 +508,20 @@ converted at the boundary so paused-clock tests stay deterministic.
   driver sequencing the calls. It is an example, not a second engine: one
   initiator, no TLS, no throttle, no gap queue, and a session that ends
   with a Logout on its first protocol error.
+
+- **#189 (the inbound header checks in the core):** the residual the #91
+  closure recorded is gone. `ironfix_session::header` holds the checks
+  every inbound frame passes: `PeerIdentity` (CompIDs, sub and location
+  IDs, each in the standard header), `SendingTimeGuard` (presence, format
+  and skew of 52), `ApplVersionGuard` (1137 and 1128),
+  `parse_heartbeat_interval` (108), and the standard-header readers. They
+  moved verbatim from the engine's private `wire.rs`, with two changes:
+  `SendingTimeGuard::validate` takes the wall clock in milliseconds instead
+  of reading it (the file is covered by `tests/no_clock_reads.rs`), and a
+  problem reports its `SessionRejectReason` and `RefTagID`
+  (`reject_code`, `ref_tag`) instead of building the engine's
+  `RejectReason`, which the engine still does through a private trait. The
+  engine's unit tests of these checks stayed where they were and run
+  against the moved code; no behaviour changed. The poll driver of #93
+  now runs the same checks, in the Tokio driver's order. Additive surface
+  on `ironfix-session`.
