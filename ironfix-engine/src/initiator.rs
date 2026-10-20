@@ -225,9 +225,16 @@ use ironfix_core::error::DecodeError;
 use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
 use ironfix_session::config::SessionConfigError;
-use ironfix_session::heartbeat::negotiate_interval;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
-use ironfix_session::{Connecting, Disconnected, HeartbeatManager, Session, SessionConfig};
+use ironfix_session::{
+    ADOPTED_RESET_NEXT_SENDER, ADOPTED_RESET_NEXT_TARGET, ADOPTED_RESET_STORED_TARGET,
+    AckHeartBtIntDefect, AckReset, Connecting, Disconnected, HeartbeatManager, LogonCounters,
+    LogonGapAction, LogonRole, NextExpectedBasis, ScreenedNextExpected, Session, SessionConfig,
+    classify_logon_seq, decide_ack_reset, decide_logon_gap, declared_next_expected,
+    default_appl_ver_id_required, initial_seed_applies, initiator_resets, interval_change,
+    logon_ack_deadline, mismatch_report_applies, negotiate_logon_interval, owes_reset_durably,
+    reset_flag_contradicts, screen_next_expected, seed_from_initial,
+};
 use ironfix_store::MessageStore;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -1076,16 +1083,11 @@ impl<A: Application + 'static> Initiator<A> {
         // when it would actually be used. The validated seed is applied by
         // `seed_session`, which reads the same fields; this is only the
         // guard.
-        if let Some((sender, target)) = self.initial_sequences
-            && !self.config.reset_on_logon
-            && !self.store.reset_is_owed()
+        if let Some(initial) = self.initial_sequences
+            && initial_seed_applies(self.config.reset_on_logon, self.store.reset_is_owed())
         {
-            NonZeroU64::new(sender).ok_or(EngineError::InvalidInitialSequence {
-                counter: SequenceCounter::Sender,
-            })?;
-            NonZeroU64::new(target).ok_or(EngineError::InvalidInitialSequence {
-                counter: SequenceCounter::Target,
-            })?;
+            seed_from_initial(initial)
+                .map_err(|counter| EngineError::InvalidInitialSequence { counter })?;
         }
         Ok(version)
     }
@@ -1121,7 +1123,7 @@ impl<A: Application + 'static> Initiator<A> {
             let _ = session.disconnect();
             return Err(err.into());
         }
-        let reset_logon = self.config.reset_on_logon || self.store.reset_is_owed();
+        let reset_logon = initiator_resets(self.config.reset_on_logon, self.store.reset_is_owed());
         // Owed from before the reset until the Logon declaring it is
         // acknowledged: a connect dropped while the reset is pending leaves it
         // owed, and so does one that fails later. The ticket pays only this
@@ -1131,7 +1133,7 @@ impl<A: Application + 'static> Initiator<A> {
         // on (ADR-0029): a crash from here until the Logon is acknowledged
         // leaves the store's marker set, and the next session, in this
         // process or a restarted one, resets and declares the reset again.
-        let reset_ticket = if reset_logon && self.store.store().is_some() {
+        let reset_ticket = if owes_reset_durably(reset_logon, self.store.store().is_some()) {
             match self
                 .store
                 .owe_durably(&session_id, self.write_timeout)
@@ -1186,10 +1188,7 @@ impl<A: Application + 'static> Initiator<A> {
         // The effective startup target, the baseline of the mismatch report
         // (ADR-0015): the number the ack is expected to carry.
         let startup_target = runtime.sequences.next_target_seq().value();
-        let next_expected = self
-            .config
-            .send_next_expected_msg_seq_num
-            .then(|| runtime.sequences.next_target_seq().value());
+        let next_expected = declared_next_expected(&self.config, &runtime.sequences);
         let logon = factory.logon(
             self.config.heartbeat_interval_secs(),
             reset_logon,
@@ -1218,9 +1217,11 @@ impl<A: Application + 'static> Initiator<A> {
         // Await the Logon acknowledgement. Garbled frames are skipped, and the
         // logon timeout covers the whole wait, so an ack that never arrives
         // intact is a LogonTimeout.
+        // The wait runs from the instant the Logon was sent, the typestate's
+        // `sent_at` (the sans-IO core's logon deadline, issue #91 stage 5).
         let ack = match read_handshake_frame(
             &mut framed,
-            self.config.logon_timeout,
+            logon_ack_deadline(&session, self.config.logon_timeout),
             &session_id,
             self.capture(&session_id).as_ref(),
         )
@@ -1385,7 +1386,7 @@ impl<A: Application + 'static> Initiator<A> {
             // that carries 141=Y in either direction, and it moves nothing.
             // A malformed 789 counts as not declared here; it is refused
             // below as before.
-            if !reset_logon && raw.get_field_str(141) != Some("Y") {
+            if mismatch_report_applies(reset_logon, raw.get_field_str(141) == Some("Y")) {
                 let peer_next_expected = if self.config.send_next_expected_msg_seq_num {
                     next_expected::read_next_expected(&raw)
                         .ok()
@@ -1394,12 +1395,17 @@ impl<A: Application + 'static> Initiator<A> {
                 } else {
                     None
                 };
+                let counters = LogonCounters::initiator(
+                    logon_seq,
+                    startup_target,
+                    runtime.sequences.next_sender_seq().value(),
+                );
                 if let Some(mismatch) = SequenceMismatch::compare(
-                    (logon_seq, startup_target),
+                    (counters.next_sender, counters.next_target),
                     stored,
                     ack_seq,
                     peer_next_expected,
-                    runtime.sequences.next_sender_seq().value(),
+                    counters.next_outbound,
                 ) {
                     self.application
                         .on_sequence_mismatch(&session_id, &mismatch)
@@ -1417,7 +1423,13 @@ impl<A: Application + 'static> Initiator<A> {
             // Refused like the ack's other field problems: a Reject
             // (reason 18; 13 for a repeated 1137; 1 for a missing one in
             // strict mode; RefTagID 1137) and a Logout.
-            match appl_version.check_logon(&raw, self.config.require_ack_default_appl_ver_id) {
+            match appl_version.check_logon(
+                &raw,
+                default_appl_ver_id_required(
+                    LogonRole::Initiator,
+                    self.config.require_ack_default_appl_ver_id,
+                ),
+            ) {
                 Ok(Some(declared)) => {
                     tracing::debug!(
                         session = %session_id,
@@ -1468,17 +1480,18 @@ impl<A: Application + 'static> Initiator<A> {
                     // SessionRejectReason 1 (Required tag missing) for an
                     // absent 108, 6 (Incorrect data format for value) for a
                     // present-but-unparseable one.
-                    let (code, detail) = if matches!(err, DecodeError::MissingRequiredField { .. })
-                    {
-                        (
-                            1,
-                            "Logon acknowledgement omitted the required HeartBtInt (108)"
-                                .to_string(),
-                        )
-                    } else {
-                        (6, err.to_string())
-                    };
-                    let reason = RejectReason::new(code, detail.clone()).with_ref_tag(108);
+                    let (defect, detail) =
+                        if matches!(err, DecodeError::MissingRequiredField { .. }) {
+                            (
+                                AckHeartBtIntDefect::Missing,
+                                "Logon acknowledgement omitted the required HeartBtInt (108)"
+                                    .to_string(),
+                            )
+                        } else {
+                            (AckHeartBtIntDefect::Malformed, err.to_string())
+                        };
+                    let reason = RejectReason::new(defect.session_reject_reason(), detail.clone())
+                        .with_ref_tag(108);
                     let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
                     let logout = factory.logout(Some(&detail));
                     let refused = refuse_handshake(
@@ -1499,11 +1512,19 @@ impl<A: Application + 'static> Initiator<A> {
                     return Err(EngineError::HeartbeatInterval { detail });
                 }
             };
-            let negotiated = match negotiate_interval(self.config.heartbeat_interval, secs) {
+            let negotiated = match negotiate_logon_interval(
+                LogonRole::Initiator,
+                self.config.heartbeat_interval,
+                secs,
+            ) {
                 Ok(interval) => interval,
                 Err(err) => {
                     let detail = err.to_string();
-                    let reason = RejectReason::new(5, detail.clone()).with_ref_tag(108);
+                    let reason = RejectReason::new(
+                        AckHeartBtIntDefect::OutOfRange.session_reject_reason(),
+                        detail.clone(),
+                    )
+                    .with_ref_tag(108);
                     let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
                     let logout = factory.logout(Some(&detail));
                     let refused = refuse_handshake(
@@ -1528,13 +1549,13 @@ impl<A: Application + 'static> Initiator<A> {
                 let mut heartbeat = lock_heartbeat(&runtime);
                 let now = crate::reactor::driver_now();
                 heartbeat.on_message_received(false, None, now);
-                if negotiated != heartbeat.interval() {
+                if let Some(interval) = interval_change(heartbeat.interval(), negotiated) {
                     tracing::info!(
                         session = %session_id,
-                        heartbeat_secs = negotiated.as_secs(),
+                        heartbeat_secs = interval.as_secs(),
                         "using heartbeat interval confirmed by counterparty"
                     );
-                    *heartbeat = HeartbeatManager::new(negotiated, now);
+                    *heartbeat = HeartbeatManager::new(interval, now);
                 }
             }
 
@@ -1548,7 +1569,7 @@ impl<A: Application + 'static> Initiator<A> {
             // peer that declares a reset and then numbers the message anything
             // else is describing two different streams, so the handshake fails
             // rather than guessing which half to believe.
-            if ack_resets && ack_seq != 1 {
+            if reset_flag_contradicts(ack_resets, ack_seq) {
                 let _ = session.on_logon_reject();
                 return Err(EngineError::Sequence(format!(
                     "Logon ack set ResetSeqNumFlag=Y but carried MsgSeqNum {ack_seq}, not 1"
@@ -1566,11 +1587,11 @@ impl<A: Application + 'static> Initiator<A> {
             // missed: resent once Active. 789 moves no counter.
             let mut ack_declares_789 = false;
             if self.config.send_next_expected_msg_seq_num {
-                let (own_logon_seq, next_outbound) = if ack_resets {
-                    (1, 2)
-                } else {
-                    (logon_seq, runtime.sequences.next_sender_seq().value())
-                };
+                let basis = NextExpectedBasis::initiator(
+                    ack_resets,
+                    logon_seq,
+                    runtime.sequences.next_sender_seq().value(),
+                );
                 let declared = next_expected::read_next_expected(&raw);
                 ack_declares_789 = matches!(declared, Ok(Some(_)));
                 // A reset this side declared that the ack does not echo: under
@@ -1580,36 +1601,44 @@ impl<A: Application + 'static> Initiator<A> {
                 // ignores the Logon's 789 for a reset it drives alone. A
                 // malformed value is still refused, and an ack that echoes 141
                 // knew of the reset, so its 789 is still checked.
-                let declared = match declared {
-                    Ok(Some(value)) if reset_logon && !ack_resets => {
+                let declared = declared.map(|declared| {
+                    match screen_next_expected(declared, reset_logon, ack_resets) {
                         // 2 is what an acceptor that took our Logon as message
                         // 1 of a new stream expects. Anything else says it kept
                         // its old stream: it will read our next message (2) as
                         // too low.
-                        if value.get() == 2 {
+                        ScreenedNextExpected::Ignored {
+                            declared,
+                            matches_reset: true,
+                        } => {
                             tracing::debug!(
                                 session = %session_id,
-                                declared = value.get(),
+                                declared = declared.get(),
                                 "ignoring the Logon ack's NextExpectedMsgSeqNum: it does not \
                                  echo the sequence reset this session declared"
                             );
-                        } else {
+                            None
+                        }
+                        ScreenedNextExpected::Ignored {
+                            declared,
+                            matches_reset: false,
+                        } => {
                             tracing::warn!(
                                 session = %session_id,
-                                declared = value.get(),
+                                declared = declared.get(),
                                 "the Logon ack does not echo the sequence reset this session \
                                  declared and its NextExpectedMsgSeqNum is not 2: the acceptor \
                                  likely kept its old stream and will refuse this session's next \
                                  message (MsgSeqNum 2) as too low"
                             );
+                            None
                         }
-                        Ok(None)
+                        screened => screened.usable(),
                     }
-                    other => other,
-                };
+                });
                 let decided = declared.and_then(|declared| {
                     declared
-                        .map(|declared| next_expected::plan(declared, own_logon_seq, next_outbound))
+                        .map(|declared| next_expected::plan_basis(declared, basis))
                         .transpose()
                 });
                 match decided {
@@ -1669,7 +1698,8 @@ impl<A: Application + 'static> Initiator<A> {
                 }
             }
 
-            if ack_resets {
+            let ack_reset = decide_ack_reset(reset_logon, ack_resets);
+            if !matches!(ack_reset, AckReset::None) {
                 tracing::info!(
                     session = %session_id,
                     "counterparty set ResetSeqNumFlag on the Logon ack: resetting sequence numbers"
@@ -1687,7 +1717,9 @@ impl<A: Application + 'static> Initiator<A> {
                 // stream replay the previous stream's frames under the numbers
                 // the new one uses. The reset is then owed, so the next connect
                 // makes it and declares ResetSeqNumFlag itself.
-                if !reset_logon && let Some(handshake) = store.as_mut() {
+                if matches!(ack_reset, AckReset::Adopt)
+                    && let Some(handshake) = store.as_mut()
+                {
                     // Owed before the call and paid only once it has
                     // succeeded: a caller that drops this connect while the
                     // reset is pending runs no error branch, and the next
@@ -1702,17 +1734,24 @@ impl<A: Application + 'static> Initiator<A> {
                             return Err(err.into());
                         }
                     };
-                    if let Err(err) = handshake.reset_to(&session_id, 2, 2).await {
+                    if let Err(err) = handshake
+                        .reset_to(
+                            &session_id,
+                            ADOPTED_RESET_NEXT_SENDER,
+                            ADOPTED_RESET_STORED_TARGET,
+                        )
+                        .await
+                    {
                         let _ = session.on_logon_reject();
                         return Err(err.into());
                     }
                     self.store.reset_paid(ticket);
                 }
-                runtime.sequences.set_target_seq(1);
+                runtime.sequences.set_target_seq(ADOPTED_RESET_NEXT_TARGET);
                 // The Logon already on the wire is message 1 of the reset
                 // outbound stream; rewinding the sender counter to 1 would
                 // re-emit a MsgSeqNum the counterparty has already seen.
-                runtime.sequences.set_sender_seq(2);
+                runtime.sequences.set_sender_seq(ADOPTED_RESET_NEXT_SENDER);
             }
 
             // The reset rule both roles share: in a Logon exchange that resets
@@ -1722,12 +1761,7 @@ impl<A: Application + 'static> Initiator<A> {
             // carries, and expects 2 next; an ack that declares a reset itself
             // was held to 34=1 above. 0 names no message, so an ack numbered 0
             // is validated as usual and refused as too low.
-            let validation = if reset_logon && ack_seq > 0 {
-                SequenceResult::Ok
-            } else {
-                runtime.sequences.validate_incoming(ack_seq)
-            };
-            match validation {
+            match classify_logon_seq(reset_logon, ack_seq, &runtime.sequences) {
                 SequenceResult::Ok => {
                     // The receive cursor includes the ack before the session
                     // goes Active on it and before the in-memory expectation
@@ -1763,13 +1797,13 @@ impl<A: Application + 'static> Initiator<A> {
                 // once that gap is filled, and no ResendRequest crosses the
                 // resend (QuickFIX/C++ does the same). Otherwise the gap is
                 // requested as the reactor's first act.
-                SequenceResult::Gap { expected, received } => {
-                    if self.config.send_next_expected_msg_seq_num && ack_declares_789 {
-                        held_logon = Some((expected, received));
-                    } else {
-                        pending_resend = Some((expected, received));
-                    }
-                }
+                SequenceResult::Gap { expected, received } => match decide_logon_gap(
+                    self.config.send_next_expected_msg_seq_num,
+                    ack_declares_789,
+                ) {
+                    LogonGapAction::Hold => held_logon = Some((expected, received)),
+                    LogonGapAction::Request => pending_resend = Some((expected, received)),
+                },
             }
         }
 

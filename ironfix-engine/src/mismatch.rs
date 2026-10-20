@@ -50,6 +50,9 @@
 //! close is reported first. It carries numbers only: no frame, no `Text`,
 //! nothing that could carry a credential.
 
+use ironfix_session::{
+    LogonCounters, LogonInboundMismatch, LogonOutboundComparison, compare_logon_sequences,
+};
 use std::fmt;
 
 /// How the counterparty's Logon `MsgSeqNum` (34) differs from the effective
@@ -75,6 +78,18 @@ pub enum InboundMismatch {
         /// The effective next target number.
         expected: u64,
     },
+}
+
+impl InboundMismatch {
+    /// The engine's report form of the core's comparison.
+    const fn from_core(inbound: LogonInboundMismatch) -> Self {
+        match inbound {
+            LogonInboundMismatch::Gap { first, last } => Self::Gap { first, last },
+            LogonInboundMismatch::TooLow { received, expected } => {
+                Self::TooLow { received, expected }
+            }
+        }
+    }
 }
 
 impl fmt::Display for InboundMismatch {
@@ -137,33 +152,33 @@ impl OutboundMismatch {
     }
 
     /// Compares a declared 789 with our own Logon number and next outbound
-    /// number, with the boundaries ADR-0021's plan uses.
+    /// number, with the boundaries ADR-0021's plan uses: the sans-IO core's
+    /// [`compare_logon_outbound`] (issue #91, stage 5). Only the tests call
+    /// it; [`SequenceMismatch::compare`] goes through the core directly.
+    #[cfg(test)]
     #[must_use]
     fn compare(declared: Option<u64>, own_logon_seq: u64, next_outbound: u64) -> Self {
-        let Some(declared) = declared else {
-            return Self::NotDeclared;
-        };
-        if declared > next_outbound {
-            return Self::PeerAhead {
+        Self::from_core(ironfix_session::compare_logon_outbound(
+            declared,
+            own_logon_seq,
+            next_outbound,
+        ))
+    }
+
+    /// The engine's report form of the core's comparison.
+    const fn from_core(outbound: LogonOutboundComparison) -> Self {
+        match outbound {
+            LogonOutboundComparison::NotDeclared => Self::NotDeclared,
+            LogonOutboundComparison::Consistent { declared } => Self::Consistent { declared },
+            LogonOutboundComparison::PeerMissed { first, last } => Self::PeerMissed { first, last },
+            LogonOutboundComparison::PeerAhead {
                 declared,
                 next_outbound,
-            };
+            } => Self::PeerAhead {
+                declared,
+                next_outbound,
+            },
         }
-        if declared < own_logon_seq {
-            // declared < own_logon_seq, so own_logon_seq >= 1 and the
-            // subtraction cannot underflow.
-            return match own_logon_seq.checked_sub(1) {
-                Some(last) => Self::PeerMissed {
-                    first: declared,
-                    last,
-                },
-                None => {
-                    debug_assert!(false, "own Logon number below a declared 789 is >= 1");
-                    Self::Consistent { declared }
-                }
-            };
-        }
-        Self::Consistent { declared }
     }
 }
 
@@ -227,27 +242,19 @@ impl SequenceMismatch {
         next_outbound: u64,
     ) -> Option<Self> {
         let (effective_next_sender, effective_next_target) = effective;
-        let inbound = match peer_logon_seq.cmp(&effective_next_target) {
-            std::cmp::Ordering::Equal => None,
-            std::cmp::Ordering::Less => Some(InboundMismatch::TooLow {
-                received: peer_logon_seq,
-                expected: effective_next_target,
-            }),
-            // peer_logon_seq > effective_next_target >= 0, so it is >= 1.
-            std::cmp::Ordering::Greater => match peer_logon_seq.checked_sub(1) {
-                Some(last) => Some(InboundMismatch::Gap {
-                    first: effective_next_target,
-                    last,
-                }),
-                None => {
-                    debug_assert!(false, "a Logon number above the target is >= 1");
-                    None
-                }
+        // The comparison is the sans-IO core's (issue #91, stage 5).
+        let comparison = compare_logon_sequences(
+            LogonCounters {
+                next_sender: effective_next_sender,
+                next_target: effective_next_target,
+                next_outbound,
             },
-        };
-        let outbound =
-            OutboundMismatch::compare(peer_next_expected, effective_next_sender, next_outbound);
-        (inbound.is_some() || outbound.is_mismatch()).then_some(Self {
+            peer_logon_seq,
+            peer_next_expected,
+        );
+        let inbound = comparison.inbound.map(InboundMismatch::from_core);
+        let outbound = OutboundMismatch::from_core(comparison.outbound);
+        comparison.is_mismatch().then_some(Self {
             effective_next_sender,
             effective_next_target,
             stored_next_sender: stored.map(|(sender, _)| sender),

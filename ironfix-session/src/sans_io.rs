@@ -87,8 +87,31 @@
 //!   session's own Logout written whole) and the `reset_on_logout` gate,
 //!   which only a graceful close passes.
 //!
-//! The two Logon handshakes are still decided inside the engine; they move
-//! here in a later stage.
+//! # Stage 5: the two Logon handshakes
+//!
+//! - [`decide_logon_refusal`], [`LogonStage`]: who gets a reply to a refused
+//!   Logon, in the authentication order of ADR-0017 (the store is never
+//!   touched before `from_admin` accepts); [`default_appl_ver_id_required`]
+//!   is the `DefaultApplVerID` (1137) rule of each [`LogonRole`].
+//! - [`reset_flag_contradicts`], [`initiator_resets`], [`acceptor_resets`],
+//!   [`owes_reset_durably`], [`decide_ack_reset`]: `ResetSeqNumFlag` (141)
+//!   and the owed reset of issue #111; [`classify_logon_seq`] and
+//!   [`decide_logon_gap`]: the reset rule and the gapped Logon.
+//! - [`negotiate_logon_interval`], [`interval_change`],
+//!   [`AckHeartBtIntDefect`]: `HeartBtInt` (108).
+//! - [`declared_next_expected`], [`screen_next_expected`],
+//!   [`plan_next_expected`]: `NextExpectedMsgSeqNum` (789, ADR-0021).
+//! - [`decide_seed_source`], [`seed_from_initial`], [`initial_below_store`],
+//!   [`seed_from_store`], [`provisional_counters`], [`inbound_loss_span`]:
+//!   the starting counters and the start report of issue #105.
+//! - [`mismatch_report_applies`], [`LogonCounters`],
+//!   [`compare_logon_sequences`]: the sequence-mismatch report of issue #80
+//!   (ADR-0015) over the effective startup counters.
+//! - [`logon_deadline`], [`logon_timed_out`], [`logon_ack_deadline`]: the
+//!   logon timeout.
+//!
+//! The driver keeps every effect: parsing the Logon's fields, `from_admin`,
+//! the store calls, the writes, the callbacks and the typestate transitions.
 //!
 //! # Time
 //!
@@ -96,6 +119,20 @@
 //! contract"). The Tokio driver passes its own clock, converted at the
 //! boundary, so a paused-clock test drives these decisions deterministically.
 
+pub use crate::logon::{
+    ADOPTED_RESET_NEXT_SENDER, ADOPTED_RESET_NEXT_TARGET, ADOPTED_RESET_STORED_TARGET,
+    AckHeartBtIntDefect, AckReset, LogonCounters, LogonGapAction, LogonInboundMismatch,
+    LogonOutboundComparison, LogonRefusal, LogonRole, LogonSequenceComparison, LogonStage,
+    NEXT_EXPECTED_AFTER_RESET, NextExpectedAhead, NextExpectedBasis, NextExpectedPlan,
+    ScreenedNextExpected, SeedSource, StoreSeed, acceptor_resets, classify_logon_seq,
+    compare_logon_inbound, compare_logon_outbound, compare_logon_sequences, decide_ack_reset,
+    decide_logon_gap, decide_logon_refusal, decide_seed_source, declared_next_expected,
+    default_appl_ver_id_required, inbound_loss_span, initial_below_store, initial_seed_applies,
+    initiator_resets, interval_change, logon_ack_deadline, logon_deadline, logon_timed_out,
+    mismatch_report_applies, negotiate_logon_interval, owes_reset_durably, plan_next_expected,
+    provisional_counters, reset_flag_contradicts, screen_next_expected, seed_from_initial,
+    seed_from_store,
+};
 pub use crate::logout::{
     LocalLogoutDecision, LocalLogoutReason, LogoutClose, LogoutPhase, LogoutReplyWrite,
     LogoutTextError, MAX_LOGOUT_TEXT_LEN, OwedLogout, PeerLogoutDecision, check_logout_text,

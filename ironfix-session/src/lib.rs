@@ -46,7 +46,10 @@
 //!   ([`decide_resend_request`], [`ResendReplay`], [`EndSeqNoInfinity`]);
 //!   stage 4 the Logout handshake ([`decide_local_logout`],
 //!   [`decide_peer_logout`], [`OwedLogout`], [`LogoutClose`],
-//!   [`close_resets`]);
+//!   [`close_resets`]); stage 5 the two Logon handshakes
+//!   ([`decide_logon_refusal`], [`classify_logon_seq`],
+//!   [`plan_next_expected`], [`decide_seed_source`],
+//!   [`compare_logon_sequences`], [`logon_deadline`]);
 //!   the Tokio reactor in
 //!   `ironfix-engine` is its first driver
 //!
@@ -59,6 +62,7 @@
 
 pub mod config;
 pub mod heartbeat;
+mod logon;
 mod logout;
 mod replay;
 pub mod sans_io;
@@ -71,6 +75,20 @@ pub use config::{
 pub use heartbeat::{
     HeartbeatIntervalError, HeartbeatManager, MAX_HEARTBEAT_INTERVAL_SECS, TestRequestOutcome,
     generate_test_req_id, negotiate_interval,
+};
+pub use sans_io::{
+    ADOPTED_RESET_NEXT_SENDER, ADOPTED_RESET_NEXT_TARGET, ADOPTED_RESET_STORED_TARGET,
+    AckHeartBtIntDefect, AckReset, LogonCounters, LogonGapAction, LogonInboundMismatch,
+    LogonOutboundComparison, LogonRefusal, LogonRole, LogonSequenceComparison, LogonStage,
+    NEXT_EXPECTED_AFTER_RESET, NextExpectedAhead, NextExpectedBasis, NextExpectedPlan,
+    ScreenedNextExpected, SeedSource, StoreSeed, acceptor_resets, classify_logon_seq,
+    compare_logon_inbound, compare_logon_outbound, compare_logon_sequences, decide_ack_reset,
+    decide_logon_gap, decide_logon_refusal, decide_seed_source, declared_next_expected,
+    default_appl_ver_id_required, inbound_loss_span, initial_below_store, initial_seed_applies,
+    initiator_resets, interval_change, logon_ack_deadline, logon_deadline, logon_timed_out,
+    mismatch_report_applies, negotiate_logon_interval, owes_reset_durably, plan_next_expected,
+    provisional_counters, reset_flag_contradicts, screen_next_expected, seed_from_initial,
+    seed_from_store,
 };
 pub use sans_io::{
     EndSeqNoInfinity, EntryScreen, GapFillRange, MAX_HELD_BYTES, MAX_HELD_SENDS,

@@ -20,7 +20,8 @@
 //!   sequence, 2 after a reset (the Logon is message 1 of the new stream), and
 //!   the first missing number when the Logon opened a gap, since a gapped
 //!   Logon is not consumed.
-//! - **What the counterparty's value asks.** [`plan`] compares it with the
+//! - **What the counterparty's value asks.** [`plan_basis`] (the sans-IO
+//!   core's plan) compares it with the
 //!   `MsgSeqNum` of this session's own Logon or acknowledgement and with the
 //!   next `MsgSeqNum` this session sends. A value above the next number this
 //!   session sends claims messages that were never sent: the Logon exchange
@@ -52,6 +53,7 @@
 use crate::application::RejectReason;
 use crate::wire::{self, FieldOccurrence};
 use ironfix_core::message::RawMessage;
+use ironfix_session::{NextExpectedAhead, NextExpectedBasis, plan_next_expected};
 use std::num::NonZeroU64;
 
 /// `NextExpectedMsgSeqNum` (789): on a Logon, the next `MsgSeqNum` the sender
@@ -136,35 +138,9 @@ impl std::fmt::Display for NextExpectedProblem {
     }
 }
 
-/// What a counterparty's `NextExpectedMsgSeqNum` (789) asks of this session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NextExpectedPlan {
-    /// The counterparty has every message this session sent before its own
-    /// Logon or acknowledgement: nothing to resend.
-    InStep,
-    /// The counterparty missed the messages numbered `begin..end`: resend
-    /// them once the session is Active, as if a `ResendRequest` (2) had asked
-    /// for exactly that range.
-    Replay {
-        /// The first number to resend: the counterparty's 789.
-        begin: u64,
-        /// The first number **not** resent: the `MsgSeqNum` of this session's
-        /// own Logon or acknowledgement.
-        end: u64,
-    },
-}
-
-impl NextExpectedPlan {
-    /// The range to resend once Active, as `(first, exclusive end)`, or
-    /// `None` when there is nothing to resend.
-    #[must_use]
-    pub(crate) const fn replay_range(self) -> Option<(u64, u64)> {
-        match self {
-            Self::InStep => None,
-            Self::Replay { begin, end } => Some((begin, end)),
-        }
-    }
-}
+/// What a counterparty's `NextExpectedMsgSeqNum` (789) asks of this session:
+/// the sans-IO core's plan (issue #91, stage 5).
+pub(crate) use ironfix_session::NextExpectedPlan;
 
 /// Reads the `NextExpectedMsgSeqNum` (789) a counterparty declared on its
 /// Logon or Logon acknowledgement.
@@ -219,40 +195,48 @@ pub(crate) fn parse_value(value: &[u8]) -> Result<NonZeroU64, NextExpectedProble
 ///
 /// `own_logon_seq` is the `MsgSeqNum` of this session's own Logon (an
 /// initiator) or acknowledgement (an acceptor), and `next_outbound` the next
-/// `MsgSeqNum` this session sends at the moment the 789 is read: for an
-/// acceptor, which reads the initiator's 789 before acknowledging, both are
-/// the number its acknowledgement takes; for an initiator, which reads the
-/// acceptor's 789 on the acknowledgement, `next_outbound` is one past its
-/// Logon. Both are taken after any sequence reset the Logon exchange makes,
-/// where a reset session's own Logon or acknowledgement is 1.
-///
-/// - `declared > next_outbound`: [`NextExpectedProblem::AheadOfSent`].
-/// - `declared < own_logon_seq`: [`NextExpectedPlan::Replay`] of
-///   `declared..own_logon_seq`, which stops before this session's own Logon
-///   (see the module documentation).
-/// - otherwise [`NextExpectedPlan::InStep`].
+/// `MsgSeqNum` this session sends at the moment the 789 is read; the bases
+/// of each role are [`NextExpectedBasis`]'s constructors. The decision is
+/// the sans-IO core's [`plan_next_expected`] (issue #91, stage 5); this only
+/// maps its refusal onto [`NextExpectedProblem::AheadOfSent`]. The engine
+/// calls [`plan_basis`]; this form is kept for the tests.
 ///
 /// # Errors
-/// [`NextExpectedProblem::AheadOfSent`] as above.
+/// [`NextExpectedProblem::AheadOfSent`] for a value above `next_outbound`.
+#[cfg(test)]
 pub(crate) const fn plan(
     declared: NonZeroU64,
     own_logon_seq: u64,
     next_outbound: u64,
 ) -> Result<NextExpectedPlan, NextExpectedProblem> {
-    let declared = declared.get();
-    if declared > next_outbound {
-        return Err(NextExpectedProblem::AheadOfSent {
+    plan_basis(
+        declared,
+        NextExpectedBasis {
+            own_logon_seq,
+            next_outbound,
+        },
+    )
+}
+
+/// The 789 plan against a core [`NextExpectedBasis`].
+///
+/// # Errors
+/// [`NextExpectedProblem::AheadOfSent`] for a value above the basis's next
+/// outbound.
+pub(crate) const fn plan_basis(
+    declared: NonZeroU64,
+    basis: NextExpectedBasis,
+) -> Result<NextExpectedPlan, NextExpectedProblem> {
+    match plan_next_expected(declared, basis) {
+        Ok(plan) => Ok(plan),
+        Err(NextExpectedAhead {
             declared,
             next_outbound,
-        });
+        }) => Err(NextExpectedProblem::AheadOfSent {
+            declared,
+            next_outbound,
+        }),
     }
-    if declared < own_logon_seq {
-        return Ok(NextExpectedPlan::Replay {
-            begin: declared,
-            end: own_logon_seq,
-        });
-    }
-    Ok(NextExpectedPlan::InStep)
 }
 
 #[cfg(test)]

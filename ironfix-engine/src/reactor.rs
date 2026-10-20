@@ -741,9 +741,14 @@ pub(crate) enum HandshakeRead {
 /// `session_id` labels the report: the session's identifier, or, before an
 /// [`AcceptorRegistry`](crate::AcceptorRegistry) has routed the Logon to a
 /// session, a fixed label that names no counterparty.
+///
+/// `deadline` is the sans-IO core's logon deadline
+/// ([`ironfix_session::logon_deadline`], issue #91 stage 5), on the driver
+/// clock ([`driver_now`]); `None` is a timeout too long to schedule, which
+/// bounds nothing, as Tokio's own `timeout` treats one.
 pub(crate) async fn read_handshake_frame<S>(
     framed: &mut FixFramed,
-    logon_timeout: Duration,
+    deadline: Option<Instant>,
     session_id: &S,
     capture: Option<&Capture>,
 ) -> HandshakeRead
@@ -751,12 +756,13 @@ where
     S: std::fmt::Display + Sync + ?Sized,
 {
     let mut skips = HandshakeSkips::default();
-    let outcome = timeout(
-        logon_timeout,
-        next_decodable_frame(framed, &mut skips, capture),
-    )
-    .await
-    .unwrap_or(HandshakeRead::TimedOut);
+    let read = next_decodable_frame(framed, &mut skips, capture);
+    let outcome = match deadline {
+        Some(deadline) => tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), read)
+            .await
+            .unwrap_or(HandshakeRead::TimedOut),
+        None => read.await,
+    };
     report_handshake_skips(framed, &skips, &outcome, session_id);
     outcome
 }

@@ -158,10 +158,10 @@ use crate::wire::{self, FieldOccurrence};
 use async_trait::async_trait;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::CompId;
-use ironfix_session::SessionConfig;
 use ironfix_session::config::{
     MAX_ID_LEN, MAX_MESSAGE_SIZE_LIMIT, MAX_TIMEOUT, MIN_MESSAGE_SIZE_LIMIT,
 };
+use ironfix_session::{SessionConfig, logon_deadline};
 use ironfix_transport::FixCodec;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1199,11 +1199,12 @@ impl<A: Application + 'static> AcceptorRegistry<A> {
         peer: Option<&PeerInfo>,
     ) -> Result<Connection, EngineError> {
         self.settings_check()?;
-        // One deadline for the read and the lookup together. The bound is
-        // checked to be at most `MAX_TIMEOUT`, so the sum cannot overflow; it
-        // is still added with a checked call.
-        let deadline = Instant::now()
-            .checked_add(self.logon_timeout)
+        // One deadline for the read and the lookup together: the sans-IO
+        // core's logon deadline (issue #91 stage 5), on the driver clock. The
+        // bound is checked to be at most `MAX_TIMEOUT`, so it cannot
+        // overflow; an unschedulable one is still refused.
+        let deadline = logon_deadline(crate::reactor::driver_now(), self.logon_timeout)
+            .map(Instant::from_std)
             .ok_or_else(|| {
                 EngineError::Configuration(format!(
                     "registry logon timeout {:?} cannot be scheduled",
