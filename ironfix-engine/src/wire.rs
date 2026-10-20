@@ -2233,10 +2233,11 @@ impl MessageFactory {
 /// The `SessionRejectReason` (373) a validation defect is reported with on
 /// `version`, or `None` when the version defines no code for it.
 ///
-/// FIX 4.3 and later (FIXT.1.1 included) define every code a defect maps to.
-/// FIX 4.2 defines 0 to 11 only (`spec/FIX42.xml`), so 13, 15, 16 and 99 have
-/// no code there: the Reject goes out without 373, and `RefTagID` (371) and
-/// `Text` (58) name the problem. FIX 4.0 and 4.1 carry no 373 at all, which
+/// FIX 4.4 and later (FIXT.1.1 included) define every code a defect maps to.
+/// FIX 4.3 has 13, 15 and 16 but not 99 (*Other*, added in FIX 4.4), and FIX
+/// 4.2 defines 0 to 11 only (`spec/FIX42.xml`). Where the version has no
+/// code, the Reject goes out without 373, and `RefTagID` (371) and `Text`
+/// (58) name the problem. FIX 4.0 and 4.1 carry no 373 at all, which
 /// [`MessageFactory`] already enforces; `None` is returned for them too.
 ///
 /// The match names every version, so a new [`FixVersion`] does not compile
@@ -2269,8 +2270,15 @@ pub(crate) const fn validation_reject_code(
                 None
             }
         }
-        FixVersion::Fix43
-        | FixVersion::Fix44
+        // 13, 15 and 16 exist from FIX 4.3; 99 (Other) only from FIX 4.4.
+        FixVersion::Fix43 => {
+            if code == 99 {
+                None
+            } else {
+                Some(code)
+            }
+        }
+        FixVersion::Fix44
         | FixVersion::Fix50
         | FixVersion::Fix50Sp1
         | FixVersion::Fix50Sp2
@@ -4446,8 +4454,9 @@ mod validation_reject_tests {
             }
             let fix42 = if code <= 11 { Some(code) } else { None };
             assert_eq!(validation_reject_code(FixVersion::Fix42, defect), fix42);
+            let fix43 = if code == 99 { None } else { Some(code) };
+            assert_eq!(validation_reject_code(FixVersion::Fix43, defect), fix43);
             for version in [
-                FixVersion::Fix43,
                 FixVersion::Fix44,
                 FixVersion::Fix50,
                 FixVersion::Fix50Sp1,
@@ -4489,6 +4498,27 @@ mod validation_reject_tests {
         // A code FIX 4.2 has is sent.
         let pending = factory.validation_reject(8, "D", &missing_side(), false);
         assert_eq!(get(&fields(&mut factory, &pending), 373), Some("1"));
+    }
+
+    #[test]
+    fn test_validation_reject_fix43_omits_99_and_keeps_16() {
+        let mut factory = factory_for("FIX.4.3");
+        let other = InboundRejection::new(InboundDefect::Other, None, "too many validation errors");
+        let pending = factory.validation_reject(7, "D", &other, false);
+        let first = fields(&mut factory, &pending);
+        assert_eq!(get(&first, 35), Some("3"));
+        assert_eq!(get(&first, 373), None);
+        assert_eq!(get(&first, 58), Some("too many validation errors"));
+        let count = InboundRejection::new(
+            InboundDefect::IncorrectNumInGroupCount,
+            Some(453),
+            "incorrect NumInGroup count for group NoPartyIDs(453)",
+        );
+        let pending = factory.validation_reject(8, "D", &count, false);
+        let second = fields(&mut factory, &pending);
+        assert_eq!(get(&second, 373), Some("16"));
+        assert_eq!(get(&second, 371), Some("453"));
+        assert!(get(&second, 58).is_some());
     }
 
     #[test]

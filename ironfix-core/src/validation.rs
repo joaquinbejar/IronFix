@@ -39,6 +39,7 @@ use std::fmt;
 /// not the number, is what crosses the seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum InboundDefect {
     /// A tag the schema does not define (373 = 0, *Invalid tag number*).
     InvalidTagNumber,
@@ -69,7 +70,7 @@ pub enum InboundDefect {
     /// and later).
     IncorrectNumInGroupCount,
     /// Anything else, for example a schema that cannot check this message
-    /// type (373 = 99, *Other*; FIX 4.3 and later).
+    /// type (373 = 99, *Other*; FIX 4.4 and later).
     Other,
 }
 

@@ -56,10 +56,11 @@
 //!
 //! By default a session-level Reject (35=3): `RefSeqNum` (45), `RefTagID`
 //! (371), `RefMsgType` (372), `SessionRejectReason` (373) and `Text` (58).
-//! The 373 code depends on the session's version: FIX 4.3 and later carry
-//! the code of the [`InboundDefect`](ironfix_core::InboundDefect); FIX 4.2
-//! defines codes 0 to 11 only, so a defect whose code is 13, 15, 16 or 99
-//! goes out without 373 (371 and 58 still name it); FIX 4.0 and 4.1 Rejects
+//! The 373 code depends on the session's version: FIX 4.4 and later carry
+//! the code of the [`InboundDefect`](ironfix_core::InboundDefect); FIX 4.3
+//! lacks 99 (*Other*, added in FIX 4.4) and FIX 4.2 defines codes 0 to 11
+//! only, so a defect whose code the version lacks goes out without 373
+//! (371 and 58 still name it); FIX 4.0 and 4.1 Rejects
 //! carry 45 and 58 only, as for every Reject the engine sends.
 //!
 //! With [`ValidationRejectMessage::BusinessMessageReject`], the two defects
@@ -93,6 +94,7 @@ use std::sync::Arc;
 /// validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum ValidationPolicy {
     /// Do not validate. The default.
     #[default]
@@ -109,6 +111,7 @@ pub enum ValidationPolicy {
 /// with (see the [module docs](crate::validation)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
+#[repr(u8)]
 pub enum ValidationRejectMessage {
     /// A session-level Reject (35=3) for every defect. The default.
     #[default]

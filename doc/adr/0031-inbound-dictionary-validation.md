@@ -138,16 +138,19 @@ A session-level Reject (35=3) carries `RefSeqNum` (45), `RefTagID` (371),
 
 Per version:
 
-- **FIX 4.3 and later, FIXT.1.1:** the code above.
+- **FIX 4.4 and later, FIXT.1.1:** the code above.
+- **FIX 4.3:** defines 13, 15 and 16 but not 99, which FIX 4.4 added
+  (release notes PC20030219_5, FIXimate pedigree). A defect mapped to 99
+  goes out without 373; 371 and 58 still name it.
 - **FIX 4.2:** defines 0 to 11 only, so for 13, 15, 16 and 99 the Reject goes
   out **without 373**; 371 and 58 still name the problem. 373 is optional in
   the FIX 4.2 Reject, so omitting it is legal where inventing a code is not.
 - **FIX 4.0 and 4.1:** the Reject is 45 and 58 only, as for every Reject the
   engine sends.
 
-FIX 4.3 is not vendored; that it defines 13, 15, 16 and 99 is taken from the
-#74 review note ("introduced after FIX 4.2") and is not checked against a
-FIX 4.3 dictionary in this repository.
+FIX 4.3 is not vendored; its code set (13, 15 and 16 present, 99 absent) is
+taken from the FIX 4.4 release notes and FIXimate, not checked against a FIX
+4.3 dictionary in this repository.
 
 **BusinessMessageReject.** With `ValidationRejectMessage::BusinessMessageReject`,
 on FIX 4.2 and later, the two content defects get a BusinessMessageReject

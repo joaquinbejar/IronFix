@@ -539,10 +539,11 @@ impl<'d> Validator<'d> {
     /// - A tag that one dictionary of the pair defines but the dictionary
     ///   answering it does not (for example `ClOrdID(11)`, defined by FIX 5.0
     ///   SP2, in a Heartbeat answered by FIXT 1.1) is reported as
-    ///   [`ValidationError::UnknownTag`]. A session reject would map that to
-    ///   `SessionRejectReason(373)=0` (invalid tag number), although `2` (tag
-    ///   not defined for this message type) describes it better; that is what
-    ///   [`ValidationError::inbound_rejection`] does, following QuickFIX/J.
+    ///   [`ValidationError::UnknownTag`], which
+    ///   [`ValidationError::inbound_rejection`] maps to
+    ///   `SessionRejectReason(373)=0` (invalid tag number), following
+    ///   QuickFIX/J, although `2` (tag not defined for this message type)
+    ///   would describe it better.
     /// - The embedded FIXT 1.1 transport ([`Dictionary::fixt11`]) does not
     ///   define the Logon `NoMsgTypes(384)` group, an upstream QuickFIX
     ///   deviation, so a Logon carrying it is reported. Compose a FIXT 1.1
