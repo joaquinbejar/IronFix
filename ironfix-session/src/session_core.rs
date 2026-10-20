@@ -69,6 +69,7 @@ pub struct TickInput<'h> {
 /// What a periodic tick does, from [`SessionCore::decide_tick`], in the
 /// order the checks run: the first that applies wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum TickDecision {
     /// Our Logout waited past the logout timeout: the session ends.
     LogoutTimedOut,
@@ -83,7 +84,7 @@ pub enum TickDecision {
     Liveness(LivenessAction),
 }
 
-/// What to do with a Logon held behind a `NextExpectedMsgSeqNum` (789) gap,/// What to do with a Logon held behind a `NextExpectedMsgSeqNum` (789) gap,
+/// What to do with a Logon held behind a `NextExpectedMsgSeqNum` (789) gap,
 /// given the next number the session expects
 /// ([`SessionCore::decide_held_logon_release`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

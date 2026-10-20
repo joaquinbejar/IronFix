@@ -369,6 +369,7 @@ pub fn classify_inbound(
 /// Where an inbound message goes once its header passed the identity and
 /// `SendingTime` checks and the heartbeat clock saw it ([`route_inbound`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum InboundRoute {
     /// A `SequenceReset` (4): it has its own rules, whatever its number.
     SequenceReset,
@@ -409,6 +410,7 @@ pub enum InboundRoute {
 /// What happens to a message above the expectation once its gap is
 /// requested ([`InboundRoute::Gap`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum GapDisposition {
     /// An application message: it will be resent in order, and under
     /// [`GapPolicy::Queue`](crate::config::GapPolicy::Queue) this copy is
