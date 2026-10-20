@@ -42,6 +42,7 @@ use crate::sans_io::{
     GapRequest, LivenessGate, RecoveryProgress, ResendState, StallAction, decide_gap_request,
     decide_stall, merged_high_water, note_inbound_progress, spanned_rerequest,
 };
+use crate::throttle::{Throttle, ThrottleAdmission, ThrottleRelease, TokenBucketSpec};
 
 /// What to do with a Logon held behind a `NextExpectedMsgSeqNum` (789) gap,
 /// given the next number the session expects
@@ -84,6 +85,9 @@ pub trait SessionPayloads {
     type Replay: fmt::Debug;
     /// Why this session sent its own Logout, reported when the exchange ends.
     type LogoutCause: fmt::Debug;
+    /// A new outbound application message held by the outbound throttle
+    /// until its budget earns a token ([`SessionCore::throttle_admit`]).
+    type Throttled: fmt::Debug;
 
     /// What a held entry counts against
     /// [`MAX_HELD_BYTES`](crate::MAX_HELD_BYTES), the `ResendRequest` marker
@@ -101,6 +105,7 @@ impl SessionPayloads for () {
     type Gapped = ();
     type Replay = ();
     type LogoutCause = ();
+    type Throttled = ();
 
     fn held_bytes(_: &HeldEntry<()>) -> usize {
         0
@@ -178,6 +183,7 @@ pub struct SessionCore<P: SessionPayloads = ()> {
     held_bytes: usize,
     replays: VecDeque<ReplayJob<P::Replay>>,
     gap_queue: Option<GapQueue<P>>,
+    throttle: Option<Throttle<P::Throttled>>,
 }
 
 impl<P: SessionPayloads> fmt::Debug for SessionCore<P> {
@@ -205,6 +211,7 @@ impl<P: SessionPayloads> fmt::Debug for SessionCore<P> {
                     .as_ref()
                     .map(|queue| (queue.len(), queue.bytes())),
             )
+            .field("throttle", &self.throttle.as_ref().map(Throttle::held))
             .finish()
     }
 }
@@ -234,6 +241,7 @@ impl<P: SessionPayloads> SessionCore<P> {
             held_bytes: 0,
             replays: VecDeque::new(),
             gap_queue: None,
+            throttle: None,
         }
     }
 
@@ -787,6 +795,94 @@ impl<P: SessionPayloads> SessionCore<P> {
             .as_ref()
             .map(|queue| (queue.len(), queue.bytes()))
     }
+
+    // --- Outbound throttle (stage 6c) --------------------------------------
+
+    /// Attaches an outbound throttle with full buckets at `now`, one per
+    /// spec in budget index order (the default budget,
+    /// [`DEFAULT_BUDGET`](crate::DEFAULT_BUDGET), first). The tokens start
+    /// full as the session becomes Active; a throttle attached before
+    /// replaces it, and what it held is dropped.
+    pub fn attach_throttle(
+        &mut self,
+        specs: impl IntoIterator<Item = TokenBucketSpec>,
+        now: Instant,
+    ) {
+        self.throttle = Some(Throttle::new(specs, now));
+    }
+
+    /// Whether an outbound throttle is attached.
+    #[must_use]
+    pub const fn throttled(&self) -> bool {
+        self.throttle.is_some()
+    }
+
+    /// Decides what becomes of `item`, a new outbound application message of
+    /// the budget at index `budget`, at `now` ([`Throttle::admit`]). Without a throttle it may go
+    /// at once ([`ThrottleAdmission::Now`]) and reserves nothing.
+    pub fn throttle_admit(
+        &mut self,
+        budget: u8,
+        item: P::Throttled,
+        now: Instant,
+    ) -> ThrottleAdmission<P::Throttled> {
+        match self.throttle.as_mut() {
+            Some(throttle) => throttle.admit(budget, item, now),
+            None => ThrottleAdmission::Now(item),
+        }
+    }
+
+    /// Releases, at `now`, the held message whose budget has earned its
+    /// token, if any ([`Throttle::release`]).
+    pub fn throttle_release(&mut self, now: Instant) -> Option<(u8, P::Throttled)> {
+        self.throttle.as_mut()?.release(now)
+    }
+
+    /// When the throttle may release the next message it holds, as of
+    /// `now`: [`ThrottleRelease::Idle`] without a throttle or with nothing
+    /// held, [`ThrottleRelease::Now`] when a held message has its token, and
+    /// otherwise the instant the first one is earned.
+    pub fn throttle_release_at(&mut self, now: Instant) -> ThrottleRelease {
+        match self
+            .throttle
+            .as_mut()
+            .and_then(|throttle| throttle.next_release(now))
+        {
+            None => ThrottleRelease::Idle,
+            Some(at) if at <= now => ThrottleRelease::Now,
+            Some(at) => ThrottleRelease::At(at),
+        }
+    }
+
+    /// Takes, at `now`, the token a message of `budget` reserved, now that
+    /// its frame is fed ([`Throttle::charge_at`]). Nothing without a
+    /// throttle.
+    pub fn throttle_charge(&mut self, budget: u8, now: Instant) {
+        if let Some(throttle) = self.throttle.as_mut() {
+            throttle.charge_at(budget, now);
+        }
+    }
+
+    /// Gives back the token a message of `budget` reserved and did not use
+    /// ([`Throttle::refund`]). Nothing without a throttle.
+    pub fn throttle_refund(&mut self, budget: u8) {
+        if let Some(throttle) = self.throttle.as_mut() {
+            throttle.refund(budget);
+        }
+    }
+
+    /// How many messages the throttle holds, across every budget (0 without
+    /// a throttle).
+    #[must_use]
+    pub fn throttle_held(&self) -> usize {
+        self.throttle.as_ref().map_or(0, Throttle::held)
+    }
+
+    /// Removes every message the throttle holds, budget by budget, each with
+    /// its budget ([`Throttle::drain`]). Empty without a throttle.
+    pub fn drain_throttled(&mut self) -> impl Iterator<Item = (u8, P::Throttled)> + '_ {
+        self.throttle.iter_mut().flat_map(Throttle::drain)
+    }
 }
 
 #[cfg(test)]
@@ -796,6 +892,7 @@ pub(crate) mod tests {
         MAX_HELD_BYTES, MAX_HELD_SENDS, MAX_QUEUED_REPLAYS, MAX_READS_PER_REPLAY_STEP,
     };
     use crate::state::Session;
+    use crate::throttle::{DEFAULT_BUDGET, ThrottleAdmission, ThrottleRelease, TokenBucketSpec};
 
     /// Payloads that count bytes: a held message and a queued frame are
     /// byte vectors counted by length, the `ResendRequest` marker counts
@@ -811,6 +908,7 @@ pub(crate) mod tests {
         type Gapped = Vec<u8>;
         type Replay = &'static str;
         type LogoutCause = &'static str;
+        type Throttled = u32;
 
         fn held_bytes(entry: &HeldEntry<Vec<u8>>) -> usize {
             match entry {
@@ -1224,5 +1322,79 @@ pub(crate) mod tests {
         assert!(!core.hold_full());
         assert_eq!(core.drain_held().count(), MAX_HELD_SENDS - 1);
         assert_eq!(core.held(), (0, 0));
+    }
+
+    #[test]
+    fn test_without_a_throttle_everything_goes_now() {
+        let mut core = SessionCore::<TestPayloads>::new();
+        let now = Instant::now();
+        assert!(!core.throttled());
+        assert!(matches!(
+            core.throttle_admit(DEFAULT_BUDGET, 7, now),
+            ThrottleAdmission::Now(7)
+        ));
+        core.throttle_charge(DEFAULT_BUDGET, now);
+        core.throttle_refund(DEFAULT_BUDGET);
+        assert_eq!(core.throttle_held(), 0);
+        assert_eq!(core.throttle_release_at(now), ThrottleRelease::Idle);
+        assert!(core.throttle_release(now).is_none());
+        assert_eq!(core.drain_throttled().count(), 0);
+    }
+
+    #[test]
+    fn test_core_owned_throttle_holds_releases_and_drains() {
+        let mut core = SessionCore::<TestPayloads>::new();
+        let t0 = Instant::now();
+        let second = Duration::from_secs(1);
+        core.attach_throttle([TokenBucketSpec::new(second, 1, Some(1_024))], t0);
+        assert!(core.throttled());
+        assert!(matches!(
+            core.throttle_admit(DEFAULT_BUDGET, 1, t0),
+            ThrottleAdmission::Now(1)
+        ));
+        core.throttle_charge(DEFAULT_BUDGET, t0);
+        assert!(matches!(
+            core.throttle_admit(DEFAULT_BUDGET, 2, t0),
+            ThrottleAdmission::Held
+        ));
+        assert!(matches!(
+            core.throttle_admit(DEFAULT_BUDGET, 3, t0),
+            ThrottleAdmission::Held
+        ));
+        assert_eq!(core.throttle_held(), 2);
+        assert_eq!(
+            core.throttle_release_at(t0),
+            ThrottleRelease::At(t0 + second)
+        );
+        assert!(core.throttle_release(t0).is_none(), "not earned yet");
+        let t1 = t0 + second;
+        assert_eq!(core.throttle_release_at(t1), ThrottleRelease::Now);
+        assert_eq!(core.throttle_release(t1), Some((DEFAULT_BUDGET, 2)));
+        core.throttle_charge(DEFAULT_BUDGET, t1);
+        assert!(format!("{core:?}").contains("throttle: Some(1)"));
+        let drained: Vec<_> = core.drain_throttled().collect();
+        assert_eq!(drained, [(DEFAULT_BUDGET, 3)]);
+        assert_eq!(core.throttle_held(), 0);
+        assert_eq!(core.throttle_release_at(t1), ThrottleRelease::Idle);
+    }
+
+    #[test]
+    fn test_core_throttle_refund_frees_the_reserved_token() {
+        let mut core = SessionCore::<TestPayloads>::new();
+        let t0 = Instant::now();
+        core.attach_throttle(
+            [TokenBucketSpec::new(Duration::from_secs(1), 1, Some(1_024))],
+            t0,
+        );
+        assert!(matches!(
+            core.throttle_admit(DEFAULT_BUDGET, 1, t0),
+            ThrottleAdmission::Now(1)
+        ));
+        // Vetoed before the feed: the token goes back.
+        core.throttle_refund(DEFAULT_BUDGET);
+        assert!(matches!(
+            core.throttle_admit(DEFAULT_BUDGET, 2, t0),
+            ThrottleAdmission::Now(2)
+        ));
     }
 }

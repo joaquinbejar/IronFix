@@ -133,6 +133,17 @@
 //!   The driver keeps the frames' construction and encoding, the store, the
 //!   socket, the callbacks and its own transport bookkeeping.
 //!
+//! # Stage 6c: the outbound throttle
+//!
+//! - [`Throttle`], [`ThrottleAdmission`], [`ThrottleRelease`],
+//!   [`TokenBucketSpec`]: the token buckets of a per-session rate limit on
+//!   new outbound application messages (issue #82, ADR-0024) and the
+//!   messages they hold, moved from `ironfix-engine` and owned by
+//!   [`SessionCore`] for the driver's payload
+//!   [`SessionPayloads::Throttled`]. The driver keeps the configuration (in
+//!   the engine, `ThrottleConfig` and its budgets, its validation and its
+//!   classifier, which reads the engine's message type) and the timer.
+//!
 //! # Time
 //!
 //! Every function takes `now` from the driver (ADR-0002, "Time source
@@ -171,6 +182,9 @@ pub use crate::replay::{
 };
 pub use crate::session_core::{
     HeldEntry, HeldLogonRelease, ReplayJob, SessionCore, SessionPayloads,
+};
+pub use crate::throttle::{
+    DEFAULT_BUDGET, Throttle, ThrottleAdmission, ThrottleRelease, TokenBucketSpec,
 };
 
 use crate::config::SessionConfig;

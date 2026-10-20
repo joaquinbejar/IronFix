@@ -27,6 +27,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("sequence.rs", include_str!("../src/sequence.rs")),
     ("session_core.rs", include_str!("../src/session_core.rs")),
     ("state.rs", include_str!("../src/state.rs")),
+    ("throttle.rs", include_str!("../src/throttle.rs")),
 ];
 
 /// Expressions that read a clock.

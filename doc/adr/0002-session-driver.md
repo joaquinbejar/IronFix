@@ -324,3 +324,58 @@ converted at the boundary so paused-clock tests stay deterministic.
     the hand-off position to the application dispatcher task). All three
     are facts about the Tokio driver's buffers and tasks, not protocol
     state; a different driver would keep its own.
+
+- **#91 stage 6c, part 1 (the outbound throttle in the core):** the
+  throttle's token buckets and the messages they hold moved into the core
+  (the private `throttle.rs`, re-exported through `sans_io` and the crate
+  root): `Throttle<T>`, `ThrottleAdmission<T>` (the engine's former private
+  `Admission`), `ThrottleRelease` (the reactor's former private enum),
+  `TokenBucketSpec` (spacing, burst and queue depth of one bucket) and
+  `DEFAULT_BUDGET`. `SessionCore` owns the run-time throttle:
+  `SessionPayloads` gained `type Throttled` (the reactor's held send with
+  its receipt), and the core has `attach_throttle`, `throttled`,
+  `throttle_admit`, `throttle_release`, `throttle_release_at`,
+  `throttle_charge`, `throttle_refund`, `throttle_held` and
+  `drain_throttled`. The core names a budget by its index (`u8`).
+
+  The configuration stays in the engine, and this is a deliberate deviation
+  from moving it: `BudgetId`, `ThrottleBudget`, `ThrottlePolicy`,
+  `ThrottleConfigError` and the four `*_THROTTLE_*` bounds were first moved
+  into the session crate and re-exported from `ironfix_engine::throttle`,
+  which keeps every path compiling, but `cargo-semver-checks` (what
+  `semver.yml` runs against crates.io) reports a type re-exported from
+  another crate as removed (`struct_missing`, `enum_missing`,
+  `pub_module_level_const_missing` on all of them), so the public engine
+  API would not have passed the gate as unchanged. They stay where they
+  are, unchanged; the engine turns each budget into a `TokenBucketSpec`
+  when a session starts (`ThrottleConfig::bucket_specs`, crate-private),
+  and keeps the validation, the classifier (it reads `OutboundMessage`),
+  the 1 ms timer-resolution warning, the once-per-session unknown-budget log
+  and the power-of-two refusal counters. The bucket vector is allocated at
+  the same point of session start, from an exact-size iterator, so the dhat
+  windows read the same counts. Adding an associated type to
+  `SessionPayloads` breaks an implementation outside the workspace, but the
+  trait is unreleased (stage 6b), so this is not a break against 0.4.1.
+  Nothing on the wire changes and no engine integration test changed; the
+  17 unit tests of the buckets moved with them from
+  `ironfix-engine/src/throttle.rs` to `ironfix-session/src/throttle.rs`
+  (built from a test stand-in for the engine budget), and the 10 that
+  exercise the engine's budget and configuration types stayed.
+
+  What remains for issue #91:
+
+  - **The phase owned by the core and the thin-driver handler split.** The
+    reactor's handlers still take the phase by value, return
+    `Result<Phase, SessionClosed>`, and sequence decision calls and effects
+    inline. Turning each into read, feed the core, encode and write its
+    intents, then run callbacks needs a core input/output type (inputs:
+    decoded frame summaries, ticks with `now`, commands; outputs: frame
+    intents and events) and changes every handler of `reactor.rs` at once,
+    together with moving the phase into `SessionCore`. It is planned as its
+    own change, one handler family per step as in stages 1 to 5, with the
+    engine integration tests unchanged at each step.
+  - Stays in the driver by design, as recorded for stage 6b: the
+    garbled-frame window, the writer's write marks and the published
+    watermark. They are facts about the Tokio driver's codec, write buffer
+    and dispatcher task, not protocol state; a different driver keeps its
+    own.
