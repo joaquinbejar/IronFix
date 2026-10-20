@@ -213,10 +213,12 @@ use crate::error::EngineError;
 use crate::loss::{InboundLoss, InboundLossCause};
 use ironfix_core::error::StoreError;
 use ironfix_core::message::MsgType;
-use ironfix_session::SequenceManager;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
+use ironfix_session::{
+    SeedSource, SequenceManager, StoreSeed, decide_seed_source, initial_below_store,
+    seed_from_initial, seed_from_store,
+};
 use ironfix_store::MessageStore;
-use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -962,13 +964,8 @@ impl StoreAttachment {
 pub(crate) fn seeded_counters(
     (sender, target): (u64, u64),
 ) -> Result<SequenceManager, EngineError> {
-    let sender = NonZeroU64::new(sender).ok_or(EngineError::InvalidInitialSequence {
-        counter: SequenceCounter::Sender,
-    })?;
-    let target = NonZeroU64::new(target).ok_or(EngineError::InvalidInitialSequence {
-        counter: SequenceCounter::Target,
-    })?;
-    Ok(SequenceManager::with_initial(sender, target))
+    seed_from_initial((sender, target))
+        .map_err(|counter| EngineError::InvalidInitialSequence { counter })
 }
 
 /// The store binding a Logon handshake writes through, with the counter values
@@ -1095,86 +1092,102 @@ pub(crate) async fn seed_session(plan: SeedPlan<'_>) -> Result<Seeded, EngineErr
     } = plan;
     let mut persisted = PersistedCounters::default();
 
-    if reset {
-        let stored = store.map(|store| (store.next_sender_seq(), store.next_target_seq()));
-        if let Some(store) = store {
-            if let Err(err) = timed(timeout, store.reset_to(1, 1)).await {
-                tracing::error!(
-                    session = %session_id,
-                    error = %err,
-                    "cannot reset the store for a session that starts a new sequence stream: \
-                     refusing the session rather than starting at 1 with the previous stream \
-                     still filed"
-                );
-                return Err(EngineError::Store(err));
+    // Where the counters come from is the sans-IO core's decision (issue
+    // #91, stage 5); the store calls stay here.
+    let source = decide_seed_source(
+        reset,
+        initial.is_some(),
+        store.is_some(),
+        policy.closes_session(),
+    );
+    match (source, initial, store) {
+        (SeedSource::Reset, _, store) => {
+            let stored = store.map(|store| (store.next_sender_seq(), store.next_target_seq()));
+            if let Some(store) = store {
+                if let Err(err) = timed(timeout, store.reset_to(1, 1)).await {
+                    tracing::error!(
+                        session = %session_id,
+                        error = %err,
+                        "cannot reset the store for a session that starts a new sequence \
+                         stream: refusing the session rather than starting at 1 with the \
+                         previous stream still filed"
+                    );
+                    return Err(EngineError::Store(err));
+                }
+                persisted.record_sender(1);
+                persisted.record_target(1);
             }
-            persisted.record_sender(1);
-            persisted.record_target(1);
+            Ok(Seeded {
+                sequences: SequenceManager::new(),
+                persisted,
+                stored,
+            })
         }
-        return Ok(Seeded {
-            sequences: SequenceManager::new(),
-            persisted,
-            stored,
-        });
-    }
-
-    if let Some(initial) = initial {
-        let sequences = seeded_counters(initial)?;
-        let (sender, _) = initial;
-        if let Some(store) = store
-            && policy.closes_session()
-        {
+        (SeedSource::Initial { check_store }, Some(initial), store) => {
+            let sequences = seeded_counters(initial)?;
+            let (sender, _) = initial;
+            if check_store && let Some(store) = store {
+                refresh(session_id, store, timeout).await?;
+                let stored = store.next_sender_seq();
+                if initial_below_store(sender, stored) {
+                    tracing::error!(
+                        session = %session_id,
+                        seeded = sender,
+                        stored,
+                        "initial sender sequence number is below the store's next sender \
+                         number: refusing the session rather than reusing a MsgSeqNum already \
+                         sent"
+                    );
+                    return Err(EngineError::InitialSequenceBelowStore {
+                        seeded: sender,
+                        stored,
+                    });
+                }
+            }
+            let stored = store.map(|store| (store.next_sender_seq(), store.next_target_seq()));
+            Ok(Seeded {
+                sequences,
+                persisted,
+                stored,
+            })
+        }
+        (SeedSource::Store, _, Some(store)) => {
             refresh(session_id, store, timeout).await?;
-            let stored = store.next_sender_seq();
-            if sender < stored {
-                tracing::error!(
-                    session = %session_id,
-                    seeded = sender,
-                    stored,
-                    "initial sender sequence number is below the store's next sender number: \
-                     refusing the session rather than reusing a MsgSeqNum already sent"
-                );
-                return Err(EngineError::InitialSequenceBelowStore {
-                    seeded: sender,
-                    stored,
-                });
+            let sender = store.next_sender_seq();
+            let target = store.next_target_seq();
+            // A store reporting 0 is floored at 1 by the core, and a floored
+            // value is not one the store holds, so it is not recorded.
+            let StoreSeed {
+                sequences,
+                sender_held,
+                target_held,
+            } = seed_from_store(sender, target);
+            if sender_held {
+                persisted.record_sender(sender);
             }
+            if target_held {
+                persisted.record_target(target);
+            }
+            Ok(Seeded {
+                stored: Some((sender, target)),
+                sequences,
+                persisted,
+            })
         }
-        let stored = store.map(|store| (store.next_sender_seq(), store.next_target_seq()));
-        return Ok(Seeded {
-            sequences,
-            persisted,
-            stored,
-        });
+        (SeedSource::Fresh, _, _)
+        | (SeedSource::Initial { .. }, None, _)
+        | (SeedSource::Store, _, None) => {
+            debug_assert!(
+                matches!(source, SeedSource::Fresh),
+                "the seed source follows the plan's seed and store"
+            );
+            Ok(Seeded {
+                sequences: SequenceManager::new(),
+                persisted,
+                stored: None,
+            })
+        }
     }
-
-    let Some(store) = store else {
-        return Ok(Seeded {
-            sequences: SequenceManager::new(),
-            persisted,
-            stored: None,
-        });
-    };
-    refresh(session_id, store, timeout).await?;
-    let sender = store.next_sender_seq();
-    let target = store.next_target_seq();
-    // A store reporting 0 is reporting a number that names no message. Floor
-    // it rather than number a message 0; a floored value is not one the store
-    // holds, so it is not recorded.
-    if sender >= 1 {
-        persisted.record_sender(sender);
-    }
-    if target >= 1 {
-        persisted.record_target(target);
-    }
-    Ok(Seeded {
-        stored: Some((sender, target)),
-        sequences: SequenceManager::with_initial(
-            NonZeroU64::new(sender).unwrap_or(NonZeroU64::MIN),
-            NonZeroU64::new(target).unwrap_or(NonZeroU64::MIN),
-        ),
-        persisted,
-    })
 }
 
 /// Refreshes `store` from its backing medium, bounded by `timeout`.

@@ -85,12 +85,9 @@ impl InboundLoss {
         next_target: u64,
         cause: InboundLossCause,
     ) -> Option<Self> {
-        if watermark == 0 {
-            return None;
-        }
-        let first = watermark.checked_add(1)?;
-        let last = next_target.checked_sub(1)?;
-        (first <= last).then_some(Self { first, last, cause })
+        // The span is the sans-IO core's (issue #91, stage 5).
+        let (first, last) = ironfix_session::inbound_loss_span(watermark, next_target)?;
+        Some(Self { first, last, cause })
     }
 
     /// The first `MsgSeqNum` (34) of the span.

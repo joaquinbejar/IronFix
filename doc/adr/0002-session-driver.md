@@ -191,3 +191,39 @@ converted at the boundary so paused-clock tests stay deterministic.
   are checked against the core. Additive public surface only; nothing on the
   wire changes. Remaining stages: the two Logon handshakes (including the 789
   `plan`, still in the engine), then the driver reduced to I/O and callbacks.
+- **#91 stage 5 (the two Logon handshakes):** the Logon decisions of both
+  roles moved into `sans_io` (in the private `logon.rs`, re-exported through
+  `sans_io` and the crate root). Authentication order (ADR-0017):
+  `decide_logon_refusal` over `LogonRole` and `LogonStage` says who gets a
+  reply to a refused Logon (an initiator always files its refusal; an
+  acceptor answers an unauthenticated peer with nothing while the session is
+  live elsewhere or a store is attached, provisionally otherwise), and
+  `default_appl_ver_id_required` is each role's `DefaultApplVerID` (1137)
+  rule (#67). `ResetSeqNumFlag` (141): `reset_flag_contradicts`,
+  `initiator_resets`, `acceptor_resets`, `owes_reset_durably` (the #111
+  intent made durable first), `decide_ack_reset` (`AckReset`, with the
+  `ADOPTED_RESET_*` counters), `classify_logon_seq` (the shared reset rule)
+  and `decide_logon_gap` (hold for a 789 replay or request).
+  `HeartBtInt` (108): `negotiate_logon_interval`, `interval_change` and
+  `AckHeartBtIntDefect` (the Reject codes 1, 6, 5). 789 (ADR-0021):
+  `declared_next_expected`, `screen_next_expected`, `NextExpectedBasis` and
+  `plan_next_expected` with `NextExpectedPlan` and `NextExpectedAhead`; the
+  engine's `plan` is now a mapping over it, and only the parse of the value
+  stays in `next_expected.rs`. Seeding: `decide_seed_source` (`SeedSource`),
+  `seed_from_initial`, `initial_below_store`, `seed_from_store`
+  (`StoreSeed`), `initial_seed_applies`, `provisional_counters`, and
+  `inbound_loss_span` for the #105 start report. Mismatch report (#80,
+  ADR-0015): `mismatch_report_applies`, `LogonCounters` (the effective
+  startup counters of each role), `compare_logon_inbound`,
+  `compare_logon_outbound` and `compare_logon_sequences`; the engine's
+  public `SequenceMismatch` maps the result exhaustively. Logon timeout:
+  `logon_deadline`, `logon_timed_out` and `logon_ack_deadline` (from the
+  typestate's `sent_at`); the handshake read in both roles and the
+  registry's deadline now come from it on the driver clock. The driver keeps
+  every effect: parsing the Logon's fields (CompIDs, `SendingTime`, 108,
+  1137, 789), `from_admin`, the store calls and the durable marker, the
+  writes, the callbacks and the typestate transitions. Test-only
+  transcriptions of the old engine rules are checked against the core.
+  Additive public surface only; nothing on the wire changes. Remaining
+  stage: the reactor reduced to a thin driver (read, feed, encode, write,
+  callbacks) over a core-owned state object.

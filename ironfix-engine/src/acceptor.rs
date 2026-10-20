@@ -186,7 +186,6 @@ use crate::observer::{Capture, FrameKind, FrameObserver};
 use crate::outbound::OutboundPool;
 use crate::persistence::{
     PersistedCounters, SeedPlan, Seeded, StoreAttachment, StoreFailurePolicy, seed_session,
-    seeded_counters,
 };
 use crate::reactor::{
     DEFAULT_APP_QUEUE_CAPACITY, DEFAULT_OUTBOUND_CAPACITY, DEFAULT_WRITE_TIMEOUT, FixFramed,
@@ -207,7 +206,12 @@ use ironfix_core::version::FixVersion;
 use ironfix_session::config::SessionConfigError;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
 use ironfix_session::{
-    Connecting, Disconnected, HeartbeatManager, SequenceManager, Session, SessionConfig,
+    Connecting, Disconnected, HeartbeatManager, LogonCounters, LogonGapAction, LogonRefusal,
+    LogonRole, LogonStage, NextExpectedBasis, ScreenedNextExpected, SequenceManager, Session,
+    SessionConfig, acceptor_resets, classify_logon_seq, decide_logon_gap, decide_logon_refusal,
+    default_appl_ver_id_required, interval_change, logon_deadline, mismatch_report_applies,
+    negotiate_logon_interval, owes_reset_durably, provisional_counters, reset_flag_contradicts,
+    screen_next_expected,
 };
 use ironfix_store::MessageStore;
 use ironfix_transport::CodecError;
@@ -776,12 +780,7 @@ impl<A: Application + 'static> Acceptor<A> {
     /// is zero, which a session refuses once the peer is authenticated).
     #[must_use]
     fn provisional_sequences(&self) -> SequenceManager {
-        match self.initial_sequences {
-            Some(initial) if !self.config.reset_on_logon => {
-                seeded_counters(initial).unwrap_or_else(|_| SequenceManager::new())
-            }
-            _ => SequenceManager::new(),
-        }
+        provisional_counters(self.initial_sequences, self.config.reset_on_logon)
     }
 
     /// Refuses a Logon that has not been authenticated: its version,
@@ -812,22 +811,42 @@ impl<A: Application + 'static> Acceptor<A> {
         refusal: &str,
         messages: [PendingMessage; N],
     ) {
-        if before_admission && self.session_is_live() {
-            tracing::warn!(
-                session = %session_id,
-                refusal,
-                "refusing a Logon without a reply: the session is live on another connection"
-            );
-            return;
-        }
-        if self.store.store().is_some() {
-            tracing::warn!(
-                session = %session_id,
-                refusal,
-                "refusing an unauthenticated Logon without a reply: with a store attached, \
-                 nothing is written before the peer is authenticated"
-            );
-            return;
+        // Who gets a reply is the sans-IO core's decision (ADR-0017, issue
+        // #91 stage 5). Liveness only matters before admission, so it is
+        // only read then.
+        let stage = if before_admission {
+            LogonStage::BeforeAdmission
+        } else {
+            LogonStage::Admitted
+        };
+        let live = before_admission && self.session_is_live();
+        match decide_logon_refusal(
+            LogonRole::Acceptor,
+            stage,
+            self.store.store().is_some(),
+            live,
+        ) {
+            LogonRefusal::SilentSessionLive => {
+                tracing::warn!(
+                    session = %session_id,
+                    refusal,
+                    "refusing a Logon without a reply: the session is live on another connection"
+                );
+                return;
+            }
+            LogonRefusal::SilentStoreAttached => {
+                tracing::warn!(
+                    session = %session_id,
+                    refusal,
+                    "refusing an unauthenticated Logon without a reply: with a store attached, \
+                     nothing is written before the peer is authenticated"
+                );
+                return;
+            }
+            LogonRefusal::Provisional => {}
+            LogonRefusal::Filed => {
+                debug_assert!(false, "an unauthenticated refusal is never filed");
+            }
         }
         // Without a store nothing is filed, so the only possible failure is
         // the transport's, which `refuse_handshake` logs.
@@ -1162,9 +1181,10 @@ impl<A: Application + 'static> Acceptor<A> {
         // is a LogonTimeout.
         // `on_create` has run: a failure from here is reported to the
         // application as well as returned.
+        // The logon timeout runs from now (the sans-IO core's deadline).
         let result = match read_handshake_frame(
             &mut framed,
-            self.config.logon_timeout,
+            logon_deadline(crate::reactor::driver_now(), self.config.logon_timeout),
             &session_id,
             self.capture(&session_id).as_ref(),
         )
@@ -1502,7 +1522,13 @@ impl<A: Application + 'static> Acceptor<A> {
             // Logon carries no 1137 and is not checked.
             // The declared version is kept for the session's runtime once it
             // exists (`Connection::counterparty_default_appl_version`).
-            let declared_appl_version = match appl_version.check_logon(&raw, true) {
+            let declared_appl_version = match appl_version.check_logon(
+                &raw,
+                default_appl_ver_id_required(
+                    LogonRole::Acceptor,
+                    self.config.require_ack_default_appl_ver_id,
+                ),
+            ) {
                 Ok(declared) => {
                     if let Some(declared) = declared {
                         tracing::debug!(
@@ -1537,7 +1563,7 @@ impl<A: Application + 'static> Acceptor<A> {
             // carrying it have to describe the same stream. Checked before the
             // store is touched, so a contradictory Logon cannot reset it.
             let inbound_reset = raw.get_field_str(141) == Some("Y");
-            if inbound_reset && logon_seq != 1 {
+            if reset_flag_contradicts(inbound_reset, logon_seq) {
                 let detail =
                     format!("Logon set ResetSeqNumFlag=Y but carried MsgSeqNum {logon_seq}, not 1");
                 let logout = factory.logout(Some(&detail));
@@ -1630,7 +1656,11 @@ impl<A: Application + 'static> Acceptor<A> {
                 let _ = session.reject_logon();
                 return Err(err.into());
             }
-            reset = inbound_reset || self.config.reset_on_logon || self.store.reset_is_owed();
+            reset = acceptor_resets(
+                inbound_reset,
+                self.config.reset_on_logon,
+                self.store.reset_is_owed(),
+            );
 
             // A 789 describes the stream the initiator expects to continue. A
             // reset it did not ask for (`reset_on_logon`, an owed reset)
@@ -1639,21 +1669,23 @@ impl<A: Application + 'static> Acceptor<A> {
             // (141=Y) makes our ack message 1 of the new stream: its 789 must
             // be 1, and that is known before the store is reset, so a refused
             // Logon never resets it.
-            let declared_next_expected = match declared_next_expected {
-                Some(declared) if reset && !inbound_reset => {
-                    tracing::debug!(
-                        session = %session_id,
-                        declared = declared.get(),
-                        "ignoring the Logon's NextExpectedMsgSeqNum: this session resets the \
-                         sequence the counterparty did not ask to reset"
-                    );
-                    None
-                }
-                other => other,
-            };
+            let declared_next_expected =
+                match screen_next_expected(declared_next_expected, reset, inbound_reset) {
+                    ScreenedNextExpected::Ignored { declared, .. } => {
+                        tracing::debug!(
+                            session = %session_id,
+                            declared = declared.get(),
+                            "ignoring the Logon's NextExpectedMsgSeqNum: this session resets the \
+                             sequence the counterparty did not ask to reset"
+                        );
+                        None
+                    }
+                    screened => screened.usable(),
+                };
             if reset
                 && let Some(declared) = declared_next_expected
-                && let Err(problem) = next_expected::plan(declared, 1, 1)
+                && let Err(problem) =
+                    next_expected::plan_basis(declared, NextExpectedBasis::acceptor_reset())
             {
                 let detail = problem.to_string();
                 tracing::warn!(session = %session_id, detail = %detail, "rejecting Logon NextExpectedMsgSeqNum");
@@ -1673,7 +1705,7 @@ impl<A: Application + 'static> Acceptor<A> {
             // acted on (ADR-0029): a crash from here until the
             // acknowledgement is sent leaves the store's marker set, and the
             // next session resets and declares the reset again.
-            reset_ticket = if reset && self.store.store().is_some() {
+            reset_ticket = if owes_reset_durably(reset, self.store.store().is_some()) {
                 match self.store.owe_durably(&session_id, write_timeout).await {
                     Ok(ticket) => Some(ticket),
                     Err(err) => {
@@ -1717,14 +1749,26 @@ impl<A: Application + 'static> Acceptor<A> {
                 let mut heartbeat = lock_heartbeat(&runtime);
                 let now = crate::reactor::driver_now();
                 heartbeat.on_message_received(false, None, now);
-                if Duration::from_secs(requested_heartbeat_secs) != heartbeat.interval() {
+                // The parse above already bounded the value, so the core's
+                // acceptor rule adopts it as requested.
+                let negotiated = match negotiate_logon_interval(
+                    LogonRole::Acceptor,
+                    self.config.heartbeat_interval,
+                    requested_heartbeat_secs,
+                ) {
+                    Ok(interval) => interval,
+                    Err(_) => {
+                        debug_assert!(false, "HeartBtInt (108) was bounded when parsed");
+                        Duration::from_secs(requested_heartbeat_secs)
+                    }
+                };
+                if let Some(interval) = interval_change(heartbeat.interval(), negotiated) {
                     tracing::info!(
                         session = %session_id,
                         heartbeat_secs = requested_heartbeat_secs,
                         "honoring HeartBtInt requested by counterparty"
                     );
-                    *heartbeat =
-                        HeartbeatManager::new(Duration::from_secs(requested_heartbeat_secs), now);
+                    *heartbeat = HeartbeatManager::new(interval, now);
                 }
             }
             let reply_heartbeat_secs = requested_heartbeat_secs;
@@ -1736,17 +1780,14 @@ impl<A: Application + 'static> Acceptor<A> {
             // direction), and it moves nothing. Our acknowledgement is both
             // our own Logon number and our next outbound, as ADR-0021 reads
             // it.
-            if !reset {
-                let effective_sender = runtime.sequences.next_sender_seq().value();
+            if mismatch_report_applies(reset, inbound_reset) {
+                let counters = LogonCounters::acceptor(&runtime.sequences);
                 if let Some(mismatch) = SequenceMismatch::compare(
-                    (
-                        effective_sender,
-                        runtime.sequences.next_target_seq().value(),
-                    ),
+                    (counters.next_sender, counters.next_target),
                     stored,
                     logon_seq,
                     declared_next_expected.map(NonZeroU64::get),
-                    effective_sender,
+                    counters.next_outbound,
                 ) {
                     self.application
                         .on_sequence_mismatch(&session_id, &mismatch)
@@ -1764,7 +1805,7 @@ impl<A: Application + 'static> Acceptor<A> {
             // refused before the store was reset, so this never refuses then.
             if let Some(declared) = declared_next_expected {
                 let ack_seq = runtime.sequences.next_sender_seq().value();
-                match next_expected::plan(declared, ack_seq, ack_seq) {
+                match next_expected::plan_basis(declared, NextExpectedBasis::acceptor(ack_seq)) {
                     Ok(plan) => opening_replay = plan.replay_range(),
                     Err(problem) => {
                         let detail = problem.to_string();
@@ -1797,12 +1838,7 @@ impl<A: Application + 'static> Acceptor<A> {
             // did not ask for the reset is told to make it by the ack's 141=Y),
             // and 2 is expected next: no gap is opened for the old stream's
             // numbers. Without a reset the Logon is validated as usual.
-            let validation = if reset && logon_seq > 0 {
-                SequenceResult::Ok
-            } else {
-                runtime.sequences.validate_incoming(logon_seq)
-            };
-            match validation {
+            match classify_logon_seq(reset, logon_seq, &runtime.sequences) {
                 SequenceResult::Ok => {
                     // The receive cursor includes the Logon before the session
                     // goes Active on it and before the in-memory expectation
@@ -1856,15 +1892,13 @@ impl<A: Application + 'static> Acceptor<A> {
                 // filtered 789 is used: it is None when this side drives a
                 // reset. Otherwise the gap is requested as the reactor's first
                 // act.
-                SequenceResult::Gap { expected, received } => {
-                    if self.config.send_next_expected_msg_seq_num
-                        && declared_next_expected.is_some()
-                    {
-                        held_logon = Some((expected, received));
-                    } else {
-                        pending_resend = Some((expected, received));
-                    }
-                }
+                SequenceResult::Gap { expected, received } => match decide_logon_gap(
+                    self.config.send_next_expected_msg_seq_num,
+                    declared_next_expected.is_some(),
+                ) {
+                    LogonGapAction::Hold => held_logon = Some((expected, received)),
+                    LogonGapAction::Request => pending_resend = Some((expected, received)),
+                },
             }
 
             // Reply with the Logon acknowledgement, mirroring ResetSeqNumFlag:
@@ -1877,10 +1911,8 @@ impl<A: Application + 'static> Acceptor<A> {
             // initiator now that its Logon is processed: its number plus one
             // in sequence, 2 after a reset, and the first missing number when
             // the Logon opened a gap (a gapped Logon is not consumed).
-            let next_expected = self
-                .config
-                .send_next_expected_msg_seq_num
-                .then(|| runtime.sequences.next_target_seq().value());
+            let next_expected =
+                ironfix_session::declared_next_expected(&self.config, &runtime.sequences);
             let logon_ack = factory.logon(reply_heartbeat_secs, reset, next_expected);
             if let Err(err) = send_handshake_admin(
                 self.application.as_ref(),
