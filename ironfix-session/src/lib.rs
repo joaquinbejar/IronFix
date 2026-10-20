@@ -51,7 +51,9 @@
 //!   [`plan_next_expected`], [`decide_seed_source`],
 //!   [`compare_logon_sequences`], [`logon_deadline`]); stage 6a the
 //!   session state object the core owns ([`SessionCore`],
-//!   [`HeldLogonRelease`]); the Tokio reactor in
+//!   [`HeldLogonRelease`]); stage 6b the session phase and the payload
+//!   queues ([`SessionPhase`], [`SessionPayloads`], [`HeldEntry`],
+//!   [`ReplayJob`], [`GapEntry`]); the Tokio reactor in
 //!   `ironfix-engine` is its first driver
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
@@ -62,9 +64,11 @@
 //! application.
 
 pub mod config;
+mod gap_queue;
 pub mod heartbeat;
 mod logon;
 mod logout;
+mod phase;
 mod replay;
 pub mod sans_io;
 pub mod sequence;
@@ -101,12 +105,15 @@ pub use sans_io::{
     replay_queue_full, replay_step_continues,
 };
 pub use sans_io::{
+    GapAdmission, GapEntry, GapReady, HeldEntry, HeldLogonRelease, ReplayJob, SessionCore,
+    SessionPayloads, SessionPhase,
+};
+pub use sans_io::{
     GapRequest, InboundSequence, LivenessAction, LivenessGate, RecoveryProgress, ResendState,
     StallAction, classify_inbound, decide_gap_request, decide_liveness, decide_stall,
     logout_timed_out, merged_high_water, note_inbound_progress, spanned_high_water,
     spanned_rerequest, test_request_reply_id,
 };
-pub use sans_io::{HeldLogonRelease, SessionCore};
 pub use sans_io::{
     LocalLogoutDecision, LocalLogoutReason, LogoutClose, LogoutPhase, LogoutReplyWrite,
     LogoutTextError, MAX_LOGOUT_TEXT_LEN, OwedLogout, PeerLogoutDecision, check_logout_text,

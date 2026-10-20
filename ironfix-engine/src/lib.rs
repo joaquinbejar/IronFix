@@ -268,7 +268,6 @@ pub mod connection;
 pub mod error;
 #[cfg(feature = "fixp")]
 pub mod fixp;
-mod gap_queue;
 mod garbled;
 pub mod initiator;
 pub mod loss;

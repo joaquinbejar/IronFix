@@ -263,3 +263,64 @@ converted at the boundary so paused-clock tests stay deterministic.
 
   With those, the reactor is not yet a thin driver: its handlers still
   sequence decision calls and effects inline. Issue #91 stays open for 6b.
+
+- **#91 stage 6b, part 1 (the phase and the payload queues):** the session
+  phase and every queue the reactor kept for the session moved into the
+  core. `SessionPhase` (in the private `phase.rs`, re-exported through
+  `sans_io` and the crate root) is the reactor's former `Phase`: `Active`,
+  `LogoutQueued` and `LogoutPending`, each wrapping the typestate
+  `Session<S>` by value, with `logout_phase`, `advance_logout` (the queued to
+  pending transition, timestamped with the driver's `now`) and `teardown`
+  (to `Session<Disconnected>`). The reactor's handlers still take and return
+  it by value; it names the core type through an alias.
+
+  `SessionCore` gained a payload parameter, `SessionCore<P: SessionPayloads
+  = ()>`. `SessionPayloads` names the driver's types (`Held`, `Gapped`,
+  `Replay`, `LogoutCause`) and the two byte counts the bounds need, so the
+  core owns values it cannot name while `ironfix-session` keeps depending on
+  `ironfix-core` only. With it the core now owns the hold behind a resend
+  (`HeldEntry::{Message, ResendRequest}`, with `hold`,
+  `hold_resend_request`, `unhold`, `drain_held`; the entry and byte counts
+  can no longer drift from the entries, and the counting methods of 6a are
+  private), the resends owed (`ReplayJob` over `ResendReplay`, with
+  `queue_replay`, which merges past `MAX_QUEUED_REPLAYS` as the reactor's
+  `push_resend` did, `take_replay`, `resume_replay`, `clear_replays`), the
+  gap queue (moved from the engine's private `gap_queue.rs`, with
+  `queue_gapped` returning `GapAdmission`, `take_gap_ready`,
+  `clear_gap_queue`, `gap_release_paused`), and the cause of this
+  session's own Logout (`note_local_logout_fed(cause)`,
+  `take_logout_cause`). The reactor's payload is `ReactorPayloads`: a
+  pending message with its receipt, the frame `Bytes`, the replay page and
+  rebuilt frame, and `LogoutCause`. Container types and per-message
+  allocations are unchanged (the dhat windows read the same counts).
+  `SessionCore` was unreleased, so making it generic and making the 6a
+  counting methods private is not a break against 0.4.1; the rest is
+  additive. Nothing on the wire changes and no engine integration test
+  changed. Three reactor unit tests of the replay queue moved to the core
+  with the queue (the widen case is already covered in `replay.rs`).
+
+  What remains for 6b:
+
+  - **The outbound throttle's held messages.** `Throttle<T>` is generic
+    and clock-free already, but it is built from `ThrottleConfig`, a public
+    engine type whose classifier reads `OutboundMessage`; owning it in the
+    core means moving the budgets (`ThrottleBudget`, `BudgetId`,
+    `ThrottlePolicy`) into `ironfix-session` and re-exporting them from the
+    engine, a public-surface move better reviewed on its own.
+  - **The phase owned by the core.** Every handler takes the phase by
+    value and returns `Result<Phase, SessionClosed>`; holding it inside
+    `SessionCore` changes all of their signatures at once, and is the same
+    change as the handler split below.
+  - **The thin-driver handler split.** The handlers still sequence decision
+    calls and effects inline. Turning each into read, feed the core, encode
+    and write its intents, then run callbacks needs a core input/output
+    type (frame intents and events) and touches every handler.
+  - Stays in the driver by design: the garbled-frame window (it counts
+    the frames the codec skipped, which never become frames the core sees
+    and consume no number; it is already a clock-free decision taking
+    `now`, in `garbled.rs`), the
+    writer's write marks (they compare byte offsets of the write buffer
+    against what the stream accepted) and the published watermark (it is
+    the hand-off position to the application dispatcher task). All three
+    are facts about the Tokio driver's buffers and tasks, not protocol
+    state; a different driver would keep its own.

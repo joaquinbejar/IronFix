@@ -17,9 +17,11 @@
 const SOURCES: &[(&str, &str)] = &[
     ("lib.rs", include_str!("../src/lib.rs")),
     ("config.rs", include_str!("../src/config.rs")),
+    ("gap_queue.rs", include_str!("../src/gap_queue.rs")),
     ("heartbeat.rs", include_str!("../src/heartbeat.rs")),
     ("logon.rs", include_str!("../src/logon.rs")),
     ("logout.rs", include_str!("../src/logout.rs")),
+    ("phase.rs", include_str!("../src/phase.rs")),
     ("replay.rs", include_str!("../src/replay.rs")),
     ("sans_io.rs", include_str!("../src/sans_io.rs")),
     ("sequence.rs", include_str!("../src/sequence.rs")),
