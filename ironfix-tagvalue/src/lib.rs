@@ -77,5 +77,5 @@ pub const EQUALS: u8 = b'=';
 pub use checksum::calculate_checksum;
 pub use decoder::Decoder;
 pub use encoder::Encoder;
-pub use index::{FieldIndex, FieldSpan, IndexedMessage};
+pub use index::{FieldIndex, FieldSpan, IndexedMessage, recycle_field_refs};
 pub use ironfix_core::message::RawMessage;

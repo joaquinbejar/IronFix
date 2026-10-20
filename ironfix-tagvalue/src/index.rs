@@ -324,6 +324,37 @@ impl<'a, 'i> IndexedMessage<'a, 'i> {
         )
     }
 
+    /// Builds the view as a [`RawMessage`] whose field references live in
+    /// `refs`, a buffer the caller owns and reuses across messages
+    /// ([`recycle_field_refs`]): no field list is allocated per message,
+    /// whatever its field count, once `refs` has the capacity. `refs` is
+    /// cleared first.
+    ///
+    /// # Errors
+    /// [`DecodeError::RangeOutOfBounds`] if a range does not fit the frame.
+    pub fn to_raw_message_in<'r>(
+        &self,
+        refs: &'r mut Vec<FieldRef<'a>>,
+    ) -> Result<RawMessage<'r>, DecodeError>
+    where
+        'a: 'r,
+    {
+        refs.clear();
+        for span in self.index.spans() {
+            refs.push(
+                self.resolve(span)
+                    .ok_or_else(|| self.out_of_bounds(&span.range()))?,
+            );
+        }
+        RawMessage::with_field_slice(
+            self.buffer,
+            self.begin_string.clone(),
+            self.body.clone(),
+            self.msg_type.clone(),
+            refs,
+        )
+    }
+
     /// Resolves a span against the frame.
     #[inline]
     fn resolve(&self, span: &FieldSpan) -> Option<FieldRef<'a>> {
@@ -341,6 +372,26 @@ impl<'a, 'i> IndexedMessage<'a, 'i> {
             buffer_len: self.buffer.len(),
         }
     }
+}
+
+/// Empties `refs` and hands back its allocation as a buffer for field
+/// references of another lifetime: the buffer a caller keeps between frames
+/// and lends to [`IndexedMessage::to_raw_message_in`] for each one.
+///
+/// A field reference borrows its frame, so a buffer holding the references
+/// of one frame cannot hold the next frame's under the same type. Emptied,
+/// it holds nothing, and the standard library collects an empty iterator of
+/// a same-sized type back into the same allocation, so no block is freed or
+/// allocated; the engine's allocation test checks that it stays so.
+#[must_use]
+pub fn recycle_field_refs<'x, 'y>(mut refs: Vec<FieldRef<'x>>) -> Vec<FieldRef<'y>> {
+    refs.clear();
+    // An adapter that yields nothing, so the collect needs no element and
+    // no panic path; `filter_map` is one the standard library collects in
+    // place.
+    #[allow(clippy::unnecessary_filter_map)]
+    let recycled = refs.into_iter().filter_map(|_| None).collect();
+    recycled
 }
 
 #[cfg(test)]

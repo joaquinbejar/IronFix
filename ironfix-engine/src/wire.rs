@@ -174,12 +174,16 @@ pub(crate) fn decode_frame(frame: &[u8]) -> Result<RawMessage<'_>, DecodeError> 
 /// [`DecodeError::TooManyFields`] when the message has more fields than
 /// `index` holds; the caller falls back to [`decode_frame`] then. The
 /// returned message borrows `frame` only, not `index`.
-pub(crate) fn decode_frame_into<'f>(
+pub(crate) fn decode_frame_into<'f, 'r>(
     frame: &'f [u8],
     index: &mut FieldIndex,
-) -> Result<RawMessage<'f>, DecodeError> {
+    refs: &'r mut Vec<FieldRef<'f>>,
+) -> Result<RawMessage<'r>, DecodeError>
+where
+    'f: 'r,
+{
     let mut decoder = Decoder::new(frame).with_checksum_validation(false);
-    decoder.decode_into(index)?.to_raw_message()
+    decoder.decode_into(index)?.to_raw_message_in(refs)
 }
 
 /// Returns whether `frame`, which framed but failed to decode with `error`, is

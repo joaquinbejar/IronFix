@@ -474,7 +474,34 @@ pub struct RawMessage<'a> {
     /// The parsed message type.
     msg_type: MsgType,
     /// Parsed field references (tag and value ranges).
-    fields: SmallVec<[FieldRef<'a>; 32]>,
+    fields: FieldStore<'a>,
+}
+
+/// Where a [`RawMessage`] keeps its field references: inline in the message
+/// (spilling to the heap above 32 fields), or borrowed from a buffer the
+/// caller owns and reuses ([`RawMessage::with_field_slice`]), which never
+/// allocates per message.
+// The inline variant is the `SmallVec` a `RawMessage` always held, so the
+// message is no larger than before; boxing it would allocate per message,
+// which is what this store exists to avoid.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+enum FieldStore<'a> {
+    /// Held by the message.
+    Inline(SmallVec<[FieldRef<'a>; 32]>),
+    /// Borrowed from the caller.
+    Borrowed(&'a [FieldRef<'a>]),
+}
+
+impl<'a> FieldStore<'a> {
+    /// The fields, in wire order.
+    #[inline]
+    fn as_slice(&self) -> &[FieldRef<'a>] {
+        match self {
+            Self::Inline(fields) => fields,
+            Self::Borrowed(fields) => fields,
+        }
+    }
 }
 
 /// Validates that `range` is well ordered and lies within `buffer_len` bytes.
@@ -520,7 +547,41 @@ impl<'a> RawMessage<'a> {
             begin_string,
             body,
             msg_type,
-            fields,
+            fields: FieldStore::Inline(fields),
+        })
+    }
+
+    /// Creates a RawMessage whose field references are borrowed from
+    /// `fields`, a buffer the caller owns: no field list is allocated for the
+    /// message, however many fields it has. A decoder that reuses one buffer
+    /// across messages decodes without allocating (issue #77).
+    ///
+    /// # Arguments
+    /// * `buffer` - The complete message buffer
+    /// * `begin_string` - Range of the BeginString value, relative to `buffer`
+    /// * `body` - Range of the message body, relative to `buffer`
+    /// * `msg_type` - The parsed message type
+    /// * `fields` - Parsed field references, in wire order
+    ///
+    /// # Errors
+    /// Returns [`DecodeError::RangeOutOfBounds`] if `begin_string` or `body`
+    /// is inverted or does not lie within `buffer`, as [`RawMessage::new`].
+    pub fn with_field_slice(
+        buffer: &'a [u8],
+        begin_string: Range<usize>,
+        body: Range<usize>,
+        msg_type: MsgType,
+        fields: &'a [FieldRef<'a>],
+    ) -> Result<Self, DecodeError> {
+        check_range(&begin_string, buffer.len())?;
+        check_range(&body, buffer.len())?;
+
+        Ok(Self {
+            buffer,
+            begin_string,
+            body,
+            msg_type,
+            fields: FieldStore::Borrowed(fields),
         })
     }
 
@@ -584,7 +645,7 @@ impl<'a> RawMessage<'a> {
     /// Returns an iterator over all fields.
     #[inline]
     pub fn fields(&self) -> impl Iterator<Item = &FieldRef<'a>> {
-        self.fields.iter()
+        self.fields.as_slice().iter()
     }
 
     /// Returns all fields as a slice, in wire order.
@@ -596,14 +657,14 @@ impl<'a> RawMessage<'a> {
     #[inline]
     #[must_use]
     pub fn field_slice(&self) -> &[FieldRef<'a>] {
-        &self.fields
+        self.fields.as_slice()
     }
 
     /// Returns the number of fields in the message.
     #[inline]
     #[must_use]
     pub fn field_count(&self) -> usize {
-        self.fields.len()
+        self.fields.as_slice().len()
     }
 
     /// Gets a field by tag number.
@@ -615,7 +676,7 @@ impl<'a> RawMessage<'a> {
     /// The first field with the given tag, or `None` if not found.
     #[must_use]
     pub fn get_field(&self, tag: u32) -> Option<&FieldRef<'a>> {
-        self.fields.iter().find(|f| f.tag == tag)
+        self.fields.as_slice().iter().find(|f| f.tag == tag)
     }
 
     /// Gets a field value as a string.
@@ -707,8 +768,8 @@ impl OwnedMessage {
         let buffer_start = raw.buffer.as_ptr() as usize;
         let buffer_len = raw.buffer.len();
 
-        let mut field_offsets = Vec::with_capacity(raw.fields.len());
-        for field in &raw.fields {
+        let mut field_offsets = Vec::with_capacity(raw.fields.as_slice().len());
+        for field in raw.fields.as_slice() {
             let offset = (field.value.as_ptr() as usize)
                 .checked_sub(buffer_start)
                 .and_then(|start| {
