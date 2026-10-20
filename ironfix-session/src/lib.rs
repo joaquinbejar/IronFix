@@ -116,9 +116,10 @@ pub use sans_io::{
 };
 pub use sans_io::{
     GapDisposition, GapRequest, InboundRoute, InboundSequence, LivenessAction, LivenessGate,
-    RecoveryProgress, ResendState, StallAction, classify_inbound, decide_gap_request,
-    decide_liveness, decide_stall, logout_timed_out, merged_high_water, note_inbound_progress,
-    route_inbound, spanned_high_water, spanned_rerequest, test_request_reply_id,
+    RecoveryProgress, ResendState, ResetDecision, ResetScreen, StallAction, classify_inbound,
+    decide_gap_request, decide_liveness, decide_sequence_reset, decide_stall, logout_timed_out,
+    merged_high_water, note_inbound_progress, route_inbound, screen_sequence_reset,
+    spanned_high_water, spanned_rerequest, test_request_reply_id,
 };
 pub use sans_io::{
     LocalLogoutDecision, LocalLogoutReason, LogoutClose, LogoutPhase, LogoutReplyWrite,
