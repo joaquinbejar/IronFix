@@ -104,6 +104,14 @@ pub enum FixpEngineError {
         max: u32,
     },
 
+    /// The counterparty read too slowly: more than 16 MiB of outbound
+    /// bytes were waiting, so the transport is closed.
+    #[error("outbound backlog of {len} bytes; the counterparty is not reading")]
+    OutboundBacklog {
+        /// Bytes waiting when the limit was crossed.
+        len: usize,
+    },
+
     /// The connection is closed.
     #[error("connection closed")]
     Closed,

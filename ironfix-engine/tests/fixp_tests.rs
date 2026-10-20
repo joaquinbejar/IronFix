@@ -1102,3 +1102,500 @@ async fn test_tracing_output_never_contains_credentials() {
         "a credential reached a log line"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Callbacks that await their own connection (no deadlock)
+// ---------------------------------------------------------------------------
+
+/// Sends from inside its callbacks and awaits the result: `HELLO` from
+/// `on_established`, `PONG` from `on_message` for every `PING`, a send from
+/// `on_event` on `Established` once the handle is stored, and one from
+/// `on_closed`.
+#[derive(Default)]
+struct Echo {
+    received: Mutex<Vec<Bytes>>,
+    connection: Mutex<Option<FixpConnection>>,
+    sent_from_callbacks: Mutex<Vec<&'static str>>,
+    closed_send: Mutex<Option<bool>>,
+}
+
+impl Echo {
+    fn connection(&self) -> Option<FixpConnection> {
+        self.connection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn received(&self) -> Vec<Bytes> {
+        self.received
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+#[derive(Clone)]
+struct EchoApp(Arc<Echo>);
+
+impl EchoApp {
+    fn record(&self, what: &'static str) {
+        self.0
+            .sent_from_callbacks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(what);
+    }
+}
+
+#[async_trait]
+impl FixpApplication for EchoApp {
+    async fn on_negotiate(&self, _request: &NegotiateRequest) -> NegotiationDecision {
+        NegotiationDecision::Accept {
+            server_flow: FlowType::Recoverable,
+            credentials: None,
+        }
+    }
+
+    async fn on_established(&self, connection: FixpConnection) {
+        ok(
+            connection.send(Bytes::from_static(b"HELLO")).await,
+            "send from on_established",
+        );
+        self.record("on_established");
+        *self.0.connection.lock().unwrap_or_else(|p| p.into_inner()) = Some(connection);
+    }
+
+    async fn on_message(&self, _session_id: SessionId, message: FixpInbound) {
+        self.0
+            .received
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(message.payload.clone());
+        if message.payload.as_ref() == b"PING"
+            && let Some(connection) = self.0.connection()
+        {
+            ok(
+                connection.send(Bytes::from_static(b"PONG")).await,
+                "send from on_message",
+            );
+            self.record("on_message");
+        }
+    }
+
+    async fn on_event(&self, _session_id: Option<SessionId>, event: &Event) {
+        // Any event: awaiting the connection from on_event must not block.
+        if matches!(event, Event::SequenceGap { .. })
+            && let Some(connection) = self.0.connection()
+        {
+            let _ = connection.send(Bytes::from_static(b"EVENT")).await;
+        }
+    }
+
+    async fn on_closed(&self, _session_id: Option<SessionId>) {
+        if let Some(connection) = self.0.connection() {
+            let refused = matches!(
+                connection.send(Bytes::from_static(b"LATE")).await,
+                Err(FixpEngineError::Closed)
+            );
+            *self.0.closed_send.lock().unwrap_or_else(|p| p.into_inner()) = Some(refused);
+        }
+    }
+}
+
+async fn ping_pong_both_ways(client: &FixpConnection, client_app: &Echo, server_app: &Echo) {
+    let ping = Bytes::from_static(b"PING");
+    let pong = Bytes::from_static(b"PONG");
+    let hello = Bytes::from_static(b"HELLO");
+    wait_until("HELLO both ways", || {
+        client_app.received().contains(&hello) && server_app.received().contains(&hello)
+    })
+    .await;
+    // Client to server: the server's on_message answers.
+    ok(client.send(ping.clone()).await, "client PING");
+    wait_until("PONG at the client", || {
+        client_app.received().contains(&pong)
+    })
+    .await;
+    // Server to client: the client's on_message answers.
+    let Some(server) = server_app.connection() else {
+        panic!("no server connection");
+    };
+    ok(server.send(ping).await, "server PING");
+    wait_until("PONG at the server", || {
+        server_app.received().contains(&pong)
+    })
+    .await;
+    for echo in [client_app, server_app] {
+        let sent = echo
+            .sent_from_callbacks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(sent, vec!["on_established", "on_message"]);
+    }
+    ok(client.terminate("done").await, "terminate");
+    wait_closed(client).await;
+    wait_closed(&server).await;
+    for echo in [client_app, server_app] {
+        wait_until("on_closed ran its send", || {
+            echo.closed_send
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+        })
+        .await;
+        assert_eq!(
+            *echo.closed_send.lock().unwrap_or_else(|p| p.into_inner()),
+            Some(true),
+            "a send after the close is refused, not left hanging"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_callbacks_may_await_their_own_connection_over_tcp() {
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        let (listener, addr) = tcp_pair().await;
+        let server_app = Arc::new(Echo::default());
+        let client_app = Arc::new(Echo::default());
+        let acceptor = FixpAcceptor::new(EchoApp(Arc::clone(&server_app)), FixpConfig::default());
+        let serving = tokio::spawn({
+            let acceptor = acceptor.clone();
+            async move { acceptor.serve(listener).await }
+        });
+        let client = ok(
+            FixpInitiator::new(
+                EchoApp(Arc::clone(&client_app)),
+                FixpConfig::default(),
+                session_id(0x91),
+                FlowType::Recoverable,
+            )
+            .connect(addr)
+            .await,
+            "connect",
+        );
+        wait_until("the server's connection", || {
+            server_app.connection().is_some()
+        })
+        .await;
+        ping_pong_both_ways(&client, &client_app, &server_app).await;
+        serving.abort();
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "a callback awaiting its connection deadlocked"
+    );
+}
+
+#[tokio::test]
+async fn test_callbacks_may_await_their_own_connection_over_duplex() {
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        let server_app = Arc::new(Echo::default());
+        let client_app = Arc::new(Echo::default());
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let acceptor = FixpAcceptor::new(EchoApp(Arc::clone(&server_app)), FixpConfig::default());
+        let initiator = FixpInitiator::new(
+            EchoApp(Arc::clone(&client_app)),
+            FixpConfig::default(),
+            session_id(0x92),
+            FlowType::Recoverable,
+        );
+        let (server, client) = tokio::join!(
+            acceptor.accept_stream(server_io),
+            initiator.connect_stream(client_io)
+        );
+        let _server = ok(server, "accept");
+        let client = ok(client, "connect");
+        ping_pong_both_ways(&client, &client_app, &server_app).await;
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "a callback awaiting its connection deadlocked"
+    );
+}
+
+/// The engine as requester sends from `on_event` when it reports the gap.
+#[tokio::test]
+async fn test_on_event_may_await_its_own_connection() {
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        let (engine_io, peer_io) = tokio::io::duplex(64 * 1024);
+        let app = Arc::new(Echo::default());
+        let initiator = FixpInitiator::new(
+            EchoApp(Arc::clone(&app)),
+            FixpConfig::default(),
+            session_id(0x93),
+            FlowType::Recoverable,
+        );
+        let (engine, mut peer) =
+            tokio::join!(initiator.connect_stream(engine_io), Peer::accept(peer_io));
+        let engine = ok(engine, "connect");
+        wait_until("the handle stored", || app.connection().is_some()).await;
+        let _ = peer.send_app(payload(1), false).await;
+        let _ = peer.send_app(payload(2), true).await;
+        let _ = peer.core.send(now());
+        peer.flush().await;
+        peer.stored.insert(3, payload(3));
+        peer.write_session(&SessionMessage::Sequence(Sequence { next_seq_no: 3 }))
+            .await;
+        peer.write_application(payload(3)).await;
+        // HELLO, then EVENT sent from on_event on the gap.
+        let event = Bytes::from_static(b"EVENT");
+        while !peer.applications.iter().any(|(_, _, b)| *b == event) {
+            if peer.step().await.is_none() {
+                panic!("transport ended before EVENT");
+            }
+        }
+        ok(engine.terminate("done").await, "terminate");
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "on_event awaiting its connection deadlocked"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Writes never block reads
+// ---------------------------------------------------------------------------
+
+/// Both sides write more than the transport buffers while neither has read:
+/// a driver whose pending write stopped its reads would deadlock against its
+/// counterparty (the failure #126 fixed in the tag=value reactor). Over a
+/// 64-byte duplex, each side sends 100 messages of 128 bytes at once.
+#[tokio::test]
+async fn test_bilateral_sends_over_a_tiny_duplex_do_not_deadlock() {
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        let server_app = Arc::new(Recorder::default());
+        let client_app = Arc::new(Recorder::default());
+        let (client_io, server_io) = tokio::io::duplex(64);
+        let acceptor = FixpAcceptor::new(App(Arc::clone(&server_app)), FixpConfig::default());
+        let initiator = FixpInitiator::new(
+            App(Arc::clone(&client_app)),
+            FixpConfig::default(),
+            session_id(0xa1),
+            FlowType::Recoverable,
+        )
+        .with_credentials(credentials());
+        let (server, client) = tokio::join!(
+            acceptor.accept_stream(server_io),
+            initiator.connect_stream(client_io)
+        );
+        let server = ok(server, "accept");
+        let client = ok(client, "connect");
+        let burst = |connection: FixpConnection, tag: u8| async move {
+            for n in 0..100u8 {
+                let mut bytes = vec![tag; 128];
+                bytes[0] = n;
+                ok(connection.send(bytes).await, "burst send");
+            }
+        };
+        tokio::join!(burst(client.clone(), b'C'), burst(server.clone(), b'S'));
+        wait_until("100 messages each way", || {
+            client_app.messages().len() == 100 && server_app.messages().len() == 100
+        })
+        .await;
+        for (n, (seq, _, bytes)) in server_app.messages().into_iter().enumerate() {
+            assert_eq!(seq, Some(n as u64 + 1));
+            assert_eq!(bytes.len(), 128);
+            assert_eq!(bytes[1], b'C');
+        }
+        for (_, _, bytes) in client_app.messages() {
+            assert_eq!(bytes[1], b'S');
+        }
+        ok(client.terminate("done").await, "terminate");
+        wait_closed(&client).await;
+        wait_closed(&server).await;
+    })
+    .await;
+    assert!(outcome.is_ok(), "bilateral sends deadlocked");
+}
+
+// ---------------------------------------------------------------------------
+// Handshake decisions are bounded and release the identifier
+// ---------------------------------------------------------------------------
+
+/// Never answers the first Negotiate or Establish it is asked about (per the
+/// flags); answers every later one like [`App`].
+struct Hang {
+    inner: App,
+    hang_negotiate: std::sync::atomic::AtomicBool,
+    hang_establish: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone)]
+struct HangApp(Arc<Hang>);
+
+impl HangApp {
+    fn new(recorder: &Arc<Recorder>, negotiate: bool, establish: bool) -> Self {
+        Self(Arc::new(Hang {
+            inner: App(Arc::clone(recorder)),
+            hang_negotiate: std::sync::atomic::AtomicBool::new(negotiate),
+            hang_establish: std::sync::atomic::AtomicBool::new(establish),
+        }))
+    }
+}
+
+#[async_trait]
+impl FixpApplication for HangApp {
+    async fn on_negotiate(&self, request: &NegotiateRequest) -> NegotiationDecision {
+        if self
+            .0
+            .hang_negotiate
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            std::future::pending::<()>().await;
+        }
+        self.0.inner.on_negotiate(request).await
+    }
+
+    async fn on_establish(&self, request: &EstablishRequest) -> EstablishmentDecision {
+        if self
+            .0
+            .hang_establish
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            std::future::pending::<()>().await;
+        }
+        self.0.inner.on_establish(request).await
+    }
+
+    async fn on_established(&self, connection: FixpConnection) {
+        self.0.inner.on_established(connection).await;
+    }
+
+    async fn on_message(&self, session_id: SessionId, message: FixpInbound) {
+        self.0.inner.on_message(session_id, message).await;
+    }
+
+    async fn on_event(&self, session_id: Option<SessionId>, event: &Event) {
+        self.0.inner.on_event(session_id, event).await;
+    }
+
+    async fn on_closed(&self, session_id: Option<SessionId>) {
+        self.0.inner.on_closed(session_id).await;
+    }
+}
+
+fn short_handshake() -> FixpConfig {
+    ok(
+        FixpConfig::builder()
+            .handshake_timeout(Duration::from_millis(300))
+            .build(),
+        "config",
+    )
+}
+
+/// Reads until the engine closes the transport, within [`WAIT`].
+async fn expect_closed<C: Core, S: AsyncRead + AsyncWrite + Unpin>(peer: &mut Peer<C, S>) {
+    loop {
+        match tokio::time::timeout(WAIT, peer.framed.next()).await {
+            Ok(None | Some(Err(_))) => return,
+            Ok(Some(Ok(_))) => {}
+            Err(_) => panic!("the engine kept the transport open"),
+        }
+    }
+}
+
+/// Negotiates and establishes `id` afresh: proves the acceptor no longer
+/// holds it (a held id gets NegotiationReject `DuplicateId`).
+async fn negotiates_again(addr: std::net::SocketAddr, id: SessionId) {
+    let stream = ok(TcpStream::connect(addr).await, "dial again");
+    let peer = Peer::connect(stream, id).await;
+    assert!(!peer.saw(|e| matches!(e, Event::NegotiationRejected { .. })));
+}
+
+async fn serve_hanging(
+    negotiate: bool,
+    establish: bool,
+) -> (
+    Arc<Recorder>,
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<Result<(), FixpEngineError>>,
+) {
+    let (listener, addr) = tcp_pair().await;
+    let recorder = Arc::new(Recorder::default());
+    let acceptor = FixpAcceptor::new(
+        HangApp::new(&recorder, negotiate, establish),
+        short_handshake(),
+    );
+    let serving = tokio::spawn(async move { acceptor.serve(listener).await });
+    (recorder, addr, serving)
+}
+
+fn negotiating_client(stream: TcpStream, id: SessionId) -> Peer<FixpClient, TcpStream> {
+    let client = FixpClient::new(
+        FixpConfig::default(),
+        clock(),
+        id,
+        FlowType::Recoverable,
+        Some(credentials()),
+    );
+    Peer::new(client, stream)
+}
+
+#[tokio::test]
+async fn test_a_pending_negotiate_decision_is_bounded_and_releases_the_id() {
+    let (recorder, addr, serving) = serve_hanging(true, false).await;
+    let id = session_id(0xb1);
+    let stream = ok(TcpStream::connect(addr).await, "dial");
+    let mut peer = negotiating_client(stream, id);
+    ok(peer.core.negotiate(now()), "negotiate");
+    peer.flush().await;
+    // The application never answers: the handshake deadline closes it.
+    expect_closed(&mut peer).await;
+    wait_until("server driver ended", || recorder.closed() == 1).await;
+    assert!(has_event(&recorder, |e| matches!(
+        e,
+        Event::HandshakeTimedOut { .. }
+    )));
+    negotiates_again(addr, id).await;
+    serving.abort();
+}
+
+#[tokio::test]
+async fn test_a_pending_establish_decision_is_bounded_and_releases_the_id() {
+    let (recorder, addr, serving) = serve_hanging(false, true).await;
+    let id = session_id(0xb2);
+    let stream = ok(TcpStream::connect(addr).await, "dial");
+    let mut peer = negotiating_client(stream, id);
+    ok(peer.core.negotiate(now()), "negotiate");
+    peer.flush().await;
+    peer.step_until("NegotiationResponse", |p| {
+        p.saw(|e| matches!(e, Event::Negotiated { .. }))
+    })
+    .await;
+    ok(peer.core.establish(now()), "establish");
+    peer.flush().await;
+    expect_closed(&mut peer).await;
+    wait_until("server driver ended", || recorder.closed() == 1).await;
+    negotiates_again(addr, id).await;
+    serving.abort();
+}
+
+#[tokio::test]
+async fn test_a_disconnect_during_a_pending_decision_releases_the_id() {
+    // A handshake timeout long enough that only the disconnect can end it.
+    let (listener, addr) = tcp_pair().await;
+    let recorder = Arc::new(Recorder::default());
+    let acceptor = FixpAcceptor::new(HangApp::new(&recorder, true, false), FixpConfig::default());
+    let serving = tokio::spawn(async move { acceptor.serve(listener).await });
+    let id = session_id(0xb3);
+    let stream = ok(TcpStream::connect(addr).await, "dial");
+    let mut peer = negotiating_client(stream, id);
+    ok(peer.core.negotiate(now()), "negotiate");
+    peer.flush().await;
+    wait_until("Negotiate reported", || {
+        has_event(&recorder, |e| matches!(e, Event::NegotiateReceived { .. }))
+    })
+    .await;
+    drop(peer);
+    wait_until("server driver ended on the disconnect", || {
+        recorder.closed() == 1
+    })
+    .await;
+    negotiates_again(addr, id).await;
+    serving.abort();
+}

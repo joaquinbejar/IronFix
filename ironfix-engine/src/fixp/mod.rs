@@ -34,6 +34,12 @@
 //!   finalization per role instance only, so [`FixpAcceptor`] remembers
 //!   finalized (and live) identifiers across its transports and refuses a
 //!   Negotiate naming one with NegotiationReject `DuplicateId`.
+//! - **No self-deadlock.** Writes go to an outbound buffer that the driver
+//!   drains alongside its reads, so two sides writing at once never stall
+//!   each other; callbacks that may hold a [`FixpConnection`] run in a
+//!   callback task, so they may await it; the handshake decisions run in a
+//!   task of their own, bounded by the core's handshake deadline, and a
+//!   disconnect or a lapse while one is pending releases the identifier.
 //! - **Untrusted input**: a SOFH framing error closes the transport (SOFH
 //!   has no resynchronisation point); a frame naming the FIXP schema that
 //!   does not decode is a protocol violation, answered with Terminate

@@ -74,7 +74,11 @@ impl FixpConnection {
     /// (`EncodingType::SbeV1LittleEndian`), the encoding of the FIXP schema.
     ///
     /// Returns its sequence number on a sequenced flow (FIXP v1.1 section
-    /// 3.5.1), `None` on an Unsequenced one. On a Recoverable flow the
+    /// 3.5.1), `None` on an Unsequenced one, once the message is numbered
+    /// and framed into the driver's outbound buffer; the driver writes that
+    /// buffer while it keeps reading. Safe to await from any
+    /// [`FixpApplication`](crate::fixp::FixpApplication) callback that holds
+    /// this handle. On a Recoverable flow the
     /// driver keeps the message to answer a RetransmitRequest
     /// (section 4.6.2).
     ///

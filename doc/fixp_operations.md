@@ -491,6 +491,18 @@ dependency graph (`make check-fixp-deps`, run in CI).
   timeout error, or the core's `CloseTransport`; it then reports the
   transport closed to the core, hands the last events to the application,
   and signals `FixpConnection::wait_closed`.
+- **No self-deadlock.** Outbound frames go to a buffer the driver writes
+  out in the same `select` as its reads, so a pending write never stops
+  reading (two sides writing at once over a tiny transport both progress);
+  the buffer is bounded (commands pause above 1 MiB, the transport closes
+  above 16 MiB, `write_timeout` bounds a write that makes no progress).
+  `on_established`, `on_message`, `on_event` and `on_closed` run in order in
+  a callback task, so they may await their own `FixpConnection`; inbound
+  reads pause while more than 1024 callbacks wait. `on_negotiate` and
+  `on_establish` run in a task of their own while the driver keeps reading
+  and running the core's handshake deadline: a lapse (section 4.2,
+  `handshake_timeout`) or a disconnect while one is pending closes the
+  transport and releases the identifier in the acceptor.
 - **Routing.** A frame with SOFH encoding type SBE 1.0 little-endian
   (`0xEB50`) whose SBE header names schema 2748 is a session message; any
   other frame is an application message, passed to the core's
@@ -528,8 +540,11 @@ both ways, Terminate); engine against a hand-driven core in both roles, as
 the requester of a retransmission (a gap revealed by a Sequence) and as its
 provider, over TCP and duplex; a request for messages no longer kept; a
 finalized identifier refused on a new transport; a malformed session
-message; a reserved-schema and an oversized payload; and the credentials
-log check.
+message; a reserved-schema and an oversized payload; the credentials log
+check; callbacks awaiting their own connection in both roles; bilateral
+sends over a 64-byte duplex; and a negotiate or establish decision that
+never returns, or a disconnect while one is pending, releasing the
+identifier.
 
 Not done by the driver: re-establishing an unbound session on a new
 transport (each binding is its own task, and the client is consumed by

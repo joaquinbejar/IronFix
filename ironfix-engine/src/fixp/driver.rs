@@ -34,8 +34,8 @@ use crate::fixp::application::{
 use crate::fixp::connection::{Command, FixpConnection};
 use crate::fixp::error::FixpEngineError;
 use crate::stream::SessionStream;
-use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
 use ironfix_core::SeqNum;
 use ironfix_fixp::{
     Credentials, Delivery, Event, FixpClient, FixpError, FixpServer, FlowType,
@@ -45,13 +45,119 @@ use ironfix_fixp::{
 use ironfix_sofh::{EncodingType, SofhCodec, SofhFrame, SofhHeader};
 use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio_util::codec::Framed;
+use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio_util::codec::{Encoder, FramedRead};
 
 /// Capacity of the command channel between handles and the driver.
 const COMMAND_CAPACITY: usize = 1024;
+
+/// Callbacks queued but not yet run above which the driver stops reading
+/// the transport (backpressure). Commands and timers are still served, so a
+/// callback awaiting its connection never waits on a stalled driver.
+const MAX_QUEUED_CALLBACKS: usize = 1024;
+
+/// Outbound bytes buffered above which the driver stops taking commands
+/// (the counterparty is reading slowly). It keeps reading and writing.
+const OUTBOUND_SOFT_LIMIT: usize = 1024 * 1024;
+
+/// Outbound bytes buffered above which the transport is closed: the
+/// session's own traffic (heartbeats, retransmissions) cannot grow without
+/// bound against a counterparty that never reads.
+const OUTBOUND_HARD_LIMIT: usize = 16 * 1024 * 1024;
+
+/// A handshake decision the application is computing, in its own task so
+/// the driver keeps reading (a disconnect), running the core's handshake
+/// deadline and writing while it waits.
+enum PendingDecision {
+    Negotiation(JoinHandle<NegotiationDecision>),
+    Establishment(JoinHandle<EstablishmentDecision>),
+}
+
+/// A decision that arrived.
+enum Decided {
+    Negotiation(NegotiationDecision),
+    Establishment(EstablishmentDecision),
+    /// The decision task panicked or was cancelled.
+    Lost,
+}
+
+/// Waits for the pending decision; for ever without one.
+async fn decided(pending: &mut Option<PendingDecision>) -> Decided {
+    match pending {
+        Some(PendingDecision::Negotiation(task)) => match task.await {
+            Ok(decision) => Decided::Negotiation(decision),
+            Err(_) => Decided::Lost,
+        },
+        Some(PendingDecision::Establishment(task)) => match task.await {
+            Ok(decision) => Decided::Establishment(decision),
+            Err(_) => Decided::Lost,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Moves buffered bytes to the transport: writes what it can, then flushes
+/// once the buffer is empty. Cancel-safe: `write_buf` advances the buffer
+/// only by what was written.
+async fn drive_write(
+    writer: &mut WriteHalf<SessionStream>,
+    buffer: &mut BytesMut,
+) -> std::io::Result<Written> {
+    if buffer.is_empty() {
+        writer.flush().await.map(|()| Written::Flushed)
+    } else {
+        match writer.write_buf(buffer).await? {
+            0 => Err(std::io::ErrorKind::WriteZero.into()),
+            _ => Ok(Written::Wrote),
+        }
+    }
+}
+
+/// What one [`drive_write`] did.
+enum Written {
+    Wrote,
+    Flushed,
+}
+
+/// A callback the driver hands to the session's callback task.
+///
+/// The driver never awaits a callback that receives or may hold this
+/// session's [`FixpConnection`]: `on_established`, `on_message`, `on_event`
+/// and `on_closed` run, in order, in a separate task, so they may await
+/// `send`, `terminate` or `wait_closed` on it. The handshake decisions
+/// (`on_negotiate`, `on_establish`) are awaited inline: the session has no
+/// handle yet, so they cannot wait on this driver.
+enum Callback {
+    Established(FixpConnection),
+    Message(SessionId, FixpInbound),
+    Event(Option<SessionId>, Event),
+    Closed(Option<SessionId>),
+}
+
+/// The callback task: runs queued callbacks in order until the driver drops
+/// its sender, which it does when it ends.
+async fn run_callbacks<A: FixpApplication>(
+    app: Arc<A>,
+    mut queue: mpsc::UnboundedReceiver<Callback>,
+    queued: Arc<AtomicUsize>,
+    drained: Arc<Notify>,
+) {
+    while let Some(callback) = queue.recv().await {
+        match callback {
+            Callback::Established(connection) => app.on_established(connection).await,
+            Callback::Message(session_id, message) => app.on_message(session_id, message).await,
+            Callback::Event(session_id, event) => app.on_event(session_id, &event).await,
+            Callback::Closed(session_id) => app.on_closed(session_id).await,
+        }
+        queued.fetch_sub(1, Ordering::AcqRel);
+        drained.notify_one();
+    }
+}
 
 /// The current monotonic time, from tokio's clock so that a paused test
 /// clock drives the session timers too.
@@ -265,10 +371,29 @@ pub(crate) type Handshake = oneshot::Receiver<Result<FixpConnection, FixpEngineE
 /// One FIXP session on one transport.
 pub(crate) struct Driver<A: FixpApplication> {
     role: Role,
-    framed: Framed<SessionStream, SofhCodec>,
+    reader: FramedRead<ReadHalf<SessionStream>, SofhCodec>,
+    writer: WriteHalf<SessionStream>,
+    /// Encodes outbound frames into `outbound`.
+    encoder: SofhCodec,
+    /// Bytes framed and not yet written. Writing is polled alongside
+    /// reading, so a counterparty that writes while not reading cannot
+    /// stall this side's reads (the bilateral deadlock of #126).
+    outbound: BytesMut,
+    /// Written bytes not yet flushed.
+    needs_flush: bool,
+    /// Since when the outbound buffer has made no progress.
+    write_stalled_since: Option<Instant>,
+    /// The application's handshake decision being computed.
+    pending_decision: Option<PendingDecision>,
     app: Arc<A>,
     settings: DriverSettings,
     commands: mpsc::Receiver<Command>,
+    /// The queue of the callback task.
+    callbacks: mpsc::UnboundedSender<Callback>,
+    /// Callbacks queued and not yet run.
+    queued: Arc<AtomicUsize>,
+    /// Signalled by the callback task after each callback.
+    drained: Arc<Notify>,
     connection: FixpConnection,
     closed: watch::Sender<bool>,
     handshake: Option<oneshot::Sender<Result<FixpConnection, FixpEngineError>>>,
@@ -341,12 +466,32 @@ impl<A: FixpApplication> Driver<A> {
         let (closed, closed_rx) = watch::channel(false);
         let (handshake, result) = oneshot::channel();
         let codec = SofhCodec::new().with_max_message_size(settings.max_message_size);
+        let (read_half, write_half) = tokio::io::split(stream);
+        let (callbacks, queue) = mpsc::unbounded_channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let drained = Arc::new(Notify::new());
+        // Ends once the driver drops `callbacks` and the queue is run.
+        tokio::spawn(run_callbacks(
+            Arc::clone(&app),
+            queue,
+            Arc::clone(&queued),
+            Arc::clone(&drained),
+        ));
         let driver = Self {
             role,
-            framed: Framed::new(stream, codec),
+            reader: FramedRead::new(read_half, codec),
+            writer: write_half,
+            encoder: SofhCodec::new().with_max_message_size(settings.max_message_size),
+            outbound: BytesMut::new(),
+            needs_flush: false,
+            write_stalled_since: None,
+            pending_decision: None,
             app,
             settings,
             commands,
+            callbacks,
+            queued,
+            drained,
             connection: FixpConnection::new(session_id, tx, closed_rx),
             closed,
             handshake: Some(handshake),
@@ -379,8 +524,27 @@ impl<A: FixpApplication> Driver<A> {
 
         while !self.close_requested {
             let deadline = self.role.poll_timeout();
+            let reading = self.queued.load(Ordering::Acquire) < MAX_QUEUED_CALLBACKS;
+            let writing = !self.outbound.is_empty() || self.needs_flush;
+            let accepting = self.outbound.len() < OUTBOUND_SOFT_LIMIT;
+            let stall_deadline = self
+                .write_stalled_since
+                .and_then(|since| since.checked_add(self.settings.write_timeout));
             tokio::select! {
-                frame = self.framed.next() => match frame {
+                () = self.drained.notified(), if !reading => {}
+                written = drive_write(&mut self.writer, &mut self.outbound), if writing => {
+                    self.on_written(written);
+                }
+                () = sleep_until(stall_deadline), if stall_deadline.is_some() => {
+                    let timeout = self.settings.write_timeout;
+                    tracing::warn!(?timeout, "fixp write made no progress; closing");
+                    self.fail(FixpEngineError::WriteTimeout(timeout));
+                }
+                decision = decided(&mut self.pending_decision), if self.pending_decision.is_some() => {
+                    self.pending_decision = None;
+                    self.on_decided(decision).await;
+                }
+                frame = self.reader.next(), if reading => match frame {
                     Some(Ok(frame)) => self.on_frame(frame).await,
                     Some(Err(error)) => {
                         tracing::warn!(%error, "fixp transport framing error; closing");
@@ -391,7 +555,7 @@ impl<A: FixpApplication> Driver<A> {
                         break;
                     }
                 },
-                command = self.commands.recv() => match command {
+                command = self.commands.recv(), if accepting => match command {
                     Some(command) => self.on_command(command).await,
                     // The driver holds a sender in `connection`, so the
                     // channel never closes while it runs.
@@ -404,6 +568,34 @@ impl<A: FixpApplication> Driver<A> {
             }
         }
         self.shutdown().await;
+    }
+
+    /// Accounts for a write or flush of the outbound buffer.
+    fn on_written(&mut self, written: std::io::Result<Written>) {
+        match written {
+            Ok(Written::Flushed) => {
+                self.needs_flush = false;
+                self.write_stalled_since = None;
+            }
+            Ok(Written::Wrote) => {
+                // Progress: the stall clock restarts while bytes remain.
+                self.needs_flush = true;
+                self.write_stalled_since = Some(now());
+            }
+            Err(error) => {
+                tracing::warn!(%error, "fixp write failed; closing");
+                self.fail(error.into());
+            }
+        }
+    }
+
+    /// Queues a callback for the callback task; never waits for it.
+    fn notify(&self, callback: Callback) {
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        if self.callbacks.send(callback).is_err() {
+            // The callback task is gone (the application panicked).
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Records the error that ends the transport.
@@ -466,7 +658,7 @@ impl<A: FixpApplication> Driver<A> {
                     encoding_type,
                     payload,
                 };
-                self.app.on_message(session_id, message).await;
+                self.notify(Callback::Message(session_id, message));
             }
         }
     }
@@ -607,21 +799,28 @@ impl<A: FixpApplication> Driver<A> {
     }
 
     /// Writes and flushes one frame, bounded by the write timeout.
+    /// Frames one message into the outbound buffer. The run loop writes it
+    /// out, polled alongside reads; [`DriverSettings::write_timeout`] bounds
+    /// how long the buffer may go without progress.
     async fn write(&mut self, frame: SofhFrame) {
         if self.close_requested {
             return;
         }
-        let timeout = self.settings.write_timeout;
-        match tokio::time::timeout(timeout, self.framed.send(frame)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "fixp write failed; closing");
-                self.fail(error.into());
-            }
-            Err(_) => {
-                tracing::warn!(?timeout, "fixp write timed out; closing");
-                self.fail(FixpEngineError::WriteTimeout(timeout));
-            }
+        if let Err(error) = self.encoder.encode(frame, &mut self.outbound) {
+            self.fail(error.into());
+            return;
+        }
+        if self.write_stalled_since.is_none() {
+            self.write_stalled_since = Some(now());
+        }
+        if self.outbound.len() > OUTBOUND_HARD_LIMIT {
+            tracing::warn!(
+                len = self.outbound.len(),
+                "fixp outbound backlog too large; closing"
+            );
+            self.fail(FixpEngineError::OutboundBacklog {
+                len: self.outbound.len(),
+            });
         }
     }
 
@@ -632,9 +831,8 @@ impl<A: FixpApplication> Driver<A> {
                 session_id,
                 client_flow,
             } => {
-                self.app.on_event(Some(*session_id), &event).await;
-                self.decide_negotiation(*session_id, *client_flow, now)
-                    .await;
+                self.notify(Callback::Event(Some(*session_id), event.clone()));
+                self.decide_negotiation(*session_id, *client_flow);
                 return;
             }
             Event::EstablishReceived {
@@ -642,34 +840,18 @@ impl<A: FixpApplication> Driver<A> {
                 keepalive_interval,
                 next_seq_no,
             } => {
-                self.app.on_event(Some(*session_id), &event).await;
+                self.notify(Callback::Event(Some(*session_id), event.clone()));
                 let request = EstablishRequest {
                     session_id: *session_id,
                     keepalive_interval: *keepalive_interval,
                     next_seq_no: *next_seq_no,
                     credentials: self.pending_credentials.take(),
                 };
-                let decision = self.app.on_establish(&request).await;
-                if let Role::Server { server, .. } = &mut self.role {
-                    let result = match decision {
-                        EstablishmentDecision::Accept => server.accept_establishment(now),
-                        EstablishmentDecision::Reject { code, reason } => {
-                            self.failure
-                                .get_or_insert(FixpEngineError::EstablishmentRejected {
-                                    code,
-                                    reason: reason.clone(),
-                                });
-                            // One binding per transport: a refused client
-                            // tries again on a new one (section 4.3.3).
-                            self.close_after_drain = true;
-                            server.reject_establishment(code, reason, now)
-                        }
-                    };
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "fixp establishment decision refused by the core");
-                        self.fail(error.into());
-                    }
-                }
+                let app = Arc::clone(&self.app);
+                self.pending_decision =
+                    Some(PendingDecision::Establishment(tokio::spawn(async move {
+                        app.on_establish(&request).await
+                    })));
                 return;
             }
             Event::Negotiated { .. } => {
@@ -685,7 +867,7 @@ impl<A: FixpApplication> Driver<A> {
                         self.connection = self.connection.with_session_id(session_id);
                     }
                     let _ = handshake.send(Ok(self.connection.clone()));
-                    self.app.on_established(self.connection.clone()).await;
+                    self.notify(Callback::Established(self.connection.clone()));
                 }
             }
             Event::NegotiationRejected { code, reason } => {
@@ -718,15 +900,15 @@ impl<A: FixpApplication> Driver<A> {
             }
             _ => {}
         }
-        self.app.on_event(self.role.session_id(), &event).await;
+        self.notify(Callback::Event(self.role.session_id(), event));
     }
 
-    async fn decide_negotiation(
-        &mut self,
-        session_id: SessionId,
-        client_flow: FlowType,
-        now: Instant,
-    ) {
+    /// Claims the identifier in the acceptor's registry, then asks the
+    /// application, in a task of its own: while it decides, the driver keeps
+    /// reading (a disconnect ends the session and releases the claim) and
+    /// the core's handshake deadline keeps running (a lapse closes the
+    /// transport, also releasing it).
+    fn decide_negotiation(&mut self, session_id: SessionId, client_flow: FlowType) {
         let credentials = self.pending_credentials.take();
         let Role::Server { server, registry } = &mut self.role else {
             return;
@@ -742,29 +924,66 @@ impl<A: FixpApplication> Driver<A> {
             Err(Refusal::Finalized) => Some("the session is finalized"),
             Err(Refusal::Live) => Some("the session is already negotiated"),
         };
-        let result = if let Some(reason) = refusal {
+        if let Some(reason) = refusal {
             tracing::info!(%session_id, reason, "fixp negotiate refused by the acceptor");
-            server.reject_negotiation(NegotiationRejectCode::DuplicateId, reason)
-        } else {
-            let request = NegotiateRequest {
-                session_id,
-                client_flow,
+            if let Err(error) =
+                server.reject_negotiation(NegotiationRejectCode::DuplicateId, reason)
+            {
+                self.fail(error.into());
+            }
+            return;
+        }
+        let request = NegotiateRequest {
+            session_id,
+            client_flow,
+            credentials,
+        };
+        let app = Arc::clone(&self.app);
+        self.pending_decision = Some(PendingDecision::Negotiation(tokio::spawn(async move {
+            app.on_negotiate(&request).await
+        })));
+    }
+
+    /// Applies the application's handshake decision to the core.
+    async fn on_decided(&mut self, decided: Decided) {
+        let now = now();
+        let Role::Server { server, .. } = &mut self.role else {
+            return;
+        };
+        let result = match decided {
+            Decided::Negotiation(NegotiationDecision::Accept {
+                server_flow,
                 credentials,
-            };
-            match self.app.on_negotiate(&request).await {
-                NegotiationDecision::Accept {
-                    server_flow,
-                    credentials,
-                } => server.accept_negotiation(server_flow, credentials, now),
-                NegotiationDecision::Reject { code, reason } => {
-                    server.reject_negotiation(code, reason)
-                }
+            }) => server.accept_negotiation(server_flow, credentials, now),
+            Decided::Negotiation(NegotiationDecision::Reject { code, reason }) => {
+                server.reject_negotiation(code, reason)
+            }
+            Decided::Establishment(EstablishmentDecision::Accept) => {
+                server.accept_establishment(now)
+            }
+            Decided::Establishment(EstablishmentDecision::Reject { code, reason }) => {
+                self.failure
+                    .get_or_insert(FixpEngineError::EstablishmentRejected {
+                        code,
+                        reason: reason.clone(),
+                    });
+                // One binding per transport: a refused client tries again on
+                // a new one (section 4.3.3).
+                self.close_after_drain = true;
+                server.reject_establishment(code, reason, now)
+            }
+            Decided::Lost => {
+                self.fail(FixpEngineError::HandshakeFailed {
+                    detail: "the application's handshake decision failed".to_owned(),
+                });
+                return;
             }
         };
         if let Err(error) = result {
-            tracing::warn!(%error, "fixp negotiation decision refused by the core");
+            tracing::warn!(%error, "fixp handshake decision refused by the core");
             self.fail(error.into());
         }
+        self.process_outputs().await;
     }
 
     /// Answers a RetransmitRequest from the stored messages, in one batch,
@@ -797,10 +1016,22 @@ impl<A: FixpApplication> Driver<A> {
     }
 
     async fn shutdown(&mut self) {
-        let _ = tokio::time::timeout(
-            self.settings.write_timeout,
-            SinkExt::<SofhFrame>::close(&mut self.framed),
-        )
+        if let Some(decision) = self.pending_decision.take() {
+            // The decision no longer matters; a callback that never returns
+            // does not keep its task (FIXP v1.1 section 4.2: the handshake
+            // is bounded).
+            match decision {
+                PendingDecision::Negotiation(task) => task.abort(),
+                PendingDecision::Establishment(task) => task.abort(),
+            }
+        }
+        // What is buffered (a Terminate, a reject) goes out, bounded.
+        let writer = &mut self.writer;
+        let outbound = &mut self.outbound;
+        let _ = tokio::time::timeout(self.settings.write_timeout, async {
+            writer.write_all_buf(outbound).await?;
+            writer.shutdown().await
+        })
         .await;
         self.role.on_transport_closed();
         // Only events can follow; a message has no transport to go to.
@@ -809,7 +1040,7 @@ impl<A: FixpApplication> Driver<A> {
                 if let Event::SessionFinalized { .. } = event {
                     self.finalized = true;
                 }
-                self.app.on_event(self.role.session_id(), &event).await;
+                self.notify(Callback::Event(self.role.session_id(), event));
             }
         }
         if let Role::Server { registry, .. } = &self.role
@@ -828,8 +1059,11 @@ impl<A: FixpApplication> Driver<A> {
                 });
             let _ = handshake.send(Err(error));
         }
-        self.app.on_closed(self.role.session_id()).await;
+        // The transport is closed: handles see it now, even while the
+        // callback task still runs the last callbacks, so a callback may
+        // await `wait_closed` without a cycle.
         let _ = self.closed.send(true);
+        self.notify(Callback::Closed(self.role.session_id()));
     }
 }
 

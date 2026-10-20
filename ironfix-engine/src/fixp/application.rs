@@ -122,9 +122,17 @@ impl std::fmt::Debug for FixpInbound {
 
 /// The callbacks of a FIXP session, in either role.
 ///
-/// The engine awaits each callback in its driver task, so a slow callback
-/// delays the session's own work (heartbeats included); hand long work to
-/// another task.
+/// `on_established`, `on_message`, `on_event` and `on_closed` run in order
+/// in a callback task of their own, never in the driver task, so they may
+/// await [`FixpConnection::send`], `terminate` or `wait_closed` on their own
+/// session without deadlocking. While more than 1024 callbacks wait to run,
+/// the driver stops reading the transport (backpressure) but keeps sending,
+/// answering commands and running its timers.
+///
+/// `on_negotiate` and `on_establish` are awaited by the driver itself: the
+/// session has no handle yet, and the handshake waits for the answer
+/// (bounded by the handshake timeout). They must not wait on work that needs
+/// this session's handshake to finish.
 #[async_trait]
 pub trait FixpApplication: Send + Sync + 'static {
     /// A client asks to negotiate a session (server role only).
