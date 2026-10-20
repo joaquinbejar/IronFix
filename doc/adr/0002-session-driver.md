@@ -433,3 +433,28 @@ converted at the boundary so paused-clock tests stay deterministic.
   new expectation with whether it renumbers and whether it advances). The
   driver keeps the I/O and the reject texts. Additive surface; two core
   tests; nothing on the wire changes and no engine integration test changed.
+
+- **#91 closed (what the core is, and what the driver keeps):** every
+  handler family the issue named now decides in the core and acts in the
+  driver: liveness and the periodic tick (stages 1, 7a), sequence
+  validation, gap recovery, inbound routing and SequenceReset (2, 7b, 7c),
+  resend replay (3), the Logout handshake (4), both Logon handshakes (5),
+  the session state, the phase, the queues and the throttle (6a to 6c).
+  Each decision has unit tests with no socket and no runtime, the engine
+  integration tests ran unchanged at every stage, and nothing on the wire
+  changed.
+
+  The shape is a set of synchronous decision functions over a core-owned
+  `SessionCore`, each taking `now` and returning a typed decision the
+  driver acts on, not one `handle(input) -> outputs` state machine. A
+  driver therefore sequences the calls itself, in the order the Tokio
+  reactor does; #93's non-Tokio example is the check that this is enough
+  to drive a session without duplicating a protocol rule.
+
+  Kept in the driver: the I/O (the codec, the write buffer, the flush and
+  write timeout, the garbled-frame window, the published watermark), the
+  header checks that read the decoded message (identity, `SendingTime`,
+  `ApplVerID`), the encoding of every frame and the text of every reject,
+  and the async callbacks (`from_admin`, `from_app`, the store), whose
+  results feed the next decision. #92 replaces those callbacks with
+  synchronous traits for the sans-IO path.
