@@ -152,5 +152,6 @@ decision and pinned to a compatible 0.7 range when `ironfix-fixp` lands.
   4.2.3 and 4.3 require. Following section 6.3, an Establish without a
   successful negotiation (or for a finalized id) is now rejected with
   `Unnegotiated` and its transport closed at once; rejects the client can
-  fix keep a retry window bounded by the handshake timeout, a documented
-  deviation from a "should". No `pub` item changed.
+  fix keep a retry window bounded by the handshake timeout, a deliberate
+  departure from the immediate termination 6.3 recommends. No `pub` item
+  changed.

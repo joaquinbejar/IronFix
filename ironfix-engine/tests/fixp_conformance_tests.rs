@@ -38,7 +38,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
@@ -93,6 +93,7 @@ mod template {
     pub const FINISHED_RECEIVING: u16 = 16;
     pub const APPLIED: u16 = 17;
     pub const NOT_APPLIED: u16 = 18;
+    pub const MESSAGE_TEMPLATE: u16 = 19;
 }
 
 /// Wire values of the schema's enumerations.
@@ -256,6 +257,61 @@ fn sofh(encoding: u16, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Root block length and number of variable-length fields of each
+/// template of the FIXP schema (id 2748, version 0).
+const fn layout(template: u16) -> Option<(usize, usize)> {
+    Some(match template {
+        template::NEGOTIATE | template::NEGOTIATION_RESPONSE | template::NEGOTIATION_REJECT => {
+            (25, 1)
+        }
+        template::TOPIC => (21, 1),
+        template::ESTABLISH => (36, 1),
+        template::ESTABLISHMENT_ACK => (36, 0),
+        template::ESTABLISHMENT_REJECT | template::RETRANSMIT_REJECT => (25, 1),
+        template::SEQUENCE => (8, 0),
+        template::CONTEXT | template::FINISHED_SENDING => (24, 0),
+        template::UNSEQUENCED_HEARTBEAT => (0, 0),
+        template::RETRANSMIT_REQUEST | template::RETRANSMISSION => (36, 0),
+        template::TERMINATE => (17, 1),
+        template::FINISHED_RECEIVING => (16, 0),
+        template::APPLIED | template::NOT_APPLIED => (12, 0),
+        template::MESSAGE_TEMPLATE => (12, 2),
+        _ => return None,
+    })
+}
+
+/// Reads one SOFH frame. `Ok(None)` only at end of stream before any byte
+/// of a frame; a partial header, a partial body, a `Message_Length` below
+/// the 7-byte minimum or above the 1 MiB ceiling, or a FIXP session message
+/// that does not match the schema is an error.
+async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<Frame>, String> {
+    let mut header = [0u8; 6];
+    let mut got = 0;
+    while got < header.len() {
+        match reader.read(&mut header[got..]).await {
+            Ok(0) if got == 0 => return Ok(None),
+            Ok(0) => return Err(format!("stream ended after {got} of 6 SOFH header bytes")),
+            Ok(n) => got += n,
+            // A reset at a frame boundary is a close.
+            Err(_) if got == 0 => return Ok(None),
+            Err(error) => return Err(format!("read failed inside a SOFH header: {error}")),
+        }
+    }
+    let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    let encoding = u16::from_be_bytes([header[4], header[5]]);
+    if !(7..=1024 * 1024).contains(&len) {
+        return Err(format!("SOFH Message_Length {len} outside 7..=1 MiB"));
+    }
+    let body = usize::try_from(len).map_err(|e| e.to_string())? - 6;
+    let mut payload = vec![0u8; body];
+    if let Err(error) = reader.read_exact(&mut payload).await {
+        return Err(format!("stream ended inside a {len}-byte frame: {error}"));
+    }
+    let frame = Frame { encoding, payload };
+    frame.validate()?;
+    Ok(Some(frame))
+}
+
 /// A frame read from the engine.
 #[derive(Debug, Clone)]
 struct Frame {
@@ -268,10 +324,77 @@ impl Frame {
         u16::from_le_bytes([self.payload[at], self.payload[at + 1]])
     }
 
-    /// The FIXP template id, if this is a FIXP session message.
+    /// `true` when the frame names the FIXP schema: SOFH SBE 1.0
+    /// little-endian and an SBE header with schema id 2748.
+    fn names_fixp_schema(&self) -> bool {
+        self.encoding == SBE_LE && self.payload.len() >= HEADER && self.le16(4) == SCHEMA_ID
+    }
+
+    /// Checks a frame naming the FIXP schema against the schema, before any
+    /// field is read at a fixed offset: schema version 0, a known template,
+    /// a root block at least as long as the schema's (a longer one is a
+    /// valid extension), and the variable-length fields the template
+    /// declares ending exactly at the end of the SOFH frame.
+    fn validate(&self) -> Result<(), String> {
+        if !self.names_fixp_schema() {
+            return Ok(());
+        }
+        let block = usize::from(self.le16(0));
+        let template = self.le16(2);
+        let version = self.le16(6);
+        if version != 0 {
+            return Err(format!("schema version {version}, expected 0"));
+        }
+        let Some((root, var_fields)) = layout(template) else {
+            return Err(format!("unknown template {template}"));
+        };
+        if block < root {
+            return Err(format!(
+                "template {template}: blockLength {block} below the schema's {root}"
+            ));
+        }
+        let mut at = HEADER
+            .checked_add(block)
+            .ok_or_else(|| "blockLength overflows".to_owned())?;
+        if at > self.payload.len() {
+            return Err(format!(
+                "template {template}: root block of {block} bytes past the frame's {}",
+                self.payload.len()
+            ));
+        }
+        for field in 0..var_fields {
+            let Some(len) = self.payload.get(at..at + 2) else {
+                return Err(format!(
+                    "template {template}: var field {field} length missing"
+                ));
+            };
+            let len = usize::from(u16::from_le_bytes([len[0], len[1]]));
+            at += 2 + len;
+            if at > self.payload.len() {
+                return Err(format!(
+                    "template {template}: var field {field} past the frame"
+                ));
+            }
+        }
+        if at != self.payload.len() {
+            return Err(format!(
+                "template {template}: message of {at} bytes in a SOFH frame of {} payload bytes",
+                self.payload.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The FIXP template id, if this is a FIXP session message. A frame
+    /// naming the FIXP schema that does not match the schema fails the test.
     fn template(&self) -> Option<u16> {
-        (self.encoding == SBE_LE && self.payload.len() >= HEADER && self.le16(4) == SCHEMA_ID)
-            .then(|| self.le16(2))
+        if !self.names_fixp_schema() {
+            return None;
+        }
+        if let Err(error) = self.validate() {
+            panic!("malformed FIXP session message from the engine: {error}: {self:?}");
+        }
+        Some(self.le16(2))
     }
 
     fn is_heartbeat(&self) -> bool {
@@ -281,30 +404,44 @@ impl Frame {
         )
     }
 
-    /// A field of the root block, at `offset` from its start.
+    /// `width` bytes of the root block at `offset` from its start. The frame
+    /// must be a well-formed session message and the field inside the root
+    /// block the schema defines for its template.
+    fn root(&self, offset: usize, width: usize) -> &[u8] {
+        let Some(template) = self.template() else {
+            panic!("reading a session field from a non-session frame: {self:?}");
+        };
+        let Some((root, _)) = layout(template) else {
+            panic!("unknown template {template}");
+        };
+        assert!(
+            offset + width <= root,
+            "field at {offset}+{width} outside the {root}-byte root block of template {template}"
+        );
+        &self.payload[HEADER + offset..HEADER + offset + width]
+    }
     fn u8(&self, offset: usize) -> u8 {
-        self.payload[HEADER + offset]
+        self.root(offset, 1)[0]
     }
     fn u32(&self, offset: usize) -> u32 {
-        let at = HEADER + offset;
         let mut b = [0; 4];
-        b.copy_from_slice(&self.payload[at..at + 4]);
+        b.copy_from_slice(self.root(offset, 4));
         u32::from_le_bytes(b)
     }
     fn u64(&self, offset: usize) -> u64 {
-        let at = HEADER + offset;
         let mut b = [0; 8];
-        b.copy_from_slice(&self.payload[at..at + 8]);
+        b.copy_from_slice(self.root(offset, 8));
         u64::from_le_bytes(b)
     }
     fn uuid(&self) -> [u8; 16] {
         let mut b = [0; 16];
-        b.copy_from_slice(&self.payload[HEADER..HEADER + 16]);
+        b.copy_from_slice(self.root(0, 16));
         b
     }
-    /// The first variable-length field after a root block of `block` bytes.
-    fn var(&self, block: usize) -> Vec<u8> {
-        let at = HEADER + block;
+    /// The first variable-length field, after the declared root block.
+    fn var(&self) -> Vec<u8> {
+        assert!(self.template().is_some(), "not a session message");
+        let at = HEADER + usize::from(self.le16(0));
         let len = usize::from(u16::from_le_bytes([self.payload[at], self.payload[at + 1]]));
         self.payload[at + 2..at + 2 + len].to_vec()
     }
@@ -344,21 +481,12 @@ impl Peer {
 
     /// The next frame, or `None` at end of stream. Fails after [`WAIT`].
     async fn read(&mut self) -> Option<Frame> {
-        let read = async {
-            let mut header = [0u8; 6];
-            if self.stream.read_exact(&mut header).await.is_err() {
-                return None;
-            }
-            let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-            let encoding = u16::from_be_bytes([header[4], header[5]]);
-            let body = usize::try_from(len).ok()?.checked_sub(6)?;
-            let mut payload = vec![0u8; body];
-            if self.stream.read_exact(&mut payload).await.is_err() {
-                return None;
-            }
-            Some(Frame { encoding, payload })
-        };
-        ok(tokio::time::timeout(WAIT, read).await, "a frame in time")
+        let read = read_frame(&mut self.stream);
+        let result = ok(tokio::time::timeout(WAIT, read).await, "a frame in time");
+        match result {
+            Ok(frame) => frame,
+            Err(error) => panic!("malformed output from the engine: {error}"),
+        }
     }
 
     /// The next frame; the stream must not end.
@@ -771,7 +899,7 @@ impl Client {
         // Credentials.
         assert_eq!(frame.uuid(), self.id);
         assert_eq!(frame.u8(24), flow.as_u8());
-        assert_eq!(frame.var(25), SECRET);
+        assert_eq!(frame.var(), SECRET);
         frame.u64(16)
     }
 
@@ -1011,7 +1139,7 @@ async fn test_client_handshake_fields() {
         "KeepaliveInterval in ms"
     );
     assert_eq!(establish.u64(28), 1, "NextSeqNo of the client flow");
-    assert_eq!(establish.var(36), SECRET, "Credentials");
+    assert_eq!(establish.var(), SECRET, "Credentials");
     client
         .peer
         .send(establishment_ack(id, establish.u64(16), 5_000, Some(1)))
@@ -2113,7 +2241,7 @@ async fn test_client_orderly_terminate() {
         .await;
     assert_eq!(frame.uuid(), id);
     assert_eq!(frame.u8(16), TerminationCode::Finished.as_u8());
-    assert_eq!(frame.var(17), b"done");
+    assert_eq!(frame.var(), b"done");
     client
         .peer
         .send(terminate(id, TerminationCode::Finished.as_u8()))
@@ -2567,7 +2695,9 @@ async fn test_server_sends_nothing_after_its_terminate() {
         .await;
 }
 
-/// **Local policy, a deviation from a "should"**: after an automatic
+/// **Local policy, a deliberate departure from FIXP 6.3 (p. 39)**, which
+/// recommends immediate termination; a later handshake timeout does not
+/// meet that timing. After an automatic
 /// EstablishmentReject the client can fix (here `KeepaliveInterval`), the
 /// transport stays open for a retry on it (Appendix A 7.1.12.4, p. 46 to
 /// 47, shows the reject and no close), bounded by the handshake timeout.
@@ -2726,4 +2856,185 @@ async fn test_server_rejects_an_establishment_not_answered_in_time() {
     app.establish_when = Decide::Never;
     let answer = establish_against(app, fast_config(1_000), 0xB4).await;
     assert_establishment_reject(&answer, 0xB4);
+}
+
+// ===========================================================================
+// Oracle controls: the raw peer's own checks fail on malformed output
+// ===========================================================================
+
+/// A well-formed NegotiationReject message, as the engine sends one.
+fn good_reject_message() -> Vec<u8> {
+    negotiation_reject(
+        session_id(0xC0),
+        7,
+        NegotiationRejectCode::Credentials.as_u8(),
+    )
+}
+
+/// Reads `bytes` as the engine's output with the suite's frame oracle.
+async fn oracle(bytes: &[u8]) -> Result<Option<Frame>, String> {
+    let mut reader = bytes;
+    read_frame(&mut reader).await
+}
+
+/// `true` when `check` panics.
+fn panics(check: impl FnOnce() + std::panic::UnwindSafe) -> bool {
+    std::panic::catch_unwind(check).is_err()
+}
+
+/// The NegotiationReject with `edit` applied to its SBE bytes.
+fn mutated(edit: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let mut message = good_reject_message();
+    edit(&mut message);
+    message
+}
+
+fn set_le16(message: &mut [u8], at: usize, value: u16) {
+    message[at..at + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+/// The close oracle: only end of stream before any frame byte is a clean
+/// close; a partial header (three bytes included), a partial body and an
+/// invalid `Message_Length` fail.
+#[tokio::test]
+async fn test_oracle_close_requires_zero_bytes_before_eof() {
+    assert!(matches!(oracle(&[]).await, Ok(None)));
+    let frame = sofh(SBE_LE, &good_reject_message());
+    for cut in 1..frame.len() {
+        assert!(
+            oracle(&frame[..cut]).await.is_err(),
+            "a frame cut at {cut} bytes passed as a clean close"
+        );
+    }
+    assert!(oracle(&[0, 0, 0, 6, 0xEB, 0x50]).await.is_err(), "length 6");
+    assert!(
+        oracle(&[0, 0x20, 0, 0, 0xEB, 0x50]).await.is_err(),
+        "2 MiB length"
+    );
+    assert!(matches!(oracle(&frame).await, Ok(Some(_))));
+}
+
+/// The decode oracle checks blockLength, templateId, version and the
+/// message length against the SOFH length before any field is read; a
+/// longer root block is a valid extension.
+#[tokio::test]
+async fn test_oracle_rejects_malformed_session_headers() {
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("blockLength 0", mutated(|m| set_le16(m, 0, 0))),
+        ("blockLength 24", mutated(|m| set_le16(m, 0, 24))),
+        (
+            "blockLength past the frame",
+            mutated(|m| set_le16(m, 0, 200)),
+        ),
+        ("unknown template", mutated(|m| set_le16(m, 2, 99))),
+        ("version 1", mutated(|m| set_le16(m, 6, 1))),
+        (
+            "var length past the frame",
+            mutated(|m| set_le16(m, HEADER + 25, 500)),
+        ),
+        ("var field missing", mutated(|m| m.truncate(HEADER + 25))),
+        ("trailing bytes", mutated(|m| m.push(0))),
+    ];
+    for (what, message) in cases {
+        assert!(
+            oracle(&sofh(SBE_LE, &message)).await.is_err(),
+            "{what} passed the oracle"
+        );
+    }
+    let extended = mutated(|m| {
+        set_le16(m, 0, 26);
+        m.insert(HEADER + 25, 0xAA);
+    });
+    let frame = oracle(&sofh(SBE_LE, &extended)).await;
+    assert!(
+        matches!(&frame, Ok(Some(f)) if f.var() == b"refused" && f.u8(24) == 0),
+        "{frame:?}"
+    );
+}
+
+fn as_frame(encoding: u16, payload: Vec<u8>) -> Frame {
+    Frame { encoding, payload }
+}
+
+/// The shared assertion helpers fail on mutated outputs: a header that does
+/// not match the schema, another template, another schema, another
+/// encoding type, and wrong field values.
+#[test]
+fn test_oracle_assertion_helpers_fail_on_mutated_output() {
+    let good = as_frame(SBE_LE, good_reject_message());
+    assert!(!panics(move || assert_negotiation_reject(
+        &good,
+        0xC0,
+        NegotiationRejectCode::Credentials
+    )));
+    let mutations: Vec<(&str, Frame)> = vec![
+        (
+            "blockLength 0",
+            as_frame(SBE_LE, mutated(|m| set_le16(m, 0, 0))),
+        ),
+        (
+            "template",
+            as_frame(
+                SBE_LE,
+                mutated(|m| set_le16(m, 2, template::NEGOTIATION_RESPONSE)),
+            ),
+        ),
+        (
+            "schema",
+            as_frame(SBE_LE, mutated(|m| set_le16(m, 4, 2749))),
+        ),
+        ("version", as_frame(SBE_LE, mutated(|m| set_le16(m, 6, 1)))),
+        ("session id", as_frame(SBE_LE, mutated(|m| m[HEADER] ^= 1))),
+        (
+            "request timestamp",
+            as_frame(SBE_LE, mutated(|m| m[HEADER + 16] ^= 1)),
+        ),
+        ("code", as_frame(SBE_LE, mutated(|m| m[HEADER + 24] = 3))),
+        ("encoding type", as_frame(0x5BE0, good_reject_message())),
+    ];
+    for (what, bad) in mutations {
+        assert!(
+            panics(move || assert_negotiation_reject(
+                &bad,
+                0xC0,
+                NegotiationRejectCode::Credentials
+            )),
+            "assert_negotiation_reject accepted a mutated {what}"
+        );
+    }
+
+    let establishment = |edit: fn(&mut Vec<u8>)| {
+        let mut message = establishment_reject(
+            session_id(0xC1),
+            8,
+            EstablishmentRejectCode::Unspecified.as_u8(),
+        );
+        edit(&mut message);
+        as_frame(SBE_LE, message)
+    };
+    assert!(!panics(move || assert_establishment_reject(
+        &establishment(|_| {}),
+        0xC1
+    )));
+    assert!(panics(move || assert_establishment_reject(
+        &establishment(|m| set_le16(m, 0, 0)),
+        0xC1
+    )));
+    assert!(panics(move || assert_establishment_reject(
+        &establishment(|m| m[HEADER + 24] = 0),
+        0xC1
+    )));
+
+    // A field outside the template's root block is never read.
+    let sequence_frame = as_frame(SBE_LE, sequence(1));
+    assert!(panics(move || {
+        let _ = sequence_frame.u64(8);
+    }));
+    // Classifying a heartbeat validates it too.
+    let mut short = sequence(1);
+    set_le16(&mut short, 0, 4);
+    let short = as_frame(SBE_LE, short);
+    assert!(panics(move || {
+        let _ = short.is_heartbeat();
+    }));
 }

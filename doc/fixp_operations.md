@@ -476,7 +476,7 @@ Page numbers are the printed pages of the [v1.1 Draft Standard PDF](https://gith
 | Re-establishing or renegotiating a finalized identifier | 6.3: a violation | Server: EstablishmentReject `Unnegotiated` or NegotiationReject `DuplicateId`, then the transport closed; client: `establish` refused locally |
 | Leaving sequenced mode | 3.5.4 names a context switch; Appendix A 7.3.1.1 (p. 56): any session message | Any session message this side sends other than a Sequence |
 | A handshake request the server cannot decide | 4.2.3 (p. 18): a server "must send NegotiationReject"; 4.3 (p. 19): the response to Establish is EstablishmentAck or EstablishmentReject | Always answered before the close: NegotiationReject `FlowTypeNotSupported` when the application accepts with both flows None, otherwise `Unspecified` (a decision that panicked or lapsed); EstablishmentReject `Unspecified`. The codes are **local policy** |
-| Transport after a server EstablishmentReject | 6.3 (p. 39): an Establish without a successful negotiation, and reusing a finalized id, are violations after which the session "should be immediately terminated"; Appendix A 7.1.12 (p. 45 to 48) shows the rejects and no close | `Unnegotiated` (no negotiation, another session, a finalized id): the reject, then the transport closed at once. **Deviation from a "should", local policy**: after a reject the client can fix (`KeepaliveInterval`, `Unspecified` for a bad `NextSeqNo`, `AlreadyEstablished`) the transport stays open for a retry on it, bounded by `handshake_timeout`. A reject decided by the application closes at once |
+| Transport after a server EstablishmentReject | 6.3 (p. 39): an Establish without a successful negotiation, and reusing a finalized id, are violations after which the session "should be immediately terminated"; Appendix A 7.1.12 (p. 45 to 48) shows the rejects and no close | `Unnegotiated` (no negotiation, another session, a finalized id): the reject, then the transport closed at once. **Local policy, a deliberate departure from the 6.3 recommendation**: closing at the handshake timeout does not meet the immediate termination 6.3 recommends. After a reject the client can fix (`KeepaliveInterval`, `Unspecified` for a bad `NextSeqNo`, `AlreadyEstablished`) the transport stays open for a retry on it, bounded by `handshake_timeout`. A reject decided by the application closes at once |
 | Negotiate on an established session | 4.2.3 (p. 18): nothing should follow a NegotiationReject; 6.3 (p. 39): the Negotiate is a violation that ends the session | **Local policy**: NegotiationReject `DuplicateId`, then Terminate `UnspecifiedError`; not a sequence the specification mandates |
 | Routing a frame to the session or the application | 3.3 (p. 12): left to the encoding supplements; SOFH lets encodings mix | **Local policy**: SOFH SBE 1.0 little-endian whose SBE header names schema 2748 is a session message; anything else, an unregistered encoding type included, is an application message |
 
@@ -570,7 +570,16 @@ their transport), and persisting sequence numbers or sent messages.
 engine, in both roles, against a **raw peer**: SOFH headers and FIXP SBE
 session messages built byte by byte from the schema, and the engine's frames
 parsed the same way, over a real TCP socket. It uses neither `SofhCodec` nor
-the `ironfix-fixp` codec, so IronFix is not tested against itself. Each test
+the `ironfix-fixp` codec, so IronFix is not tested against itself. The
+peer's oracle is strict: a clean close is end of stream with zero bytes of
+a frame; every frame naming schema 2748 must match the schema (version 0, a
+known template, a root block at least as long as the schema's, its
+variable-length fields ending exactly at the SOFH length) before any field
+is read, and fields are read only inside the template's root block. Three
+control tests feed it mutated output and check that it fails
+(`test_oracle_close_requires_zero_bytes_before_eof`,
+`test_oracle_rejects_malformed_session_headers`,
+`test_oracle_assertion_helpers_fail_on_mutated_output`). Each test
 cites the section and printed page of the v1.1 Draft Standard; "policy"
 marks a case the specification leaves open or only shows in the informative
 Appendix A (see the decisions table). Every wait is bounded (5 s) and the
