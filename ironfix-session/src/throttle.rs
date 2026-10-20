@@ -403,16 +403,56 @@ impl<T> Throttle<T> {
     }
 
     /// Removes every held message, budget by budget, each with its budget.
-    pub fn drain(&mut self) -> impl Iterator<Item = (u8, T)> + '_ {
+    ///
+    /// The throttle is empty once the returned iterator is dropped, whether
+    /// or not it was consumed: what was not taken is dropped with it, so the
+    /// count of held messages never disagrees with the queues.
+    pub fn drain(&mut self) -> ThrottleDrain<'_, T> {
         self.held = 0;
         self.next_ticket = 0;
-        self.buckets
-            .iter_mut()
-            .enumerate()
-            .flat_map(|(slot, bucket)| {
-                let id = u8::try_from(slot).unwrap_or(DEFAULT_BUDGET);
-                bucket.queue.drain(..).map(move |(_, item)| (id, item))
-            })
+        ThrottleDrain {
+            buckets: &mut self.buckets,
+            slot: 0,
+        }
+    }
+}
+
+/// The held messages of a [`Throttle`], each with its budget, from
+/// [`Throttle::drain`]. Dropping it drops whatever was not taken.
+#[derive(Debug)]
+pub struct ThrottleDrain<'a, T> {
+    /// The throttle's buckets.
+    buckets: &'a mut [Bucket<T>],
+    /// The bucket being emptied.
+    slot: usize,
+}
+
+impl<T> Iterator for ThrottleDrain<'_, T> {
+    type Item = (u8, T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(bucket) = self.buckets.get_mut(self.slot) {
+            if let Some((_, item)) = bucket.queue.pop_front() {
+                let id = u8::try_from(self.slot).unwrap_or(DEFAULT_BUDGET);
+                return Some((id, item));
+            }
+            match self.slot.checked_add(1) {
+                Some(slot) => self.slot = slot,
+                None => {
+                    debug_assert!(false, "a bucket index never reaches usize::MAX");
+                    return None;
+                }
+            }
+        }
+        None
+    }
+}
+
+impl<T> Drop for ThrottleDrain<'_, T> {
+    fn drop(&mut self) {
+        for bucket in self.buckets.iter_mut() {
+            bucket.queue.clear();
+        }
     }
 }
 
@@ -825,6 +865,32 @@ mod tests {
         assert_eq!(drained, [(a, 3), (b, 4)]);
         assert_eq!(throttle.held(), 0);
         assert_eq!(throttle.next_release(t0 + SECOND), None);
+    }
+
+    /// Dropping the drain unconsumed, or after taking part of it, still
+    /// leaves the throttle empty, so a later admit and release keep their
+    /// accounting (#179 review).
+    #[test]
+    fn test_throttle_drain_dropped_early_still_empties_the_throttle() {
+        let t0 = Instant::now();
+        let budgets = [TestBudget::new(1, SECOND), TestBudget::new(1, SECOND)];
+        let specs = budgets.map(|budget| budget.spec());
+        for take in 0..3 {
+            let mut throttle: Throttle<u32> = Throttle::new(specs, t0);
+            let (a, b) = (DEFAULT_BUDGET, 1);
+            assert_now(throttle.admit_sent(a, 1, t0), 1);
+            assert_now(throttle.admit_sent(b, 2, t0), 2);
+            assert_held(throttle.admit_sent(a, 3, t0));
+            assert_held(throttle.admit_sent(b, 4, t0));
+            assert_eq!(throttle.drain().take(take).count(), take.min(2));
+            assert_eq!(throttle.held(), 0);
+            assert_eq!(throttle.next_release(t0 + SECOND), None);
+            assert!(throttle.release_sent(t0 + SECOND).is_none());
+            assert_held(throttle.admit_sent(a, 5, t0));
+            assert_eq!(throttle.held(), 1);
+            assert_eq!(throttle.release_sent(t0 + SECOND), Some((a, 5)));
+            assert_eq!(throttle.held(), 0);
+        }
     }
 
     /// The bound the documentation states: over any half-open interval of
