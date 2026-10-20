@@ -108,7 +108,13 @@ window, which allows 4: 64 would hide a cost that recurs every 128 sends.
   channel is replaced by the engine's private `command_queue`, a
   `VecDeque` allocated with the session's outbound capacity at session
   start and never grown, behind a `std::sync::Mutex` held only to push or
-  pop one command, with `tokio::sync::Notify` waking the other side. It
+  pop one command. A send first takes a slot from a `tokio::sync::Semaphore`
+  with that many permits, which admits waiting senders in order, so a send
+  (or a Logout) already waiting cannot be overtaken by later ones; the
+  receiver gives the permit back as it takes the command out, and
+  `tokio::sync::Notify` wakes it. Dropping the receiver drops what is
+  still queued, so a `Connection` that outlives the session keeps no
+  command or pooled message alive (both from codex's review of #197). It
   keeps the channel's semantics (order, backpressure when full, `None` once
   every handle is dropped, close and drain, cancel-safe futures, a `Send`
   send future). The ready-gate window now measures **0 blocks for 1024
