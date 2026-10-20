@@ -281,7 +281,6 @@ use crate::application::{Application, RejectReason, SessionId};
 use crate::close::{CloseReason, LogoutCause, bounded_peer_text};
 use crate::connection::{Command, SessionRuntime};
 use crate::error::EngineError;
-use crate::gap_queue::{GapQueue, Gapped, Insert};
 use crate::garbled::{GarbledFrameWindow, GarbledVerdict};
 use crate::loss::{InboundLoss, InboundLossCause};
 use crate::observer::{Capture, FrameKind, OutboundResult};
@@ -308,20 +307,20 @@ use ironfix_core::version::FixVersion;
 use ironfix_session::config::MAX_INBOUND_FIELDS;
 use ironfix_session::heartbeat::generate_test_req_id;
 use ironfix_session::sans_io::{
-    EntryScreen, GapRequest, HeldLogonRelease, InboundSequence, LivenessAction, LivenessGate,
-    OpeningReplay, PageRead, PageRequest, ReplayAction, ReplayStep, ReplayVerdict, ResendReplay,
-    ResendRequestDecision, SessionCore, StallAction, classify_inbound, decide_liveness,
-    decide_opening_replay, decide_resend_request, logout_timed_out, replay_queue_full,
-    replay_step_continues, spanned_high_water, test_request_reply_id,
+    EntryScreen, GapAdmission, GapEntry, GapRequest, HeldEntry, HeldLogonRelease, InboundSequence,
+    LivenessAction, LivenessGate, OpeningReplay, PageRead, PageRequest, ReplayAction, ReplayJob,
+    ReplayStep, ReplayVerdict, ResendRequestDecision, SessionCore, SessionPayloads,
+    SessionPhase as Phase, StallAction, classify_inbound, decide_liveness, decide_opening_replay,
+    decide_resend_request, logout_timed_out, replay_step_continues, spanned_high_water,
+    test_request_reply_id,
 };
 use ironfix_session::sans_io::{
-    LocalLogoutDecision, LogoutPhase, LogoutReplyWrite, PeerLogoutDecision, close_resets,
-    decide_local_logout, decide_logout_advance, reply_close, settle_close,
+    LocalLogoutDecision, LogoutReplyWrite, PeerLogoutDecision, close_resets, decide_local_logout,
+    reply_close, settle_close,
 };
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_session::{
-    Active, HeartbeatManager, LogoutPending, SequenceManager, Session, SessionConfig,
-    TestRequestOutcome,
+    Active, HeartbeatManager, SequenceManager, Session, SessionConfig, TestRequestOutcome,
 };
 use ironfix_store::{MessageStore, StoredMessage};
 use ironfix_tagvalue::FieldIndex;
@@ -446,20 +445,6 @@ const APP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reactor tick granularity for heartbeat/timeout checks.
 pub(crate) const TICK_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Most resends a session queues for its counterparty, the one under way
-/// included.
-///
-/// Resends are answered by steps of the reactor loop, between inbound reads,
-/// so requests that keep arriving faster than they are answered would
-/// otherwise grow the queue without bound. Past this many, a new request is
-/// merged into the last queued one, which is not under way yet: its range
-/// widens to cover both, so every number either request asked for is still
-/// answered (a number asked for by neither reaches the counterparty as a
-/// possible duplicate, which it drops). Decided by the sans-IO core
-/// ([`replay_queue_full`]).
-#[cfg(test)]
-const MAX_QUEUED_RESENDS: usize = ironfix_session::MAX_QUEUED_REPLAYS;
 
 /// Runs `to_admin`, checks the body, and writes one administrative frame
 /// during the handshake, before the reactor exists.
@@ -883,37 +868,6 @@ pub(crate) fn lock_heartbeat(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Runtime session phase, wrapping the typestate session so the reactor can
-/// transition it dynamically.
-enum Phase {
-    /// Session is established.
-    Active(Session<Active>),
-    /// A locally initiated Logout is in the write buffer and has not all been
-    /// written yet. The session already behaves as one logging out (no new
-    /// application message, an inbound Logout completes the exchange), but
-    /// the logout timeout has not started: the Logout has not been sent. Once
-    /// its last byte is written, the session moves to
-    /// [`Phase::LogoutPending`] ([`Reactor::advance_logout`]), whose
-    /// typestate records that moment; if it is never written, the write
-    /// timeout closes the session.
-    LogoutQueued(Session<Active>),
-    /// A locally initiated Logout has been sent and is awaiting
-    /// acknowledgement, within the logout timeout from `Session::sent_at`.
-    LogoutPending(Session<LogoutPending>),
-}
-
-impl Phase {
-    /// The phase as the sans-IO core's Logout decisions read it.
-    #[must_use]
-    const fn logout_phase(&self) -> LogoutPhase {
-        match self {
-            Self::Active(_) => LogoutPhase::Active,
-            Self::LogoutQueued(_) => LogoutPhase::Queued,
-            Self::LogoutPending(_) => LogoutPhase::Pending,
-        }
-    }
-}
-
 /// Terminal outcome of the reactor loop.
 ///
 /// Whether the close is graceful (it ended through a Logout exchange) is the
@@ -967,14 +921,7 @@ const fn codec_failure_reason(err: &CodecError) -> CloseReason {
 /// Consumes a phase on an abnormal close, driving the typestate to
 /// Disconnected.
 fn teardown(phase: Phase) {
-    match phase {
-        Phase::Active(session) | Phase::LogoutQueued(session) => {
-            let _ = session.disconnect();
-        }
-        Phase::LogoutPending(session) => {
-            let _ = session.on_timeout();
-        }
-    }
+    let _ = phase.teardown();
 }
 
 /// Tears the session down because a sequence counter is exhausted.
@@ -1221,16 +1168,12 @@ struct ReactorChannels {
     app_completed: Arc<AtomicU64>,
 }
 
-/// One resend this session owes the counterparty: what is left of
-/// `begin_seq..new_seq`, written a few frames per step of the reactor loop.
-///
-/// The numbers (reply cursor, page cursor, whether the store is done) are the
-/// sans-IO core's [`ResendReplay`]; the reactor keeps what it read and built:
-/// the page and a rebuilt frame waiting behind its gap fill.
-#[derive(Debug)]
-struct ResendJob {
-    /// The decision state of the replay.
-    core: ResendReplay,
+/// The reactor's payload for one resend it owes, the core's
+/// [`ReplayJob`] holding the numbers (reply cursor, page cursor, whether the
+/// store is done) in its [`ResendReplay`](ironfix_session::ResendReplay):
+/// what the reactor read and built for it.
+#[derive(Debug, Default)]
+struct ResendPages {
     /// Stored messages read and not yet written or skipped, in order.
     page: std::vec::IntoIter<StoredMessage>,
     /// A rebuilt replay frame, with its number, written on the call after
@@ -1238,38 +1181,49 @@ struct ResendJob {
     pending: Option<(u64, BytesMut)>,
 }
 
-impl ResendJob {
-    /// The resend of `begin_seq..new_seq`, or `None` for an empty range. With
-    /// `no_store` the store is done from the start: the whole range is one
-    /// gap fill.
-    #[must_use]
-    fn new(begin_seq: u64, new_seq: u64, no_store: bool) -> Option<Self> {
-        Some(Self {
-            core: ResendReplay::new(begin_seq, new_seq, !no_store)?,
-            page: Vec::new().into_iter(),
-            pending: None,
-        })
+/// One resend this session owes, as the core queues it.
+type ResendJob = ReplayJob<ResendPages>;
+
+/// The reactor's payload types, which the sans-IO core stores for it
+/// (issue #91, stage 6b): what is held behind a resend, the frames queued
+/// above a gap, the replay pages, and why this session logged out.
+#[derive(Debug)]
+struct ReactorPayloads;
+
+impl SessionPayloads for ReactorPayloads {
+    type Held = (PendingMessage, Option<Receipt>);
+    type Gapped = Bytes;
+    type Replay = ResendPages;
+    type LogoutCause = LogoutCause;
+
+    /// What this entry counts against
+    /// [`MAX_HELD_BYTES`](ironfix_session::MAX_HELD_BYTES): the body field
+    /// values plus a fixed allowance per field and per message for the tags,
+    /// delimiters and header the frame adds. A `ResendRequest` marker is
+    /// built later from fixed fields and counts the allowance only.
+    fn held_bytes(entry: &DeferredSend) -> usize {
+        match entry {
+            HeldEntry::Message((pending, _)) => pending
+                .message()
+                .fields()
+                .iter()
+                .map(|field| match field {
+                    outbound::OutboundField::Raw { value, .. }
+                    | outbound::OutboundField::Data { value, .. } => {
+                        value.len() + HELD_FIELD_OVERHEAD
+                    }
+                })
+                // A sum past `usize::MAX` cannot be held anyway: it counts
+                // as a full hold.
+                .try_fold(HELD_MESSAGE_OVERHEAD, usize::checked_add)
+                .unwrap_or(usize::MAX),
+            HeldEntry::ResendRequest => HELD_MESSAGE_OVERHEAD,
+        }
     }
 
-    /// Widens a resend that has written nothing yet to also cover `other`'s
-    /// range: from the lower start to the higher end.
-    fn widen(&mut self, other: &Self) {
-        self.core.widen(&other.core);
+    fn gapped_bytes(frame: &Bytes) -> usize {
+        frame.len()
     }
-}
-
-/// Queues `job` behind `queue`, or, once the core's queue bound is reached
-/// ([`replay_queue_full`]), merges it into the last one, which is not under
-/// way yet (the head is), so the queue stays bounded and every number `job`
-/// asks for is still answered.
-fn push_resend(queue: &mut VecDeque<ResendJob>, job: ResendJob) {
-    if replay_queue_full(queue.len())
-        && let Some(last) = queue.back_mut()
-    {
-        last.widen(&job);
-        return;
-    }
-    queue.push_back(job);
 }
 
 /// What one call of [`Reactor::advance_resend`] did.
@@ -2030,16 +1984,7 @@ struct Reactor<A: Application> {
     /// The logout deadline is *not* tracked there: `Session<LogoutPending>`
     /// carries the instant the Logout went out, so the phase itself is the
     /// deadline.
-    core: SessionCore,
-    /// Resends this session owes the counterparty, answered in order, by
-    /// steps of the reactor loop ([`Reactor::resend_step`]).
-    resends: VecDeque<ResendJob>,
-    /// Messages that take a new number, held back while a resend is under
-    /// way and written in order once it is done ([`Reactor::finish_resends`]).
-    deferred: VecDeque<DeferredSend>,
-    /// Why this session sent its own Logout, once it has: reported in the
-    /// close reason when the exchange completes or times out.
-    logout_cause: Option<LogoutCause>,
+    core: SessionCore<ReactorPayloads>,
     /// How long waiting output may make no progress before the session is
     /// closed ([`Writer::on_tick`]).
     write_timeout: Duration,
@@ -2053,11 +1998,6 @@ struct Reactor<A: Application> {
     /// The outbound throttle, when one is attached: the budgets new
     /// application messages are held to, and the messages they hold.
     throttle: Option<OutboundThrottle>,
-    /// Messages held above an open gap under
-    /// [`GapPolicy::Queue`](ironfix_session::GapPolicy::Queue), released in
-    /// order once it is filled ([`Reactor::release_ready`]); `None` under
-    /// `Discard`.
-    gap_queue: Option<GapQueue>,
     /// The field index every inbound frame is decoded into, allocated once
     /// with [`SessionConfig::max_inbound_fields`] entries.
     inbound_index: FieldIndex,
@@ -2649,50 +2589,21 @@ struct PendingReceipt {
 }
 
 /// A message that takes a new sequence number, held back while a resend is
-/// under way and written once it is done.
-#[derive(Debug)]
-enum DeferredSend {
-    /// A message built when it was asked for: a Heartbeat answering a
-    /// TestRequest, a session Reject. A tracked application message would
-    /// carry its receipt here, but none is ever held: application messages
-    /// wait in the command queue while a resend is under way.
-    Message(PendingMessage, Option<Receipt>),
-    /// The `ResendRequest` for the gap recovery tracks. It is built when it is
-    /// written, from the gap as it stands then, and skipped if the gap has
-    /// closed meanwhile.
-    ///
-    /// Whether writing it costs a [`SessionConfig::max_resend_requests`]
-    /// attempt is the gap's to say (`ResendState::charge_on_write`): the
-    /// attempt is charged when the request is written, not when it is held,
-    /// so a request a `to_admin` callback drops costs none (issue #128).
-    ResendRequest,
-}
-
-impl DeferredSend {
-    /// What this entry counts against [`MAX_HELD_BYTES`](ironfix_session::MAX_HELD_BYTES): the body field
-    /// values plus a fixed allowance per field and per message for the tags,
-    /// delimiters and header the frame adds. A `ResendRequest` marker is
-    /// built later from fixed fields and counts the allowance only.
-    fn held_bytes(&self) -> usize {
-        match self {
-            Self::Message(pending, _) => pending
-                .message()
-                .fields()
-                .iter()
-                .map(|field| match field {
-                    outbound::OutboundField::Raw { value, .. }
-                    | outbound::OutboundField::Data { value, .. } => {
-                        value.len() + HELD_FIELD_OVERHEAD
-                    }
-                })
-                // A sum past `usize::MAX` cannot be held anyway: it counts
-                // as a full hold.
-                .try_fold(HELD_MESSAGE_OVERHEAD, usize::checked_add)
-                .unwrap_or(usize::MAX),
-            Self::ResendRequest => HELD_MESSAGE_OVERHEAD,
-        }
-    }
-}
+/// under way and written once it is done, as the core holds it.
+///
+/// [`HeldEntry::Message`] is a message built when it was asked for: a
+/// Heartbeat answering a TestRequest, a session Reject. A tracked application
+/// message would carry its receipt there, but none is ever held: application
+/// messages wait in the command queue while a resend is under way.
+///
+/// [`HeldEntry::ResendRequest`] is the `ResendRequest` for the gap recovery
+/// tracks. It is built when it is written, from the gap as it stands then,
+/// and skipped if the gap has closed meanwhile. Whether writing it costs a
+/// [`SessionConfig::max_resend_requests`] attempt is the gap's to say
+/// (`ResendState::charge_on_write`): the attempt is charged when the request
+/// is written, not when it is held, so a request a `to_admin` callback drops
+/// costs none (issue #128).
+type DeferredSend = HeldEntry<(PendingMessage, Option<Receipt>)>;
 
 /// Most messages held back behind a resend before the reactor stops reading.
 ///
@@ -2707,7 +2618,7 @@ impl DeferredSend {
 const MAX_DEFERRED_SENDS: usize = ironfix_session::MAX_HELD_SENDS;
 
 /// Most bytes held back behind a resend before the reactor stops reading,
-/// counted by [`DeferredSend::held_bytes`] (issue #128).
+/// counted by [`ReactorPayloads::held_bytes`] (issue #128).
 ///
 /// The count bound alone lets the hold reach `MAX_DEFERRED_SENDS` times
 /// `max_message_size`: a Heartbeat reply echoes the counterparty's
@@ -2720,10 +2631,10 @@ const MAX_DEFERRED_SENDS: usize = ironfix_session::MAX_HELD_SENDS;
 #[cfg(test)]
 const MAX_DEFERRED_BYTES: usize = ironfix_session::MAX_HELD_BYTES;
 
-/// Per-field allowance in [`DeferredSend::held_bytes`]: the tag, `=` and SOH.
+/// Per-field allowance in [`ReactorPayloads::held_bytes`]: the tag, `=` and SOH.
 const HELD_FIELD_OVERHEAD: usize = 16;
 
-/// Per-message allowance in [`DeferredSend::held_bytes`]: the header and
+/// Per-message allowance in [`ReactorPayloads::held_bytes`]: the header and
 /// trailer the frame adds, and the entry itself.
 const HELD_MESSAGE_OVERHEAD: usize = 128;
 
@@ -2738,11 +2649,11 @@ impl<A: Application> Reactor<A> {
         // reporting a plain request is better than a panic, which would
         // abort the process under `panic = "abort"`.
         debug_assert!(
-            self.logout_cause.is_some(),
+            self.core.logout_sent(),
             "a Logout exchange of ours ended with no recorded cause"
         );
-        self.logout_cause
-            .take()
+        self.core
+            .take_logout_cause()
             .unwrap_or(LogoutCause::Requested { text: None })
     }
 
@@ -3045,15 +2956,8 @@ impl<A: Application> Reactor<A> {
     /// records the moment, and the logout timeout runs from it. Any other
     /// phase is handed back as it is.
     fn advance_logout(&mut self, phase: Phase) -> Phase {
-        let advance =
-            decide_logout_advance(phase.logout_phase(), || self.writer.logout.take_written());
-        match phase {
-            Phase::LogoutQueued(session) if advance => {
-                // Typestate: Active -> LogoutPending, as the Logout is sent.
-                Phase::LogoutPending(session.initiate_logout(driver_now()))
-            }
-            phase => phase,
-        }
+        // Typestate: Active -> LogoutPending, as the Logout is sent.
+        phase.advance_logout(|| self.writer.logout.take_written(), driver_now())
     }
 
     /// Starts the deadlines of the probes written whole since the last pass:
@@ -3295,7 +3199,7 @@ impl<A: Application> Reactor<A> {
         receipt: Option<Receipt>,
     ) -> Result<Sent, EngineError> {
         if self.resend_in_progress() {
-            self.hold(DeferredSend::Message(pending, receipt));
+            self.hold(HeldEntry::Message((pending, receipt)));
             return Ok(Sent::Deferred);
         }
         self.send_now_tracked(framed, pending, receipt).await
@@ -3804,9 +3708,8 @@ impl<A: Application> Reactor<A> {
                 // can start while one is under way (both wait behind it), and
                 // a resend the counterparty asks for after this Logout is
                 // still answered, as FIX allows.
-                self.core.note_local_logout_fed();
-                self.clear_gap_queue("this session logged out");
-                self.logout_cause = Some(cause);
+                let dropped = self.core.note_local_logout_fed(cause);
+                self.log_gap_queue_dropped(dropped, "this session logged out");
                 // Nothing that takes a new number follows this session's own
                 // Logout: what the throttle holds is discarded now, not left
                 // to wait for a token it can no longer use.
@@ -4623,7 +4526,7 @@ impl<A: Application> Reactor<A> {
                     let phase = self
                         .request_resend(framed, phase, expected, received)
                         .await?;
-                    self.queue_gapped(&phase, seq, Gapped::Frame(frame.clone()));
+                    self.queue_gapped(&phase, seq, GapEntry::Frame(frame.clone()));
                     return Ok(phase);
                 }
                 InboundSequence::Duplicate { expected, .. } => {
@@ -4853,7 +4756,7 @@ impl<A: Application> Reactor<A> {
     /// outbound application messages wait.
     #[must_use]
     fn resend_in_progress(&self) -> bool {
-        !self.resends.is_empty()
+        self.core.replaying()
     }
 
     /// Queues the resend of `begin_seq..new_seq` (`new_seq` exclusive): the
@@ -4868,9 +4771,12 @@ impl<A: Application> Reactor<A> {
     /// empty range queues nothing, and past [`MAX_QUEUED_REPLAYS`](ironfix_session::MAX_QUEUED_REPLAYS) a request
     /// is merged into the last queued one.
     fn queue_resend(&mut self, begin_seq: u64, new_seq: u64) {
-        if let Some(job) = ResendJob::new(begin_seq, new_seq, self.store.is_none()) {
-            push_resend(&mut self.resends, job);
-        }
+        let _ = self.core.queue_replay(
+            begin_seq,
+            new_seq,
+            self.store.is_some(),
+            ResendPages::default(),
+        );
     }
 
     /// Feeds the next frames of the resend at the head of the queue
@@ -4901,7 +4807,7 @@ impl<A: Application> Reactor<A> {
         // on the tick: a step can feed the rest of a resend at once, and must
         // not do so past the deadline.
         let phase = self.cut_resend_for_owed_logout(framed, phase).await?;
-        let Some(mut job) = self.resends.pop_front() else {
+        let Some(mut job) = self.core.take_replay() else {
             return Ok(phase);
         };
         let mut frames_fed: usize = 0;
@@ -4919,15 +4825,15 @@ impl<A: Application> Reactor<A> {
                     if !replay_step_continues(frames_fed, framed.write_buffer().len()) {
                         // The step ends here, and the resend goes on at the
                         // next one.
-                        self.resends.push_front(job);
+                        self.core.resume_replay(job);
                         return Ok(phase);
                     }
                 }
                 Ok(ResendProgress::ReadPage) => {
-                    self.resends.push_front(job);
+                    self.core.resume_replay(job);
                     return Ok(phase);
                 }
-                Ok(ResendProgress::Done) if self.resends.is_empty() => {
+                Ok(ResendProgress::Done) if !self.core.replaying() => {
                     return self.finish_resends(framed, phase).await;
                 }
                 Ok(ResendProgress::Done) => return Ok(phase),
@@ -4965,10 +4871,10 @@ impl<A: Application> Reactor<A> {
             let Some(next) = self.unhold() else {
                 break;
             };
-            let request = matches!(next, DeferredSend::ResendRequest);
+            let request = matches!(next, HeldEntry::ResendRequest);
             let (pending, receipt) = match next {
-                DeferredSend::Message(pending, receipt) => (pending, receipt),
-                DeferredSend::ResendRequest => match self.core.resend_expected() {
+                HeldEntry::Message((pending, receipt)) => (pending, receipt),
+                HeldEntry::ResendRequest => match self.core.resend_expected() {
                     Some(expected) => (self.factory.resend_request(expected, 0), None),
                     // The gap closed while the request was held.
                     None => continue,
@@ -5044,7 +4950,7 @@ impl<A: Application> Reactor<A> {
         abandoned: bool,
     ) -> Result<Phase, SessionClosed> {
         if abandoned {
-            self.resends.clear();
+            self.core.clear_replays();
             let reason = self.reason_behind_resend();
             self.discard_deferred(&reason);
         }
@@ -5090,21 +4996,17 @@ impl<A: Application> Reactor<A> {
 
     /// Holds `entry` back behind the resend under way, counting its bytes.
     fn hold(&mut self, entry: DeferredSend) {
-        self.core.note_held(entry.held_bytes());
-        self.deferred.push_back(entry);
+        self.core.hold(entry);
         #[cfg(test)]
         {
             let (messages, bytes) = self.core.held();
-            debug_assert_eq!(messages, self.deferred.len());
             tests::note_held(messages, bytes);
         }
     }
 
     /// Takes the oldest held entry, uncounting its bytes.
     fn unhold(&mut self) -> Option<DeferredSend> {
-        let entry = self.deferred.pop_front()?;
-        self.core.note_unheld(entry.held_bytes());
-        Some(entry)
+        self.core.unhold()
     }
 
     /// Whether the hold has reached either of its bounds,
@@ -5118,12 +5020,12 @@ impl<A: Application> Reactor<A> {
     /// already held: it is built when it is written, from the gap as it
     /// stands then, and charged as the gap it is written for says.
     fn defer_resend_request(&mut self) {
-        if !self
-            .deferred
-            .iter()
-            .any(|held| matches!(held, DeferredSend::ResendRequest))
-        {
-            self.hold(DeferredSend::ResendRequest);
+        if self.core.hold_resend_request() {
+            #[cfg(test)]
+            {
+                let (messages, bytes) = self.core.held();
+                tests::note_held(messages, bytes);
+            }
         }
     }
 
@@ -5144,9 +5046,8 @@ impl<A: Application> Reactor<A> {
     /// one with `reason`.
     fn discard_deferred(&mut self, reason: &NotSentReason) {
         let capture = self.writer.capture.as_ref();
-        self.core.clear_held();
-        for held in self.deferred.drain(..) {
-            if let DeferredSend::Message(_, receipt) = held {
+        for held in self.core.drain_held() {
+            if let HeldEntry::Message((_, receipt)) = held {
                 settle(capture, FrameKind::Session, receipt, || {
                     SendOutcome::not_sent(reason.clone())
                 });
@@ -5223,18 +5124,22 @@ impl<A: Application> Reactor<A> {
         loop {
             // A replayed message whose gap fill was fed on the previous call.
             // The core already counted it past the reply cursor.
-            if let Some((seq, frame)) = job.pending.take() {
+            if let Some((seq, frame)) = job.payload_mut().pending.take() {
                 self.send_replay(framed, seq, &frame)?;
                 return Ok(ResendProgress::Wrote);
             }
-            if let Some(message) = job.page.next() {
+            if let Some(message) = job.payload_mut().page.next() {
                 let seq = message.seq_num();
                 // Outside what the reply still owes (a store must not move
                 // the reply), or administrative: gap-filled, not replayed
                 // (`doc/fix_operations.md`, "Resend Request", item 3), since
                 // resending a stale Heartbeat or Logon says nothing true
                 // about the session now.
-                if job.core.screen_entry(seq, message.msg_type().is_admin()) == EntryScreen::Skip {
+                if job
+                    .replay_mut()
+                    .screen_entry(seq, message.msg_type().is_admin())
+                    == EntryScreen::Skip
+                {
                     continue;
                 }
                 // Replayed in the precision the session stamps everything
@@ -5260,7 +5165,7 @@ impl<A: Application> Reactor<A> {
                     Some(frame) if self.replay_allowed(seq, frame).await => ReplayVerdict::Replay,
                     Some(_) | None => ReplayVerdict::GapFill,
                 };
-                match (job.core.decide_entry(seq, verdict), rebuilt) {
+                match (job.replay_mut().decide_entry(seq, verdict), rebuilt) {
                     (ReplayAction::Replay { seq }, Some(frame)) => {
                         self.send_replay(framed, seq, &frame)?;
                         return Ok(ResendProgress::Wrote);
@@ -5272,7 +5177,7 @@ impl<A: Application> Reactor<A> {
                     (ReplayAction::GapFillThenReplay { gap_fill, seq }, Some(frame)) => {
                         self.send_gap_fill(framed, gap_fill.at, gap_fill.new_seq)
                             .await?;
-                        job.pending = Some((seq, frame));
+                        job.payload_mut().pending = Some((seq, frame));
                         return Ok(ResendProgress::Wrote);
                     }
                     // The core decides a replay only on a `Replay` verdict,
@@ -5286,7 +5191,7 @@ impl<A: Application> Reactor<A> {
                     }
                 }
             }
-            match job.core.poll_store() {
+            match job.replay_mut().poll_store() {
                 // A page read is a step of its own: the loop reads inbound
                 // and yields between pages, whatever the page held.
                 ReplayStep::ReadPage(request) => {
@@ -5361,7 +5266,7 @@ impl<A: Application> Reactor<A> {
         request: PageRequest,
     ) -> Result<(), EngineError> {
         let Some(store) = self.store.as_deref() else {
-            job.core.on_page(PageRead::Failed);
+            job.replay_mut().on_page(PageRead::Failed);
             return Ok(());
         };
         // One unit of cooperative budget per page: a store that answers at
@@ -5391,17 +5296,17 @@ impl<A: Application> Reactor<A> {
                     error = %err,
                     "cannot read the resend range from the store: gap-filling the rest"
                 );
-                job.core.on_page(PageRead::Failed);
+                job.replay_mut().on_page(PageRead::Failed);
                 return Ok(());
             }
         };
         // Ascending and bounded to the range: the core reads the next page
         // from just past the furthest key, or ends the store's part.
-        job.core.on_page(PageRead::Read {
+        job.replay_mut().on_page(PageRead::Read {
             len: page.len(),
             furthest: page.last().map(StoredMessage::seq_num),
         });
-        job.page = page.into_iter();
+        job.payload_mut().page = page.into_iter();
         Ok(())
     }
 
@@ -5487,17 +5392,13 @@ impl<A: Application> Reactor<A> {
             // Behind a resend, a released message's reply is held too: once
             // the hold is full, releasing pauses as reading does, and resumes
             // when the resend is done ([`Reactor::finish_resends`]).
-            if self.resend_in_progress() && self.hold_full() {
+            if self.core.gap_release_paused() {
                 return Ok(phase);
             }
             let expected = self.runtime.sequences.next_target_seq().value();
-            let Some(queue) = self.gap_queue.as_mut() else {
+            let Some(ready) = self.core.take_gap_ready(expected) else {
                 return Ok(phase);
             };
-            if queue.is_empty() {
-                return Ok(phase);
-            }
-            let ready = queue.take_ready(expected);
             if ready.superseded > 0 {
                 tracing::debug!(
                     session = %self.session_id,
@@ -5510,8 +5411,10 @@ impl<A: Application> Reactor<A> {
                 return Ok(phase);
             };
             phase = match entry {
-                Gapped::Frame(frame) => self.release_frame(framed, phase, expected, &frame).await?,
-                Gapped::Processed => self.consume_processed(phase, expected).await?,
+                GapEntry::Frame(frame) => {
+                    self.release_frame(framed, phase, expected, &frame).await?
+                }
+                GapEntry::Processed => self.consume_processed(phase, expected).await?,
             };
             phase = self.release_held_logon(phase).await?;
         }
@@ -5579,16 +5482,10 @@ impl<A: Application> Reactor<A> {
     /// gapped TestRequest is not answered twice and an administrative frame
     /// on a number an application message already claimed does not run. An
     /// overflow returns `false`: the message is acted on as under `Discard`.
-    fn queue_gapped(&mut self, phase: &Phase, seq: u64, entry: Gapped) -> bool {
-        if !matches!(phase, Phase::Active(_)) || self.core.logout_owed() {
-            return false;
-        }
-        let Some(queue) = self.gap_queue.as_mut() else {
-            return false;
-        };
-        match queue.insert(seq, entry) {
-            Insert::Queued => false,
-            Insert::Duplicate => {
+    fn queue_gapped(&mut self, phase: &Phase, seq: u64, entry: GapEntry<Bytes>) -> bool {
+        match self.core.queue_gapped(phase, seq, entry) {
+            GapAdmission::Bypassed | GapAdmission::Queued | GapAdmission::Overflow => false,
+            GapAdmission::Duplicate => {
                 tracing::debug!(
                     session = %self.session_id,
                     seq,
@@ -5596,15 +5493,13 @@ impl<A: Application> Reactor<A> {
                 );
                 true
             }
-            Insert::Overflow => {
-                if queue.first_overflow() {
-                    tracing::warn!(
-                        session = %self.session_id,
-                        seq,
-                        "the gap queue is full: discarding further messages above the gap until \
-                         it drains; the resend delivers them"
-                    );
-                }
+            GapAdmission::FirstOverflow => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    seq,
+                    "the gap queue is full: discarding further messages above the gap until \
+                     it drains; the resend delivers them"
+                );
                 false
             }
         }
@@ -5612,10 +5507,13 @@ impl<A: Application> Reactor<A> {
 
     /// Drops every queued message, logging why when there were any.
     fn clear_gap_queue(&mut self, why: &'static str) {
-        let Some(queue) = self.gap_queue.as_mut() else {
-            return;
-        };
-        let dropped = queue.clear();
+        let dropped = self.core.clear_gap_queue();
+        self.log_gap_queue_dropped(dropped, why);
+    }
+
+    /// Logs that `dropped` messages queued above a gap were dropped, and
+    /// why, when there were any.
+    fn log_gap_queue_dropped(&self, dropped: usize, why: &'static str) {
         if dropped > 0 {
             tracing::debug!(
                 session = %self.session_id,
@@ -5940,10 +5838,11 @@ impl<A: Application> Reactor<A> {
                     // sequence), and under Queue their number is kept to be
                     // consumed in turn, except a Logout's: it empties the
                     // queue.
-                    self.queue_gapped(&phase, seq, Gapped::Frame(frame.clone()));
+                    self.queue_gapped(&phase, seq, GapEntry::Frame(frame.clone()));
                     return Ok(phase);
                 }
-                if msg_type != MsgType::Logout && self.queue_gapped(&phase, seq, Gapped::Processed)
+                if msg_type != MsgType::Logout
+                    && self.queue_gapped(&phase, seq, GapEntry::Processed)
                 {
                     // A copy of a number already held: dropped, not acted
                     // on a second time.
@@ -6433,7 +6332,7 @@ where
     let (app_tx, app_rx) = mpsc::channel(app_queue_capacity);
     let (reject_tx, reject_rx) = mpsc::channel(app_queue_capacity);
     let garbled = config.garbled_frame_limit.map(GarbledFrameWindow::new);
-    let gap_queue = GapQueue::for_policy(config.gap_policy);
+    let core = SessionCore::with_gap_policy(config.gap_policy);
     // `SessionConfig::validate` bounds the knob before a session starts; the
     // `min` keeps a configuration assembled by hand from sizing this
     // allocation past the documented ceiling.
@@ -6517,16 +6416,12 @@ where
         reset_owed,
         accounted,
         published: opening_mark,
-        core: SessionCore::new(),
-        resends: VecDeque::new(),
-        deferred: VecDeque::new(),
-        logout_cause: None,
+        core,
         write_timeout,
         writer,
         app_tx,
         garbled,
         throttle,
-        gap_queue,
         inbound_index,
         field_index_fallbacks: 0,
     };
@@ -6800,75 +6695,6 @@ mod tests {
         state.record_retry(driver_now());
         assert_eq!(state.attempts(), 1);
         assert!(!state.can_retry(), "the one real request is spent");
-    }
-
-    #[test]
-    fn test_resend_job_refuses_an_empty_range() {
-        assert!(ResendJob::new(5, 5, false).is_none());
-        assert!(ResendJob::new(6, 5, false).is_none());
-        assert!(ResendJob::new(0, 5, false).is_none());
-        let Some(job) = ResendJob::new(3, 6, true) else {
-            panic!("3..6 is a range")
-        };
-        assert_eq!((job.core.reply_cursor(), job.core.read_from()), (3, 3));
-        assert_eq!((job.core.end_seq(), job.core.new_seq()), (5, 6));
-        assert!(
-            job.core.store_done(),
-            "without a store the range is one gap fill"
-        );
-    }
-
-    #[test]
-    fn test_push_resend_merges_past_the_cap_into_the_last_unstarted_job() {
-        let mut queue = VecDeque::new();
-        let cap = u64::try_from(MAX_QUEUED_RESENDS).unwrap_or(u64::MAX);
-        // One single-number request per number, 2 onwards, past the cap.
-        for seq in 2..2 + cap + 6 {
-            let Some(job) = ResendJob::new(seq, seq + 1, false) else {
-                panic!("a one-number range")
-            };
-            push_resend(&mut queue, job);
-        }
-        assert_eq!(queue.len(), MAX_QUEUED_RESENDS, "the queue stays bounded");
-        let Some(head) = queue.front() else {
-            panic!("the queue is not empty")
-        };
-        assert_eq!(
-            (head.core.reply_cursor(), head.core.new_seq()),
-            (2, 3),
-            "the head is untouched"
-        );
-        let Some(last) = queue.back() else {
-            panic!("the queue is not empty")
-        };
-        // The last queued request (cap + 1) absorbed the six that followed it.
-        assert_eq!(last.core.reply_cursor(), cap + 1);
-        assert_eq!(
-            last.core.new_seq(),
-            cap + 8,
-            "every merged number is still answered"
-        );
-    }
-
-    #[test]
-    fn test_resend_job_widen_covers_both_ranges() {
-        let (Some(mut job), Some(other)) =
-            (ResendJob::new(10, 20, false), ResendJob::new(4, 30, false))
-        else {
-            panic!("both are ranges")
-        };
-        job.widen(&other);
-        assert_eq!((job.core.reply_cursor(), job.core.read_from()), (4, 4));
-        assert_eq!((job.core.end_seq(), job.core.new_seq()), (29, 30));
-        let Some(inner) = ResendJob::new(12, 15, false) else {
-            panic!("12..15 is a range")
-        };
-        job.widen(&inner);
-        assert_eq!(
-            (job.core.reply_cursor(), job.core.new_seq()),
-            (4, 30),
-            "a covered range changes nothing"
-        );
     }
 
     /// A framed pipe as the reactor holds one, and the peer's raw end.

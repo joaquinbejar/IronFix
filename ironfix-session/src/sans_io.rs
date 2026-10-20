@@ -120,8 +120,18 @@
 //!   Logon ([`HeldLogonRelease`]), the spanning re-request mark, the owed
 //!   Logout, whether this session's Logout was fed, the unwritten
 //!   TestRequest, the read budget between replay steps and the hold count.
-//!   The driver keeps the typestate phase, the frames, the store, the socket
-//!   and the callbacks.
+//!
+//! # Stage 6b: the phase and the payload queues
+//!
+//! - [`SessionPhase`]: the phase of a live session (established, own Logout
+//!   queued, own Logout pending), wrapping the typestate session so a driver
+//!   moves it only through the consuming transitions.
+//! - [`SessionPayloads`]: the driver's payload types, stored opaquely. With
+//!   it [`SessionCore`] owns the hold behind a resend ([`HeldEntry`]), the
+//!   resends owed ([`ReplayJob`]), the gap queue ([`GapEntry`],
+//!   [`GapAdmission`], [`GapReady`]) and why this session logged out.
+//!   The driver keeps the frames' construction and encoding, the store, the
+//!   socket, the callbacks and its own transport bookkeeping.
 //!
 //! # Time
 //!
@@ -129,6 +139,7 @@
 //! contract"). The Tokio driver passes its own clock, converted at the
 //! boundary, so a paused-clock test drives these decisions deterministically.
 
+pub use crate::gap_queue::{GapAdmission, GapEntry, GapReady};
 pub use crate::logon::{
     ADOPTED_RESET_NEXT_SENDER, ADOPTED_RESET_NEXT_TARGET, ADOPTED_RESET_STORED_TARGET,
     AckHeartBtIntDefect, AckReset, LogonCounters, LogonGapAction, LogonInboundMismatch,
@@ -149,6 +160,7 @@ pub use crate::logout::{
     close_resets, decide_local_logout, decide_logout_advance, decide_peer_logout, owed_logout_due,
     reply_close, resend_stalled_text, settle_close,
 };
+pub use crate::phase::SessionPhase;
 pub use crate::replay::{
     EndSeqNoInfinity, EntryScreen, GapFillRange, MAX_HELD_BYTES, MAX_HELD_SENDS,
     MAX_QUEUED_REPLAYS, MAX_READS_PER_REPLAY_STEP, OpeningReplay, PageRead, PageRequest,
@@ -157,7 +169,9 @@ pub use crate::replay::{
     decide_resend_request, hold_full, orig_sending_time, reads_yield_to_replay, replay_field,
     replay_queue_full, replay_step_continues,
 };
-pub use crate::session_core::{HeldLogonRelease, SessionCore};
+pub use crate::session_core::{
+    HeldEntry, HeldLogonRelease, ReplayJob, SessionCore, SessionPayloads,
+};
 
 use crate::config::SessionConfig;
 use crate::heartbeat::HeartbeatManager;
