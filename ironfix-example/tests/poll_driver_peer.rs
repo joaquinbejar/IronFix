@@ -241,6 +241,20 @@ fn test_ack_without_heartbeat_interval_is_rejected_and_ends_the_session() {
 }
 
 #[test]
+fn test_ack_without_encrypt_method_is_rejected_and_ends_the_session() {
+    let (mut client, mut peer, _) = connect(MemoryStore::new());
+    peer.send(&peer_frame("A", 1, &[(108, "30")]));
+    let reject = peer.next(&mut client);
+    assert_eq!(field(&reject, 35).as_deref(), Some("3"));
+    assert_eq!(field(&reject, 371).as_deref(), Some("98"));
+    assert_eq!(field(&reject, 373).as_deref(), Some("1"));
+    let logout = peer.next(&mut client);
+    assert_eq!(field(&logout, 35).as_deref(), Some("5"));
+    assert!(matches!(client.ended(), Some(Ended::Protocol(_))));
+    assert!(!client.is_active());
+}
+
+#[test]
 fn test_ack_heartbeat_interval_is_adopted() {
     let (mut client, mut peer, _) = connect(MemoryStore::new());
     // The peer confirms a different interval: the session runs on it, so a

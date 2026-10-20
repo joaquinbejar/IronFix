@@ -996,3 +996,74 @@ fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     (era * 146_097 + day_of_era).checked_sub(719_468)
 }
+
+/// Longest `EncryptMethod` (98) value echoed in a log line, a Reject or a
+/// Logout `Text` (58). The value is counterparty-controlled, so it is bounded.
+pub const MAX_ECHOED_ENCRYPT_METHOD: usize = 16;
+
+/// Why an inbound Logon's `EncryptMethod` (98) was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncryptMethodProblem {
+    /// The field is absent: it is a required field of the Logon.
+    Missing,
+    /// The field names a method other than 0 (None): IronFix implements no
+    /// encryption, so nothing else can be honoured.
+    Unsupported {
+        /// The offending value, bounded by [`MAX_ECHOED_ENCRYPT_METHOD`].
+        value: String,
+    },
+}
+
+impl EncryptMethodProblem {
+    /// The `SessionRejectReason` (373) of the session-level Reject this
+    /// problem produces: 1 (required tag missing) or 5 (value is incorrect).
+    /// Its `RefTagID` (371) is 98 and its `Text` (58) the problem's
+    /// `Display`.
+    #[must_use]
+    pub const fn reject_code(&self) -> u32 {
+        match self {
+            Self::Missing => 1,
+            Self::Unsupported { .. } => 5,
+        }
+    }
+
+    /// The `RefTagID` (371) of that Reject: `EncryptMethod` (98).
+    #[must_use]
+    pub const fn ref_tag(&self) -> u32 {
+        98
+    }
+}
+
+impl std::fmt::Display for EncryptMethodProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => write!(
+                f,
+                "unsupported EncryptMethod (98) '<absent>'; only 0 (None) is supported"
+            ),
+            Self::Unsupported { value } => write!(
+                f,
+                "unsupported EncryptMethod (98) '{value}'; only 0 (None) is supported"
+            ),
+        }
+    }
+}
+
+/// Checks the `EncryptMethod` (98) of an inbound Logon or Logon
+/// acknowledgement: it is required, and only 0 (None) is supported.
+///
+/// # Errors
+/// [`EncryptMethodProblem::Missing`] when 98 is absent and
+/// [`EncryptMethodProblem::Unsupported`] when it is anything but `0`.
+pub fn check_encrypt_method(raw: &RawMessage<'_>) -> Result<(), EncryptMethodProblem> {
+    match raw.get_field(98) {
+        None => Err(EncryptMethodProblem::Missing),
+        Some(field) if field.value == b"0" => Ok(()),
+        Some(field) => Err(EncryptMethodProblem::Unsupported {
+            value: String::from_utf8_lossy(field.value)
+                .chars()
+                .take(MAX_ECHOED_ENCRYPT_METHOD)
+                .collect(),
+        }),
+    }
+}
