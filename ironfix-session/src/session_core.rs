@@ -395,6 +395,22 @@ impl SessionCore {
     }
 
     /// One held entry of `bytes` was taken back out.
+    ///
+    /// # Preconditions
+    ///
+    /// - The entry was noted earlier with [`Self::note_held`] and has not
+    ///   been taken out since (nor dropped by [`Self::clear_held`]).
+    /// - `bytes` is exactly the count passed to [`Self::note_held`] for that
+    ///   entry.
+    ///
+    /// A violation is a driver bug. In debug builds it trips a
+    /// `debug_assert`. In release builds the count that would go below zero
+    /// stops at zero instead: an entry taken out with none noted leaves the
+    /// entry count at 0, and `bytes` above the noted total leaves the byte
+    /// count at 0. The two counts are handled independently. A count that
+    /// stops at zero then reads lower than what the driver actually holds,
+    /// so [`Self::hold_full`] can report room the hold does not have until
+    /// the next [`Self::clear_held`].
     pub const fn note_unheld(&mut self, bytes: usize) {
         self.held_sends = match self.held_sends.checked_sub(1) {
             Some(count) => count,
