@@ -308,9 +308,12 @@ use ironfix_core::version::FixVersion;
 use ironfix_session::config::MAX_INBOUND_FIELDS;
 use ironfix_session::heartbeat::generate_test_req_id;
 use ironfix_session::sans_io::{
-    LivenessAction, LivenessGate, decide_liveness, logout_timed_out, test_request_reply_id,
+    GapRequest, InboundSequence, LivenessAction, LivenessGate, ResendState, StallAction,
+    classify_inbound, decide_gap_request, decide_liveness, decide_stall, logout_timed_out,
+    merged_high_water, note_inbound_progress, spanned_high_water, spanned_rerequest,
+    test_request_reply_id,
 };
-use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
+use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_session::{
     Active, HeartbeatManager, LogoutPending, SequenceManager, Session, SessionConfig,
     TestRequestOutcome,
@@ -1210,123 +1213,6 @@ struct ReactorChannels {
     /// The inbound application watermark as the dispatcher last published
     /// it in memory.
     app_completed: Arc<AtomicU64>,
-}
-
-/// Bookkeeping for an outstanding `ResendRequest` (2).
-///
-/// A resend that is never satisfied must not keep the session open forever:
-/// gapped frames refresh the heartbeat clock, so the heartbeat timeout never
-/// fires while the inbound expectation sits pinned. This tracks the gap so the
-/// reactor can retry the request and, once the attempts are spent, log the
-/// session out instead of waiting on a peer that is not answering.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ResendState {
-    /// The next sequence number the recovery is waiting to receive. It advances
-    /// with in-order inbound progress so a retry re-requests from the current
-    /// gap start, never a number already consumed.
-    expected: u64,
-    /// The top of the outstanding range: the highest sequence number seen while
-    /// the gap has been open. The request is open-ended (`EndSeqNo` 0, or
-    /// 999999 on FIX 4.0 and 4.1), so this is the water mark the expectation
-    /// must cross for the gap to be considered closed — clearing recovery on the first in-order message
-    /// instead would forget that later numbers in the range are still missing.
-    high_water: u64,
-    /// When the most recent request for this gap was sent.
-    requested_at: Instant,
-    /// How many requests have been sent for this gap, counting the first.
-    attempts: u32,
-    /// Attempt ceiling, resolved once from the configuration.
-    limit: u32,
-    /// How long a request may make no progress before it is retried.
-    timeout: Duration,
-    /// Whether the `ResendRequest` held behind a resend of ours for this gap
-    /// costs an attempt when it is written. It lives here, with the gap, not
-    /// on the held marker: when the gap closes, the flag goes with it, and a
-    /// later uncharged gap reusing the marker is not charged (issue #128).
-    charge_on_write: bool,
-}
-
-impl ResendState {
-    /// Opens recovery for a gap at `expected`, with `high_water` the highest
-    /// sequence number outstanding, counting the first request.
-    #[must_use]
-    pub(crate) fn first(expected: u64, high_water: u64, config: &SessionConfig) -> Self {
-        Self {
-            expected,
-            high_water,
-            requested_at: Instant::now(),
-            attempts: 1,
-            limit: config.resend_attempt_limit(),
-            timeout: config.resend_timeout,
-            charge_on_write: false,
-        }
-    }
-
-    /// Opens recovery for a gap that `NextExpectedMsgSeqNum` (789) already
-    /// asked the counterparty to fill, with **no** `ResendRequest` sent:
-    /// `attempts` is 0.
-    ///
-    /// The state is armed so a gapped frame arriving meanwhile does not send a
-    /// request that would cross the counterparty's 789 resend, and so a gap
-    /// that stops filling is still chased: once it has made no progress for
-    /// the retry timeout (no resend at all, or one that stalls partway),
-    /// [`Reactor::on_resend_stalled`] sends a real `ResendRequest`, which a
-    /// limit of one request still allows.
-    #[must_use]
-    pub(crate) fn implied(expected: u64, high_water: u64, config: &SessionConfig) -> Self {
-        Self {
-            attempts: 0,
-            ..Self::first(expected, high_water, config)
-        }
-    }
-
-    /// Whether this gap has waited longer than its retry timeout.
-    #[must_use]
-    fn is_stalled(&self) -> bool {
-        self.requested_at.elapsed() >= self.timeout
-    }
-
-    /// Whether another request may still be sent for this gap.
-    #[must_use]
-    const fn can_retry(&self) -> bool {
-        self.attempts < self.limit
-    }
-
-    /// Restarts the stall clock: a request that is not charged against the
-    /// retry budget has just gone out (or been held back behind a resend).
-    fn restart_clock(&mut self) {
-        self.requested_at = Instant::now();
-    }
-
-    /// Records that another request for this same gap has gone out.
-    fn record_retry(&mut self) {
-        self.requested_at = Instant::now();
-        // Any charged request settles what a held one owed: a later held
-        // request in this gap is charged only if armed again (issue #128).
-        self.charge_on_write = false;
-        // `attempts` never passes `limit` (a u32) by more than the one
-        // request `can_retry` allowed, so this cannot overflow; if it ever
-        // did, the count stays at its ceiling, which already refuses a retry.
-        match self.attempts.checked_add(1) {
-            Some(attempts) => self.attempts = attempts,
-            None => debug_assert!(false, "ResendRequest attempt count overflowed u32"),
-        }
-    }
-
-    /// Records genuine in-order progress within the outstanding range.
-    ///
-    /// The gap start has advanced to `expected`, so the stall clock and the
-    /// retry budget both reset: a peer that is actively feeding the gap has
-    /// proved itself responsive and must not be logged out for being slow. A
-    /// duplicate or an out-of-order frame makes no such progress and so does not
-    /// reach here.
-    fn record_progress(&mut self, expected: u64) {
-        self.expected = expected;
-        self.requested_at = Instant::now();
-        // An implied gap (no request sent yet) stays implied, so a stall
-        // after partial progress still gets its one real request.
-        self.attempts = self.attempts.min(1);
-    }
 }
 
 /// One resend this session owes the counterparty: what is left of
@@ -3218,7 +3104,7 @@ impl<A: Application> Reactor<A> {
         if self.writer.resend_request.take_written()
             && let Some(state) = self.resend.as_mut()
         {
-            state.restart_clock();
+            state.restart_clock(driver_now());
         }
     }
 
@@ -4047,11 +3933,15 @@ impl<A: Application> Reactor<A> {
         // A request still buffered has not reached the counterparty: its
         // clock starts once it is written whole ([`Reactor::advance_probes`]),
         // and the write timeout bounds how long it may wait.
-        if let Some(resend) = self.resend
-            && resend.is_stalled()
-            && !self.writer.resend_request.unwritten()
-        {
-            return self.on_resend_stalled(framed, phase, resend).await;
+        match decide_stall(
+            self.resend.as_ref(),
+            driver_now(),
+            self.writer.resend_request.unwritten(),
+        ) {
+            StallAction::Wait => {}
+            stalled @ (StallAction::Retry { .. } | StallAction::Abandon { .. }) => {
+                return self.on_resend_stalled(framed, phase, stalled).await;
+            }
         }
 
         // The guard is a std mutex: the decision is copied out and the guard
@@ -4159,14 +4049,11 @@ impl<A: Application> Reactor<A> {
         expected: u64,
         high_water: u64,
     ) -> Result<Phase, SessionClosed> {
-        if let Some(state) = self.resend.as_mut() {
-            if high_water > state.high_water {
-                state.high_water = high_water;
-            }
-            // The request from this gap start is already on the wire.
-            if state.expected == expected {
-                return Ok(phase);
-            }
+        // The request from this gap start is already on the wire; a frame
+        // reaching further only raises the water mark.
+        match decide_gap_request(self.resend.as_mut(), expected, high_water) {
+            GapRequest::AlreadyRequested => return Ok(phase),
+            GapRequest::Request => {}
         }
         // Behind a resend of ours the request waits too, as a marker built
         // when it is written; recovery is armed now, so the gapped frames
@@ -4175,11 +4062,9 @@ impl<A: Application> Reactor<A> {
         // ([`Reactor::finish_resends`]), so a request a `to_admin` callback
         // drops then costs none (issue #128).
         if self.resend_in_progress() {
-            let high_water = self
-                .resend
-                .map_or(high_water, |state| state.high_water.max(high_water));
-            let mut state = ResendState::implied(expected, high_water, &self.config);
-            state.charge_on_write = true;
+            let high_water = merged_high_water(self.resend.as_ref(), high_water);
+            let mut state = ResendState::implied(expected, high_water, &self.config, driver_now());
+            state.charge_held_request();
             self.resend = Some(state);
             self.defer_resend_request();
             return Ok(phase);
@@ -4201,10 +4086,13 @@ impl<A: Application> Reactor<A> {
         }
         // A re-request at a new gap start keeps the highest water mark seen so
         // far, so the range is never narrowed by a later, lower frame.
-        let high_water = self
-            .resend
-            .map_or(high_water, |state| state.high_water.max(high_water));
-        self.resend = Some(ResendState::first(expected, high_water, &self.config));
+        let high_water = merged_high_water(self.resend.as_ref(), high_water);
+        self.resend = Some(ResendState::first(
+            expected,
+            high_water,
+            &self.config,
+            driver_now(),
+        ));
         self.drop_held_logon_for_a_request();
         Ok(phase)
     }
@@ -4234,8 +4122,7 @@ impl<A: Application> Reactor<A> {
         new_seq: u64,
     ) -> Result<Phase, SessionClosed> {
         self.spanning_rerequested = Some(expected);
-        // `new_seq > expected >= 1`, so this cannot underflow.
-        let high_water = new_seq.checked_sub(1).unwrap_or(expected).max(expected);
+        let high_water = spanned_high_water(expected, new_seq);
         tracing::info!(
             session = %self.session_id,
             expected,
@@ -4268,13 +4155,14 @@ impl<A: Application> Reactor<A> {
     /// its clock; otherwise it starts implied.
     fn arm_uncharged(&mut self, expected: u64, high_water: u64) {
         match self.resend.as_mut() {
-            Some(state) => {
-                state.expected = expected;
-                state.high_water = state.high_water.max(high_water);
-                state.restart_clock();
-            }
+            Some(state) => state.rearm_uncharged(expected, high_water, driver_now()),
             None => {
-                self.resend = Some(ResendState::implied(expected, high_water, &self.config));
+                self.resend = Some(ResendState::implied(
+                    expected,
+                    high_water,
+                    &self.config,
+                    driver_now(),
+                ));
             }
         }
     }
@@ -4309,15 +4197,11 @@ impl<A: Application> Reactor<A> {
     /// stall timer honest against a peer that fills the gap start and then
     /// stalls while spamming timely duplicates.
     fn note_inbound_progress(&mut self) {
-        let Some(high_water) = self.resend.as_ref().map(|state| state.high_water) else {
+        if self.resend.is_none() {
             return;
-        };
-        let next_target = self.runtime.sequences.next_target_seq().value();
-        if next_target > high_water {
-            self.resend = None;
-        } else if let Some(state) = self.resend.as_mut() {
-            state.record_progress(next_target);
         }
+        let next_target = self.runtime.sequences.next_target_seq().value();
+        let _ = note_inbound_progress(&mut self.resend, next_target, driver_now());
     }
 
     /// Handles an outstanding ResendRequest that has gone unanswered past its
@@ -4332,24 +4216,23 @@ impl<A: Application> Reactor<A> {
         &mut self,
         framed: &mut FixFramed,
         phase: Phase,
-        resend: ResendState,
+        stalled: StallAction,
     ) -> Result<Phase, SessionClosed> {
-        if !resend.can_retry() {
-            let cause = LogoutCause::ResendStalled {
-                expected: resend.expected,
-                attempts: resend.attempts,
-            };
-            tracing::warn!(session = %self.session_id, reason = %cause, "abandoning stalled resend");
-            return match phase {
-                // A logout already in flight cannot be reissued; let its own
-                // deadline (or, while it is still queued, the write timeout)
-                // close the session.
-                Phase::LogoutQueued(_) | Phase::LogoutPending(_) => Ok(phase),
-                Phase::Active(session) => self.begin_logout(framed, session, cause).await,
-            };
-        }
-
-        let expected = resend.expected;
+        let expected = match stalled {
+            StallAction::Wait => return Ok(phase),
+            StallAction::Retry { expected } => expected,
+            StallAction::Abandon { expected, attempts } => {
+                let cause = LogoutCause::ResendStalled { expected, attempts };
+                tracing::warn!(session = %self.session_id, reason = %cause, "abandoning stalled resend");
+                return match phase {
+                    // A logout already in flight cannot be reissued; let its own
+                    // deadline (or, while it is still queued, the write timeout)
+                    // close the session.
+                    Phase::LogoutQueued(_) | Phase::LogoutPending(_) => Ok(phase),
+                    Phase::Active(session) => self.begin_logout(framed, session, cause).await,
+                };
+            }
+        };
         let request = self.factory.resend_request(expected, 0);
         match self.send(framed, request).await {
             Err(err) => {
@@ -4363,7 +4246,7 @@ impl<A: Application> Reactor<A> {
             Ok(Sent::Yes | Sent::Deferred) => {}
         }
         if let Some(state) = self.resend.as_mut() {
-            state.record_retry();
+            state.record_retry(driver_now());
         }
         self.drop_held_logon_for_a_request();
         tracing::debug!(
@@ -4447,8 +4330,8 @@ impl<A: Application> Reactor<A> {
                 .close_on_missing_seq_num(framed, phase, header.msg_type.unwrap_or(""))
                 .await);
         };
-        match self.runtime.sequences.validate_incoming(seq) {
-            SequenceResult::Ok => {
+        match classify_inbound(&self.runtime.sequences, seq, || header.poss_dup) {
+            InboundSequence::InSequence => {
                 tracing::warn!(
                     session = %self.session_id,
                     seq,
@@ -4477,22 +4360,20 @@ impl<A: Application> Reactor<A> {
                 );
                 self.send_reject(framed, phase, reject).await
             }
-            SequenceResult::TooLow { expected, received } => {
-                if header.poss_dup {
-                    tracing::debug!(
-                        session = %self.session_id,
-                        seq,
-                        defect,
-                        "dropping a possible-duplicate resend of an already-consumed number \
-                         whose body does not decode"
-                    );
-                    return Ok(phase);
-                }
-                Err(self
-                    .close_on_too_low(framed, phase, expected, received)
-                    .await)
+            InboundSequence::Duplicate { .. } => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    seq,
+                    defect,
+                    "dropping a possible-duplicate resend of an already-consumed number \
+                     whose body does not decode"
+                );
+                Ok(phase)
             }
-            SequenceResult::Gap { expected, received } => {
+            InboundSequence::TooLow { expected, received } => Err(self
+                .close_on_too_low(framed, phase, expected, received)
+                .await),
+            InboundSequence::Gap { expected, received } => {
                 tracing::warn!(
                     session = %self.session_id,
                     seq,
@@ -4782,8 +4663,10 @@ impl<A: Application> Reactor<A> {
         // -- and a too-low duplicate is dropped without reaching from_admin.
         // Reset mode carries no meaningful MsgSeqNum and is not classified.
         if gap_fill {
-            match self.runtime.sequences.validate_incoming(seq) {
-                SequenceResult::Gap { expected, received } => {
+            match classify_inbound(&self.runtime.sequences, seq, || {
+                raw.get_field_str(43) == Some("Y")
+            }) {
+                InboundSequence::Gap { expected, received } => {
                     // The fill is itself gapped: it cannot be trusted to
                     // describe the missing range, so NewSeqNo is not applied
                     // and the range is requested instead. Under the Queue
@@ -4795,37 +4678,37 @@ impl<A: Application> Reactor<A> {
                     self.queue_gapped(&phase, seq, Gapped::Frame(frame.clone()));
                     return Ok(phase);
                 }
-                SequenceResult::TooLow { expected, received } => {
-                    if raw.get_field_str(43) == Some("Y") {
-                        // Duplicate delivery of an already-applied fill: it is
-                        // ignored, as FIX requires, even when its NewSeqNo
-                        // reaches past the expectation. Such a fill spans
-                        // numbers this session still lacks, so they are
-                        // re-requested from the expectation, once per expected
-                        // number.
-                        let spans = raw
-                            .get_field_str(36)
-                            .and_then(|value| value.parse::<u64>().ok())
-                            .filter(|new_seq| *new_seq > expected);
-                        // Only an Active session re-requests: once this
-                        // session's Logout is out it has stopped asking
-                        // (`begin_logout` cleared recovery), and a request
-                        // now would reopen what it closed (issue #128).
-                        if let Some(new_seq) = spans
-                            && matches!(phase, Phase::Active(_))
-                            && self.spanning_rerequested != Some(expected)
-                        {
-                            return self
-                                .rerequest_spanned_gap(framed, phase, expected, new_seq)
-                                .await;
-                        }
-                        return Ok(phase);
+                InboundSequence::Duplicate { expected, .. } => {
+                    // Duplicate delivery of an already-applied fill: it is
+                    // ignored, as FIX requires, even when its NewSeqNo
+                    // reaches past the expectation. Such a fill spans
+                    // numbers this session still lacks, so they are
+                    // re-requested from the expectation, once per expected
+                    // number. Only an Active session re-requests: once this
+                    // session's Logout is out it has stopped asking
+                    // (`begin_logout` cleared recovery), and a request now
+                    // would reopen what it closed (issue #128).
+                    let new_seq_no = raw
+                        .get_field_str(36)
+                        .and_then(|value| value.parse::<u64>().ok());
+                    if let Some(new_seq) = spanned_rerequest(
+                        expected,
+                        new_seq_no,
+                        matches!(phase, Phase::Active(_)),
+                        self.spanning_rerequested,
+                    ) {
+                        return self
+                            .rerequest_spanned_gap(framed, phase, expected, new_seq)
+                            .await;
                     }
+                    return Ok(phase);
+                }
+                InboundSequence::TooLow { expected, received } => {
                     return Err(self
                         .close_on_too_low(framed, phase, expected, received)
                         .await);
                 }
-                SequenceResult::Ok => {
+                InboundSequence::InSequence => {
                     // The fill occupies `seq` whatever happens next (accepted,
                     // rejected, or carrying an unusable NewSeqNo), so `seq + 1`
                     // is persisted before `from_admin` sees it, as for every
@@ -5151,7 +5034,7 @@ impl<A: Application> Reactor<A> {
             let (pending, receipt) = match next {
                 DeferredSend::Message(pending, receipt) => (pending, receipt),
                 DeferredSend::ResendRequest => match self.resend {
-                    Some(state) => (self.factory.resend_request(state.expected, 0), None),
+                    Some(state) => (self.factory.resend_request(state.expected(), 0), None),
                     // The gap closed while the request was held.
                     None => continue,
                 },
@@ -5160,11 +5043,7 @@ impl<A: Application> Reactor<A> {
             // outcome: the charge it owed is taken now, and paid only if the
             // request goes out. A request `to_admin` vetoes costs nothing and
             // leaves no charge behind for a later request in the same gap.
-            let charge = request
-                && self
-                    .resend
-                    .as_mut()
-                    .is_some_and(|state| std::mem::take(&mut state.charge_on_write));
+            let charge = request && self.resend.as_mut().is_some_and(ResendState::take_charge);
             match self.send_now_tracked(framed, pending, receipt).await {
                 Err(EngineError::Store(err)) => {
                     return Err(self.close_on_store_failure(phase, &err));
@@ -5178,9 +5057,9 @@ impl<A: Application> Reactor<A> {
                     // and a charged request pays its attempt now that it has.
                     if let Some(state) = self.resend.as_mut() {
                         if charge {
-                            state.record_retry();
+                            state.record_retry(driver_now());
                         } else {
-                            state.restart_clock();
+                            state.restart_clock(driver_now());
                         }
                     }
                     self.drop_held_logon_for_a_request();
@@ -5938,7 +5817,12 @@ impl<A: Application> Reactor<A> {
                 "holding the gapped Logon: the counterparty resends the gap below it on its own \
                  (NextExpectedMsgSeqNum)"
             );
-            self.resend = Some(ResendState::implied(expected, logon_seq, &self.config));
+            self.resend = Some(ResendState::implied(
+                expected,
+                logon_seq,
+                &self.config,
+                driver_now(),
+            ));
             self.held_logon = Some(logon_seq);
         }
         if let Some((begin_seq, new_seq)) = opening.replay {
@@ -6080,8 +5964,10 @@ impl<A: Application> Reactor<A> {
                 .await;
         }
 
-        match self.runtime.sequences.validate_incoming(seq) {
-            SequenceResult::Ok => {
+        match classify_inbound(&self.runtime.sequences, seq, || {
+            raw.get_field_str(43) == Some("Y")
+        }) {
+            InboundSequence::InSequence => {
                 if msg_type.is_admin() {
                     // The receive cursor includes this message before it is
                     // acted on, so a restart never asks for it again; and the
@@ -6115,16 +6001,12 @@ impl<A: Application> Reactor<A> {
                         .await
                 }
             }
-            SequenceResult::TooLow { expected, received } => {
-                if raw.get_field_str(43) == Some("Y") {
-                    // Duplicate delivery of an already-processed message.
-                    return Ok(phase);
-                }
-                Err(self
-                    .close_on_too_low(framed, phase, expected, received)
-                    .await)
-            }
-            SequenceResult::Gap { expected, received } => {
+            // Duplicate delivery of an already-processed message.
+            InboundSequence::Duplicate { .. } => Ok(phase),
+            InboundSequence::TooLow { expected, received } => Err(self
+                .close_on_too_low(framed, phase, expected, received)
+                .await),
+            InboundSequence::Gap { expected, received } => {
                 let phase = self
                     .request_resend(framed, phase, expected, received)
                     .await?;
@@ -6966,34 +6848,34 @@ mod tests {
     #[test]
     fn test_resend_state_record_retry_counts_each_request() {
         let config = config_with_limit(3);
-        let mut state = ResendState::first(3, 6, &config);
-        state.record_retry();
-        state.record_retry();
-        assert_eq!(state.attempts, 3);
+        let mut state = ResendState::first(3, 6, &config, driver_now());
+        state.record_retry(driver_now());
+        state.record_retry(driver_now());
+        assert_eq!(state.attempts(), 3);
         assert!(!state.can_retry());
     }
 
     #[test]
     fn test_resend_state_implied_has_sent_nothing_yet() {
         let config = config_with_limit(1);
-        let implied = ResendState::implied(3, 6, &config);
-        assert_eq!(implied.attempts, 0, "nothing sent yet");
-        assert_eq!(implied.expected, 3);
-        assert_eq!(implied.high_water, 6);
+        let implied = ResendState::implied(3, 6, &config, driver_now());
+        assert_eq!(implied.attempts(), 0, "nothing sent yet");
+        assert_eq!(implied.expected(), 3);
+        assert_eq!(implied.high_water(), 6);
         // Even a limit of one request leaves room for the real one.
         assert!(implied.can_retry());
 
-        let first = ResendState::first(3, 6, &config);
-        assert_eq!(first.attempts, 1);
+        let first = ResendState::first(3, 6, &config, driver_now());
+        assert_eq!(first.attempts(), 1);
         assert!(!first.can_retry());
     }
 
     #[test]
     fn test_resend_state_implied_allows_exactly_one_real_request_at_limit_one() {
         let config = config_with_limit(1);
-        let mut state = ResendState::implied(3, 6, &config);
-        state.record_retry();
-        assert_eq!(state.attempts, 1);
+        let mut state = ResendState::implied(3, 6, &config, driver_now());
+        state.record_retry(driver_now());
+        assert_eq!(state.attempts(), 1);
         assert!(!state.can_retry(), "the one real request is spent");
     }
 
@@ -7307,18 +7189,23 @@ mod tests {
     #[test]
     fn test_resend_state_progress_keeps_an_implied_gap_implied() {
         let config = config_with_limit(1);
-        let mut implied = ResendState::implied(3, 6, &config);
-        implied.record_progress(4);
-        assert_eq!(implied.expected, 4);
+        let mut implied = ResendState::implied(3, 6, &config, driver_now());
+        implied.record_progress(4, driver_now());
+        assert_eq!(implied.expected(), 4);
         assert_eq!(
-            implied.attempts, 0,
+            implied.attempts(),
+            0,
             "a stall after partial progress still gets its one real request"
         );
 
-        let mut real = ResendState::first(3, 6, &config);
-        real.record_retry();
-        real.record_progress(4);
-        assert_eq!(real.attempts, 1, "progress resets a real request's budget");
+        let mut real = ResendState::first(3, 6, &config, driver_now());
+        real.record_retry(driver_now());
+        real.record_progress(4, driver_now());
+        assert_eq!(
+            real.attempts(),
+            1,
+            "progress resets a real request's budget"
+        );
     }
 }
 

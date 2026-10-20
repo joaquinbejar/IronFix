@@ -40,8 +40,10 @@
 //! - **Sans-IO core** ([`sans_io`]): the protocol decisions a driver acts on,
 //!   with no I/O, no clock read and no `.await` (ADR-0002, issue #91). Stage 1
 //!   holds the liveness family ([`decide_liveness`], [`logout_timed_out`],
-//!   [`test_request_reply_id`]); the Tokio reactor in `ironfix-engine` is its
-//!   first driver
+//!   [`test_request_reply_id`]); stage 2 the sequence classification and gap
+//!   recovery decisions ([`classify_inbound`], [`ResendState`],
+//!   [`decide_gap_request`], [`decide_stall`]); the Tokio reactor in
+//!   `ironfix-engine` is its first driver
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
 //! progress". The actual `ResendRequest` / `SequenceReset` / gap-fill message
@@ -61,7 +63,10 @@ pub use heartbeat::{
     generate_test_req_id, negotiate_interval,
 };
 pub use sans_io::{
-    LivenessAction, LivenessGate, decide_liveness, logout_timed_out, test_request_reply_id,
+    GapRequest, InboundSequence, LivenessAction, LivenessGate, RecoveryProgress, ResendState,
+    StallAction, classify_inbound, decide_gap_request, decide_liveness, decide_stall,
+    logout_timed_out, merged_high_water, note_inbound_progress, spanned_high_water,
+    spanned_rerequest, test_request_reply_id,
 };
 pub use sequence::{SequenceCounter, SequenceExhausted, SequenceManager, SequenceResult};
 pub use state::{
