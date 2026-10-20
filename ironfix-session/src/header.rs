@@ -259,7 +259,6 @@ impl std::fmt::Display for HeartBtIntProblem {
 /// Returns [`HeartBtIntProblem::Missing`] when tag 108 is absent,
 /// [`HeartBtIntProblem::Malformed`] when it is not a non-negative integer, and
 /// [`HeartBtIntProblem::OutOfRange`] when it exceeds the maximum.
-#[must_use]
 pub fn parse_heartbeat_interval(raw: &RawMessage<'_>) -> Result<u64, HeartBtIntProblem> {
     let Some(value) = raw.get_field_str(108) else {
         return Err(HeartBtIntProblem::Missing);
