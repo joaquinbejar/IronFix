@@ -403,8 +403,11 @@ impl SessionCore {
     /// - `bytes` is exactly the count passed to [`Self::note_held`] for that
     ///   entry.
     ///
-    /// A violation is a driver bug. In debug builds it trips a
-    /// `debug_assert`. In release builds the count that would go below zero
+    /// A violation is a driver bug. Only an aggregate underflow is detected:
+    /// in debug builds it trips a `debug_assert`. Pairing each call with its
+    /// entry and passing that entry's exact byte count remain the driver's
+    /// responsibility, and a mismatch that does not underflow goes
+    /// undetected. In release builds the count that would go below zero
     /// stops at zero instead: an entry taken out with none noted leaves the
     /// entry count at 0, and `bytes` above the noted total leaves the byte
     /// count at 0. The two counts are handled independently. A count that
