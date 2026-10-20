@@ -392,3 +392,19 @@ converted at the boundary so paused-clock tests stay deterministic.
   handler split below replaces. Additive surface on the unreleased
   `SessionCore`; nothing on the wire changes and no engine integration
   test changed.
+
+- **#91 stage 7a (handler split: the periodic tick):** the first handler
+  family turned into "the core decides, the driver acts". `SessionCore::
+  decide_tick(&phase, &TickInput)` returns a `TickDecision`
+  (`LogoutTimedOut`, `ResendUnderWay`, `Stalled(StallAction)`,
+  `Liveness(LivenessAction)`), running the checks in the order the
+  reactor ran them inline: our Logout's timeout, a resend under way, an
+  output bound that forbids writing (frames awaiting their write result),
+  a stalled recovery, then the liveness step under the probe gate.
+  `TickInput` carries the driver's clock, the logout timeout, the heartbeat
+  clocks and three facts about the driver's output. The reactor's
+  `on_tick` keeps its I/O work (polling the flush, the write timeout,
+  advancing written probes) and then only acts on the decision. Additive
+  surface (`TickInput`, `TickDecision`, `decide_tick`); four core tests
+  cover each branch with no socket and no runtime; nothing on the wire
+  changes and no engine integration test changed.

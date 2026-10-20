@@ -112,7 +112,7 @@ pub use sans_io::{
 };
 pub use sans_io::{
     GapAdmission, GapEntry, GapReady, HeldEntry, HeldLogonRelease, ReplayJob, SessionCore,
-    SessionPayloads, SessionPhase,
+    SessionPayloads, SessionPhase, TickDecision, TickInput,
 };
 pub use sans_io::{
     GapRequest, InboundSequence, LivenessAction, LivenessGate, RecoveryProgress, ResendState,

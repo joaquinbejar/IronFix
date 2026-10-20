@@ -181,7 +181,7 @@ pub use crate::replay::{
     replay_queue_full, replay_step_continues,
 };
 pub use crate::session_core::{
-    HeldEntry, HeldLogonRelease, ReplayJob, SessionCore, SessionPayloads,
+    HeldEntry, HeldLogonRelease, ReplayJob, SessionCore, SessionPayloads, TickDecision, TickInput,
 };
 pub use crate::throttle::{
     DEFAULT_BUDGET, Throttle, ThrottleAdmission, ThrottleDrain, ThrottleRelease, TokenBucketSpec,
