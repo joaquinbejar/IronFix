@@ -53,7 +53,9 @@
 //!   session state object the core owns ([`SessionCore`],
 //!   [`HeldLogonRelease`]); stage 6b the session phase and the payload
 //!   queues ([`SessionPhase`], [`SessionPayloads`], [`HeldEntry`],
-//!   [`ReplayJob`], [`GapEntry`]); the Tokio reactor in
+//!   [`ReplayJob`], [`GapEntry`]); stage 6c the outbound throttle's token
+//!   buckets and the messages they hold, owned by the session core
+//!   ([`Throttle`], [`TokenBucketSpec`]); the Tokio reactor in
 //!   `ironfix-engine` is its first driver
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
@@ -74,6 +76,7 @@ pub mod sans_io;
 pub mod sequence;
 mod session_core;
 pub mod state;
+mod throttle;
 
 pub use config::{
     GapPolicy, GarbledFrameLimit, SessionConfig, SessionConfigBuilder, SessionConfigError,
@@ -96,6 +99,7 @@ pub use sans_io::{
     provisional_counters, reset_flag_contradicts, screen_next_expected, seed_from_initial,
     seed_from_store,
 };
+pub use sans_io::{DEFAULT_BUDGET, Throttle, ThrottleAdmission, ThrottleRelease, TokenBucketSpec};
 pub use sans_io::{
     EndSeqNoInfinity, EntryScreen, GapFillRange, MAX_HELD_BYTES, MAX_HELD_SENDS,
     MAX_QUEUED_REPLAYS, MAX_READS_PER_REPLAY_STEP, OpeningReplay, PageRead, PageRequest,

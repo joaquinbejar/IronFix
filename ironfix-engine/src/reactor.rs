@@ -252,13 +252,13 @@
 //! With a [`ThrottleConfig`] attached, every new outbound application message
 //! taken from the command queue goes through [`Reactor::admit_through_throttle`]
 //! before anything else happens to it: the classifier names its budget and
-//! [`Throttle::admit`], a synchronous decision over the driver's `now`, either
+//! [`ironfix_session::Throttle::admit`], a synchronous decision over the driver's `now`, either
 //! reserves a token (the message goes on to the outbound gate at once, and
-//! the token is taken when its frame is fed, [`Throttle::charge_at`]), holds it
+//! the token is taken when its frame is fed, [`ironfix_session::Throttle::charge_at`]), holds it
 //! in its budget's queue, or refuses it (`NotSent` with `Throttled`, nothing
 //! peeked, spent or filed). A held message is released by a branch of the
 //! loop, one per pass, on a single timer moved to the instant the next token
-//! is earned ([`Throttle::next_release`]), under the same conditions a command
+//! is earned ([`ironfix_session::Throttle::next_release`]), under the same conditions a command
 //! is taken: no resend under way and room under the live mark, and only while
 //! the session is Active. A message whose token is already there is released
 //! without the timer, whose deadlines Tokio rounds up to the millisecond, so
@@ -291,7 +291,7 @@ use crate::persistence::{
     sync_marker, timed,
 };
 use crate::stream::SessionStream;
-use crate::throttle::{Admission, BudgetId, Throttle, ThrottleConfig};
+use crate::throttle::{BudgetId, ThrottleConfig};
 use crate::validation::{InboundValidation, ValidationPolicy, ValidationRejectMessage};
 use crate::wire::{
     self, ApplVersionGuard, ApplVersionProblem, MessageFactory, PeerIdentity, PendingMessage,
@@ -310,9 +310,9 @@ use ironfix_session::sans_io::{
     EntryScreen, GapAdmission, GapEntry, GapRequest, HeldEntry, HeldLogonRelease, InboundSequence,
     LivenessAction, LivenessGate, OpeningReplay, PageRead, PageRequest, ReplayAction, ReplayJob,
     ReplayStep, ReplayVerdict, ResendRequestDecision, SessionCore, SessionPayloads,
-    SessionPhase as Phase, StallAction, classify_inbound, decide_liveness, decide_opening_replay,
-    decide_resend_request, logout_timed_out, replay_step_continues, spanned_high_water,
-    test_request_reply_id,
+    SessionPhase as Phase, StallAction, ThrottleAdmission, ThrottleRelease, classify_inbound,
+    decide_liveness, decide_opening_replay, decide_resend_request, logout_timed_out,
+    replay_step_continues, spanned_high_water, test_request_reply_id,
 };
 use ironfix_session::sans_io::{
     LocalLogoutDecision, LogoutReplyWrite, PeerLogoutDecision, close_resets, decide_local_logout,
@@ -1195,6 +1195,7 @@ impl SessionPayloads for ReactorPayloads {
     type Gapped = Bytes;
     type Replay = ResendPages;
     type LogoutCause = LogoutCause;
+    type Throttled = HeldSend;
 
     /// What this entry counts against
     /// [`MAX_HELD_BYTES`](ironfix_session::MAX_HELD_BYTES): the body field
@@ -2016,14 +2017,14 @@ struct HeldSend {
     receipt: Option<Receipt>,
 }
 
-/// The session's outbound throttle: its configuration, which classifies each
-/// message, and the run-time budgets.
+/// The driver's half of the session's outbound throttle: its configuration,
+/// whose classifier reads an [`outbound::OutboundMessage`], and the log
+/// bookkeeping. The tokens and the messages held for them are the core's
+/// ([`SessionCore::throttle_admit`], issue #91 stage 6c).
 #[derive(Debug)]
 struct OutboundThrottle {
     /// The budgets and the classifier.
     config: ThrottleConfig,
-    /// The tokens, and the messages held for them.
-    state: Throttle<HeldSend>,
     /// Whether the classifier has named a budget the configuration does not
     /// define: logged once per session, the message going to the default
     /// budget.
@@ -2032,19 +2033,6 @@ struct OutboundThrottle {
     /// receipt, so its refusal is a warning, logged at the 1st, 2nd, 4th,
     /// 8th... refusal of each budget so a flood of sends cannot flood the log.
     untracked_refused: Vec<u64>,
-}
-
-/// When the outbound throttle may release the next message it holds
-/// ([`Reactor::next_throttle_release`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThrottleRelease {
-    /// Nothing to release: no throttle, nothing held, or a session that may
-    /// not release now.
-    Idle,
-    /// A held message has its token already.
-    Now,
-    /// The next held message's token is earned at this instant.
-    At(Instant),
 }
 
 /// What the Logon exchange left for the reactor to do before anything else.
@@ -3464,7 +3452,7 @@ impl<A: Application> Reactor<A> {
     /// as [`NotSentReason::Throttled`], before `to_app_checked` runs and
     /// before a sequence number is peeked or the store touched; a refused
     /// plain send is logged at debug level with its budget and MsgType only.
-    /// The decision is [`Throttle::admit`], which reads no clock: the time is
+    /// The decision is [`ironfix_session::Throttle::admit`], which reads no clock: the time is
     /// the driver's, read here.
     fn admit_through_throttle(
         &mut self,
@@ -3489,21 +3477,23 @@ impl<A: Application> Reactor<A> {
                 BudgetId::DEFAULT
             }
         };
-        match throttle
-            .state
-            .admit(budget, HeldSend { message, receipt }, driver_now())
+        match self
+            .core
+            .throttle_admit(budget.index(), HeldSend { message, receipt }, driver_now())
         {
-            Admission::Now(HeldSend { message, receipt }) => Some((Some(budget), message, receipt)),
-            Admission::Held => {
+            ThrottleAdmission::Now(HeldSend { message, receipt }) => {
+                Some((Some(budget), message, receipt))
+            }
+            ThrottleAdmission::Held => {
                 tracing::trace!(
                     session = %self.session_id,
                     budget = %budget,
-                    held = throttle.state.held(),
+                    held = self.core.throttle_held(),
                     "outbound application message held by the throttle"
                 );
                 None
             }
-            Admission::Refused(HeldSend { message, receipt }) => {
+            ThrottleAdmission::Refused(HeldSend { message, receipt }) => {
                 if let Some(capture) = &self.writer.capture {
                     capture.unsent(
                         &SendOutcome::not_sent(NotSentReason::Throttled { budget }),
@@ -3568,8 +3558,8 @@ impl<A: Application> Reactor<A> {
             .await
         {
             Ok(Sent::Dropped) => {
-                if let (Some(budget), Some(throttle)) = (budget, self.throttle.as_mut()) {
-                    throttle.state.refund(budget);
+                if let Some(budget) = budget {
+                    self.core.throttle_refund(budget.index());
                 }
                 Ok(phase)
             }
@@ -3577,8 +3567,8 @@ impl<A: Application> Reactor<A> {
                 // The token was only reserved before the gate and the store
                 // were awaited; it is taken now, at the instant the frame was
                 // fed, as if the message had been admitted now.
-                if let (Some(budget), Some(throttle)) = (budget, self.throttle.as_mut()) {
-                    throttle.state.charge_at(budget, driver_now());
+                if let Some(budget) = budget {
+                    self.core.throttle_charge(budget.index(), driver_now());
                 }
                 Ok(phase)
             }
@@ -3593,18 +3583,10 @@ impl<A: Application> Reactor<A> {
     /// the driver's clock: [`ThrottleRelease::Idle`] without a throttle or
     /// with nothing held. The clock is read only while a message is held.
     fn next_throttle_release(&mut self) -> ThrottleRelease {
-        let Some(throttle) = self.throttle.as_mut() else {
-            return ThrottleRelease::Idle;
-        };
-        if throttle.state.held() == 0 {
+        if self.core.throttle_held() == 0 {
             return ThrottleRelease::Idle;
         }
-        let now = driver_now();
-        match throttle.state.next_release(now) {
-            None => ThrottleRelease::Idle,
-            Some(at) if at <= now => ThrottleRelease::Now,
-            Some(at) => ThrottleRelease::At(at),
-        }
+        self.core.throttle_release_at(driver_now())
     }
 
     /// Releases the message the outbound throttle has earned a token for,
@@ -3632,14 +3614,10 @@ impl<A: Application> Reactor<A> {
             ));
         }
         let now = driver_now();
-        let Some((budget, HeldSend { message, receipt })) = self
-            .throttle
-            .as_mut()
-            .and_then(|throttle| throttle.state.release(now))
-        else {
+        let Some((budget, HeldSend { message, receipt })) = self.core.throttle_release(now) else {
             return Ok(phase);
         };
-        self.send_application(framed, phase, Some(budget), message, receipt)
+        self.send_application(framed, phase, Some(BudgetId::new(budget)), message, receipt)
             .await
     }
 
@@ -3649,17 +3627,15 @@ impl<A: Application> Reactor<A> {
     /// that no held message is written after it, and as the session closes.
     /// The count, tracked or not, is logged.
     fn discard_throttled(&mut self) {
-        let Some(throttle) = self.throttle.as_mut() else {
-            return;
-        };
-        if throttle.state.held() == 0 {
+        if self.core.throttle_held() == 0 {
             return;
         }
         let capture = self.writer.capture.as_ref();
-        let discarded = throttle
-            .state
-            .drain()
+        let discarded = self
+            .core
+            .drain_throttled()
             .map(|(budget, held)| {
+                let budget = BudgetId::new(budget);
                 settle(capture, FrameKind::Session, held.receipt, || {
                     SendOutcome::not_sent(NotSentReason::DiscardedByThrottle { budget })
                 });
@@ -6332,7 +6308,7 @@ where
     let (app_tx, app_rx) = mpsc::channel(app_queue_capacity);
     let (reject_tx, reject_rx) = mpsc::channel(app_queue_capacity);
     let garbled = config.garbled_frame_limit.map(GarbledFrameWindow::new);
-    let core = SessionCore::with_gap_policy(config.gap_policy);
+    let mut core = SessionCore::with_gap_policy(config.gap_policy);
     // `SessionConfig::validate` bounds the knob before a session starts; the
     // `min` keeps a configuration assembled by hand from sizing this
     // allocation past the documented ceiling.
@@ -6355,12 +6331,15 @@ where
             );
         }
     }
-    // The budgets start full as the session becomes Active.
-    let throttle = throttle.map(|config| OutboundThrottle {
-        state: Throttle::new(&config, driver_now()),
-        untracked_refused: vec![0; config.budgets().len()],
-        config,
-        unknown_budget_logged: false,
+    // The budgets start full as the session becomes Active; the core owns
+    // the tokens and what they hold.
+    let throttle = throttle.map(|config| {
+        core.attach_throttle(config.bucket_specs(), driver_now());
+        OutboundThrottle {
+            untracked_refused: vec![0; config.budgets().len()],
+            config,
+            unknown_budget_logged: false,
+        }
     });
 
     // The dispatcher stops when the reactor drops `app_tx`, which `run_reactor`

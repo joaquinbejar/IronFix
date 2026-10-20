@@ -118,7 +118,11 @@ places its window. A unit test checks that bound for a greedy sender.
 
 The decision (`Throttle::admit`, `release`, `next_release`, `refund`) is
 synchronous and takes `now`; the reactor reads `now` from Tokio's clock
-(`driver_now`), and only while the throttle is in use.
+(`driver_now`), and only while the throttle is in use. Since issue #91
+stage 6c the token buckets and the messages they hold live in the sans-IO
+core (`ironfix_session::Throttle`, owned by `SessionCore`); the engine keeps
+the configuration types, their validation and the classifier, and hands
+the core one `TokenBucketSpec` per budget.
 
 ### Order
 
