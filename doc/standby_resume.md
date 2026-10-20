@@ -41,7 +41,7 @@ None of it is checked by the engine.
   durable there relaxes the first point of this contract (`Ok` only once
   durable), and this loss is the price. The mismatch report below detects
   only the disagreements a Logon makes observable; it does not detect every
-  asynchronous replication loss. Nothing is reported when the counterparty
+  asynchronous replication loss. Outbound replication loss cannot be inferred when the counterparty
   declares no usable 789 (absent, malformed, or the session does not use
   789), or when the counterparty never received the lost messages either:
   its numbers then agree with the standby's and the loss is invisible at
