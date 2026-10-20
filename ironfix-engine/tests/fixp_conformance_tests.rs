@@ -508,6 +508,10 @@ enum Decide {
     Now,
     /// After a delay.
     After(Duration),
+    /// Never: the decision task panics (an application bug).
+    Panic,
+    /// Never: the decision task never returns.
+    Never,
 }
 
 impl Decide {
@@ -515,6 +519,8 @@ impl Decide {
         match self {
             Self::Now => {}
             Self::After(delay) => tokio::time::sleep(delay).await,
+            Self::Panic => panic!("the application's decision fails (intended by the test)"),
+            Self::Never => std::future::pending::<()>().await,
         }
     }
 }
@@ -528,6 +534,7 @@ struct App {
     negotiation_reject: Option<NegotiationRejectCode>,
     establishment_reject: Option<EstablishmentRejectCode>,
     negotiate_when: Decide,
+    establish_when: Decide,
 }
 
 impl App {
@@ -538,6 +545,7 @@ impl App {
             negotiation_reject: None,
             establishment_reject: None,
             negotiate_when: Decide::Now,
+            establish_when: Decide::Now,
         }
     }
     fn with_server_flow(mut self, flow: FlowType) -> Self {
@@ -573,6 +581,7 @@ impl FixpApplication for App {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(request.clone());
+        self.establish_when.wait().await;
         match self.establishment_reject {
             Some(code) => EstablishmentDecision::Reject {
                 code,
@@ -2542,4 +2551,111 @@ async fn test_server_bounds_the_transport_after_an_unnegotiated_establish() {
     peer.send(establish(id, 44, 5_000, Some(1))).await;
     let _ = peer.expect(template::ESTABLISHMENT_REJECT).await;
     peer.expect_closed_silently().await;
+}
+
+// ===========================================================================
+// Regressions: a refused handshake is always answered (defect found by #97)
+// ===========================================================================
+
+/// A raw client whose Negotiate reaches an engine server running `app`;
+/// returns the first frame the engine answers with, then checks the close.
+async fn negotiate_against(app: App, config: FixpConfig, seed: u8, flow: u8) -> Frame {
+    let server = engine_server_with(app, config).await;
+    let mut peer = Peer::connect(server.addr).await;
+    peer.send(negotiate(session_id(seed), 7, flow, SECRET))
+        .await;
+    let answer = peer.recv().await;
+    peer.expect_closed_silently().await;
+    answer
+}
+
+/// Checks a NegotiationReject for request timestamp 7 with `code`.
+fn assert_negotiation_reject(frame: &Frame, seed: u8, code: NegotiationRejectCode) {
+    assert_eq!(
+        frame.template(),
+        Some(template::NEGOTIATION_REJECT),
+        "{frame:?}"
+    );
+    assert_eq!(frame.uuid(), session_id(seed));
+    assert_eq!(frame.u64(16), 7, "RequestTimestamp");
+    assert_eq!(frame.u8(24), code.as_u8());
+}
+
+/// FIXP 4.2.3 (p. 18): "When a session cannot be created, a server must
+/// send NegotiationReject". An application that accepts a None client flow
+/// with a None server flow (3.4.4.1, p. 14: only one may be None) cannot
+/// create the session; the engine used to close without a word, it now
+/// rejects with `FlowTypeNotSupported`.
+#[tokio::test]
+async fn test_server_rejects_a_negotiation_with_both_flows_none() {
+    let app = App::new().with_server_flow(FlowType::None);
+    let answer = negotiate_against(app, config(), 0xB0, wire::NONE).await;
+    assert_negotiation_reject(&answer, 0xB0, NegotiationRejectCode::FlowTypeNotSupported);
+}
+
+/// FIXP 4.2.3 (p. 18): a negotiation decision that fails (the application
+/// panicked) is answered with NegotiationReject `Unspecified`, not a silent
+/// close.
+#[tokio::test]
+async fn test_server_rejects_a_negotiation_when_the_application_fails() {
+    let mut app = App::new();
+    app.negotiate_when = Decide::Panic;
+    let answer = negotiate_against(app, config(), 0xB1, wire::RECOVERABLE).await;
+    assert_negotiation_reject(&answer, 0xB1, NegotiationRejectCode::Unspecified);
+}
+
+/// FIXP 4.2.3 (p. 18): a negotiation decision that never comes is bounded
+/// by the handshake timeout (**local policy**) and then answered with
+/// NegotiationReject `Unspecified`.
+#[tokio::test]
+async fn test_server_rejects_a_negotiation_not_answered_in_time() {
+    let mut app = App::new();
+    app.negotiate_when = Decide::Never;
+    let answer = negotiate_against(app, fast_config(1_000), 0xB2, wire::RECOVERABLE).await;
+    assert_negotiation_reject(&answer, 0xB2, NegotiationRejectCode::Unspecified);
+}
+
+/// A raw client negotiated on an engine server running `app`, whose
+/// Establish (timestamp 8) gets the returned answer; checks the close.
+async fn establish_against(app: App, config: FixpConfig, seed: u8) -> Frame {
+    let server = engine_server_with(app, config).await;
+    let id = session_id(seed);
+    let mut peer = Peer::connect(server.addr).await;
+    raw_negotiate(&mut peer, id, wire::RECOVERABLE, FlowType::Recoverable).await;
+    peer.send(establish(id, 8, 5_000, Some(1))).await;
+    let answer = peer.recv().await;
+    peer.expect_closed_silently().await;
+    answer
+}
+
+fn assert_establishment_reject(frame: &Frame, seed: u8) {
+    assert_eq!(
+        frame.template(),
+        Some(template::ESTABLISHMENT_REJECT),
+        "{frame:?}"
+    );
+    assert_eq!(frame.uuid(), session_id(seed));
+    assert_eq!(frame.u64(16), 8, "RequestTimestamp");
+    assert_eq!(frame.u8(24), EstablishmentRejectCode::Unspecified.as_u8());
+}
+
+/// FIXP 4.3 (p. 19): "The response to Establish is either EstablishmentAck
+/// or EstablishmentReject". A failed establishment decision is answered
+/// with EstablishmentReject `Unspecified`, then the transport closes.
+#[tokio::test]
+async fn test_server_rejects_an_establishment_when_the_application_fails() {
+    let mut app = App::new();
+    app.establish_when = Decide::Panic;
+    let answer = establish_against(app, config(), 0xB3).await;
+    assert_establishment_reject(&answer, 0xB3);
+}
+
+/// FIXP 4.3 (p. 19): the same for a decision that never comes, after the
+/// handshake timeout (**local policy**).
+#[tokio::test]
+async fn test_server_rejects_an_establishment_not_answered_in_time() {
+    let mut app = App::new();
+    app.establish_when = Decide::Never;
+    let answer = establish_against(app, fast_config(1_000), 0xB4).await;
+    assert_establishment_reject(&answer, 0xB4);
 }
