@@ -234,15 +234,21 @@ when the exchange carries 141=Y, since a reset discards both histories by
 agreement and the counters are compared after the reset at 1. It is called
 only when at least one comparison below differs.
 
-**What it compares.** Our side is the persisted state the session started
-from: the values of `next_sender_seq()` and `next_target_seq()` read after
-`refresh()`, or the seeds of `with_initial_sequences` when no store is
-attached. These are the same numbers the engine numbers from; the report
-adds no new store method and no snapshot type, so a store on the trait
-defaults gets the report too.
+**What it compares.** Our side, the comparison baseline, is the
+**effective startup counters**: the next sender and next target numbers the
+session actually starts from, taken after the engine has selected them.
+That covers every path: counters recovered from an attached store (after
+`refresh()`), explicit seeds from `with_initial_sequences` (which override
+the stored counters even when a store is attached), and a reset. The stored
+values are kept as separate fields for the report, never as the baseline.
+Example: the store holds 10/20, the accepted seeds are 15/30, so the session
+starts at 15/30; a peer Logon with `MsgSeqNum` 30 is in sync and no
+mismatch is reported, although the stored target is 20. The report adds no
+new store method and no snapshot type, so a store on the trait defaults
+gets the report too.
 
 - *Inbound*: the `MsgSeqNum` (34) of the counterparty's Logon against our
-  persisted next target. Higher: a gap of `next_target ..= logon_seq - 1`
+  effective next target. Higher: a gap of `next_target ..= logon_seq - 1`
   (`InboundMismatch::Gap { first, last }`). Lower: the counterparty is
   behind our record (`InboundMismatch::TooLow { received, expected }`).
 - *Outbound*: the counterparty's 789, if present, against the number of our
@@ -257,8 +263,10 @@ defaults gets the report too.
   Logon is never read as a statement about our numbers.
 
 `SequenceMismatch` is `#[non_exhaustive]` with private fields and
-`#[must_use]` `const fn` getters: `persisted_next_sender()`,
-`persisted_next_target()`, `peer_logon_seq()`, `peer_next_expected() ->
+`#[must_use]` `const fn` getters: `effective_next_sender()` and
+`effective_next_target()` (the baseline), `stored_next_sender() ->
+Option<u64>` and `stored_next_target() -> Option<u64>` (what the store held
+before any seed or reset; `None` without a store), `peer_logon_seq()`, `peer_next_expected() ->
 Option<u64>`, `inbound() -> Option<InboundMismatch>`, `outbound() ->
 OutboundMismatch`. Both enums are `#[non_exhaustive]`. Numbers only: no
 frame bytes, no `Text`, nothing that could carry a credential.
@@ -312,6 +320,8 @@ once the counterparty's numbers are known; then `on_logon`.
 - The gaps (no replication, no fencing, a single-writer lock with no
   takeover) stay open and are named in the docs rather than hidden.
 - Follow-up: the implementation issue (callback, types, tests in both roles
-  for every mismatch kind and for the 141=Y and no-mismatch cases), and the
+  for every mismatch kind and for the 141=Y and no-mismatch cases, and a
+  test that combines an attached store with explicit seeds and proves the
+  comparison uses the effective counters), and the
   store-contract documentation page. The implementation PR closes #80.
 - No code changes in this ADR.
