@@ -227,3 +227,39 @@ converted at the boundary so paused-clock tests stay deterministic.
   Additive public surface only; nothing on the wire changes. Remaining
   stage: the reactor reduced to a thin driver (read, feed, encode, write,
   callbacks) over a core-owned state object.
+- **#91 stage 6a (the core-owned session state):** the state the reactor
+  kept in its own fields for the decisions above moved into one object the
+  core owns, `SessionCore` (in the private `session_core.rs`, re-exported
+  through `sans_io` and the crate root). It holds the outstanding recovery
+  (`ResendState`), the Logon held behind a 789 gap (with
+  `decide_held_logon_release` and `HeldLogonRelease`, the release rule that
+  was inline in the reactor), the spanning re-request mark, the owed Logout,
+  whether this session's own Logout was fed, the `TestReqID` (112) of a
+  TestRequest not yet written whole (`probe_gate`), the read budget between
+  replay steps, and the count and bytes of what is held behind a resend
+  (`hold_full`). Every method that starts or checks a clock takes `now`; the
+  file is covered by `tests/no_clock_reads.rs`. The reactor holds one
+  `SessionCore` and reads and updates that state only through it. Additive
+  public surface only (`SessionCore`, `HeldLogonRelease`); nothing on the
+  wire changes and no engine test changed.
+
+  What stage 6a leaves in the reactor, each because moving it needs more than
+  a mechanical move and is planned as stage 6b:
+
+  - The phase (`Active`, `LogoutQueued`, `LogoutPending`) wraps the typestate
+    `Session<S>`, which the reactor consumes by value on every path
+    (`Result<Phase, SessionClosed>`); owning it in the core changes the
+    signature of every handler.
+  - The frames themselves: the held messages (with their receipts), the
+    replay queue and its store pages and rebuilt frames, the gap queue
+    (`GapQueue`, which holds `Bytes`) and the outbound throttle's held
+    messages. The core counts the hold but cannot own `Bytes` or engine
+    receipts without a new dependency or a generic payload type.
+  - `LogoutCause` is a public engine type (it carries the caller's owned
+    `Text`), so the cause stays with the driver; the core sees it as
+    `LocalLogoutReason`.
+  - The garbled-frame window, the writer's write marks and the published
+    watermark are I/O bookkeeping of the Tokio driver, not protocol state.
+
+  With those, the reactor is not yet a thin driver: its handlers still
+  sequence decision calls and effects inline. Issue #91 stays open for 6b.

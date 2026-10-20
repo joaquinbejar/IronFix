@@ -49,8 +49,9 @@
 //!   [`close_resets`]); stage 5 the two Logon handshakes
 //!   ([`decide_logon_refusal`], [`classify_logon_seq`],
 //!   [`plan_next_expected`], [`decide_seed_source`],
-//!   [`compare_logon_sequences`], [`logon_deadline`]);
-//!   the Tokio reactor in
+//!   [`compare_logon_sequences`], [`logon_deadline`]); stage 6a the
+//!   session state object the core owns ([`SessionCore`],
+//!   [`HeldLogonRelease`]); the Tokio reactor in
 //!   `ironfix-engine` is its first driver
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
@@ -67,6 +68,7 @@ mod logout;
 mod replay;
 pub mod sans_io;
 pub mod sequence;
+mod session_core;
 pub mod state;
 
 pub use config::{
@@ -104,6 +106,7 @@ pub use sans_io::{
     logout_timed_out, merged_high_water, note_inbound_progress, spanned_high_water,
     spanned_rerequest, test_request_reply_id,
 };
+pub use sans_io::{HeldLogonRelease, SessionCore};
 pub use sans_io::{
     LocalLogoutDecision, LocalLogoutReason, LogoutClose, LogoutPhase, LogoutReplyWrite,
     LogoutTextError, MAX_LOGOUT_TEXT_LEN, OwedLogout, PeerLogoutDecision, check_logout_text,
