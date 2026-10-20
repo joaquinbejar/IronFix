@@ -486,9 +486,11 @@ around it.
   sans-IO session core with Tokio as one driver is the accepted direction
   (`doc/adr/0002-session-driver.md`, tracked in #90 to #93). The decisions
   and the per-session decision state live in `ironfix_session::sans_io`
-  today, but the Tokio reactor is still the only driver: there are no
-  synchronous `Application` or store traits (#92) and no non-Tokio driver
-  (#93).
+  (#91), and synchronous counterparts of the callbacks exist
+  (`ironfix_engine::SyncApplication`, `ironfix_store::SyncMessageStore`,
+  implemented by `MemoryStore`, with adapters to the async traits; #92),
+  but the Tokio reactor is still the only driver shipped: there is no
+  non-Tokio driver yet (#93).
 - **Only four dictionaries are embedded**: FIX 4.2, FIX 4.4, FIXT 1.1 and
   FIX 5.0 SP2 (`ironfix-dictionary/spec/`, vendored verbatim from QuickFIX).
   FIX 4.0, 4.1, 4.3, 5.0 and 5.0 SP1 require

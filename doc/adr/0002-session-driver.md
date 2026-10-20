@@ -458,3 +458,25 @@ converted at the boundary so paused-clock tests stay deterministic.
   and the async callbacks (`from_admin`, `from_app`, the store), whose
   results feed the next decision. #92 replaces those callbacks with
   synchronous traits for the sans-IO path.
+
+- **#92 (synchronous application and store traits):** `ironfix_store::
+  SyncMessageStore` is `MessageStore` with synchronous methods (same
+  method set, defaults and contract, the persistence order and the
+  call-order rule included), and `SyncStoreAdapter` uses one where a
+  `MessageStore` is expected. `MemoryStore` implements both: its work moved
+  into the synchronous impl, and the async impl runs it inline, so each
+  call still completes within one poll. `ironfix_engine::SyncApplication`
+  is `Application` with synchronous callbacks (the gates return a
+  `Result`), and `SyncApplicationAdapter` uses one where an `Application`
+  is expected, its gates through `SendVerdict::ready`. Both adapters run
+  the synchronous call inline, so they are sound only for calls that
+  decide or write at once; a call that blocks on a disk or a network
+  blocks the runtime thread, and for the callbacks the reactor awaits
+  inline, the session. The default reports of `on_inbound_lost` and
+  `on_sequence_mismatch` moved into crate-private helpers both traits use.
+  `ironfix-engine/tests/sync_traits_tests.rs` answers a `ResendRequest`
+  from a synchronous store with a synchronous application and the core's
+  replay decisions and no runtime, then runs the same implementations
+  under the Tokio acceptor through the adapters and checks that the wire
+  matches. Additive surface only; existing async implementations are
+  unaffected.

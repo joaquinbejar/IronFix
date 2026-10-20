@@ -280,6 +280,7 @@ pub mod persistence;
 mod reactor;
 pub mod registry;
 mod stream;
+pub mod sync_application;
 pub mod throttle;
 pub mod tls;
 pub mod validation;
@@ -299,6 +300,7 @@ pub use outbound::{OutboundField, OutboundMessage};
 pub use outcome::{NotSentReason, SendOutcome, UnknownReason};
 pub use persistence::StoreFailurePolicy;
 pub use registry::{AcceptorRegistry, LogonIdentity, LookupError, SessionLookup};
+pub use sync_application::{SyncApplication, SyncApplicationAdapter};
 pub use throttle::{
     BudgetId, ThrottleBudget, ThrottleConfig, ThrottleConfigBuilder, ThrottleConfigError,
     ThrottlePolicy,
