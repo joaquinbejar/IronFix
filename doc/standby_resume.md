@@ -37,7 +37,15 @@ None of it is checked by the engine.
   advisory lock on `<name>.lock`) and offers no takeover of that lock.
 - **Asynchronous replication loses outbound messages.** A message the active
   process sent but the standby's copy does not hold cannot be resent with its
-  original content. The mismatch report below is how the engine says so.
+  original content. A replica that acknowledges a write before it is
+  durable there relaxes the first point of this contract (`Ok` only once
+  durable), and this loss is the price. The mismatch report below detects
+  only the disagreements a Logon makes observable; it does not detect every
+  asynchronous replication loss. Nothing is reported when the counterparty
+  declares no usable 789 (absent, malformed, or the session does not use
+  789), or when the counterparty never received the lost messages either:
+  its numbers then agree with the standby's and the loss is invisible at
+  Logon.
 
 ## Fencing is the deployment's job
 
