@@ -218,6 +218,7 @@ use crate::stream::SessionStream;
 use crate::throttle::ThrottleConfig;
 use crate::tls::{self, DEFAULT_TLS_HANDSHAKE_TIMEOUT, PeerInfo};
 use crate::validation::InboundValidation;
+use crate::wire::HeaderReject as _;
 use crate::wire::{
     self, ApplVersionGuard, MessageFactory, PeerIdentity, SendingTimeGuard, UnsupportedVersion,
 };
@@ -1335,7 +1336,7 @@ impl<A: Application + 'static> Initiator<A> {
             // on every later frame: a peer whose SendingTime is wildly skewed
             // cannot be trusted to sequence a session, and the handshake is the
             // cheapest place to refuse it.
-            if let Err(problem) = sending_time.validate(&raw) {
+            if let Err(problem) = sending_time.validate(&raw, wire::wall_clock_millis()) {
                 let detail = problem.to_string();
                 let reason = problem.reject_reason();
                 let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);

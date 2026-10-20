@@ -205,7 +205,10 @@ fn spawn_acceptor(app: Arc<ServerApp>) -> SocketAddr {
             ok(addr_tx.send(ok(listener.local_addr(), "addr")), "send addr");
             let (socket, _) = ok(listener.accept().await, "accept");
             let store = MemoryStore::new();
-            ok(MessageStore::set_next_target_seq(&store, 2).await, "acceptor target");
+            ok(
+                MessageStore::set_next_target_seq(&store, 2).await,
+                "acceptor target",
+            );
             let config = SessionConfig::new(comp_id("VENUE"), comp_id("CLIENT"), "FIX.4.4")
                 .with_heartbeat_interval(Duration::from_secs(30));
             let connection = ok(

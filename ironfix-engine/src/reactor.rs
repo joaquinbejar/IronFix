@@ -293,6 +293,7 @@ use crate::persistence::{
 use crate::stream::SessionStream;
 use crate::throttle::{BudgetId, ThrottleConfig};
 use crate::validation::{InboundValidation, ValidationPolicy, ValidationRejectMessage};
+use crate::wire::HeaderReject as _;
 use crate::wire::{
     self, ApplVersionGuard, ApplVersionProblem, MessageFactory, PeerIdentity, PendingMessage,
     SendingTimeGuard, SendingTimeProblem,
@@ -5715,7 +5716,7 @@ impl<A: Application> Reactor<A> {
         // refreshed: a peer whose SendingTime is outside the tolerance is one
         // whose sequencing cannot be trusted, so it must not keep the session
         // alive either.
-        if let Err(problem) = self.sending_time.validate(&raw) {
+        if let Err(problem) = self.sending_time.validate(&raw, wire::wall_clock_millis()) {
             return Err(self
                 .close_on_sending_time(framed, phase, seq, msg_type.as_str(), problem)
                 .await);

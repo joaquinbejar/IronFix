@@ -67,6 +67,7 @@
 
 pub mod config;
 mod gap_queue;
+pub mod header;
 pub mod heartbeat;
 mod logon;
 mod logout;
