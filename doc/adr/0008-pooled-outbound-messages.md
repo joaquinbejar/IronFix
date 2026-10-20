@@ -88,11 +88,10 @@ timing is claimed):
 | pooled orders, default `to_app_checked` | 1032 | 1 |
 | pooled orders through the throttle | 1032 | 1 |
 | pooled orders with a frame observer | 1032 | 1 |
-| pooled orders, `to_app_checked` returning `SendVerdict::ready` | 8 | about 1/128 |
+| pooled orders, `to_app_checked` returning `SendVerdict::ready` | 8 (0 since the ring below) | about 1/128 (0) |
 
 The windows allow up to 64 non-recurring blocks, except the ready-gate
-window, which allows the command queue's rate plus 4: 64 would hide a cost
-that recurs every 128 sends.
+window, which allows 4: 64 would hide a cost that recurs every 128 sends.
 
 - **The `to_app` future.** `Application` is an `#[async_trait]` trait, so
   every `to_app` call boxes its future. The default `to_app_checked` forwards
@@ -102,13 +101,19 @@ that recurs every 128 sends.
   `to_app` avoids that block. Removing the box
   for everyone means changing the trait's shape, a breaking change, and is
   not done here.
-- **The command queue.** Every send crosses the `tokio::sync::mpsc`
+- **The command queue.** Every send crossed the `tokio::sync::mpsc`
   command channel, which grows its slot list by one block about every 128
-  sends (scaled to 4096 messages, the ready-gate window costs 32 blocks, all
-  from that channel's block growth). It is tokio's internals; this change
-  does not alter them. So even through a ready gate the send path is **not
-  yet zero allocation**: it is about one block per 128 sends, and a fully
-  allocation-free send stays open.
+  sends (scaled to 4096 messages, the ready-gate window cost 32 blocks, all
+  from that channel's block growth). Follow-up (issue #76 closed): the
+  channel is replaced by the engine's private `command_queue`, a
+  `VecDeque` allocated with the session's outbound capacity at session
+  start and never grown, behind a `std::sync::Mutex` held only to push or
+  pop one command, with `tokio::sync::Notify` waking the other side. It
+  keeps the channel's semantics (order, backpressure when full, `None` once
+  every handle is dropped, close and drain, cancel-safe futures, a `Send`
+  send future). The ready-gate window now measures **0 blocks for 1024
+  sends**: through a gate that decides at once, with no store, a pooled
+  send allocates nothing.
 - **A store.** With a `MemoryStore` attached a send costs five blocks
   (`STORED_LIVE_BLOCKS` in the test): the `to_app` future above, the
   `file_outbound` future, the `store` and `set_next_sender_seq` futures of the `#[async_trait]`

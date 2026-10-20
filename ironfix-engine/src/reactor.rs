@@ -279,6 +279,7 @@
 
 use crate::application::{Application, RejectReason, SessionId};
 use crate::close::{CloseReason, LogoutCause, bounded_peer_text};
+use crate::command_queue::{CommandReceiver, CommandSender, command_queue};
 use crate::connection::{Command, SessionRuntime};
 use crate::error::EngineError;
 use crate::garbled::{GarbledFrameWindow, GarbledVerdict};
@@ -1192,7 +1193,7 @@ async fn run_app_dispatcher<A: Application>(
 /// Everything the reactor loop owns besides the socket and the session.
 struct ReactorChannels {
     /// Commands from [`Connection`](crate::Connection) handles.
-    commands: mpsc::Receiver<Command>,
+    commands: CommandReceiver<Command>,
     /// Rejections and store failures coming back from the application
     /// dispatcher.
     app_rejects: mpsc::Receiver<DispatcherEvent>,
@@ -5069,7 +5070,7 @@ impl<A: Application> Reactor<A> {
     /// [`NotSentReason::Discarded`]. Untracked ones are counted in the same
     /// warning, since nothing else reports them. Frames already fed to the
     /// write buffer are not here: they are resolved by the close's last flush.
-    fn discard_unsent(&mut self, commands: &mut mpsc::Receiver<Command>, behind_resend: bool) {
+    fn discard_unsent(&mut self, commands: &mut CommandReceiver<Command>, behind_resend: bool) {
         // Taken from the queue before anything still in it, so resolved
         // first.
         self.discard_throttled();
@@ -5081,7 +5082,7 @@ impl<A: Application> Reactor<A> {
             NotSentReason::Discarded {}
         };
         commands.close();
-        let discarded = std::iter::from_fn(|| commands.try_recv().ok())
+        let discarded = std::iter::from_fn(|| commands.try_recv())
             .filter_map(|command| match command {
                 Command::Send { receipt, .. } => Some(receipt),
                 Command::Logout(_) => None,
@@ -6313,7 +6314,7 @@ pub(crate) struct SessionParams<A: Application> {
 pub(crate) fn spawn_session<A, G>(
     params: SessionParams<A>,
     guard: G,
-) -> (mpsc::Sender<Command>, watch::Receiver<bool>)
+) -> (CommandSender<Command>, watch::Receiver<bool>)
 where
     A: Application + 'static,
     G: Send + 'static,
@@ -6345,7 +6346,7 @@ where
         capture,
     } = params;
 
-    let (command_tx, command_rx) = mpsc::channel(outbound_capacity);
+    let (command_tx, command_rx) = command_queue(outbound_capacity);
     let (closed_tx, closed_rx) = watch::channel(false);
     let (app_tx, app_rx) = mpsc::channel(app_queue_capacity);
     let (reject_tx, reject_rx) = mpsc::channel(app_queue_capacity);
