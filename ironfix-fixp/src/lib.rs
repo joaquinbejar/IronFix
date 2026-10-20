@@ -76,8 +76,8 @@
 //! session left negotiated without a transport has no timer at all; the
 //! driver that routes sessions decides when to evict it.
 //!
-//! The core does not frame bytes (`ironfix-sofh` does, and the engine will
-//! compose the two) and does not store application messages: on a
+//! The core does not frame bytes (`ironfix-sofh` does, and `ironfix-engine`
+//! composes the two behind its `fixp` feature) and does not store application messages: on a
 //! Recoverable flow the driver keeps what it sends, by sequence number, and
 //! replays it when the session asks (`retransmit` returns the range).
 //!
@@ -220,8 +220,8 @@
 //!   MessageTemplate is decoded and passed over, not applied).
 //! - **Persistence**: sequence numbers live in memory, so a session cannot be
 //!   re-established by a new process.
-//! - **Engine wiring**: no driver exists yet; FIXP over SOFH in
-//!   `ironfix-engine` is ADR-0003's follow-up.
+//! - **A driver** is not part of this crate: `ironfix-engine`'s `fixp`
+//!   feature runs it over SOFH, one binding per transport.
 //!
 //! ## Example
 //!

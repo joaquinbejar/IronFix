@@ -205,6 +205,16 @@
 //! `on_create`, [`CloseReason::Tls`]. See [`tls`] and ADR-0009
 //! (`doc/adr/0009-tls.md`).
 //!
+//! ## FIXP over SOFH
+//!
+//! With the `fixp` feature (off by default), the `fixp` module runs the
+//! FIX Performance Session Layer v1.1 core of `ironfix-fixp` over SOFH
+//! framing (`ironfix-sofh`) in both roles: `fixp::FixpInitiator` and
+//! `fixp::FixpAcceptor`, over TCP or any caller stream, each transport in
+//! its own driver task, separate from the tag=value reactor. With the
+//! feature off neither crate, nor `ironsbe-core`, is in the dependency
+//! graph. See the module and `doc/fixp_operations.md`.
+//!
 //! No public type gains a stream type parameter, [`Connection`] included. The
 //! TCP path is unaffected by the seam: its socket is held by value, with no
 //! allocation and no dynamic call. A caller's stream is boxed once, when the
@@ -256,6 +266,8 @@ pub mod builder;
 pub mod close;
 pub mod connection;
 pub mod error;
+#[cfg(feature = "fixp")]
+pub mod fixp;
 mod gap_queue;
 mod garbled;
 pub mod initiator;

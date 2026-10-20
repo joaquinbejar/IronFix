@@ -127,3 +127,16 @@ decision and pinned to a compatible 0.7 range when `ironfix-fixp` lands.
   policy there. The crate joins the lockstep version and `make publish-all`
   right after `ironfix-sofh`, and enters the `semver.yml` matrix after its
   first publish.
+- **The engine wiring exists** (#96). `ironfix-engine`'s optional `fixp`
+  feature adds the `fixp` module: `FixpInitiator`, `FixpAcceptor`,
+  `FixpConnection`, the `FixpApplication` trait, and `FixpEngineError`, its
+  own `thiserror` boundary (the bridge from `SofhError` that the #122
+  amendment expected in `EngineError` lives there instead, so `EngineError`
+  does not change shape with a feature). One driver task per transport
+  composes `SofhCodec` with the core, separate from the tag=value reactor.
+  With the feature off the engine's normal graph holds neither
+  `ironfix-sofh`, `ironfix-fixp` nor `ironsbe-core`; `make check-fixp-deps`
+  checks it in CI. The module re-exports `ironfix_fixp` and `ironfix_sofh`,
+  so a breaking release of either is a breaking change of the engine's
+  `fixp` surface. Not driven yet: re-establishment on a new transport and
+  persistence (`doc/fixp_operations.md`, "Engine driver").

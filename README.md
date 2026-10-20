@@ -29,8 +29,8 @@ FIXT.1.1) and FAST. A binary order-entry stack, SOFH framing and a FIXP session
 over SBE (via `ironsbe-core`), is being built inside the workspace
 (`doc/adr/0003-fixp-sofh-in-workspace.md`, tracked in #94 to #97). The SOFH
 framing codec (`ironfix-sofh`) and the sans-IO FIXP session core with its SBE
-session messages (`ironfix-fixp`) exist; nothing drives them yet, because the
-engine wiring (#96) does not exist.
+session messages (`ironfix-fixp`) exist, and `ironfix-engine` runs them over
+TCP or any caller stream behind its optional `fixp` feature (#96).
 
 **What works today**, end to end:
 
@@ -97,7 +97,19 @@ engine wiring (#96) does not exist.
   Malformed input is a typed error and protocol violations are answered on
   the wire. What is implemented and tested, and every decision
   the specification leaves open, are listed in `doc/fixp_operations.md`.
-  No driver uses it yet.
+- **FIXP over SOFH in the engine**, behind `ironfix-engine`'s `fixp` feature
+  (off by default; with it off, neither `ironfix-sofh`, `ironfix-fixp` nor
+  `ironsbe-core` is in the engine's dependency graph, checked by
+  `make check-fixp-deps` in CI). `fixp::FixpInitiator` dials (or takes a
+  caller stream, a TLS one included) and negotiates and establishes;
+  `fixp::FixpAcceptor` serves a listener or a caller stream, the
+  `FixpApplication` deciding each Negotiate and Establish. Application
+  messages travel as opaque SOFH payloads, numbered by the session. On a
+  Recoverable flow the driver keeps the last sent messages in memory
+  (10 000 by default) and answers a RetransmitRequest from them; the
+  acceptor remembers finalized session identifiers and refuses them.
+  Tested end to end in both roles over TCP and an in-memory duplex
+  (`ironfix-engine/tests/fixp_tests.rs`).
 - **A client engine and a server engine** in `ironfix-engine`. `Initiator`
   dials over TCP and runs the initiator half of the Logon handshake. `Acceptor`
   serves inbound connections for one configured counterparty and runs the
@@ -512,10 +524,11 @@ around it.
   sequence decoding, so `ironfix-fast` decodes the fields of a message only when
   something else supplies their order. There is also no UDP multicast receiver
   and no wiring into the session or engine path (`ironfix-fast/src/lib.rs`).
-- **No binary order-entry session can run yet.** `ironfix-sofh` frames and
-  `ironfix-fixp` runs the FIXP session logic, but no driver composes them
-  over a socket: the engine wiring behind a `fixp` feature is #96. Of FIXP
-  itself, sending a finalization (this side never sends FinishedSending, so
+- **The FIXP engine path is minimal.** One session per transport;
+  re-establishing an unbound session on a new transport is not driven by
+  the engine (the core supports it); sent messages and sequence numbers
+  live in memory only, so a restarted process cannot resume a session; no
+  FIXP conformance suite yet (#97). Of FIXP itself, sending a finalization (this side never sends FinishedSending, so
   it never starts one), multiplexing several sessions on one
   transport, datagram transports, multicast, WebSocket and session
   persistence across process restarts are not implemented; the application
@@ -585,12 +598,12 @@ against it.
 | `ironfix-store` | The `MessageStore` trait, `MemoryStore`, and the persistent `FileStore` |
 | `ironfix-transport` | `FixCodec`, a Tokio codec that frames FIX messages; depends on `ironfix-tagvalue` only. No TCP helpers, no TLS (TLS lives behind `ironfix-engine`'s `tls` feature) |
 | `ironfix-sofh` | `SofhCodec`, a Tokio codec for the Simple Open Framing Header v1.0 that frames SBE and other binary encodings; depends on no other IronFix crate. Not published yet |
-| `ironfix-fixp` | The FIXP v1.1 session core, sans-IO: `FixpClient`, `FixpServer`, and the SBE session messages on `ironsbe-core`; depends on `ironfix-core` and `ironsbe-core` only. Not published yet |
+| `ironfix-fixp` | The FIXP v1.1 session core, sans-IO: `FixpClient`, `FixpServer`, and the SBE session messages on `ironsbe-core`; depends on `ironfix-core` and `ironsbe-core` only; driven by `ironfix-engine`'s `fixp` feature. Not published yet |
 | `ironfix-fast` | FAST encoding/decoding primitives: stop-bit, presence maps, the operator table; depends on no other IronFix crate. No template layer |
 | `ironfix-codegen` | Build-time Rust generation from a `Dictionary`: data structs, and opt-in views, enumerations and writers (no in-workspace consumer) |
 | `ironfix-codegen-check` | Not published. A CI check: its build script generates the full views of the embedded FIX 4.4, FIX 4.2 and FIXT 1.1 dictionaries and the workspace lints compile them |
 | `ironfix-derive` | `#[derive(FixMessage)]` / `#[derive(FixField)]` for the `ironfix-core` traits (no in-workspace consumer) |
-| `ironfix-engine` | The composition root: `Initiator`, `Acceptor`, `EngineBuilder`, `Connection`, the `Application` trait |
+| `ironfix-engine` | The composition root: `Initiator`, `Acceptor`, `EngineBuilder`, `Connection`, the `Application` trait; with the `fixp` feature, `fixp::FixpInitiator` / `fixp::FixpAcceptor` running FIXP over SOFH |
 | `ironfix-example` | Umbrella facade (`prelude`) plus the runnable examples |
 
 There is no `ironfix` facade crate. The umbrella re-exports live in
