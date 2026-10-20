@@ -54,6 +54,7 @@ use std::time::{Duration, Instant};
 /// The core does not see the driver's write buffer; the driver summarises it
 /// here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum LivenessGate {
     /// Only the deadline may be checked; nothing new is written. A driver
     /// uses this while a resend it owes is under way (resent frames are
@@ -79,6 +80,7 @@ pub enum LivenessGate {
 /// new one is a compile error in each driver rather than an arm that silently
 /// does nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum LivenessAction {
     /// Nothing is due.
     Idle,

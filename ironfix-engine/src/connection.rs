@@ -495,6 +495,15 @@ impl Connection {
 
     /// Returns true if the session has detected a heartbeat timeout
     /// (a TestRequest went unanswered for a full heartbeat interval).
+    ///
+    /// The check reads the session's clock as the reactor does: Tokio's
+    /// clock, converted at the boundary. Under a paused Tokio clock (a
+    /// simulation or a `start_paused` test), call this from within the
+    /// session's runtime context. Called from a plain thread, it reads the
+    /// system monotonic clock instead, which can lie before the synthetic
+    /// instants the heartbeat recorded after the paused clock advanced; a
+    /// debug build then trips the heartbeat's backward-time assertion. An
+    /// ordinary, unpaused runtime is unaffected.
     #[must_use]
     pub fn is_timed_out(&self) -> bool {
         // A poisoned lock means a previous holder panicked. The heartbeat state
