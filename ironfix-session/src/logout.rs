@@ -32,9 +32,10 @@
 //!   (issue #69): which kinds are graceful, and how a graceful close becomes
 //!   [`LogoutClose::Unwritten`] when this session's own Logout never reached
 //!   the stream whole ([`settle_close`], [`reply_close`]). Only a graceful
-//!   close counts for `reset_on_logout` ([`close_resets`], issue #126), and so
-//!   only a graceful close records the durable owed-reset marker of issue
-//!   #111.
+//!   close counts for `reset_on_logout` ([`close_resets`], issue #126).
+//!   `reset_on_disconnect` resets on every close, graceful or not, so it can
+//!   record the durable owed-reset marker of issue #111 on a non-graceful
+//!   close too.
 
 use crate::config::SessionConfig;
 use std::time::{Duration, Instant};
