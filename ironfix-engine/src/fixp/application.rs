@@ -134,7 +134,11 @@ impl std::fmt::Debug for FixpInbound {
 /// (`FixpConfig::handshake_timeout`). If that deadline lapses or the
 /// counterparty disconnects first, the task is aborted, the transport is
 /// closed and the acceptor releases the session id; a late answer is
-/// dropped. The session has no handle yet, so they cannot wait on it.
+/// dropped. A request left undecided (the deadline lapsed, the task
+/// panicked, or the core refused the acceptance, as for two None flows) is
+/// answered with NegotiationReject or EstablishmentReject before the close
+/// (FIXP v1.1 sections 4.2.3 and 4.3). The session has no handle yet, so
+/// they cannot wait on it.
 #[async_trait]
 pub trait FixpApplication: Send + Sync + 'static {
     /// A client asks to negotiate a session (server role only).

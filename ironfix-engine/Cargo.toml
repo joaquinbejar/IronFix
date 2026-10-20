@@ -76,3 +76,9 @@ required-features = ["tls"]
 [[test]]
 name = "fixp_tests"
 required-features = ["fixp"]
+
+# The FIXP/SOFH conformance suite (issue #97): a raw peer of hand-built SBE
+# bytes against the engine, in both roles.
+[[test]]
+name = "fixp_conformance_tests"
+required-features = ["fixp"]

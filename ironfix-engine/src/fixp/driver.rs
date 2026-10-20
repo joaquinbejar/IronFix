@@ -38,9 +38,9 @@ use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use ironfix_core::SeqNum;
 use ironfix_fixp::{
-    Credentials, Delivery, Event, FixpClient, FixpError, FixpServer, FlowType,
-    NegotiationRejectCode, Output, RetransmitRejectCode, SessionId, SessionMessage, SessionStatus,
-    TerminationCode, is_session_message,
+    Credentials, Delivery, EstablishmentRejectCode, Event, FixpClient, FixpError, FixpServer,
+    FlowType, NegotiationRejectCode, Output, RetransmitRejectCode, SessionId, SessionMessage,
+    SessionStatus, TerminationCode, is_session_message,
 };
 use ironfix_sofh::{EncodingType, SofhCodec, SofhFrame, SofhHeader};
 use std::collections::{BTreeMap, HashSet};
@@ -82,8 +82,10 @@ enum PendingDecision {
 enum Decided {
     Negotiation(NegotiationDecision),
     Establishment(EstablishmentDecision),
-    /// The decision task panicked or was cancelled.
-    Lost,
+    /// The negotiation decision task panicked or was cancelled.
+    NegotiationLost,
+    /// The establishment decision task panicked or was cancelled.
+    EstablishmentLost,
 }
 
 /// Waits for the pending decision; for ever without one.
@@ -91,11 +93,11 @@ async fn decided(pending: &mut Option<PendingDecision>) -> Decided {
     match pending {
         Some(PendingDecision::Negotiation(task)) => match task.await {
             Ok(decision) => Decided::Negotiation(decision),
-            Err(_) => Decided::Lost,
+            Err(_) => Decided::NegotiationLost,
         },
         Some(PendingDecision::Establishment(task)) => match task.await {
             Ok(decision) => Decided::Establishment(decision),
-            Err(_) => Decided::Lost,
+            Err(_) => Decided::EstablishmentLost,
         },
         None => std::future::pending().await,
     }
@@ -946,6 +948,14 @@ impl<A: FixpApplication> Driver<A> {
     }
 
     /// Applies the application's handshake decision to the core.
+    ///
+    /// A request the server cannot grant is always answered on the wire
+    /// before the transport closes: FIXP v1.1 section 4.2.3 (p. 18) says a
+    /// server "must send NegotiationReject" when a session cannot be
+    /// created, and section 4.3 (p. 19) that the response to Establish "is
+    /// either EstablishmentAck or EstablishmentReject". So an acceptance the
+    /// core refuses (both flows None, section 3.4.4.1) and a decision task
+    /// that failed are turned into a reject, never into a silent close.
     async fn on_decided(&mut self, decided: Decided) {
         let now = now();
         let Role::Server { server, .. } = &mut self.role else {
@@ -955,12 +965,43 @@ impl<A: FixpApplication> Driver<A> {
             Decided::Negotiation(NegotiationDecision::Accept {
                 server_flow,
                 credentials,
-            }) => server.accept_negotiation(server_flow, credentials, now),
+            }) => match server.accept_negotiation(server_flow, credentials, now) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    tracing::warn!(%error, "fixp negotiation acceptance refused by the core; rejecting");
+                    let code = match error {
+                        FixpError::BothFlowsNone => NegotiationRejectCode::FlowTypeNotSupported,
+                        _ => NegotiationRejectCode::Unspecified,
+                    };
+                    server.reject_negotiation(code, "the server cannot serve this session")
+                }
+            },
             Decided::Negotiation(NegotiationDecision::Reject { code, reason }) => {
                 server.reject_negotiation(code, reason)
             }
+            Decided::NegotiationLost => {
+                self.failure
+                    .get_or_insert(FixpEngineError::HandshakeFailed {
+                        detail: "the application's negotiation decision failed".to_owned(),
+                    });
+                server.reject_negotiation(
+                    NegotiationRejectCode::Unspecified,
+                    "the server could not decide",
+                )
+            }
             Decided::Establishment(EstablishmentDecision::Accept) => {
-                server.accept_establishment(now)
+                match server.accept_establishment(now) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        tracing::warn!(%error, "fixp establishment acceptance refused by the core; rejecting");
+                        self.close_after_drain = true;
+                        server.reject_establishment(
+                            EstablishmentRejectCode::Unspecified,
+                            "the server cannot bind this session",
+                            now,
+                        )
+                    }
+                }
             }
             Decided::Establishment(EstablishmentDecision::Reject { code, reason }) => {
                 self.failure
@@ -973,11 +1014,17 @@ impl<A: FixpApplication> Driver<A> {
                 self.close_after_drain = true;
                 server.reject_establishment(code, reason, now)
             }
-            Decided::Lost => {
-                self.fail(FixpEngineError::HandshakeFailed {
-                    detail: "the application's handshake decision failed".to_owned(),
-                });
-                return;
+            Decided::EstablishmentLost => {
+                self.failure
+                    .get_or_insert(FixpEngineError::HandshakeFailed {
+                        detail: "the application's establishment decision failed".to_owned(),
+                    });
+                self.close_after_drain = true;
+                server.reject_establishment(
+                    EstablishmentRejectCode::Unspecified,
+                    "the server could not decide",
+                    now,
+                )
             }
         };
         if let Err(error) = result {

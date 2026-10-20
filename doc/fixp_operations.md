@@ -117,8 +117,11 @@ Implemented and tested:
 - Server: `accept_negotiation` refuses both flows None and keeps the
   Negotiate pending (`test_server_accept_negotiation_refuses_both_flows_none`).
 - Server, automatic EstablishmentReject: `Unnegotiated` for an Establish
-  before any negotiation or naming another session (Appendix A 7.1.12.1;
-  `test_server_rejects_establish_without_negotiation`,
+  before any negotiation or naming another session (Appendix A 7.1.12.1),
+  then the transport is closed at once, since section 6.3 (p. 39) lists
+  an Establish without a successful negotiation as a violation after
+  which the session "should be immediately terminated"
+  (`test_server_rejects_establish_without_negotiation`,
   `test_server_rejects_establish_for_another_session`); `KeepaliveInterval`
   outside the configured range (Appendix A 7.1.12.4;
   `test_server_rejects_a_keepalive_out_of_range`); `AlreadyEstablished` while
@@ -147,7 +150,10 @@ Implemented and tested:
   negotiated, retry on a new transport, Appendix A 7.1.12.9); server waiting
   for Negotiate (closes), for the application's answer to a Negotiate
   (closes) or to an Establish (keeps the session), and for an Establish on a
-  transport (keeps the session) (`test_client_negotiation_times_out`,
+  transport (keeps the session). A Negotiate or Establish the application
+  left unanswered is first refused with NegotiationReject or
+  EstablishmentReject `Unspecified` (section 4.2.3, p. 18; section 4.3,
+  p. 19; a defect found by #97) (`test_client_negotiation_times_out`,
   `test_client_establishment_times_out_and_can_retry`,
   `test_server_handshake_timeouts`,
   `test_server_application_answers_are_bounded_by_the_handshake_timeout`).
@@ -469,6 +475,10 @@ Page numbers are the printed pages of the [v1.1 Draft Standard PDF](https://gith
 | When a session is finalized | 4.7.2 (p. 31; [text](https://github.com/FIXTradingCommunity/fixp-specification/blob/master/v1-1/doc/04PointToPointSessionProtocol.md)): FinishedReceiving, then unbinding; no exception by Terminate code | **Local policy**, conservative, not a check the specification mandates: finalized only when every Terminate of the closing exchange carries `Finished` (the counterparty's, or this side's and its answer) after this side sent FinishedReceiving. An error Terminate either way, or a transport failure, leaves the session negotiated |
 | Re-establishing or renegotiating a finalized identifier | 6.3: a violation | Server: EstablishmentReject `Unnegotiated` or NegotiationReject `DuplicateId`, then the transport closed; client: `establish` refused locally |
 | Leaving sequenced mode | 3.5.4 names a context switch; Appendix A 7.3.1.1 (p. 56): any session message | Any session message this side sends other than a Sequence |
+| A handshake request the server cannot decide | 4.2.3 (p. 18): a server "must send NegotiationReject"; 4.3 (p. 19): the response to Establish is EstablishmentAck or EstablishmentReject | Always answered before the close: NegotiationReject `FlowTypeNotSupported` when the application accepts with both flows None, otherwise `Unspecified` (a decision that panicked or lapsed); EstablishmentReject `Unspecified`. The codes are **local policy** |
+| Transport after a server EstablishmentReject | 6.3 (p. 39): an Establish without a successful negotiation, and reusing a finalized id, are violations after which the session "should be immediately terminated"; Appendix A 7.1.12 (p. 45 to 48) shows the rejects and no close | `Unnegotiated` (no negotiation, another session, a finalized id): the reject, then the transport closed at once. **Local policy, a deliberate departure from the 6.3 recommendation**: closing at the handshake timeout does not meet the immediate termination 6.3 recommends. After a reject the client can fix (`KeepaliveInterval`, `Unspecified` for a bad `NextSeqNo`, `AlreadyEstablished`) the transport stays open for a retry on it, bounded by `handshake_timeout`. A reject decided by the application closes at once |
+| Negotiate on an established session | 4.2.3 (p. 18): nothing should follow a NegotiationReject; 6.3 (p. 39): the Negotiate is a violation that ends the session | **Local policy**: NegotiationReject `DuplicateId`, then Terminate `UnspecifiedError`; not a sequence the specification mandates |
+| Routing a frame to the session or the application | 3.3 (p. 12): left to the encoding supplements; SOFH lets encodings mix | **Local policy**: SOFH SBE 1.0 little-endian whose SBE header names schema 2748 is a session message; anything else, an unregistered encoding type included, is an application message |
 
 ## Engine driver (`ironfix-engine`, `fixp` feature)
 
@@ -502,7 +512,10 @@ dependency graph (`make check-fixp-deps`, run in CI).
   `on_establish` run in a task of their own while the driver keeps reading
   and running the core's handshake deadline: a lapse (section 4.2,
   `handshake_timeout`) or a disconnect while one is pending closes the
-  transport and releases the identifier in the acceptor.
+  transport and releases the identifier in the acceptor. A request left
+  undecided (a lapse, a decision task that panicked, an acceptance the core
+  refuses such as two None flows) is answered with NegotiationReject or
+  EstablishmentReject before the close (sections 4.2.3 and 4.3).
 - **Routing.** A frame with SOFH encoding type SBE 1.0 little-endian
   (`0xEB50`) whose SBE header names schema 2748 is a session message; any
   other frame is an application message, passed to the core's
@@ -551,6 +564,71 @@ transport (each binding is its own task, and the client is consumed by
 `connect`), evicting idle negotiated sessions (the acceptor drops them with
 their transport), and persisting sequence numbers or sent messages.
 
+## Conformance suite (issue #97)
+
+`ironfix-engine/tests/fixp_conformance_tests.rs` (`fixp` feature) runs the
+engine, in both roles, against a **raw peer**: SOFH headers and FIXP SBE
+session messages built byte by byte from the schema, and the engine's frames
+parsed the same way, over a real TCP socket. It uses neither `SofhCodec` nor
+the `ironfix-fixp` codec, so IronFix is not tested against itself. The
+peer's oracle is strict: a clean close is end of stream with zero bytes of
+a frame; every frame naming schema 2748 must match the schema (version 0, a
+known template, a root block at least as long as the schema's, its
+variable-length fields ending exactly at the SOFH length) before any field
+is read, and fields are read only inside the template's root block. Three
+control tests feed it mutated output and check that it fails
+(`test_oracle_close_requires_zero_bytes_before_eof`,
+`test_oracle_rejects_malformed_session_headers`,
+`test_oracle_assertion_helpers_fail_on_mutated_output`). Each test
+cites the section and printed page of the v1.1 Draft Standard; "policy"
+marks a case the specification leaves open or only shows in the informative
+Appendix A (see the decisions table). Every wait is bounded (5 s) and the
+timers involved are configured an order of magnitude below it.
+
+| Behaviour | FIXP v1.1 | Kind | Test(s) |
+|---|---|---|---|
+| SOFH length above the ceiling closes the transport, before and after establishment | 3.3.3 (p. 12), 4.4 (p. 22) | spec | `test_server_closes_on_an_oversized_sofh_length`, `test_client_closes_on_an_oversized_sofh_length_when_established` |
+| SOFH length below the 7-byte minimum closes | 3.3.3 (p. 12), 4.4 (p. 22) | spec | `test_server_closes_on_a_sofh_length_below_the_header` |
+| Frames split byte by byte, and coalesced in one write | 3.3.3 (p. 12) | spec | `test_server_reassembles_a_frame_split_into_single_bytes`, `test_server_splits_coalesced_frames` |
+| Unknown SOFH encoding type: an application message once established, a violation before | 3.3 (p. 12), 6.3 (p. 39) | policy (routing) | `test_server_delivers_an_unknown_encoding_type_as_an_application_message`, `test_server_refuses_an_unknown_encoding_type_before_establishment` |
+| Truncated SBE session message: Terminate once established, close before; unknown template | 4.4 (p. 22), 6.3 (p. 39), 3.3.1 (p. 12) | spec | `test_server_terminates_on_a_truncated_session_message`, `test_server_closes_on_a_truncated_negotiate`, `test_client_closes_on_a_truncated_negotiation_response`, `test_client_terminates_on_an_unknown_session_template` |
+| Negotiate and Establish fields sent; NegotiationResponse and EstablishmentAck fields answered | 4.2.1, 4.2.2 (p. 17 to 18), 4.3.1, 4.3.2 (p. 20 to 21) | spec | `test_client_handshake_fields`, `test_server_handshake_fields` |
+| Every NegotiationRejectCode, received and sent; `DuplicateId` for a live id; nil id | 4.2.3 (p. 18 to 19), 3.4.1 (p. 13) | spec (nil id: Appendix A 7.1.7.3) | `test_client_reports_every_negotiation_reject_code`, `test_server_sends_every_negotiation_reject_code`, `test_server_rejects_a_live_session_id_with_duplicate_id`, `test_server_rejects_a_nil_session_id` |
+| Every EstablishmentRejectCode received; `SessionBlocked`, `Credentials`, `Unnegotiated`, `AlreadyEstablished`, `KeepaliveInterval`, `Unspecified` sent | 4.3.3 (p. 21) | spec (`Unspecified` for `NextSeqNo` 0: policy) | `test_client_reports_every_establishment_reject_code`, `test_server_sends_application_establishment_reject_codes`, `test_server_rejects_an_establish_without_negotiation`, `test_server_rejects_an_establish_for_another_session_and_closes`, `test_server_rejects_a_redundant_establish`, `test_server_rejects_a_keepalive_out_of_range`, `test_server_rejects_a_next_seq_no_of_zero_with_unspecified` |
+| Establish before the NegotiationResponse; application message before establishment | 6.3 (p. 39) | spec | `test_server_refuses_an_establish_sent_before_the_negotiation_response`, `test_server_refuses_an_application_message_before_establishment` |
+| A refused or undecided Negotiate or Establish is answered with a reject (defect fixed by #97) | 4.2.3 (p. 18), 4.3 (p. 19) | spec (codes: policy) | `test_server_rejects_a_negotiation_with_both_flows_none`, `test_server_rejects_a_negotiation_when_the_application_fails`, `test_server_rejects_a_negotiation_not_answered_in_time`, `test_server_rejects_an_establishment_when_the_application_fails`, `test_server_rejects_an_establishment_not_answered_in_time` |
+| Handshake timeouts; a response for another request ignored; retry after a keepalive reject, bounded | 4.3.1 (p. 20), Appendix A 7.1.7.5 (p. 43), 7.1.12.4 (p. 46 to 47) | policy | `test_client_negotiation_times_out`, `test_client_establishment_times_out`, `test_server_closes_a_silent_transport_after_the_handshake_timeout`, `test_client_ignores_a_negotiation_response_for_another_request`, `test_server_allows_a_retry_after_a_keepalive_reject`, `test_server_bounds_the_transport_after_a_keepalive_reject` |
+| Negotiate on an established session: NegotiationReject then Terminate | 4.2.3 (p. 18), 6.3 (p. 39) | policy | `test_server_answers_a_negotiate_on_an_established_session` |
+| Both flows None refused; keepalive outside the agreed range | 3.4.4.1 (p. 14), 4.3.1 (p. 20) | spec / policy (range) | `test_client_refuses_both_flows_none`, `test_client_terminates_on_a_server_keepalive_out_of_range` |
+| Implicit numbering after Sequence; numbering from the announced `NextSeqNo`; Context for this session | 3.5.1 (p. 14), 4.3.2 (p. 20), 3.5.3 (p. 15) | spec | `test_server_numbers_messages_after_a_sequence`, `test_client_numbers_from_the_announced_next_seq_no`, `test_server_accepts_a_context_for_its_session` |
+| Lower `NextSeqNo`; jump above `max_gap_len` (no overflow at `u64::MAX`); Context for another session | Appendix A 7.3.1.2 (p. 56 to 57), 3.5.3 (p. 15) | policy | `test_server_terminates_on_a_lower_next_seq_no`, `test_server_terminates_on_a_sequence_jump_above_the_gap_bound`, `test_server_terminates_on_a_context_for_another_session` |
+| Recoverable gap: RetransmitRequest, Retransmission delivered as retransmitted, real time resumes behind a Sequence | 4.6.1 (p. 26), 4.6.2 (p. 26 to 27), 3.5.4 (p. 15) | spec | `test_server_requests_and_receives_a_retransmission`, `test_client_requests_and_receives_a_retransmission` |
+| One RetransmitRequest in flight | 4.6.1 (p. 26) | spec | `test_server_keeps_one_retransmit_request_in_flight` |
+| Every RetransmitRejectCode received abandons the range | 4.6.2.3 (p. 28) | spec | `test_server_reports_every_retransmit_reject_code`, `test_client_reports_a_retransmit_reject` |
+| Provider: Retransmission header then the same frames; every RetransmitRejectCode sent; overflowing and empty ranges; messages no longer kept | 4.6.2 (p. 26 to 27), 4.6.2.3 (p. 28) | spec (empty range, eviction: policy) | `test_server_serves_a_retransmission`, `test_client_serves_a_retransmission`, `test_server_sends_every_retransmit_reject_code`, `test_server_rejects_overflowing_and_empty_retransmit_requests`, `test_client_rejects_a_request_for_messages_no_longer_kept` |
+| RetransmitRequest to a flow that is not Recoverable; Retransmission with no request | 4.6.1 (p. 26), Appendix A 7.3.4 (p. 60 to 63) | spec / policy (code) | `test_server_terminates_on_a_retransmit_request_to_a_flow_that_is_not_recoverable`, `test_client_terminates_on_an_unsolicited_retransmission` |
+| Idempotent gap answered with NotApplied behind a Sequence; Applied and NotApplied received; NotApplied for a Recoverable flow | 4.8.1, 4.8.2 (p. 33) | spec | `test_server_sends_not_applied_on_an_idempotent_gap`, `test_client_sends_not_applied_on_an_idempotent_gap`, `test_client_reports_applied_and_not_applied`, `test_client_terminates_on_not_applied_for_a_recoverable_flow` |
+| Unsequenced and None flows: no numbers, Sequence or Context refused, no application message on None; Topic refused | 3.5.1 (p. 14), 3.4.4 (p. 14), 6.1 (p. 38), 6.3 (p. 39) | spec | `test_server_unsequenced_flow_has_no_numbers_and_refuses_a_sequence`, `test_server_none_flow_refuses_a_context`, `test_server_terminates_on_an_application_message_on_a_none_flow`, `test_client_terminates_on_a_topic`, `test_server_terminates_on_a_server_only_message` |
+| Heartbeat: Sequence on a sequenced flow, UnsequencedHeartbeat otherwise | 4.5 (p. 25 to 26) | spec | `test_server_heartbeats_with_a_sequence`, `test_client_heartbeats_with_an_unsequenced_heartbeat` |
+| Peer silence terminates; a heartbeating peer does not | 4.5 (p. 25), 4.4 (p. 22) | spec (grace: policy) | `test_server_terminates_a_silent_client`, `test_client_terminates_a_silent_server_but_not_a_heartbeating_one` |
+| Every TerminationCode received is answered with Terminate `Finished` | 4.4.1 (p. 23) | spec (answer code: policy) | `test_server_answers_every_terminate_code`, `test_client_answers_a_terminate` |
+| Orderly terminate; unanswered terminate closes; nothing sent after Terminate; messages after the peer's Terminate ignored; abrupt disconnect | 4.4 (p. 22), 4.4.1, 4.4.2 (p. 23) | spec | `test_client_orderly_terminate`, `test_server_closes_when_its_terminate_is_not_answered`, `test_server_sends_nothing_after_its_terminate`, `test_server_ignores_messages_after_the_peer_terminate`, `test_abrupt_disconnect_in_both_roles` |
+| Terminate for another session | 4.4 (p. 22) | policy | `test_server_terminates_on_a_terminate_for_another_session` |
+| Finalization started by the peer: FinishedReceiving, no application message after it, finalized id refused; recovery up to `LastSeqNo` first; repeated FinishedSending answered once; Unsequenced flow | 4.7.1, 4.7.2 (p. 31), 6.3 (p. 39), 3.4.1 (p. 13) | spec (finalize only on `Finished`: policy) | `test_server_finalization_and_reuse_refused`, `test_client_recovers_up_to_last_seq_no_before_finished_receiving`, `test_server_answers_finished_sending_once`, `test_server_answers_finished_sending_on_an_unsequenced_flow` |
+| Finalization violations: unsolicited FinishedReceiving, application message after FinishedSending, no `LastSeqNo` on a sequenced flow | 6.3 (p. 39), 4.7.1 (p. 31) | spec / policy (missing `LastSeqNo`) | `test_server_terminates_on_an_unsolicited_finished_receiving`, `test_client_terminates_on_an_application_message_after_finished_sending`, `test_server_terminates_on_finished_sending_without_last_seq_no` |
+
+Not exercised against the engine, and why:
+
+- **Terminate `ReRequestInProgress` sent by the engine** (4.6.4, p. 29):
+  the engine provider answers a request in one batch at once, so no request
+  can arrive while one is in progress. The core sends it
+  (`test_a_request_while_one_is_answered_terminates_with_re_request_in_progress`).
+- **FinishedSending sent by the engine** (4.7.1): not implemented (see Not
+  implemented).
+- **Re-establishment on a new transport** (3.4.3, 4.1): not driven by the
+  engine (see Engine driver); the core and `tests/loopback.rs` cover it.
+- **Multiplexing, datagrams, multicast, WebSocket**: not implemented.
+
 ## Not implemented
 
 - **Sending a finalization** (section 4.7): this side never sends
@@ -567,5 +645,4 @@ their transport), and persisting sequence numbers or sent messages.
 - **Application-message storage**: the driver's job.
 - **Engine re-establishment and persistence**: the engine driver (below)
   runs one binding per transport; it does not re-establish an unbound
-  session on a new transport, and keeps sent messages in memory only. A
-  conformance suite is #97.
+  session on a new transport, and keeps sent messages in memory only.

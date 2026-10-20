@@ -140,3 +140,18 @@ decision and pinned to a compatible 0.7 range when `ironfix-fixp` lands.
   so a breaking release of either is a breaking change of the engine's
   `fixp` surface. Not driven yet: re-establishment on a new transport and
   persistence (`doc/fixp_operations.md`, "Engine driver").
+- **The conformance suite exists** (#97).
+  `ironfix-engine/tests/fixp_conformance_tests.rs` runs the engine in both
+  roles against a raw peer of hand-built SOFH and SBE bytes (neither
+  `SofhCodec` nor the `ironfix-fixp` codec), each case citing a FIXP v1.1
+  section and page and marking local policy where the specification is
+  open; the coverage table is in `doc/fixp_operations.md`. It found one
+  defect, fixed with it: a Negotiate or Establish the server could not
+  grant (two None flows, a failed or lapsed application decision) was
+  closed without the NegotiationReject or EstablishmentReject sections
+  4.2.3 and 4.3 require. Following section 6.3, an Establish without a
+  successful negotiation (or for a finalized id) is now rejected with
+  `Unnegotiated` and its transport closed at once; rejects the client can
+  fix keep a retry window bounded by the handshake timeout, a deliberate
+  departure from the immediate termination 6.3 recommends. No `pub` item
+  changed.

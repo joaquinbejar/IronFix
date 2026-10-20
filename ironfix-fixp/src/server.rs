@@ -29,7 +29,12 @@
 //! Every wait is bounded by [`FixpConfig::handshake_timeout`]: for a
 //! Negotiate, for the application's answer to it, for an Establish on a
 //! transport, and for the application's answer to that. When one lapses the
-//! server asks for the transport to be closed.
+//! server asks for the transport to be closed; a Negotiate or Establish the
+//! application left unanswered is first refused with NegotiationReject or
+//! EstablishmentReject `Unspecified`, since FIXP v1.1 answers every such
+//! request (section 4.2.3, p. 18: a server "must send NegotiationReject";
+//! section 4.3, p. 19: the response to Establish "is either
+//! EstablishmentAck or EstablishmentReject").
 //!
 //! One `FixpServer` serves one session. A driver serving several routes each
 //! Negotiate and Establish by session identifier
@@ -509,6 +514,15 @@ impl FixpServer {
             } => {
                 if deadline.is_some_and(|deadline| now >= deadline) {
                     tracing::warn!(%session_id, "fixp server: the application did not answer the Negotiate in time");
+                    // Section 4.2.3 (p. 18): "When a session cannot be
+                    // created, a server must send NegotiationReject".
+                    self.core
+                        .send(SessionMessage::NegotiationReject(NegotiationReject {
+                            session_id,
+                            request_timestamp: request,
+                            code: NegotiationRejectCode::Unspecified,
+                            reason: "negotiation not answered in time".to_owned(),
+                        }));
                     self.core.event(Event::HandshakeTimedOut {
                         stage: HandshakeStage::Negotiation,
                     });
@@ -532,6 +546,15 @@ impl FixpServer {
             } => {
                 if deadline.is_some_and(|deadline| now >= deadline) {
                     tracing::warn!(session_id = %session.id(), "fixp server: the application did not answer the Establish in time");
+                    // Section 4.3 (p. 19): "The response to Establish is
+                    // either EstablishmentAck or EstablishmentReject."
+                    self.core
+                        .send(SessionMessage::EstablishmentReject(EstablishmentReject {
+                            session_id: session.id(),
+                            request_timestamp: request,
+                            code: EstablishmentRejectCode::Unspecified,
+                            reason: "establishment not answered in time".to_owned(),
+                        }));
                     self.core.event(Event::HandshakeTimedOut {
                         stage: HandshakeStage::Establishment,
                     });
@@ -902,26 +925,40 @@ impl FixpServer {
 
     fn on_establish(&mut self, state: ServerState, m: &Establish, now: Instant) -> ServerState {
         match state {
-            // Appendix A 7.1.12.1: Establish without negotiation.
-            ServerState::AwaitingNegotiate { since } => {
+            // Appendix A 7.1.12.1: Establish without negotiation. Section
+            // 6.3 (p. 39) lists it as a protocol violation, after which the
+            // session "should be immediately terminated": the reject goes
+            // out, then the transport is closed at once.
+            ServerState::AwaitingNegotiate { .. } => {
                 self.refuse_establish(
                     m,
                     EstablishmentRejectCode::Unnegotiated,
                     "establish without negotiation",
                 );
-                ServerState::AwaitingNegotiate { since }
+                self.core
+                    .violation_unbound("Establish without a successful negotiation");
+                ServerState::Closed(ClosedReason::ProtocolViolation)
             }
             ServerState::NegotiationPending { .. } => {
                 self.violation(state, "Establish before the negotiation was answered")
             }
             ServerState::Negotiated { session, deadline } => {
                 if m.session_id != session.id() {
+                    // Section 6.3 (p. 39): an Establish for a session that
+                    // was not negotiated is a violation; reject, then close
+                    // this transport. The negotiated session survives it.
                     self.refuse_establish(
                         m,
                         EstablishmentRejectCode::Unnegotiated,
                         "unknown session",
                     );
-                    return ServerState::Negotiated { session, deadline };
+                    self.core
+                        .violation_unbound("Establish for a session not negotiated");
+                    let _ = deadline;
+                    return ServerState::Negotiated {
+                        session,
+                        deadline: None,
+                    };
                 }
                 // Section 4.3.3, Appendix A 7.1.12.4.
                 if !self
@@ -1283,12 +1320,18 @@ mod tests {
         assert_eq!(reject.request_timestamp, Nanotime::from_nanos(42));
         assert!(matches!(
             events(&outputs).as_slice(),
-            [Event::Refused {
-                message: "EstablishmentReject",
-                ..
-            }]
+            [
+                Event::Refused {
+                    message: "EstablishmentReject",
+                    ..
+                },
+                Event::ProtocolViolation { .. }
+            ]
         ));
-        assert_eq!(server.status(), SessionStatus::AwaitingNegotiate);
+        // Section 6.3 (p. 39): the reject, then the transport closes at once.
+        assert!(closes(&outputs));
+        assert_eq!(server.status(), SessionStatus::Closed);
+        assert_eq!(server.poll_timeout(), None);
     }
 
     #[test]
@@ -1297,10 +1340,14 @@ mod tests {
         let (_client, mut server) =
             negotiated_pair(origin, FlowType::Recoverable, FlowType::Recoverable);
         server.handle_message(&establish_message(OTHER_SESSION, 1_000, None), origin);
+        let outputs = drain(&mut server);
         assert_eq!(
-            establishment_reject(&drain(&mut server)).code,
+            establishment_reject(&outputs).code,
             EstablishmentRejectCode::Unnegotiated
         );
+        // Section 6.3 (p. 39): the transport closes at once; the negotiated
+        // session survives it.
+        assert!(closes(&outputs));
         assert_eq!(server.status(), SessionStatus::Negotiated);
     }
 
@@ -1612,6 +1659,15 @@ mod tests {
                 stage: HandshakeStage::Negotiation
             }]
         );
+        // Section 4.2.3 (p. 18): a session that cannot be created is
+        // answered with NegotiationReject, then the transport closes.
+        assert!(matches!(
+            sent(&outputs).as_slice(),
+            [SessionMessage::NegotiationReject(NegotiationReject {
+                code: NegotiationRejectCode::Unspecified,
+                ..
+            })]
+        ));
         assert!(closes(&outputs));
         assert_eq!(negotiating.status(), SessionStatus::Closed);
         // An Establish the application never answers.
@@ -1629,6 +1685,15 @@ mod tests {
                 stage: HandshakeStage::Establishment
             }]
         );
+        // Section 4.3 (p. 19): an Establish is answered with
+        // EstablishmentAck or EstablishmentReject.
+        match sent(&outputs).as_slice() {
+            [SessionMessage::EstablishmentReject(reject)] => {
+                assert_eq!(reject.code, EstablishmentRejectCode::Unspecified);
+                assert_eq!(reject.session_id, SESSION);
+            }
+            other => panic!("expected one EstablishmentReject, got {other:?}"),
+        }
         assert!(closes(&outputs));
         assert_eq!(establishing.status(), SessionStatus::Negotiated);
         assert!(matches!(
