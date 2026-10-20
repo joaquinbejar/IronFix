@@ -170,6 +170,7 @@ impl<R> ReplayJob<R> {
 /// protocol event it records or the decision it answers. `P` names the
 /// driver's payloads ([`SessionPayloads`]).
 pub struct SessionCore<P: SessionPayloads = ()> {
+    phase: Option<SessionPhase>,
     resend: Option<ResendState>,
     held_logon: Option<u64>,
     logout_owed: Option<OwedLogout>,
@@ -191,6 +192,10 @@ impl<P: SessionPayloads> fmt::Debug for SessionCore<P> {
         // Counts only for what may carry counterparty text or frames: the
         // owed Logout's `Text` (58), a `TestReqID` (112), queued frames.
         f.debug_struct("SessionCore")
+            .field(
+                "phase",
+                &self.phase.as_ref().map(SessionPhase::logout_phase),
+            )
             .field("resend", &self.resend)
             .field("held_logon", &self.held_logon)
             .field("logout_owed", &self.logout_owed.is_some())
@@ -228,6 +233,7 @@ impl<P: SessionPayloads> SessionCore<P> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            phase: None,
             resend: None,
             held_logon: None,
             logout_owed: None,
@@ -253,6 +259,47 @@ impl<P: SessionPayloads> SessionCore<P> {
         let mut core = Self::new();
         core.gap_queue = GapQueue::for_policy(policy);
         core
+    }
+
+    // --- Phase ------------------------------------------------------------
+
+    /// Hands the core the session's phase: once the Logon exchange is done,
+    /// and after every event a driver handled with [`Self::take_phase`]. The
+    /// core holds it between events, so the phase a driver reads at the start
+    /// of the next event is the one the last event left.
+    pub fn enter_phase(&mut self, phase: SessionPhase) {
+        debug_assert!(self.phase.is_none(), "one phase per session");
+        self.phase = Some(phase);
+    }
+
+    /// Takes the phase out for an event whose handling consumes the
+    /// typestate. `None` before [`Self::enter_phase`], or after the session
+    /// closed: a closed session never gets its phase back.
+    pub const fn take_phase(&mut self) -> Option<SessionPhase> {
+        self.phase.take()
+    }
+
+    /// The phase, as the last event left it; `None` before
+    /// [`Self::enter_phase`] or while an event holds it.
+    #[must_use]
+    pub const fn phase(&self) -> Option<&SessionPhase> {
+        self.phase.as_ref()
+    }
+
+    /// Whether the session is established with no Logout of its own fed
+    /// ([`SessionPhase::is_active`]); `false` while the phase is out.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        matches!(self.phase, Some(SessionPhase::Active(_)))
+    }
+
+    /// Moves a queued Logout to pending once its last byte is written
+    /// ([`SessionPhase::advance_logout`]), in place; nothing happens while
+    /// the phase is out.
+    pub fn advance_logout(&mut self, take_written: impl FnOnce() -> bool, now: Instant) {
+        if let Some(phase) = self.phase.take() {
+            self.phase = Some(phase.advance_logout(take_written, now));
+        }
     }
 
     // --- Gap recovery -----------------------------------------------------
@@ -929,6 +976,47 @@ pub(crate) mod tests {
                 .send_logon(Instant::now())
                 .on_logon_ack(),
         )
+    }
+
+    #[test]
+    fn test_core_holds_the_phase_between_events() {
+        let mut core = SessionCore::<()>::new();
+        assert!(core.phase().is_none());
+        assert!(!core.is_active());
+        assert!(core.take_phase().is_none());
+        core.enter_phase(active());
+        assert!(core.is_active());
+        let Some(SessionPhase::Active(session)) = core.take_phase() else {
+            panic!("the phase handed in comes back out");
+        };
+        assert!(core.phase().is_none());
+        // An event that queues this session's Logout hands that phase back.
+        core.enter_phase(SessionPhase::LogoutQueued(session));
+        assert!(!core.is_active());
+        let now = Instant::now();
+        core.advance_logout(|| false, now);
+        assert!(matches!(core.phase(), Some(SessionPhase::LogoutQueued(_))));
+        let later = now + Duration::from_secs(1);
+        core.advance_logout(|| true, later);
+        match core.phase() {
+            Some(SessionPhase::LogoutPending(session)) => assert_eq!(session.sent_at(), later),
+            other => panic!("expected LogoutPending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_advance_logout_without_a_phase_never_asks() {
+        let mut core = SessionCore::<()>::new();
+        let mut asked = false;
+        core.advance_logout(
+            || {
+                asked = true;
+                true
+            },
+            Instant::now(),
+        );
+        assert!(!asked);
+        assert!(core.phase().is_none());
     }
 
     fn queueing() -> SessionCore<TestPayloads> {
