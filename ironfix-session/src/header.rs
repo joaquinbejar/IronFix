@@ -249,7 +249,7 @@ impl std::fmt::Display for HeartBtIntProblem {
 /// Parses and bounds the `HeartBtInt` (108) of an inbound Logon.
 ///
 /// The value is adopted by the acceptor and drives a
-/// [`HeartbeatManager`](ironfix_session::HeartbeatManager), so it is validated
+/// [`HeartbeatManager`](crate::HeartbeatManager), so it is validated
 /// at the handshake rather than trusted onto the heartbeat clock. `108 = 0` is
 /// accepted (it is legal FIX and is not specially handled today); anything above
 /// [`MAX_HEARTBEAT_INTERVAL_SECS`] is refused so a crafted value can never
