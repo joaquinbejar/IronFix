@@ -421,3 +421,15 @@ converted at the boundary so paused-clock tests stay deterministic.
   driver for now: they read the decoded message, which the core does not
   see. Additive surface; four core tests; nothing on the wire changes and
   no engine integration test changed.
+
+- **#91 stage 7c (handler split: SequenceReset):** the handler awaits
+  `from_admin` in the middle, so its decisions are two, one on each side of
+  that round trip. `screen_sequence_reset(sequences, gap_fill_flag, seq,
+  poss_dup) -> ResetScreen` runs before the application sees the message
+  (bad 123, gapped / duplicate / too-low / in-sequence fill with its next
+  number, exhausted, Reset mode); `decide_sequence_reset(gap_fill, seq,
+  new_seq_no, expected) -> ResetDecision` runs after it accepted (missing
+  36, a fill that does not advance, a Reset below the expectation, or the
+  new expectation with whether it renumbers and whether it advances). The
+  driver keeps the I/O and the reject texts. Additive surface; two core
+  tests; nothing on the wire changes and no engine integration test changed.

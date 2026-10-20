@@ -319,6 +319,9 @@ use ironfix_session::sans_io::{
     LocalLogoutDecision, LogoutReplyWrite, PeerLogoutDecision, close_resets, decide_local_logout,
     reply_close, settle_close,
 };
+use ironfix_session::sans_io::{
+    ResetDecision, ResetScreen, decide_sequence_reset, screen_sequence_reset,
+};
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_session::{
     Active, HeartbeatManager, SequenceManager, Session, SessionConfig, TestRequestOutcome,
@@ -4477,16 +4480,22 @@ impl<A: Application> Reactor<A> {
         seq: u64,
         frame: &Bytes,
     ) -> Result<Phase, SessionClosed> {
-        // Only Y and N are valid GapFillFlag Booleans. An absent 123 is Reset
-        // mode per spec, but a present-but-malformed value is rejected with
-        // reason 6 (incorrect data format) rather than guessing a mode from an
-        // uninterpretable field. Reset mode's target jump is defined behaviour,
-        // so a malformed value gains no extra power by being read as a Reset --
-        // it is simply not a value we are entitled to interpret.
-        let gap_fill = match raw.get_field_str(123) {
-            Some("Y") => true,
-            Some("N") | None => false,
-            Some(other) => {
+        // The core screens the message before the application sees it; the
+        // driver acts. Only Y and N are valid GapFillFlag Booleans: an absent
+        // 123 is Reset mode per spec, but a present-but-malformed value is
+        // rejected with reason 6 rather than guessing a mode from an
+        // uninterpretable field. A GapFill's MsgSeqNum is classified first:
+        // a gapped fill triggers a ResendRequest (never a Reject the
+        // application asked for) and a too-low duplicate is dropped without
+        // reaching from_admin. Reset mode carries no meaningful MsgSeqNum and
+        // is not classified.
+        let screen =
+            screen_sequence_reset(&self.runtime.sequences, raw.get_field_str(123), seq, || {
+                raw.get_field_str(43) == Some("Y")
+            });
+        let gap_fill = match screen {
+            ResetScreen::BadGapFillFlag => {
+                let other = raw.get_field_str(123).unwrap_or_default();
                 let reason = RejectReason::new(
                     6,
                     format!("GapFillFlag (123) must be Y or N, got '{other}'"),
@@ -4502,77 +4511,61 @@ impl<A: Application> Reactor<A> {
                     )
                     .await;
             }
-        };
-
-        // Classify a Gap Fill's MsgSeqNum before the application sees it. A
-        // gapped fill cannot be trusted to describe the missing range, so it
-        // triggers a ResendRequest -- never a Reject the application asked for
-        // -- and a too-low duplicate is dropped without reaching from_admin.
-        // Reset mode carries no meaningful MsgSeqNum and is not classified.
-        if gap_fill {
-            match classify_inbound(&self.runtime.sequences, seq, || {
-                raw.get_field_str(43) == Some("Y")
-            }) {
-                InboundSequence::Gap { expected, received } => {
-                    // The fill is itself gapped: it cannot be trusted to
-                    // describe the missing range, so NewSeqNo is not applied
-                    // and the range is requested instead. Under the Queue
-                    // policy it is kept and applied in turn, once the gap
-                    // below it is filled.
-                    let phase = self
-                        .request_resend(framed, phase, expected, received)
-                        .await?;
-                    self.queue_gapped(&phase, seq, GapEntry::Frame(frame.clone()));
-                    return Ok(phase);
-                }
-                InboundSequence::Duplicate { expected, .. } => {
-                    // Duplicate delivery of an already-applied fill: it is
-                    // ignored, as FIX requires, even when its NewSeqNo
-                    // reaches past the expectation. Such a fill spans
-                    // numbers this session still lacks, so they are
-                    // re-requested from the expectation, once per expected
-                    // number. Only an Active session re-requests: once this
-                    // session's Logout is out it has stopped asking
-                    // (`begin_logout` cleared recovery), and a request now
-                    // would reopen what it closed (issue #128).
-                    let new_seq_no = raw
-                        .get_field_str(36)
-                        .and_then(|value| value.parse::<u64>().ok());
-                    if let Some(new_seq) = self.core.spanned_rerequest(
-                        expected,
-                        new_seq_no,
-                        matches!(phase, Phase::Active(_)),
-                    ) {
-                        return self
-                            .rerequest_spanned_gap(framed, phase, expected, new_seq)
-                            .await;
-                    }
-                    return Ok(phase);
-                }
-                InboundSequence::TooLow { expected, received } => {
-                    return Err(self
-                        .close_on_too_low(framed, phase, expected, received)
-                        .await);
-                }
-                InboundSequence::InSequence => {
-                    // The fill occupies `seq` whatever happens next (accepted,
-                    // rejected, or carrying an unusable NewSeqNo), so `seq + 1`
-                    // is persisted before `from_admin` sees it, as for every
-                    // other in-sequence message.
-                    let Some(next) = seq.checked_add(1) else {
-                        return Err(exhausted(
-                            phase,
-                            SequenceExhausted {
-                                counter: SequenceCounter::Target,
-                            },
-                        ));
-                    };
-                    if let Err(err) = self.persist_target(next).await {
-                        return Err(self.close_on_store_failure(phase, &err));
-                    }
-                }
+            ResetScreen::GappedFill { expected, received } => {
+                // Under the Queue policy the fill is kept and applied in
+                // turn, once the gap below it is filled.
+                let phase = self
+                    .request_resend(framed, phase, expected, received)
+                    .await?;
+                self.queue_gapped(&phase, seq, GapEntry::Frame(frame.clone()));
+                return Ok(phase);
             }
-        }
+            ResetScreen::DuplicateFill { expected } => {
+                // Ignored, as FIX requires, even when its NewSeqNo reaches
+                // past the expectation; the numbers it spans are re-requested
+                // once per expected number, and only by an Active session:
+                // once this session's Logout is out it has stopped asking
+                // (`begin_logout` cleared recovery), and a request now would
+                // reopen what it closed (issue #128).
+                let new_seq_no = raw
+                    .get_field_str(36)
+                    .and_then(|value| value.parse::<u64>().ok());
+                if let Some(new_seq) = self.core.spanned_rerequest(
+                    expected,
+                    new_seq_no,
+                    matches!(phase, Phase::Active(_)),
+                ) {
+                    return self
+                        .rerequest_spanned_gap(framed, phase, expected, new_seq)
+                        .await;
+                }
+                return Ok(phase);
+            }
+            ResetScreen::TooLowFill { expected, received } => {
+                return Err(self
+                    .close_on_too_low(framed, phase, expected, received)
+                    .await);
+            }
+            ResetScreen::Exhausted => {
+                return Err(exhausted(
+                    phase,
+                    SequenceExhausted {
+                        counter: SequenceCounter::Target,
+                    },
+                ));
+            }
+            ResetScreen::FillInSequence { next } => {
+                // The fill occupies `seq` whatever happens next (accepted,
+                // rejected, or carrying an unusable NewSeqNo), so `seq + 1`
+                // is persisted before `from_admin` sees it, as for every
+                // other in-sequence message.
+                if let Err(err) = self.persist_target(next).await {
+                    return Err(self.close_on_store_failure(phase, &err));
+                }
+                true
+            }
+            ResetScreen::Reset => false,
+        };
 
         // The fill is in sequence (or this is Reset mode): the application may
         // now inspect it.
@@ -4591,23 +4584,19 @@ impl<A: Application> Reactor<A> {
                 .await;
         }
 
-        let Some(new_seq) = raw.get_field_str(36).and_then(|s| s.parse::<u64>().ok()) else {
-            let reason = RejectReason::new(1, "SequenceReset without a valid NewSeqNo (36)")
-                .with_ref_tag(36);
-            // Same hazard as the rejection path above: the fill still occupies
-            // its sequence number even though its NewSeqNo is unusable.
-            if let Err(err) = self.consume_rejected_fill(gap_fill, seq) {
-                return Err(exhausted(phase, err));
+        let new_seq_no = raw.get_field_str(36).and_then(|s| s.parse::<u64>().ok());
+        let expected = self.runtime.sequences.next_target_seq().value();
+        let reason = match decide_sequence_reset(gap_fill, seq, new_seq_no, expected) {
+            ResetDecision::MissingNewSeqNo => {
+                // Same hazard as the rejection path above: the fill still
+                // occupies its sequence number even though its NewSeqNo is
+                // unusable.
+                if let Err(err) = self.consume_rejected_fill(gap_fill, seq) {
+                    return Err(exhausted(phase, err));
+                }
+                RejectReason::new(1, "SequenceReset without a valid NewSeqNo (36)").with_ref_tag(36)
             }
-            return self
-                .send_session_reject(framed, phase, seq, MsgType::SequenceReset.as_str(), &reason)
-                .await;
-        };
-
-        if gap_fill {
-            // The fill was classified as in sequence above; a Gap Fill must
-            // advance past the number it occupies itself.
-            if new_seq <= seq {
+            ResetDecision::FillNotAdvancing { new_seq } => {
                 // The fill was in sequence, so consume it: repeating the
                 // same number would deadlock the session on this message.
                 if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
@@ -4616,66 +4605,48 @@ impl<A: Application> Reactor<A> {
                 // The consumed number is real progress: keep an outstanding
                 // resend from re-requesting it.
                 self.note_inbound_progress();
-                let reason = RejectReason::new(
+                RejectReason::new(
                     5,
                     format!("GapFill NewSeqNo {new_seq} does not advance past MsgSeqNum {seq}"),
                 )
-                .with_ref_tag(36);
-                return self
-                    .send_session_reject(
-                        framed,
-                        phase,
-                        seq,
-                        MsgType::SequenceReset.as_str(),
-                        &reason,
-                    )
-                    .await;
+                .with_ref_tag(36)
             }
-        } else {
-            let expected = self.runtime.sequences.next_target_seq().value();
-            if new_seq < expected {
-                let reason = RejectReason::new(
-                    5,
-                    format!("SequenceReset NewSeqNo {new_seq} is below the expected {expected}"),
-                )
-                .with_ref_tag(36);
-                return self
-                    .send_session_reject(
-                        framed,
-                        phase,
-                        seq,
-                        MsgType::SequenceReset.as_str(),
-                        &reason,
-                    )
-                    .await;
+            ResetDecision::ResetBelowExpected { new_seq, expected } => RejectReason::new(
+                5,
+                format!("SequenceReset NewSeqNo {new_seq} is below the expected {expected}"),
+            )
+            .with_ref_tag(36),
+            ResetDecision::Apply {
+                new_seq,
+                renumbers,
+                advances,
+            } => {
+                // The new expectation is persisted before it takes effect. A
+                // Reset has no place in the sequence, so it reached
+                // `from_admin` before any write; this is its first.
+                if let Err(err) = self.persist_target(new_seq).await {
+                    return Err(self.close_on_store_failure(phase, &err));
+                }
+                self.runtime.sequences.set_target_seq(new_seq);
+                // A Reset renumbers the stream: what was queued above the gap
+                // was numbered before it, so none of it is released. A Gap
+                // Fill keeps the numbering; queued messages it jumped past
+                // are dropped on release.
+                if renumbers {
+                    self.clear_gap_queue("a SequenceReset-Reset renumbered the stream");
+                }
+                // Only a reset that actually advances the expectation touches
+                // an outstanding ResendRequest: one inside the outstanding
+                // range keeps recovery armed against the rest of it, one past
+                // the water mark clears it.
+                if advances {
+                    self.note_inbound_progress();
+                }
+                return Ok(phase);
             }
-        }
-
-        let expected_before = self.runtime.sequences.next_target_seq().value();
-        // The new expectation is persisted before it takes effect. A Reset
-        // has no place in the sequence, so it reached `from_admin` before any
-        // write; this is its first.
-        if let Err(err) = self.persist_target(new_seq).await {
-            return Err(self.close_on_store_failure(phase, &err));
-        }
-        self.runtime.sequences.set_target_seq(new_seq);
-        // A Reset renumbers the stream: what was queued above the gap was
-        // numbered before it, so none of it is released. A Gap Fill keeps the
-        // numbering; queued messages it jumped past are dropped on release.
-        if !gap_fill {
-            self.clear_gap_queue("a SequenceReset-Reset renumbered the stream");
-        }
-        // Only a reset that actually advances the expectation touches an
-        // outstanding ResendRequest. A reset landing on the number we already
-        // expect changes nothing, and reconciling for it would let a peer replay
-        // it to make the engine emit a fresh ResendRequest every round --
-        // sequence amplification with no progress. A reset that advances but
-        // stays inside the outstanding range keeps recovery armed against the
-        // rest of it; one that jumps past the water mark clears it.
-        if new_seq > expected_before {
-            self.note_inbound_progress();
-        }
-        Ok(phase)
+        };
+        self.send_session_reject(framed, phase, seq, MsgType::SequenceReset.as_str(), &reason)
+            .await
     }
 
     /// Answers an inbound ResendRequest (35=2).

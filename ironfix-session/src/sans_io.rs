@@ -467,6 +467,152 @@ pub fn route_inbound(
     }
 }
 
+/// The first decision on an inbound `SequenceReset` (4), before the
+/// application sees it ([`screen_sequence_reset`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ResetScreen {
+    /// `GapFillFlag` (123) is present but neither `Y` nor `N`: a session
+    /// Reject, reason 6 (incorrect data format), `RefTagID` 123.
+    BadGapFillFlag,
+    /// A GapFill above the expectation: it cannot be trusted to describe the
+    /// missing range, so `NewSeqNo` is not applied; the range from
+    /// `expected` is requested, and the fill is queued under
+    /// [`GapPolicy::Queue`](crate::config::GapPolicy::Queue) to apply in turn.
+    GappedFill {
+        /// The start of the gap.
+        expected: u64,
+        /// The fill's own number.
+        received: u64,
+    },
+    /// A possible-duplicate GapFill below the expectation: ignored. Its
+    /// `NewSeqNo` may span numbers still missing ([`spanned_rerequest`]).
+    DuplicateFill {
+        /// The number the session expected.
+        expected: u64,
+    },
+    /// A GapFill below the expectation without `PossDupFlag` (43) = Y: the
+    /// session ends.
+    TooLowFill {
+        /// The number the session expected.
+        expected: u64,
+        /// The fill's own number.
+        received: u64,
+    },
+    /// A GapFill next in sequence: it occupies its number whatever happens
+    /// next, so `next` is persisted before the application sees it.
+    FillInSequence {
+        /// The next inbound number once the fill's is consumed.
+        next: u64,
+    },
+    /// A GapFill next in sequence on the last inbound number: the session
+    /// ends.
+    Exhausted,
+    /// Reset mode (123 = N or absent): no place in the sequence; the
+    /// application sees it next.
+    Reset,
+}
+
+/// Screens an inbound `SequenceReset` (4) carrying `GapFillFlag` (123)
+/// `gap_fill_flag` and number `seq`, before the application sees it.
+///
+/// Only `Y` and `N` are valid; an absent flag is Reset mode. A GapFill is
+/// classified against `sequences` ([`classify_inbound`]); `poss_dup` is read
+/// only for a fill below the expectation. Reset mode carries no meaningful
+/// `MsgSeqNum` and is not classified.
+#[must_use]
+pub fn screen_sequence_reset(
+    sequences: &SequenceManager,
+    gap_fill_flag: Option<&str>,
+    seq: u64,
+    poss_dup: impl FnOnce() -> bool,
+) -> ResetScreen {
+    match gap_fill_flag {
+        Some("Y") => {}
+        Some("N") | None => return ResetScreen::Reset,
+        Some(_) => return ResetScreen::BadGapFillFlag,
+    }
+    match classify_inbound(sequences, seq, poss_dup) {
+        InboundSequence::Gap { expected, received } => {
+            ResetScreen::GappedFill { expected, received }
+        }
+        InboundSequence::Duplicate { expected, .. } => ResetScreen::DuplicateFill { expected },
+        InboundSequence::TooLow { expected, received } => {
+            ResetScreen::TooLowFill { expected, received }
+        }
+        InboundSequence::InSequence => match seq.checked_add(1) {
+            Some(next) => ResetScreen::FillInSequence { next },
+            None => ResetScreen::Exhausted,
+        },
+    }
+}
+
+/// The decision on a `SequenceReset` (4) the application accepted
+/// ([`decide_sequence_reset`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ResetDecision {
+    /// `NewSeqNo` (36) is missing or not a number: a session Reject, reason
+    /// 1 (required tag missing), `RefTagID` 36. An in-sequence GapFill still
+    /// consumes its own number first.
+    MissingNewSeqNo,
+    /// A GapFill whose `NewSeqNo` does not pass its own number: it is
+    /// consumed (repeating the number would deadlock the session), counts as
+    /// progress, and gets a session Reject, reason 5 (value incorrect),
+    /// `RefTagID` 36.
+    FillNotAdvancing {
+        /// The fill's `NewSeqNo`.
+        new_seq: u64,
+    },
+    /// A Reset whose `NewSeqNo` is below the expectation: a session Reject,
+    /// reason 5, `RefTagID` 36; nothing changes.
+    ResetBelowExpected {
+        /// The Reset's `NewSeqNo`.
+        new_seq: u64,
+        /// The number the session expected.
+        expected: u64,
+    },
+    /// The expectation moves to `new_seq`, persisted first.
+    Apply {
+        /// The new inbound expectation.
+        new_seq: u64,
+        /// Reset mode renumbered the stream: nothing queued above a gap is
+        /// released.
+        renumbers: bool,
+        /// The expectation advances: an outstanding recovery is reconciled.
+        /// A reset landing on the number already expected changes nothing,
+        /// so a peer replaying it cannot make the session ask again.
+        advances: bool,
+    },
+}
+
+/// Decides a `SequenceReset` (4) the application accepted: `gap_fill` from
+/// [`screen_sequence_reset`] (a fill is in sequence by then), its number
+/// `seq`, its parsed `NewSeqNo` (36), and the expectation `expected` before
+/// it.
+#[must_use]
+pub const fn decide_sequence_reset(
+    gap_fill: bool,
+    seq: u64,
+    new_seq_no: Option<u64>,
+    expected: u64,
+) -> ResetDecision {
+    let Some(new_seq) = new_seq_no else {
+        return ResetDecision::MissingNewSeqNo;
+    };
+    if gap_fill && new_seq <= seq {
+        return ResetDecision::FillNotAdvancing { new_seq };
+    }
+    if !gap_fill && new_seq < expected {
+        return ResetDecision::ResetBelowExpected { new_seq, expected };
+    }
+    ResetDecision::Apply {
+        new_seq,
+        renumbers: !gap_fill,
+        advances: new_seq > expected,
+    }
+}
+
 /// Whether a duplicate `SequenceReset` (4) GapFill below the expectation must
 /// be followed by a re-request of the numbers it spans.
 ///
@@ -1036,6 +1182,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_screen_sequence_reset_flag_and_classification() {
+        let sequences = sequences_expecting(5);
+        let never = || panic!("43 is read only below the expectation");
+        assert_eq!(
+            screen_sequence_reset(&sequences, Some("X"), 5, never),
+            ResetScreen::BadGapFillFlag
+        );
+        assert_eq!(
+            screen_sequence_reset(&sequences, Some(""), 5, never),
+            ResetScreen::BadGapFillFlag
+        );
+        for flag in [Some("N"), None] {
+            // Reset mode is never classified, whatever its number.
+            for seq in [1, 5, 9] {
+                assert_eq!(
+                    screen_sequence_reset(&sequences, flag, seq, never),
+                    ResetScreen::Reset
+                );
+            }
+        }
+        assert_eq!(
+            screen_sequence_reset(&sequences, Some("Y"), 5, never),
+            ResetScreen::FillInSequence { next: 6 }
+        );
+        assert_eq!(
+            screen_sequence_reset(&sequences, Some("Y"), 8, never),
+            ResetScreen::GappedFill {
+                expected: 5,
+                received: 8
+            }
+        );
+        assert_eq!(
+            screen_sequence_reset(&sequences, Some("Y"), 3, || true),
+            ResetScreen::DuplicateFill { expected: 5 }
+        );
+        assert_eq!(
+            screen_sequence_reset(&sequences, Some("Y"), 3, || false),
+            ResetScreen::TooLowFill {
+                expected: 5,
+                received: 3
+            }
+        );
+        let last = sequences_expecting(u64::MAX);
+        assert_eq!(
+            screen_sequence_reset(&last, Some("Y"), u64::MAX, never),
+            ResetScreen::Exhausted
+        );
+    }
+
+    #[test]
+    fn test_decide_sequence_reset_after_the_application() {
+        // A fill in sequence at 5, expectation still 5.
+        assert_eq!(
+            decide_sequence_reset(true, 5, None, 5),
+            ResetDecision::MissingNewSeqNo
+        );
+        assert_eq!(
+            decide_sequence_reset(true, 5, Some(5), 5),
+            ResetDecision::FillNotAdvancing { new_seq: 5 }
+        );
+        assert_eq!(
+            decide_sequence_reset(true, 5, Some(4), 5),
+            ResetDecision::FillNotAdvancing { new_seq: 4 }
+        );
+        assert_eq!(
+            decide_sequence_reset(true, 5, Some(9), 5),
+            ResetDecision::Apply {
+                new_seq: 9,
+                renumbers: false,
+                advances: true
+            }
+        );
+        // Reset mode: below, on, and past the expectation.
+        assert_eq!(
+            decide_sequence_reset(false, 1, Some(4), 5),
+            ResetDecision::ResetBelowExpected {
+                new_seq: 4,
+                expected: 5
+            }
+        );
+        assert_eq!(
+            decide_sequence_reset(false, 1, Some(5), 5),
+            ResetDecision::Apply {
+                new_seq: 5,
+                renumbers: true,
+                advances: false
+            }
+        );
+        assert_eq!(
+            decide_sequence_reset(false, 1, Some(20), 5),
+            ResetDecision::Apply {
+                new_seq: 20,
+                renumbers: true,
+                advances: true
+            }
+        );
+        assert_eq!(
+            decide_sequence_reset(false, 1, None, 5),
+            ResetDecision::MissingNewSeqNo
+        );
     }
 
     #[test]
