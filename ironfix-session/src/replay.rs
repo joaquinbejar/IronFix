@@ -380,6 +380,9 @@ pub struct ResendReplay {
     reply_cursor: u64,
     read_from: u64,
     store_done: bool,
+    /// Whether the replay has been polled, fed a page or asked about an
+    /// entry: once it has, [`ResendReplay::widen`] may no longer be called.
+    started: bool,
 }
 
 impl ResendReplay {
@@ -400,6 +403,7 @@ impl ResendReplay {
             reply_cursor: begin_seq,
             read_from: begin_seq,
             store_done: !has_store,
+            started: false,
         })
     }
 
@@ -433,9 +437,20 @@ impl ResendReplay {
         self.store_done
     }
 
-    /// Widens a replay that has written nothing yet to also cover `other`'s
-    /// range: from the lower start to the higher end.
+    /// Widens a replay to also cover `other`'s range: from the lower start to
+    /// the higher end.
+    ///
+    /// Only a fresh replay may be widened: one never polled
+    /// ([`ResendReplay::poll_store`]), fed a page ([`ResendReplay::on_page`])
+    /// or asked about an entry ([`ResendReplay::decide_entry`]). Writing
+    /// nothing is not enough: an empty page already marks the store done, and
+    /// widening after it would gap-fill the extension without reading it.
+    /// Debug builds assert this; `other` is only read for its range.
     pub fn widen(&mut self, other: &Self) {
+        debug_assert!(
+            !self.started,
+            "ResendReplay::widen called on a replay that has already started"
+        );
         let begin_seq = self.reply_cursor.min(other.reply_cursor);
         self.reply_cursor = begin_seq;
         self.read_from = begin_seq;
@@ -447,6 +462,7 @@ impl ResendReplay {
     /// frame is waiting: a page read, nothing more from the store, or the
     /// end, with the trailing gap fill.
     pub const fn poll_store(&mut self) -> ReplayStep {
+        self.started = true;
         if !self.store_done {
             if self.read_from > self.end_seq {
                 self.store_done = true;
@@ -477,6 +493,7 @@ impl ResendReplay {
     /// read from just past it; a short or empty page, or a failed read, ends
     /// the store's part.
     pub const fn on_page(&mut self, read: PageRead) {
+        self.started = true;
         match read {
             PageRead::Failed | PageRead::Read { furthest: None, .. } => self.store_done = true,
             PageRead::Read { len, .. } if len < REPLAY_PAGE_LIMIT => self.store_done = true,
@@ -507,6 +524,7 @@ impl ResendReplay {
     ///
     /// A `seq` that does not screen as a candidate is skipped as well.
     pub fn decide_entry(&mut self, seq: u64, verdict: ReplayVerdict) -> ReplayAction {
+        self.started = true;
         if matches!(verdict, ReplayVerdict::GapFill)
             || matches!(self.screen_entry(seq, false), EntryScreen::Skip)
         {
@@ -803,6 +821,23 @@ mod tests {
             job.store_done(),
             "without a store the range is one gap fill"
         );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "already started")]
+    fn test_widen_after_a_page_request_is_refused_in_debug() {
+        let (Some(mut job), Some(other)) =
+            (ResendReplay::new(1, 5, true), ResendReplay::new(1, 9, true))
+        else {
+            panic!("both ranges are valid");
+        };
+        let _ = job.poll_store();
+        job.on_page(PageRead::Read {
+            len: 0,
+            furthest: None,
+        });
+        job.widen(&other);
     }
 
     #[test]
