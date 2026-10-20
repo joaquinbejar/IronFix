@@ -202,6 +202,7 @@ use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::close::CloseReason;
 use crate::connection::{Connection, SessionRuntime, report_handshake};
 use crate::error::EngineError;
+use crate::mismatch::SequenceMismatch;
 use crate::next_expected::{self, NextExpectedPlan};
 use crate::observer::{Capture, FrameObserver};
 use crate::outbound::OutboundPool;
@@ -1148,6 +1149,7 @@ impl<A: Application + 'static> Initiator<A> {
         let Seeded {
             sequences,
             persisted,
+            stored,
         } = match seed_session(self.seed_plan(reset_logon)).await {
             Ok(seeded) => seeded,
             Err(err) => {
@@ -1181,6 +1183,9 @@ impl<A: Application + 'static> Initiator<A> {
         // number expected from the acceptor: the seeded target counter, which
         // is 1 when the Logon declares a reset.
         let logon_seq = runtime.sequences.next_sender_seq().value();
+        // The effective startup target, the baseline of the mismatch report
+        // (ADR-0015): the number the ack is expected to carry.
+        let startup_target = runtime.sequences.next_target_seq().value();
         let next_expected = self
             .config
             .send_next_expected_msg_seq_num
@@ -1372,6 +1377,34 @@ impl<A: Application + 'static> Initiator<A> {
                 return Err(EngineError::LogonRejected {
                     reason: reason.text,
                 });
+            }
+
+            // The ack is accepted: compare its numbers with the state this
+            // session started from, and report a disagreement before the
+            // engine acts on it (issue #80, ADR-0015). Not for an exchange
+            // that carries 141=Y in either direction, and it moves nothing.
+            // A malformed 789 counts as not declared here; it is refused
+            // below as before.
+            if !reset_logon && raw.get_field_str(141) != Some("Y") {
+                let peer_next_expected = if self.config.send_next_expected_msg_seq_num {
+                    next_expected::read_next_expected(&raw)
+                        .ok()
+                        .flatten()
+                        .map(NonZeroU64::get)
+                } else {
+                    None
+                };
+                if let Some(mismatch) = SequenceMismatch::compare(
+                    (logon_seq, startup_target),
+                    stored,
+                    ack_seq,
+                    peer_next_expected,
+                    runtime.sequences.next_sender_seq().value(),
+                ) {
+                    self.application
+                        .on_sequence_mismatch(&session_id, &mismatch)
+                        .await;
+                }
             }
 
             // DefaultApplVerID (1137) on the ack: on a FIXT.1.1 session, a

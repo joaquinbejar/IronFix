@@ -47,6 +47,16 @@
 //! so after a failure a crash can leave the store behind what the
 //! counterparty has seen.
 //!
+//! # Resuming on a standby process
+//!
+//! A store a standby process resumes a session from must also acknowledge a
+//! mutation only once it is durable on the medium the standby reads,
+//! override [`MessageStore::refresh`] to reread that medium (the default is
+//! a no-op), and replicate the counters, the owed-reset marker and the
+//! application watermark together. Fencing a former owner is the
+//! deployment's job, not the store's or the engine's. See
+//! `doc/standby_resume.md` and `doc/adr/0015-standby-session-resume.md`.
+//!
 //! # Mutations take effect in call order, even when a call is dropped
 //!
 //! `ironfix-engine` bounds every call with a timeout, and a timeout drops the

@@ -180,6 +180,7 @@
 use crate::application::{Application, NoOpApplication, RejectReason, SessionId};
 use crate::connection::{Connection, SessionRuntime, report_handshake};
 use crate::error::EngineError;
+use crate::mismatch::SequenceMismatch;
 use crate::next_expected;
 use crate::observer::{Capture, FrameKind, FrameObserver};
 use crate::outbound::OutboundPool;
@@ -211,6 +212,7 @@ use ironfix_session::{
 use ironfix_store::MessageStore;
 use ironfix_transport::CodecError;
 use std::collections::HashSet;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -871,6 +873,7 @@ impl<A: Application + 'static> Acceptor<A> {
         let Seeded {
             sequences,
             persisted,
+            ..
         } = seed_session(self.seed_plan(false)).await?;
         let mut store = self.store.handshake(persisted, self.write_timeout);
         refuse_handshake(
@@ -1684,6 +1687,7 @@ impl<A: Application + 'static> Acceptor<A> {
             let Seeded {
                 sequences,
                 persisted,
+                stored,
             } = match seed_session(self.seed_plan(reset)).await {
                 Ok(seeded) => seeded,
                 Err(err) => {
@@ -1724,6 +1728,31 @@ impl<A: Application + 'static> Acceptor<A> {
                 }
             }
             let reply_heartbeat_secs = requested_heartbeat_secs;
+
+            // The Logon is accepted and the session's counters are chosen:
+            // compare the Logon's numbers with them, and report a
+            // disagreement before the engine acts on it (issue #80,
+            // ADR-0015). Not for an exchange that resets (141=Y in either
+            // direction), and it moves nothing. Our acknowledgement is both
+            // our own Logon number and our next outbound, as ADR-0021 reads
+            // it.
+            if !reset {
+                let effective_sender = runtime.sequences.next_sender_seq().value();
+                if let Some(mismatch) = SequenceMismatch::compare(
+                    (
+                        effective_sender,
+                        runtime.sequences.next_target_seq().value(),
+                    ),
+                    stored,
+                    logon_seq,
+                    declared_next_expected.map(NonZeroU64::get),
+                    effective_sender,
+                ) {
+                    self.application
+                        .on_sequence_mismatch(&session_id, &mismatch)
+                        .await;
+                }
+            }
 
             // NextExpectedMsgSeqNum (789) against the counters the session now
             // runs on: the ack takes the next sender number, so a 789 above it
