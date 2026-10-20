@@ -51,11 +51,23 @@ Constraints any answer keeps:
 - A caller of `decode_into` with a sufficient index decodes without a heap
   allocation; `ironfix-tagvalue/tests/field_index_allocations.rs` proves it
   with `dhat` for a 100-field message.
-- The engine still hands the session layer and the application a
-  `RawMessage`, built from the index with `to_raw_message`. That conversion
-  keeps the `SmallVec<[FieldRef; 32]>` behaviour: inline up to 32 fields, an
-  allocation above. Removing it needs `RawMessage` (or the reactor) to read
-  through the index, which is a larger, breaking change left for later.
+- The engine hands the session layer and the application a `RawMessage`
+  whose field references it does not own. Follow-up of #77:
+  `RawMessage::with_field_slice` builds one over a borrowed slice (additive;
+  `RawMessage::new` keeps the `SmallVec`), `IndexedMessage::to_raw_message_in`
+  fills a caller-owned `Vec<FieldRef>` from the index, and
+  `recycle_field_refs` hands that buffer from one frame's lifetime to the
+  next without freeing it (the standard library collects an empty iterator
+  of a same-sized type back into the same allocation; a tagvalue unit test
+  checks the pointer and capacity survive, and the engine allocation test
+  checks the result). The reactor and the application dispatcher each own
+  one buffer, sized with the index at session start. The allocation matrix
+  measured a 60-field ExecutionReport at 2.1 blocks more than a 12-field
+  one before (a field list in the reactor and one in the dispatcher) and
+  about 0.1 after, none of it a field list. A frame above
+  `max_inbound_fields` still takes the `decode` fallback and its
+  `SmallVec`: refusing it would refuse a legal message the operator sized
+  the index below, and the fallback is bounded by `max_message_size`.
 - The fallback count is internal to the reactor; it is not on the public
   `Connection` surface.
 - The criterion group `tagvalue/decode_index` compares `decode` and

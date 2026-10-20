@@ -1804,6 +1804,13 @@ mod tests {
                 panic!("an indexed message converts to a RawMessage");
             };
             assert_eq!(pairs(raw.field_slice()), pairs(expected.field_slice()));
+            let mut refs = Vec::new();
+            let Ok(borrowed) = actual.to_raw_message_in(&mut refs) else {
+                panic!("an indexed message converts into a lent buffer");
+            };
+            assert_eq!(pairs(borrowed.field_slice()), pairs(expected.field_slice()));
+            assert_eq!(borrowed.msg_type(), expected.msg_type());
+            assert_eq!(borrowed.body(), expected.body());
             assert_eq!(plain.offset(), indexed.offset());
         }
     }
@@ -1820,6 +1827,48 @@ mod tests {
             true,
             &mut index,
         );
+    }
+
+    /// A wide message (100 fields) through a reused index and a recycled
+    /// field buffer: the same fields as `decode`, and the buffer keeps its
+    /// one allocation from frame to frame (issue #77).
+    #[test]
+    fn test_wide_message_into_a_recycled_field_buffer() {
+        let mut body = b"35=8\x01".to_vec();
+        for tag in 1000..1099_u32 {
+            body.extend_from_slice(format!("{tag}=v{tag}\x01").as_bytes());
+        }
+        let frame = build_frame(&body);
+        let mut index = FieldIndex::with_capacity(128);
+        let mut refs: Vec<FieldRef<'static>> = Vec::with_capacity(128);
+        let start = refs.as_ptr().cast::<u8>();
+        for _ in 0..3 {
+            let mut lent = crate::recycle_field_refs(refs);
+            {
+                let mut decoder = Decoder::new(&frame);
+                let Ok(indexed) = decoder.decode_into(&mut index) else {
+                    panic!("the wide frame decodes");
+                };
+                let Ok(raw) = indexed.to_raw_message_in(&mut lent) else {
+                    panic!("the wide frame converts");
+                };
+                assert!(
+                    raw.field_count() > 32,
+                    "wide enough to spill inline storage"
+                );
+                let Ok(plain) = Decoder::new(&frame).decode() else {
+                    panic!("decode");
+                };
+                let pairs = |fields: &[FieldRef<'_>]| -> Vec<(u32, Vec<u8>)> {
+                    fields.iter().map(|f| (f.tag, f.value.to_vec())).collect()
+                };
+                assert_eq!(pairs(raw.field_slice()), pairs(plain.field_slice()));
+            }
+            refs = crate::recycle_field_refs(lent);
+            assert!(refs.is_empty());
+            assert!(refs.capacity() >= 128, "the capacity is kept");
+            assert_eq!(refs.as_ptr().cast::<u8>(), start, "the same allocation");
+        }
     }
 
     #[test]

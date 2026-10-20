@@ -42,9 +42,13 @@ TCP or any caller stream behind its optional `fixp` feature (#96).
   field index; one above the capacity is `DecodeError::TooManyFields`. The
   engine decodes inbound frames into one index per session, sized by
   `SessionConfig::max_inbound_fields` (`doc/adr/0028-bounded-field-index.md`).
-  Only that scratch index is reused: the engine still hands on a `RawMessage`,
-  which allocates for a message above 32 fields, so the inbound path is not
-  allocation-free end to end.
+  The `RawMessage` handed on borrows its field references from a buffer the
+  reactor (and the application dispatcher) lend to each frame
+  (`RawMessage::with_field_slice`, `IndexedMessage::to_raw_message_in`), so a
+  message above 32 fields no longer allocates a field list; the allocation
+  test measures a 60-field message at about 0.1 block more than a 12-field
+  one, none of it a field list. A frame above `max_inbound_fields` still
+  falls back to `decode`, which allocates.
 - **Framing** over a Tokio codec (`FixCodec`) with a bounded read buffer and an
   unconditionally verified trailer. Both engines skip garbled inbound frames (a
   bad `CheckSum` or `BodyLength`, bytes before `8=`, `MsgType` not third) as

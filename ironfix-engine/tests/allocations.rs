@@ -120,7 +120,7 @@
 //! | of which: the `ApplVerID` problem's two owned strings (the code, the accepted versions) | 2 |
 //! | of which, by difference: the reason text formatted from the problem | 5 |
 //! | `FileStore`, per Reject: the target number persisted, the Reject filed, the watermark moved past it (ADR-0030) | 3 |
-//! | `RawMessage` spill (at most 12 fields, 32 held inline) | 0 |
+//! | `RawMessage` spill: none for the 12-field messages (32 held inline); a 60-field message decodes into lent field buffers in the reactor and the dispatcher (issue #77), and costs about 0.1 block more than a narrow one, none of it a field list (2.1 before the buffers) | 0 |
 //! | frame observer | 0 |
 //! | rustls, both endpoints, per order | about 2 |
 //! | rustls, both endpoints, per invalid message and its Reject | about 2.1 |
@@ -877,6 +877,34 @@ fn executions(first: u64, count: u64, invalid: Invalid) -> BytesMut {
     wire
 }
 
+/// Extra body fields of a wide ExecutionReport: with the header and the
+/// trailer it has 60 fields, well above the 32 a `RawMessage` holds inline.
+const WIDE_EXTRA_FIELDS: u32 = 48;
+
+/// `count` valid FIXT.1.1 ExecutionReports from the acceptor, numbered from
+/// `first`, each with [`WIDE_EXTRA_FIELDS`] extra body fields (issue #77).
+fn wide_executions(first: u64, count: u64) -> BytesMut {
+    let extra: Vec<(u32, String)> = (0..WIDE_EXTRA_FIELDS)
+        .map(|offset| (5000 + offset, format!("V{offset}")))
+        .collect();
+    let mut wire = BytesMut::new();
+    for seq in first..first + count {
+        let id = format!("EXEC-{seq:06}");
+        let mut body: Vec<(u32, &str)> = vec![(37, id.as_str()), (17, id.as_str()), (39, "0")];
+        body.extend(extra.iter().map(|(tag, value)| (*tag, value.as_str())));
+        wire.extend_from_slice(&frame_in(
+            "FIXT.1.1",
+            "VENUE",
+            "CLIENT",
+            "8",
+            seq,
+            &[],
+            &body,
+        ));
+    }
+    wire
+}
+
 /// How many of the `count` messages numbered from `first` have an even
 /// `MsgSeqNum`, and so are session-invalid under [`Invalid::EvenSeq`].
 fn even_in(first: u64, count: u64) -> u64 {
@@ -1119,6 +1147,8 @@ struct Matrix<'a> {
     file_live: &'a Window,
     /// Valid inbound application messages, all delivered, no store.
     accepted: &'a Window,
+    /// The same with 60 fields each, above what a `RawMessage` holds inline.
+    wide_accepted: &'a Window,
     /// Session-invalid inbound application messages (a refused `ApplVerID`
     /// (1128)), each answered by the reactor with a Reject, no store.
     rejected: &'a Window,
@@ -1161,6 +1191,7 @@ fn check_matrix(matrix: &Matrix<'_>) {
     let to_app = total(matrix.live);
     let store_order = total(matrix.file_live) - to_app;
     let delivery = total(matrix.accepted);
+    let wide_spill = total(matrix.wide_accepted) - delivery;
     let store_delivered = total(matrix.file_accepted) - delivery;
     let reject = total(matrix.rejected);
     let store_reject = total(matrix.file_rejected) - reject;
@@ -1207,7 +1238,11 @@ fn check_matrix(matrix: &Matrix<'_>) {
             "  FileStore, per Reject (its number, the Reject filed, the watermark): {}",
             per(store_reject, m)
         ),
-        "  RawMessage spill: none (at most 12 fields, 32 inline)".to_string(),
+        format!(
+            "  RawMessage spill, wide messages ({} fields, 32 inline) over narrow ones: {}",
+            WIDE_EXTRA_FIELDS + 12,
+            per(wide_spill, m)
+        ),
         format!(
             "  plain profile (FileStore + observer + session Rejects): sent {}, received {}, \
              rejected {} (35=3 sent by the reactor, none delivered): {plain} blocks, \
@@ -1277,6 +1312,16 @@ fn check_matrix(matrix: &Matrix<'_>) {
             "{name}: {measured} blocks for {m} messages, expected {expected} within {slack}"
         );
     }
+    // A wide message decodes into the lent field buffers of the reactor and
+    // the dispatcher, so it spills nothing (issue #77): before them it cost
+    // two blocks more than a narrow one, a field list in each. What is left,
+    // about 0.1 block per message, was there before them too and is not a
+    // field list; it is bounded here, not named.
+    assert!(
+        wide_spill <= full_m / 4,
+        "a wide message costs {wide_spill} blocks more than a narrow one over {m} messages: \
+         at most a quarter block each, no field list"
+    );
     let tolerance = i128::from(4 * SLACK);
     assert!(
         (plain - predicted).abs() <= tolerance,
@@ -1384,6 +1429,8 @@ fn main() {
     let valid_window = executions(2 + WARM_UP, MESSAGES, Invalid::None);
     let invalid_warm_up = executions(2, WARM_UP, Invalid::All);
     let invalid_window = executions(2 + WARM_UP, MESSAGES, Invalid::All);
+    let wide_warm_up = wide_executions(2, WARM_UP);
+    let wide_window = wide_executions(2 + WARM_UP, MESSAGES);
     let mixed_warm_up_wire = executions(2, WARM_UP, Invalid::EvenSeq);
     let mixed_window_wire = executions(2 + WARM_UP, MESSAGES, Invalid::EvenSeq);
     let empty = BytesMut::new();
@@ -1405,6 +1452,8 @@ fn main() {
     let rejecting = matrix_initiator(app);
     let (app, file_accepted_seen) = Inbound::new();
     let file_accepting = matrix_initiator(app).with_store(accepted_store);
+    let (app, wide_seen) = Inbound::new();
+    let wide_accepting = matrix_initiator(app);
     let (app, file_rejected_seen) = Inbound::new();
     let file_rejecting = matrix_initiator(app).with_store(rejected_store);
     let plain_observer = Arc::new(CountingObserver::default());
@@ -1654,6 +1703,23 @@ fn main() {
             drop(session);
         }
 
+        // Wide valid messages, delivered: the reactor and the dispatcher
+        // decode them into lent field buffers, so they cost what the narrow
+        // ones of the `accepted` window cost (issue #77).
+        let mut session = log_on_with(wide_accepting, matrix_ack()).await;
+        inbound_windows.push(
+            measure_traffic(
+                &mut session,
+                &wide_seen,
+                &mut no_orders,
+                (&wide_warm_up, inbound_only(WARM_UP, 0)),
+                (&wide_window, inbound_only(MESSAGES, 0)),
+            )
+            .await,
+        );
+        session.counter.abort();
+        drop(session);
+
         let mut session = log_on_with(plain, matrix_ack()).await;
         let plain = measure_traffic(
             &mut session,
@@ -1726,15 +1792,21 @@ fn main() {
     });
     let _ = std::fs::remove_dir_all(&store_dir);
     let (file_live, inbound_windows, plain, tls) = matrix;
-    let [accepted, rejected, file_accepted, file_rejected]: [Window; 4] =
-        match inbound_windows.try_into() {
-            Ok(windows) => windows,
-            Err(_) => panic!("four inbound windows"),
-        };
+    let [
+        accepted,
+        rejected,
+        file_accepted,
+        file_rejected,
+        wide_accepted,
+    ]: [Window; 5] = match inbound_windows.try_into() {
+        Ok(windows) => windows,
+        Err(_) => panic!("five inbound windows"),
+    };
     check_matrix(&Matrix {
         live: &live,
         file_live: &file_live,
         accepted: &accepted,
+        wide_accepted: &wide_accepted,
         rejected: &rejected,
         file_accepted: &file_accepted,
         file_rejected: &file_rejected,

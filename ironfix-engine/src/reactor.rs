@@ -301,6 +301,7 @@ use crate::wire::{
 use bytes::{Bytes, BytesMut};
 use futures_util::{FutureExt, Sink, SinkExt, StreamExt};
 use ironfix_core::error::{DecodeError, EncodeError, StoreError};
+use ironfix_core::field::FieldRef;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::Timestamp;
 use ironfix_core::validation::InboundRejection;
@@ -328,7 +329,7 @@ use ironfix_session::{
     Active, HeartbeatManager, SequenceManager, Session, SessionConfig, TestRequestOutcome,
 };
 use ironfix_store::{MessageStore, StoredMessage};
-use ironfix_tagvalue::FieldIndex;
+use ironfix_tagvalue::{FieldIndex, recycle_field_refs};
 use ironfix_transport::{CodecError, FixCodec};
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -1028,6 +1029,11 @@ struct AppDispatcher<A: Application> {
     sink: WatermarkSink,
     /// The watermark last written (or attempted) to the store.
     written: u64,
+    /// The dispatcher's own field index, sized as the reactor's.
+    index: FieldIndex,
+    /// The field references of the message being delivered, lent to each
+    /// one and taken back ([`recycle_field_refs`]); empty between messages.
+    refs: Vec<FieldRef<'static>>,
 }
 
 impl<A: Application> AppDispatcher<A> {
@@ -1058,10 +1064,30 @@ impl<A: Application> AppDispatcher<A> {
     /// rejection it returned, if any. Returns `false` when the dispatcher
     /// must stop: a failed watermark write, or a reactor that is gone.
     async fn deliver(&mut self, AppFrame { frame, seq }: AppFrame) -> bool {
+        // Decoded into a lent field buffer, as the reactor does, so a wide
+        // message allocates no field list here either (issue #77).
+        let mut refs = recycle_field_refs(std::mem::take(&mut self.refs));
+        let delivered = self.deliver_frame(&frame, seq, &mut refs).await;
+        self.refs = recycle_field_refs(refs);
+        delivered
+    }
+
+    /// [`AppDispatcher::deliver`] for `frame`, its field references kept in
+    /// `refs`.
+    async fn deliver_frame<'f>(
+        &mut self,
+        frame: &'f Bytes,
+        seq: u64,
+        refs: &mut Vec<FieldRef<'f>>,
+    ) -> bool {
         // The reactor decoded this frame already; a failure here cannot
         // happen, and inventing a session action for it is not this task's
-        // job.
-        let Ok(raw) = wire::decode_frame(&frame) else {
+        // job. A frame above the index takes the reactor's fallback.
+        let decoded = match wire::decode_frame_into(frame, &mut self.index, refs) {
+            Err(DecodeError::TooManyFields { .. }) => wire::decode_frame(frame),
+            decoded => decoded,
+        };
+        let Ok(raw) = decoded else {
             tracing::warn!(
                 session = %self.session_id,
                 seq,
@@ -2014,6 +2040,9 @@ struct Reactor<A: Application> {
     /// The field index every inbound frame is decoded into, allocated once
     /// with [`SessionConfig::max_inbound_fields`] entries.
     inbound_index: FieldIndex,
+    /// The field references of the frame being handled, lent to each frame
+    /// and taken back ([`recycle_field_refs`]); empty between frames.
+    inbound_refs: Vec<FieldRef<'static>>,
     /// Inbound frames with more fields than `inbound_index` holds, decoded
     /// through the unbounded fallback instead.
     field_index_fallbacks: u64,
@@ -5665,10 +5694,29 @@ impl<A: Application> Reactor<A> {
         // Frozen once: handing an application message to the dispatcher is
         // then a reference-count bump on this buffer, not a copy of it.
         let frame = frame.freeze();
-        let decoded = match wire::decode_frame_into(&frame, &mut self.inbound_index) {
+        // The field references of the decoded message live in a buffer the
+        // reactor lends to each frame and takes back after it, so a message
+        // with more fields than `RawMessage` holds inline allocates no field
+        // list (issue #77).
+        let mut refs = recycle_field_refs(std::mem::take(&mut self.inbound_refs));
+        let result = self.on_frozen_frame(framed, phase, &frame, &mut refs).await;
+        self.inbound_refs = recycle_field_refs(refs);
+        result
+    }
+
+    /// [`Reactor::on_frame`] for a frozen frame, its field references kept
+    /// in `refs`.
+    async fn on_frozen_frame<'f>(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        frame: &'f Bytes,
+        refs: &mut Vec<FieldRef<'f>>,
+    ) -> Result<Phase, SessionClosed> {
+        let decoded = match wire::decode_frame_into(frame, &mut self.inbound_index, refs) {
             Err(DecodeError::TooManyFields { capacity }) => {
                 self.note_field_index_fallback(capacity);
-                wire::decode_frame(&frame)
+                wire::decode_frame(frame)
             }
             decoded => decoded,
         };
@@ -5679,7 +5727,7 @@ impl<A: Application> Reactor<A> {
             // garbled: it is ignored exactly like one the codec skipped, and
             // counts toward the same limit. The log names the defect, never
             // the error's text, which can quote input.
-            Err(err) if wire::decode_is_garbled(&err, &frame) => {
+            Err(err) if wire::decode_is_garbled(&err, frame) => {
                 return self
                     .on_garbled(framed, phase, 1, wire::decode_defect(&err))
                     .await;
@@ -5688,7 +5736,7 @@ impl<A: Application> Reactor<A> {
             // data length, an invalid MsgType value) is not garbled and is
             // not counted toward the limit: it is a message, and gets a
             // session Reject under its positionally read MsgSeqNum.
-            Err(err) => return self.on_malformed(framed, phase, &err, &frame).await,
+            Err(err) => return self.on_malformed(framed, phase, &err, frame).await,
         };
         let msg_type = raw.msg_type().clone();
 
@@ -5751,7 +5799,7 @@ impl<A: Application> Reactor<A> {
             raw.get_field_str(43) == Some("Y")
         }) {
             InboundRoute::SequenceReset => {
-                self.on_sequence_reset(framed, phase, &raw, seq, &frame)
+                self.on_sequence_reset(framed, phase, &raw, seq, frame)
                     .await
             }
             InboundRoute::Admin { next } => {
@@ -5776,7 +5824,7 @@ impl<A: Application> Reactor<A> {
                 self.dispatch_admin(framed, phase, &raw, seq).await
             }
             InboundRoute::App => {
-                self.on_app_in_sequence(framed, phase, &raw, seq, &frame)
+                self.on_app_in_sequence(framed, phase, &raw, seq, frame)
                     .await
             }
             InboundRoute::Exhausted => Err(exhausted(
@@ -6306,8 +6354,11 @@ where
     // `SessionConfig::validate` bounds the knob before a session starts; the
     // `min` keeps a configuration assembled by hand from sizing this
     // allocation past the documented ceiling.
-    let inbound_index =
-        FieldIndex::with_capacity(config.max_inbound_fields.min(MAX_INBOUND_FIELDS));
+    let inbound_fields = config.max_inbound_fields.min(MAX_INBOUND_FIELDS);
+    let inbound_index = FieldIndex::with_capacity(inbound_fields);
+    // Sized with the index, at session start: a frame never has more field
+    // references than the index holds, so the buffer never grows.
+    let inbound_refs = Vec::with_capacity(inbound_fields);
     let writer = Writer::new(config.max_message_size).with_capture(capture);
     // A budget whose tokens come faster than the release timer's resolution
     // keeps its rate only with a burst of a millisecond's worth of tokens.
@@ -6367,6 +6418,8 @@ where
                 owed: Arc::clone(&reset_owed),
             },
             written: opening_mark,
+            index: FieldIndex::with_capacity(inbound_fields),
+            refs: Vec::with_capacity(inbound_fields),
         },
         app_rx,
         marks,
@@ -6396,6 +6449,7 @@ where
         garbled,
         throttle,
         inbound_index,
+        inbound_refs,
         field_index_fallbacks: 0,
     };
 
