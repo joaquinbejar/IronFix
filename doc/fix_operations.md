@@ -1005,7 +1005,7 @@ assumptions, and only those, the suite shows:
 
 | Crash after (application message N outbound, M inbound) | After the restart |
 |---|---|
-| N encoded, before `file_outbound` took effect (with `EveryWrite`, also "before the flush") | Neither frame N nor counter N+1 is durable; the restarted Logon takes N, which never reached the wire. |
+| N encoded, the store cut before `file_outbound` writes anything | Neither frame N nor counter N+1 is durable; the restarted Logon takes N, which never reached the wire. |
 | a non-atomic `file_outbound` (the trait default) stored frame N, before counter N+1 | The counter is never ahead of the frame; N is taken by the restarted Logon and the stored frame replaced. |
 | `file_outbound` took effect, before the socket write | Frame N and counter N+1 are durable; N is never reused; a 789 below the restarted Logon, or a `ResendRequest`, replays the original N with `PossDupFlag` (43) = Y and `OrigSendingTime` (122). |
 | N on the wire | As above; the counterparty holds N once, plus an identical `PossDupFlag` copy when it asks. |
@@ -1015,8 +1015,9 @@ assumptions, and only those, the suite shows:
 | an inbound `SequenceReset`, Reset or GapFill mode | The durable next target is its `NewSeqNo` (36). |
 | an outbound gap fill answering a `ResendRequest` | A later resend still replays the original application frames. |
 
-For a `FileStore` under `SyncPolicy::EveryN` or `SyncPolicy::Never`, the suite
-shows only that a write that returned `Ok` survives a **process** crash. No
+No test intercepts the window between a journal write and its flush: the
+first row cuts the store before the write. For a `FileStore` under
+`SyncPolicy::EveryN` or `SyncPolicy::Never`, the suite shows only that a write that returned `Ok` survives a **process** crash. No
 operating-system crash or power loss is simulated, so nothing here extends the
 `SyncPolicy` documentation for those. The crashes around a reset declared with
 `ResetSeqNumFlag` (141), in both roles, are covered by
@@ -1037,9 +1038,12 @@ stopped before the standby opens the store:
   `OutboundMismatch::PeerAhead`), refuses the Logon with
   `EngineError::NextExpectedMsgSeqNum`, never runs `on_logon`, adopts none of
   the counterparty's numbers and retransmits nothing. Its one frame is the
-  Logout FIX prescribes for a 789 above what was sent, numbered from the
-  standby's own counter: that number is one the counterparty already holds
-  with other content, which no numbering of a refusal can avoid.
+  Logout the FIX Session Layer (§4.4.1) requires when 789 exceeds the next
+  number to be sent, numbered from the standby's own counter, which is left
+  as it is. That number is one the counterparty already holds with other
+  content: the one documented exception to "no number is reused", which no
+  numbering of the refusal can avoid without adopting the counterparty's
+  numbers (ADR-0015).
 - **Incomplete inbound prefix, FIX.4.2.** Without 789 a standby that holds
   every outbound message but not the counterparty's last ones reports the
   inbound gap (`OutboundMismatch::NotDeclared`) and recovers it with a

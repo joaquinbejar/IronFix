@@ -327,56 +327,57 @@ struct Reuse {
     poss_dup: bool,
 }
 
-/// Every reuse of a `MsgSeqNum` in the ledger:
-///
-/// - two originals (no `PossDupFlag`) under one number that differ in
-///   anything but the fields a resend may change;
-/// - a resend (`PossDupFlag` = Y, not a gap fill) whose number carried a
-///   different original;
-/// - a gap fill over a number whose original was an application message.
-fn reuses(ledger: &Ledger) -> Vec<Reuse> {
-    let frames = ledger.frames();
-    let mut originals: BTreeMap<u64, Vec<(u32, Vec<u8>)>> = BTreeMap::new();
-    let mut found = Vec::new();
-    for frame in frames.iter().filter(|frame| !is_poss_dup(frame)) {
-        let seq = number(frame, 34);
-        let body = normalized(frame);
-        match originals.get(&seq) {
-            Some(first) if *first != body => found.push(Reuse {
-                seq,
-                msg_type: field(frame, 35).unwrap_or_default(),
-                poss_dup: false,
-            }),
-            Some(_) => {}
-            None => {
-                originals.insert(seq, body);
-            }
-        }
+/// The anchor of every number: the first copy received under it that is not
+/// a gap fill, whether an original or a replay. A counterparty that first
+/// sees a number as a `PossDupFlag` replay (it never got the original) holds
+/// that replay's content, so every later copy must match it as well.
+fn anchors(frames: &[BytesMut]) -> BTreeMap<u64, BytesMut> {
+    let mut anchors = BTreeMap::new();
+    for frame in frames.iter().filter(|frame| !is_gap_fill(frame)) {
+        anchors
+            .entry(number(frame, 34))
+            .or_insert_with(|| frame.clone());
     }
-    for frame in frames.iter().filter(|frame| is_poss_dup(frame)) {
+    anchors
+}
+
+/// Every reuse of a `MsgSeqNum` in the frames:
+///
+/// - a copy (original or `PossDupFlag` replay, not a gap fill) whose content
+///   differs from the number's anchor in anything but the fields a resend
+///   may change;
+/// - a gap fill whose span (`MsgSeqNum` up to, not including, `NewSeqNo`
+///   (36)) covers a number anchored on an application message, wherever the
+///   gap fill and the anchor fall in the ledger.
+fn reuses_in(frames: &[BytesMut]) -> Vec<Reuse> {
+    let anchors = anchors(frames);
+    let mut found = Vec::new();
+    for frame in frames {
         let seq = number(frame, 34);
-        let Some(original) = originals.get(&seq) else {
-            continue;
-        };
-        let original_type = original
-            .iter()
-            .find(|(tag, _)| *tag == 35)
-            .map(|(_, value)| String::from_utf8_lossy(value).to_string())
-            .unwrap_or_default();
         let changed = if is_gap_fill(frame) {
-            !is_admin(&original_type)
+            (seq..number(frame, 36)).any(|covered| {
+                anchors
+                    .get(&covered)
+                    .is_some_and(|anchor| !is_admin(&field(anchor, 35).unwrap_or_default()))
+            })
         } else {
-            normalized(frame) != *original
+            anchors
+                .get(&seq)
+                .is_some_and(|anchor| normalized(frame) != normalized(anchor))
         };
         if changed {
             found.push(Reuse {
                 seq,
                 msg_type: field(frame, 35).unwrap_or_default(),
-                poss_dup: true,
+                poss_dup: is_poss_dup(frame),
             });
         }
     }
     found
+}
+
+fn reuses(ledger: &Ledger) -> Vec<Reuse> {
+    reuses_in(&ledger.frames())
 }
 
 /// The shared assertion: no frame the counterparty received reuses a
@@ -1055,14 +1056,14 @@ async fn recv_resend(peer: &mut Peer, last: u64) -> Vec<BytesMut> {
     frames
 }
 
-/// Checks a resend answer against the ledger's originals: every number from
-/// `first` to `last` is answered exactly once; an application original comes
-/// back byte-identical apart from the fields a resend may change, with
-/// `OrigSendingTime` (122) equal to the original's `SendingTime` (52); an
-/// administrative original or a number the counterparty never received comes
-/// back as a gap fill or (when the engine holds it) a replay.
+/// Checks a resend answer against the ledger's anchors (see [`anchors`]):
+/// every number from `first` to `last` is answered exactly once; a replay
+/// equals its number's anchor apart from the fields a resend may change, and
+/// keeps the first transmission's time in `OrigSendingTime` (122); a gap
+/// fill covers no number anchored on an application message.
 #[track_caller]
 fn assert_resend(ledger: &Ledger, replies: &[BytesMut], first: u64, last: u64, case: &str) {
+    let anchors = anchors(&ledger.frames());
     let mut covered = BTreeSet::new();
     for reply in replies {
         let seq = number(reply, 34);
@@ -1075,32 +1076,36 @@ fn assert_resend(ledger: &Ledger, replies: &[BytesMut], first: u64, last: u64, c
         } else {
             vec![seq]
         };
-        for covered_seq in span {
+        for covered_seq in &span {
             assert!(
-                covered.insert(covered_seq),
+                covered.insert(*covered_seq),
                 "{case}: {covered_seq} answered twice"
             );
         }
         if is_gap_fill(reply) {
-            for gap_seq in seq..number(reply, 36) {
-                if let Some(original) = ledger.original(gap_seq) {
-                    let original_type = field(&original, 35).unwrap_or_default();
+            for gap_seq in span {
+                if let Some(anchor) = anchors.get(&gap_seq) {
                     assert!(
-                        is_admin(&original_type),
+                        is_admin(&field(anchor, 35).unwrap_or_default()),
                         "{case}: application message {gap_seq} gap-filled"
                     );
                 }
             }
-        } else if let Some(original) = ledger.original(seq) {
+        } else if let Some(anchor) = anchors.get(&seq) {
             assert_eq!(
                 normalized(reply),
-                normalized(&original),
+                normalized(anchor),
                 "{case}: {seq} resent with different content"
             );
+            let first_sent = if is_poss_dup(anchor) {
+                field(anchor, 122)
+            } else {
+                field(anchor, 52)
+            };
             assert_eq!(
                 field(reply, 122),
-                field(&original, 52),
-                "{case}: {seq} OrigSendingTime is the original SendingTime"
+                first_sent,
+                "{case}: {seq} OrigSendingTime is the first transmission's time"
             );
         }
     }
@@ -1109,6 +1114,116 @@ fn assert_resend(ledger: &Ledger, replies: &[BytesMut], first: u64, last: u64, c
         covered, expected,
         "{case}: the resend covers exactly the range"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Negative controls for the shared assertions
+// ---------------------------------------------------------------------------
+
+/// A frame from the engine (VENUE) numbered `seq`, as a replay when
+/// `poss_dup` is set.
+fn engine_frame(msg_type: &str, seq: u64, poss_dup: bool, extra: &[(u32, &str)]) -> BytesMut {
+    let mut encoder = Encoder::new("FIX.4.4");
+    encoder.put_str(35, msg_type);
+    encoder.put_str(49, "VENUE");
+    encoder.put_str(56, "CLIENT");
+    encoder.put_uint(34, seq);
+    let sent = "20261020-10:00:00.000";
+    if poss_dup {
+        encoder.put_str(43, "Y");
+        encoder.put_str(52, "20261020-10:00:05.000");
+        encoder.put_str(122, sent);
+    } else {
+        encoder.put_str(52, sent);
+    }
+    for (tag, value) in extra {
+        encoder.put_str(*tag, value);
+    }
+    let mut out = BytesMut::new();
+    ok(encoder.finish_into(&mut out), "test frame must encode");
+    out
+}
+
+fn ledger_of(frames: &[BytesMut]) -> Ledger {
+    let ledger = Ledger::default();
+    for frame in frames {
+        ledger.push(frame.clone());
+    }
+    ledger
+}
+
+/// Whether `check` panics.
+fn fails(check: impl FnOnce() + std::panic::UnwindSafe) -> bool {
+    std::panic::catch_unwind(check).is_err()
+}
+
+/// Number 2 is first seen as a replay of ORDER-A (the original never
+/// arrived), then again as a replay of ORDER-B: a reuse, with no ordinary
+/// original to compare against.
+#[test]
+fn test_shared_assertions_catch_two_replays_with_different_content() {
+    let a = engine_frame("8", 2, true, &[(17, "ORDER-A")]);
+    let b = engine_frame("8", 2, true, &[(17, "ORDER-B")]);
+    let ledger = ledger_of(&[a.clone(), b.clone()]);
+    assert_eq!(
+        reuses(&ledger),
+        vec![Reuse {
+            seq: 2,
+            msg_type: "8".to_string(),
+            poss_dup: true,
+        }]
+    );
+    let shared = ledger.clone();
+    assert!(fails(move || assert_no_reuse(&shared, "negative control")));
+    let replies = vec![b];
+    assert!(fails(move || assert_resend(
+        &ledger,
+        &replies,
+        2,
+        2,
+        "negative control"
+    )));
+    // The positive control: the same replay twice is no reuse.
+    let ledger = ledger_of(&[a.clone(), a]);
+    assert!(reuses(&ledger).is_empty());
+}
+
+/// A gap fill whose span covers an application message, whether the message
+/// arrived before the gap fill or after it.
+#[test]
+fn test_shared_assertions_catch_a_gap_fill_over_an_application_message() {
+    let logon = engine_frame("A", 1, false, &[(98, "0"), (108, "30")]);
+    let report = engine_frame("8", 2, false, &[(17, "ORDER-2")]);
+    let gap_fill = engine_frame("4", 1, true, &[(123, "Y"), (36, "4")]);
+    for frames in [
+        vec![logon.clone(), report.clone(), gap_fill.clone()],
+        vec![gap_fill.clone(), logon.clone(), report.clone()],
+    ] {
+        let ledger = ledger_of(&frames);
+        assert_eq!(
+            reuses(&ledger),
+            vec![Reuse {
+                seq: 1,
+                msg_type: "4".to_string(),
+                poss_dup: true,
+            }],
+            "{frames:?}"
+        );
+        let shared = ledger.clone();
+        assert!(fails(move || assert_no_reuse(&shared, "negative control")));
+        let replies = vec![gap_fill.clone()];
+        assert!(fails(move || assert_resend(
+            &ledger,
+            &replies,
+            1,
+            3,
+            "negative control"
+        )));
+    }
+    // The positive control: a gap fill over administrative numbers only.
+    let narrow = engine_frame("4", 1, true, &[(123, "Y"), (36, "2")]);
+    let ledger = ledger_of(&[logon, report, narrow]);
+    assert!(reuses(&ledger).is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,8 +1236,8 @@ fn assert_resend(ledger: &Ledger, replies: &[BytesMut], first: u64, last: u64, c
 enum OutboundRow {
     /// Frame encoded, before the counter is updated: the store crashes as
     /// `file_outbound` is called, so neither frame N nor counter N+1 is
-    /// durable. Under `SyncPolicy::EveryWrite` this is also "store write,
-    /// before fsync": `file_outbound` returns only once the write is flushed.
+    /// durable. This is a cut **before** the write: it does not exercise the
+    /// window between a write and its flush, which no test here intercepts.
     BeforeCounter,
     /// A store whose `file_outbound` is the trait default (frame, then
     /// counter) dies between the two: the counter can never be ahead of the
@@ -1372,8 +1487,8 @@ both_stores!(
     OutboundRow::AfterSocket
 );
 
-/// "Store write, before fsync" under the policies that do not flush every
-/// write: a write that returned `Ok` survives a **process** crash (it is in
+/// The policies that do not flush every write: a write that returned `Ok`
+/// survives a **process** crash (it is in
 /// the operating system's hands), so frame N and counter N+1 come back, as
 /// in the "before the socket write" row. What these policies lose on an
 /// operating-system crash is documented on `SyncPolicy` and not simulated.
@@ -2007,7 +2122,8 @@ async fn takeover_incomplete_prefix(version: Version) {
     assert_eq!(mismatch.effective_next_target(), 3, "{case}");
 
     // Nothing is retransmitted, and the counterparty's numbers are not
-    // adopted: the only frame is the refusal FIX prescribes for a 789 above
+    // adopted: the only frame is the refusal FIX Session Layer §4.4.1
+    // requires for a 789 above
     // what was sent, a Logout numbered from the standby's own counter.
     let sent = &ledger.frames()[before..];
     assert!(
