@@ -109,7 +109,11 @@ TCP or any caller stream behind its optional `fixp` feature (#96).
   (10 000 by default) and answers a RetransmitRequest from them; the
   acceptor remembers finalized session identifiers and refuses them.
   Tested end to end in both roles over TCP and an in-memory duplex
-  (`ironfix-engine/tests/fixp_tests.rs`).
+  (`ironfix-engine/tests/fixp_tests.rs`), and by a conformance suite
+  (`ironfix-engine/tests/fixp_conformance_tests.rs`, #97) that drives the
+  engine in both roles from a raw peer writing hand-built SOFH and SBE
+  bytes, each case citing its FIXP v1.1 section and page; the coverage
+  table is in `doc/fixp_operations.md`.
 - **A client engine and a server engine** in `ironfix-engine`. `Initiator`
   dials over TCP and runs the initiator half of the Logon handshake. `Acceptor`
   serves inbound connections for one configured counterparty and runs the
@@ -527,8 +531,8 @@ around it.
 - **The FIXP engine path is minimal.** One session per transport;
   re-establishing an unbound session on a new transport is not driven by
   the engine (the core supports it); sent messages and sequence numbers
-  live in memory only, so a restarted process cannot resume a session; no
-  FIXP conformance suite yet (#97). Of FIXP itself, sending a finalization (this side never sends FinishedSending, so
+  live in memory only, so a restarted process cannot resume a session. Of
+  FIXP itself, sending a finalization (this side never sends FinishedSending, so
   it never starts one), multiplexing several sessions on one
   transport, datagram transports, multicast, WebSocket and session
   persistence across process restarts are not implemented; the application
