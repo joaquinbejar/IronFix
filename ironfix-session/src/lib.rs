@@ -37,6 +37,11 @@
 //!   `NextExpectedMsgSeqNum` (789) on the Logon exchange
 //!   ([`SessionConfig::send_next_expected_msg_seq_num`], FIX.4.4 and
 //!   FIXT.1.1 only); all enforced by `ironfix-engine`
+//! - **Sans-IO core** ([`sans_io`]): the protocol decisions a driver acts on,
+//!   with no I/O, no clock read and no `.await` (ADR-0002, issue #91). Stage 1
+//!   holds the liveness family ([`decide_liveness`], [`logout_timed_out`],
+//!   [`test_request_reply_id`]); the Tokio reactor in `ironfix-engine` is its
+//!   first driver
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
 //! progress". The actual `ResendRequest` / `SequenceReset` / gap-fill message
@@ -44,6 +49,7 @@
 
 pub mod config;
 pub mod heartbeat;
+pub mod sans_io;
 pub mod sequence;
 pub mod state;
 
@@ -53,6 +59,9 @@ pub use config::{
 pub use heartbeat::{
     HeartbeatIntervalError, HeartbeatManager, MAX_HEARTBEAT_INTERVAL_SECS, TestRequestOutcome,
     generate_test_req_id, negotiate_interval,
+};
+pub use sans_io::{
+    LivenessAction, LivenessGate, decide_liveness, logout_timed_out, test_request_reply_id,
 };
 pub use sequence::{SequenceCounter, SequenceExhausted, SequenceManager, SequenceResult};
 pub use state::{
