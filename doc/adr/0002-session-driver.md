@@ -139,3 +139,29 @@ converted at the boundary so paused-clock tests stay deterministic.
   request, the Logout on an abandoned gap, the hold behind a resend). Additive
   public surface only. Remaining stages: resend replay, the Logout handshake,
   the two Logon handshakes, then the driver reduced to I/O and callbacks.
+- **#91 stage 3 (resend replay):** the decisions of answering a
+  `ResendRequest` (2) and the opening replay a `NextExpectedMsgSeqNum` (789)
+  asks for (ADR-0021) moved into `sans_io` (in the private `replay.rs`,
+  re-exported through `sans_io`). `decide_resend_request` validates
+  `BeginSeqNo` (7) and `EndSeqNo` (16) and clamps the range to what was sent,
+  reading infinity through `EndSeqNoInfinity` (moved from the engine's
+  `wire.rs`: `999999` or `0` on FIX 4.0 and 4.1, only `0` later, issue #137);
+  `decide_opening_replay` checks a 789 range. `ResendReplay` walks one range as
+  request/response steps with the driver: `poll_store` asks for a page
+  (`PageRequest`, answered with `on_page(PageRead)`) or completes with the
+  trailing gap fill; per stored entry `screen_entry` skips what is out of
+  range or administrative, and `decide_entry(seq, ReplayVerdict)` turns the
+  driver's rebuild and `to_app_resend` outcome (issue #133) into a
+  `ReplayAction`, so admin messages, holes, unrebuildable frames and vetoes
+  coalesce into one gap fill per run. The bounds of #126 and #128 are core
+  functions over core constants (`replay_step_continues`,
+  `reads_yield_to_replay`, `replay_queue_full`, `hold_full`), and the rebuild's
+  header decisions are `replay_field` and `orig_sending_time` (the `PossDupFlag`
+  (43) and `OrigSendingTime` (122) rule). The driver keeps every effect: the
+  async store read with its timeout and the corrupted-store close, the frame
+  rebuild and encoding, the async replay gate, the writes, and the held
+  output. A test-only transcription of the old reactor loop is checked against
+  the core over 400 synthetic ranges. Additive public surface only; nothing on
+  the wire changes. Remaining stages: the Logout handshake, the two Logon
+  handshakes (including the 789 `plan`, still in the engine), then the driver
+  reduced to I/O and callbacks.

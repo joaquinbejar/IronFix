@@ -38,7 +38,7 @@ use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::Timestamp;
 use ironfix_core::validation::{InboundDefect, InboundRejection};
 use ironfix_core::version::FixVersion;
-use ironfix_session::SessionConfig;
+use ironfix_session::{ReplayField, SessionConfig, orig_sending_time, replay_field};
 use ironfix_tagvalue::{Decoder, Encoder, FieldIndex};
 use std::time::Duration;
 
@@ -1603,7 +1603,8 @@ pub(crate) fn resend_frame(
     // Prefer an existing OrigSendingTime (122): on a resend-of-a-resend it holds
     // the *first* transmission's time, whereas 52 by then is the prior replay's.
     // Falling back to 52 covers the first resend, where no 122 is present yet.
-    let orig_sending_time = precision.narrow(raw.get_field_str(122).unwrap_or(sending_time_52));
+    let orig_sending_time =
+        precision.narrow(orig_sending_time(raw.get_field_str(122), sending_time_52));
     let now = Timestamp::now();
 
     // The rebuilt frame is the original plus 43 and 122; the extra headroom
@@ -1617,20 +1618,23 @@ pub(crate) fn resend_frame(
     let mut index = 0;
     while let Some(field) = fields.get(index) {
         index += 1;
-        match field.tag {
+        // Which header fields are dropped, reinserted or restamped is the
+        // sans-IO core's decision (issue #91, stage 3).
+        match replay_field(field.tag) {
             // BeginString and BodyLength are stamped by `finish`.
-            8 | 9 => {}
+            ReplayField::Framing => {}
             // Re-emitted below, in their standard-header positions. A frame
             // already carrying them is being replayed a second time.
-            43 | 122 => {}
-            52 => {
+            ReplayField::Reinserted => {}
+            ReplayField::SendingTime => {
                 encoder.try_put_raw(43, b"Y")?;
                 precision.with_formatted(now, |sending_time| {
                     encoder.try_put_raw(52, sending_time.as_bytes())
                 })?;
                 encoder.try_put_raw(122, orig_sending_time.as_bytes())?;
             }
-            tag => {
+            ReplayField::Copied => {
+                let tag = field.tag;
                 if let Err(err) = encoder.try_put_raw(tag, field.value) {
                     // The encoder refuses a LENGTH or DATA tag on its own,
                     // because it derives the declared count from the payload
@@ -1721,68 +1725,9 @@ impl PendingMessage {
 }
 
 /// How a session writes and reads the open-ended ("to infinity") `EndSeqNo`
-/// (16) of a ResendRequest (35=2), decided by its FIX version.
-///
-/// FIX 4.0 and FIX 4.1 define infinity as `999999`; FIX 4.2 replaced it with
-/// `0`, which every later version (FIXT.1.1 included) keeps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EndSeqNoInfinity {
-    /// `16=999999`: FIX 4.0 and FIX 4.1.
-    Nines,
-    /// `16=0`: FIX 4.2 and later.
-    Zero,
-}
-
-impl EndSeqNoInfinity {
-    /// The FIX 4.0 / 4.1 open-ended `EndSeqNo`.
-    pub(crate) const NINES: u64 = 999_999;
-
-    /// Returns the convention a session in `version` uses.
-    ///
-    /// The match names every version, so a new [`FixVersion`] does not
-    /// compile until it has been given a convention.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn for_version(version: FixVersion) -> Self {
-        match version {
-            FixVersion::Fix40 | FixVersion::Fix41 => Self::Nines,
-            FixVersion::Fix42
-            | FixVersion::Fix43
-            | FixVersion::Fix44
-            | FixVersion::Fix50
-            | FixVersion::Fix50Sp1
-            | FixVersion::Fix50Sp2
-            | FixVersion::Fixt11 => Self::Zero,
-        }
-    }
-
-    /// The `EndSeqNo` this session writes for an open-ended request.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn sentinel(self) -> u64 {
-        match self {
-            Self::Nines => Self::NINES,
-            Self::Zero => 0,
-        }
-    }
-
-    /// Whether an inbound `EndSeqNo` means "to infinity".
-    ///
-    /// On FIX 4.0 / 4.1 both `999999` and `0` do: a literal `0` cannot name a
-    /// range there (it is below every valid `BeginSeqNo`), so reading it as
-    /// the later versions' sentinel answers rather than rejects a peer that
-    /// mixes conventions. On FIX 4.2 and later only `0` does; `999999` stays a
-    /// literal bound, which the reply clamps to our next outbound number
-    /// anyway, so it is answered in full unless we have sent more than that.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn is_open_ended(self, end_seq: u64) -> bool {
-        match self {
-            Self::Nines => end_seq == Self::NINES || end_seq == 0,
-            Self::Zero => end_seq == 0,
-        }
-    }
-}
+/// (16) of a ResendRequest (35=2): decided by the sans-IO core (issue #91,
+/// stage 3), by FIX version.
+pub(crate) use ironfix_session::EndSeqNoInfinity;
 
 /// Builds outbound messages and frames them with the session header stamped.
 #[derive(Debug)]
@@ -2035,8 +1980,17 @@ impl MessageFactory {
     /// on this session (see [`EndSeqNoInfinity::is_open_ended`]).
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn is_open_ended_end_seq_no(&self, end_seq: u64) -> bool {
-        EndSeqNoInfinity::for_version(self.version).is_open_ended(end_seq)
+        self.end_seq_no_infinity().is_open_ended(end_seq)
+    }
+
+    /// This session's "to infinity" `EndSeqNo` (16) convention, the input the
+    /// sans-IO core's `decide_resend_request` reads it through.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn end_seq_no_infinity(&self) -> EndSeqNoInfinity {
+        EndSeqNoInfinity::for_version(self.version)
     }
 
     /// Builds a SequenceReset-GapFill (35=4, 123=Y) that answers a
