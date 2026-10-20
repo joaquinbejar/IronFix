@@ -61,6 +61,13 @@
 //!   `from_app` is reported as an [`InboundLoss`] span through
 //!   [`Application::on_inbound_lost`], never redelivered. See
 //!   `doc/adr/0030-inbound-loss-report.md`.
+//! - **[`mismatch`]**: the Logon sequence mismatch report. When the
+//!   counterparty's Logon `MsgSeqNum` (34) or `NextExpectedMsgSeqNum` (789)
+//!   disagrees with the counters the session started from, a
+//!   [`SequenceMismatch`] is reported through
+//!   [`Application::on_sequence_mismatch`] before `on_logon`; it moves no
+//!   counter. See `doc/adr/0015-standby-session-resume.md` and
+//!   `doc/standby_resume.md`.
 //! - **[`OutboundMessage`]**: the body you hand to [`Connection::send`]; the
 //!   engine stamps the header, `MsgSeqNum` and trailer.
 //!   [`Connection::acquire`] takes one from the session's bounded pool, to
@@ -253,6 +260,7 @@ mod gap_queue;
 mod garbled;
 pub mod initiator;
 pub mod loss;
+pub mod mismatch;
 mod next_expected;
 pub mod observer;
 pub mod outbound;
@@ -274,6 +282,7 @@ pub use connection::Connection;
 pub use error::EngineError;
 pub use initiator::Initiator;
 pub use loss::{InboundLoss, InboundLossCause};
+pub use mismatch::{InboundMismatch, OutboundMismatch, SequenceMismatch};
 pub use observer::{Direction, FrameKind, FrameObserver, Observation, OutboundResult};
 pub use outbound::{OutboundField, OutboundMessage};
 pub use outcome::{NotSentReason, SendOutcome, UnknownReason};

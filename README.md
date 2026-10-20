@@ -438,6 +438,14 @@ around it.
   (#105, `doc/adr/0030-inbound-loss-report.md`). The span can include
   administrative numbers and a message `from_app` saw just before the crash.
   Inbound frames are not filed.
+- **No standby takeover support beyond a report.** There is no replicated
+  store and no fencing; resuming a session on a standby process is safe
+  only from a store meeting the contract in `doc/standby_resume.md`, opened
+  after the former owner can no longer operate. When the counterparty's
+  Logon `MsgSeqNum` (34) or `NextExpectedMsgSeqNum` (789) disagrees with the
+  counters the session started from, `Application::on_sequence_mismatch`
+  reports it before `on_logon`, and the engine moves no counter (#80,
+  `doc/adr/0015-standby-session-resume.md`).
 - **One session per `Initiator` or `Acceptor`.** `into_initiator()` and
   `into_acceptor()` return `EngineError::Configuration` unless exactly one
   `SessionConfig` was added (`ironfix-engine/src/builder.rs`). Several

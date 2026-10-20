@@ -11,6 +11,7 @@
 
 use crate::close::CloseReason;
 use crate::loss::InboundLoss;
+use crate::mismatch::SequenceMismatch;
 use crate::outbound::OutboundMessage;
 use crate::tls::PeerInfo;
 use async_trait::async_trait;
@@ -287,6 +288,44 @@ pub trait Application: Send + Sync {
             cause = %loss.cause(),
             "inbound messages in MsgSeqNum range first..=last were accepted but may not have \
              reached from_app; they are not redelivered"
+        );
+    }
+
+    /// Called when the numbers of a Logon exchange do not match the state the
+    /// session started from (issue #80, ADR-0015).
+    ///
+    /// Runs at most once per Logon exchange, in both roles: after
+    /// [`Application::from_admin`] has accepted the counterparty's Logon
+    /// (initiator: its acknowledgement) and its `NextExpectedMsgSeqNum` (789)
+    /// has been read, after [`Application::on_inbound_lost`], and before
+    /// [`Application::on_logon`]. It runs only when a comparison differs, and
+    /// never for an exchange that carries `ResetSeqNumFlag` (141) = Y. See
+    /// [`crate::mismatch`] for what is compared.
+    ///
+    /// The report is informational: it never moves a counter, and the engine
+    /// then acts on the exchange exactly as it would without it (a gap is
+    /// recovered, a Logon too low or a 789 above our next outbound closes
+    /// the session with its own error). An application that wants another
+    /// recovery profile logs out through the [`Connection`](crate::Connection)
+    /// once Active, or arranges a reset for the next session.
+    ///
+    /// The default logs the numbers at warn level, nothing else.
+    ///
+    /// # Arguments
+    /// * `session_id` - The session identifier
+    /// * `mismatch` - The effective and stored counters and both comparisons
+    async fn on_sequence_mismatch(&self, session_id: &SessionId, mismatch: &SequenceMismatch) {
+        tracing::warn!(
+            session = %session_id,
+            effective_next_sender = mismatch.effective_next_sender(),
+            effective_next_target = mismatch.effective_next_target(),
+            stored_next_sender = ?mismatch.stored_next_sender(),
+            stored_next_target = ?mismatch.stored_next_target(),
+            peer_logon_seq = mismatch.peer_logon_seq(),
+            peer_next_expected = ?mismatch.peer_next_expected(),
+            inbound = ?mismatch.inbound(),
+            outbound = %mismatch.outbound(),
+            "the Logon exchange does not match the sequence state this session started from"
         );
     }
 

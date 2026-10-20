@@ -1032,6 +1032,10 @@ pub(crate) struct Seeded {
     /// The counter values the store holds, so they are not written back
     /// unchanged.
     pub(crate) persisted: PersistedCounters,
+    /// The (next sender, next target) the attached store held before any
+    /// seed or reset was applied, for the mismatch report (ADR-0015); `None`
+    /// without a store.
+    pub(crate) stored: Option<(u64, u64)>,
 }
 
 /// The inputs [`seed_session`] decides a session's counters from.
@@ -1092,6 +1096,7 @@ pub(crate) async fn seed_session(plan: SeedPlan<'_>) -> Result<Seeded, EngineErr
     let mut persisted = PersistedCounters::default();
 
     if reset {
+        let stored = store.map(|store| (store.next_sender_seq(), store.next_target_seq()));
         if let Some(store) = store {
             if let Err(err) = timed(timeout, store.reset_to(1, 1)).await {
                 tracing::error!(
@@ -1109,6 +1114,7 @@ pub(crate) async fn seed_session(plan: SeedPlan<'_>) -> Result<Seeded, EngineErr
         return Ok(Seeded {
             sequences: SequenceManager::new(),
             persisted,
+            stored,
         });
     }
 
@@ -1134,9 +1140,11 @@ pub(crate) async fn seed_session(plan: SeedPlan<'_>) -> Result<Seeded, EngineErr
                 });
             }
         }
+        let stored = store.map(|store| (store.next_sender_seq(), store.next_target_seq()));
         return Ok(Seeded {
             sequences,
             persisted,
+            stored,
         });
     }
 
@@ -1144,6 +1152,7 @@ pub(crate) async fn seed_session(plan: SeedPlan<'_>) -> Result<Seeded, EngineErr
         return Ok(Seeded {
             sequences: SequenceManager::new(),
             persisted,
+            stored: None,
         });
     };
     refresh(session_id, store, timeout).await?;
@@ -1159,6 +1168,7 @@ pub(crate) async fn seed_session(plan: SeedPlan<'_>) -> Result<Seeded, EngineErr
         persisted.record_target(target);
     }
     Ok(Seeded {
+        stored: Some((sender, target)),
         sequences: SequenceManager::with_initial(
             NonZeroU64::new(sender).unwrap_or(NonZeroU64::MIN),
             NonZeroU64::new(target).unwrap_or(NonZeroU64::MIN),
