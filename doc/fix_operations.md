@@ -991,6 +991,72 @@ number as one record.
 
 Not done: inbound frames are not filed (only the target counter is kept).
 
+**What the crash and takeover gate proves (#89).**
+`ironfix-engine/tests/acceptance_gate_tests.rs` runs both roles over a
+`FileStore` under `SyncPolicy::EveryWrite` and over a `MemoryStore` that
+outlives the engine, always with `StoreFailurePolicy::CloseSession`, on
+FIX.4.2 (no 789), FIX.4.4 and FIXT.1.1 (789 on both sides). A crash kills the
+engine at a named store call and a new engine starts on what the store made
+durable (a `FileStore` dropped without `close` and reopened). The
+counterparty records every frame it receives, and every scenario checks that
+no `MsgSeqNum` ever carries two different messages and that every resent copy
+equals the original apart from 9, 10, 43, 52 and 122. Under those
+assumptions, and only those, the suite shows:
+
+| Crash after (application message N outbound, M inbound) | After the restart |
+|---|---|
+| N encoded, the store cut before `file_outbound` writes anything | Neither frame N nor counter N+1 is durable; the restarted Logon takes N, which never reached the wire. |
+| a non-atomic `file_outbound` (the trait default) stored frame N, before counter N+1 | The counter is never ahead of the frame; N is taken by the restarted Logon and the stored frame replaced. |
+| `file_outbound` took effect, before the socket write | Frame N and counter N+1 are durable; N is never reused; a 789 below the restarted Logon, or a `ResendRequest`, replays the original N with `PossDupFlag` (43) = Y and `OrigSendingTime` (122). |
+| N on the wire | As above; the counterparty holds N once, plus an identical `PossDupFlag` copy when it asks. |
+| M read, before the target write | The engine expects M again and accepts the counterparty's resend; `from_app` sees M once, with `PossDupFlag` (43) = Y. |
+| target write M+1, before `from_app` handled M | M is reported through `on_inbound_lost` before the session is Active, never requested again, never redelivered. |
+| a Heartbeat and an application message `from_app` refused | The durable receive cursor includes both; the restart asks for neither. |
+| an inbound `SequenceReset`, Reset or GapFill mode | The durable next target is its `NewSeqNo` (36). |
+| an outbound gap fill answering a `ResendRequest` | A later resend still replays the original application frames. |
+
+No test intercepts the window between a journal write and its flush: the
+first row cuts the store before the write. For a `FileStore` under
+`SyncPolicy::EveryN` or `SyncPolicy::Never`, the suite shows only that a write that returned `Ok` survives a **process** crash. No
+operating-system crash or power loss is simulated, so nothing here extends the
+`SyncPolicy` documentation for those. The crashes around a reset declared with
+`ResetSeqNumFlag` (141), in both roles, are covered by
+`ironfix-engine/tests/durable_reset_tests.rs` over the same two stores.
+
+*Takeover* (ADR-0015, `doc/standby_resume.md`), with the active process
+stopped before the standby opens the store:
+
+- **Complete prefix.** A standby on the same `FileStore` expects the active's
+  next inbound number (administrative messages included), reports no
+  mismatch, asks for nothing, and answers a `ResendRequest` over the whole
+  session with every original application message byte-identical (as above)
+  and every administrative number gap-filled; in both roles and all three
+  versions.
+- **Incomplete prefix, acceptor, FIX.4.4 and FIXT.1.1.** A standby whose copy
+  of the journal ends before the active's last messages reports both missing
+  ranges through `on_sequence_mismatch` (`InboundMismatch::Gap`,
+  `OutboundMismatch::PeerAhead`), refuses the Logon with
+  `EngineError::NextExpectedMsgSeqNum`, never runs `on_logon`, adopts none of
+  the counterparty's numbers and retransmits nothing. Its one frame is the
+  Logout the FIX Session Layer (§4.4.1) requires when 789 exceeds the next
+  number to be sent, numbered from the standby's own counter, which is left
+  as it is. That number is one the counterparty already holds with other
+  content: the one documented exception to "no number is reused", which no
+  numbering of the refusal can avoid without adopting the counterparty's
+  numbers (ADR-0015).
+- **Incomplete inbound prefix, FIX.4.2.** Without 789 a standby that holds
+  every outbound message but not the counterparty's last ones reports the
+  inbound gap (`OutboundMismatch::NotDeclared`) and recovers it with a
+  `ResendRequest`.
+- **Split brain.** While the active holds the session, a second `FileStore`
+  on the same files fails to open (`StoreError::Io`, the advisory lock), and
+  the active `Acceptor` refuses a duplicate Logon without a reply.
+
+Not proven, and not claimed: any outbound loss without 789 (an initiator's
+Logon, or an acceptor's acknowledgement on FIX.4.2, goes out before the
+counterparty's numbers are known, so a standby missing outbound messages
+reuses a number there); fencing; replication; any failover time.
+
 **Open-ended `EndSeqNo` by version (#137).** When the engine detects an
 inbound gap it requests retransmission with an open-ended `EndSeqNo` (16). FIX
 4.2 introduced `0` for "to infinity"; FIX 4.0 and 4.1 use `999999`. The engine

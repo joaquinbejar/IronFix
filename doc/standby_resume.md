@@ -47,6 +47,18 @@ None of it is checked by the engine.
   its numbers then agree with the standby's and the loss is invisible at
   Logon.
 
+## What is tested
+
+`ironfix-engine/tests/acceptance_gate_tests.rs` (issue #89) resumes sessions
+on a `FileStore` (`SyncPolicy::EveryWrite`, `StoreFailurePolicy::CloseSession`)
+after the active engine has been killed, in both roles. With a complete
+store, the standby continues both sequence streams and replays every original
+application message under its original number. With a copy that ends early,
+an acceptor on FIX.4.4 or FIXT.1.1 reports the missing ranges and refuses the
+Logon, as described below. The results, and their limits, are listed in
+`doc/fix_operations.md` ("What the crash and takeover gate proves"). No
+shared or replicated storage, no fencing and no failover time is tested.
+
 ## Fencing is the deployment's job
 
 The engine does not fence a former owner. Two writers on one session number
