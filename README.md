@@ -481,16 +481,18 @@ around it.
   the end-entity certificate in `PeerInfo` is verified; the rest of the chain
   is what the peer chose to send. No TLS performance figure exists; the
   engine's allocation test counts blocks per frame for TLS, not time.
-- **Async only.** Everything that touches a socket runs on Tokio. There is no
-  synchronous mode, no kernel-bypass path, and no busy-polling transport. A
-  sans-IO session core with Tokio as one driver is the accepted direction
-  (`doc/adr/0002-session-driver.md`, tracked in #90 to #93). The decisions
-  and the per-session decision state live in `ironfix_session::sans_io`
-  (#91), and synchronous counterparts of the callbacks exist
-  (`ironfix_engine::SyncApplication`, `ironfix_store::SyncMessageStore`,
-  implemented by `MemoryStore`, with adapters to the async traits; #92),
-  but the Tokio reactor is still the only driver shipped: there is no
-  non-Tokio driver yet (#93).
+- **One shipped driver.** The engine's `Initiator`, `Acceptor` and
+  `AcceptorRegistry` run on Tokio; there is no kernel-bypass path and no
+  busy-polling transport. The session decisions and their state are a
+  sans-IO core in `ironfix_session::sans_io` (ADR-0002, #91), with
+  synchronous callback traits (`ironfix_engine::SyncApplication`,
+  `ironfix_store::SyncMessageStore`, implemented by `MemoryStore`; #92). A
+  driver without Tokio is shown, not shipped: `fix44_poll_client` is a
+  single-threaded, poll-driven FIX 4.4 initiator over non-blocking
+  `std::net` sockets, built on those pieces in the example crate, and
+  tested against the Tokio `Acceptor` (#93). It is an example: one
+  initiator session, no TLS, no throttle, no gap queue. No latency or
+  throughput figure exists for it.
 - **Only four dictionaries are embedded**: FIX 4.2, FIX 4.4, FIXT 1.1 and
   FIX 5.0 SP2 (`ironfix-dictionary/spec/`, vendored verbatim from QuickFIX).
   FIX 4.0, 4.1, 4.3, 5.0 and 5.0 SP1 require
@@ -869,6 +871,11 @@ Engine and concurrency examples:
 
 - `fix44_engine_client`: the client flow driven by `Initiator`, which owns the
   socket, framing, Logon and heartbeats. Pairs with `fix44_server`.
+- `fix44_poll_client`: the same client flow with no async runtime: a plain
+  poll loop over a non-blocking `std::net` socket drives the sans-IO session
+  core, with the synchronous application and store traits. Pairs with
+  `fix44_server`; `ironfix-example/tests/poll_driver_interop.rs` runs it
+  against the Tokio `Acceptor`, a resend included.
 - `fix44_server_channel`: per-connection reader tasks hand decoded messages to
   a single processor task over an mpsc channel, keeping business logic off the
   read path.

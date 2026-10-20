@@ -480,3 +480,24 @@ converted at the boundary so paused-clock tests stay deterministic.
   under the Tokio acceptor through the adapters and checks that the wire
   matches. Additive surface only; existing async implementations are
   unaffected.
+
+- **#93 (a driver without Tokio):** `ironfix-example/examples/
+  poll_driver/mod.rs` is a single-threaded, poll-driven FIX 4.4 initiator
+  over a non-blocking `std::net::TcpStream`, and `fix44_poll_client` runs it
+  against `fix44_server`. Each `poll(now)` writes what is queued, reads what
+  the socket holds, frames it with `FixCodec` through its synchronous
+  `Decoder` impl, routes each frame with `route_inbound`, answers a
+  `ResendRequest` from a `SyncMessageStore` through `ResendReplay` and the
+  replay gate of a `SyncApplication`, handles a `SequenceReset` with
+  `screen_sequence_reset` / `decide_sequence_reset`, requests gaps through
+  `SessionCore::decide_gap_request`, and runs `SessionCore::decide_tick`.
+  It files every frame with the next sender number before queuing it and
+  persists the target before acting on a message, in the store contract's
+  order. `ironfix-example/tests/poll_driver_interop.rs` runs it against the
+  Tokio `Acceptor`: the Logon, a resend the acceptor asks for (orders
+  replayed with 43=Y, admin messages gap-filled), a new order and the
+  Logout. This answers what stage 6 left open: the decision functions and
+  `SessionCore` are enough to drive a session without Tokio, with the
+  driver sequencing the calls. It is an example, not a second engine: one
+  initiator, no TLS, no throttle, no gap queue, and a session that ends
+  with a Logout on its first protocol error.
