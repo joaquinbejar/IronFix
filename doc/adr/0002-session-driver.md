@@ -408,3 +408,16 @@ converted at the boundary so paused-clock tests stay deterministic.
   surface (`TickInput`, `TickDecision`, `decide_tick`); four core tests
   cover each branch with no socket and no runtime; nothing on the wire
   changes and no engine integration test changed.
+
+- **#91 stage 7b (handler split: inbound routing):** once an inbound frame
+  passed the header checks (MsgSeqNum present, identity, `SendingTime`) and
+  the heartbeat clock saw it, `route_inbound(sequences, msg_type, seq,
+  poss_dup)` decides everything the driver does with it before any I/O:
+  `InboundRoute::{SequenceReset, Admin { next }, App, Duplicate, TooLow,
+  Gap { then }, Exhausted}`, with `GapDisposition::{QueueFrame,
+  KeepNumber, Dispatch}` for a message above the expectation. The reactor's
+  `on_frame` acts on the route (persist and consume an admin number,
+  request the gap, queue or dispatch). The header checks stay in the
+  driver for now: they read the decoded message, which the core does not
+  see. Additive surface; four core tests; nothing on the wire changes and
+  no engine integration test changed.

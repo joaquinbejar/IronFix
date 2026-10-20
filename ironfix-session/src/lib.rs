@@ -115,10 +115,10 @@ pub use sans_io::{
     SessionPayloads, SessionPhase, TickDecision, TickInput,
 };
 pub use sans_io::{
-    GapRequest, InboundSequence, LivenessAction, LivenessGate, RecoveryProgress, ResendState,
-    StallAction, classify_inbound, decide_gap_request, decide_liveness, decide_stall,
-    logout_timed_out, merged_high_water, note_inbound_progress, spanned_high_water,
-    spanned_rerequest, test_request_reply_id,
+    GapDisposition, GapRequest, InboundRoute, InboundSequence, LivenessAction, LivenessGate,
+    RecoveryProgress, ResendState, StallAction, classify_inbound, decide_gap_request,
+    decide_liveness, decide_stall, logout_timed_out, merged_high_water, note_inbound_progress,
+    route_inbound, spanned_high_water, spanned_rerequest, test_request_reply_id,
 };
 pub use sans_io::{
     LocalLogoutDecision, LocalLogoutReason, LogoutClose, LogoutPhase, LogoutReplyWrite,

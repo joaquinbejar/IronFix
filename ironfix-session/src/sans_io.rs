@@ -191,6 +191,7 @@ use crate::config::SessionConfig;
 use crate::heartbeat::HeartbeatManager;
 use crate::sequence::{SequenceManager, SequenceResult};
 use crate::state::{LogoutPending, Session};
+use ironfix_core::message::MsgType;
 use std::time::{Duration, Instant};
 
 /// What the driver's output allows a liveness check to add to it.
@@ -362,6 +363,105 @@ pub fn classify_inbound(
             }
         }
         SequenceResult::Gap { expected, received } => InboundSequence::Gap { expected, received },
+    }
+}
+
+/// Where an inbound message goes once its header passed the identity and
+/// `SendingTime` checks and the heartbeat clock saw it ([`route_inbound`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundRoute {
+    /// A `SequenceReset` (4): it has its own rules, whatever its number.
+    SequenceReset,
+    /// An admin message next in sequence. The driver persists `next` as the
+    /// expected inbound number, consumes the number, then acts on the
+    /// message, so any reply is numbered against the advanced expectation.
+    Admin {
+        /// The next inbound number once this one is consumed.
+        next: u64,
+    },
+    /// An application message next in sequence: its version is checked and
+    /// it is delivered or rejected.
+    App,
+    /// A possible duplicate below the expectation: ignored.
+    Duplicate,
+    /// Below the expectation without `PossDupFlag` (43) = Y: the session ends.
+    TooLow {
+        /// The number the session expected.
+        expected: u64,
+        /// The number the message carried.
+        received: u64,
+    },
+    /// Above the expectation: the gap from `expected` is requested, then
+    /// the message is handled as `then` says.
+    Gap {
+        /// The number the session expected: the start of the gap.
+        expected: u64,
+        /// The number the message carried.
+        received: u64,
+        /// What happens to the message once the gap is requested.
+        then: GapDisposition,
+    },
+    /// The message is next in sequence but the inbound counter has no
+    /// number after it: the session ends.
+    Exhausted,
+}
+
+/// What happens to a message above the expectation once its gap is
+/// requested ([`InboundRoute::Gap`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapDisposition {
+    /// An application message: it will be resent in order, and under
+    /// [`GapPolicy::Queue`](crate::config::GapPolicy::Queue) this copy is
+    /// queued and released once the gap is filled. It is not acted on now.
+    QueueFrame,
+    /// An admin message other than a Logout: acted on now without advancing
+    /// the expectation, its number kept in the gap queue to be consumed in
+    /// turn. A copy of a number already kept is dropped instead.
+    KeepNumber,
+    /// A Logout: acted on now; it empties the gap queue.
+    Dispatch,
+}
+
+/// Routes an inbound message of type `msg_type` and number `seq` against
+/// `sequences` ([`classify_inbound`]), deciding everything the driver does
+/// with it before any I/O.
+///
+/// `poss_dup` reports whether the message carries `PossDupFlag` (43) = Y; it
+/// is called only for a number below the expectation.
+#[must_use]
+pub fn route_inbound(
+    sequences: &SequenceManager,
+    msg_type: &MsgType,
+    seq: u64,
+    poss_dup: impl FnOnce() -> bool,
+) -> InboundRoute {
+    if *msg_type == MsgType::SequenceReset {
+        return InboundRoute::SequenceReset;
+    }
+    match classify_inbound(sequences, seq, poss_dup) {
+        InboundSequence::InSequence if msg_type.is_admin() => match seq.checked_add(1) {
+            Some(next) => InboundRoute::Admin { next },
+            None => InboundRoute::Exhausted,
+        },
+        InboundSequence::InSequence => InboundRoute::App,
+        InboundSequence::Duplicate { .. } => InboundRoute::Duplicate,
+        InboundSequence::TooLow { expected, received } => {
+            InboundRoute::TooLow { expected, received }
+        }
+        InboundSequence::Gap { expected, received } => {
+            let then = if msg_type.is_app() {
+                GapDisposition::QueueFrame
+            } else if *msg_type == MsgType::Logout {
+                GapDisposition::Dispatch
+            } else {
+                GapDisposition::KeepNumber
+            };
+            InboundRoute::Gap {
+                expected,
+                received,
+                then,
+            }
+        }
     }
 }
 
@@ -934,6 +1034,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_route_inbound_in_sequence_and_below() {
+        let sequences = sequences_expecting(5);
+        assert_eq!(
+            route_inbound(&sequences, &MsgType::Heartbeat, 5, || false),
+            InboundRoute::Admin { next: 6 }
+        );
+        assert_eq!(
+            route_inbound(&sequences, &MsgType::NewOrderSingle, 5, || false),
+            InboundRoute::App
+        );
+        assert_eq!(
+            route_inbound(&sequences, &MsgType::NewOrderSingle, 3, || true),
+            InboundRoute::Duplicate
+        );
+        assert_eq!(
+            route_inbound(&sequences, &MsgType::Heartbeat, 3, || false),
+            InboundRoute::TooLow {
+                expected: 5,
+                received: 3
+            }
+        );
+    }
+
+    #[test]
+    fn test_route_inbound_sequence_reset_whatever_its_number() {
+        let sequences = sequences_expecting(5);
+        for seq in [1, 5, 9] {
+            assert_eq!(
+                route_inbound(&sequences, &MsgType::SequenceReset, seq, || {
+                    panic!("a SequenceReset never reads 43 here")
+                }),
+                InboundRoute::SequenceReset
+            );
+        }
+    }
+
+    #[test]
+    fn test_route_inbound_gap_disposition_by_type() {
+        let sequences = sequences_expecting(5);
+        let gap = |msg_type: MsgType| route_inbound(&sequences, &msg_type, 8, || false);
+        let then = |route| match route {
+            InboundRoute::Gap {
+                expected: 5,
+                received: 8,
+                then,
+            } => then,
+            other => panic!("expected a gap from 5 to 8, got {other:?}"),
+        };
+        assert_eq!(
+            then(gap(MsgType::NewOrderSingle)),
+            GapDisposition::QueueFrame
+        );
+        assert_eq!(then(gap(MsgType::Heartbeat)), GapDisposition::KeepNumber);
+        assert_eq!(then(gap(MsgType::TestRequest)), GapDisposition::KeepNumber);
+        assert_eq!(then(gap(MsgType::Logout)), GapDisposition::Dispatch);
+    }
+
+    #[test]
+    fn test_route_inbound_exhausted_at_the_last_number() {
+        let sequences = sequences_expecting(u64::MAX);
+        assert_eq!(
+            route_inbound(&sequences, &MsgType::Heartbeat, u64::MAX, || false),
+            InboundRoute::Exhausted
+        );
+        // An application message's number is consumed by its own path.
+        assert_eq!(
+            route_inbound(&sequences, &MsgType::NewOrderSingle, u64::MAX, || false),
+            InboundRoute::App
+        );
     }
 
     #[test]
