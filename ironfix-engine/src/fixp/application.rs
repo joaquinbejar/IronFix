@@ -129,10 +129,12 @@ impl std::fmt::Debug for FixpInbound {
 /// the driver stops reading the transport (backpressure) but keeps sending,
 /// answering commands and running its timers.
 ///
-/// `on_negotiate` and `on_establish` are awaited by the driver itself: the
-/// session has no handle yet, and the handshake waits for the answer
-/// (bounded by the handshake timeout). They must not wait on work that needs
-/// this session's handshake to finish.
+/// `on_negotiate` and `on_establish` each run in a task of their own while
+/// the driver keeps reading and running the core's handshake deadline
+/// (`FixpConfig::handshake_timeout`). If that deadline lapses or the
+/// counterparty disconnects first, the task is aborted, the transport is
+/// closed and the acceptor releases the session id; a late answer is
+/// dropped. The session has no handle yet, so they cannot wait on it.
 #[async_trait]
 pub trait FixpApplication: Send + Sync + 'static {
     /// A client asks to negotiate a session (server role only).

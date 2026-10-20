@@ -130,8 +130,9 @@ enum Written {
 /// session's [`FixpConnection`]: `on_established`, `on_message`, `on_event`
 /// and `on_closed` run, in order, in a separate task, so they may await
 /// `send`, `terminate` or `wait_closed` on it. The handshake decisions
-/// (`on_negotiate`, `on_establish`) are awaited inline: the session has no
-/// handle yet, so they cannot wait on this driver.
+/// (`on_negotiate`, `on_establish`) are not callbacks of this queue: each
+/// runs in a task of its own ([`PendingDecision`]), under the core's
+/// handshake deadline, and is aborted when the transport closes.
 enum Callback {
     Established(FixpConnection),
     Message(SessionId, FixpInbound),
