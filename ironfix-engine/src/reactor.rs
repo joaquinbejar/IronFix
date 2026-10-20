@@ -307,12 +307,13 @@ use ironfix_core::version::FixVersion;
 use ironfix_session::config::MAX_INBOUND_FIELDS;
 use ironfix_session::heartbeat::generate_test_req_id;
 use ironfix_session::sans_io::{
-    EntryScreen, GapAdmission, GapEntry, GapRequest, HeldEntry, HeldLogonRelease, InboundSequence,
-    LivenessAction, LivenessGate, OpeningReplay, PageRead, PageRequest, ReplayAction, ReplayJob,
-    ReplayStep, ReplayVerdict, ResendRequestDecision, SessionCore, SessionPayloads,
-    SessionPhase as Phase, StallAction, ThrottleAdmission, ThrottleRelease, TickDecision,
-    TickInput, classify_inbound, decide_liveness, decide_opening_replay, decide_resend_request,
-    replay_step_continues, spanned_high_water, test_request_reply_id,
+    EntryScreen, GapAdmission, GapDisposition, GapEntry, GapRequest, HeldEntry, HeldLogonRelease,
+    InboundRoute, InboundSequence, LivenessAction, LivenessGate, OpeningReplay, PageRead,
+    PageRequest, ReplayAction, ReplayJob, ReplayStep, ReplayVerdict, ResendRequestDecision,
+    SessionCore, SessionPayloads, SessionPhase as Phase, StallAction, ThrottleAdmission,
+    ThrottleRelease, TickDecision, TickInput, classify_inbound, decide_liveness,
+    decide_opening_replay, decide_resend_request, replay_step_continues, route_inbound,
+    spanned_high_water, test_request_reply_id,
 };
 use ironfix_session::sans_io::{
     LocalLogoutDecision, LogoutReplyWrite, PeerLogoutDecision, close_resets, decide_local_logout,
@@ -5773,77 +5774,79 @@ impl<A: Application> Reactor<A> {
             TestRequestOutcome::NonePending => {}
         }
 
-        if msg_type == MsgType::SequenceReset {
-            return self
-                .on_sequence_reset(framed, phase, &raw, seq, &frame)
-                .await;
-        }
-
-        match classify_inbound(&self.runtime.sequences, seq, || {
+        // The core routes the message; the driver acts on the route.
+        match route_inbound(&self.runtime.sequences, &msg_type, seq, || {
             raw.get_field_str(43) == Some("Y")
         }) {
-            InboundSequence::InSequence => {
-                if msg_type.is_admin() {
-                    // The receive cursor includes this message before it is
-                    // acted on, so a restart never asks for it again; and the
-                    // in-memory expectation moves only once that write has
-                    // been accepted, as for an application message.
-                    let Some(next) = seq.checked_add(1) else {
-                        return Err(exhausted(
-                            phase,
-                            SequenceExhausted {
-                                counter: SequenceCounter::Target,
-                            },
-                        ));
-                    };
-                    if let Err(err) = self.persist_target(next).await {
-                        return Err(self.close_on_store_failure(phase, &err));
-                    }
-                    // Consume the number before the admin handler runs: any
-                    // reply it sends is numbered against the advanced
-                    // expectation, and admin messages never queue.
-                    if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
-                        return Err(exhausted(phase, err));
-                    }
-                    // An in-order message advances recovery but does not
-                    // necessarily end it: clear the marker only once the whole
-                    // outstanding range is filled, never on the first message
-                    // back.
-                    self.note_inbound_progress();
-                    self.dispatch_admin(framed, phase, &raw, seq).await
-                } else {
-                    self.on_app_in_sequence(framed, phase, &raw, seq, &frame)
-                        .await
-                }
+            InboundRoute::SequenceReset => {
+                self.on_sequence_reset(framed, phase, &raw, seq, &frame)
+                    .await
             }
+            InboundRoute::Admin { next } => {
+                // The receive cursor includes this message before it is
+                // acted on, so a restart never asks for it again; and the
+                // in-memory expectation moves only once that write has been
+                // accepted, as for an application message.
+                if let Err(err) = self.persist_target(next).await {
+                    return Err(self.close_on_store_failure(phase, &err));
+                }
+                // Consume the number before the admin handler runs: any
+                // reply it sends is numbered against the advanced
+                // expectation, and admin messages never queue.
+                if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
+                    return Err(exhausted(phase, err));
+                }
+                // An in-order message advances recovery but does not
+                // necessarily end it: clear the marker only once the whole
+                // outstanding range is filled, never on the first message
+                // back.
+                self.note_inbound_progress();
+                self.dispatch_admin(framed, phase, &raw, seq).await
+            }
+            InboundRoute::App => {
+                self.on_app_in_sequence(framed, phase, &raw, seq, &frame)
+                    .await
+            }
+            InboundRoute::Exhausted => Err(exhausted(
+                phase,
+                SequenceExhausted {
+                    counter: SequenceCounter::Target,
+                },
+            )),
             // Duplicate delivery of an already-processed message.
-            InboundSequence::Duplicate { .. } => Ok(phase),
-            InboundSequence::TooLow { expected, received } => Err(self
+            InboundRoute::Duplicate => Ok(phase),
+            InboundRoute::TooLow { expected, received } => Err(self
                 .close_on_too_low(framed, phase, expected, received)
                 .await),
-            InboundSequence::Gap { expected, received } => {
+            InboundRoute::Gap {
+                expected,
+                received,
+                then,
+            } => {
                 let phase = self
                     .request_resend(framed, phase, expected, received)
                     .await?;
-                if msg_type.is_app() {
+                match then {
                     // Application messages inside a gap will be resent in
                     // order; under the Queue policy this copy is kept and
-                    // released once the gap is filled. Admin messages are
-                    // still processed below (without advancing the target
-                    // sequence), and under Queue their number is kept to be
-                    // consumed in turn, except a Logout's: it empties the
-                    // queue.
-                    self.queue_gapped(&phase, seq, GapEntry::Frame(frame.clone()));
-                    return Ok(phase);
+                    // released once the gap is filled.
+                    GapDisposition::QueueFrame => {
+                        self.queue_gapped(&phase, seq, GapEntry::Frame(frame.clone()));
+                        Ok(phase)
+                    }
+                    // Admin messages are still processed (without advancing
+                    // the target sequence), and under Queue their number is
+                    // kept to be consumed in turn. A copy of a number
+                    // already held is dropped, not acted on a second time.
+                    GapDisposition::KeepNumber => {
+                        if self.queue_gapped(&phase, seq, GapEntry::Processed) {
+                            return Ok(phase);
+                        }
+                        self.dispatch_admin(framed, phase, &raw, seq).await
+                    }
+                    // A Logout empties the queue.
+                    GapDisposition::Dispatch => self.dispatch_admin(framed, phase, &raw, seq).await,
                 }
-                if msg_type != MsgType::Logout
-                    && self.queue_gapped(&phase, seq, GapEntry::Processed)
-                {
-                    // A copy of a number already held: dropped, not acted
-                    // on a second time.
-                    return Ok(phase);
-                }
-                self.dispatch_admin(framed, phase, &raw, seq).await
             }
         }
     }
