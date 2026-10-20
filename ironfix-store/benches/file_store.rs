@@ -27,8 +27,10 @@
 //!   a cold `get_range` on a store reopened before each call;
 //! - `set_next_sender_seq` under each `SyncPolicy`, and the in-memory reads
 //!   `next_sender_seq` and `next_target_seq`;
-//! - `set_next_target_seq` on a store with an automatic compaction threshold,
-//!   so the writes periodically trigger a compaction on the writer thread;
+//! - `file_outbound` re-filing the same 64 sequence numbers on a store with an
+//!   automatic compaction threshold, so the superseded frame records
+//!   periodically trigger a compaction on the writer thread; an untimed check
+//!   first asserts that a compaction does happen;
 //! - `file_outbound` and `set_next_target_seq` under `SyncPolicy::EveryWrite`
 //!   on a fresh directory per iteration (`*_fresh`), so the cost of a flush is
 //!   not skewed by a journal that grows across the whole run;
@@ -36,7 +38,7 @@
 //!
 //! The journals live in the directory named by the `IRONFIX_BENCH_DIR`
 //! environment variable, or in the system temporary directory when it is not
-//! set; the chosen directory is printed to stderr once. What a flush costs
+//! set. What a flush costs
 //! depends on the file system and device behind it. This harness only makes
 //! measurement possible. It records no baseline and asserts no latency or
 //! throughput figure: run `make bench` to obtain numbers on your own hardware.
@@ -63,17 +65,47 @@ const PAGE: usize = 256;
 /// auto-compaction benchmark.
 const AUTO_COMPACT_BYTES: u64 = 64 * 1024;
 
+/// Sequence numbers the auto-compaction benchmark re-files in turn.
+const OVERWRITE_SEQS: u64 = 64;
+
+/// Writes the auto-compaction benchmark may make, untimed, before the check
+/// that an automatic compaction happened gives up.
+const AUTO_COMPACT_PROBE_WRITES: u64 = 10_000;
+
 /// Environment variable naming the directory the journals live in.
 const BENCH_DIR_VAR: &str = "IRONFIX_BENCH_DIR";
 
-/// The root directory for every benchmark journal, chosen and reported once.
+/// The root directory for every benchmark journal, chosen once.
 fn bench_root() -> &'static PathBuf {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let root = std::env::var_os(BENCH_DIR_VAR).map_or_else(std::env::temp_dir, PathBuf::from);
-        eprintln!("ironfix-store benches: journals in {}", root.display());
-        root
+        std::env::var_os(BENCH_DIR_VAR).map_or_else(std::env::temp_dir, PathBuf::from)
     })
+}
+
+/// Checks, outside the timed region, that `write` makes the store compact
+/// its journal on its own: a compaction writes a new journal and renames it
+/// into place, so the journal's inode changes or its size drops.
+fn assert_auto_compacts(journal: &std::path::Path, mut write: impl FnMut(u64), next: &AtomicU64) {
+    let identity = |path: &std::path::Path| {
+        let meta = ok(std::fs::metadata(path), "journal metadata");
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+        #[cfg(not(unix))]
+        let inode = 0_u64;
+        (inode, meta.len())
+    };
+    write(next.fetch_add(1, Ordering::Relaxed));
+    let (inode, mut size) = identity(journal);
+    for _ in 0..AUTO_COMPACT_PROBE_WRITES {
+        write(next.fetch_add(1, Ordering::Relaxed));
+        let (now_inode, now_size) = identity(journal);
+        if now_inode != inode || now_size < size {
+            return;
+        }
+        size = now_size;
+    }
+    panic!("no automatic compaction after {AUTO_COMPACT_PROBE_WRITES} overwriting writes");
 }
 
 /// Fails the benchmark setup with context.
@@ -198,25 +230,29 @@ fn bench_writes(c: &mut Criterion) {
         ok(rt.block_on(store.close()), "close");
     }
 
-    // Counter writes supersede earlier counter records, so this store crosses
-    // its compaction threshold periodically and compacts on its writer thread.
+    // Re-filing the same few sequence numbers supersedes the earlier frame
+    // records, so this store crosses its compaction threshold periodically
+    // and compacts on its writer thread. Counter writes would not: they
+    // overwrite the checkpoint slots in place and leave no superseded bytes.
     let dir = BenchDir::new("write-auto-compact");
-    let store = ok(
-        rt.block_on(FileStore::open(dir.config_with_compaction(
-            SyncPolicy::Never,
-            Some(AUTO_COMPACT_BYTES),
-        ))),
-        "open",
-    );
-    let seq = AtomicU64::new(1);
-    group.bench_function("set_next_target_seq_auto_compact/never", |b| {
-        b.iter(|| {
-            let at = seq.fetch_add(1, Ordering::Relaxed);
-            ok(
-                rt.block_on(store.set_next_target_seq(black_box(at))),
-                "set_next_target_seq",
-            );
-        });
+    let config = dir.config_with_compaction(SyncPolicy::Never, Some(AUTO_COMPACT_BYTES));
+    let journal = config.journal_path();
+    let store = ok(rt.block_on(FileStore::open(config)), "open");
+    let payload = frame(1);
+    let next = AtomicU64::new(0);
+    let overwrite = |store: &FileStore, i: u64| {
+        let at = i % OVERWRITE_SEQS + 1;
+        let filed = rt.block_on(store.file_outbound(
+            at,
+            &MsgType::NewOrderSingle,
+            black_box(&payload),
+            OVERWRITE_SEQS + 1,
+        ));
+        ok(filed, "file_outbound");
+    };
+    assert_auto_compacts(&journal, |i| overwrite(&store, i), &next);
+    group.bench_function("file_outbound_overwrite_auto_compact/never", |b| {
+        b.iter(|| overwrite(&store, next.fetch_add(1, Ordering::Relaxed)));
     });
     ok(rt.block_on(store.close()), "close");
     group.finish();
