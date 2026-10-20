@@ -82,6 +82,7 @@ release:
 test:
 	LOGLEVEL=WARN cargo test --workspace
 	LOGLEVEL=WARN cargo test -p ironfix-engine --features tls
+	LOGLEVEL=WARN cargo test -p ironfix-engine --features fixp
 
 # Proves the engine's optional `tls` feature is additive (ADR-0009): with it
 # off, no TLS crate is in ironfix-engine's normal dependency graph, and with it
@@ -101,6 +102,22 @@ check-tls-deps:
 	@cargo tree -p ironfix-engine -e normal --features tls --prefix none | grep -Eq '^rustls ' \
 		|| { echo "check-tls-deps: rustls is missing with the tls feature on"; exit 1; }
 	@echo "check-tls-deps: no TLS crate without the feature; no crypto provider forced with it."
+
+# Proves the engine's optional `fixp` feature is additive (issue #96,
+# ADR-0003): with it off, neither FIXP crate nor the SBE codec is in
+# ironfix-engine's normal dependency graph; with it on, both FIXP crates are.
+.PHONY: check-fixp-deps
+check-fixp-deps:
+	@if cargo tree -p ironfix-engine -e normal --prefix none | grep -Eq '^(ironfix-sofh|ironfix-fixp|ironsbe-core) '; then \
+		echo "check-fixp-deps: a FIXP crate is in ironfix-engine's normal graph with the fixp feature off:"; \
+		cargo tree -p ironfix-engine -e normal --prefix none | grep -E '^(ironfix-sofh|ironfix-fixp|ironsbe-core) ' | sort -u; \
+		exit 1; \
+	fi
+	@cargo tree -p ironfix-engine -e normal --features fixp --prefix none | grep -Eq '^ironfix-fixp ' \
+		|| { echo "check-fixp-deps: ironfix-fixp is missing with the fixp feature on"; exit 1; }
+	@cargo tree -p ironfix-engine -e normal --features fixp --prefix none | grep -Eq '^ironfix-sofh ' \
+		|| { echo "check-fixp-deps: ironfix-sofh is missing with the fixp feature on"; exit 1; }
+	@echo "check-fixp-deps: no FIXP crate without the feature; both with it."
 
 # Format the code
 .PHONY: fmt

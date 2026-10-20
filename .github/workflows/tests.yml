@@ -33,6 +33,12 @@ jobs:
       - name: TLS feature dependency check
         run: make check-tls-deps
 
+      # Issue #96: the engine's `fixp` feature is additive. With it off,
+      # neither ironfix-sofh, ironfix-fixp nor ironsbe-core may enter
+      # ironfix-engine's normal dependency graph.
+      - name: FIXP feature dependency check
+        run: make check-fixp-deps
+
       # Compiles the criterion benchmarks without running them. A timing taken
       # on a shared runner is not a measurement, but a benchmark that stops
       # compiling is a real regression, and this catches it.

@@ -60,7 +60,8 @@ session that comes back on a new transport is told with `on_transport_opened`,
 which arms the Establish deadline
 (`test_server_on_transport_opened_arms_the_establish_deadline`); a server
 session left negotiated with no transport has no timer, and evicting it is the
-driver's policy (#96).
+driver's policy: the engine's acceptor drops it with its transport (see
+Engine driver).
 
 ## Session messages
 
@@ -469,6 +470,72 @@ Page numbers are the printed pages of the [v1.1 Draft Standard PDF](https://gith
 | Re-establishing or renegotiating a finalized identifier | 6.3: a violation | Server: EstablishmentReject `Unnegotiated` or NegotiationReject `DuplicateId`, then the transport closed; client: `establish` refused locally |
 | Leaving sequenced mode | 3.5.4 names a context switch; Appendix A 7.3.1.1 (p. 56): any session message | Any session message this side sends other than a Sequence |
 
+## Engine driver (`ironfix-engine`, `fixp` feature)
+
+`ironfix_engine::fixp` composes the core with `ironfix-sofh` over a stream
+(issue #96, ADR-0003). The feature is off by default; with it off, neither
+`ironfix-sofh`, `ironfix-fixp` nor `ironsbe-core` is in the engine's normal
+dependency graph (`make check-fixp-deps`, run in CI).
+
+- **Entry points.** `FixpInitiator::connect` (TCP, `TCP_NODELAY`) or
+  `connect_stream` (any `AsyncRead + AsyncWrite`, a TLS stream included)
+  negotiates and establishes (sections 4.2, 4.3) and returns a
+  `FixpConnection` once established. `FixpAcceptor::serve` (a listener) or
+  `accept_stream` runs the server side; `FixpApplication::on_negotiate`
+  and `on_establish` receive the request with its credentials and decide.
+  The default `on_negotiate` refuses (`Credentials`).
+- **One task per transport.** A driver task reads SOFH frames, takes
+  `FixpConnection` commands and sleeps until the core's `poll_timeout`,
+  feeding each input to the core with tokio's clock and carrying out the
+  outputs in order. It ends on end of stream, an I/O, framing or write
+  timeout error, or the core's `CloseTransport`; it then reports the
+  transport closed to the core, hands the last events to the application,
+  and signals `FixpConnection::wait_closed`.
+- **Routing.** A frame with SOFH encoding type SBE 1.0 little-endian
+  (`0xEB50`) whose SBE header names schema 2748 is a session message; any
+  other frame is an application message, passed to the core's
+  `on_application_message` and, when accepted, to
+  `FixpApplication::on_message` with its sequence number, retransmitted
+  flag, encoding type and bytes. Decoding business messages is the
+  application's job. Sending a payload that names schema 2748 is refused
+  (`FixpEngineError::ReservedSchema`), as is one above the frame ceiling,
+  both before a sequence number is spent.
+- **Retransmission as the provider** (section 4.6.2). On a Recoverable
+  outbound flow the driver keeps the last `DEFAULT_RETRANSMIT_CAPACITY`
+  (10 000, a setting) application messages, NotApplied included, by
+  sequence number. A RetransmitRequest the core validated is answered in
+  one batch: the Retransmission header, then the stored frames. A range no
+  longer fully kept is refused with RetransmitReject `OutOfRange`
+  (section 4.6.2.3); this is local policy, the specification names the
+  code for numbers not sent.
+- **Finalized identifiers** (sections 4.7.2, 6.3). The core records
+  finalization in its role instance, which lives as long as its transport.
+  `FixpAcceptor` therefore remembers, for its own lifetime and in memory,
+  the identifiers live on one of its transports and those finalized, and
+  answers a Negotiate naming either with NegotiationReject `DuplicateId`.
+- **Untrusted input.** A SOFH error closes the transport (every SOFH error
+  is fatal). A frame naming schema 2748 that does not decode is a protocol
+  violation (section 6.3): Terminate `UnspecifiedError` once established,
+  otherwise the transport is closed. Neither panics.
+- **Credentials** reach the application in `NegotiateRequest` and
+  `EstablishRequest`; every engine type holding them prints their length
+  only, and a test captures every `tracing` line of both roles through a
+  handshake with credentials and finds none of the bytes.
+
+Tested in `ironfix-engine/tests/fixp_tests.rs`: engine against engine over
+TCP and over an in-memory duplex (negotiate, establish, application messages
+both ways, Terminate); engine against a hand-driven core in both roles, as
+the requester of a retransmission (a gap revealed by a Sequence) and as its
+provider, over TCP and duplex; a request for messages no longer kept; a
+finalized identifier refused on a new transport; a malformed session
+message; a reserved-schema and an oversized payload; and the credentials
+log check.
+
+Not done by the driver: re-establishing an unbound session on a new
+transport (each binding is its own task, and the client is consumed by
+`connect`), evicting idle negotiated sessions (the acceptor drops them with
+their transport), and persisting sequence numbers or sent messages.
+
 ## Not implemented
 
 - **Sending a finalization** (section 4.7): this side never sends
@@ -483,5 +550,7 @@ Page numbers are the printed pages of the [v1.1 Draft Standard PDF](https://gith
 - **Session-layer persistence**: sequence numbers and gaps live in memory; a
   restarted process cannot re-establish a session.
 - **Application-message storage**: the driver's job.
-- **Engine integration**: no driver; FIXP over SOFH in `ironfix-engine` behind
-  a `fixp` feature is issue #96, and a conformance suite is #97.
+- **Engine re-establishment and persistence**: the engine driver (below)
+  runs one binding per transport; it does not re-establish an unbound
+  session on a new transport, and keeps sent messages in memory only. A
+  conformance suite is #97.

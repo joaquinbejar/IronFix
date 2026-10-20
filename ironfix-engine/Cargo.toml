@@ -25,6 +25,8 @@ bytes.workspace = true
 tracing.workspace = true
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
+ironfix-sofh = { workspace = true, optional = true }
+ironfix-fixp = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -32,6 +34,11 @@ default = []
 # Acceptor::serve_tls and AcceptorRegistry::serve_tls. Off by default; with it
 # off, no TLS crate is in the normal dependency graph (`make check-tls-deps`).
 tls = ["dep:rustls", "dep:tokio-rustls"]
+# FIXP v1.1 over SOFH for both roles (issue #96, ADR-0003): the `fixp` module
+# with FixpInitiator and FixpAcceptor. Off by default; with it off, neither
+# ironfix-sofh, ironfix-fixp nor ironsbe-core is in the normal dependency
+# graph (`make check-fixp-deps`).
+fixp = ["dep:ironfix-sofh", "dep:ironfix-fixp"]
 
 [dev-dependencies]
 dhat.workspace = true
@@ -64,3 +71,8 @@ harness = false
 [[test]]
 name = "tls_tests"
 required-features = ["tls"]
+
+# Only meaningful with FIXP compiled in.
+[[test]]
+name = "fixp_tests"
+required-features = ["fixp"]
