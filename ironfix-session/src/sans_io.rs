@@ -70,8 +70,25 @@
 //! - [`replay_field`], [`orig_sending_time`]: the `PossDupFlag` (43) and
 //!   `OrigSendingTime` (122) rebuild decisions.
 //!
-//! The Logout handshake and the two Logon handshakes are still decided inside
-//! the engine's reactor; they move here in later stages.
+//! # Stage 4: the Logout handshake
+//!
+//! - [`check_logout_text`]: the `Text` (58) a caller may ask for.
+//! - [`decide_local_logout`], [`LocalLogoutReason`]: whether this session's
+//!   Logout may start (only the first counts) and the `Text` it carries;
+//!   [`LogoutPhase`] summarises the driver's phase, `Queued` until the Logout
+//!   is written whole ([`decide_logout_advance`]) and `Pending` after, where
+//!   the logout timeout runs ([`logout_timed_out`]).
+//! - [`decide_peer_logout`], [`OwedLogout`], [`owed_logout_due`]: the
+//!   counterparty's Logout completes ours (crossed or acknowledged) or is
+//!   owed a reply, which waits behind a resend of ours within the logout
+//!   timeout.
+//! - [`LogoutClose`], [`reply_close`], [`settle_close`], [`close_resets`]:
+//!   the close-reason family of the exchange, the graceful rule (this
+//!   session's own Logout written whole) and the `reset_on_logout` gate,
+//!   which only a graceful close passes.
+//!
+//! The two Logon handshakes are still decided inside the engine; they move
+//! here in a later stage.
 //!
 //! # Time
 //!
@@ -79,6 +96,12 @@
 //! contract"). The Tokio driver passes its own clock, converted at the
 //! boundary, so a paused-clock test drives these decisions deterministically.
 
+pub use crate::logout::{
+    LocalLogoutDecision, LocalLogoutReason, LogoutClose, LogoutPhase, LogoutReplyWrite,
+    LogoutTextError, MAX_LOGOUT_TEXT_LEN, OwedLogout, PeerLogoutDecision, check_logout_text,
+    close_resets, decide_local_logout, decide_logout_advance, decide_peer_logout, owed_logout_due,
+    reply_close, resend_stalled_text, settle_close,
+};
 pub use crate::replay::{
     EndSeqNoInfinity, EntryScreen, GapFillRange, MAX_HELD_BYTES, MAX_HELD_SENDS,
     MAX_QUEUED_REPLAYS, MAX_READS_PER_REPLAY_STEP, OpeningReplay, PageRead, PageRequest,

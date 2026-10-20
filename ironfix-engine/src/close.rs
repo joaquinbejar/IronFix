@@ -44,6 +44,7 @@
 //! appear in it.
 
 use crate::tls::TlsFailure;
+use ironfix_session::sans_io::{LocalLogoutReason, LogoutClose, resend_stalled_text};
 use ironfix_session::sequence::SequenceCounter;
 use std::fmt;
 use std::time::Duration;
@@ -276,10 +277,40 @@ impl CloseReason {
     /// `reset_on_logout`.
     #[must_use]
     pub const fn is_graceful(&self) -> bool {
-        matches!(
-            self,
-            Self::LocalLogout { .. } | Self::PeerLogout { .. } | Self::LogoutTimeout { .. }
-        )
+        self.logout_close().is_graceful()
+    }
+
+    /// Where this reason sits in the sans-IO core's Logout close family,
+    /// which owns the graceful rule (ADR-0002, issue #91 stage 4).
+    #[must_use]
+    pub(crate) const fn logout_close(&self) -> LogoutClose {
+        match self {
+            Self::LocalLogout { .. } => LogoutClose::Local,
+            Self::PeerLogout { .. } => LogoutClose::Peer,
+            Self::LogoutTimeout { .. } => LogoutClose::Timeout,
+            Self::LogoutUnwritten { .. } => LogoutClose::Unwritten,
+            // Named one by one, so a new reason does not compile until it
+            // has been placed in the family.
+            Self::HeartbeatTimeout { .. }
+            | Self::WriteTimeout { .. }
+            | Self::TransportClosed { .. }
+            | Self::TransportError { .. }
+            | Self::MessageTooLarge { .. }
+            | Self::FramingError { .. }
+            | Self::SequenceTooLow { .. }
+            | Self::GarbledFrameLimit { .. }
+            | Self::MsgSeqNumMissing { .. }
+            | Self::IdentityMismatch { .. }
+            | Self::SendingTime { .. }
+            | Self::StoreFailure { .. }
+            | Self::SequenceExhausted { .. }
+            | Self::ApplicationQueueFull { .. }
+            | Self::DispatcherStopped { .. }
+            | Self::ConnectFailed { .. }
+            | Self::LogonFailed { .. }
+            | Self::Tls { .. }
+            | Self::Internal { .. } => LogoutClose::Other,
+        }
     }
 
     /// Whether the session reached Active before it ended: false only for
@@ -342,10 +373,27 @@ impl fmt::Display for LogoutCause {
             Self::Requested { text: None } => f.write_str("requested"),
             Self::Requested { text: Some(text) } => write!(f, "requested: {text}"),
             Self::HandlesDropped => f.write_str("every connection handle dropped"),
-            Self::ResendStalled { expected, attempts } => write!(
-                f,
-                "resend of MsgSeqNum {expected} unanswered after {attempts} request(s)"
-            ),
+            Self::ResendStalled { expected, attempts } => {
+                f.write_str(&resend_stalled_text(*expected, *attempts))
+            }
+        }
+    }
+}
+
+impl LogoutCause {
+    /// The cause as the sans-IO core reads it: what decides the `Text` (58)
+    /// of this session's Logout.
+    #[must_use]
+    pub(crate) fn as_core(&self) -> LocalLogoutReason<'_> {
+        match self {
+            Self::Requested { text } => LocalLogoutReason::Requested {
+                text: text.as_deref(),
+            },
+            Self::HandlesDropped => LocalLogoutReason::HandlesDropped,
+            Self::ResendStalled { expected, attempts } => LocalLogoutReason::ResendStalled {
+                expected: *expected,
+                attempts: *attempts,
+            },
         }
     }
 }
@@ -440,6 +488,116 @@ fn write_peer_text(f: &mut fmt::Formatter<'_>, text: Option<&str>) -> fmt::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One reason of every kind a session can close with.
+    fn every_reason() -> Vec<CloseReason> {
+        let cause = LogoutCause::Requested {
+            text: Some("eod".to_owned()),
+        };
+        vec![
+            CloseReason::LocalLogout {
+                cause: cause.clone(),
+                peer_text: Some("bye".to_owned()),
+            },
+            CloseReason::PeerLogout { text: None },
+            CloseReason::LogoutTimeout {
+                cause: cause.clone(),
+            },
+            CloseReason::LogoutUnwritten {
+                initiator: LogoutInitiator::Peer,
+                cause: None,
+                peer_text: None,
+            },
+            CloseReason::HeartbeatTimeout {},
+            CloseReason::WriteTimeout {
+                timeout: Duration::from_secs(1),
+            },
+            CloseReason::TransportClosed {},
+            CloseReason::TransportError { kind: None },
+            CloseReason::MessageTooLarge {
+                size: 2,
+                max_size: 1,
+            },
+            CloseReason::FramingError {},
+            CloseReason::SequenceTooLow {
+                expected: 5,
+                received: 4,
+            },
+            CloseReason::GarbledFrameLimit {
+                max: 3,
+                window: Duration::from_secs(1),
+            },
+            CloseReason::MsgSeqNumMissing {},
+            CloseReason::IdentityMismatch { tag: 49 },
+            CloseReason::SendingTime {},
+            CloseReason::StoreFailure {},
+            CloseReason::SequenceExhausted {
+                counter: SequenceCounter::Sender,
+            },
+            CloseReason::ApplicationQueueFull {},
+            CloseReason::DispatcherStopped {},
+            CloseReason::ConnectFailed {
+                kind: None,
+                timed_out: true,
+            },
+            CloseReason::LogonFailed {},
+            CloseReason::Internal {},
+        ]
+    }
+
+    #[test]
+    fn test_close_family_matches_the_engine_reasons() {
+        // The graceful rule moved to the sans-IO core (issue #91 stage 4):
+        // the engine's reasons and their unwritten forms must land on the
+        // same family members the core computes.
+        for reason in every_reason() {
+            let close = reason.logout_close();
+            assert_eq!(
+                reason.is_graceful(),
+                matches!(
+                    reason,
+                    CloseReason::LocalLogout { .. }
+                        | CloseReason::PeerLogout { .. }
+                        | CloseReason::LogoutTimeout { .. }
+                ),
+                "{reason}"
+            );
+            assert_eq!(close.is_graceful(), reason.is_graceful(), "{reason}");
+            assert_eq!(
+                reason.clone().unwritten().logout_close(),
+                close.unwritten(),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_logout_cause_text_matches_the_display() {
+        for (cause, text) in [
+            (LogoutCause::Requested { text: None }, None),
+            (
+                LogoutCause::Requested {
+                    text: Some("eod".to_owned()),
+                },
+                Some("eod".to_owned()),
+            ),
+            (LogoutCause::HandlesDropped, None),
+            (
+                LogoutCause::ResendStalled {
+                    expected: 9,
+                    attempts: 3,
+                },
+                Some("resend of MsgSeqNum 9 unanswered after 3 request(s)".to_owned()),
+            ),
+        ] {
+            assert_eq!(cause.as_core().text(), text, "{cause}");
+            if matches!(cause, LogoutCause::ResendStalled { .. }) {
+                // The stalled-resend Logout's Text has always been the
+                // cause's Display.
+                assert_eq!(cause.as_core().text(), Some(cause.to_string()));
+            }
+        }
+    }
 
     #[test]
     fn test_graceful_reasons() {

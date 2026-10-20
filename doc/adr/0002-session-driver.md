@@ -165,3 +165,29 @@ converted at the boundary so paused-clock tests stay deterministic.
   the wire changes. Remaining stages: the Logout handshake, the two Logon
   handshakes (including the 789 `plan`, still in the engine), then the driver
   reduced to I/O and callbacks.
+- **#91 stage 4 (the Logout handshake):** the Logout decisions moved into
+  `sans_io` (in the private `logout.rs`, re-exported through `sans_io` and the
+  crate root). `check_logout_text` and `MAX_LOGOUT_TEXT_LEN` screen a
+  caller's `Text` (58) (issue #69; the engine's constant of the same name is
+  now an alias). `LogoutPhase` summarises the driver's phase (`Active`,
+  `Queued`, `Pending`, issue #126): `decide_local_logout` lets only the first
+  Logout start, `LocalLogoutReason::text` (with `resend_stalled_text`) picks
+  its `Text`, `decide_logout_advance` moves a queued Logout to pending once it
+  is written whole, and `accepts_application_messages` refuses new
+  application messages behind it. `decide_peer_logout` decides what the
+  counterparty's Logout means: it completes ours (crossed when ours was still
+  queued), or it is owed a reply that waits behind a resend of ours;
+  `OwedLogout` keeps the first arrival and text, and `owed_logout_due` is the
+  deadline the driver checks on the tick, before each resend step and between
+  held frames (issues #79, #128). `LogoutClose` is the close-reason family of
+  the exchange with the graceful rule; `reply_close` and `settle_close` turn a
+  close whose own Logout never reached the stream into `Unwritten`, and
+  `close_resets` is the `reset_on_logout` / `reset_on_disconnect` gate, which
+  is also when the durable owed-reset marker of #111 is recorded. The engine's
+  `CloseReason` maps onto the family exhaustively, and `is_graceful`
+  delegates to it. The driver keeps every effect: building and writing the
+  Logout, the write mark, the typestate transitions, the store reset and its
+  marker, and the callbacks. Test-only transcriptions of the old reactor rules
+  are checked against the core. Additive public surface only; nothing on the
+  wire changes. Remaining stages: the two Logon handshakes (including the 789
+  `plan`, still in the engine), then the driver reduced to I/O and callbacks.

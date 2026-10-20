@@ -44,6 +44,9 @@
 //!   recovery decisions ([`classify_inbound`], [`ResendState`],
 //!   [`decide_gap_request`], [`decide_stall`]); stage 3 the resend replay
 //!   ([`decide_resend_request`], [`ResendReplay`], [`EndSeqNoInfinity`]);
+//!   stage 4 the Logout handshake ([`decide_local_logout`],
+//!   [`decide_peer_logout`], [`OwedLogout`], [`LogoutClose`],
+//!   [`close_resets`]);
 //!   the Tokio reactor in
 //!   `ironfix-engine` is its first driver
 //!
@@ -56,6 +59,7 @@
 
 pub mod config;
 pub mod heartbeat;
+mod logout;
 mod replay;
 pub mod sans_io;
 pub mod sequence;
@@ -81,6 +85,12 @@ pub use sans_io::{
     StallAction, classify_inbound, decide_gap_request, decide_liveness, decide_stall,
     logout_timed_out, merged_high_water, note_inbound_progress, spanned_high_water,
     spanned_rerequest, test_request_reply_id,
+};
+pub use sans_io::{
+    LocalLogoutDecision, LocalLogoutReason, LogoutClose, LogoutPhase, LogoutReplyWrite,
+    LogoutTextError, MAX_LOGOUT_TEXT_LEN, OwedLogout, PeerLogoutDecision, check_logout_text,
+    close_resets, decide_local_logout, decide_logout_advance, decide_peer_logout, owed_logout_due,
+    reply_close, resend_stalled_text, settle_close,
 };
 pub use sequence::{SequenceCounter, SequenceExhausted, SequenceManager, SequenceResult};
 pub use state::{

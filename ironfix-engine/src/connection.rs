@@ -18,6 +18,7 @@ use crate::outbound::{OutboundMessage, OutboundPool};
 use crate::outcome::{NotSentReason, Receipt, SendOutcome};
 use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
+use ironfix_session::sans_io::LogoutTextError;
 use ironfix_session::{HeartbeatManager, SequenceManager};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -39,7 +40,10 @@ pub(crate) enum Command {
 }
 
 /// The most bytes [`Connection::logout_with_text`] accepts for `Text` (58).
-pub const MAX_LOGOUT_TEXT_LEN: usize = 1024;
+///
+/// The same bound as the sans-IO core's
+/// [`ironfix_session::sans_io::MAX_LOGOUT_TEXT_LEN`].
+pub const MAX_LOGOUT_TEXT_LEN: usize = ironfix_session::sans_io::MAX_LOGOUT_TEXT_LEN;
 
 /// Checks a Logout `Text` (58) given to [`Connection::logout_with_text`].
 ///
@@ -59,19 +63,19 @@ pub(crate) fn check_logout_text(text: &str) -> Result<(), EngineError> {
             reason: reason.to_string(),
         })
     };
-    if text.is_empty() {
-        return refuse("value is empty; a FIX field carries at least one byte");
-    }
-    if text.len() > MAX_LOGOUT_TEXT_LEN {
-        return refuse("Logout text is longer than MAX_LOGOUT_TEXT_LEN (1024) bytes");
-    }
-    if !text.bytes().all(|byte| (0x20..=0x7E).contains(&byte)) {
-        return refuse(
+    match ironfix_session::sans_io::check_logout_text(text) {
+        Ok(()) => Ok(()),
+        Err(LogoutTextError::Empty) => {
+            refuse("value is empty; a FIX field carries at least one byte")
+        }
+        Err(LogoutTextError::TooLong) => {
+            refuse("Logout text is longer than MAX_LOGOUT_TEXT_LEN (1024) bytes")
+        }
+        Err(LogoutTextError::NotPrintableAscii) => refuse(
             "Logout text must be printable ASCII: no SOH or other control character, and no \
              non-ASCII character (that needs EncodedText (355))",
-        );
+        ),
     }
-    Ok(())
 }
 
 /// Session runtime state shared between the reactor and connection handles.
