@@ -49,7 +49,8 @@
 //!   acceptor and no TLS.
 //! - Only FIX 4.2, FIX 4.4, FIXT 1.1 and FIX 5.0 SP2 have embedded
 //!   dictionaries; other versions need `Dictionary::from_quickfix_xml`. The
-//!   validator is never invoked automatically.
+//!   engine invokes the validator only on inbound application messages of a
+//!   session configured with inbound validation (ADR-0031).
 //! - [`fast`] is standalone: no template XML parser, no UDP multicast, and no
 //!   wiring into the session path.
 //! - A criterion harness exists (`benches/` in `ironfix-tagvalue`,

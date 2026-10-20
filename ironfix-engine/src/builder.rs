@@ -36,6 +36,7 @@ use crate::initiator::Initiator;
 use crate::observer::FrameObserver;
 use crate::registry::AcceptorRegistry;
 use crate::throttle::ThrottleConfig;
+use crate::validation::InboundValidation;
 use ironfix_session::config::SessionConfig;
 use ironfix_store::MessageStore;
 use std::sync::Arc;
@@ -61,6 +62,8 @@ pub struct EngineBuilder<A: Application = NoOpApplication> {
     throttle: Option<ThrottleConfig>,
     /// Frame observer attached by every terminal method, if any.
     observer: Option<Arc<dyn FrameObserver>>,
+    /// Inbound validation attached by every terminal method, if any.
+    validation: Option<InboundValidation>,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
@@ -73,6 +76,7 @@ impl<A: Application> std::fmt::Debug for EngineBuilder<A> {
             .field("store", &self.store.is_some())
             .field("throttle", &self.throttle)
             .field("frame_observer", &self.observer.is_some())
+            .field("inbound_validation", &self.validation)
             .finish_non_exhaustive()
     }
 }
@@ -94,6 +98,7 @@ impl EngineBuilder<NoOpApplication> {
             store: None,
             throttle: None,
             observer: None,
+            validation: None,
         }
     }
 }
@@ -109,6 +114,7 @@ impl<A: Application + 'static> EngineBuilder<A> {
             store: self.store,
             throttle: self.throttle,
             observer: self.observer,
+            validation: self.validation,
         }
     }
 
@@ -172,6 +178,25 @@ impl<A: Application + 'static> EngineBuilder<A> {
         self
     }
 
+    /// Attaches inbound dictionary validation to the engine a terminal
+    /// method produces: [`Initiator::with_inbound_validation`] for
+    /// [`EngineBuilder::into_initiator`], [`Acceptor::with_inbound_validation`]
+    /// for [`EngineBuilder::into_acceptor`], and the same on every
+    /// [`Acceptor`] of [`EngineBuilder::into_acceptor_registry`]. See
+    /// [`crate::validation`] (issue #84, ADR-0031).
+    #[must_use]
+    pub fn with_inbound_validation(mut self, validation: InboundValidation) -> Self {
+        self.validation = Some(validation);
+        self
+    }
+
+    /// Returns the inbound validation set with `with_inbound_validation`,
+    /// if any.
+    #[must_use]
+    pub const fn inbound_validation(&self) -> Option<&InboundValidation> {
+        self.validation.as_ref()
+    }
+
     /// Returns whether a frame observer has been set.
     #[must_use]
     pub const fn has_frame_observer(&self) -> bool {
@@ -221,6 +246,10 @@ impl<A: Application + 'static> EngineBuilder<A> {
             Some(observer) => initiator.with_frame_observer(observer),
             None => initiator,
         };
+        let initiator = match self.validation {
+            Some(validation) => initiator.with_inbound_validation(validation),
+            None => initiator,
+        };
         Ok(match self.store {
             Some(store) => initiator.with_store(store),
             None => initiator,
@@ -243,6 +272,10 @@ impl<A: Application + 'static> EngineBuilder<A> {
         };
         let acceptor = match self.observer {
             Some(observer) => acceptor.with_frame_observer(observer),
+            None => acceptor,
+        };
+        let acceptor = match self.validation {
+            Some(validation) => acceptor.with_inbound_validation(validation),
             None => acceptor,
         };
         Ok(match self.store {
@@ -289,6 +322,10 @@ impl<A: Application + 'static> EngineBuilder<A> {
             };
             let acceptor = match &self.observer {
                 Some(observer) => acceptor.with_frame_observer(Arc::clone(observer)),
+                None => acceptor,
+            };
+            let acceptor = match &self.validation {
+                Some(validation) => acceptor.with_inbound_validation(validation.clone()),
                 None => acceptor,
             };
             let acceptor = match &self.store {
@@ -547,6 +584,47 @@ mod tests {
         match EngineBuilder::new().add_session(session()).into_initiator() {
             Ok(initiator) => assert!(!initiator.has_frame_observer()),
             Err(err) => panic!("one session must build an initiator: {err}"),
+        }
+    }
+
+    #[test]
+    fn test_engine_builder_inbound_validation_reaches_every_terminal_method() {
+        use crate::validation::{InboundValidation, ValidationPolicy};
+        use ironfix_core::message::RawMessage;
+        use ironfix_core::{InboundRejection, InboundValidator};
+        struct Pass;
+        impl InboundValidator for Pass {
+            fn validate(&self, _: &RawMessage<'_>) -> Result<(), InboundRejection> {
+                Ok(())
+            }
+        }
+        let validation = InboundValidation::new(Arc::new(Pass), ValidationPolicy::Reject);
+        let builder = || {
+            EngineBuilder::new()
+                .add_session(session())
+                .with_inbound_validation(validation.clone())
+        };
+        assert!(builder().inbound_validation().is_some());
+        match builder().into_initiator() {
+            Ok(initiator) => assert_eq!(
+                initiator
+                    .inbound_validation()
+                    .map(InboundValidation::policy),
+                Some(ValidationPolicy::Reject)
+            ),
+            Err(err) => panic!("into_initiator failed: {err}"),
+        }
+        match builder().into_acceptor() {
+            Ok(acceptor) => assert!(acceptor.inbound_validation().is_some()),
+            Err(err) => panic!("into_acceptor failed: {err}"),
+        }
+        match builder().into_acceptor_registry() {
+            Ok(_) => {}
+            Err(err) => panic!("into_acceptor_registry failed: {err}"),
+        }
+        match EngineBuilder::new().add_session(session()).into_initiator() {
+            Ok(initiator) => assert!(initiator.inbound_validation().is_none()),
+            Err(err) => panic!("into_initiator failed: {err}"),
         }
     }
 

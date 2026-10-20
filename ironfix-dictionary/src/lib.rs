@@ -91,10 +91,14 @@
 //! **[`Validator::new`] does not check `BeginString(8)`**; only
 //! [`Validator::for_session`] does.
 //!
-//! **[`Validator`] is opt-in and is never invoked automatically.** Neither
-//! `ironfix-engine` nor `ironfix-transport` validates against a dictionary; a
-//! message that decodes successfully has not been schema-checked unless you
-//! call the validator yourself.
+//! **[`Validator`] is opt-in.** `ironfix-transport` never validates. The
+//! engine validates inbound application messages only when a session is
+//! given an [`InboundValidator`](ironfix_core::InboundValidator) (which
+//! [`Validator`], [`Dictionary`] and [`SessionDictionary`] implement) with a
+//! policy other than `Off`; administrative messages are never checked
+//! against the dictionary there (ADR-0031). Otherwise a message that decodes
+//! successfully has not been schema-checked unless you call the validator
+//! yourself.
 //!
 //! [`ironfix_dictionary::schema::FieldRef`](FieldRef) is the schema's
 //! *reference to a field definition*, not

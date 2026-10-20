@@ -44,6 +44,14 @@ tokio = { workspace = true, features = ["test-util"] }
 # time, so no private key is committed.
 rustls = { workspace = true, features = ["ring"] }
 rcgen.workspace = true
+# The inbound validation tests (#84, ADR-0031) validate against the embedded
+# dictionaries. A dev-dependency only: the engine's normal dependency graph
+# stays free of ironfix-dictionary, which reaches it through the
+# `ironfix_core::InboundValidator` trait.
+ironfix-dictionary.workspace = true
+# Captures the warning the `Log` validation policy emits, to check it carries
+# no field value. Already in the workspace lock through ironfix-example.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 # Installs dhat as the global allocator to count the allocations of the
 # reactor's write path, so it runs as its own binary without the libtest

@@ -195,6 +195,7 @@ use crate::reactor::{
 use crate::stream::SessionStream;
 use crate::throttle::ThrottleConfig;
 use crate::tls::{self, DEFAULT_TLS_HANDSHAKE_TIMEOUT, PeerInfo};
+use crate::validation::InboundValidation;
 use crate::wire::{
     self, ApplVersionGuard, MessageFactory, PeerIdentity, PendingMessage, SendingTimeGuard,
     UnsupportedVersion,
@@ -298,6 +299,8 @@ pub struct Acceptor<A: Application = NoOpApplication> {
     throttle: Option<ThrottleConfig>,
     /// The frame observer every session of this engine reports to, if any.
     observer: Option<Arc<dyn FrameObserver>>,
+    /// Dictionary validation of inbound application messages, if any.
+    validation: Option<InboundValidation>,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
@@ -318,6 +321,7 @@ impl<A: Application> std::fmt::Debug for Acceptor<A> {
             .field("store_timeout", &self.store.timeout(self.write_timeout))
             .field("throttle", &self.throttle)
             .field("frame_observer", &self.observer.is_some())
+            .field("inbound_validation", &self.validation)
             .finish_non_exhaustive()
     }
 }
@@ -356,6 +360,7 @@ impl<A: Application + 'static> Acceptor<A> {
             admitted: Arc::new(Mutex::new(HashSet::new())),
             throttle: None,
             observer: None,
+            validation: None,
         }
     }
 
@@ -675,6 +680,42 @@ impl<A: Application + 'static> Acceptor<A> {
     #[must_use]
     pub const fn has_frame_observer(&self) -> bool {
         self.observer.is_some()
+    }
+
+    /// Validates the inbound application messages of every session this acceptor admits
+    /// against a schema before `from_app` (issue #84, ADR-0031).
+    ///
+    /// Each in-sequence application message is checked with the
+    /// validation's validator, typically an `ironfix_dictionary`
+    /// `Validator`, `Dictionary` or `SessionDictionary`, and a failure is
+    /// logged ([`ValidationPolicy::Log`](crate::ValidationPolicy::Log))
+    /// or answered with a Reject that consumes the message's number and
+    /// keeps it from `from_app`
+    /// ([`ValidationPolicy::Reject`](crate::ValidationPolicy::Reject)).
+    /// Administrative messages are not validated. See
+    /// [`crate::validation`] for where the check sits and what the Reject
+    /// carries.
+    ///
+    /// Without one, or under
+    /// [`ValidationPolicy::Off`](crate::ValidationPolicy::Off) (the
+    /// default), the validator is never called.
+    ///
+    /// An [`AcceptorRegistry`](crate::AcceptorRegistry) session gets the
+    /// validation of the `Acceptor` it is routed to.
+    ///
+    /// # Arguments
+    /// * `validation` - The validator and its policy
+    #[must_use]
+    pub fn with_inbound_validation(mut self, validation: InboundValidation) -> Self {
+        self.validation = Some(validation);
+        self
+    }
+
+    /// Returns the inbound validation attached with
+    /// `with_inbound_validation`, if any.
+    #[must_use]
+    pub const fn inbound_validation(&self) -> Option<&InboundValidation> {
+        self.validation.as_ref()
     }
 
     /// The attached frame observer bound to `session_id`, if any.
@@ -1882,6 +1923,7 @@ impl<A: Application + 'static> Acceptor<A> {
             app_queue_capacity: self.app_queue_capacity,
             throttle: self.throttle.clone(),
             capture: self.capture(&session_id),
+            validation: self.validation.clone(),
         };
         let (command_tx, closed_rx) = spawn_session(params, admission);
 
