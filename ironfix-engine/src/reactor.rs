@@ -315,6 +315,11 @@ use ironfix_session::sans_io::{
     merged_high_water, note_inbound_progress, reads_yield_to_replay, replay_queue_full,
     replay_step_continues, spanned_high_water, spanned_rerequest, test_request_reply_id,
 };
+use ironfix_session::sans_io::{
+    LocalLogoutDecision, LogoutPhase, LogoutReplyWrite, OwedLogout, PeerLogoutDecision,
+    close_resets, decide_local_logout, decide_logout_advance, decide_peer_logout, owed_logout_due,
+    reply_close, settle_close,
+};
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_session::{
     Active, HeartbeatManager, LogoutPending, SequenceManager, Session, SessionConfig,
@@ -891,6 +896,18 @@ enum Phase {
     /// A locally initiated Logout has been sent and is awaiting
     /// acknowledgement, within the logout timeout from `Session::sent_at`.
     LogoutPending(Session<LogoutPending>),
+}
+
+impl Phase {
+    /// The phase as the sans-IO core's Logout decisions read it.
+    #[must_use]
+    const fn logout_phase(&self) -> LogoutPhase {
+        match self {
+            Self::Active(_) => LogoutPhase::Active,
+            Self::LogoutQueued(_) => LogoutPhase::Queued,
+            Self::LogoutPending(_) => LogoutPhase::Pending,
+        }
+    }
 }
 
 /// Terminal outcome of the reactor loop.
@@ -2395,7 +2412,8 @@ async fn run_reactor<A: Application + 'static>(
     // been written. One still in the buffer never reached the counterparty:
     // the close is not graceful, so `reset_on_logout` does not reset a stream
     // the counterparty still expects to continue.
-    if outcome.reason.is_graceful() && ctx.writer.logout_unwritten() {
+    let close = settle_close(outcome.reason.logout_close(), ctx.writer.logout_unwritten());
+    if close != outcome.reason.logout_close() {
         tracing::warn!(
             session = %ctx.session_id,
             reason = %outcome.reason,
@@ -2403,7 +2421,8 @@ async fn run_reactor<A: Application + 'static>(
         );
         outcome.reason = outcome.reason.unwritten();
     }
-    let graceful = outcome.reason.is_graceful();
+    debug_assert_eq!(outcome.reason.logout_close(), close);
+    let graceful = close.is_graceful();
 
     // Closing the queue is what stops the dispatcher; joining it is what keeps
     // `on_logout` from running beside a `from_app` still in flight. A wedged
@@ -2439,7 +2458,7 @@ async fn run_reactor<A: Application + 'static>(
     }
 
     let mut write_counters = true;
-    if ctx.config.reset_on_disconnect || (graceful && ctx.config.reset_on_logout) {
+    if close_resets(&ctx.config, close) {
         ctx.runtime.sequences.reset();
         // The stored messages go with the counters. Leaving them behind would
         // file the next session's messages on top of this one's, and a resend
@@ -2722,18 +2741,6 @@ const HELD_FIELD_OVERHEAD: usize = 16;
 /// Per-message allowance in [`DeferredSend::held_bytes`]: the header and
 /// trailer the frame adds, and the entry itself.
 const HELD_MESSAGE_OVERHEAD: usize = 128;
-
-/// A Logout the counterparty sent while this session still owed it a resend:
-/// the reply waits for the resend, within the logout timeout.
-#[derive(Debug, Clone)]
-struct OwedLogout {
-    /// When the counterparty's first Logout arrived, on the driver's clock
-    /// ([`driver_now`]). A repeated Logout keeps it: the logout timeout runs
-    /// from the first (issue #128).
-    since: Instant,
-    /// Its `Text` (58), bounded, for the close reason.
-    text: Option<String>,
-}
 
 impl<A: Application> Reactor<A> {
     /// Why this session sent its own Logout. Every path to
@@ -3053,8 +3060,10 @@ impl<A: Application> Reactor<A> {
     /// records the moment, and the logout timeout runs from it. Any other
     /// phase is handed back as it is.
     fn advance_logout(&mut self, phase: Phase) -> Phase {
+        let advance =
+            decide_logout_advance(phase.logout_phase(), || self.writer.logout.take_written());
         match phase {
-            Phase::LogoutQueued(session) if self.writer.logout.take_written() => {
+            Phase::LogoutQueued(session) if advance => {
                 // Typestate: Active -> LogoutPending, as the Logout is sent.
                 Phase::LogoutPending(session.initiate_logout(driver_now()))
             }
@@ -3523,7 +3532,7 @@ impl<A: Application> Reactor<A> {
         }
         match command {
             Command::Send { message, receipt } => {
-                if matches!(phase, Phase::LogoutQueued(_) | Phase::LogoutPending(_)) {
+                if !phase.logout_phase().accepts_application_messages() {
                     tracing::warn!(
                         session = %self.session_id,
                         msg_type = %message.msg_type(),
@@ -3545,9 +3554,16 @@ impl<A: Application> Reactor<A> {
                 self.send_application(framed, phase, budget, message, receipt)
                     .await
             }
-            Command::Logout(cause) => match phase {
-                Phase::LogoutQueued(_) | Phase::LogoutPending(_) => Ok(phase),
-                Phase::Active(session) => self.begin_logout(framed, session, cause).await,
+            Command::Logout(cause) => match (decide_local_logout(phase.logout_phase()), phase) {
+                (LocalLogoutDecision::Send, Phase::Active(session)) => {
+                    self.begin_logout(framed, session, cause).await
+                }
+                // Only the first Logout counts.
+                (LocalLogoutDecision::AlreadyLoggingOut, phase) => Ok(phase),
+                (LocalLogoutDecision::Send, phase) => {
+                    debug_assert!(false, "the core started a Logout outside Active");
+                    Ok(phase)
+                }
             },
         }
     }
@@ -3785,11 +3801,7 @@ impl<A: Application> Reactor<A> {
         session: Session<Active>,
         cause: LogoutCause,
     ) -> Result<Phase, SessionClosed> {
-        let text = match &cause {
-            LogoutCause::Requested { text } => text.clone(),
-            LogoutCause::ResendStalled { .. } => Some(cause.to_string()),
-            _ => None,
-        };
+        let text = cause.as_core().text();
         let logout = self.factory.logout(text.as_deref());
         match self.send_now(framed, logout).await {
             Err(err) => {
@@ -4195,12 +4207,18 @@ impl<A: Application> Reactor<A> {
             StallAction::Abandon { expected, attempts } => {
                 let cause = LogoutCause::ResendStalled { expected, attempts };
                 tracing::warn!(session = %self.session_id, reason = %cause, "abandoning stalled resend");
-                return match phase {
+                return match (decide_local_logout(phase.logout_phase()), phase) {
+                    (LocalLogoutDecision::Send, Phase::Active(session)) => {
+                        self.begin_logout(framed, session, cause).await
+                    }
                     // A logout already in flight cannot be reissued; let its own
                     // deadline (or, while it is still queued, the write timeout)
                     // close the session.
-                    Phase::LogoutQueued(_) | Phase::LogoutPending(_) => Ok(phase),
-                    Phase::Active(session) => self.begin_logout(framed, session, cause).await,
+                    (LocalLogoutDecision::AlreadyLoggingOut, phase) => Ok(phase),
+                    (LocalLogoutDecision::Send, phase) => {
+                        debug_assert!(false, "the core started a Logout outside Active");
+                        Ok(phase)
+                    }
                 };
             }
         };
@@ -5078,31 +5096,34 @@ impl<A: Application> Reactor<A> {
             let reason = self.reason_behind_resend();
             self.discard_deferred(&reason);
         }
-        let text = self.logout_owed.take().and_then(|owed| owed.text);
+        let text = self.logout_owed.take().and_then(OwedLogout::into_text);
         let logout = self.factory.logout(None);
         let reason = CloseReason::PeerLogout { text };
-        let reason = match self.send_now(framed, logout).await {
+        let write = match self.send_now(framed, logout).await {
             Err(EngineError::Store(err)) => return Err(self.close_on_store_failure(phase, &err)),
             // Fed to the write buffer: graceful once it is written whole,
             // which the close-time check of the write mark decides.
-            Ok(Sent::Yes) => reason,
+            Ok(Sent::Yes) => LogoutReplyWrite::Fed,
             // The stream accepted the whole reply before the failure (a
             // flush that failed after the write, typically): the peer can
             // decode it, so the exchange is complete and the close stays
             // graceful.
-            Err(_) if self.writer.logout_written() => reason,
+            Err(_) if self.writer.logout_written() => LogoutReplyWrite::WrittenBeforeFailure,
             // No reply reached the buffer, or not all of it reached the
             // stream: a `to_admin` callback left it
             // unframeable, or feeding it failed. The counterparty never sees
             // our Logout, so the close is not graceful and
             // `reset_on_logout` does not reset.
-            Ok(Sent::Dropped | Sent::Deferred) | Err(_) => {
-                tracing::warn!(
-                    session = %self.session_id,
-                    "the reply to the counterparty's Logout was not sent: not a graceful close"
-                );
-                reason.unwritten()
-            }
+            Ok(Sent::Dropped | Sent::Deferred) | Err(_) => LogoutReplyWrite::NotWritten,
+        };
+        let reason = if reply_close(write).is_graceful() {
+            reason
+        } else {
+            tracing::warn!(
+                session = %self.session_id,
+                "the reply to the counterparty's Logout was not sent: not a graceful close"
+            );
+            reason.unwritten()
         };
         teardown(phase);
         Err(closed(reason))
@@ -5111,9 +5132,11 @@ impl<A: Application> Reactor<A> {
     /// Whether a Logout the counterparty sent while a resend was owed has
     /// waited the logout timeout since it (the first of them) arrived.
     fn owed_logout_due(&self) -> bool {
-        self.logout_owed.as_ref().is_some_and(|owed| {
-            driver_now().duration_since(owed.since) >= self.config.logout_timeout
-        })
+        owed_logout_due(
+            self.logout_owed.as_ref(),
+            driver_now(),
+            self.config.logout_timeout,
+        )
     }
 
     /// Holds `entry` back behind the resend under way, counting its bytes.
@@ -6297,8 +6320,20 @@ impl<A: Application> Reactor<A> {
         phase: Phase,
         raw: &RawMessage<'_>,
     ) -> Result<Phase, SessionClosed> {
-        match phase {
-            Phase::LogoutPending(session) => {
+        // In Active, a repeated Logout keeps the first one's arrival time
+        // and text: the logout timeout runs from the first, so a
+        // counterparty that keeps logging out cannot keep pushing the reply
+        // back (issue #128).
+        let resending = self.resend_in_progress();
+        let decision = decide_peer_logout(
+            phase.logout_phase(),
+            &mut self.logout_owed,
+            driver_now(),
+            || bounded_peer_text(raw.get_field_str(58)),
+            resending,
+        );
+        match (decision, phase) {
+            (PeerLogoutDecision::CompleteLocal { .. }, Phase::LogoutPending(session)) => {
                 // Typestate: LogoutPending -> Disconnected.
                 let _ = session.on_logout_ack();
                 Err(self.local_logout_complete(raw))
@@ -6308,37 +6343,33 @@ impl<A: Application> Reactor<A> {
             // or the two Logouts crossing): the exchange is complete. What
             // is left of ours is written out as the session closes, and a
             // close whose Logout never got out is not graceful.
-            Phase::LogoutQueued(session) => {
+            (PeerLogoutDecision::CompleteLocal { .. }, Phase::LogoutQueued(session)) => {
                 // Typestate: Active -> LogoutPending -> Disconnected.
                 let _ = session.initiate_logout(driver_now()).on_logout_ack();
                 Err(self.local_logout_complete(raw))
             }
-            Phase::Active(session) => {
-                // A repeated Logout keeps the first one's arrival time and
-                // text: the logout timeout runs from the first, so a
-                // counterparty that keeps logging out cannot keep pushing
-                // the reply back (issue #128).
-                if self.logout_owed.is_none() {
-                    self.logout_owed = Some(OwedLogout {
-                        since: driver_now(),
-                        text: bounded_peer_text(raw.get_field_str(58)),
-                    });
-                }
-                // A resend this session owes is finished first: FIX gives
-                // the remote end the chance to fill any gap before it
-                // replies to a Logout. The reply waits, bounded by the
-                // logout timeout, and the session keeps resending and
-                // reading meanwhile.
-                if self.resend_in_progress() {
-                    tracing::debug!(
-                        session = %self.session_id,
-                        "the counterparty logged out while a resend is owed: replying once it \
-                         is done"
-                    );
-                    return Ok(Phase::Active(session));
-                }
+            // A resend this session owes is finished first: FIX gives
+            // the remote end the chance to fill any gap before it
+            // replies to a Logout. The reply waits, bounded by the
+            // logout timeout, and the session keeps resending and
+            // reading meanwhile.
+            (PeerLogoutDecision::AwaitResend, Phase::Active(session)) => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    "the counterparty logged out while a resend is owed: replying once it \
+                     is done"
+                );
+                Ok(Phase::Active(session))
+            }
+            (PeerLogoutDecision::Reply, Phase::Active(session)) => {
                 self.reply_owed_logout(framed, Phase::Active(session), false)
                     .await
+            }
+            // The core decides from the phase it was given, so no other pair
+            // is reachable; replying is what Active would do.
+            (decision, phase) => {
+                debug_assert!(false, "{decision:?} does not fit the session's phase");
+                self.reply_owed_logout(framed, phase, false).await
             }
         }
     }
