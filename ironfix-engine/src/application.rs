@@ -281,14 +281,7 @@ pub trait Application: Send + Sync {
     /// * `session_id` - The session identifier
     /// * `loss` - The span, and when it was found
     async fn on_inbound_lost(&self, session_id: &SessionId, loss: &InboundLoss) {
-        tracing::error!(
-            session = %session_id,
-            first = loss.first(),
-            last = loss.last(),
-            cause = %loss.cause(),
-            "inbound messages in MsgSeqNum range first..=last were accepted but may not have \
-             reached from_app; they are not redelivered"
-        );
+        log_inbound_lost(session_id, loss);
     }
 
     /// Called when the numbers of a Logon exchange do not match the state the
@@ -315,18 +308,7 @@ pub trait Application: Send + Sync {
     /// * `session_id` - The session identifier
     /// * `mismatch` - The effective and stored counters and both comparisons
     async fn on_sequence_mismatch(&self, session_id: &SessionId, mismatch: &SequenceMismatch) {
-        tracing::warn!(
-            session = %session_id,
-            effective_next_sender = mismatch.effective_next_sender(),
-            effective_next_target = mismatch.effective_next_target(),
-            stored_next_sender = ?mismatch.stored_next_sender(),
-            stored_next_target = ?mismatch.stored_next_target(),
-            peer_logon_seq = mismatch.peer_logon_seq(),
-            peer_next_expected = ?mismatch.peer_next_expected(),
-            inbound = ?mismatch.inbound(),
-            outbound = %mismatch.outbound(),
-            "the Logon exchange does not match the sequence state this session started from"
-        );
+        log_sequence_mismatch(session_id, mismatch);
     }
 
     /// Called before an administrative message (Logon, Heartbeat, Logout, …)
@@ -560,6 +542,38 @@ pub trait Application: Send + Sync {
         message: &RawMessage<'_>,
         session_id: &SessionId,
     ) -> Result<(), RejectReason>;
+}
+
+/// The default report of [`Application::on_inbound_lost`] and
+/// [`SyncApplication::on_inbound_lost`](crate::SyncApplication::on_inbound_lost):
+/// the span at error level, numbers only.
+pub(crate) fn log_inbound_lost(session_id: &SessionId, loss: &InboundLoss) {
+    tracing::error!(
+        session = %session_id,
+        first = loss.first(),
+        last = loss.last(),
+        cause = %loss.cause(),
+        "inbound messages in MsgSeqNum range first..=last were accepted but may not have \
+         reached from_app; they are not redelivered"
+    );
+}
+
+/// The default report of [`Application::on_sequence_mismatch`] and
+/// [`SyncApplication::on_sequence_mismatch`](crate::SyncApplication::on_sequence_mismatch):
+/// the numbers at warn level.
+pub(crate) fn log_sequence_mismatch(session_id: &SessionId, mismatch: &SequenceMismatch) {
+    tracing::warn!(
+        session = %session_id,
+        effective_next_sender = mismatch.effective_next_sender(),
+        effective_next_target = mismatch.effective_next_target(),
+        stored_next_sender = ?mismatch.stored_next_sender(),
+        stored_next_target = ?mismatch.stored_next_target(),
+        peer_logon_seq = mismatch.peer_logon_seq(),
+        peer_next_expected = ?mismatch.peer_next_expected(),
+        inbound = ?mismatch.inbound(),
+        outbound = %mismatch.outbound(),
+        "the Logon exchange does not match the sequence state this session started from"
+    );
 }
 
 /// What [`Application::to_app_checked`] decided about one outbound

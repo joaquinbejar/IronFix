@@ -19,6 +19,10 @@
 //!   numbers across restarts. Every write, the counters included, is
 //!   asynchronous and fallible, and the engine relies on a stated ordering (see
 //!   the [`traits`] module docs)
+//! - **[`SyncMessageStore`]**: the same contract with synchronous methods,
+//!   for a driver without an async runtime (ADR-0002, issue #92), and
+//!   [`SyncStoreAdapter`], which uses one where a [`MessageStore`] is
+//!   expected (see the [`sync_traits`] module docs for when that is sound)
 //! - **[`StoredMessage`]**: one message as it was filed — verbatim frame bytes,
 //!   its sequence number, and its recorded `MsgType`
 //! - **[`MemoryStore`]**: an in-memory implementation, backed by a
@@ -54,6 +58,7 @@
 pub mod file;
 pub mod memory;
 pub mod stored;
+pub mod sync_traits;
 pub mod traits;
 
 pub use file::{
@@ -61,4 +66,5 @@ pub use file::{
 };
 pub use memory::MemoryStore;
 pub use stored::StoredMessage;
+pub use sync_traits::{SyncMessageStore, SyncStoreAdapter};
 pub use traits::MessageStore;

@@ -91,14 +91,10 @@ impl Default for MemoryStore {
     }
 }
 
-#[async_trait]
-impl MessageStore for MemoryStore {
-    async fn store(
-        &self,
-        seq_num: u64,
-        msg_type: &MsgType,
-        message: &[u8],
-    ) -> Result<(), StoreError> {
+/// The store's work: every method runs to completion under its lock or on
+/// an atomic, without waiting on anything.
+impl crate::sync_traits::SyncMessageStore for MemoryStore {
+    fn store(&self, seq_num: u64, msg_type: &MsgType, message: &[u8]) -> Result<(), StoreError> {
         let entry = (msg_type.clone(), Bytes::copy_from_slice(message));
         // The guard is scoped to this statement: it is a `parking_lot` lock,
         // which does not yield, and must never be live across an await.
@@ -106,7 +102,7 @@ impl MessageStore for MemoryStore {
         Ok(())
     }
 
-    async fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+    fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
         // `EndSeqNo` (16) = 0 is the FIX spelling of "to infinity". It is
         // normalised here, before any comparison, so the inverted-range check
         // below cannot mistake it for a bound below `begin`.
@@ -139,7 +135,7 @@ impl MessageStore for MemoryStore {
         Ok(result)
     }
 
-    async fn get_page(
+    fn get_page(
         &self,
         begin: u64,
         end: u64,
@@ -182,18 +178,18 @@ impl MessageStore for MemoryStore {
     }
 
     /// Never fails: the counter is an atomic in this process.
-    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+    fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
         self.next_sender_seq.store(seq, Ordering::SeqCst);
         Ok(())
     }
 
     /// Never fails: the counter is an atomic in this process.
-    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+    fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
         self.next_target_seq.store(seq, Ordering::SeqCst);
         Ok(())
     }
 
-    async fn reset(&self) -> Result<(), StoreError> {
+    fn reset(&self) -> Result<(), StoreError> {
         let mut messages = self.messages.write();
         messages.clear();
         self.next_sender_seq.store(1, Ordering::SeqCst);
@@ -209,7 +205,7 @@ impl MessageStore for MemoryStore {
     }
 
     /// Never fails: the marker is an atomic in this process. A reset keeps it.
-    async fn set_reset_owed(&self, owed: bool) -> Result<(), StoreError> {
+    fn set_reset_owed(&self, owed: bool) -> Result<(), StoreError> {
         self.reset_owed.store(owed, Ordering::SeqCst);
         Ok(())
     }
@@ -223,13 +219,88 @@ impl MessageStore for MemoryStore {
 
     /// Never fails: the watermark is an atomic in this process. A reset
     /// clears it.
-    async fn set_app_watermark(&self, watermark: u64) -> Result<(), StoreError> {
+    fn set_app_watermark(&self, watermark: u64) -> Result<(), StoreError> {
         self.app_watermark.store(watermark, Ordering::SeqCst);
         Ok(())
     }
 
     fn creation_time(&self) -> SystemTime {
         self.creation_time
+    }
+}
+
+/// The async trait runs the synchronous methods inline: each call completes
+/// within one poll of its future, so a dropped future has either applied its
+/// mutation in full or not started it.
+#[async_trait]
+impl MessageStore for MemoryStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), StoreError> {
+        crate::sync_traits::SyncMessageStore::store(self, seq_num, msg_type, message)
+    }
+
+    async fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        crate::sync_traits::SyncMessageStore::get_range(self, begin, end)
+    }
+
+    async fn get_page(
+        &self,
+        begin: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, StoreError> {
+        crate::sync_traits::SyncMessageStore::get_page(self, begin, end, limit)
+    }
+
+    fn next_sender_seq(&self) -> u64 {
+        crate::sync_traits::SyncMessageStore::next_sender_seq(self)
+    }
+
+    fn next_target_seq(&self) -> u64 {
+        crate::sync_traits::SyncMessageStore::next_target_seq(self)
+    }
+
+    /// Never fails: the counter is an atomic in this process.
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+        crate::sync_traits::SyncMessageStore::set_next_sender_seq(self, seq)
+    }
+
+    /// Never fails: the counter is an atomic in this process.
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        crate::sync_traits::SyncMessageStore::set_next_target_seq(self, seq)
+    }
+
+    async fn reset(&self) -> Result<(), StoreError> {
+        crate::sync_traits::SyncMessageStore::reset(self)
+    }
+
+    /// Reports the marker as last set in this process.
+    fn reset_owed(&self) -> bool {
+        crate::sync_traits::SyncMessageStore::reset_owed(self)
+    }
+
+    /// Never fails: the marker is an atomic in this process. A reset keeps it.
+    async fn set_reset_owed(&self, owed: bool) -> Result<(), StoreError> {
+        crate::sync_traits::SyncMessageStore::set_reset_owed(self, owed)
+    }
+
+    /// Reports the watermark as last set in this process.
+    fn app_watermark(&self) -> u64 {
+        crate::sync_traits::SyncMessageStore::app_watermark(self)
+    }
+
+    /// Never fails: the watermark is an atomic in this process. A reset
+    /// clears it.
+    async fn set_app_watermark(&self, watermark: u64) -> Result<(), StoreError> {
+        crate::sync_traits::SyncMessageStore::set_app_watermark(self, watermark)
+    }
+
+    fn creation_time(&self) -> SystemTime {
+        crate::sync_traits::SyncMessageStore::creation_time(self)
     }
 }
 
