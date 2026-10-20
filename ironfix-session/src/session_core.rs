@@ -35,16 +35,55 @@ use std::time::{Duration, Instant};
 
 use crate::config::{GapPolicy, SessionConfig};
 use crate::gap_queue::{GapAdmission, GapEntry, GapQueue, GapReady, Insert};
+use crate::heartbeat::HeartbeatManager;
 use crate::logout::{LogoutPhase, OwedLogout, PeerLogoutDecision, decide_peer_logout};
 use crate::phase::SessionPhase;
 use crate::replay::{ResendReplay, hold_full, reads_yield_to_replay, replay_queue_full};
 use crate::sans_io::{
-    GapRequest, LivenessGate, RecoveryProgress, ResendState, StallAction, decide_gap_request,
-    decide_stall, merged_high_water, note_inbound_progress, spanned_rerequest,
+    GapRequest, LivenessAction, LivenessGate, RecoveryProgress, ResendState, StallAction,
+    decide_gap_request, decide_liveness, decide_stall, logout_timed_out, merged_high_water,
+    note_inbound_progress, spanned_rerequest,
 };
 use crate::throttle::{Throttle, ThrottleAdmission, ThrottleRelease, TokenBucketSpec};
 
-/// What to do with a Logon held behind a `NextExpectedMsgSeqNum` (789) gap,
+/// What the driver knows at a periodic tick, for [`SessionCore::decide_tick`].
+#[derive(Debug, Clone, Copy)]
+pub struct TickInput<'h> {
+    /// The driver's clock at the tick.
+    pub now: Instant,
+    /// How long a Logout of ours waits for the counterparty's.
+    pub logout_timeout: Duration,
+    /// The session's heartbeat clocks, as of the tick.
+    pub heartbeat: &'h HeartbeatManager,
+    /// Whether output is waiting to be written (it counts as traffic).
+    pub output_waiting: bool,
+    /// Whether the last `ResendRequest` (2) is still in the driver's output,
+    /// so its stall clock has not started.
+    pub resend_request_unwritten: bool,
+    /// Whether the driver's output is at a bound that forbids writing
+    /// anything new this tick (frames awaiting their write result, under a
+    /// frame observer): only the deadlines are checked.
+    pub output_bound_reached: bool,
+}
+
+/// What a periodic tick does, from [`SessionCore::decide_tick`], in the
+/// order the checks run: the first that applies wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickDecision {
+    /// Our Logout waited past the logout timeout: the session ends.
+    LogoutTimedOut,
+    /// A resend is under way: nothing new is written. The driver answers a
+    /// Logout the counterparty sent meanwhile if its timeout ran out, then
+    /// checks only the heartbeat deadline.
+    ResendUnderWay,
+    /// A recovery that made no progress is retried or abandoned.
+    Stalled(StallAction),
+    /// The liveness step: idle, a TestRequest, a Heartbeat, or the close of
+    /// a heartbeat timeout.
+    Liveness(LivenessAction),
+}
+
+/// What to do with a Logon held behind a `NextExpectedMsgSeqNum` (789) gap,/// What to do with a Logon held behind a `NextExpectedMsgSeqNum` (789) gap,
 /// given the next number the session expects
 /// ([`SessionCore::decide_held_logon_release`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,6 +339,48 @@ impl<P: SessionPayloads> SessionCore<P> {
         if let Some(phase) = self.phase.take() {
             self.phase = Some(phase.advance_logout(take_written, now));
         }
+    }
+
+    // --- The periodic tick ------------------------------------------------
+
+    /// Decides a periodic tick in `phase`, the phase an event holds
+    /// ([`Self::take_phase`]).
+    ///
+    /// The checks run in this order: our Logout's timeout (its deadline is
+    /// the instant the Logout was written whole, carried by the typestate);
+    /// a resend under way, during which nothing new is written; an output
+    /// bound that forbids writing, under which only the heartbeat deadline is
+    /// checked; a stalled recovery, chased on its own clock; and the
+    /// liveness step, gated by a TestRequest still unwritten and by output
+    /// waiting ([`Self::probe_gate`]).
+    #[must_use]
+    pub fn decide_tick(&self, phase: &SessionPhase, input: &TickInput<'_>) -> TickDecision {
+        if let SessionPhase::LogoutPending(session) = phase
+            && logout_timed_out(session, input.now, input.logout_timeout)
+        {
+            return TickDecision::LogoutTimedOut;
+        }
+        if self.replaying() {
+            return TickDecision::ResendUnderWay;
+        }
+        if input.output_bound_reached {
+            return TickDecision::Liveness(decide_liveness(
+                input.heartbeat,
+                input.now,
+                LivenessGate::DeadlinesOnly,
+            ));
+        }
+        match self.decide_stall(input.now, input.resend_request_unwritten) {
+            StallAction::Wait => {}
+            stalled @ (StallAction::Retry { .. } | StallAction::Abandon { .. }) => {
+                return TickDecision::Stalled(stalled);
+            }
+        }
+        TickDecision::Liveness(decide_liveness(
+            input.heartbeat,
+            input.now,
+            self.probe_gate(input.output_waiting),
+        ))
     }
 
     // --- Gap recovery -----------------------------------------------------
@@ -969,13 +1050,15 @@ pub(crate) mod tests {
         }
     }
 
+    fn active_session() -> Session<crate::state::Active> {
+        Session::new("S")
+            .connect()
+            .send_logon(Instant::now())
+            .on_logon_ack()
+    }
+
     fn active() -> SessionPhase {
-        SessionPhase::Active(
-            Session::new("S")
-                .connect()
-                .send_logon(Instant::now())
-                .on_logon_ack(),
-        )
+        SessionPhase::Active(active_session())
     }
 
     #[test]
@@ -1324,6 +1407,104 @@ pub(crate) mod tests {
             core.decide_stall(now, false),
             StallAction::Abandon { expected: 5, .. }
         ));
+    }
+
+    fn tick<'h>(heartbeat: &'h HeartbeatManager, now: Instant) -> TickInput<'h> {
+        TickInput {
+            now,
+            logout_timeout: Duration::from_secs(10),
+            heartbeat,
+            output_waiting: false,
+            resend_request_unwritten: false,
+            output_bound_reached: false,
+        }
+    }
+
+    #[test]
+    fn test_tick_logout_timeout_wins_over_everything() {
+        let t0 = Instant::now();
+        let heartbeat = HeartbeatManager::new(Duration::from_secs(30), t0);
+        let mut core = SessionCore::<TestPayloads>::new();
+        assert!(core.queue_replay(3, 6, true, "a"));
+        let pending = SessionPhase::LogoutPending(active_session().initiate_logout(t0));
+        let before = tick(&heartbeat, t0 + Duration::from_secs(9));
+        assert_eq!(
+            core.decide_tick(&pending, &before),
+            TickDecision::ResendUnderWay
+        );
+        let after = tick(&heartbeat, t0 + Duration::from_secs(10));
+        assert_eq!(
+            core.decide_tick(&pending, &after),
+            TickDecision::LogoutTimedOut
+        );
+        // A queued Logout has no deadline yet.
+        let queued = SessionPhase::LogoutQueued(active_session());
+        assert_eq!(
+            core.decide_tick(&queued, &after),
+            TickDecision::ResendUnderWay
+        );
+    }
+
+    #[test]
+    fn test_tick_output_bound_checks_only_the_deadline() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(1);
+        let heartbeat = HeartbeatManager::new(interval, t0);
+        let core = SessionCore::<()>::new();
+        let late = t0 + interval * 3;
+        let mut input = tick(&heartbeat, late);
+        // Without the bound, a silent link earns a probe.
+        assert!(matches!(
+            core.decide_tick(&active(), &input),
+            TickDecision::Liveness(LivenessAction::SendTestRequest | LivenessAction::SendHeartbeat)
+        ));
+        input.output_bound_reached = true;
+        assert_eq!(
+            core.decide_tick(&active(), &input),
+            TickDecision::Liveness(LivenessAction::Idle)
+        );
+    }
+
+    #[test]
+    fn test_tick_chases_a_stalled_recovery_before_liveness() {
+        let t0 = Instant::now();
+        let cfg = config();
+        let heartbeat = HeartbeatManager::new(Duration::from_secs(30), t0);
+        let mut core = SessionCore::<()>::new();
+        core.arm_requested(5, 9, &cfg, t0);
+        let late = t0 + cfg.resend_timeout + Duration::from_millis(1);
+        let mut input = tick(&heartbeat, late);
+        assert_eq!(
+            core.decide_tick(&active(), &input),
+            TickDecision::Stalled(StallAction::Retry { expected: 5 })
+        );
+        // A request still unwritten has no clock yet.
+        input.resend_request_unwritten = true;
+        assert_eq!(
+            core.decide_tick(&active(), &input),
+            TickDecision::Liveness(LivenessAction::Idle)
+        );
+    }
+
+    #[test]
+    fn test_tick_heartbeat_waits_for_output_to_drain() {
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(30);
+        let mut heartbeat = HeartbeatManager::new(interval, t0);
+        let due = t0 + interval;
+        // Inbound is fresh, so only our own Heartbeat is due.
+        let _ = heartbeat.on_message_received(false, None, due);
+        let core = SessionCore::<()>::new();
+        let mut input = tick(&heartbeat, due);
+        assert_eq!(
+            core.decide_tick(&active(), &input),
+            TickDecision::Liveness(LivenessAction::SendHeartbeat)
+        );
+        input.output_waiting = true;
+        assert_eq!(
+            core.decide_tick(&active(), &input),
+            TickDecision::Liveness(LivenessAction::Idle)
+        );
     }
 
     #[test]

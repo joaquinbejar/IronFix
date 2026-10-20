@@ -310,8 +310,8 @@ use ironfix_session::sans_io::{
     EntryScreen, GapAdmission, GapEntry, GapRequest, HeldEntry, HeldLogonRelease, InboundSequence,
     LivenessAction, LivenessGate, OpeningReplay, PageRead, PageRequest, ReplayAction, ReplayJob,
     ReplayStep, ReplayVerdict, ResendRequestDecision, SessionCore, SessionPayloads,
-    SessionPhase as Phase, StallAction, ThrottleAdmission, ThrottleRelease, classify_inbound,
-    decide_liveness, decide_opening_replay, decide_resend_request, logout_timed_out,
+    SessionPhase as Phase, StallAction, ThrottleAdmission, ThrottleRelease, TickDecision,
+    TickInput, classify_inbound, decide_liveness, decide_opening_replay, decide_resend_request,
     replay_step_continues, spanned_high_water, test_request_reply_id,
 };
 use ironfix_session::sans_io::{
@@ -3761,62 +3761,57 @@ impl<A: Application> Reactor<A> {
             }
         }
 
-        // The logout deadline lives in the typestate: LogoutPending is defined
-        // by the instant its Logout was sent (written whole), so there is no
-        // second copy of it to drift. A Logout still queued has no deadline
-        // yet; the write timeout bounds how long it may wait.
-        if let Phase::LogoutPending(session) = &phase
-            && logout_timed_out(session, driver_now(), self.config.logout_timeout)
-        {
-            teardown(phase);
-            let cause = self.take_logout_cause();
-            return Err(closed(CloseReason::LogoutTimeout { cause }));
-        }
-
-        // While a resend is under way only the deadlines are checked. Resend
-        // frames are traffic, so no Heartbeat or TestRequest is due; and a
-        // stalled gap of our own is not chased, since its request could not go
-        // out before the resend ends anyway (it is checked on the first tick
-        // after). A Logout the counterparty sent meanwhile is answered once
-        // the resend is done, or now if the logout timeout has run out.
-        if self.resend_in_progress() {
-            let phase = self.cut_resend_for_owed_logout(framed, phase).await?;
-            return self.check_liveness_deadline(phase);
-        }
-
-        // With a frame observer and the frames awaiting a write result at
-        // their bound, the tick writes nothing new either (no ResendRequest
-        // retry, TestRequest or Heartbeat): a stream that takes every byte
-        // but never completes a flush must stop making progress, so the
-        // write timeout can close the session. Only the deadlines are
-        // checked.
-        if self.writer.observed_full() {
-            return self.check_liveness_deadline(phase);
-        }
-
-        // A gap that is making no progress is chased on its own clock,
-        // independent of the heartbeat: gapped frames keep the heartbeat alive,
-        // so this is the only thing that bounds an unsatisfied resend.
-        // A request still buffered has not reached the counterparty: its
-        // clock starts once it is written whole ([`Reactor::advance_probes`]),
-        // and the write timeout bounds how long it may wait.
-        match self
-            .core
-            .decide_stall(driver_now(), self.writer.resend_request.unwritten())
-        {
-            StallAction::Wait => {}
-            stalled @ (StallAction::Retry { .. } | StallAction::Abandon { .. }) => {
+        // The core decides the tick; the driver acts on it. The heartbeat
+        // guard is a std mutex, dropped at the end of this statement, before
+        // any await below. Output still waiting to be written is traffic the
+        // counterparty is about to receive, so an idle Heartbeat is due only
+        // once nothing is waiting; a ResendRequest still buffered has not
+        // reached the counterparty, so its stall clock starts once it is
+        // written whole ([`Reactor::advance_probes`]). With a frame observer
+        // and the frames awaiting a write result at their bound, nothing new
+        // is written: a stream that takes every byte but never completes a
+        // flush must stop making progress, so the write timeout can close
+        // the session.
+        let decision = self.core.decide_tick(
+            &phase,
+            &TickInput {
+                now: driver_now(),
+                logout_timeout: self.config.logout_timeout,
+                heartbeat: &lock_heartbeat(&self.runtime),
+                output_waiting: self.writer.pending,
+                resend_request_unwritten: self.writer.resend_request.unwritten(),
+                output_bound_reached: self.writer.observed_full(),
+            },
+        );
+        let action = match decision {
+            // The logout deadline lives in the typestate: LogoutPending is
+            // defined by the instant its Logout was sent (written whole). A
+            // Logout still queued has no deadline yet; the write timeout
+            // bounds how long it may wait.
+            TickDecision::LogoutTimedOut => {
+                teardown(phase);
+                let cause = self.take_logout_cause();
+                return Err(closed(CloseReason::LogoutTimeout { cause }));
+            }
+            // Resend frames are traffic, so no Heartbeat or TestRequest is
+            // due; a stalled gap of our own is not chased, since its request
+            // could not go out before the resend ends (it is checked on the
+            // first tick after). A Logout the counterparty sent meanwhile is
+            // answered once the resend is done, or now if the logout timeout
+            // has run out.
+            TickDecision::ResendUnderWay => {
+                let phase = self.cut_resend_for_owed_logout(framed, phase).await?;
+                return self.check_liveness_deadline(phase);
+            }
+            // A gap that is making no progress is chased on its own clock,
+            // independent of the heartbeat: gapped frames keep the heartbeat
+            // alive, so this is the only thing that bounds an unsatisfied
+            // resend.
+            TickDecision::Stalled(stalled) => {
                 return self.on_resend_stalled(framed, phase, stalled).await;
             }
-        }
-
-        // The guard is a std mutex: the decision is copied out and the guard
-        // dropped at the end of this statement, before any await below.
-        // Output still waiting to be written is traffic the counterparty is
-        // about to receive, so an idle Heartbeat is due only once nothing is
-        // waiting.
-        let gate = self.core.probe_gate(self.writer.pending);
-        let action = decide_liveness(&lock_heartbeat(&self.runtime), driver_now(), gate);
+            TickDecision::Liveness(action) => action,
+        };
         match action {
             LivenessAction::Idle => {}
             LivenessAction::CloseHeartbeatTimeout => {
