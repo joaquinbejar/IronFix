@@ -920,6 +920,13 @@ const fn codec_failure_reason(err: &CodecError) -> CloseReason {
 
 /// Consumes a phase on an abnormal close, driving the typestate to
 /// Disconnected.
+/// The close for a phase the core should hold and does not: an internal
+/// error, logged, never a panic.
+fn phase_lost(session_id: &SessionId) -> SessionClosed {
+    tracing::error!(session = %session_id, "internal error: session phase lost");
+    closed(CloseReason::Internal {})
+}
+
 fn teardown(phase: Phase) {
     let _ = phase.teardown();
 }
@@ -2088,14 +2095,16 @@ async fn run_reactor<A: Application + 'static>(
     // first inbound message is acted on, its target write must never be on
     // the store with no watermark below it, or a crash would leave W = 0
     // ("none") and the loss would go unreported (ADR-0030).
-    let (mut phase, mut opening_failure) = match ctx.persist_opening_watermark().await {
-        Err(err) => (
-            None,
-            Some(ctx.close_on_store_failure(Phase::Active(session), &err)),
-        ),
+    // The core holds the phase from here on: a failed opening leaves it
+    // without one, and the first pass of the loop ends the session.
+    let mut opening_failure = match ctx.persist_opening_watermark().await {
+        Err(err) => Some(ctx.close_on_store_failure(Phase::Active(session), &err)),
         Ok(()) => match ctx.open(&mut framed, Phase::Active(session), opening).await {
-            Ok(phase) => (Some(phase), None),
-            Err(outcome) => (None, Some(outcome)),
+            Ok(phase) => {
+                ctx.core.enter_phase(phase);
+                None
+            }
+            Err(outcome) => Some(outcome),
         },
     };
     let mut commands_open = true;
@@ -2132,26 +2141,32 @@ async fn run_reactor<A: Application + 'static>(
     // The handshake persisted the counters it moved and handed over the record
     // of what it wrote, so the first pass below writes only what it did not.
     let outcome = loop {
-        // The phase is put back by every handler that does not close the
-        // session, so it is always present here once the opening request
+        // The core gets the phase back from every handler that does not
+        // close the session, so it holds one here once the opening request
         // succeeded. Treating its absence otherwise as a close keeps the
         // reactor panic-free rather than relying on that.
-        let Some(current) = phase.take() else {
-            break opening_failure.take().unwrap_or_else(|| {
-                tracing::error!(session = %ctx.session_id, "internal error: session phase lost");
-                closed(CloseReason::Internal {})
-            });
-        };
+        if ctx.core.phase().is_none() {
+            break opening_failure
+                .take()
+                .unwrap_or_else(|| phase_lost(&ctx.session_id));
+        }
         // Every counter change of the previous event (or of the handshake, on
         // the first pass) is persisted before the next event is handled; under
         // the fail-closed policy a failed write ends the session here.
-        let current = match ctx.persist_counters().await {
-            Ok(()) => current,
-            Err(err) => break ctx.close_on_store_failure(current, &err),
-        };
+        if let Err(err) = ctx.persist_counters().await {
+            break match ctx.core.take_phase() {
+                Some(current) => ctx.close_on_store_failure(current, &err),
+                None => phase_lost(&ctx.session_id),
+            };
+        }
         // A Logout of ours written whole since the last pass has now been
         // sent: its logout timeout starts.
-        let current = ctx.advance_logout(current);
+        ctx.advance_logout();
+        // The event below consumes the typestate; the core gets the phase
+        // back when the event leaves the session open.
+        let Some(current) = ctx.core.take_phase() else {
+            break phase_lost(&ctx.session_id);
+        };
         ctx.advance_probes();
         // Nothing below waits on the socket: every handler only appends to
         // the write buffer (a live frame is also written through at once when
@@ -2284,7 +2299,7 @@ async fn run_reactor<A: Application + 'static>(
         match result {
             Ok(next) => {
                 ctx.publish_accounted();
-                phase = Some(next);
+                ctx.core.enter_phase(next);
             }
             Err(outcome) => break outcome,
         }
@@ -2943,9 +2958,18 @@ impl<A: Application> Reactor<A> {
     /// [`Phase::LogoutQueued`] to [`Phase::LogoutPending`]: the typestate
     /// records the moment, and the logout timeout runs from it. Any other
     /// phase is handed back as it is.
-    fn advance_logout(&mut self, phase: Phase) -> Phase {
+    fn advance_logout_of(&mut self, phase: Phase) -> Phase {
         // Typestate: Active -> LogoutPending, as the Logout is sent.
         phase.advance_logout(|| self.writer.logout.take_written(), driver_now())
+    }
+
+    /// [`Self::advance_logout_of`] for the phase the core holds, between
+    /// events.
+    fn advance_logout(&mut self) {
+        // Typestate: Active -> LogoutPending, as the Logout is sent.
+        let writer = &mut self.writer;
+        self.core
+            .advance_logout(|| writer.logout.take_written(), driver_now());
     }
 
     /// Starts the deadlines of the probes written whole since the last pass:
@@ -3694,7 +3718,7 @@ impl<A: Application> Reactor<A> {
                 // written (at once if it was written through). The new state
                 // records that moment, which is what `on_tick` times through
                 // `Session::sent_at`.
-                Ok(self.advance_logout(Phase::LogoutQueued(session)))
+                Ok(self.advance_logout_of(Phase::LogoutQueued(session)))
             }
         }
     }
@@ -3724,7 +3748,7 @@ impl<A: Application> Reactor<A> {
                 ));
             }
         }
-        let phase = self.advance_logout(phase);
+        let phase = self.advance_logout_of(phase);
         self.advance_probes();
         match self.writer.on_tick(driver_now(), self.write_timeout) {
             WriteCheck::Fine => {}

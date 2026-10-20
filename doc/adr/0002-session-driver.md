@@ -379,3 +379,16 @@ converted at the boundary so paused-clock tests stay deterministic.
     watermark. They are facts about the Tokio driver's codec, write buffer
     and dispatcher task, not protocol state; a different driver keeps its
     own.
+
+- **#91 stage 6c, part 2 (the core holds the phase):** `SessionCore` now
+  holds the session's `SessionPhase` between events: `enter_phase` (after
+  the opening, and after every event that leaves the session open),
+  `take_phase` (for the event, whose handling consumes the typestate),
+  `phase`, `is_active` and an in-place `advance_logout`. The reactor no
+  longer keeps the phase in a local of its loop; a phase missing where the
+  core should hold one closes the session as an internal error, as before,
+  never a panic. The handlers keep taking the phase by value for the event
+  and returning `Result<Phase, SessionClosed>`: that is the boundary the
+  handler split below replaces. Additive surface on the unreleased
+  `SessionCore`; nothing on the wire changes and no engine integration
+  test changed.
