@@ -1202,7 +1202,10 @@ async fn test_server_sends_application_establishment_reject_codes() {
 }
 
 /// FIXP 4.3.3 (p. 21), 6.3 (p. 39): an Establish "not preceded by a
-/// Negotiation" is refused with `Unnegotiated`.
+/// Negotiation" is refused with `Unnegotiated`; 6.3 lists it as a protocol
+/// violation after which the session "should be immediately terminated",
+/// so the transport closes at once, not at the handshake timeout (10 s by
+/// default here, twice the suite's bound).
 #[tokio::test]
 async fn test_server_rejects_an_establish_without_negotiation() {
     let server = engine_server().await;
@@ -1212,6 +1215,23 @@ async fn test_server_rejects_an_establish_without_negotiation() {
     let reject = peer.expect(template::ESTABLISHMENT_REJECT).await;
     assert_eq!(reject.u8(24), EstablishmentRejectCode::Unnegotiated.as_u8());
     assert_eq!(reject.u64(16), 44);
+    peer.expect_closed_silently().await;
+}
+
+/// FIXP 6.3 (p. 39): an Establish for a session other than the one
+/// negotiated on this transport was not negotiated: `Unnegotiated`, then
+/// the transport closes at once.
+#[tokio::test]
+async fn test_server_rejects_an_establish_for_another_session_and_closes() {
+    let server = engine_server().await;
+    let id = session_id(0x3F);
+    let mut peer = Peer::connect(server.addr).await;
+    raw_negotiate(&mut peer, id, wire::RECOVERABLE, FlowType::Recoverable).await;
+    peer.send(establish(session_id(0x4F), 45, 5_000, Some(1)))
+        .await;
+    let reject = peer.expect(template::ESTABLISHMENT_REJECT).await;
+    assert_eq!(reject.u8(24), EstablishmentRejectCode::Unnegotiated.as_u8());
+    peer.expect_closed_silently().await;
 }
 
 /// FIXP 4.3.3 (p. 21): "EstablishmentAck was already sent; Establish was
@@ -2197,6 +2217,15 @@ async fn test_server_finalization_and_reuse_refused() {
         .await;
     let reject = again.expect(template::NEGOTIATION_REJECT).await;
     assert_eq!(reject.u8(24), NegotiationRejectCode::DuplicateId.as_u8());
+    again.expect_closed_silently().await;
+
+    // Establishing the finalized id directly is refused with `Unnegotiated`
+    // and the transport closes at once (6.3, p. 39).
+    let mut direct = Peer::connect(server.addr).await;
+    direct.send(establish(id, 4, 5_000, Some(3))).await;
+    let reject = direct.expect(template::ESTABLISHMENT_REJECT).await;
+    assert_eq!(reject.u8(24), EstablishmentRejectCode::Unnegotiated.as_u8());
+    direct.expect_closed_silently().await;
 }
 
 /// FIXP 4.7.1 (p. 31): "If received on a recoverable flow, the peer may
@@ -2538,19 +2567,58 @@ async fn test_server_sends_nothing_after_its_terminate() {
         .await;
 }
 
-/// **Local policy**: after an automatic EstablishmentReject the transport
-/// stays open so the client may negotiate or establish again on it
-/// (Appendix A 7.1.12, p. 45-48, shows the reject and no close), bounded by
-/// the handshake timeout; FIXP 6.3 (p. 39) "should" terminate is satisfied
-/// by that bound.
+/// **Local policy, a deviation from a "should"**: after an automatic
+/// EstablishmentReject the client can fix (here `KeepaliveInterval`), the
+/// transport stays open for a retry on it (Appendix A 7.1.12.4, p. 46 to
+/// 47, shows the reject and no close), bounded by the handshake timeout.
+/// A retry with a valid interval is established on the same transport.
 #[tokio::test]
-async fn test_server_bounds_the_transport_after_an_unnegotiated_establish() {
-    let server = engine_server_with(App::new(), fast_config(1_000)).await;
+async fn test_server_allows_a_retry_after_a_keepalive_reject() {
+    let server = engine_server().await;
     let id = session_id(0xAB);
     let mut peer = Peer::connect(server.addr).await;
-    peer.send(establish(id, 44, 5_000, Some(1))).await;
+    raw_negotiate(&mut peer, id, wire::RECOVERABLE, FlowType::Recoverable).await;
+    peer.send(establish(id, 46, 10, Some(1))).await;
+    let reject = peer.expect(template::ESTABLISHMENT_REJECT).await;
+    assert_eq!(
+        reject.u8(24),
+        EstablishmentRejectCode::KeepaliveInterval.as_u8()
+    );
+    let _ = raw_establish(&mut peer, id, 5_000, Some(1)).await;
+}
+
+/// **Local policy**: the same, without a retry: the transport closes when
+/// the handshake timeout lapses.
+#[tokio::test]
+async fn test_server_bounds_the_transport_after_a_keepalive_reject() {
+    let server = engine_server_with(App::new(), fast_config(1_000)).await;
+    let id = session_id(0xAD);
+    let mut peer = Peer::connect(server.addr).await;
+    raw_negotiate(&mut peer, id, wire::RECOVERABLE, FlowType::Recoverable).await;
+    peer.send(establish(id, 46, 10, Some(1))).await;
     let _ = peer.expect(template::ESTABLISHMENT_REJECT).await;
     peer.expect_closed_silently().await;
+}
+
+/// **Local policy**: a Negotiate on an established session is answered with
+/// NegotiationReject `DuplicateId` and then Terminate `UnspecifiedError`.
+/// FIXP 4.2.3 (p. 18) says no further message should follow a
+/// NegotiationReject, and 6.3 (p. 39) makes the Negotiate a violation that
+/// ends the session; the engine keeps both answers (the reject tells the
+/// client why, the Terminate unbinds the established session). This
+/// sequence is the engine's choice, not one the specification mandates.
+#[tokio::test]
+async fn test_server_answers_a_negotiate_on_an_established_session() {
+    let server = engine_server().await;
+    let id = session_id(0xAE);
+    let (mut peer, _connection) = established_client(&server, id, wire::RECOVERABLE, 5_000).await;
+    peer.send(negotiate(id, 9, wire::RECOVERABLE, SECRET)).await;
+    let reject = peer
+        .expect_skipping_heartbeats(template::NEGOTIATION_REJECT)
+        .await;
+    assert_eq!(reject.u8(24), NegotiationRejectCode::DuplicateId.as_u8());
+    peer.expect_terminate_then_close(id, TerminationCode::UnspecifiedError)
+        .await;
 }
 
 // ===========================================================================

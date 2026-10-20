@@ -149,4 +149,8 @@ decision and pinned to a compatible 0.7 range when `ironfix-fixp` lands.
   defect, fixed with it: a Negotiate or Establish the server could not
   grant (two None flows, a failed or lapsed application decision) was
   closed without the NegotiationReject or EstablishmentReject sections
-  4.2.3 and 4.3 require. No `pub` item changed.
+  4.2.3 and 4.3 require. Following section 6.3, an Establish without a
+  successful negotiation (or for a finalized id) is now rejected with
+  `Unnegotiated` and its transport closed at once; rejects the client can
+  fix keep a retry window bounded by the handshake timeout, a documented
+  deviation from a "should". No `pub` item changed.
