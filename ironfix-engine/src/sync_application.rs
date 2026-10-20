@@ -142,7 +142,7 @@ pub trait SyncApplication: Send + Sync {
 ///
 /// Every async callback runs the synchronous one of the same name inline;
 /// see the [module docs](self) for when that is sound.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SyncApplicationAdapter<T> {
     /// The synchronous application.
     inner: T,

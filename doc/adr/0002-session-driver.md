@@ -459,6 +459,13 @@ converted at the boundary so paused-clock tests stay deterministic.
   results feed the next decision. #92 replaces those callbacks with
   synchronous traits for the sans-IO path.
 
+  One residual, found in review of the closing PR (#186): the header
+  checks above are decisions, not I/O. `PeerIdentity` (CompIDs and their
+  header position), `SendingTimeGuard` (presence, format and skew of 52),
+  `ApplVersionGuard` (1137 and 1128) and the `HeartBtInt` (108) parse are
+  still private engine code, so another driver cannot reuse them and must
+  write its own. Moving them into the core is tracked in #189.
+
 - **#92 (synchronous application and store traits):** `ironfix_store::
   SyncMessageStore` is `MessageStore` with synchronous methods (same
   method set, defaults and contract, the persistence order and the

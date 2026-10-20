@@ -172,7 +172,7 @@ pub trait SyncMessageStore: Send + Sync {
 ///
 /// Every async method runs the synchronous method of the same name inline;
 /// see the [module docs](self) for when that is sound.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SyncStoreAdapter<S> {
     /// The synchronous store.
     inner: S,
