@@ -308,10 +308,12 @@ use ironfix_core::version::FixVersion;
 use ironfix_session::config::MAX_INBOUND_FIELDS;
 use ironfix_session::heartbeat::generate_test_req_id;
 use ironfix_session::sans_io::{
-    GapRequest, InboundSequence, LivenessAction, LivenessGate, ResendState, StallAction,
-    classify_inbound, decide_gap_request, decide_liveness, decide_stall, logout_timed_out,
-    merged_high_water, note_inbound_progress, spanned_high_water, spanned_rerequest,
-    test_request_reply_id,
+    EntryScreen, GapRequest, InboundSequence, LivenessAction, LivenessGate, OpeningReplay,
+    PageRead, PageRequest, ReplayAction, ReplayStep, ReplayVerdict, ResendReplay,
+    ResendRequestDecision, ResendState, StallAction, classify_inbound, decide_gap_request,
+    decide_liveness, decide_opening_replay, decide_resend_request, decide_stall, logout_timed_out,
+    merged_high_water, note_inbound_progress, reads_yield_to_replay, replay_queue_full,
+    replay_step_continues, spanned_high_water, spanned_rerequest, test_request_reply_id,
 };
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_session::{
@@ -397,6 +399,10 @@ pub(crate) const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// to after a flush ([`Writer::flushed`]).
 const WRITE_BUFFER_HIGH_WATER: usize = 64 * 1024;
 
+// A resend step stops feeding at the core's byte bound (issue #126), which is
+// the write buffer's high water: a step never fills the buffer past it.
+const _: () = assert!(WRITE_BUFFER_HIGH_WATER == ironfix_session::REPLAY_STEP_MAX_BYTES);
+
 /// Output, in bytes, above which the reactor stops taking live messages from
 /// the command queue.
 ///
@@ -418,19 +424,9 @@ const REPLY_ALLOWANCE: usize = 64 * 1024;
 
 /// Most frames one resend step feeds, whatever their size, so a step of small
 /// frames (gap fills, short reports) does not run for long without the
-/// reactor reading or yielding.
-const MAX_FRAMES_PER_RESEND_STEP: usize = 64;
-
-/// Most inbound frames the reactor handles in a row while a resend has room
-/// to write, before it gives the resend a step.
-///
-/// Before each resend step the reactor handles a frame the counterparty has
-/// already sent, if there is one, so a resend never holds reading back (a
-/// Logout that arrived is seen before the resend runs on). This bound is the
-/// other half of the ratio: a counterparty that sends without pause (market
-/// data, or a TestRequest storm) cannot hold a resend back, and nothing that
-/// waits behind the resend is held with it.
-const MAX_READS_PER_RESEND_STEP: u32 = 16;
+/// reactor reading or yielding. Decided by the sans-IO core
+/// ([`replay_step_continues`]).
+const MAX_FRAMES_PER_RESEND_STEP: usize = ironfix_session::REPLAY_STEP_MAX_FRAMES;
 
 /// Most inbound frames dropped per poll while a closing session writes out
 /// its last output, so a counterparty that keeps sending cannot keep that
@@ -448,16 +444,6 @@ const APP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Reactor tick granularity for heartbeat/timeout checks.
 pub(crate) const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Number of stored messages a resend reads from the store per page.
-///
-/// A `ResendRequest` with `EndSeqNo` (16) = 0 asks for the whole session, so the
-/// replay reads in bounded batches rather than allocating and locking over the
-/// entire history at once. Each page read is a step of its own in the reactor
-/// loop and spends cooperative budget, so a long run of administrative or
-/// unrebuildable entries (skipped, not written) cannot keep the reactor from
-/// yielding.
-const RESEND_PAGE_LIMIT: usize = 256;
-
 /// Most resends a session queues for its counterparty, the one under way
 /// included.
 ///
@@ -467,11 +453,10 @@ const RESEND_PAGE_LIMIT: usize = 256;
 /// merged into the last queued one, which is not under way yet: its range
 /// widens to cover both, so every number either request asked for is still
 /// answered (a number asked for by neither reaches the counterparty as a
-/// possible duplicate, which it drops).
-const MAX_QUEUED_RESENDS: usize = 64;
-
-// The merge widens the last queued resend, which must not be the one under way.
-const _: () = assert!(MAX_QUEUED_RESENDS >= 2);
+/// possible duplicate, which it drops). Decided by the sans-IO core
+/// ([`replay_queue_full`]).
+#[cfg(test)]
+const MAX_QUEUED_RESENDS: usize = ironfix_session::MAX_QUEUED_REPLAYS;
 
 /// Runs `to_admin`, checks the body, and writes one administrative frame
 /// during the handshake, before the reactor exists.
@@ -1217,21 +1202,16 @@ struct ReactorChannels {
 
 /// One resend this session owes the counterparty: what is left of
 /// `begin_seq..new_seq`, written a few frames per step of the reactor loop.
+///
+/// The numbers (reply cursor, page cursor, whether the store is done) are the
+/// sans-IO core's [`ResendReplay`]; the reactor keeps what it read and built:
+/// the page and a rebuilt frame waiting behind its gap fill.
 #[derive(Debug)]
 struct ResendJob {
-    /// The first number not covered by the reply (exclusive end).
-    new_seq: u64,
-    /// The last number the reply may replay: `new_seq - 1`.
-    end_seq: u64,
-    /// The next number the reply still owes the counterparty.
-    reply_cursor: u64,
-    /// The next store key to read a page from.
-    read_from: u64,
+    /// The decision state of the replay.
+    core: ResendReplay,
     /// Stored messages read and not yet written or skipped, in order.
     page: std::vec::IntoIter<StoredMessage>,
-    /// Whether the store has nothing more to give for this range (or there
-    /// is no store, or a read failed): what is left is gap-filled.
-    store_done: bool,
     /// A rebuilt replay frame, with its number, written on the call after
     /// the gap fill that precedes it.
     pending: Option<(u64, BytesMut)>,
@@ -1243,17 +1223,9 @@ impl ResendJob {
     /// gap fill.
     #[must_use]
     fn new(begin_seq: u64, new_seq: u64, no_store: bool) -> Option<Self> {
-        if begin_seq == 0 || begin_seq >= new_seq {
-            return None;
-        }
-        let end_seq = new_seq.checked_sub(1)?;
         Some(Self {
-            new_seq,
-            end_seq,
-            reply_cursor: begin_seq,
-            read_from: begin_seq,
+            core: ResendReplay::new(begin_seq, new_seq, !no_store)?,
             page: Vec::new().into_iter(),
-            store_done: no_store,
             pending: None,
         })
     }
@@ -1261,19 +1233,16 @@ impl ResendJob {
     /// Widens a resend that has written nothing yet to also cover `other`'s
     /// range: from the lower start to the higher end.
     fn widen(&mut self, other: &Self) {
-        let begin_seq = self.reply_cursor.min(other.reply_cursor);
-        self.reply_cursor = begin_seq;
-        self.read_from = begin_seq;
-        self.new_seq = self.new_seq.max(other.new_seq);
-        self.end_seq = self.end_seq.max(other.end_seq);
+        self.core.widen(&other.core);
     }
 }
 
-/// Queues `job` behind `queue`, or, once [`MAX_QUEUED_RESENDS`] are queued,
-/// merges it into the last one, which is not under way yet (the head is), so
-/// the queue stays bounded and every number `job` asks for is still answered.
+/// Queues `job` behind `queue`, or, once the core's queue bound is reached
+/// ([`replay_queue_full`]), merges it into the last one, which is not under
+/// way yet (the head is), so the queue stays bounded and every number `job`
+/// asks for is still answered.
 fn push_resend(queue: &mut VecDeque<ResendJob>, job: ResendJob) {
-    if queue.len() >= MAX_QUEUED_RESENDS
+    if replay_queue_full(queue.len())
         && let Some(last) = queue.back_mut()
     {
         last.widen(&job);
@@ -2047,14 +2016,14 @@ struct Reactor<A: Application> {
     /// steps of the reactor loop ([`Reactor::resend_step`]).
     resends: VecDeque<ResendJob>,
     /// Inbound frames handled since the last resend step, counted only while
-    /// a resend has room to write; at [`MAX_READS_PER_RESEND_STEP`] the next
+    /// a resend has room to write; at [`MAX_READS_PER_REPLAY_STEP`](ironfix_session::MAX_READS_PER_REPLAY_STEP) the next
     /// pass gives the resend its step before reading again.
     reads_since_resend_step: u32,
     /// Messages that take a new number, held back while a resend is under
     /// way and written in order once it is done ([`Reactor::finish_resends`]).
     deferred: VecDeque<DeferredSend>,
     /// What `deferred` holds, by [`DeferredSend::held_bytes`]: reading stops
-    /// at [`MAX_DEFERRED_BYTES`] as it does at [`MAX_DEFERRED_SENDS`].
+    /// at [`MAX_HELD_BYTES`](ironfix_session::MAX_HELD_BYTES) as it does at [`MAX_HELD_SENDS`](ironfix_session::MAX_HELD_SENDS).
     deferred_bytes: usize,
     /// A Logout the counterparty sent while a resend was owed: replied to
     /// once the resend is done, or when the logout timeout runs out.
@@ -2280,12 +2249,12 @@ async fn run_reactor<A: Application + 'static>(
         // that neither reads nor stops sending.
         let hold_full = resending && ctx.hold_full();
         // Reading also pauses for one pass once a resend that has room has
-        // waited through MAX_READS_PER_RESEND_STEP inbound frames, and while
+        // waited through MAX_READS_PER_REPLAY_STEP inbound frames, and while
         // the replies to inbound frames have piled up past the read ceiling.
         let read = !hold_full
             && !ctx.writer.reads_paused(waiting)
             && !ctx.writer.observed_reads_paused()
-            && !(resend_ready && ctx.reads_since_resend_step >= MAX_READS_PER_RESEND_STEP);
+            && !(resend_ready && reads_yield_to_replay(ctx.reads_since_resend_step));
         let flushing = ctx.writer.pending;
         // A message the outbound throttle holds is released under the same
         // conditions a new command is taken (no resend under way, room under
@@ -2318,7 +2287,7 @@ async fn run_reactor<A: Application + 'static>(
             // Always ready while a resend has room to write. The socket is
             // polled once first, without waiting: a frame the counterparty
             // has already sent is handled before the next step, up to
-            // MAX_READS_PER_RESEND_STEP in a row, so neither the resend nor
+            // MAX_READS_PER_REPLAY_STEP in a row, so neither the resend nor
             // the reading can hold the other back.
             () = std::future::ready(()), if resend_ready => match poll_socket_now(&mut framed, &mut ctx.writer, read) {
                 Some(event) => ctx.on_socket_event(&mut framed, current, event, resend_ready).await,
@@ -2696,7 +2665,7 @@ enum DeferredSend {
 }
 
 impl DeferredSend {
-    /// What this entry counts against [`MAX_DEFERRED_BYTES`]: the body field
+    /// What this entry counts against [`MAX_HELD_BYTES`](ironfix_session::MAX_HELD_BYTES): the body field
     /// values plus a fixed allowance per field and per message for the tags,
     /// delimiters and header the frame adds. A `ResendRequest` marker is
     /// built later from fixed fields and counts the allowance only.
@@ -2730,7 +2699,8 @@ impl DeferredSend {
 /// inbound frame produces (a Heartbeat reply and the `ResendRequest` marker).
 /// A counterparty that neither reads nor stops sending is closed by the
 /// write timeout.
-const MAX_DEFERRED_SENDS: usize = 1_024;
+#[cfg(test)]
+const MAX_DEFERRED_SENDS: usize = ironfix_session::MAX_HELD_SENDS;
 
 /// Most bytes held back behind a resend before the reactor stops reading,
 /// counted by [`DeferredSend::held_bytes`] (issue #128).
@@ -2743,7 +2713,8 @@ const MAX_DEFERRED_SENDS: usize = 1_024;
 /// once either bound is reached, so the hold grows past this one by at most
 /// what one inbound frame produces (one reply, bounded by
 /// `max_message_size`, and the `ResendRequest` marker).
-const MAX_DEFERRED_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(test)]
+const MAX_DEFERRED_BYTES: usize = ironfix_session::MAX_HELD_BYTES;
 
 /// Per-field allowance in [`DeferredSend::held_bytes`]: the tag, `=` and SOH.
 const HELD_FIELD_OVERHEAD: usize = 16;
@@ -2959,7 +2930,7 @@ impl<A: Application> Reactor<A> {
     /// Handles what one poll of the socket came to: a completed or failed
     /// flush, or an inbound read. `resend_ready` says whether a resend had
     /// room to write when the socket was polled; an inbound frame handled
-    /// then counts against [`MAX_READS_PER_RESEND_STEP`].
+    /// then counts against [`MAX_READS_PER_REPLAY_STEP`](ironfix_session::MAX_READS_PER_REPLAY_STEP).
     async fn on_socket_event(
         &mut self,
         framed: &mut FixFramed,
@@ -3300,8 +3271,8 @@ impl<A: Application> Reactor<A> {
     /// range being answered, and a counterparty that does not queue gapped
     /// messages (IronFix itself under `GapPolicy::Discard`) would be left
     /// waiting for it. The
-    /// hold has no overflow path: once it holds [`MAX_DEFERRED_SENDS`] or
-    /// [`MAX_DEFERRED_BYTES`], the reactor stops reading (and taking application Rejects) until the
+    /// hold has no overflow path: once it holds [`MAX_HELD_SENDS`](ironfix_session::MAX_HELD_SENDS) or
+    /// [`MAX_HELD_BYTES`](ironfix_session::MAX_HELD_BYTES), the reactor stops reading (and taking application Rejects) until the
     /// resend is done, so it grows past the bound by at most what one inbound
     /// frame produces. Messages that end the session (its Logouts, and the
     /// Rejects that precede them) go through [`Reactor::send_now`] instead.
@@ -4866,63 +4837,40 @@ impl<A: Application> Reactor<A> {
     ) -> Result<Phase, SessionClosed> {
         let ref_msg_type = MsgType::ResendRequest.as_str();
 
-        let Some(begin_seq) = raw.get_field_str(7).and_then(|s| s.parse::<u64>().ok()) else {
-            let reason = RejectReason::new(1, "ResendRequest without a valid BeginSeqNo (7)")
-                .with_ref_tag(7);
-            return self
-                .send_session_reject(framed, phase, seq, ref_msg_type, &reason)
-                .await;
-        };
-        let Some(end_seq) = raw.get_field_str(16).and_then(|s| s.parse::<u64>().ok()) else {
-            let reason = RejectReason::new(1, "ResendRequest without a valid EndSeqNo (16)")
-                .with_ref_tag(16);
-            return self
-                .send_session_reject(framed, phase, seq, ref_msg_type, &reason)
-                .await;
-        };
-
+        let begin_seq = raw.get_field_str(7).and_then(|s| s.parse::<u64>().ok());
+        let end_seq = raw.get_field_str(16).and_then(|s| s.parse::<u64>().ok());
         let next_sender = self.runtime.sequences.next_sender_seq().value();
-        if begin_seq == 0 || begin_seq >= next_sender {
-            let reason = RejectReason::new(
+        // FIX 4.0 / 4.1 write "to infinity" as 999999, later versions as 0.
+        let infinity = self.factory.end_seq_no_infinity();
+        let reason = match decide_resend_request(begin_seq, end_seq, next_sender, infinity) {
+            ResendRequestDecision::Replay { begin_seq, new_seq } => {
+                // The reply covers begin_seq..new_seq, never beyond
+                // EndSeqNo + 1 and never beyond what we have actually sent.
+                self.queue_resend(begin_seq, new_seq);
+                return Ok(phase);
+            }
+            ResendRequestDecision::MissingBeginSeqNo => {
+                RejectReason::new(1, "ResendRequest without a valid BeginSeqNo (7)").with_ref_tag(7)
+            }
+            ResendRequestDecision::MissingEndSeqNo => {
+                RejectReason::new(1, "ResendRequest without a valid EndSeqNo (16)").with_ref_tag(16)
+            }
+            ResendRequestDecision::BeginSeqNoOutsideSent {
+                begin_seq,
+                next_sender,
+            } => RejectReason::new(
                 5,
                 format!("ResendRequest BeginSeqNo {begin_seq} is outside the sent range 1..{next_sender}"),
             )
-            .with_ref_tag(7);
-            return self
-                .send_session_reject(framed, phase, seq, ref_msg_type, &reason)
-                .await;
-        }
-        // FIX 4.0 / 4.1 write "to infinity" as 999999, later versions as 0.
-        let open_ended = self.factory.is_open_ended_end_seq_no(end_seq);
-        if !open_ended && end_seq < begin_seq {
-            let reason = RejectReason::new(
+            .with_ref_tag(7),
+            ResendRequestDecision::EndSeqNoBelowBegin { begin_seq, end_seq } => RejectReason::new(
                 5,
                 format!("ResendRequest EndSeqNo {end_seq} is below BeginSeqNo {begin_seq}"),
             )
-            .with_ref_tag(16);
-            return self
-                .send_session_reject(framed, phase, seq, ref_msg_type, &reason)
-                .await;
-        }
-
-        // The reply covers begin_seq..new_seq, never beyond EndSeqNo + 1 and
-        // never beyond what we have actually sent.
-        let new_seq = if open_ended {
-            next_sender
-        } else {
-            match end_seq.checked_add(1) {
-                Some(bound) => bound.min(next_sender),
-                // `end_seq` = u64::MAX: no bound below infinity.
-                None => next_sender,
-            }
+            .with_ref_tag(16),
         };
-        debug_assert!(
-            new_seq > begin_seq,
-            "begin_seq < next_sender was checked above"
-        );
-
-        self.queue_resend(begin_seq, new_seq);
-        Ok(phase)
+        self.send_session_reject(framed, phase, seq, ref_msg_type, &reason)
+            .await
     }
 
     /// Whether a resend is queued or under way: until it is done, live
@@ -4941,7 +4889,7 @@ impl<A: Application> Reactor<A> {
     /// counterparty's `NextExpectedMsgSeqNum` (789) on the Logon exchange asks
     /// for. Resends are answered in the order they were queued, each fed to
     /// the write buffer by [`Reactor::resend_step`] a few frames at a time. An
-    /// empty range queues nothing, and past [`MAX_QUEUED_RESENDS`] a request
+    /// empty range queues nothing, and past [`MAX_QUEUED_REPLAYS`](ironfix_session::MAX_QUEUED_REPLAYS) a request
     /// is merged into the last queued one.
     fn queue_resend(&mut self, begin_seq: u64, new_seq: u64) {
         if let Some(job) = ResendJob::new(begin_seq, new_seq, self.store.is_none()) {
@@ -4980,11 +4928,26 @@ impl<A: Application> Reactor<A> {
         let Some(mut job) = self.resends.pop_front() else {
             return Ok(phase);
         };
-        for _ in 0..MAX_FRAMES_PER_RESEND_STEP {
+        let mut frames_fed: usize = 0;
+        loop {
             match self.advance_resend(framed, &mut job).await {
-                Ok(ResendProgress::Wrote)
-                    if framed.write_buffer().len() < WRITE_BUFFER_HIGH_WATER => {}
-                Ok(ResendProgress::Wrote | ResendProgress::ReadPage) => {
+                Ok(ResendProgress::Wrote) => {
+                    // At most REPLAY_STEP_MAX_FRAMES, so this cannot overflow.
+                    frames_fed = match frames_fed.checked_add(1) {
+                        Some(fed) => fed,
+                        None => {
+                            debug_assert!(false, "a resend step fed usize::MAX frames");
+                            usize::MAX
+                        }
+                    };
+                    if !replay_step_continues(frames_fed, framed.write_buffer().len()) {
+                        // The step ends here, and the resend goes on at the
+                        // next one.
+                        self.resends.push_front(job);
+                        return Ok(phase);
+                    }
+                }
+                Ok(ResendProgress::ReadPage) => {
                     self.resends.push_front(job);
                     return Ok(phase);
                 }
@@ -4998,10 +4961,6 @@ impl<A: Application> Reactor<A> {
                 }
             }
         }
-        // MAX_FRAMES_PER_RESEND_STEP frames fed: the step ends here, below
-        // the byte cap, and the resend goes on at the next one.
-        self.resends.push_front(job);
-        Ok(phase)
     }
 
     /// Runs once the last owed resend is done: writes, in order, the messages
@@ -5188,10 +5147,10 @@ impl<A: Application> Reactor<A> {
     }
 
     /// Whether the hold has reached either of its bounds,
-    /// [`MAX_DEFERRED_SENDS`] or [`MAX_DEFERRED_BYTES`]: reading stops until
+    /// [`MAX_HELD_SENDS`](ironfix_session::MAX_HELD_SENDS) or [`MAX_HELD_BYTES`](ironfix_session::MAX_HELD_BYTES): reading stops until
     /// the resend is done.
     fn hold_full(&self) -> bool {
-        self.deferred.len() >= MAX_DEFERRED_SENDS || self.deferred_bytes >= MAX_DEFERRED_BYTES
+        ironfix_session::hold_full(self.deferred.len(), self.deferred_bytes)
     }
 
     /// Holds a `ResendRequest` back behind the resend under way, unless one is
@@ -5302,30 +5261,26 @@ impl<A: Application> Reactor<A> {
     ) -> Result<ResendProgress, EngineError> {
         loop {
             // A replayed message whose gap fill was fed on the previous call.
+            // The core already counted it past the reply cursor.
             if let Some((seq, frame)) = job.pending.take() {
                 self.send_replay(framed, seq, &frame)?;
-                job.reply_cursor = seq.checked_add(1).unwrap_or(job.new_seq);
                 return Ok(ResendProgress::Wrote);
             }
             if let Some(message) = job.page.next() {
                 let seq = message.seq_num();
-                // A store handing back something outside the asked-for range
-                // must not be allowed to move the reply.
-                if seq < job.reply_cursor || seq > job.end_seq {
-                    continue;
-                }
-                // Administrative messages are gap-filled, not replayed
-                // (`doc/fix_operations.md`, "Resend Request", item 3):
-                // resending a stale Heartbeat or Logon says nothing true about
-                // the session now.
-                if message.msg_type().is_admin() {
+                // Outside what the reply still owes (a store must not move
+                // the reply), or administrative: gap-filled, not replayed
+                // (`doc/fix_operations.md`, "Resend Request", item 3), since
+                // resending a stale Heartbeat or Logon says nothing true
+                // about the session now.
+                if job.core.screen_entry(seq, message.msg_type().is_admin()) == EntryScreen::Skip {
                     continue;
                 }
                 // Replayed in the precision the session stamps everything
                 // else in: whole seconds on FIX 4.0 and FIX 4.1.
                 let precision = self.factory.sending_time_precision();
-                let frame = match wire::resend_frame(message.payload(), precision) {
-                    Ok(frame) => frame,
+                let rebuilt = match wire::resend_frame(message.payload(), precision) {
+                    Ok(frame) => Some(frame),
                     Err(err) => {
                         tracing::warn!(
                             session = %self.session_id,
@@ -5333,49 +5288,62 @@ impl<A: Application> Reactor<A> {
                             error = %err,
                             "cannot rebuild a stored message as a resend: gap-filling it instead"
                         );
-                        continue;
+                        None
                     }
                 };
                 // The replay gate (ADR-0023): a vetoed message is not
                 // resent, and its number joins the gap fill fed before the
                 // next replayed message, or the trailing one, so a run of
                 // vetoes is one fill.
-                if !self.replay_allowed(seq, &frame).await {
-                    continue;
+                let verdict = match &rebuilt {
+                    Some(frame) if self.replay_allowed(seq, frame).await => ReplayVerdict::Replay,
+                    Some(_) | None => ReplayVerdict::GapFill,
+                };
+                match (job.core.decide_entry(seq, verdict), rebuilt) {
+                    (ReplayAction::Replay { seq }, Some(frame)) => {
+                        self.send_replay(framed, seq, &frame)?;
+                        return Ok(ResendProgress::Wrote);
+                    }
+                    // Everything between the cursor and this message (holes,
+                    // admin messages, frames that would not rebuild, vetoes)
+                    // is one fill, fed first; the message follows on the
+                    // next call.
+                    (ReplayAction::GapFillThenReplay { gap_fill, seq }, Some(frame)) => {
+                        self.send_gap_fill(framed, gap_fill.at, gap_fill.new_seq)
+                            .await?;
+                        job.pending = Some((seq, frame));
+                        return Ok(ResendProgress::Wrote);
+                    }
+                    // The core decides a replay only on a `Replay` verdict,
+                    // which needs a rebuilt frame.
+                    (ReplayAction::Skip, _)
+                    | (
+                        ReplayAction::Replay { .. } | ReplayAction::GapFillThenReplay { .. },
+                        None,
+                    ) => {
+                        continue;
+                    }
                 }
-                // Everything between the cursor and this message (holes,
-                // admin messages, frames that would not rebuild) is one fill,
-                // fed first; the message follows on the next call.
-                if seq > job.reply_cursor {
-                    self.send_gap_fill(framed, job.reply_cursor, seq).await?;
-                    job.reply_cursor = seq;
-                    job.pending = Some((seq, frame));
-                    return Ok(ResendProgress::Wrote);
+            }
+            match job.core.poll_store() {
+                // A page read is a step of its own: the loop reads inbound
+                // and yields between pages, whatever the page held.
+                ReplayStep::ReadPage(request) => {
+                    self.read_resend_page(job, request).await?;
+                    return Ok(ResendProgress::ReadPage);
                 }
-                self.send_replay(framed, seq, &frame)?;
-                // `seq <= end_seq < new_seq <= u64::MAX`, so this cannot
-                // overflow; it is checked rather than assumed because a
-                // wrapped sequence number would corrupt the session it is
-                // meant to repair.
-                job.reply_cursor = seq.checked_add(1).unwrap_or(job.new_seq);
-                return Ok(ResendProgress::Wrote);
+                ReplayStep::StoreExhausted => return Ok(ResendProgress::ReadPage),
+                // Whatever the replay did not cover (a trailing run of admin
+                // messages, holes, or the entire range when there is no
+                // store) is gap-filled, so the counterparty's expectation
+                // always lands exactly on `new_seq`.
+                ReplayStep::Complete { gap_fill } => {
+                    if let Some(fill) = gap_fill {
+                        self.send_gap_fill(framed, fill.at, fill.new_seq).await?;
+                    }
+                    return Ok(ResendProgress::Done);
+                }
             }
-            // A page read is a step of its own: the loop reads inbound and
-            // yields between pages, whatever the page held.
-            if !job.store_done {
-                self.read_resend_page(job).await?;
-                return Ok(ResendProgress::ReadPage);
-            }
-            // Whatever the replay did not cover (a trailing run of admin
-            // messages, holes, or the entire range when there is no store) is
-            // gap-filled, so the counterparty's expectation always lands
-            // exactly on `new_seq`.
-            if job.reply_cursor < job.new_seq {
-                self.send_gap_fill(framed, job.reply_cursor, job.new_seq)
-                    .await?;
-                job.reply_cursor = job.new_seq;
-            }
-            return Ok(ResendProgress::Done);
         }
     }
 
@@ -5415,7 +5383,7 @@ impl<A: Application> Reactor<A> {
     /// Reads the next page of `job`'s range from the store into its page
     /// buffer, or marks the store done for it.
     ///
-    /// The store is read in bounded pages of [`RESEND_PAGE_LIMIT`] rather than
+    /// The store is read in bounded pages of [`REPLAY_PAGE_LIMIT`](ironfix_session::REPLAY_PAGE_LIMIT) rather than
     /// all at once: a `ResendRequest` with `EndSeqNo` (16) = 0 asks for the
     /// whole session, and materialising an arbitrarily long history in one
     /// read would allocate it all up front. A short page means the range is
@@ -5426,28 +5394,28 @@ impl<A: Application> Reactor<A> {
     /// [`EngineError::Store`] when the store reports itself corrupted. Every
     /// other failure marks the store done, so the rest of the range is
     /// gap-filled.
-    async fn read_resend_page(&self, job: &mut ResendJob) -> Result<(), EngineError> {
+    async fn read_resend_page(
+        &self,
+        job: &mut ResendJob,
+        request: PageRequest,
+    ) -> Result<(), EngineError> {
         let Some(store) = self.store.as_deref() else {
-            job.store_done = true;
+            job.core.on_page(PageRead::Failed);
             return Ok(());
         };
-        if job.read_from > job.end_seq {
-            job.store_done = true;
-            return Ok(());
-        }
         // One unit of cooperative budget per page: a store that answers at
         // once (MemoryStore) never makes the reactor yield by itself.
         tokio::task::consume_budget().await;
         // Bounded like every store call; a read that overruns degrades to a
         // gap fill like any other failed read.
-        let read = store.get_page(job.read_from, job.end_seq, RESEND_PAGE_LIMIT);
+        let read = store.get_page(request.from, request.through, request.limit);
         let page = match timed(self.store_timeout, read).await {
             Ok(page) => page,
             Err(err @ StoreError::Corrupted { .. }) => {
                 tracing::error!(
                     session = %self.session_id,
-                    read_from = job.read_from,
-                    end_seq = job.end_seq,
+                    read_from = request.from,
+                    end_seq = request.through,
                     error = %err,
                     "the store holding the resend range is corrupted: closing the session \
                      rather than gap-filling messages it may still hold"
@@ -5457,25 +5425,21 @@ impl<A: Application> Reactor<A> {
             Err(err) => {
                 tracing::warn!(
                     session = %self.session_id,
-                    read_from = job.read_from,
-                    end_seq = job.end_seq,
+                    read_from = request.from,
+                    end_seq = request.through,
                     error = %err,
                     "cannot read the resend range from the store: gap-filling the rest"
                 );
-                job.store_done = true;
+                job.core.on_page(PageRead::Failed);
                 return Ok(());
             }
         };
-        // Ascending and bounded to `end_seq`: the last key is the furthest
-        // this page reached, so the next page reads from just past it.
-        match page.last().map(StoredMessage::seq_num) {
-            None => job.store_done = true,
-            Some(_) if page.len() < RESEND_PAGE_LIMIT => job.store_done = true,
-            Some(furthest) => match furthest.checked_add(1) {
-                Some(next) if next <= job.end_seq => job.read_from = next,
-                _ => job.store_done = true,
-            },
-        }
+        // Ascending and bounded to the range: the core reads the next page
+        // from just past the furthest key, or ends the store's part.
+        job.core.on_page(PageRead::Read {
+            len: page.len(),
+            furthest: page.last().map(StoredMessage::seq_num),
+        });
         job.page = page.into_iter();
         Ok(())
     }
@@ -5827,7 +5791,9 @@ impl<A: Application> Reactor<A> {
         }
         if let Some((begin_seq, new_seq)) = opening.replay {
             let next_sender = self.runtime.sequences.next_sender_seq().value();
-            if begin_seq == 0 || begin_seq >= new_seq || new_seq > next_sender {
+            let OpeningReplay::Replay { begin_seq, new_seq } =
+                decide_opening_replay(begin_seq, new_seq, next_sender)
+            else {
                 tracing::warn!(
                     session = %self.session_id,
                     begin_seq,
@@ -5836,7 +5802,7 @@ impl<A: Application> Reactor<A> {
                     "not resending a NextExpectedMsgSeqNum range outside what was sent"
                 );
                 return Ok(phase);
-            }
+            };
             tracing::info!(
                 session = %self.session_id,
                 begin_seq,
@@ -6887,9 +6853,12 @@ mod tests {
         let Some(job) = ResendJob::new(3, 6, true) else {
             panic!("3..6 is a range")
         };
-        assert_eq!((job.reply_cursor, job.read_from), (3, 3));
-        assert_eq!((job.end_seq, job.new_seq), (5, 6));
-        assert!(job.store_done, "without a store the range is one gap fill");
+        assert_eq!((job.core.reply_cursor(), job.core.read_from()), (3, 3));
+        assert_eq!((job.core.end_seq(), job.core.new_seq()), (5, 6));
+        assert!(
+            job.core.store_done(),
+            "without a store the range is one gap fill"
+        );
     }
 
     #[test]
@@ -6908,7 +6877,7 @@ mod tests {
             panic!("the queue is not empty")
         };
         assert_eq!(
-            (head.reply_cursor, head.new_seq),
+            (head.core.reply_cursor(), head.core.new_seq()),
             (2, 3),
             "the head is untouched"
         );
@@ -6916,9 +6885,9 @@ mod tests {
             panic!("the queue is not empty")
         };
         // The last queued request (cap + 1) absorbed the six that followed it.
-        assert_eq!(last.reply_cursor, cap + 1);
+        assert_eq!(last.core.reply_cursor(), cap + 1);
         assert_eq!(
-            last.new_seq,
+            last.core.new_seq(),
             cap + 8,
             "every merged number is still answered"
         );
@@ -6932,14 +6901,14 @@ mod tests {
             panic!("both are ranges")
         };
         job.widen(&other);
-        assert_eq!((job.reply_cursor, job.read_from), (4, 4));
-        assert_eq!((job.end_seq, job.new_seq), (29, 30));
+        assert_eq!((job.core.reply_cursor(), job.core.read_from()), (4, 4));
+        assert_eq!((job.core.end_seq(), job.core.new_seq()), (29, 30));
         let Some(inner) = ResendJob::new(12, 15, false) else {
             panic!("12..15 is a range")
         };
         job.widen(&inner);
         assert_eq!(
-            (job.reply_cursor, job.new_seq),
+            (job.core.reply_cursor(), job.core.new_seq()),
             (4, 30),
             "a covered range changes nothing"
         );

@@ -53,14 +53,40 @@
 //!   `SequenceReset` (4) GapFill below the expectation whose `NewSeqNo` (36)
 //!   spans numbers still missing.
 //!
-//! Resend replay, the Logout handshake and the two Logon handshakes are still
-//! decided inside the engine's reactor; they move here in later stages.
+//! # Stage 3: resend replay
+//!
+//! - [`decide_resend_request`] and [`EndSeqNoInfinity`]: what a
+//!   `ResendRequest` (2) asks, with the version's "to infinity" `EndSeqNo`
+//!   (16); [`decide_opening_replay`] checks the range a
+//!   `NextExpectedMsgSeqNum` (789) asks for.
+//! - [`ResendReplay`]: one replay as request/response steps with the driver,
+//!   which reads the store ([`PageRequest`], [`PageRead`]), rebuilds each
+//!   candidate and runs the replay gate ([`ReplayVerdict`]); the core answers
+//!   with what to write ([`ReplayAction`], [`ReplayStep`]), coalescing
+//!   administrative messages, holes, unrebuildable frames and vetoes into one
+//!   `SequenceReset` (4) GapFill per run.
+//! - [`replay_step_continues`], [`reads_yield_to_replay`],
+//!   [`replay_queue_full`], [`hold_full`]: the step, queue and hold bounds.
+//! - [`replay_field`], [`orig_sending_time`]: the `PossDupFlag` (43) and
+//!   `OrigSendingTime` (122) rebuild decisions.
+//!
+//! The Logout handshake and the two Logon handshakes are still decided inside
+//! the engine's reactor; they move here in later stages.
 //!
 //! # Time
 //!
 //! Every function takes `now` from the driver (ADR-0002, "Time source
 //! contract"). The Tokio driver passes its own clock, converted at the
 //! boundary, so a paused-clock test drives these decisions deterministically.
+
+pub use crate::replay::{
+    EndSeqNoInfinity, EntryScreen, GapFillRange, MAX_HELD_BYTES, MAX_HELD_SENDS,
+    MAX_QUEUED_REPLAYS, MAX_READS_PER_REPLAY_STEP, OpeningReplay, PageRead, PageRequest,
+    REPLAY_PAGE_LIMIT, REPLAY_STEP_MAX_BYTES, REPLAY_STEP_MAX_FRAMES, ReplayAction, ReplayField,
+    ReplayStep, ReplayVerdict, ResendReplay, ResendRequestDecision, decide_opening_replay,
+    decide_resend_request, hold_full, orig_sending_time, reads_yield_to_replay, replay_field,
+    replay_queue_full, replay_step_continues,
+};
 
 use crate::config::SessionConfig;
 use crate::heartbeat::HeartbeatManager;

@@ -42,15 +42,21 @@
 //!   holds the liveness family ([`decide_liveness`], [`logout_timed_out`],
 //!   [`test_request_reply_id`]); stage 2 the sequence classification and gap
 //!   recovery decisions ([`classify_inbound`], [`ResendState`],
-//!   [`decide_gap_request`], [`decide_stall`]); the Tokio reactor in
+//!   [`decide_gap_request`], [`decide_stall`]); stage 3 the resend replay
+//!   ([`decide_resend_request`], [`ResendReplay`], [`EndSeqNoInfinity`]);
+//!   the Tokio reactor in
 //!   `ironfix-engine` is its first driver
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
-//! progress". The actual `ResendRequest` / `SequenceReset` / gap-fill message
-//! handling lives in `ironfix-engine`, because it requires the wire layer.
+//! progress". The decisions of answering a `ResendRequest` (which range, what
+//! is replayed and what is gap-filled) live in [`sans_io`]; reading the store,
+//! rebuilding and encoding the frames and running the replay gate live in
+//! `ironfix-engine`, because they need the wire layer, the store and the
+//! application.
 
 pub mod config;
 pub mod heartbeat;
+mod replay;
 pub mod sans_io;
 pub mod sequence;
 pub mod state;
@@ -61,6 +67,14 @@ pub use config::{
 pub use heartbeat::{
     HeartbeatIntervalError, HeartbeatManager, MAX_HEARTBEAT_INTERVAL_SECS, TestRequestOutcome,
     generate_test_req_id, negotiate_interval,
+};
+pub use sans_io::{
+    EndSeqNoInfinity, EntryScreen, GapFillRange, MAX_HELD_BYTES, MAX_HELD_SENDS,
+    MAX_QUEUED_REPLAYS, MAX_READS_PER_REPLAY_STEP, OpeningReplay, PageRead, PageRequest,
+    REPLAY_PAGE_LIMIT, REPLAY_STEP_MAX_BYTES, REPLAY_STEP_MAX_FRAMES, ReplayAction, ReplayField,
+    ReplayStep, ReplayVerdict, ResendReplay, ResendRequestDecision, decide_opening_replay,
+    decide_resend_request, hold_full, orig_sending_time, reads_yield_to_replay, replay_field,
+    replay_queue_full, replay_step_continues,
 };
 pub use sans_io::{
     GapRequest, InboundSequence, LivenessAction, LivenessGate, RecoveryProgress, ResendState,
