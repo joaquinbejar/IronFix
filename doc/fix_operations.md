@@ -94,7 +94,14 @@ and stops at the first failure:
    (`SessionConfig::require_ack_default_appl_ver_id`, default `false`) requires
    it: an ack without 1137 then draws a Reject with reason 1 (required tag
    missing), `RefTagID` = 1137, and a Logout. A FIX 4.x ack is not checked.
-6. **`HeartBtInt` (108).** 108 is a *required* field of the Logon, so an ack
+6. **`EncryptMethod` (98) and `HeartBtInt` (108).** 98 is a *required* field of the Logon and
+   IronFix implements no encryption, so an ack without 98 (session Reject,
+   reason 1) or naming a method other than 0 (reason 5), `RefTagID` = 98 in
+   both cases and each followed by a Logout, fails the handshake with
+   `EngineError::LogonRejected`. The acceptor applies the same check to the
+   Logon (`ironfix_session::header::check_encrypt_method`).
+
+   108 is a *required* field of the Logon too, so an ack
    that omits it (session Reject, reason 1 — required tag missing) or carries a
    non-numeric value (session Reject, reason 6 — incorrect data format for
    value), `RefTagID` = 108 in both cases and each followed by a Logout, fails

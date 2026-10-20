@@ -205,6 +205,7 @@ use bytes::BytesMut;
 use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
 use ironfix_session::config::SessionConfigError;
+use ironfix_session::header::check_encrypt_method;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
 use ironfix_session::{
     Connecting, Disconnected, HeartbeatManager, LogonCounters, LogonGapAction, LogonRefusal,
@@ -1382,12 +1383,8 @@ impl<A: Application + 'static> Acceptor<A> {
             // EncryptMethod (98): IronFix implements no encryption, so only 0
             // (None) can be honoured. A missing or non-zero method is refused
             // rather than silently accepted as if it were plaintext.
-            let encrypt_method = raw.get_field_str(98);
-            if encrypt_method != Some("0") {
-                let shown = encrypt_method
-                    .map_or_else(|| "<absent>".to_string(), |v| v.chars().take(16).collect());
-                let detail =
-                    format!("unsupported EncryptMethod (98) '{shown}'; only 0 (None) is supported");
+            if let Err(problem) = check_encrypt_method(&raw) {
+                let detail = problem.to_string();
                 let logout = factory.logout(Some(&detail));
                 self.refuse_unauthenticated(
                     &session_id,

@@ -1014,6 +1014,49 @@ async fn test_max_u64_heartbeat_interval_fails_handshake_without_abort() {
     );
 }
 
+/// EncryptMethod (98) is a required field of the Logon, and only 0 (None) is
+/// supported. An ack without it, or naming another method, is refused with
+/// a Reject (RefTagID 98: reason 1 when absent, 5 otherwise) and a Logout,
+/// and fails the handshake (codex review of #192).
+#[tokio::test]
+async fn test_ack_encrypt_method_missing_or_unsupported_fails_handshake() {
+    for (body, code) in [
+        (vec![(108, "30")], "1"),
+        (vec![(98, "1"), (108, "30")], "5"),
+    ] {
+        let (listener, addr) = bind_listener().await;
+        let acceptor = tokio::spawn(async move {
+            let mut framed = accept_framed(listener).await;
+            let _logon = next_frame(&mut framed).await;
+            ok(
+                framed.send(venue_msg("A", 1, &body)).await,
+                "send logon ack with a bad EncryptMethod",
+            );
+            let reject = next_frame(&mut framed).await;
+            assert_eq!(msg_type_of(&reject), "3");
+            assert_eq!(field(&reject, 371).as_deref(), Some("98"));
+            assert_eq!(field(&reject, 373).as_deref(), Some(code));
+            let logout = next_frame(&mut framed).await;
+            assert_eq!(msg_type_of(&logout), "5");
+        });
+        let (app, _app_rx) = RecordingApp::new();
+        let initiator = Initiator::new(client_config(Duration::from_secs(30)), Arc::clone(&app));
+        match initiator.connect(addr).await {
+            Err(EngineError::LogonRejected { reason }) => {
+                assert!(reason.contains("EncryptMethod (98)"), "got {reason}");
+            }
+            other => panic!("expected LogonRejected, got {other:?}"),
+        }
+        ok(
+            ok(
+                timeout(Duration::from_secs(5), acceptor).await,
+                "acceptor done within 5s",
+            ),
+            "acceptor task",
+        );
+    }
+}
+
 /// HeartBtInt (108) is a required field of the Logon. An ack that omits it is
 /// refused with a Reject (reason 1, RefTagID 108) and a Logout, and fails the
 /// handshake rather than silently establishing a session on the locally

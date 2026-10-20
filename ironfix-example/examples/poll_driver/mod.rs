@@ -51,7 +51,8 @@ use ironfix_engine::application::{RejectReason, SessionId};
 use ironfix_engine::{OutboundField, OutboundMessage, SyncApplication};
 use ironfix_session::SessionConfig;
 use ironfix_session::header::{
-    HeartBtIntProblem, PeerIdentity, SendingTimeGuard, header_seq_num, parse_heartbeat_interval,
+    HeartBtIntProblem, PeerIdentity, SendingTimeGuard, check_encrypt_method, header_seq_num,
+    parse_heartbeat_interval,
 };
 use ironfix_session::heartbeat::{HeartbeatManager, generate_test_req_id};
 use ironfix_session::sans_io::{
@@ -390,6 +391,20 @@ impl<A: SyncApplication, S: SyncMessageStore> PollSession<A, S> {
                 format!("Logon acknowledgement refused: {}", reason.text),
                 now,
             );
+        }
+        // EncryptMethod (98) is required, and only 0 (None) is supported: a
+        // session Reject (RefTagID 98) and a Logout otherwise, as the
+        // engine's initiator does.
+        if let Err(problem) = check_encrypt_method(raw) {
+            let detail = problem.to_string();
+            let reason = RejectReason::new(problem.reject_code(), detail.clone())
+                .with_ref_tag(problem.ref_tag());
+            self.reject(seq, msg_type, &reason, now);
+            let mut logout = OutboundMessage::new(MsgType::Logout);
+            logout.push_str(58, &detail);
+            let _ = self.send_admin(logout, now);
+            let _ = self.flush(now);
+            return self.end(Ended::Protocol(detail));
         }
         // HeartBtInt (108) is required on the acknowledgement, bounded, and
         // adopted, as the engine's initiator does: a session Reject

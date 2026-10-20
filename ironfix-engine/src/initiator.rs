@@ -226,6 +226,7 @@ use ironfix_core::error::DecodeError;
 use ironfix_core::message::MsgType;
 use ironfix_core::version::FixVersion;
 use ironfix_session::config::SessionConfigError;
+use ironfix_session::header::check_encrypt_method;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted, SequenceResult};
 use ironfix_session::{
     ADOPTED_RESET_NEXT_SENDER, ADOPTED_RESET_NEXT_TARGET, ADOPTED_RESET_STORED_TARGET,
@@ -1462,6 +1463,34 @@ impl<A: Application + 'static> Initiator<A> {
                     refused?;
                     return Err(EngineError::ApplVersion { detail });
                 }
+            }
+
+            // EncryptMethod (98) is a required field of the Logon, and IronFix
+            // implements no encryption: an acknowledgement without it, or
+            // naming another method, is refused with a session Reject
+            // (RefTagID 98) and a Logout, as the acceptor refuses a Logon.
+            if let Err(problem) = check_encrypt_method(&raw) {
+                let detail = problem.to_string();
+                let reason = RejectReason::new(problem.reject_code(), detail.clone())
+                    .with_ref_tag(problem.ref_tag());
+                let reject = factory.session_reject(ack_seq, MsgType::Logon.as_str(), &reason);
+                let logout = factory.logout(Some(&detail));
+                let refused = refuse_handshake(
+                    self.application.as_ref(),
+                    &session_id,
+                    &mut framed,
+                    &mut factory,
+                    &runtime.sequences,
+                    store.as_mut(),
+                    write_timeout,
+                    self.capture(&session_id).as_ref(),
+                    &detail,
+                    [reject, logout],
+                )
+                .await;
+                let _ = session.on_logon_reject();
+                refused?;
+                return Err(EngineError::LogonRejected { reason: detail });
             }
 
             // Honor the heartbeat interval confirmed by the counterparty, but
