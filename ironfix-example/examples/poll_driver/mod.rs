@@ -43,20 +43,24 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::BytesMut;
+use ironfix_core::error::StoreError;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::Timestamp;
 use ironfix_core::version::FixVersion;
 use ironfix_engine::application::{RejectReason, SessionId};
 use ironfix_engine::{OutboundField, OutboundMessage, SyncApplication};
 use ironfix_session::SessionConfig;
-use ironfix_session::header::{PeerIdentity, SendingTimeGuard, header_seq_num};
+use ironfix_session::header::{
+    HeartBtIntProblem, PeerIdentity, SendingTimeGuard, header_seq_num, parse_heartbeat_interval,
+};
 use ironfix_session::heartbeat::{HeartbeatManager, generate_test_req_id};
 use ironfix_session::sans_io::{
-    EndSeqNoInfinity, EntryScreen, GapDisposition, GapRequest, InboundRoute, LivenessAction,
-    PageRead, ReplayAction, ReplayField, ReplayStep, ReplayVerdict, ResendReplay,
-    ResendRequestDecision, ResetDecision, ResetScreen, SessionCore, SessionPhase, TickDecision,
-    TickInput, decide_resend_request, decide_sequence_reset, orig_sending_time, replay_field,
-    route_inbound, screen_sequence_reset, test_request_reply_id,
+    AckHeartBtIntDefect, EndSeqNoInfinity, EntryScreen, GapDisposition, GapRequest, InboundRoute,
+    LivenessAction, LogonRole, PageRead, ReplayAction, ReplayField, ReplayStep, ReplayVerdict,
+    ResendReplay, ResendRequestDecision, ResetDecision, ResetScreen, SessionCore, SessionPhase,
+    TickDecision, TickInput, decide_resend_request, decide_sequence_reset, interval_change,
+    negotiate_logon_interval, orig_sending_time, replay_field, route_inbound,
+    screen_sequence_reset, test_request_reply_id,
 };
 use ironfix_session::sequence::SequenceManager;
 use ironfix_session::state::{LogonSent, Session};
@@ -359,10 +363,15 @@ impl<A: SyncApplication, S: SyncMessageStore> PollSession<A, S> {
             } => {
                 self.request_gap(expected, received, now);
                 match then {
-                    // No gap queue here: the message is recovered by the
-                    // resend.
-                    GapDisposition::QueueFrame | GapDisposition::KeepNumber => {}
-                    GapDisposition::Dispatch => self.on_admin(&raw, &msg_type, now),
+                    // No gap queue here: an application message is recovered
+                    // by the resend.
+                    GapDisposition::QueueFrame => {}
+                    // An admin message is acted on now, without advancing
+                    // the expectation: a TestRequest above a gap still gets
+                    // its Heartbeat, a ResendRequest its answer.
+                    GapDisposition::KeepNumber | GapDisposition::Dispatch => {
+                        self.on_admin(&raw, &msg_type, now);
+                    }
                 }
             }
         }
@@ -381,6 +390,40 @@ impl<A: SyncApplication, S: SyncMessageStore> PollSession<A, S> {
                 format!("Logon acknowledgement refused: {}", reason.text),
                 now,
             );
+        }
+        // HeartBtInt (108) is required on the acknowledgement, bounded, and
+        // adopted, as the engine's initiator does: a session Reject
+        // (RefTagID 108) and a Logout otherwise.
+        let negotiated = match parse_heartbeat_interval(raw) {
+            Ok(secs) => {
+                negotiate_logon_interval(LogonRole::Initiator, self.config.heartbeat_interval, secs)
+                    .map_err(|err| (AckHeartBtIntDefect::OutOfRange, err.to_string()))
+            }
+            Err(problem @ HeartBtIntProblem::Missing) => {
+                Err((AckHeartBtIntDefect::Missing, problem.to_string()))
+            }
+            Err(problem @ HeartBtIntProblem::Malformed { .. }) => {
+                Err((AckHeartBtIntDefect::Malformed, problem.to_string()))
+            }
+            Err(problem @ HeartBtIntProblem::OutOfRange { .. }) => {
+                Err((AckHeartBtIntDefect::OutOfRange, problem.to_string()))
+            }
+        };
+        let negotiated = match negotiated {
+            Ok(interval) => interval,
+            Err((defect, detail)) => {
+                let reason = RejectReason::new(defect.session_reject_reason(), detail.clone())
+                    .with_ref_tag(108);
+                self.reject(seq, msg_type, &reason, now);
+                let mut logout = OutboundMessage::new(MsgType::Logout);
+                logout.push_str(58, &detail);
+                let _ = self.send_admin(logout, now);
+                let _ = self.flush(now);
+                return self.end(Ended::Protocol(detail));
+            }
+        };
+        if let Some(interval) = interval_change(self.heartbeat.interval(), negotiated) {
+            self.heartbeat = HeartbeatManager::new(interval, now);
         }
         let route = route_inbound(&self.sequences, msg_type, seq, || false);
         let Stage::LogonSent(session) = std::mem::replace(&mut self.stage, Stage::Live) else {
@@ -503,6 +546,11 @@ impl<A: SyncApplication, S: SyncMessageStore> PollSession<A, S> {
             ResetScreen::Reset => false,
         };
         if let Err(reason) = self.app.from_admin(raw, &self.session_id) {
+            // An in-sequence fill occupies its number however it is
+            // answered: the persisted target already moved past it.
+            if gap_fill && !self.consume_fill(now) {
+                return;
+            }
             return self.reject(seq, &MsgType::SequenceReset, &reason, now);
         }
         let new_seq_no = raw.get_field_str(36).and_then(|value| value.parse().ok());
@@ -515,12 +563,47 @@ impl<A: SyncApplication, S: SyncMessageStore> PollSession<A, S> {
                 self.sequences.set_target_seq(new_seq);
                 let _ = self.core.note_inbound_progress(new_seq, now);
             }
-            refused => {
-                let reason = RejectReason::new(5, format!("SequenceReset refused: {refused:?}"))
+            ResetDecision::MissingNewSeqNo => {
+                if gap_fill && !self.consume_fill(now) {
+                    return;
+                }
+                let reason = RejectReason::new(1, "SequenceReset without a valid NewSeqNo (36)")
                     .with_ref_tag(36);
                 self.reject(seq, &MsgType::SequenceReset, &reason, now);
             }
+            ResetDecision::FillNotAdvancing { new_seq } => {
+                if !self.consume_fill(now) {
+                    return;
+                }
+                let reason = RejectReason::new(
+                    5,
+                    format!("GapFill NewSeqNo {new_seq} does not advance past MsgSeqNum {seq}"),
+                )
+                .with_ref_tag(36);
+                self.reject(seq, &MsgType::SequenceReset, &reason, now);
+            }
+            ResetDecision::ResetBelowExpected { new_seq, expected } => {
+                let reason = RejectReason::new(
+                    5,
+                    format!("SequenceReset NewSeqNo {new_seq} is below the expected {expected}"),
+                )
+                .with_ref_tag(36);
+                self.reject(seq, &MsgType::SequenceReset, &reason, now);
+            }
         }
+    }
+
+    /// Consumes the number of an in-sequence GapFill that is rejected: its
+    /// next number is already persisted ([`ResetScreen::FillInSequence`]),
+    /// so the in-memory expectation follows. `false` once the session ended.
+    fn consume_fill(&mut self, now: Instant) -> bool {
+        if self.sequences.try_increment_target_seq().is_err() {
+            self.fail("inbound MsgSeqNum exhausted".to_string(), now);
+            return false;
+        }
+        let target = self.sequences.next_target_seq().value();
+        let _ = self.core.note_inbound_progress(target, now);
+        true
     }
 
     /// Requests the gap from `expected` when the core says a request is due.
@@ -564,6 +647,14 @@ impl<A: SyncApplication, S: SyncMessageStore> PollSession<A, S> {
                 ReplayStep::ReadPage(page) => {
                     let messages = match self.store.get_page(page.from, page.through, page.limit) {
                         Ok(messages) => messages,
+                        // A store that reports itself corrupted cannot say
+                        // what was sent: gap-filling over it would tell the
+                        // counterparty its filed messages never existed. The
+                        // session ends, as the engine's does.
+                        Err(err @ StoreError::Corrupted { .. }) => {
+                            return self.fail(format!("the store is corrupted: {err}"), now);
+                        }
+                        // Any other failed read gap-fills the rest.
                         Err(_) => {
                             replay.on_page(PageRead::Failed);
                             continue;
@@ -811,16 +902,30 @@ fn rebuild_replay(stored: &[u8], _now: Instant) -> Option<Vec<u8>> {
     let sent = raw.get_field_str(52)?;
     let orig = orig_sending_time(raw.get_field_str(122), sent).to_string();
     let mut encoder = Encoder::new(BEGIN_STRING);
-    for field in raw.fields() {
+    // Collected so a LENGTH field can look ahead to its DATA field.
+    let fields: Vec<_> = raw.fields().collect();
+    let mut index = 0;
+    while let Some(field) = fields.get(index) {
+        index += 1;
         match replay_field(field.tag) {
             ReplayField::Framing | ReplayField::Reinserted => {}
             ReplayField::SendingTime => {
-                encoder.put_str(43, "Y");
-                encoder.put_str(52, Timestamp::now().format_millis().as_str());
-                encoder.put_str(122, &orig);
+                encoder.try_put_raw(43, b"Y").ok()?;
+                let now = Timestamp::now().format_millis();
+                encoder.try_put_raw(52, now.as_bytes()).ok()?;
+                encoder.try_put_raw(122, orig.as_bytes()).ok()?;
             }
             ReplayField::Copied if field.tag == 10 => {}
-            ReplayField::Copied => encoder.put_raw(field.tag, field.value),
+            ReplayField::Copied => {
+                if encoder.try_put_raw(field.tag, field.value).is_err() {
+                    // The encoder refuses a LENGTH or DATA tag on its own (it
+                    // derives the count from the payload): write the pair
+                    // together, as the engine's rebuild does.
+                    let data = fields.get(index)?;
+                    encoder.try_put_data(field.tag, data.tag, data.value).ok()?;
+                    index += 1;
+                }
+            }
         }
     }
     encoder.finish().ok().map(<[u8]>::to_vec)
