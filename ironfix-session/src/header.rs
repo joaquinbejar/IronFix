@@ -71,6 +71,7 @@ impl std::fmt::Display for IdentityMismatch {
 /// `OnBehalfOfSendingTime` (370), the `NoHops` group (627 and its 628/629/630 entries), and the FIXT.1.1
 /// application-version fields (1128, 1129, 1156). A tag outside this set is
 /// the first field of the message body.
+#[must_use]
 pub const fn is_standard_header_tag(tag: u32) -> bool {
     matches!(
         tag,
@@ -116,13 +117,17 @@ pub const fn is_standard_header_tag(tag: u32) -> bool {
 /// the first body field. Decoded fields keep their wire order, which is what
 /// makes the distinction available here at all — nothing else in a decoded
 /// message says where the header ended.
+#[must_use]
 pub fn in_standard_header(raw: &RawMessage<'_>, tag: u32) -> bool {
+    // The boundary is checked first: the first body field ends the header,
+    // whatever its tag, so a body tag is never reported as in the header
+    // (as [`header_field`] reads it).
     for field in raw.fields() {
-        if field.tag == tag {
-            return true;
-        }
         if !is_standard_header_tag(field.tag) {
             return false;
+        }
+        if field.tag == tag {
+            return true;
         }
     }
     false
@@ -152,6 +157,7 @@ pub enum FieldOccurrence<'a> {
 /// [`FieldOccurrence::Repeated`] rather than its first value. One scan, no
 /// allocation, and the value is returned as raw bytes, so a caller bounding an
 /// untrusted value sees every byte before deciding whether it is text at all.
+#[must_use]
 pub fn header_field<'a>(raw: &RawMessage<'a>, tag: u32) -> FieldOccurrence<'a> {
     let mut found = FieldOccurrence::Absent;
     for field in raw.fields() {
@@ -177,6 +183,7 @@ pub fn header_field<'a>(raw: &RawMessage<'a>, tag: u32) -> FieldOccurrence<'a> {
 /// Logon that is, in fact, missing its header `MsgSeqNum`.
 ///
 /// Returns `None` when 34 is absent from the header or is not a valid `u64`.
+#[must_use]
 pub fn header_seq_num(raw: &RawMessage<'_>) -> Option<u64> {
     if !in_standard_header(raw, 34) {
         return None;
@@ -252,6 +259,7 @@ impl std::fmt::Display for HeartBtIntProblem {
 /// Returns [`HeartBtIntProblem::Missing`] when tag 108 is absent,
 /// [`HeartBtIntProblem::Malformed`] when it is not a non-negative integer, and
 /// [`HeartBtIntProblem::OutOfRange`] when it exceeds the maximum.
+#[must_use]
 pub fn parse_heartbeat_interval(raw: &RawMessage<'_>) -> Result<u64, HeartBtIntProblem> {
     let Some(value) = raw.get_field_str(108) else {
         return Err(HeartBtIntProblem::Missing);
@@ -473,6 +481,10 @@ impl SendingTimeGuard {
     /// counterparty, so it is treated as absent. The binding spec assigns no
     /// positional reject reason for 52 (reason 9 is CompID-only), so this is
     /// inbound-acceptance hardening rather than a spec-mandated reject.
+    ///
+    /// `now_millis` is the driver's wall clock: UTC milliseconds since the
+    /// Unix epoch, the scale [`parse_utc_timestamp_millis`] reads 52 into.
+    /// The check reads no clock itself.
     ///
     /// # Errors
     /// Returns [`SendingTimeProblem::Missing`] when tag 52 is absent from the
@@ -699,6 +711,7 @@ impl std::fmt::Display for ApplVersionProblem {
 /// [`RawMessage::get_field_str`], which finds the first occurrence wherever it
 /// is, so the value the session checks has to be the only one the message
 /// carries.
+#[must_use]
 pub fn message_field<'a>(raw: &RawMessage<'a>, tag: u32) -> FieldOccurrence<'a> {
     let mut found = FieldOccurrence::Absent;
     for field in raw.fields() {
@@ -884,6 +897,7 @@ impl ApplVersionGuard {
 /// date that does not exist and any year before 1970. There is no
 /// representable instant for those, and inventing one would let a malformed
 /// value pass the accuracy check.
+#[must_use]
 pub fn parse_utc_timestamp_millis(value: &str) -> Option<u64> {
     let bytes = value.as_bytes();
     // "YYYYMMDD-HH:MM:SS" — the fractional part is optional.

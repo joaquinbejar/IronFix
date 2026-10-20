@@ -1354,7 +1354,7 @@ mod tests {
     use ironfix_core::types::CompId;
     use ironfix_session::header::{
         HeartBtIntProblem, MAX_ECHOED_APPL_VER_ID, MAX_ECHOED_HEARTBEAT, MAX_ECHOED_SENDING_TIME,
-        MAX_HEARTBEAT_INTERVAL_SECS,
+        MAX_HEARTBEAT_INTERVAL_SECS, in_standard_header,
     };
     use std::time::Duration;
 
@@ -2478,6 +2478,14 @@ mod tests {
         assert_eq!(header_field(&raw, 50), FieldOccurrence::Absent);
         // A body tag is never a header field, even as the first body field.
         assert_eq!(header_field(&raw, 98), FieldOccurrence::Absent);
+        // The positional check agrees with the reader (#191 review): the
+        // first body field ends the header, whatever its tag.
+        for tag in [49, 56, 142, 52] {
+            assert!(in_standard_header(&raw, tag), "{tag} is a header field");
+        }
+        for tag in [98, 57, 50] {
+            assert!(!in_standard_header(&raw, tag), "{tag} is not in the header");
+        }
     }
 
     #[test]
