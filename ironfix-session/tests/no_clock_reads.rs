@@ -23,6 +23,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("replay.rs", include_str!("../src/replay.rs")),
     ("sans_io.rs", include_str!("../src/sans_io.rs")),
     ("sequence.rs", include_str!("../src/sequence.rs")),
+    ("session_core.rs", include_str!("../src/session_core.rs")),
     ("state.rs", include_str!("../src/state.rs")),
 ];
 

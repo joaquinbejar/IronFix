@@ -308,17 +308,15 @@ use ironfix_core::version::FixVersion;
 use ironfix_session::config::MAX_INBOUND_FIELDS;
 use ironfix_session::heartbeat::generate_test_req_id;
 use ironfix_session::sans_io::{
-    EntryScreen, GapRequest, InboundSequence, LivenessAction, LivenessGate, OpeningReplay,
-    PageRead, PageRequest, ReplayAction, ReplayStep, ReplayVerdict, ResendReplay,
-    ResendRequestDecision, ResendState, StallAction, classify_inbound, decide_gap_request,
-    decide_liveness, decide_opening_replay, decide_resend_request, decide_stall, logout_timed_out,
-    merged_high_water, note_inbound_progress, reads_yield_to_replay, replay_queue_full,
-    replay_step_continues, spanned_high_water, spanned_rerequest, test_request_reply_id,
+    EntryScreen, GapRequest, HeldLogonRelease, InboundSequence, LivenessAction, LivenessGate,
+    OpeningReplay, PageRead, PageRequest, ReplayAction, ReplayStep, ReplayVerdict, ResendReplay,
+    ResendRequestDecision, SessionCore, StallAction, classify_inbound, decide_liveness,
+    decide_opening_replay, decide_resend_request, logout_timed_out, replay_queue_full,
+    replay_step_continues, spanned_high_water, test_request_reply_id,
 };
 use ironfix_session::sans_io::{
-    LocalLogoutDecision, LogoutPhase, LogoutReplyWrite, OwedLogout, PeerLogoutDecision,
-    close_resets, decide_local_logout, decide_logout_advance, decide_peer_logout, owed_logout_due,
-    reply_close, settle_close,
+    LocalLogoutDecision, LogoutPhase, LogoutReplyWrite, PeerLogoutDecision, close_resets,
+    decide_local_logout, decide_logout_advance, reply_close, settle_close,
 };
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_session::{
@@ -2021,43 +2019,24 @@ struct Reactor<A: Application> {
     accounted: watch::Sender<u64>,
     /// The number last published on `accounted`.
     published: u64,
-    /// The outstanding ResendRequest, if a gap is being recovered.
+    /// The session state the sans-IO core owns (issue #91, stage 6a): the
+    /// outstanding ResendRequest recovery, the TestRequest fed but not yet
+    /// written whole (its reply deadline starts once it is,
+    /// [`Reactor::advance_probes`]), the Logon held behind a 789 gap
+    /// ([`Reactor::release_held_logon`]), the read budget between resend
+    /// steps, the hold count, the owed Logout, the spanning re-request mark
+    /// and whether this session's own Logout was fed.
     ///
-    /// The logout deadline is *not* tracked here: `Session<LogoutPending>`
+    /// The logout deadline is *not* tracked there: `Session<LogoutPending>`
     /// carries the instant the Logout went out, so the phase itself is the
     /// deadline.
-    resend: Option<ResendState>,
-    /// The `TestReqID` (112) of a TestRequest fed but not yet written whole:
-    /// its reply deadline starts once it is ([`Reactor::advance_probes`]).
-    /// While it is set no other TestRequest is sent.
-    unwritten_test_request: Option<String>,
-    /// The `MsgSeqNum` of a gapped Logon or acknowledgement held until the
-    /// `NextExpectedMsgSeqNum` (789) resend fills the gap below it, then
-    /// consumed ([`Reactor::release_held_logon`]).
-    held_logon: Option<u64>,
+    core: SessionCore,
     /// Resends this session owes the counterparty, answered in order, by
     /// steps of the reactor loop ([`Reactor::resend_step`]).
     resends: VecDeque<ResendJob>,
-    /// Inbound frames handled since the last resend step, counted only while
-    /// a resend has room to write; at [`MAX_READS_PER_REPLAY_STEP`](ironfix_session::MAX_READS_PER_REPLAY_STEP) the next
-    /// pass gives the resend its step before reading again.
-    reads_since_resend_step: u32,
     /// Messages that take a new number, held back while a resend is under
     /// way and written in order once it is done ([`Reactor::finish_resends`]).
     deferred: VecDeque<DeferredSend>,
-    /// What `deferred` holds, by [`DeferredSend::held_bytes`]: reading stops
-    /// at [`MAX_HELD_BYTES`](ironfix_session::MAX_HELD_BYTES) as it does at [`MAX_HELD_SENDS`](ironfix_session::MAX_HELD_SENDS).
-    deferred_bytes: usize,
-    /// A Logout the counterparty sent while a resend was owed: replied to
-    /// once the resend is done, or when the logout timeout runs out.
-    logout_owed: Option<OwedLogout>,
-    /// The expected number a spanning possible-duplicate gap fill last made
-    /// this session re-request, so it re-requests at most once per number
-    /// ([`Reactor::rerequest_spanned_gap`]).
-    spanning_rerequested: Option<u64>,
-    /// Whether this session's own Logout has been fed: messages still queued
-    /// behind it when the session closes report `LogoutPending`.
-    logout_sent: bool,
     /// Why this session sent its own Logout, once it has: reported in the
     /// close reason when the exchange completes or times out.
     logout_cause: Option<LogoutCause>,
@@ -2277,7 +2256,7 @@ async fn run_reactor<A: Application + 'static>(
         let read = !hold_full
             && !ctx.writer.reads_paused(waiting)
             && !ctx.writer.observed_reads_paused()
-            && !(resend_ready && reads_yield_to_replay(ctx.reads_since_resend_step));
+            && !(resend_ready && ctx.core.reads_yield_to_replay());
         let flushing = ctx.writer.pending;
         // A message the outbound throttle holds is released under the same
         // conditions a new command is taken (no resend under way, room under
@@ -2962,8 +2941,8 @@ impl<A: Application> Reactor<A> {
                 UnknownReason::Transport,
             )),
             SocketEvent::Inbound(inbound) => {
-                if resend_ready && let Some(reads) = self.reads_since_resend_step.checked_add(1) {
-                    self.reads_since_resend_step = reads;
+                if resend_ready {
+                    self.core.note_read_while_replaying();
                 }
                 // The same poll can write a probe whole, leave the flush
                 // pending and return the counterparty's answer to it: arm
@@ -3083,14 +3062,12 @@ impl<A: Application> Reactor<A> {
     /// output buffered ahead of it under backpressure does not use them up.
     fn advance_probes(&mut self) {
         if self.writer.test_request.take_written()
-            && let Some(test_req_id) = self.unwritten_test_request.take()
+            && let Some(test_req_id) = self.core.take_written_test_request()
         {
             lock_heartbeat(&self.runtime).on_test_request_sent(test_req_id, driver_now());
         }
-        if self.writer.resend_request.take_written()
-            && let Some(state) = self.resend.as_mut()
-        {
-            state.restart_clock(driver_now());
+        if self.writer.resend_request.take_written() {
+            self.core.restart_resend_clock(driver_now());
         }
     }
 
@@ -3827,10 +3804,8 @@ impl<A: Application> Reactor<A> {
                 // can start while one is under way (both wait behind it), and
                 // a resend the counterparty asks for after this Logout is
                 // still answered, as FIX allows.
-                self.resend = None;
-                self.held_logon = None;
+                self.core.note_local_logout_fed();
                 self.clear_gap_queue("this session logged out");
-                self.logout_sent = true;
                 self.logout_cause = Some(cause);
                 // Nothing that takes a new number follows this session's own
                 // Logout: what the throttle holds is discarded now, not left
@@ -3922,11 +3897,10 @@ impl<A: Application> Reactor<A> {
         // A request still buffered has not reached the counterparty: its
         // clock starts once it is written whole ([`Reactor::advance_probes`]),
         // and the write timeout bounds how long it may wait.
-        match decide_stall(
-            self.resend.as_ref(),
-            driver_now(),
-            self.writer.resend_request.unwritten(),
-        ) {
+        match self
+            .core
+            .decide_stall(driver_now(), self.writer.resend_request.unwritten())
+        {
             StallAction::Wait => {}
             stalled @ (StallAction::Retry { .. } | StallAction::Abandon { .. }) => {
                 return self.on_resend_stalled(framed, phase, stalled).await;
@@ -3938,10 +3912,7 @@ impl<A: Application> Reactor<A> {
         // Output still waiting to be written is traffic the counterparty is
         // about to receive, so an idle Heartbeat is due only once nothing is
         // waiting.
-        let gate = LivenessGate::Probe {
-            test_request_unwritten: self.unwritten_test_request.is_some(),
-            output_waiting: self.writer.pending,
-        };
+        let gate = self.core.probe_gate(self.writer.pending);
         let action = decide_liveness(&lock_heartbeat(&self.runtime), driver_now(), gate);
         match action {
             LivenessAction::Idle => {}
@@ -3964,7 +3935,7 @@ impl<A: Application> Reactor<A> {
                     // Arming it for a dropped probe would time the session out
                     // waiting for an answer to a frame never sent.
                     Ok(Sent::Yes) => {
-                        self.unwritten_test_request = Some(test_req_id);
+                        self.core.note_test_request_fed(test_req_id);
                         self.advance_probes();
                     }
                     Ok(Sent::Dropped | Sent::Deferred) => {}
@@ -4027,7 +3998,7 @@ impl<A: Application> Reactor<A> {
     /// is already outstanding. `high_water` is the highest sequence number seen
     /// for this gap — the top of the range the request must eventually fill.
     ///
-    /// The first request for a gap opens a [`ResendState`], whose timer bounds
+    /// The first request for a gap opens a [`ResendState`](ironfix_session::ResendState), whose timer bounds
     /// how long the gap may sit unfilled (see [`Reactor::on_resend_stalled`]).
     /// A frame that reaches beyond an already-open gap only raises the recorded
     /// water mark; it does not emit a second overlapping request.
@@ -4040,7 +4011,7 @@ impl<A: Application> Reactor<A> {
     ) -> Result<Phase, SessionClosed> {
         // The request from this gap start is already on the wire; a frame
         // reaching further only raises the water mark.
-        match decide_gap_request(self.resend.as_mut(), expected, high_water) {
+        match self.core.decide_gap_request(expected, high_water) {
             GapRequest::AlreadyRequested => return Ok(phase),
             GapRequest::Request => {}
         }
@@ -4051,10 +4022,8 @@ impl<A: Application> Reactor<A> {
         // ([`Reactor::finish_resends`]), so a request a `to_admin` callback
         // drops then costs none (issue #128).
         if self.resend_in_progress() {
-            let high_water = merged_high_water(self.resend.as_ref(), high_water);
-            let mut state = ResendState::implied(expected, high_water, &self.config, driver_now());
-            state.charge_held_request();
-            self.resend = Some(state);
+            self.core
+                .arm_held_request(expected, high_water, &self.config, driver_now());
             self.defer_resend_request();
             return Ok(phase);
         }
@@ -4075,13 +4044,8 @@ impl<A: Application> Reactor<A> {
         }
         // A re-request at a new gap start keeps the highest water mark seen so
         // far, so the range is never narrowed by a later, lower frame.
-        let high_water = merged_high_water(self.resend.as_ref(), high_water);
-        self.resend = Some(ResendState::first(
-            expected,
-            high_water,
-            &self.config,
-            driver_now(),
-        ));
+        self.core
+            .arm_requested(expected, high_water, &self.config, driver_now());
         self.drop_held_logon_for_a_request();
         Ok(phase)
     }
@@ -4110,7 +4074,7 @@ impl<A: Application> Reactor<A> {
         expected: u64,
         new_seq: u64,
     ) -> Result<Phase, SessionClosed> {
-        self.spanning_rerequested = Some(expected);
+        self.core.note_spanned_rerequest(expected);
         let high_water = spanned_high_water(expected, new_seq);
         tracing::info!(
             session = %self.session_id,
@@ -4143,17 +4107,8 @@ impl<A: Application> Reactor<A> {
     /// retry budget: recovery already armed keeps its attempts and restarts
     /// its clock; otherwise it starts implied.
     fn arm_uncharged(&mut self, expected: u64, high_water: u64) {
-        match self.resend.as_mut() {
-            Some(state) => state.rearm_uncharged(expected, high_water, driver_now()),
-            None => {
-                self.resend = Some(ResendState::implied(
-                    expected,
-                    high_water,
-                    &self.config,
-                    driver_now(),
-                ));
-            }
-        }
+        self.core
+            .arm_uncharged(expected, high_water, &self.config, driver_now());
     }
 
     /// Drops a held Logon because a real `ResendRequest` has just gone out.
@@ -4166,7 +4121,7 @@ impl<A: Application> Reactor<A> {
     /// missing. Duplicates of the counterparty's own 789 resend that arrive
     /// meanwhile are dropped as possible duplicates as usual.
     fn drop_held_logon_for_a_request(&mut self) {
-        if let Some(logon_seq) = self.held_logon.take() {
+        if let Some(logon_seq) = self.core.release_held_logon_to_request() {
             tracing::debug!(
                 session = %self.session_id,
                 held_logon = logon_seq,
@@ -4186,11 +4141,11 @@ impl<A: Application> Reactor<A> {
     /// stall timer honest against a peer that fills the gap start and then
     /// stalls while spamming timely duplicates.
     fn note_inbound_progress(&mut self) {
-        if self.resend.is_none() {
+        if !self.core.recovering() {
             return;
         }
         let next_target = self.runtime.sequences.next_target_seq().value();
-        let _ = note_inbound_progress(&mut self.resend, next_target, driver_now());
+        let _ = self.core.note_inbound_progress(next_target, driver_now());
     }
 
     /// Handles an outstanding ResendRequest that has gone unanswered past its
@@ -4240,9 +4195,7 @@ impl<A: Application> Reactor<A> {
             Ok(Sent::Dropped) => return Ok(phase),
             Ok(Sent::Yes | Sent::Deferred) => {}
         }
-        if let Some(state) = self.resend.as_mut() {
-            state.record_retry(driver_now());
-        }
+        self.core.record_retry(driver_now());
         self.drop_held_logon_for_a_request();
         tracing::debug!(
             session = %self.session_id,
@@ -4686,11 +4639,10 @@ impl<A: Application> Reactor<A> {
                     let new_seq_no = raw
                         .get_field_str(36)
                         .and_then(|value| value.parse::<u64>().ok());
-                    if let Some(new_seq) = spanned_rerequest(
+                    if let Some(new_seq) = self.core.spanned_rerequest(
                         expected,
                         new_seq_no,
                         matches!(phase, Phase::Active(_)),
-                        self.spanning_rerequested,
                     ) {
                         return self
                             .rerequest_spanned_gap(framed, phase, expected, new_seq)
@@ -4944,7 +4896,7 @@ impl<A: Application> Reactor<A> {
         framed: &mut FixFramed,
         phase: Phase,
     ) -> Result<Phase, SessionClosed> {
-        self.reads_since_resend_step = 0;
+        self.core.note_replay_step();
         // The owed Logout's deadline is checked before every step, not only
         // on the tick: a step can feed the rest of a resend at once, and must
         // not do so past the deadline.
@@ -5016,8 +4968,8 @@ impl<A: Application> Reactor<A> {
             let request = matches!(next, DeferredSend::ResendRequest);
             let (pending, receipt) = match next {
                 DeferredSend::Message(pending, receipt) => (pending, receipt),
-                DeferredSend::ResendRequest => match self.resend {
-                    Some(state) => (self.factory.resend_request(state.expected(), 0), None),
+                DeferredSend::ResendRequest => match self.core.resend_expected() {
+                    Some(expected) => (self.factory.resend_request(expected, 0), None),
                     // The gap closed while the request was held.
                     None => continue,
                 },
@@ -5026,7 +4978,7 @@ impl<A: Application> Reactor<A> {
             // outcome: the charge it owed is taken now, and paid only if the
             // request goes out. A request `to_admin` vetoes costs nothing and
             // leaves no charge behind for a later request in the same gap.
-            let charge = request && self.resend.as_mut().is_some_and(ResendState::take_charge);
+            let charge = request && self.core.take_resend_charge();
             match self.send_now_tracked(framed, pending, receipt).await {
                 Err(EngineError::Store(err)) => {
                     return Err(self.close_on_store_failure(phase, &err));
@@ -5038,19 +4990,13 @@ impl<A: Application> Reactor<A> {
                 Ok(Sent::Yes) if request => {
                     // The stall clock runs from when the request went out,
                     // and a charged request pays its attempt now that it has.
-                    if let Some(state) = self.resend.as_mut() {
-                        if charge {
-                            state.record_retry(driver_now());
-                        } else {
-                            state.restart_clock(driver_now());
-                        }
-                    }
+                    self.core.note_held_request_written(charge, driver_now());
                     self.drop_held_logon_for_a_request();
                 }
                 Ok(_) => {}
             }
         }
-        if self.logout_owed.is_some() {
+        if self.core.logout_owed() {
             return self.reply_owed_logout(framed, phase, false).await;
         }
         // Messages queued above a gap whose release paused on a full hold.
@@ -5102,7 +5048,7 @@ impl<A: Application> Reactor<A> {
             let reason = self.reason_behind_resend();
             self.discard_deferred(&reason);
         }
-        let text = self.logout_owed.take().and_then(OwedLogout::into_text);
+        let text = self.core.take_owed_logout_text();
         let logout = self.factory.logout(None);
         let reason = CloseReason::PeerLogout { text };
         let write = match self.send_now(framed, logout).await {
@@ -5138,40 +5084,26 @@ impl<A: Application> Reactor<A> {
     /// Whether a Logout the counterparty sent while a resend was owed has
     /// waited the logout timeout since it (the first of them) arrived.
     fn owed_logout_due(&self) -> bool {
-        owed_logout_due(
-            self.logout_owed.as_ref(),
-            driver_now(),
-            self.config.logout_timeout,
-        )
+        self.core
+            .owed_logout_due(driver_now(), self.config.logout_timeout)
     }
 
     /// Holds `entry` back behind the resend under way, counting its bytes.
     fn hold(&mut self, entry: DeferredSend) {
-        let bytes = entry.held_bytes();
-        self.deferred_bytes = match self.deferred_bytes.checked_add(bytes) {
-            Some(total) => total,
-            // Unreachable while reading stops at MAX_DEFERRED_BYTES; a full
-            // count still stops reading.
-            None => {
-                debug_assert!(false, "held bytes overflowed usize");
-                usize::MAX
-            }
-        };
+        self.core.note_held(entry.held_bytes());
         self.deferred.push_back(entry);
         #[cfg(test)]
-        tests::note_held(self.deferred.len(), self.deferred_bytes);
+        {
+            let (messages, bytes) = self.core.held();
+            debug_assert_eq!(messages, self.deferred.len());
+            tests::note_held(messages, bytes);
+        }
     }
 
     /// Takes the oldest held entry, uncounting its bytes.
     fn unhold(&mut self) -> Option<DeferredSend> {
         let entry = self.deferred.pop_front()?;
-        self.deferred_bytes = match self.deferred_bytes.checked_sub(entry.held_bytes()) {
-            Some(total) => total,
-            None => {
-                debug_assert!(false, "held bytes underflowed");
-                0
-            }
-        };
+        self.core.note_unheld(entry.held_bytes());
         Some(entry)
     }
 
@@ -5179,7 +5111,7 @@ impl<A: Application> Reactor<A> {
     /// [`MAX_HELD_SENDS`](ironfix_session::MAX_HELD_SENDS) or [`MAX_HELD_BYTES`](ironfix_session::MAX_HELD_BYTES): reading stops until
     /// the resend is done.
     fn hold_full(&self) -> bool {
-        ironfix_session::hold_full(self.deferred.len(), self.deferred_bytes)
+        self.core.hold_full()
     }
 
     /// Holds a `ResendRequest` back behind the resend under way, unless one is
@@ -5201,7 +5133,7 @@ impl<A: Application> Reactor<A> {
     /// [`NotSentReason::DiscardedBehindResend`].
     #[must_use]
     const fn reason_behind_resend(&self) -> NotSentReason {
-        if self.logout_sent {
+        if self.core.logout_sent() {
             NotSentReason::LogoutPending
         } else {
             NotSentReason::DiscardedBehindResend {}
@@ -5212,7 +5144,7 @@ impl<A: Application> Reactor<A> {
     /// one with `reason`.
     fn discard_deferred(&mut self, reason: &NotSentReason) {
         let capture = self.writer.capture.as_ref();
-        self.deferred_bytes = 0;
+        self.core.clear_held();
         for held in self.deferred.drain(..) {
             if let DeferredSend::Message(_, receipt) = held {
                 settle(capture, FrameKind::Session, receipt, || {
@@ -5648,7 +5580,7 @@ impl<A: Application> Reactor<A> {
     /// on a number an application message already claimed does not run. An
     /// overflow returns `false`: the message is acted on as under `Discard`.
     fn queue_gapped(&mut self, phase: &Phase, seq: u64, entry: Gapped) -> bool {
-        if !matches!(phase, Phase::Active(_)) || self.logout_owed.is_some() {
+        if !matches!(phase, Phase::Active(_)) || self.core.logout_owed() {
             return false;
         }
         let Some(queue) = self.gap_queue.as_mut() else {
@@ -5725,23 +5657,23 @@ impl<A: Application> Reactor<A> {
     /// The session is closed on an exhausted target counter, or a store write
     /// that fails under the fail-closed policy.
     async fn release_held_logon(&mut self, phase: Phase) -> Result<Phase, SessionClosed> {
-        let Some(logon_seq) = self.held_logon else {
+        if self.core.held_logon().is_none() {
             return Ok(phase);
-        };
+        }
         let next_target = self.runtime.sequences.next_target_seq().value();
-        if next_target < logon_seq {
-            return Ok(phase);
-        }
-        self.held_logon = None;
-        if next_target > logon_seq {
-            tracing::debug!(
-                session = %self.session_id,
-                held_logon = logon_seq,
-                next_target,
-                "the gap below the held Logon was filled past it"
-            );
-            return Ok(phase);
-        }
+        let logon_seq = match self.core.decide_held_logon_release(next_target) {
+            HeldLogonRelease::Wait => return Ok(phase),
+            HeldLogonRelease::Passed { logon_seq } => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    held_logon = logon_seq,
+                    next_target,
+                    "the gap below the held Logon was filled past it"
+                );
+                return Ok(phase);
+            }
+            HeldLogonRelease::Consume { logon_seq } => logon_seq,
+        };
         let Some(next) = logon_seq.checked_add(1) else {
             return Err(exhausted(
                 phase,
@@ -5773,7 +5705,7 @@ impl<A: Application> Reactor<A> {
     /// A held Logon sends nothing. The gap below it is one the counterparty
     /// resends on its own, because this session's 789 named it: requesting it
     /// as well would cross that resend, which 789 exists to avoid. The gap is
-    /// armed as an implied recovery ([`ResendState::implied`]), so a gapped
+    /// armed as an implied recovery ([`ResendState::implied`](ironfix_session::ResendState::implied)), so a gapped
     /// frame arriving meanwhile sends no request either, and a gap that makes
     /// no progress for [`SessionConfig::resend_timeout`] (no resend, or one
     /// that stalls partway) gets one real `ResendRequest`. The Logon's number
@@ -5810,13 +5742,8 @@ impl<A: Application> Reactor<A> {
                 "holding the gapped Logon: the counterparty resends the gap below it on its own \
                  (NextExpectedMsgSeqNum)"
             );
-            self.resend = Some(ResendState::implied(
-                expected,
-                logon_seq,
-                &self.config,
-                driver_now(),
-            ));
-            self.held_logon = Some(logon_seq);
+            self.core
+                .hold_logon(expected, logon_seq, &self.config, driver_now());
         }
         if let Some((begin_seq, new_seq)) = opening.replay {
             let next_sender = self.runtime.sequences.next_sender_seq().value();
@@ -6331,9 +6258,8 @@ impl<A: Application> Reactor<A> {
         // counterparty that keeps logging out cannot keep pushing the reply
         // back (issue #128).
         let resending = self.resend_in_progress();
-        let decision = decide_peer_logout(
+        let decision = self.core.decide_peer_logout(
             phase.logout_phase(),
-            &mut self.logout_owed,
             driver_now(),
             || bounded_peer_text(raw.get_field_str(58)),
             resending,
@@ -6591,16 +6517,9 @@ where
         reset_owed,
         accounted,
         published: opening_mark,
-        resend: None,
-        unwritten_test_request: None,
-        held_logon: None,
+        core: SessionCore::new(),
         resends: VecDeque::new(),
-        reads_since_resend_step: 0,
         deferred: VecDeque::new(),
-        deferred_bytes: 0,
-        logout_owed: None,
-        spanning_rerequested: None,
-        logout_sent: false,
         logout_cause: None,
         write_timeout,
         writer,
@@ -6635,6 +6554,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironfix_session::sans_io::ResendState;
 
     thread_local! {
         /// The largest hold seen on this thread, as (messages, bytes): the

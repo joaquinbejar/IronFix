@@ -113,6 +113,16 @@
 //! The driver keeps every effect: parsing the Logon's fields, `from_admin`,
 //! the store calls, the writes, the callbacks and the typestate transitions.
 //!
+//! # Stage 6a: the core-owned session state
+//!
+//! - [`SessionCore`]: the state the decisions above read and update, owned by
+//!   the core instead of the driver: the outstanding recovery, the held
+//!   Logon ([`HeldLogonRelease`]), the spanning re-request mark, the owed
+//!   Logout, whether this session's Logout was fed, the unwritten
+//!   TestRequest, the read budget between replay steps and the hold count.
+//!   The driver keeps the typestate phase, the frames, the store, the socket
+//!   and the callbacks.
+//!
 //! # Time
 //!
 //! Every function takes `now` from the driver (ADR-0002, "Time source
@@ -147,6 +157,7 @@ pub use crate::replay::{
     decide_resend_request, hold_full, orig_sending_time, reads_yield_to_replay, replay_field,
     replay_queue_full, replay_step_continues,
 };
+pub use crate::session_core::{HeldLogonRelease, SessionCore};
 
 use crate::config::SessionConfig;
 use crate::heartbeat::HeartbeatManager;
