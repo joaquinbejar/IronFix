@@ -123,7 +123,19 @@ converted at the boundary so paused-clock tests stay deterministic.
   both handshakes, and `Connection::is_timed_out`) now comes from Tokio's
   clock converted at the boundary, so a paused-clock test drives them; with a
   running clock Tokio's `Instant` is the system monotonic clock, so nothing
-  visible on the wire changes. Remaining stages: sequence validation and gap
-  recovery (including `ResendState`, whose stall clock still reads
-  `std::time::Instant`), resend replay, the Logout handshake, the two Logon
-  handshakes, then the driver reduced to I/O and callbacks.
+  visible on the wire changes.
+- **#91 stage 2 (sequence validation and gap recovery):** `sans_io` now also
+  holds `classify_inbound` (in sequence, `PossDupFlag` (43) duplicate, too
+  low, gap: `InboundSequence`), used by the reactor's main, GapFill and
+  malformed-body paths; `ResendState`, moved out of the reactor with private
+  fields, every clock start taking `now`; `decide_gap_request` and
+  `merged_high_water` (no second request for the same gap start, a water mark
+  that only rises); `note_inbound_progress` (`RecoveryProgress`);
+  `decide_stall` (`StallAction::{Wait, Retry, Abandon}`); and
+  `spanned_rerequest` / `spanned_high_water` (a duplicate GapFill whose
+  `NewSeqNo` (36) spans missing numbers). The resend stall clock now runs on
+  `driver_now()`, so paused-clock tests drive it too; with a running clock
+  nothing changes on the wire. The reactor keeps every effect (writing the
+  request, the Logout on an abandoned gap, the hold behind a resend). Additive
+  public surface only. Remaining stages: resend replay, the Logout handshake,
+  the two Logon handshakes, then the driver reduced to I/O and callbacks.
