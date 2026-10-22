@@ -151,6 +151,13 @@ check-licences:
 				esac;; \
 			esac; \
 		done; \
+		case "$$ids" in *" MIT "*) \
+			if ! printf '%s\n' "$$list" | grep -qx LICENSE; then \
+				echo "check-licences: $$crate declares MIT but publishes no LICENSE file"; failed=1; \
+			elif ! cmp -s "$$crate/LICENSE" LICENSE; then \
+				echo "check-licences: $$crate/LICENSE differs from the workspace LICENSE"; failed=1; \
+			fi;; \
+		esac; \
 	done; \
 	exit $$failed; \
 	} || exit 1
