@@ -103,6 +103,21 @@ check-tls-deps:
 		|| { echo "check-tls-deps: rustls is missing with the tls feature on"; exit 1; }
 	@echo "check-tls-deps: no TLS crate without the feature; no crypto provider forced with it."
 
+# Proves the published ironfix-fixp package carries no FIXP specification
+# content (issue #203). The FIXP SBE schema under ironfix-fixp/spec/ is
+# CC BY-ND 4.0: it may be redistributed only unmodified and only in the
+# repository, as the input of a test, never in the MIT crate.
+.PHONY: check-package-fixp
+check-package-fixp:
+	@list=$$(cargo package -p ironfix-fixp --list --allow-dirty) || { echo "check-package-fixp: cargo package --list failed"; exit 1; }; \
+	leaked=$$(printf '%s\n' "$$list" | grep -E '^spec/|SBEschema|LICENSE-FIXP' || true); \
+	if [ -n "$$leaked" ]; then \
+		echo "check-package-fixp: FIXP specification files would be published:"; \
+		printf '%s\n' "$$leaked"; \
+		exit 1; \
+	fi
+	@echo "check-package-fixp: no FIXP specification file in the published package."
+
 # Proves the engine's optional `fixp` feature is additive (issue #96,
 # ADR-0003): with it off, neither FIXP crate nor the SBE codec is in
 # ironfix-engine's normal dependency graph; with it on, both FIXP crates are.

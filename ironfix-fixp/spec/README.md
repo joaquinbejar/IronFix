@@ -40,6 +40,17 @@ To refresh a file, fetch it as a git blob from a named upstream commit, check
 conformance test. Never edit either file, the schema to make a test pass
 included.
 
+## Rules for this directory
+
+- The schema is **never edited**, not even to make a test pass.
+- It is **never used to generate shipped code** or documentation: no build
+  script, macro or code generator reads it, and nothing derived from it is
+  published. The codec in `src/codec.rs` stays hand-written.
+- It is **only read by tests** (`tests/schema_conformance.rs`).
+- It is **never published**: `make check-package-fixp`, run in CI by
+  `lint.yml`, fails if any file under `spec/` appears in
+  `cargo package -p ironfix-fixp --list`.
+
 ## Known upstream quirks
 
 - Template 13 is spelled `RestransmitReject` in the schema; the specification
