@@ -9,10 +9,15 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-# The FIX Orchestra test fixture is distributed under its own license
-# (Apache-2.0, see its README): keep it, and the test that includes it, out
-# of the published package.
-exclude = ["tests/fixtures/orchestra", "tests/orchestra_fix44.rs"]
+# The FIX Orchestra test fixtures are distributed under their own license
+# (Apache-2.0, see their README): keep them, and the tests that include
+# them, out of the published package.
+exclude = [
+    "tests/fixtures/orchestra",
+    "tests/orchestra_fix44.rs",
+    "tests/orchestra_equivalence.rs",
+    "tests/orchestra_equivalence",
+]
 
 [dependencies]
 ironfix-core.workspace = true
