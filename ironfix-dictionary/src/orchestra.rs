@@ -741,41 +741,79 @@ impl Raw {
 
     /// Removes every reference to a definition left out by its pedigree,
     /// and every group that loses its count field or all its members that
-    /// way, until nothing changes. A reference to an id the repository
-    /// never defined is left alone, so it is still a dangling id.
+    /// way. A reference to an id the repository never defined is left
+    /// alone, so it is still a dangling id, and a group the repository
+    /// defines without members is still an empty group.
+    ///
+    /// Linear in the members of the repository: a reverse index from each
+    /// definition to the groups that reference it drives a worklist, so a
+    /// chain of nested groups is pruned in one pass rather than one pass per
+    /// level.
     fn prune_excluded(&mut self) {
         if self.excluded.is_empty() {
             return;
         }
-        loop {
-            let excluded = &self.excluded;
-            let kept = |member: &RawRef| !excluded.contains(&(member.kind, member.id));
-            for component in &mut self.components {
-                component.members.retain(kept);
+        // Per group, how many of its members are still in; per definition,
+        // the groups that list it as a member. A count field is a field, and
+        // only fields excluded by pedigree are excluded, so the count fields
+        // are checked once, up front.
+        let mut live: Vec<usize> = Vec::with_capacity(self.groups.len());
+        let mut used_by: HashMap<(RefKind, u32), Vec<usize>> = HashMap::new();
+        let mut gone: HashSet<usize> = HashSet::new();
+        let mut work: Vec<usize> = Vec::new();
+        for (index, group) in self.groups.iter().enumerate() {
+            let mut members = 0;
+            for member in &group.members {
+                if !self.excluded.contains(&(member.kind, member.id)) {
+                    members += 1;
+                    used_by
+                        .entry((member.kind, member.id))
+                        .or_default()
+                        .push(index);
+                }
             }
-            for message in &mut self.messages {
-                message.members.retain(kept);
+            live.push(members);
+            let lost_count = group
+                .count
+                .is_some_and(|count| self.excluded.contains(&(RefKind::Field, count)));
+            let emptied = members == 0 && !group.members.is_empty();
+            if (lost_count || emptied) && gone.insert(index) {
+                work.push(index);
             }
-            for group in &mut self.groups {
-                group.members.retain(kept);
+        }
+        while let Some(index) = work.pop() {
+            let Some(group) = self.groups.get(index) else {
+                continue;
+            };
+            let key = (RefKind::Group, group.id);
+            self.excluded.insert(key);
+            for &user in used_by.get(&key).map_or(&[][..], Vec::as_slice) {
+                if let Some(members) = live.get_mut(user)
+                    && let Some(left) = members.checked_sub(1)
+                {
+                    *members = left;
+                    if left == 0 && gone.insert(user) {
+                        work.push(user);
+                    }
+                }
             }
-            let emptied: Vec<u32> = self
-                .groups
-                .iter()
-                .filter(|group| {
-                    group.members.is_empty()
-                        || group
-                            .count
-                            .is_some_and(|count| excluded.contains(&(RefKind::Field, count)))
-                })
-                .map(|group| group.id)
-                .collect();
-            if emptied.is_empty() {
-                return;
-            }
-            self.groups.retain(|group| !emptied.contains(&group.id));
-            self.excluded
-                .extend(emptied.into_iter().map(|id| (RefKind::Group, id)));
+        }
+        let excluded = &self.excluded;
+        let kept = |member: &RawRef| !excluded.contains(&(member.kind, member.id));
+        for component in &mut self.components {
+            component.members.retain(kept);
+        }
+        for message in &mut self.messages {
+            message.members.retain(kept);
+        }
+        let mut index = 0;
+        self.groups.retain(|_| {
+            let keep = !gone.contains(&index);
+            index += 1;
+            keep
+        });
+        for group in &mut self.groups {
+            group.members.retain(kept);
         }
     }
 }
@@ -952,10 +990,23 @@ fn parse_version(version: &str) -> Result<Version, DictionaryError> {
 
 /// The message types of the FIXT.1.1 session layer: Heartbeat, TestRequest,
 /// ResendRequest, Reject, SequenceReset, Logout, Logon and XMLnonFIX.
+///
+/// These are the administrative messages the FIX Transport (FIXT) 1.1
+/// specification defines in its "Administrative Messages" section (the
+/// FIX Session Protocol's session-level messages, carried over unchanged
+/// by FIXT.1.1); every other message type is application-level. See also
+/// `doc/fix_operations.md`, "Session Layer Messages".
 const FIXT_SESSION_MSG_TYPES: [&str; 8] = ["0", "1", "2", "3", "4", "5", "A", "n"];
 
 /// `ApplVerID(1128)` and `DefaultApplVerID(1137)`: the fields through which
 /// FIXT.1.1 names the application version it carries.
+///
+/// The FIXT 1.1 specification's application version selection rules put
+/// `DefaultApplVerID(1137)` in the Logon (required: the session's default
+/// application version) and `ApplVerID(1128)` in the standard header (a
+/// per-message override); a session layer that defines neither cannot
+/// carry an application version. See `doc/fix_operations.md`, "Logon
+/// (MsgType = A)" (tag 1137).
 const FIXT_APPL_VER_ID_TAGS: [u32; 2] = [1128, 1137];
 
 /// The error for a repository named `FIXT` that declares `declared`.
@@ -2302,8 +2353,6 @@ fn report_unreferenced(
     Ok(())
 }
 
-/// Builds the dictionary from the parsed definitions, adding the
-/// unreferenced definitions to `report`.
 /// Maps each field's `lengthId`: the field it names carries the field's
 /// length, so an `int` one is typed [`FieldType::Length`], as FIX types it
 /// from 4.3 on (FIX 4.2 has no `Length` datatype, and its repository types
@@ -2342,6 +2391,8 @@ fn map_length_ids(
     Ok(())
 }
 
+/// Builds the dictionary from the parsed definitions, adding the
+/// unreferenced definitions to `report`.
 fn build(raw: &Raw, report: &mut Report) -> Result<Dictionary, DictionaryError> {
     let types = Types::new(raw)?;
 
@@ -3767,6 +3818,50 @@ mod tests {
         };
         assert_eq!(listed(advert.members()), ["field 1"]);
         assert!(import.report().is_empty(), "{:?}", import.report());
+    }
+
+    #[test]
+    fn test_latest_import_prunes_a_deep_chain_of_nested_groups_in_one_pass() {
+        // Group i nests group i + 1 and nothing else; the last one holds
+        // only a field FIX Latest added. Leaving that field out empties the
+        // last group, which empties the one before it, and so on: the whole
+        // chain goes, and so does the message's reference to its head.
+        const DEPTH: u32 = 5_000;
+        let mut doc = latest_doc();
+        let mut groups = String::new();
+        for i in 0..DEPTH {
+            let count = 100_000 + i;
+            doc.fields.push_str(&format!(
+                r#"<fixr:field id="{count}" name="NoChain{i}" type="NumInGroup" added="FIX.4.4"/>"#
+            ));
+            let member = if i + 1 == DEPTH {
+                r#"<fixr:fieldRef id="2" added="FIX.4.4"/>"#.to_owned()
+            } else {
+                format!(
+                    r#"<fixr:groupRef id="{}" added="FIX.4.4"/>"#,
+                    300_000 + i + 1
+                )
+            };
+            groups.push_str(&format!(
+                r#"<fixr:group id="{}" name="Chain{i}" added="FIX.4.4"><fixr:numInGroup id="{count}"/>{member}</fixr:group>"#,
+                300_000 + i
+            ));
+        }
+        doc.groups.push_str(&groups);
+        doc.messages.push_str(
+            r#"
+            <fixr:message id="17" name="Chained" msgType="8" category="Other" added="FIX.4.4">
+              <fixr:structure>
+                <fixr:fieldRef id="1"/>
+                <fixr:groupRef id="300000"/>
+              </fixr:structure>
+            </fixr:message>"#,
+        );
+        let import = load_latest(&doc.xml());
+        let Some(chained) = import.dictionary().get_message("8") else {
+            panic!("Chained is defined");
+        };
+        assert_eq!(listed(chained.members()), ["field 1"]);
     }
 
     #[test]
