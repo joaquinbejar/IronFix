@@ -1,6 +1,6 @@
 # ADR-0010 — Embed the FIX 4.2, FIXT 1.1 and FIX 5.0 SP2 QuickFIX dictionaries and compose transport with application
 
-- **Status:** Accepted
+- **Status:** Superseded by ADR-0032
 - **Date:** 2026-10-17
 
 ## Context
