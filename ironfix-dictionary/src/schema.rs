@@ -204,7 +204,7 @@ impl std::str::FromStr for FieldType {
             // rules are not validated (a documented loosening).
             "STRING" | "XID" | "XIDREF" => Self::String,
             "MULTIPLECHARVALUE" => Self::MultipleCharValue,
-            // `MULTIPLEVALUESTRING` is the spelling the vendored FIX 4.4
+            // `MULTIPLEVALUESTRING` is the spelling the QuickFIX FIX 4.4
             // QuickFIX dictionary uses for its eight multi-value string
             // fields (ExecInst(18), QuoteCondition(276), ...);
             // `MULTIPLESTRINGVALUE` is the later FIX 5.0 spelling. Both name
@@ -217,7 +217,7 @@ impl std::str::FromStr for FieldType {
             "UTCTIMESTAMP" => Self::UtcTimestamp,
             "UTCTIMEONLY" => Self::UtcTimeOnly,
             // `UTCDATE` is the FIX 4.2 spelling (MDEntryDate(272) in the
-            // vendored FIX 4.2 dictionary) of what FIX 4.3 renamed
+            // QuickFIX FIX 4.2 dictionary) of what FIX 4.3 renamed
             // `UTCDateOnly`; both are a `YYYYMMDD` date.
             "UTCDATEONLY" | "UTCDATE" => Self::UtcDateOnly,
             "LOCALMKTDATE" => Self::LocalMktDate,
@@ -1076,7 +1076,7 @@ mod tests {
 
     #[test]
     fn test_field_type_from_str_both_multi_value_string_spellings_map() {
-        // The vendored FIX 4.4 dictionary spells it `MULTIPLEVALUESTRING`;
+        // The QuickFIX FIX 4.4 dictionary spells it `MULTIPLEVALUESTRING`;
         // FIX 5.0 spells the same type `MULTIPLESTRINGVALUE`.
         assert_eq!(
             "MULTIPLEVALUESTRING".parse::<FieldType>(),

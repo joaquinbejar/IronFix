@@ -72,9 +72,11 @@ The architecture prioritizes three often-competing goals through careful design 
 > `reactor.rs` / `wire.rs`; `ironfix-session` has no
 > `recovery.rs` and its FSM lives in `state.rs`; `ironfix-fast` has no
 > `template.rs` or `dictionary.rs`; `ironfix-dictionary` has `loader.rs` /
-> `schema.rs` / `validator.rs` / `composition.rs` and four QuickFIX
-> dictionaries vendored verbatim under `spec/` (`FIX42.xml`, `FIX44.xml`,
-> `FIXT11.xml`, `FIX50SP2.xml`), not a `versions/` directory.
+> `schema.rs` / `validator.rs` / `composition.rs` and four FIX Orchestra
+> repositories vendored verbatim under `spec/orchestra/` (FIX 4.2, FIX 4.4,
+> the FIXT session layer, and FIX Latest from which FIX 5.0 SP2 is derived;
+> ADR-0032), not a `versions/` directory. The QuickFIX files are test
+> fixtures in `tests/fixtures/quickfix/` and are not published.
 
 ```
 ironfix/

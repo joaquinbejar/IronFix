@@ -22,7 +22,7 @@
 //! It also compiles both outputs, `CodeGenerator::generate` and
 //! `CodeGenerator::generate_views`, for the dictionary that
 //! `Dictionary::from_orchestra_xml` loads from the FIX Trading Community's
-//! FIX 4.4 Orchestra repository (the `ironfix-dictionary` test fixture).
+//! FIX 4.4 Orchestra repository `ironfix-dictionary` embeds, loaded directly.
 //!
 //! `build.rs` generates the sources into `OUT_DIR`; Cargo reruns it when
 //! `build.rs`, the Orchestra fixture, or one of its build dependencies
@@ -134,7 +134,7 @@ mod tests {
     /// The FIX 4.4 Orchestra repository build.rs generated from.
     const ORCHESTRA_FIX44: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../ironfix-dictionary/tests/fixtures/orchestra/OrchestraFIX44.xml"
+        "/../ironfix-dictionary/spec/orchestra/OrchestraFIX44.xml"
     ));
 
     /// Generation is deterministic: run again at test time, both generators
@@ -182,7 +182,7 @@ mod tests {
             panic!("an Orchestra ExecutionReport view");
         };
         let Some(from_quickfix) = fix44::views::ExecutionReportView::from_message(&msg) else {
-            panic!("a QuickFIX ExecutionReport view");
+            panic!("an embedded FIX 4.4 ExecutionReport view");
         };
         assert_eq!(
             ok(from_orchestra.order_id(), "OrderID"),
@@ -210,54 +210,40 @@ mod tests {
         assert_eq!(ids, ["TRADER"]);
     }
 
-    /// The party IDs of a `Parties` component of the FIX 5.0 SP2 data
-    /// definitions.
-    fn party_ids(parties: &data::fix50sp2::components::Parties) -> Vec<&str> {
-        parties
-            .no_party_ids
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.party_id.as_deref())
-            .collect()
-    }
-
     #[test]
     fn test_full_fix50sp2_data_shares_one_type_per_component() {
-        use data::fix50sp2::components::{
-            Parties, PartiesNoPartyIDsEntry, PtysSubGrp, PtysSubGrpNoPartySubIDsEntry,
+        use data::fix50sp2::components::Instrument;
+        use data::fix50sp2::messages::{
+            ExecutionReport, NewOrderSingle, NewOrderSingleNoPartyIDsEntry,
+            NewOrderSingleNoPartyIDsNoPartySubIDsEntry,
         };
-        use data::fix50sp2::messages::{ExecutionReport, NewOrderSingle};
-
-        // Parties nests a group (NoPartySubIDs) through PtysSubGrp inside its
-        // own group's entries.
-        let parties = Parties {
-            no_party_ids: Some(vec![PartiesNoPartyIDsEntry {
-                party_id: Some("BROKER-1".to_owned()),
-                party_idsource: Some('D'),
-                party_role: Some(1),
-                party_role_qualifier: None,
-                ptys_sub_grp: Some(PtysSubGrp {
-                    no_party_sub_ids: Some(vec![PtysSubGrpNoPartySubIDsEntry {
-                        party_sub_id: Some("DESK-7".to_owned()),
-                        party_sub_idtype: Some(4),
-                    }]),
-                }),
-            }]),
-        };
-        assert_eq!(party_ids(&parties), ["BROKER-1"]);
 
         // NewOrderSingle and ExecutionReport hold the same component type,
-        // so one function reads the parties of either.
-        let of_order: fn(&NewOrderSingle) -> Vec<&str> =
-            |order| order.parties.as_ref().map(party_ids).unwrap_or_default();
-        let of_report: fn(&ExecutionReport) -> Vec<&str> =
-            |report| report.parties.as_ref().map(party_ids).unwrap_or_default();
-        // A required component is a bare field: the symbol is one access away.
-        let symbol: fn(&NewOrderSingle) -> Option<&str> =
-            |order| order.instrument.symbol.as_deref();
+        // so one function reads the instrument of either. A required
+        // component is a bare field: the symbol is one access away.
+        let symbol = |instrument: &Instrument| instrument.symbol.clone();
+        let of_order: fn(&NewOrderSingle) -> &Instrument = |order| &order.instrument;
+        let of_report: fn(&ExecutionReport) -> &Instrument = |report| &report.instrument;
+
+        // The FIX Orchestra repository holds Parties as a repeating group,
+        // not a component, so each message has its own entry type; the
+        // NoPartySubIDs group nests inside it.
+        let party = NewOrderSingleNoPartyIDsEntry {
+            party_id: Some("BROKER-1".to_owned()),
+            party_idsource: Some('D'),
+            party_role: Some(1),
+            party_role_qualifier: None,
+            no_party_sub_ids: Some(vec![NewOrderSingleNoPartyIDsNoPartySubIDsEntry {
+                party_sub_id: Some("DESK-7".to_owned()),
+                party_sub_idtype: Some(4),
+            }]),
+        };
+        assert_eq!(party.party_id.as_deref(), Some("BROKER-1"));
+        let parties: fn(&NewOrderSingle) -> usize =
+            |order| order.no_party_ids.as_ref().map_or(0, Vec::len);
         // CumQty (14) is a required FIX Qty: a decimal, never binary floating
         // point.
         let cum_qty: fn(&ExecutionReport) -> Decimal = |report| report.cum_qty;
-        let _ = (of_order, of_report, symbol, cum_qty);
+        let _ = (symbol, of_order, of_report, parties, cum_qty);
     }
 }

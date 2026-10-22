@@ -4,34 +4,34 @@
    Date: 12/7/26
 ******************************************************************************/
 
-//! QuickFIX XML dictionary loader.
+//! QuickFIX XML dictionary loader, and the embedded dictionaries.
 //!
-//! This module parses QuickFIX-format XML specifications (e.g. `FIX44.xml`)
-//! into a [`Dictionary`], and exposes four embedded dictionaries, each
-//! vendored verbatim from QuickFIX (see `spec/README.md` for provenance and
-//! `spec/LICENSE-QUICKFIX` for the license):
+//! This module parses QuickFIX-format XML specifications (e.g. a
+//! `FIX44.xml` you supply) into a [`Dictionary`] with
+//! [`Dictionary::from_quickfix_xml`]. The crate ships no QuickFIX file.
 //!
-//! | Constructor | Vendored file | [`Version`] |
-//! |---|---|---|
-//! | [`Dictionary::fix42`] | `FIX42.xml` | [`Version::Fix42`] |
-//! | [`Dictionary::fix44`] | `FIX44.xml` | [`Version::Fix44`] |
-//! | [`Dictionary::fixt11`] | `FIXT11.xml` | [`Version::Fixt11`] |
-//! | [`Dictionary::fix50sp2`] | `FIX50SP2.xml` | [`Version::Fix50Sp2`] |
+//! It also exposes four embedded dictionaries, each built on first use from
+//! a FIX Trading Community FIX Orchestra repository vendored verbatim under
+//! `spec/orchestra/` (Apache-2.0; see `spec/orchestra/README.md` for
+//! provenance and `spec/orchestra/LICENSE` for the license):
 //!
-//! `FIXT11.xml` is a *transport* dictionary (session header, trailer, and
-//! admin messages) and `FIX50SP2.xml` an *application* dictionary with an
-//! empty header and trailer; QuickFIX ships FIX 5.0 that way, and
-//! [`SessionDictionary`](crate::SessionDictionary) composes the two.
+//! | Constructor | Vendored repository | Loaded with | [`Version`] |
+//! |---|---|---|---|
+//! | [`Dictionary::fix42`] | `OrchestraFIX42.xml` | [`Dictionary::from_orchestra_xml`] | [`Version::Fix42`] |
+//! | [`Dictionary::fix44`] | `OrchestraFIX44.xml` | [`Dictionary::from_orchestra_xml`] | [`Version::Fix44`] |
+//! | [`Dictionary::fixt11`] | `FIXTSession.xml` | [`Dictionary::from_orchestra_xml`] | [`Version::Fixt11`] |
+//! | [`Dictionary::fix50sp2`] | `OrchestraFIXLatest.xml` | [`Dictionary::from_orchestra_latest_xml`] | [`Version::Fix50Sp2`] |
+//!
+//! `FIXTSession.xml` is a *transport* dictionary (session header, trailer,
+//! and admin messages). The FIX 5.0 SP2 dictionary derived from FIX Latest
+//! is complete (it carries a header, a trailer and the session messages
+//! too); [`SessionDictionary`](crate::SessionDictionary) composes it with
+//! the FIXT 1.1 transport. The differences from the QuickFIX dictionaries
+//! the crate embedded up to 0.5 are listed in `doc/orchestra_differences.md`.
 //!
 //! Every other version (FIX 4.0, 4.1, 4.3, 5.0, 5.0 SP1), and any
-//! venue-specific dialect, is loaded from caller-supplied QuickFIX XML with
-//! [`Dictionary::from_quickfix_xml`].
-//!
-//! The QuickFIX Software License, Version 1.0, requires this
-//! acknowledgement wherever the embedded files are redistributed:
-//!
-//! > This product includes software developed by quickfixengine.org
-//! > (<http://www.quickfixengine.org/>).
+//! venue-specific dialect, is loaded from caller-supplied XML with
+//! [`Dictionary::from_quickfix_xml`] or [`Dictionary::from_orchestra_xml`].
 //!
 //! # Untrusted input
 //!
@@ -91,23 +91,22 @@ pub const MAX_COMPONENT_DEPTH: usize = 32;
 /// overflowing the stack.
 pub const MAX_NESTING_DEPTH: usize = 32;
 
-// Every embedded specification below is a byte-for-byte copy of
-// `spec/<FILE>` from quickfix/quickfix at commit
-// 386ce46e917ae494ab6e90b1be90fd421cdbe3f9; `spec/README.md` records each
-// file's SHA-256. Never edit them to make a test pass.
+// Every embedded repository below is a byte-for-byte copy of
+// `FIX Standard/<FILE>` from FIXTradingCommunity/orchestrations at commit
+// cd24169a2abd8daba7c360987c7a46ca11873a12; `spec/orchestra/README.md`
+// records each file's SHA-256. Never edit them to make a test pass.
 
-/// Embedded QuickFIX FIX 4.2 specification (`spec/FIX42.xml`).
-const FIX42_XML: &str = include_str!("../spec/FIX42.xml");
+/// Embedded FIX Orchestra FIX 4.2 repository.
+const FIX42_XML: &str = include_str!("../spec/orchestra/OrchestraFIX42.xml");
 
-/// Embedded QuickFIX FIX 4.4 specification (`spec/FIX44.xml`).
-const FIX44_XML: &str = include_str!("../spec/FIX44.xml");
+/// Embedded FIX Orchestra FIX 4.4 repository.
+const FIX44_XML: &str = include_str!("../spec/orchestra/OrchestraFIX44.xml");
 
-/// Embedded QuickFIX FIXT 1.1 transport specification (`spec/FIXT11.xml`).
-const FIXT11_XML: &str = include_str!("../spec/FIXT11.xml");
+/// Embedded FIX Orchestra FIXT session-layer repository.
+const FIXT11_XML: &str = include_str!("../spec/orchestra/FIXTSession.xml");
 
-/// Embedded QuickFIX FIX 5.0 SP2 application specification
-/// (`spec/FIX50SP2.xml`).
-const FIX50SP2_XML: &str = include_str!("../spec/FIX50SP2.xml");
+/// Embedded FIX Orchestra FIX Latest repository, the source of FIX 5.0 SP2.
+const FIX_LATEST_XML: &str = include_str!("../spec/orchestra/OrchestraFIXLatest.xml");
 
 /// Parse-once cache of one embedded specification.
 ///
@@ -120,12 +119,14 @@ static FIX44_DICT: EmbeddedCell = OnceLock::new();
 static FIXT11_DICT: EmbeddedCell = OnceLock::new();
 static FIX50SP2_DICT: EmbeddedCell = OnceLock::new();
 
-/// Returns the dictionary cached in `cell`, parsing `xml` on first use.
+/// Returns the dictionary cached in `cell`, loading it with `load` on first
+/// use. The Orchestra report of an embedded repository is not kept: what it
+/// lists is documented in the `orchestra` module and pinned by the tests.
 fn embedded(
     cell: &'static EmbeddedCell,
-    xml: &str,
+    load: impl FnOnce() -> Result<crate::OrchestraImport, DictionaryError>,
 ) -> Result<&'static Dictionary, DictionaryError> {
-    match cell.get_or_init(|| load(xml)) {
+    match cell.get_or_init(|| load().map(|import| import.into_parts().0)) {
         Ok(dict) => Ok(dict),
         Err(err) => Err(err.clone()),
     }
@@ -355,7 +356,7 @@ pub enum DictionaryError {
 impl Dictionary {
     /// Returns the embedded standard FIX 4.2 dictionary.
     ///
-    /// Parsed from the vendored QuickFIX `FIX42.xml` on first use and cached
+    /// Built from the vendored FIX Orchestra `OrchestraFIX42.xml` on first use and cached
     /// for the lifetime of the process; every call returns the same
     /// instance.
     ///
@@ -366,12 +367,12 @@ impl Dictionary {
     /// are expected to recover from; it exists so that the crate has no
     /// panicking path at all.
     pub fn fix42() -> Result<&'static Self, DictionaryError> {
-        embedded(&FIX42_DICT, FIX42_XML)
+        embedded(&FIX42_DICT, || Self::from_orchestra_xml(FIX42_XML))
     }
 
     /// Returns the embedded standard FIX 4.4 dictionary.
     ///
-    /// Parsed from the vendored QuickFIX `FIX44.xml` on first use and cached
+    /// Built from the vendored FIX Orchestra `OrchestraFIX44.xml` on first use and cached
     /// for the lifetime of the process; every call returns the same
     /// instance.
     ///
@@ -382,12 +383,12 @@ impl Dictionary {
     /// are expected to recover from; it exists so that the crate has no
     /// panicking path at all.
     pub fn fix44() -> Result<&'static Self, DictionaryError> {
-        embedded(&FIX44_DICT, FIX44_XML)
+        embedded(&FIX44_DICT, || Self::from_orchestra_xml(FIX44_XML))
     }
 
     /// Returns the embedded FIXT 1.1 transport dictionary.
     ///
-    /// Parsed from the vendored QuickFIX `FIXT11.xml` on first use and cached
+    /// Built from the vendored FIX Orchestra `FIXTSession.xml` on first use and cached
     /// for the lifetime of the process; every call returns the same
     /// instance.
     ///
@@ -397,15 +398,10 @@ impl Dictionary {
     /// [`Dictionary::fix50sp2`] through
     /// [`SessionDictionary`](crate::SessionDictionary).
     ///
-    /// **Upstream deviation.** FIXT 1.1 defines the Logon `MsgTypeGrp`
-    /// component as the `NoMsgTypes(384)` group (`RefMsgType(372)`,
-    /// `MsgDirection(385)`, `RefApplVerID(1130)`, `RefApplExtID(1406)`,
-    /// `RefCstmApplVerID(1131)`, `DefaultVerIndicator(1410)`). The vendored
-    /// QuickFIX file defines `MsgTypeGrp` with no members and does not define
-    /// tags 384 or 385, so the validator reports a Logon carrying the group
-    /// ([`ValidationError::UnknownTag`](crate::ValidationError::UnknownTag)
-    /// for 384). The file is not patched; to accept the group, load a FIXT 1.1
-    /// dictionary that defines it with [`Dictionary::from_quickfix_xml`].
+    /// It defines the Logon `NoMsgTypes(384)` group. Its `MsgType(35)` and
+    /// `RefMsgType(372)` enumerate only the session message types; composed
+    /// with an application dictionary, the validator admits the union of
+    /// both enumerations.
     ///
     /// # Errors
     /// Returns [`DictionaryError`] if the bundled specification fails to
@@ -414,21 +410,21 @@ impl Dictionary {
     /// are expected to recover from; it exists so that the crate has no
     /// panicking path at all.
     pub fn fixt11() -> Result<&'static Self, DictionaryError> {
-        embedded(&FIXT11_DICT, FIXT11_XML)
+        embedded(&FIXT11_DICT, || Self::from_orchestra_xml(FIXT11_XML))
     }
 
     /// Returns the embedded FIX 5.0 SP2 application dictionary.
     ///
-    /// Parsed from the vendored QuickFIX `FIX50SP2.xml` on first use and
-    /// cached for the lifetime of the process; every call returns the same
-    /// instance.
+    /// Derived on first use from the vendored FIX Orchestra
+    /// `OrchestraFIXLatest.xml` with [`Dictionary::from_orchestra_latest_xml`]
+    /// (what its pedigree places at or before FIX 5.0 SP2), and cached for
+    /// the lifetime of the process; every call returns the same instance.
     ///
-    /// This is an *application* dictionary: its header and trailer are
-    /// empty and it defines no session-level messages, because FIX 5.0 runs
-    /// over a FIXT.1.1 session. Validating a complete message against it
-    /// alone therefore reports every header tag as not allowed; compose it
-    /// with [`Dictionary::fixt11`] through
-    /// [`SessionDictionary`](crate::SessionDictionary) instead.
+    /// It holds every FIX 5.0 SP2 application message and also the standard
+    /// header, the trailer and the session messages, as the repository
+    /// does. Under a FIXT.1.1 session compose it with [`Dictionary::fixt11`]
+    /// through [`SessionDictionary`](crate::SessionDictionary): the envelope
+    /// and admin messages then come from the transport side.
     ///
     /// # Errors
     /// Returns [`DictionaryError`] if the bundled specification fails to
@@ -437,7 +433,9 @@ impl Dictionary {
     /// are expected to recover from; it exists so that the crate has no
     /// panicking path at all.
     pub fn fix50sp2() -> Result<&'static Self, DictionaryError> {
-        embedded(&FIX50SP2_DICT, FIX50SP2_XML)
+        embedded(&FIX50SP2_DICT, || {
+            Self::from_orchestra_latest_xml(FIX_LATEST_XML, Version::Fix50Sp2)
+        })
     }
 
     /// Loads a dictionary from a QuickFIX-format XML specification.
@@ -1242,6 +1240,15 @@ mod tests {
     use crate::schema::MemberRef;
     use std::fmt::Debug;
 
+    // The QuickFIX specifications the crate embedded up to 0.5, kept as test
+    // fixtures for the QuickFIX loader (`tests/fixtures/quickfix`, excluded
+    // from the package; see its README for provenance and license). They
+    // shadow the embedded Orchestra repositories of the same names.
+    const FIX42_XML: &str = include_str!("../tests/fixtures/quickfix/FIX42.xml");
+    const FIX44_XML: &str = include_str!("../tests/fixtures/quickfix/FIX44.xml");
+    const FIXT11_XML: &str = include_str!("../tests/fixtures/quickfix/FIXT11.xml");
+    const FIX50SP2_XML: &str = include_str!("../tests/fixtures/quickfix/FIX50SP2.xml");
+
     /// Unwraps a `Result` with test context instead of `.unwrap()`.
     #[track_caller]
     fn ok<T, E: Debug>(result: Result<T, E>, what: &str) -> T {
@@ -1271,8 +1278,33 @@ mod tests {
 
     /// Returns the embedded FIX 4.4 dictionary for a test.
     #[track_caller]
+    /// Loads a QuickFIX fixture once per process.
+    fn quickfix(cell: &'static OnceLock<Dictionary>, xml: &str) -> &'static Dictionary {
+        cell.get_or_init(|| ok(Dictionary::from_quickfix_xml(xml), "QuickFIX fixture loads"))
+    }
+
+    /// The QuickFIX FIX 4.2 fixture, loaded with the QuickFIX loader.
+    fn fix42() -> &'static Dictionary {
+        static CELL: OnceLock<Dictionary> = OnceLock::new();
+        quickfix(&CELL, FIX42_XML)
+    }
+
+    /// The QuickFIX FIX 4.4 fixture, loaded with the QuickFIX loader.
     fn fix44() -> &'static Dictionary {
-        ok(Dictionary::fix44(), "embedded FIX 4.4 dictionary loads")
+        static CELL: OnceLock<Dictionary> = OnceLock::new();
+        quickfix(&CELL, FIX44_XML)
+    }
+
+    /// The QuickFIX FIXT 1.1 fixture, loaded with the QuickFIX loader.
+    fn fixt11() -> &'static Dictionary {
+        static CELL: OnceLock<Dictionary> = OnceLock::new();
+        quickfix(&CELL, FIXT11_XML)
+    }
+
+    /// The QuickFIX FIX 5.0 SP2 fixture, loaded with the QuickFIX loader.
+    fn fix50sp2() -> &'static Dictionary {
+        static CELL: OnceLock<Dictionary> = OnceLock::new();
+        quickfix(&CELL, FIX50SP2_XML)
     }
 
     #[test]
@@ -1305,6 +1337,29 @@ mod tests {
     }
 
     #[test]
+    fn test_embedded_dictionaries_are_built_from_the_orchestra_repositories() {
+        // Message and field counts of the vendored repositories, as the
+        // Orchestra loader reads them.
+        for (constructor, messages, fields) in [
+            (Dictionary::fix42 as EmbeddedConstructor, 46, 405),
+            (Dictionary::fix44, 93, 912),
+            (Dictionary::fixt11, 8, 92),
+            (Dictionary::fix50sp2, 164, 5887),
+        ] {
+            let dict = ok(constructor(), "embedded dictionary loads");
+            assert_eq!(dict.messages.len(), messages, "{}", dict.version);
+            assert_eq!(dict.fields.len(), fields, "{}", dict.version);
+        }
+        // FIX 5.0 SP2 is derived from FIX Latest: complete, with a header.
+        let fix50sp2 = ok(Dictionary::fix50sp2(), "FIX 5.0 SP2 loads");
+        assert!(fix50sp2.header.iter().any(|f| f.tag == 35 && f.required));
+        // FIXT 1.1 defines the Logon NoMsgTypes(384) group.
+        let fixt11 = ok(Dictionary::fixt11(), "FIXT 1.1 loads");
+        let logon = some(fixt11.get_message("A"), "Logon defined");
+        assert!(logon.groups().iter().any(|g| g.count_tag == 384));
+    }
+
+    #[test]
     fn test_embedded_dictionaries_are_distinct_instances() {
         let all = [
             ok(Dictionary::fix42(), "FIX 4.2 loads"),
@@ -1323,7 +1378,7 @@ mod tests {
     fn test_fix42_utcdate_field_loads_as_utc_date_only() {
         // The vendored FIX 4.2 file declares MDEntryDate(272) `UTCDATE`, the
         // FIX 4.2 spelling of UTCDateOnly.
-        let dict = ok(Dictionary::fix42(), "FIX 4.2 loads");
+        let dict = fix42();
         let def = some(dict.get_field(272), "MDEntryDate defined");
         assert_eq!(def.name, "MDEntryDate");
         assert_eq!(def.field_type, FieldType::UtcDateOnly);
@@ -1331,7 +1386,7 @@ mod tests {
 
     #[test]
     fn test_fix42_header_messages_and_group_count_fields() {
-        let dict = ok(Dictionary::fix42(), "FIX 4.2 loads");
+        let dict = fix42();
         assert!(dict.header.iter().any(|f| f.tag == 49 && f.required));
         assert!(dict.trailer.iter().any(|f| f.tag == 10 && f.required));
         let nos = some(dict.get_message("D"), "NewOrderSingle defined");
@@ -1358,7 +1413,7 @@ mod tests {
 
     #[test]
     fn test_fix50sp2_xid_and_xidref_fields_load_as_string() {
-        let dict = ok(Dictionary::fix50sp2(), "FIX 5.0 SP2 loads");
+        let dict = fix50sp2();
         for (tag, name) in [
             (40039, "CashSettlTermXID"),
             (41314, "UnderlyingProtectionTermXIDRef"),
@@ -1373,7 +1428,7 @@ mod tests {
     fn test_fix50sp2_is_an_application_dictionary() {
         // QuickFIX ships FIX 5.0 SP2 with an empty header and trailer and no
         // session-level messages: those come from FIXT 1.1.
-        let dict = ok(Dictionary::fix50sp2(), "FIX 5.0 SP2 loads");
+        let dict = fix50sp2();
         assert!(dict.header.is_empty());
         assert!(dict.header_groups.is_empty());
         assert!(dict.trailer.is_empty());
@@ -1389,7 +1444,7 @@ mod tests {
 
     #[test]
     fn test_fixt11_is_a_transport_dictionary() {
-        let dict = ok(Dictionary::fixt11(), "FIXT 1.1 loads");
+        let dict = fixt11();
         let appl_ver_id = some(
             dict.header.iter().find(|f| f.name == "ApplVerID"),
             "ApplVerID in the FIXT 1.1 header",
@@ -1417,7 +1472,7 @@ mod tests {
         // The vendored FIXT 1.1 file defines `<component name='MsgTypeGrp' />`
         // with no members, and Logon references it. Skipping the self-closing
         // definition made that reference a dangling UnknownComponent.
-        let dict = ok(Dictionary::fixt11(), "FIXT 1.1 loads");
+        let dict = fixt11();
         let group = some(dict.get_component("MsgTypeGrp"), "MsgTypeGrp defined");
         assert!(group.fields().is_empty());
         assert!(group.groups().is_empty());
@@ -1430,7 +1485,7 @@ mod tests {
     fn test_self_closing_message_definition_loads() {
         // FIX 4.4 and FIXT 1.1 both define
         // `<message name='XMLnonFIX' msgtype='n' msgcat='admin' />`.
-        for dict in [fix44(), ok(Dictionary::fixt11(), "FIXT 1.1 loads")] {
+        for dict in [fix44(), fixt11()] {
             let message = some(dict.get_message("n"), "XMLnonFIX defined");
             assert_eq!(message.name, "XMLnonFIX");
             assert_eq!(message.category, MessageCategory::Admin);
@@ -1771,10 +1826,26 @@ mod tests {
     #[test]
     fn test_every_definition_keeps_its_xml_member_order() {
         for (what, xml, dict) in [
-            ("FIX 4.2", FIX42_XML, Dictionary::fix42()),
-            ("FIX 4.4", FIX44_XML, Dictionary::fix44()),
-            ("FIXT 1.1", FIXT11_XML, Dictionary::fixt11()),
-            ("FIX 5.0 SP2", FIX50SP2_XML, Dictionary::fix50sp2()),
+            (
+                "FIX 4.2",
+                FIX42_XML,
+                Ok::<&Dictionary, DictionaryError>(fix42()),
+            ),
+            (
+                "FIX 4.4",
+                FIX44_XML,
+                Ok::<&Dictionary, DictionaryError>(fix44()),
+            ),
+            (
+                "FIXT 1.1",
+                FIXT11_XML,
+                Ok::<&Dictionary, DictionaryError>(fixt11()),
+            ),
+            (
+                "FIX 5.0 SP2",
+                FIX50SP2_XML,
+                Ok::<&Dictionary, DictionaryError>(fix50sp2()),
+            ),
         ] {
             let dict = ok(dict, what);
             let mut expected = xml_members(xml);

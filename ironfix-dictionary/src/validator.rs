@@ -1538,7 +1538,7 @@ mod tests {
 
     #[test]
     fn test_validate_multiple_value_string_accepts_a_list_of_defined_tokens() {
-        // ExecInst(18) is MULTIPLEVALUESTRING in the vendored FIX 4.4
+        // ExecInst(18) is a multiple-value string in the embedded FIX 4.4
         // dictionary: `1 2` is two defined tokens and must pass.
         let result = validate(&with_header(&[
             "11=ORDER-1",
@@ -1553,11 +1553,11 @@ mod tests {
 
     #[test]
     fn test_validate_multiple_value_string_rejects_an_undefined_token() {
-        // `T` is not among the ExecInst values the vendored dictionary
+        // `f` is not among the ExecInst values the embedded dictionary
         // defines, so the list is rejected even though `1` is valid.
         let found = errors(validate(&with_header(&[
             "11=ORDER-1",
-            "18=1 T",
+            "18=1 f",
             "55=EURUSD",
             "54=1",
             "60=20260712-10:00:00",
@@ -1566,7 +1566,7 @@ mod tests {
         assert!(found.contains(&ValidationError::InvalidEnumValue {
             tag: 18,
             name: "ExecInst".to_string(),
-            value: "1 T".to_string(),
+            value: "1 f".to_string(),
         }));
     }
 
@@ -2073,7 +2073,7 @@ mod tests {
         assert_eq!(validate(&message), expected);
         for _ in 0..4 {
             let reloaded = ok(
-                Dictionary::from_quickfix_xml(include_str!("../spec/FIX44.xml")),
+                Dictionary::from_quickfix_xml(include_str!("../tests/fixtures/quickfix/FIX44.xml")),
                 "FIX 4.4 reloads",
             );
             for _ in 0..4 {
@@ -2560,23 +2560,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_for_session_logon_with_no_msg_types_follows_the_vendored_file() {
-        // The vendored FIXT 1.1 file defines MsgTypeGrp with no members and
-        // never defines NoMsgTypes(384). The dictionary answers, unpatched:
-        // a Logon carrying the group is reported, member tags included.
+    fn test_validate_for_session_logon_with_no_msg_types_passes() {
+        // The embedded FIXT 1.1 dictionary defines the Logon NoMsgTypes(384)
+        // group; RefMsgType(372) names an application message type, which
+        // the composed validator admits (the union of both enumerations).
         let mut fields = fixt11_header("35=A");
         fields.extend(["98=0", "108=30", "384=1", "372=D", "1137=9", "10=000"]);
-        let found = errors(validate_session(&fields));
-        assert_eq!(
-            found,
-            vec![
-                ValidationError::UnknownTag { tag: 384 },
-                ValidationError::FieldNotAllowedForMessage {
-                    tag: 372,
-                    msg_type: "A".to_string(),
-                },
-            ]
-        );
+        assert_eq!(validate_session(&fields), Ok(()));
     }
 
     #[test]
@@ -2648,19 +2638,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_fix50sp2_alone_flags_the_header_tags() {
-        // FIX 5.0 SP2 has an empty header and trailer: on its own it cannot
-        // place a single header tag, which is why it has to be composed.
-        let found = errors(validate_with(fix50sp2(), &fix50sp2_new_order_single()));
-        for tag in [8, 9, 35, 49, 56, 34, 52, 1128] {
-            assert!(
-                found.contains(&ValidationError::FieldNotAllowedForMessage {
-                    tag,
-                    msg_type: "D".to_string(),
-                }),
-                "header tag {tag} was not flagged: {found:?}"
-            );
-        }
+    fn test_validate_fix50sp2_alone_validates_a_complete_message() {
+        // The embedded FIX 5.0 SP2 dictionary is derived from FIX Latest,
+        // which defines the standard header and trailer: validated on its
+        // own, the whole message passes.
+        assert_eq!(
+            validate_with(fix50sp2(), &fix50sp2_new_order_single()),
+            Ok(())
+        );
     }
 
     /// Builds a hand-made transport/application pair in which tag 9000 is a
@@ -2922,21 +2907,27 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_for_session_logon_accepts_any_default_appl_ver_id_value() {
-        // Pins a documented gap: FIXT11.xml declares DefaultApplVerID(1137)
-        // as a STRING with no enumeration, so a value that names no
-        // application version is not rejected.
+    fn test_validate_for_session_logon_rejects_an_undefined_default_appl_ver_id() {
+        // The embedded FIXT 1.1 dictionary enumerates DefaultApplVerID(1137),
+        // so a value that names no application version is rejected.
         let mut fields = fixt11_header("35=A");
         fields.extend(["98=0", "108=30", "1137=NOT-A-VERSION", "10=000"]);
-        assert_eq!(validate_session(&fields), Ok(()));
+        assert_eq!(
+            validate_session(&fields),
+            Err(vec![ValidationError::InvalidEnumValue {
+                tag: 1137,
+                name: "DefaultApplVerID".to_string(),
+                value: "NOT-A-VERSION".to_string(),
+            }])
+        );
     }
 
     #[test]
     fn test_validate_for_session_fixt11_defining_msg_type_grp_accepts_no_msg_types() {
-        // The documented workaround for the upstream MsgTypeGrp deviation:
-        // load a FIXT 1.1 dictionary that defines the group. The vendored
+        // The QuickFIX FIXT 1.1 file lacks the NoMsgTypes group: loaded with
+        // the group added, it accepts it. The fixture
         // file is not touched; the variant is built in memory.
-        let vendored = include_str!("../spec/FIXT11.xml");
+        let vendored = include_str!("../tests/fixtures/quickfix/FIXT11.xml");
         let empty_component = "<component name='MsgTypeGrp' />";
         let fields_end = " </fields>";
         assert_eq!(vendored.matches(empty_component).count(), 1);
@@ -3005,17 +2996,14 @@ mod tests {
             Some(message) => message,
             None => panic!("StreamAssignmentRequest is defined"),
         };
-        let component = match message.components().first() {
-            Some(reference) => reference.name.as_str(),
-            None => panic!("StreamAssignmentRequest references StrmAsgnReqGrp"),
-        };
-        let group = session
-            .application()
-            .get_component(component)
-            .and_then(|def| def.groups().iter().find(|group| group.count_tag == 1499));
+        // Orchestra holds StrmAsgnReqGrp as a group on the message.
+        let group = message
+            .groups()
+            .iter()
+            .find(|group| group.count_tag == 1499);
         match group {
             Some(group) => assert_eq!(group.delimiter_tag, 453),
-            None => panic!("NoAsgnReqs(1499) is defined in {component}"),
+            None => panic!("NoAsgnReqs(1499) is defined on StreamAssignmentRequest"),
         }
     }
 

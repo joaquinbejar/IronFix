@@ -26,8 +26,9 @@ use std::ops::Range;
 /// # Why 8
 ///
 /// Every MsgType the FIX specification defines is one or two bytes: in the
-/// vendored `spec/FIX44.xml` all 93 `msgtype` attributes and all 119 enum
-/// values of field 35 are at most two bytes long, the longest being the
+/// FIX 4.4 repository `ironfix-dictionary` embeds
+/// (`spec/orchestra/OrchestraFIX44.xml`) all 93 message types are at most two
+/// bytes long, the longest being the
 /// two-letter codes `AA`..`BH`. The remaining headroom is for bilaterally
 /// agreed codes, which counterparties conventionally prefix with `U` and
 /// number (`U1`, `U9999`), and for the two-letter codes later FIX versions

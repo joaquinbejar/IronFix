@@ -100,11 +100,21 @@ fn test_generated_fixt11_carries_its_tags_and_types() {
     assert_eq!(fields::DEFAULT_APPL_VER_ID, 1137);
     let heartbeat = Heartbeat { test_req_id: None };
     assert!(heartbeat.test_req_id.is_none());
-    // The self-closing XMLnonFIX definition becomes a field-less struct.
-    let _ = XMLnonFIX {};
-    // So does the member-less MsgTypeGrp component of the vendored XML,
-    // which Logon references.
-    let _ = generated_fixt11::components::MsgTypeGrp {};
+    // XMLnonFIX carries the NoAttachments(2104) group.
+    let xml_non_fix = XMLnonFIX {
+        no_attachments: None,
+    };
+    assert!(xml_non_fix.no_attachments.is_none());
+    // Logon carries the NoMsgTypes(384) group.
+    let entry = generated_fixt11::messages::LogonNoMsgTypesEntry {
+        ref_msg_type: Some("D".to_string()),
+        msg_direction: Some('S'),
+        ref_appl_ver_id: None,
+        ref_appl_ext_id: None,
+        ref_cstm_appl_ver_id: None,
+        default_ver_indicator: None,
+    };
+    assert_eq!(entry.ref_msg_type.as_deref(), Some("D"));
 }
 
 #[test]

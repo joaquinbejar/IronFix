@@ -11,8 +11,8 @@ pub mod enums {
     /// EncryptMethod (tag 98): 7 declared values.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum EncryptMethod<'a> {
-        /// `0`: NONE_OTHER.
-        NoneOther,
+        /// `0`: None.
+        None0,
         /// `1`: PKCS.
         Pkcs,
         /// `2`: DES.
@@ -23,8 +23,8 @@ pub mod enums {
         Pgpdes,
         /// `5`: PGPDESMD5.
         Pgpdesmd5,
-        /// `6`: PEMDESMD5.
-        Pemdesmd5,
+        /// `6`: PEM.
+        Pem,
         /// A value the dictionary does not declare, as its wire bytes.
         Other(&'a [u8]),
     }
@@ -34,13 +34,13 @@ pub mod enums {
         #[must_use]
         pub const fn from_bytes(value: &'a [u8]) -> Self {
             match value {
-                b"0" => Self::NoneOther,
+                b"0" => Self::None0,
                 b"1" => Self::Pkcs,
                 b"2" => Self::Des,
                 b"3" => Self::Pkcsdes,
                 b"4" => Self::Pgpdes,
                 b"5" => Self::Pgpdesmd5,
-                b"6" => Self::Pemdesmd5,
+                b"6" => Self::Pem,
                 other => Self::Other(other),
             }
         }
@@ -49,13 +49,74 @@ pub mod enums {
         #[must_use]
         pub const fn as_bytes(&self) -> &'a [u8] {
             match *self {
-                Self::NoneOther => b"0",
+                Self::None0 => b"0",
                 Self::Pkcs => b"1",
                 Self::Des => b"2",
                 Self::Pkcsdes => b"3",
                 Self::Pgpdes => b"4",
                 Self::Pgpdesmd5 => b"5",
-                Self::Pemdesmd5 => b"6",
+                Self::Pem => b"6",
+                Self::Other(value) => value,
+            }
+        }
+    }
+
+    /// RefMsgType (tag 372): 9 declared values.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum RefMsgType<'a> {
+        /// `0`: Heartbeat.
+        Heartbeat,
+        /// `1`: TestRequest.
+        TestRequest,
+        /// `2`: ResendRequest.
+        ResendRequest,
+        /// `3`: Reject.
+        Reject,
+        /// `4`: SequenceReset.
+        SequenceReset,
+        /// `5`: Logout.
+        Logout,
+        /// `A`: Logon.
+        Logon,
+        /// `j`: BusinessMessageReject.
+        BusinessMessageReject,
+        /// `n`: XMLnonFIX.
+        XMLnonFIX,
+        /// A value the dictionary does not declare, as its wire bytes.
+        Other(&'a [u8]),
+    }
+
+    impl<'a> RefMsgType<'a> {
+        /// Returns the variant of a wire value; an undeclared value is `Other`.
+        #[must_use]
+        pub const fn from_bytes(value: &'a [u8]) -> Self {
+            match value {
+                b"0" => Self::Heartbeat,
+                b"1" => Self::TestRequest,
+                b"2" => Self::ResendRequest,
+                b"3" => Self::Reject,
+                b"4" => Self::SequenceReset,
+                b"5" => Self::Logout,
+                b"A" => Self::Logon,
+                b"j" => Self::BusinessMessageReject,
+                b"n" => Self::XMLnonFIX,
+                other => Self::Other(other),
+            }
+        }
+
+        /// Returns the wire value.
+        #[must_use]
+        pub const fn as_bytes(&self) -> &'a [u8] {
+            match *self {
+                Self::Heartbeat => b"0",
+                Self::TestRequest => b"1",
+                Self::ResendRequest => b"2",
+                Self::Reject => b"3",
+                Self::SequenceReset => b"4",
+                Self::Logout => b"5",
+                Self::Logon => b"A",
+                Self::BusinessMessageReject => b"j",
+                Self::XMLnonFIX => b"n",
                 Self::Other(value) => value,
             }
         }
@@ -64,45 +125,45 @@ pub mod enums {
     /// SessionRejectReason (tag 373): 20 declared values.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum SessionRejectReason<'a> {
-        /// `0`: INVALID_TAG_NUMBER.
+        /// `0`: InvalidTagNumber.
         InvalidTagNumber,
-        /// `1`: REQUIRED_TAG_MISSING.
+        /// `1`: RequiredTagMissing.
         RequiredTagMissing,
-        /// `10`: SENDINGTIME_ACCURACY_PROBLEM.
-        SendingtimeAccuracyProblem,
-        /// `11`: INVALID_MSGTYPE.
-        InvalidMsgtype,
-        /// `12`: XML_VALIDATION_ERROR.
-        XmlValidationError,
-        /// `13`: TAG_APPEARS_MORE_THAN_ONCE.
+        /// `10`: SendingTimeAccuracyProblem.
+        SendingTimeAccuracyProblem,
+        /// `11`: InvalidMsgType.
+        InvalidMsgType,
+        /// `12`: XMLValidationError.
+        XMLValidationError,
+        /// `13`: TagAppearsMoreThanOnce.
         TagAppearsMoreThanOnce,
-        /// `14`: TAG_SPECIFIED_OUT_OF_REQUIRED_ORDER.
+        /// `14`: TagSpecifiedOutOfRequiredOrder.
         TagSpecifiedOutOfRequiredOrder,
-        /// `15`: REPEATING_GROUP_FIELDS_OUT_OF_ORDER.
+        /// `15`: RepeatingGroupFieldsOutOfOrder.
         RepeatingGroupFieldsOutOfOrder,
-        /// `16`: INCORRECT_NUMINGROUP_COUNT_FOR_REPEATING_GROUP.
-        IncorrectNumingroupCountForRepeatingGroup,
-        /// `17`: NON_DATA_VALUE_INCLUDES_FIELD_DELIMITER.
-        NonDataValueIncludesFieldDelimiter,
-        /// `18`: INVALID_UNSUPPORTED_APPLICATION_VERSION.
-        InvalidUnsupportedApplicationVersion,
-        /// `2`: TAG_NOT_DEFINED_FOR_THIS_MESSAGE_TYPE.
+        /// `16`: IncorrectNumInGroupCountForRepeatingGroup.
+        IncorrectNumInGroupCountForRepeatingGroup,
+        /// `17`: FieldDelimiterInFieldValue.
+        FieldDelimiterInFieldValue,
+        /// `18`: InvalidUnsupportedAppVersion.
+        InvalidUnsupportedAppVersion,
+        /// `2`: TagNotDefinedForThisMessageType.
         TagNotDefinedForThisMessageType,
-        /// `3`: UNDEFINED_TAG.
+        /// `3`: UndefinedTag.
         UndefinedTag,
-        /// `4`: TAG_SPECIFIED_WITHOUT_A_VALUE.
+        /// `4`: TagSpecifiedWithoutAValue.
         TagSpecifiedWithoutAValue,
-        /// `5`: VALUE_IS_INCORRECT.
+        /// `5`: ValueIsIncorrect.
         ValueIsIncorrect,
-        /// `6`: INCORRECT_DATA_FORMAT_FOR_VALUE.
+        /// `6`: IncorrectDataFormatForValue.
         IncorrectDataFormatForValue,
-        /// `7`: DECRYPTION_PROBLEM.
+        /// `7`: DecryptionProblem.
         DecryptionProblem,
-        /// `8`: SIGNATURE_PROBLEM.
+        /// `8`: SignatureProblem.
         SignatureProblem,
-        /// `9`: COMPID_PROBLEM.
-        CompidProblem,
-        /// `99`: OTHER.
+        /// `9`: CompIDProblem.
+        CompIDProblem,
+        /// `99`: Other.
         Other99,
         /// A value the dictionary does not declare, as its wire bytes.
         Other(&'a [u8]),
@@ -115,15 +176,15 @@ pub mod enums {
             match value {
                 b"0" => Self::InvalidTagNumber,
                 b"1" => Self::RequiredTagMissing,
-                b"10" => Self::SendingtimeAccuracyProblem,
-                b"11" => Self::InvalidMsgtype,
-                b"12" => Self::XmlValidationError,
+                b"10" => Self::SendingTimeAccuracyProblem,
+                b"11" => Self::InvalidMsgType,
+                b"12" => Self::XMLValidationError,
                 b"13" => Self::TagAppearsMoreThanOnce,
                 b"14" => Self::TagSpecifiedOutOfRequiredOrder,
                 b"15" => Self::RepeatingGroupFieldsOutOfOrder,
-                b"16" => Self::IncorrectNumingroupCountForRepeatingGroup,
-                b"17" => Self::NonDataValueIncludesFieldDelimiter,
-                b"18" => Self::InvalidUnsupportedApplicationVersion,
+                b"16" => Self::IncorrectNumInGroupCountForRepeatingGroup,
+                b"17" => Self::FieldDelimiterInFieldValue,
+                b"18" => Self::InvalidUnsupportedAppVersion,
                 b"2" => Self::TagNotDefinedForThisMessageType,
                 b"3" => Self::UndefinedTag,
                 b"4" => Self::TagSpecifiedWithoutAValue,
@@ -131,7 +192,7 @@ pub mod enums {
                 b"6" => Self::IncorrectDataFormatForValue,
                 b"7" => Self::DecryptionProblem,
                 b"8" => Self::SignatureProblem,
-                b"9" => Self::CompidProblem,
+                b"9" => Self::CompIDProblem,
                 b"99" => Self::Other99,
                 other => Self::Other(other),
             }
@@ -143,15 +204,15 @@ pub mod enums {
             match *self {
                 Self::InvalidTagNumber => b"0",
                 Self::RequiredTagMissing => b"1",
-                Self::SendingtimeAccuracyProblem => b"10",
-                Self::InvalidMsgtype => b"11",
-                Self::XmlValidationError => b"12",
+                Self::SendingTimeAccuracyProblem => b"10",
+                Self::InvalidMsgType => b"11",
+                Self::XMLValidationError => b"12",
                 Self::TagAppearsMoreThanOnce => b"13",
                 Self::TagSpecifiedOutOfRequiredOrder => b"14",
                 Self::RepeatingGroupFieldsOutOfOrder => b"15",
-                Self::IncorrectNumingroupCountForRepeatingGroup => b"16",
-                Self::NonDataValueIncludesFieldDelimiter => b"17",
-                Self::InvalidUnsupportedApplicationVersion => b"18",
+                Self::IncorrectNumInGroupCountForRepeatingGroup => b"16",
+                Self::FieldDelimiterInFieldValue => b"17",
+                Self::InvalidUnsupportedAppVersion => b"18",
                 Self::TagNotDefinedForThisMessageType => b"2",
                 Self::UndefinedTag => b"3",
                 Self::TagSpecifiedWithoutAValue => b"4",
@@ -159,34 +220,209 @@ pub mod enums {
                 Self::IncorrectDataFormatForValue => b"6",
                 Self::DecryptionProblem => b"7",
                 Self::SignatureProblem => b"8",
-                Self::CompidProblem => b"9",
+                Self::CompIDProblem => b"9",
                 Self::Other99 => b"99",
                 Self::Other(value) => value,
             }
         }
     }
 
-    /// SessionStatus (tag 1409): 9 declared values.
+    /// MsgDirection (tag 385): 2 declared values.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum MsgDirection<'a> {
+        /// `R`: Receive.
+        Receive,
+        /// `S`: Send.
+        Send,
+        /// A value the dictionary does not declare, as its wire bytes.
+        Other(&'a [u8]),
+    }
+
+    impl<'a> MsgDirection<'a> {
+        /// Returns the variant of a wire value; an undeclared value is `Other`.
+        #[must_use]
+        pub const fn from_bytes(value: &'a [u8]) -> Self {
+            match value {
+                b"R" => Self::Receive,
+                b"S" => Self::Send,
+                other => Self::Other(other),
+            }
+        }
+
+        /// Returns the wire value.
+        #[must_use]
+        pub const fn as_bytes(&self) -> &'a [u8] {
+            match *self {
+                Self::Receive => b"R",
+                Self::Send => b"S",
+                Self::Other(value) => value,
+            }
+        }
+    }
+
+    /// RefApplVerID (tag 1130): 11 declared values.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum RefApplVerID<'a> {
+        /// `0`: FIX27.
+        Fix27,
+        /// `1`: FIX30.
+        Fix30,
+        /// `10`: FIXLatest.
+        FIXLatest,
+        /// `2`: FIX40.
+        Fix40,
+        /// `3`: FIX41.
+        Fix41,
+        /// `4`: FIX42.
+        Fix42,
+        /// `5`: FIX43.
+        Fix43,
+        /// `6`: FIX44.
+        Fix44,
+        /// `7`: FIX50.
+        Fix50,
+        /// `8`: FIX50SP1.
+        Fix50sp1,
+        /// `9`: FIX50SP2.
+        Fix50sp2,
+        /// A value the dictionary does not declare, as its wire bytes.
+        Other(&'a [u8]),
+    }
+
+    impl<'a> RefApplVerID<'a> {
+        /// Returns the variant of a wire value; an undeclared value is `Other`.
+        #[must_use]
+        pub const fn from_bytes(value: &'a [u8]) -> Self {
+            match value {
+                b"0" => Self::Fix27,
+                b"1" => Self::Fix30,
+                b"10" => Self::FIXLatest,
+                b"2" => Self::Fix40,
+                b"3" => Self::Fix41,
+                b"4" => Self::Fix42,
+                b"5" => Self::Fix43,
+                b"6" => Self::Fix44,
+                b"7" => Self::Fix50,
+                b"8" => Self::Fix50sp1,
+                b"9" => Self::Fix50sp2,
+                other => Self::Other(other),
+            }
+        }
+
+        /// Returns the wire value.
+        #[must_use]
+        pub const fn as_bytes(&self) -> &'a [u8] {
+            match *self {
+                Self::Fix27 => b"0",
+                Self::Fix30 => b"1",
+                Self::FIXLatest => b"10",
+                Self::Fix40 => b"2",
+                Self::Fix41 => b"3",
+                Self::Fix42 => b"4",
+                Self::Fix43 => b"5",
+                Self::Fix44 => b"6",
+                Self::Fix50 => b"7",
+                Self::Fix50sp1 => b"8",
+                Self::Fix50sp2 => b"9",
+                Self::Other(value) => value,
+            }
+        }
+    }
+
+    /// DefaultApplVerID (tag 1137): 11 declared values.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum DefaultApplVerID<'a> {
+        /// `0`: FIX27.
+        Fix27,
+        /// `1`: FIX30.
+        Fix30,
+        /// `10`: FIXLatest.
+        FIXLatest,
+        /// `2`: FIX40.
+        Fix40,
+        /// `3`: FIX41.
+        Fix41,
+        /// `4`: FIX42.
+        Fix42,
+        /// `5`: FIX43.
+        Fix43,
+        /// `6`: FIX44.
+        Fix44,
+        /// `7`: FIX50.
+        Fix50,
+        /// `8`: FIX50SP1.
+        Fix50sp1,
+        /// `9`: FIX50SP2.
+        Fix50sp2,
+        /// A value the dictionary does not declare, as its wire bytes.
+        Other(&'a [u8]),
+    }
+
+    impl<'a> DefaultApplVerID<'a> {
+        /// Returns the variant of a wire value; an undeclared value is `Other`.
+        #[must_use]
+        pub const fn from_bytes(value: &'a [u8]) -> Self {
+            match value {
+                b"0" => Self::Fix27,
+                b"1" => Self::Fix30,
+                b"10" => Self::FIXLatest,
+                b"2" => Self::Fix40,
+                b"3" => Self::Fix41,
+                b"4" => Self::Fix42,
+                b"5" => Self::Fix43,
+                b"6" => Self::Fix44,
+                b"7" => Self::Fix50,
+                b"8" => Self::Fix50sp1,
+                b"9" => Self::Fix50sp2,
+                other => Self::Other(other),
+            }
+        }
+
+        /// Returns the wire value.
+        #[must_use]
+        pub const fn as_bytes(&self) -> &'a [u8] {
+            match *self {
+                Self::Fix27 => b"0",
+                Self::Fix30 => b"1",
+                Self::FIXLatest => b"10",
+                Self::Fix40 => b"2",
+                Self::Fix41 => b"3",
+                Self::Fix42 => b"4",
+                Self::Fix43 => b"5",
+                Self::Fix44 => b"6",
+                Self::Fix50 => b"7",
+                Self::Fix50sp1 => b"8",
+                Self::Fix50sp2 => b"9",
+                Self::Other(value) => value,
+            }
+        }
+    }
+
+    /// SessionStatus (tag 1409): 11 declared values.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum SessionStatus<'a> {
-        /// `0`: SESSION_ACTIVE.
+        /// `0`: SessionActive.
         SessionActive,
-        /// `1`: SESSION_PASSWORD_CHANGED.
+        /// `1`: SessionPasswordChanged.
         SessionPasswordChanged,
-        /// `2`: SESSION_PASSWORD_DUE_TO_EXPIRE.
+        /// `10`: ReceivedNextExpectedMsgSeqNumTooHigh.
+        ReceivedNextExpectedMsgSeqNumTooHigh,
+        /// `2`: SessionPasswordDueToExpire.
         SessionPasswordDueToExpire,
-        /// `3`: NEW_SESSION_PASSWORD_DOES_NOT_COMPLY_WITH_POLICY.
+        /// `3`: NewSessionPasswordDoesNotComplyWithPolicy.
         NewSessionPasswordDoesNotComplyWithPolicy,
-        /// `4`: SESSION_LOGOUT_COMPLETE.
+        /// `4`: SessionLogoutComplete.
         SessionLogoutComplete,
-        /// `5`: INVALID_USERNAME_OR_PASSWORD.
+        /// `5`: InvalidUsernameOrPassword.
         InvalidUsernameOrPassword,
-        /// `6`: ACCOUNT_LOCKED.
+        /// `6`: AccountLocked.
         AccountLocked,
-        /// `7`: LOGONS_ARE_NOT_ALLOWED_AT_THIS_TIME.
+        /// `7`: LogonsAreNotAllowedAtThisTime.
         LogonsAreNotAllowedAtThisTime,
-        /// `8`: PASSWORD_EXPIRED.
+        /// `8`: PasswordExpired.
         PasswordExpired,
+        /// `9`: ReceivedMsgSeqNumTooLow.
+        ReceivedMsgSeqNumTooLow,
         /// A value the dictionary does not declare, as its wire bytes.
         Other(&'a [u8]),
     }
@@ -198,6 +434,7 @@ pub mod enums {
             match value {
                 b"0" => Self::SessionActive,
                 b"1" => Self::SessionPasswordChanged,
+                b"10" => Self::ReceivedNextExpectedMsgSeqNumTooHigh,
                 b"2" => Self::SessionPasswordDueToExpire,
                 b"3" => Self::NewSessionPasswordDoesNotComplyWithPolicy,
                 b"4" => Self::SessionLogoutComplete,
@@ -205,6 +442,7 @@ pub mod enums {
                 b"6" => Self::AccountLocked,
                 b"7" => Self::LogonsAreNotAllowedAtThisTime,
                 b"8" => Self::PasswordExpired,
+                b"9" => Self::ReceivedMsgSeqNumTooLow,
                 other => Self::Other(other),
             }
         }
@@ -215,6 +453,7 @@ pub mod enums {
             match *self {
                 Self::SessionActive => b"0",
                 Self::SessionPasswordChanged => b"1",
+                Self::ReceivedNextExpectedMsgSeqNumTooHigh => b"10",
                 Self::SessionPasswordDueToExpire => b"2",
                 Self::NewSessionPasswordDoesNotComplyWithPolicy => b"3",
                 Self::SessionLogoutComplete => b"4",
@@ -222,6 +461,73 @@ pub mod enums {
                 Self::AccountLocked => b"6",
                 Self::LogonsAreNotAllowedAtThisTime => b"7",
                 Self::PasswordExpired => b"8",
+                Self::ReceivedMsgSeqNumTooLow => b"9",
+                Self::Other(value) => value,
+            }
+        }
+    }
+
+    /// ApplLevelRecoveryIndicator (tag 1744): 2 declared values.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum ApplLevelRecoveryIndicator<'a> {
+        /// `0`: NoApplRecoveryNeeded.
+        NoApplRecoveryNeeded,
+        /// `1`: ApplRecoveryNeeded.
+        ApplRecoveryNeeded,
+        /// A value the dictionary does not declare, as its wire bytes.
+        Other(&'a [u8]),
+    }
+
+    impl<'a> ApplLevelRecoveryIndicator<'a> {
+        /// Returns the variant of a wire value; an undeclared value is `Other`.
+        #[must_use]
+        pub const fn from_bytes(value: &'a [u8]) -> Self {
+            match value {
+                b"0" => Self::NoApplRecoveryNeeded,
+                b"1" => Self::ApplRecoveryNeeded,
+                other => Self::Other(other),
+            }
+        }
+
+        /// Returns the wire value.
+        #[must_use]
+        pub const fn as_bytes(&self) -> &'a [u8] {
+            match *self {
+                Self::NoApplRecoveryNeeded => b"0",
+                Self::ApplRecoveryNeeded => b"1",
+                Self::Other(value) => value,
+            }
+        }
+    }
+
+    /// AttachmentEncodingType (tag 2109): 2 declared values.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum AttachmentEncodingType<'a> {
+        /// `0`: Base64.
+        Base64,
+        /// `1`: RawBinary.
+        RawBinary,
+        /// A value the dictionary does not declare, as its wire bytes.
+        Other(&'a [u8]),
+    }
+
+    impl<'a> AttachmentEncodingType<'a> {
+        /// Returns the variant of a wire value; an undeclared value is `Other`.
+        #[must_use]
+        pub const fn from_bytes(value: &'a [u8]) -> Self {
+            match value {
+                b"0" => Self::Base64,
+                b"1" => Self::RawBinary,
+                other => Self::Other(other),
+            }
+        }
+
+        /// Returns the wire value.
+        #[must_use]
+        pub const fn as_bytes(&self) -> &'a [u8] {
+            match *self {
+                Self::Base64 => b"0",
+                Self::RawBinary => b"1",
                 Self::Other(value) => value,
             }
         }
@@ -237,6 +543,24 @@ pub mod layouts {
     pub const HEADER_NO_HOPS: GroupSpec<'static> = match GroupSpec::new(627, 628, &[628, 629, 630], &[]) {
         Ok(spec) => spec,
         Err(_) => panic!("invalid HeaderNoHops group table"),
+    };
+
+    /// NoMsgTypes (tag 384) group of the Logon message; entries start with tag 372.
+    pub const LOGON_NO_MSG_TYPES: GroupSpec<'static> = match GroupSpec::new(384, 372, &[372, 385, 1130, 1131, 1406, 1410], &[]) {
+        Ok(spec) => spec,
+        Err(_) => panic!("invalid LogonNoMsgTypes group table"),
+    };
+
+    /// NoAttachments (tag 2104) group of the XMLnonFIX message; entries start with tag 2105.
+    pub const XMLNON_FIXNO_ATTACHMENTS: GroupSpec<'static> = match GroupSpec::new(2104, 2105, &[2105, 2106, 2107, 2108, 2109, 2110, 2111, 2112, 2113], &[XMLNON_FIXNO_ATTACHMENTS_NO_ATTACHMENT_KEYWORDS]) {
+        Ok(spec) => spec,
+        Err(_) => panic!("invalid XMLnonFIXNoAttachments group table"),
+    };
+
+    /// NoAttachmentKeywords (tag 2113) group of an entry of the NoAttachments group; entries start with tag 2114.
+    pub const XMLNON_FIXNO_ATTACHMENTS_NO_ATTACHMENT_KEYWORDS: GroupSpec<'static> = match GroupSpec::new(2113, 2114, &[2114], &[]) {
+        Ok(spec) => spec,
+        Err(_) => panic!("invalid XMLnonFIXNoAttachmentsNoAttachmentKeywords group table"),
     };
 
     /// Groups that may open at the top level of Heartbeat (MsgType=0), header and trailer groups included,
@@ -269,28 +593,28 @@ pub mod layouts {
 
     /// Groups that may open at the top level of SequenceReset (MsgType=4), header and trailer groups included,
     /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
-    pub const SEQUENCE_RESET: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 36, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 97, 115, 116, 122, 123, 128, 129, 142, 143, 144, 145, 212, 213, 347, 369, 627, 1128, 1129, 1156]) {
+    pub const SEQUENCE_RESET: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 36, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 97, 115, 116, 122, 123, 128, 129, 142, 143, 144, 145, 212, 213, 347, 369, 627, 1128, 1129, 1156, 1744]) {
         Ok(set) => set,
         Err(_) => panic!("invalid SequenceReset group table"),
     };
 
     /// Groups that may open at the top level of Logout (MsgType=5), header and trailer groups included,
     /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
-    pub const LOGOUT: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 58, 89, 90, 91, 93, 97, 115, 116, 122, 128, 129, 142, 143, 144, 145, 212, 213, 347, 354, 355, 369, 627, 1128, 1129, 1156, 1409]) {
+    pub const LOGOUT: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 58, 89, 90, 91, 93, 97, 115, 116, 122, 128, 129, 142, 143, 144, 145, 212, 213, 347, 354, 355, 369, 627, 789, 1128, 1129, 1156, 1409]) {
         Ok(set) => set,
         Err(_) => panic!("invalid Logout group table"),
     };
 
     /// Groups that may open at the top level of Logon (MsgType=A), header and trailer groups included,
     /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
-    pub const LOGON: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 58, 89, 90, 91, 93, 95, 96, 97, 98, 108, 115, 116, 122, 128, 129, 141, 142, 143, 144, 145, 212, 213, 347, 354, 355, 369, 383, 464, 553, 554, 627, 789, 925, 1128, 1129, 1137, 1156, 1400, 1401, 1402, 1403, 1404, 1407, 1408, 1409]) {
+    pub const LOGON: GroupSet<'static> = match GroupSet::with_level_tags(&[LOGON_NO_MSG_TYPES, HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 58, 89, 90, 91, 93, 95, 96, 97, 98, 108, 115, 116, 122, 128, 129, 141, 142, 143, 144, 145, 212, 213, 347, 354, 355, 369, 383, 384, 464, 553, 554, 627, 789, 925, 1128, 1129, 1137, 1156, 1400, 1401, 1402, 1403, 1404, 1407, 1408, 1409, 1600, 1601, 1602, 1603, 1604, 1605]) {
         Ok(set) => set,
         Err(_) => panic!("invalid Logon group table"),
     };
 
     /// Groups that may open at the top level of XMLnonFIX (MsgType=n), header and trailer groups included,
     /// with every tag the message level accepts, so group boundaries read as `MessageLayout` reads them.
-    pub const XMLNON_FIX: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 97, 115, 116, 122, 128, 129, 142, 143, 144, 145, 212, 213, 347, 369, 627, 1128, 1129, 1156]) {
+    pub const XMLNON_FIX: GroupSet<'static> = match GroupSet::with_level_tags(&[HEADER_NO_HOPS, XMLNON_FIXNO_ATTACHMENTS], &[8, 9, 10, 34, 35, 43, 49, 50, 52, 56, 57, 89, 90, 91, 93, 97, 115, 116, 122, 128, 129, 142, 143, 144, 145, 212, 213, 347, 369, 627, 1128, 1129, 1156, 2104]) {
         Ok(set) => set,
         Err(_) => panic!("invalid XMLnonFIX group table"),
     };
@@ -316,9 +640,12 @@ pub mod views {
     use ::ironfix_core::error::DecodeError;
     use ::ironfix_core::field::FieldRef;
     use ::ironfix_core::message::RawMessage;
-    use ::ironfix_dictionary::FieldType;
+    use ::ironfix_dictionary::{FieldType, GroupEntries, GroupEntry, GroupError};
     use super::enums;
     use super::layouts;
+
+    /// The typed entries of a repeating group, in wire order.
+    pub type Entries<'m, 'a, E> = ::core::iter::Map<GroupEntries<'m, 'a, 'static>, fn(GroupEntry<'m, 'a, 'static>) -> E>;
 
     /// Returns `field`, or the missing-field error of `tag` when it is absent.
     fn required<'m, 'a>(field: ::core::option::Option<&'m FieldRef<'a>>, tag: u32) -> ::core::result::Result<&'m FieldRef<'a>, DecodeError> {
@@ -535,13 +862,13 @@ pub mod views {
         }
 
         /// RefMsgType (tag 372).
-        pub fn ref_msg_type(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
-            self.get(372).map(|field| text(field, FieldType::String)).transpose()
+        pub fn ref_msg_type(&self) -> ::core::result::Result<::core::option::Option<enums::RefMsgType<'a>>, DecodeError> {
+            self.get(372).map(|field| text(field, FieldType::String).map(|value| enums::RefMsgType::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// RefApplVerID (tag 1130).
-        pub fn ref_appl_ver_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
-            self.get(1130).map(|field| text(field, FieldType::String)).transpose()
+        pub fn ref_appl_ver_id(&self) -> ::core::result::Result<::core::option::Option<enums::RefApplVerID<'a>>, DecodeError> {
+            self.get(1130).map(|field| text(field, FieldType::String).map(|value| enums::RefApplVerID::from_bytes(value.as_bytes()))).transpose()
         }
 
         /// RefApplExtID (tag 1406).
@@ -621,6 +948,11 @@ pub mod views {
         pub fn new_seq_no(&self) -> ::core::result::Result<u64, DecodeError> {
             uint(required(self.get(36), 36)?, FieldType::SeqNum)
         }
+
+        /// ApplLevelRecoveryIndicator (tag 1744).
+        pub fn appl_level_recovery_indicator(&self) -> ::core::result::Result<::core::option::Option<enums::ApplLevelRecoveryIndicator<'a>>, DecodeError> {
+            self.get(1744).map(|field| text(field, FieldType::Int).map(|value| enums::ApplLevelRecoveryIndicator::from_bytes(value.as_bytes()))).transpose()
+        }
     }
 
     /// Logout message (MsgType=5), read in place from a decoded message.
@@ -662,6 +994,11 @@ pub mod views {
         /// SessionStatus (tag 1409).
         pub fn session_status(&self) -> ::core::result::Result<::core::option::Option<enums::SessionStatus<'a>>, DecodeError> {
             self.get(1409).map(|field| text(field, FieldType::Int).map(|value| enums::SessionStatus::from_bytes(value.as_bytes()))).transpose()
+        }
+
+        /// NextExpectedMsgSeqNum (tag 789).
+        pub fn next_expected_msg_seq_num(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
+            self.get(789).map(|field| uint(field, FieldType::SeqNum)).transpose()
         }
 
         /// Text (tag 58).
@@ -753,6 +1090,11 @@ pub mod views {
             self.get(383).map(|field| uint(field, FieldType::Length)).transpose()
         }
 
+        /// NoMsgTypes (tag 384) repeating group: its entries in wire order, `None` when absent.
+        pub fn no_msg_types(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, LogonNoMsgTypesView<'m, 'a>>>, GroupError> {
+            Ok(layouts::LOGON.read(self.msg, 384)?.map(|entries| entries.map(LogonNoMsgTypesView::wrap as fn(_) -> _)))
+        }
+
         /// TestMessageIndicator (tag 464).
         pub fn test_message_indicator(&self) -> ::core::result::Result<::core::option::Option<bool>, DecodeError> {
             self.get(464).map(|field| boolean(field, FieldType::Boolean)).transpose()
@@ -806,8 +1148,8 @@ pub mod views {
         }
 
         /// DefaultApplVerID (tag 1137). Required.
-        pub fn default_appl_ver_id(&self) -> ::core::result::Result<&'a str, DecodeError> {
-            text(required(self.get(1137), 1137)?, FieldType::String)
+        pub fn default_appl_ver_id(&self) -> ::core::result::Result<enums::DefaultApplVerID<'a>, DecodeError> {
+            text(required(self.get(1137), 1137)?, FieldType::String).map(|value| enums::DefaultApplVerID::from_bytes(value.as_bytes()))
         }
 
         /// DefaultApplExtID (tag 1407).
@@ -818,6 +1160,36 @@ pub mod views {
         /// DefaultCstmApplVerID (tag 1408).
         pub fn default_cstm_appl_ver_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
             self.get(1408).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// FIXEngineName (tag 1600).
+        pub fn fixengine_name(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.get(1600).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// FIXEngineVersion (tag 1601).
+        pub fn fixengine_version(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.get(1601).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// FIXEngineVendor (tag 1602).
+        pub fn fixengine_vendor(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.get(1602).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// ApplicationSystemName (tag 1603).
+        pub fn application_system_name(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.get(1603).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// ApplicationSystemVersion (tag 1604).
+        pub fn application_system_version(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.get(1604).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// ApplicationSystemVendor (tag 1605).
+        pub fn application_system_vendor(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.get(1605).map(|field| text(field, FieldType::String)).transpose()
         }
 
         /// Text (tag 58).
@@ -864,6 +1236,170 @@ pub mod views {
         #[must_use]
         pub const fn message(&self) -> &'m RawMessage<'a> {
             self.msg
+        }
+
+        /// NoAttachments (tag 2104) repeating group: its entries in wire order, `None` when absent.
+        pub fn no_attachments(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, XMLnonFIXNoAttachmentsView<'m, 'a>>>, GroupError> {
+            Ok(layouts::XMLNON_FIX.read(self.msg, 2104)?.map(|entries| entries.map(XMLnonFIXNoAttachmentsView::wrap as fn(_) -> _)))
+        }
+    }
+
+    /// One entry of the NoMsgTypes (tag 384) repeating group of the Logon message, read in place.
+    #[derive(Clone, Copy)]
+    pub struct LogonNoMsgTypesView<'m, 'a> {
+        entry: GroupEntry<'m, 'a, 'static>,
+    }
+
+    impl ::core::fmt::Debug for LogonNoMsgTypesView<'_, '_> {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            f.debug_struct("LogonNoMsgTypesView").finish_non_exhaustive()
+        }
+    }
+
+    impl<'m, 'a> LogonNoMsgTypesView<'m, 'a> {
+        /// Wraps an entry read with `layouts::LOGON_NO_MSG_TYPES`.
+        const fn wrap(entry: GroupEntry<'m, 'a, 'static>) -> Self {
+            Self { entry }
+        }
+
+        /// Returns the entry this view reads: its index and its fields in wire order. Its `Debug`
+        /// prints raw field values.
+        #[must_use]
+        pub const fn entry(&self) -> GroupEntry<'m, 'a, 'static> {
+            self.entry
+        }
+
+        /// RefMsgType (tag 372). Required.
+        pub fn ref_msg_type(&self) -> ::core::result::Result<enums::RefMsgType<'a>, DecodeError> {
+            text(required(self.entry.get(372), 372)?, FieldType::String).map(|value| enums::RefMsgType::from_bytes(value.as_bytes()))
+        }
+
+        /// MsgDirection (tag 385).
+        pub fn msg_direction(&self) -> ::core::result::Result<::core::option::Option<enums::MsgDirection<'a>>, DecodeError> {
+            self.entry.get(385).map(|field| text(field, FieldType::Char).map(|value| enums::MsgDirection::from_bytes(value.as_bytes()))).transpose()
+        }
+
+        /// RefApplVerID (tag 1130).
+        pub fn ref_appl_ver_id(&self) -> ::core::result::Result<::core::option::Option<enums::RefApplVerID<'a>>, DecodeError> {
+            self.entry.get(1130).map(|field| text(field, FieldType::String).map(|value| enums::RefApplVerID::from_bytes(value.as_bytes()))).transpose()
+        }
+
+        /// RefApplExtID (tag 1406).
+        pub fn ref_appl_ext_id(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
+            self.entry.get(1406).map(|field| int(field, FieldType::Int)).transpose()
+        }
+
+        /// RefCstmApplVerID (tag 1131).
+        pub fn ref_cstm_appl_ver_id(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.entry.get(1131).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// DefaultVerIndicator (tag 1410).
+        pub fn default_ver_indicator(&self) -> ::core::result::Result<::core::option::Option<bool>, DecodeError> {
+            self.entry.get(1410).map(|field| boolean(field, FieldType::Boolean)).transpose()
+        }
+    }
+
+    /// One entry of the NoAttachments (tag 2104) repeating group of the XMLnonFIX message, read in place.
+    #[derive(Clone, Copy)]
+    pub struct XMLnonFIXNoAttachmentsView<'m, 'a> {
+        entry: GroupEntry<'m, 'a, 'static>,
+    }
+
+    impl ::core::fmt::Debug for XMLnonFIXNoAttachmentsView<'_, '_> {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            f.debug_struct("XMLnonFIXNoAttachmentsView").finish_non_exhaustive()
+        }
+    }
+
+    impl<'m, 'a> XMLnonFIXNoAttachmentsView<'m, 'a> {
+        /// Wraps an entry read with `layouts::XMLNON_FIXNO_ATTACHMENTS`.
+        const fn wrap(entry: GroupEntry<'m, 'a, 'static>) -> Self {
+            Self { entry }
+        }
+
+        /// Returns the entry this view reads: its index and its fields in wire order. Its `Debug`
+        /// prints raw field values.
+        #[must_use]
+        pub const fn entry(&self) -> GroupEntry<'m, 'a, 'static> {
+            self.entry
+        }
+
+        /// AttachmentName (tag 2105). Required.
+        pub fn attachment_name(&self) -> ::core::result::Result<&'a str, DecodeError> {
+            text(required(self.entry.get(2105), 2105)?, FieldType::String)
+        }
+
+        /// AttachmentMediaType (tag 2106).
+        pub fn attachment_media_type(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.entry.get(2106).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// AttachmentClassification (tag 2107).
+        pub fn attachment_classification(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.entry.get(2107).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// AttachmentExternalURL (tag 2108).
+        pub fn attachment_external_url(&self) -> ::core::result::Result<::core::option::Option<&'a str>, DecodeError> {
+            self.entry.get(2108).map(|field| text(field, FieldType::String)).transpose()
+        }
+
+        /// AttachmentEncodingType (tag 2109).
+        pub fn attachment_encoding_type(&self) -> ::core::result::Result<::core::option::Option<enums::AttachmentEncodingType<'a>>, DecodeError> {
+            self.entry.get(2109).map(|field| text(field, FieldType::Int).map(|value| enums::AttachmentEncodingType::from_bytes(value.as_bytes()))).transpose()
+        }
+
+        /// UnencodedAttachmentLen (tag 2110).
+        pub fn unencoded_attachment_len(&self) -> ::core::result::Result<::core::option::Option<i64>, DecodeError> {
+            self.entry.get(2110).map(|field| int(field, FieldType::Int)).transpose()
+        }
+
+        /// EncodedAttachmentLen (tag 2111).
+        pub fn encoded_attachment_len(&self) -> ::core::result::Result<::core::option::Option<u64>, DecodeError> {
+            self.entry.get(2111).map(|field| uint(field, FieldType::Length)).transpose()
+        }
+
+        /// EncodedAttachment (tag 2112).
+        #[must_use]
+        pub fn encoded_attachment(&self) -> ::core::option::Option<&'a [u8]> {
+            self.entry.get(2112).map(|field| field.value)
+        }
+
+        /// NoAttachmentKeywords (tag 2113) repeating group: its entries in wire order, `None` when absent.
+        pub fn no_attachment_keywords(&self) -> ::core::result::Result<::core::option::Option<Entries<'m, 'a, XMLnonFIXNoAttachmentsNoAttachmentKeywordsView<'m, 'a>>>, GroupError> {
+            Ok(self.entry.group(2113)?.map(|entries| entries.map(XMLnonFIXNoAttachmentsNoAttachmentKeywordsView::wrap as fn(_) -> _)))
+        }
+    }
+
+    /// One entry of the NoAttachmentKeywords (tag 2113) repeating group of an entry of the NoAttachments group, read in place.
+    #[derive(Clone, Copy)]
+    pub struct XMLnonFIXNoAttachmentsNoAttachmentKeywordsView<'m, 'a> {
+        entry: GroupEntry<'m, 'a, 'static>,
+    }
+
+    impl ::core::fmt::Debug for XMLnonFIXNoAttachmentsNoAttachmentKeywordsView<'_, '_> {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            f.debug_struct("XMLnonFIXNoAttachmentsNoAttachmentKeywordsView").finish_non_exhaustive()
+        }
+    }
+
+    impl<'m, 'a> XMLnonFIXNoAttachmentsNoAttachmentKeywordsView<'m, 'a> {
+        /// Wraps an entry read with `layouts::XMLNON_FIXNO_ATTACHMENTS_NO_ATTACHMENT_KEYWORDS`.
+        const fn wrap(entry: GroupEntry<'m, 'a, 'static>) -> Self {
+            Self { entry }
+        }
+
+        /// Returns the entry this view reads: its index and its fields in wire order. Its `Debug`
+        /// prints raw field values.
+        #[must_use]
+        pub const fn entry(&self) -> GroupEntry<'m, 'a, 'static> {
+            self.entry
+        }
+
+        /// AttachmentKeyword (tag 2114). Required.
+        pub fn attachment_keyword(&self) -> ::core::result::Result<&'a str, DecodeError> {
+            text(required(self.entry.get(2114), 2114)?, FieldType::String)
         }
     }
 }
@@ -977,6 +1513,15 @@ pub mod writers {
     fn check_data(value: ::core::option::Option<&[u8]>, tag: u32) -> ::core::result::Result<(), EncodeError> {
         match value {
             Some([]) => Err(invalid(tag, "the value is empty".to_string())),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuses a value that is not one printable ASCII character (a control character includes SOH): an enumeration-backed `char` value or a `MultipleCharValue` token, held as bytes.
+    fn check_ascii(value: ::core::option::Option<&[u8]>, tag: u32) -> ::core::result::Result<(), EncodeError> {
+        match value {
+            Some([byte]) if byte.is_ascii() && !byte.is_ascii_control() => Ok(()),
+            Some(value) => Err(invalid(tag, format!("{:?} is not one printable ASCII character", ::std::string::String::from_utf8_lossy(value)))),
             _ => Ok(()),
         }
     }
@@ -1183,9 +1728,9 @@ pub mod writers {
         /// RefTagID (tag 371).
         pub ref_tag_id: ::core::option::Option<i64>,
         /// RefMsgType (tag 372).
-        pub ref_msg_type: ::core::option::Option<&'v str>,
+        pub ref_msg_type: ::core::option::Option<enums::RefMsgType<'v>>,
         /// RefApplVerID (tag 1130).
-        pub ref_appl_ver_id: ::core::option::Option<&'v str>,
+        pub ref_appl_ver_id: ::core::option::Option<enums::RefApplVerID<'v>>,
         /// RefApplExtID (tag 1406).
         pub ref_appl_ext_id: ::core::option::Option<i64>,
         /// RefCstmApplVerID (tag 1131).
@@ -1224,10 +1769,10 @@ pub mod writers {
         fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.ref_seq_num.is_some(), 45)?;
             check_number(self.ref_seq_num, FieldType::SeqNum, 45)?;
-            check_text(self.ref_msg_type.map(str::as_bytes), 372)?;
-            check_grammar(self.ref_msg_type.map(str::as_bytes), FieldType::String, 372)?;
-            check_text(self.ref_appl_ver_id.map(str::as_bytes), 1130)?;
-            check_grammar(self.ref_appl_ver_id.map(str::as_bytes), FieldType::String, 1130)?;
+            check_text(self.ref_msg_type.map(|value| value.as_bytes()), 372)?;
+            check_grammar(self.ref_msg_type.map(|value| value.as_bytes()), FieldType::String, 372)?;
+            check_text(self.ref_appl_ver_id.map(|value| value.as_bytes()), 1130)?;
+            check_grammar(self.ref_appl_ver_id.map(|value| value.as_bytes()), FieldType::String, 1130)?;
             check_text(self.ref_cstm_appl_ver_id.map(str::as_bytes), 1131)?;
             check_grammar(self.ref_cstm_appl_ver_id.map(str::as_bytes), FieldType::String, 1131)?;
             check_text(self.session_reject_reason.map(|value| value.as_bytes()), 373)?;
@@ -1255,20 +1800,22 @@ pub mod writers {
 
     /// Body of a SequenceReset message (MsgType=4), to write.
     #[derive(Clone, Copy, Default)]
-    pub struct SequenceResetFields {
+    pub struct SequenceResetFields<'v> {
         /// GapFillFlag (tag 123).
         pub gap_fill_flag: ::core::option::Option<bool>,
         /// NewSeqNo (tag 36). Required.
         pub new_seq_no: ::core::option::Option<u64>,
+        /// ApplLevelRecoveryIndicator (tag 1744).
+        pub appl_level_recovery_indicator: ::core::option::Option<enums::ApplLevelRecoveryIndicator<'v>>,
     }
 
-    impl ::core::fmt::Debug for SequenceResetFields {
+    impl ::core::fmt::Debug for SequenceResetFields<'_> {
         fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
             f.debug_struct("SequenceResetFields").finish_non_exhaustive()
         }
     }
 
-    impl SequenceResetFields {
+    impl SequenceResetFields<'_> {
         /// Writes the body to `sink`, one call per field, in XML order: a repeating group
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
@@ -1288,6 +1835,8 @@ pub mod writers {
         fn check(&self) -> ::core::result::Result<(), EncodeError> {
             present(self.new_seq_no.is_some(), 36)?;
             check_number(self.new_seq_no, FieldType::SeqNum, 36)?;
+            check_text(self.appl_level_recovery_indicator.map(|value| value.as_bytes()), 1744)?;
+            check_grammar(self.appl_level_recovery_indicator.map(|value| value.as_bytes()), FieldType::Int, 1744)?;
             Ok(())
         }
 
@@ -1295,6 +1844,7 @@ pub mod writers {
         fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.gap_fill_flag { sink.field(123, if value { b"Y" } else { b"N" }); }
             if let Some(value) = self.new_seq_no { put_display(sink, 36, value)?; }
+            if let Some(value) = self.appl_level_recovery_indicator { sink.field(1744, value.as_bytes()); }
             Ok(())
         }
     }
@@ -1304,6 +1854,8 @@ pub mod writers {
     pub struct LogoutFields<'v> {
         /// SessionStatus (tag 1409).
         pub session_status: ::core::option::Option<enums::SessionStatus<'v>>,
+        /// NextExpectedMsgSeqNum (tag 789).
+        pub next_expected_msg_seq_num: ::core::option::Option<u64>,
         /// Text (tag 58).
         pub text: ::core::option::Option<&'v str>,
         /// EncodedText (tag 355). Written with its length (tag 354), which is derived from it.
@@ -1336,6 +1888,7 @@ pub mod writers {
         fn check(&self) -> ::core::result::Result<(), EncodeError> {
             check_text(self.session_status.map(|value| value.as_bytes()), 1409)?;
             check_grammar(self.session_status.map(|value| value.as_bytes()), FieldType::Int, 1409)?;
+            check_number(self.next_expected_msg_seq_num, FieldType::SeqNum, 789)?;
             check_text(self.text.map(str::as_bytes), 58)?;
             check_grammar(self.text.map(str::as_bytes), FieldType::String, 58)?;
             check_data(self.encoded_text, 355)?;
@@ -1345,6 +1898,7 @@ pub mod writers {
         /// Writes the fields, in XML order (an entry: its delimiter first).
         fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
             if let Some(value) = self.session_status { sink.field(1409, value.as_bytes()); }
+            if let Some(value) = self.next_expected_msg_seq_num { put_display(sink, 789, value)?; }
             if let Some(value) = self.text { sink.field(58, value.as_bytes()); }
             if let Some(value) = self.encoded_text { sink.data(354, 355, value); }
             Ok(())
@@ -1366,6 +1920,8 @@ pub mod writers {
         pub next_expected_msg_seq_num: ::core::option::Option<u64>,
         /// MaxMessageSize (tag 383).
         pub max_message_size: ::core::option::Option<u64>,
+        /// NoMsgTypes (tag 384) repeating group: one item per entry. Empty when absent.
+        pub no_msg_types: &'v [LogonNoMsgTypesFields<'v>],
         /// TestMessageIndicator (tag 464).
         pub test_message_indicator: ::core::option::Option<bool>,
         /// Username (tag 553).
@@ -1383,11 +1939,23 @@ pub mod writers {
         /// SessionStatus (tag 1409).
         pub session_status: ::core::option::Option<enums::SessionStatus<'v>>,
         /// DefaultApplVerID (tag 1137). Required.
-        pub default_appl_ver_id: ::core::option::Option<&'v str>,
+        pub default_appl_ver_id: ::core::option::Option<enums::DefaultApplVerID<'v>>,
         /// DefaultApplExtID (tag 1407).
         pub default_appl_ext_id: ::core::option::Option<i64>,
         /// DefaultCstmApplVerID (tag 1408).
         pub default_cstm_appl_ver_id: ::core::option::Option<&'v str>,
+        /// FIXEngineName (tag 1600).
+        pub fixengine_name: ::core::option::Option<&'v str>,
+        /// FIXEngineVersion (tag 1601).
+        pub fixengine_version: ::core::option::Option<&'v str>,
+        /// FIXEngineVendor (tag 1602).
+        pub fixengine_vendor: ::core::option::Option<&'v str>,
+        /// ApplicationSystemName (tag 1603).
+        pub application_system_name: ::core::option::Option<&'v str>,
+        /// ApplicationSystemVersion (tag 1604).
+        pub application_system_version: ::core::option::Option<&'v str>,
+        /// ApplicationSystemVendor (tag 1605).
+        pub application_system_vendor: ::core::option::Option<&'v str>,
         /// Text (tag 58).
         pub text: ::core::option::Option<&'v str>,
         /// EncodedText (tag 355). Written with its length (tag 354), which is derived from it.
@@ -1425,6 +1993,9 @@ pub mod writers {
             check_data(self.raw_data, 96)?;
             check_number(self.next_expected_msg_seq_num, FieldType::SeqNum, 789)?;
             check_number(self.max_message_size, FieldType::Length, 383)?;
+            for entry in self.no_msg_types {
+                entry.check()?;
+            }
             check_text(self.username.map(str::as_bytes), 553)?;
             check_grammar(self.username.map(str::as_bytes), FieldType::String, 553)?;
             check_text(self.password.map(str::as_bytes), 554)?;
@@ -1436,10 +2007,22 @@ pub mod writers {
             check_text(self.session_status.map(|value| value.as_bytes()), 1409)?;
             check_grammar(self.session_status.map(|value| value.as_bytes()), FieldType::Int, 1409)?;
             present(self.default_appl_ver_id.is_some(), 1137)?;
-            check_text(self.default_appl_ver_id.map(str::as_bytes), 1137)?;
-            check_grammar(self.default_appl_ver_id.map(str::as_bytes), FieldType::String, 1137)?;
+            check_text(self.default_appl_ver_id.map(|value| value.as_bytes()), 1137)?;
+            check_grammar(self.default_appl_ver_id.map(|value| value.as_bytes()), FieldType::String, 1137)?;
             check_text(self.default_cstm_appl_ver_id.map(str::as_bytes), 1408)?;
             check_grammar(self.default_cstm_appl_ver_id.map(str::as_bytes), FieldType::String, 1408)?;
+            check_text(self.fixengine_name.map(str::as_bytes), 1600)?;
+            check_grammar(self.fixengine_name.map(str::as_bytes), FieldType::String, 1600)?;
+            check_text(self.fixengine_version.map(str::as_bytes), 1601)?;
+            check_grammar(self.fixengine_version.map(str::as_bytes), FieldType::String, 1601)?;
+            check_text(self.fixengine_vendor.map(str::as_bytes), 1602)?;
+            check_grammar(self.fixengine_vendor.map(str::as_bytes), FieldType::String, 1602)?;
+            check_text(self.application_system_name.map(str::as_bytes), 1603)?;
+            check_grammar(self.application_system_name.map(str::as_bytes), FieldType::String, 1603)?;
+            check_text(self.application_system_version.map(str::as_bytes), 1604)?;
+            check_grammar(self.application_system_version.map(str::as_bytes), FieldType::String, 1604)?;
+            check_text(self.application_system_vendor.map(str::as_bytes), 1605)?;
+            check_grammar(self.application_system_vendor.map(str::as_bytes), FieldType::String, 1605)?;
             check_text(self.text.map(str::as_bytes), 58)?;
             check_grammar(self.text.map(str::as_bytes), FieldType::String, 58)?;
             check_data(self.encoded_text, 355)?;
@@ -1454,6 +2037,12 @@ pub mod writers {
             if let Some(value) = self.reset_seq_num_flag { sink.field(141, if value { b"Y" } else { b"N" }); }
             if let Some(value) = self.next_expected_msg_seq_num { put_display(sink, 789, value)?; }
             if let Some(value) = self.max_message_size { put_display(sink, 383, value)?; }
+            if !self.no_msg_types.is_empty() {
+                put_display(sink, 384, self.no_msg_types.len())?;
+                for entry in self.no_msg_types {
+                    entry.emit(sink)?;
+                }
+            }
             if let Some(value) = self.test_message_indicator { sink.field(464, if value { b"Y" } else { b"N" }); }
             if let Some(value) = self.username { sink.field(553, value.as_bytes()); }
             if let Some(value) = self.password { sink.field(554, value.as_bytes()); }
@@ -1465,6 +2054,12 @@ pub mod writers {
             if let Some(value) = self.default_appl_ver_id { sink.field(1137, value.as_bytes()); }
             if let Some(value) = self.default_appl_ext_id { put_display(sink, 1407, value)?; }
             if let Some(value) = self.default_cstm_appl_ver_id { sink.field(1408, value.as_bytes()); }
+            if let Some(value) = self.fixengine_name { sink.field(1600, value.as_bytes()); }
+            if let Some(value) = self.fixengine_version { sink.field(1601, value.as_bytes()); }
+            if let Some(value) = self.fixengine_vendor { sink.field(1602, value.as_bytes()); }
+            if let Some(value) = self.application_system_name { sink.field(1603, value.as_bytes()); }
+            if let Some(value) = self.application_system_version { sink.field(1604, value.as_bytes()); }
+            if let Some(value) = self.application_system_vendor { sink.field(1605, value.as_bytes()); }
             if let Some(value) = self.text { sink.field(58, value.as_bytes()); }
             if let Some(value) = self.encoded_text { sink.data(354, 355, value); }
             Ok(())
@@ -1473,15 +2068,18 @@ pub mod writers {
 
     /// Body of a XMLnonFIX message (MsgType=n), to write.
     #[derive(Clone, Copy, Default)]
-    pub struct XMLnonFIXFields {}
+    pub struct XMLnonFIXFields<'v> {
+        /// NoAttachments (tag 2104) repeating group: one item per entry. Empty when absent.
+        pub no_attachments: &'v [XMLnonFIXNoAttachmentsFields<'v>],
+    }
 
-    impl ::core::fmt::Debug for XMLnonFIXFields {
+    impl ::core::fmt::Debug for XMLnonFIXFields<'_> {
         fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
             f.debug_struct("XMLnonFIXFields").finish_non_exhaustive()
         }
     }
 
-    impl XMLnonFIXFields {
+    impl XMLnonFIXFields<'_> {
         /// Writes the body to `sink`, one call per field, in XML order: a repeating group
         /// as its count, then each entry with its delimiter first and its other members in XML order.
         ///
@@ -1492,7 +2090,174 @@ pub mod writers {
         /// `char`, an enumeration of a `char` field, a `MultipleCharValue` token) that is not printable
         /// ASCII, or a multi-value token that is empty or carries a space. All are
         /// checked before anything is written.
-        pub fn write<S: Sink + ?::core::marker::Sized>(&self, _sink: &mut S) -> ::core::result::Result<(), EncodeError> {
+        pub fn write<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
+            self.check()?;
+            self.emit(sink)
+        }
+
+        /// Checks required fields, groups and entries before anything is written.
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
+            for entry in self.no_attachments {
+                entry.check()?;
+            }
+            Ok(())
+        }
+
+        /// Writes the fields, in XML order (an entry: its delimiter first).
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
+            if !self.no_attachments.is_empty() {
+                put_display(sink, 2104, self.no_attachments.len())?;
+                for entry in self.no_attachments {
+                    entry.emit(sink)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// One entry of the NoMsgTypes (tag 384) repeating group of the Logon message, to write.
+    #[derive(Clone, Copy, Default)]
+    pub struct LogonNoMsgTypesFields<'v> {
+        /// RefMsgType (tag 372). Required.
+        pub ref_msg_type: ::core::option::Option<enums::RefMsgType<'v>>,
+        /// MsgDirection (tag 385).
+        pub msg_direction: ::core::option::Option<enums::MsgDirection<'v>>,
+        /// RefApplVerID (tag 1130).
+        pub ref_appl_ver_id: ::core::option::Option<enums::RefApplVerID<'v>>,
+        /// RefApplExtID (tag 1406).
+        pub ref_appl_ext_id: ::core::option::Option<i64>,
+        /// RefCstmApplVerID (tag 1131).
+        pub ref_cstm_appl_ver_id: ::core::option::Option<&'v str>,
+        /// DefaultVerIndicator (tag 1410).
+        pub default_ver_indicator: ::core::option::Option<bool>,
+    }
+
+    impl ::core::fmt::Debug for LogonNoMsgTypesFields<'_> {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            f.debug_struct("LogonNoMsgTypesFields").finish_non_exhaustive()
+        }
+    }
+
+    impl LogonNoMsgTypesFields<'_> {
+        /// Checks required fields, groups and entries before anything is written.
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
+            present(self.ref_msg_type.is_some(), 372)?;
+            check_text(self.ref_msg_type.map(|value| value.as_bytes()), 372)?;
+            check_grammar(self.ref_msg_type.map(|value| value.as_bytes()), FieldType::String, 372)?;
+            check_text(self.msg_direction.map(|value| value.as_bytes()), 385)?;
+            check_grammar(self.msg_direction.map(|value| value.as_bytes()), FieldType::Char, 385)?;
+            check_ascii(self.msg_direction.map(|value| value.as_bytes()), 385)?;
+            check_text(self.ref_appl_ver_id.map(|value| value.as_bytes()), 1130)?;
+            check_grammar(self.ref_appl_ver_id.map(|value| value.as_bytes()), FieldType::String, 1130)?;
+            check_text(self.ref_cstm_appl_ver_id.map(str::as_bytes), 1131)?;
+            check_grammar(self.ref_cstm_appl_ver_id.map(str::as_bytes), FieldType::String, 1131)?;
+            Ok(())
+        }
+
+        /// Writes the fields, in XML order (an entry: its delimiter first).
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
+            if let Some(value) = self.ref_msg_type { sink.field(372, value.as_bytes()); }
+            if let Some(value) = self.msg_direction { sink.field(385, value.as_bytes()); }
+            if let Some(value) = self.ref_appl_ver_id { sink.field(1130, value.as_bytes()); }
+            if let Some(value) = self.ref_appl_ext_id { put_display(sink, 1406, value)?; }
+            if let Some(value) = self.ref_cstm_appl_ver_id { sink.field(1131, value.as_bytes()); }
+            if let Some(value) = self.default_ver_indicator { sink.field(1410, if value { b"Y" } else { b"N" }); }
+            Ok(())
+        }
+    }
+
+    /// One entry of the NoAttachments (tag 2104) repeating group of the XMLnonFIX message, to write.
+    #[derive(Clone, Copy, Default)]
+    pub struct XMLnonFIXNoAttachmentsFields<'v> {
+        /// AttachmentName (tag 2105). Required.
+        pub attachment_name: ::core::option::Option<&'v str>,
+        /// AttachmentMediaType (tag 2106).
+        pub attachment_media_type: ::core::option::Option<&'v str>,
+        /// AttachmentClassification (tag 2107).
+        pub attachment_classification: ::core::option::Option<&'v str>,
+        /// AttachmentExternalURL (tag 2108).
+        pub attachment_external_url: ::core::option::Option<&'v str>,
+        /// AttachmentEncodingType (tag 2109).
+        pub attachment_encoding_type: ::core::option::Option<enums::AttachmentEncodingType<'v>>,
+        /// UnencodedAttachmentLen (tag 2110).
+        pub unencoded_attachment_len: ::core::option::Option<i64>,
+        /// EncodedAttachment (tag 2112). Written with its length (tag 2111), which is derived from it.
+        pub encoded_attachment: ::core::option::Option<&'v [u8]>,
+        /// NoAttachmentKeywords (tag 2113) repeating group: one item per entry. Empty when absent.
+        pub no_attachment_keywords: &'v [XMLnonFIXNoAttachmentsNoAttachmentKeywordsFields<'v>],
+    }
+
+    impl ::core::fmt::Debug for XMLnonFIXNoAttachmentsFields<'_> {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            f.debug_struct("XMLnonFIXNoAttachmentsFields").finish_non_exhaustive()
+        }
+    }
+
+    impl XMLnonFIXNoAttachmentsFields<'_> {
+        /// Checks required fields, groups and entries before anything is written.
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
+            present(self.attachment_name.is_some(), 2105)?;
+            check_text(self.attachment_name.map(str::as_bytes), 2105)?;
+            check_grammar(self.attachment_name.map(str::as_bytes), FieldType::String, 2105)?;
+            check_text(self.attachment_media_type.map(str::as_bytes), 2106)?;
+            check_grammar(self.attachment_media_type.map(str::as_bytes), FieldType::String, 2106)?;
+            check_text(self.attachment_classification.map(str::as_bytes), 2107)?;
+            check_grammar(self.attachment_classification.map(str::as_bytes), FieldType::String, 2107)?;
+            check_text(self.attachment_external_url.map(str::as_bytes), 2108)?;
+            check_grammar(self.attachment_external_url.map(str::as_bytes), FieldType::String, 2108)?;
+            check_text(self.attachment_encoding_type.map(|value| value.as_bytes()), 2109)?;
+            check_grammar(self.attachment_encoding_type.map(|value| value.as_bytes()), FieldType::Int, 2109)?;
+            check_data(self.encoded_attachment, 2112)?;
+            for entry in self.no_attachment_keywords {
+                entry.check()?;
+            }
+            Ok(())
+        }
+
+        /// Writes the fields, in XML order (an entry: its delimiter first).
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
+            if let Some(value) = self.attachment_name { sink.field(2105, value.as_bytes()); }
+            if let Some(value) = self.attachment_media_type { sink.field(2106, value.as_bytes()); }
+            if let Some(value) = self.attachment_classification { sink.field(2107, value.as_bytes()); }
+            if let Some(value) = self.attachment_external_url { sink.field(2108, value.as_bytes()); }
+            if let Some(value) = self.attachment_encoding_type { sink.field(2109, value.as_bytes()); }
+            if let Some(value) = self.unencoded_attachment_len { put_display(sink, 2110, value)?; }
+            if let Some(value) = self.encoded_attachment { sink.data(2111, 2112, value); }
+            if !self.no_attachment_keywords.is_empty() {
+                put_display(sink, 2113, self.no_attachment_keywords.len())?;
+                for entry in self.no_attachment_keywords {
+                    entry.emit(sink)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// One entry of the NoAttachmentKeywords (tag 2113) repeating group of an entry of the NoAttachments group, to write.
+    #[derive(Clone, Copy, Default)]
+    pub struct XMLnonFIXNoAttachmentsNoAttachmentKeywordsFields<'v> {
+        /// AttachmentKeyword (tag 2114). Required.
+        pub attachment_keyword: ::core::option::Option<&'v str>,
+    }
+
+    impl ::core::fmt::Debug for XMLnonFIXNoAttachmentsNoAttachmentKeywordsFields<'_> {
+        fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+            f.debug_struct("XMLnonFIXNoAttachmentsNoAttachmentKeywordsFields").finish_non_exhaustive()
+        }
+    }
+
+    impl XMLnonFIXNoAttachmentsNoAttachmentKeywordsFields<'_> {
+        /// Checks required fields, groups and entries before anything is written.
+        fn check(&self) -> ::core::result::Result<(), EncodeError> {
+            present(self.attachment_keyword.is_some(), 2114)?;
+            check_text(self.attachment_keyword.map(str::as_bytes), 2114)?;
+            check_grammar(self.attachment_keyword.map(str::as_bytes), FieldType::String, 2114)?;
+            Ok(())
+        }
+
+        /// Writes the fields, in XML order (an entry: its delimiter first).
+        fn emit<S: Sink + ?::core::marker::Sized>(&self, sink: &mut S) -> ::core::result::Result<(), EncodeError> {
+            if let Some(value) = self.attachment_keyword { sink.field(2114, value.as_bytes()); }
             Ok(())
         }
     }

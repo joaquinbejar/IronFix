@@ -10,11 +10,11 @@
 //! session-level header, trailer and admin messages are FIXT.1.1, and the
 //! application messages are any application version FIXT.1.1 can carry (FIX
 //! 4.0 through 4.4, ApplVerID `2` to `6`, as well as FIX 5.0, 5.0 SP1 and 5.0
-//! SP2, ApplVerID `7` to `9`). QuickFIX ships this as two dictionaries: a
-//! *transport* dictionary (`FIXT11.xml`: the standard header and trailer plus
+//! SP2, ApplVerID `7` to `9`). That is two dictionaries: a *transport*
+//! dictionary ([`Dictionary::fixt11`]: the standard header and trailer plus
 //! the admin messages) and an *application* dictionary (for example
-//! `FIX50SP2.xml`: the application messages, with an empty header and
-//! trailer). [`SessionDictionary`] pairs them, and
+//! [`Dictionary::fix50sp2`], whose own header, trailer and session messages
+//! the pair does not use). [`SessionDictionary`] pairs them, and
 //! [`Validator::for_session`](crate::Validator::for_session) validates a
 //! message against the pair with QuickFIX-like semantics:
 //!
@@ -30,17 +30,13 @@
 //! dictionary answers a given message is the caller's decision, made when the
 //! pair is built.
 //!
-//! # Upstream deviation in the embedded FIXT 1.1 dictionary
+//! # Enumerations both sides define
 //!
-//! FIXT 1.1 defines the Logon `MsgTypeGrp` component as the `NoMsgTypes(384)`
-//! repeating group (`RefMsgType(372)`, `MsgDirection(385)`,
-//! `RefApplVerID(1130)`, `RefApplExtID(1406)`, `RefCstmApplVerID(1131)`,
-//! `DefaultVerIndicator(1410)`). The QuickFIX `FIXT11.xml` vendored as
-//! [`Dictionary::fixt11`] defines `MsgTypeGrp` with no members and does not
-//! define tags 384 and 385 at all, so a Logon carrying the group is reported
-//! as invalid. The file stays unpatched. To accept the group, load a FIXT 1.1
-//! dictionary that defines it with
-//! [`Dictionary::from_quickfix_xml`] and compose that instead.
+//! A field both dictionaries enumerate admits the values of either. The
+//! embedded FIXT 1.1 dictionary lists only the session message types for
+//! `MsgType(35)` and `RefMsgType(372)`, as the FIX Orchestra FIXT
+//! repository does; composed, the application's message types are valid
+//! too.
 
 use crate::loader::DictionaryError;
 use crate::schema::{Dictionary, Version};
@@ -53,9 +49,10 @@ use crate::schema::{Dictionary, Version};
 /// as two references. Validate messages against it with
 /// [`Validator::for_session`](crate::Validator::for_session).
 ///
-/// The embedded FIXT 1.1 transport ([`Dictionary::fixt11`]) does not define
-/// the Logon `NoMsgTypes(384)` group, an upstream QuickFIX deviation described
-/// in the [module docs](crate::composition).
+/// The embedded FIXT 1.1 transport ([`Dictionary::fixt11`]) enumerates only
+/// the session message types for `MsgType(35)` and `RefMsgType(372)`; see the
+/// [module docs](crate::composition) for how the pair admits the
+/// application's.
 ///
 /// # Examples
 ///

@@ -15,14 +15,15 @@
 //!
 //! # What is tested
 //!
-//! The loader is exercised against four of the FIX Trading Community's
-//! repositories, vendored as test fixtures: `OrchestraFIX42.xml` (FIX 4.2 as
-//! of Extension Pack 310), `OrchestraFIX44.xml` (FIX 4.4 as of Extension Pack
-//! 311), `FIXTSession.xml` (the FIXT session layer) and
+//! The loader is exercised against the four FIX Trading Community
+//! repositories the crate embeds (`spec/orchestra`): `OrchestraFIX42.xml`
+//! (FIX 4.2 as of Extension Pack 310), `OrchestraFIX44.xml` (FIX 4.4 as of
+//! Extension Pack 311), `FIXTSession.xml` (the FIXT session layer) and
 //! `OrchestraFIXLatest.xml` (FIX Latest as of Extension Pack 312, read as FIX
 //! 5.0 SP2 by [`Dictionary::from_orchestra_latest_xml`]). Each result is
-//! compared with the embedded QuickFIX dictionary of its version, and every
-//! difference is listed in `doc/orchestra_differences.md`.
+//! compared with the QuickFIX dictionary of its version the crate embedded
+//! up to 0.5 (a test fixture now), and every difference is listed in
+//! `doc/orchestra_differences.md`.
 //! The loader is also exercised against synthetic documents. No other
 //! version's standard repository is exercised.
 //!

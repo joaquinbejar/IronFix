@@ -427,7 +427,7 @@ pub(crate) struct MalformedReject {
 /// session-level Reject it gets.
 ///
 /// Only codes FIX 4.2 already defines are used (0, 4, 6 and 11; FIX 4.2
-/// defines 0 to 11, `ironfix-dictionary/spec/FIX42.xml`), so the mapping is
+/// defines 0 to 11, `ironfix-dictionary/spec/orchestra/OrchestraFIX42.xml`), so the mapping is
 /// the same on every version that carries 373. FIX 4.0 and FIX 4.1 have no
 /// 373 and get `RefSeqNum` and the `Text` alone
 /// ([`MessageFactory::session_reject`]).
@@ -1212,7 +1212,7 @@ impl MessageFactory {
 
     /// Builds a BusinessMessageReject (35=j): `RefSeqNum` (45), `RefMsgType`
     /// (372), `BusinessRejectReason` (380) and `Text` (58), the layout FIX
-    /// 4.2 and FIX 4.4 define (`spec/FIX42.xml`, `spec/FIX44.xml`).
+    /// 4.2 and FIX 4.4 define (`spec/orchestra/OrchestraFIX42.xml`, `spec/orchestra/OrchestraFIX44.xml`).
     #[must_use]
     pub(crate) fn business_message_reject(
         &self,
@@ -1283,7 +1283,7 @@ impl MessageFactory {
 ///
 /// FIX 4.4 and later (FIXT.1.1 included) define every code a defect maps to.
 /// FIX 4.3 has 13, 15 and 16 but not 99 (*Other*, added in FIX 4.4), and FIX
-/// 4.2 defines 0 to 11 only (`spec/FIX42.xml`). Where the version has no
+/// 4.2 defines 0 to 11 only (`spec/orchestra/OrchestraFIX42.xml`). Where the version has no
 /// code, the Reject goes out without 373, and `RefTagID` (371) and `Text`
 /// (58) name the problem. FIX 4.0 and 4.1 carry no 373 at all, which
 /// [`MessageFactory`] already enforces; `None` is returned for them too.

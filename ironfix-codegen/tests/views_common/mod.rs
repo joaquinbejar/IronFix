@@ -316,18 +316,29 @@ pub fn views_sample_dictionary() -> Dictionary {
     dict
 }
 
-/// The embedded FIX 4.4 dictionary with only Heartbeat (0), Logon (A) and
-/// NewOrderSingle (D) kept.
+/// The QuickFIX FIX 4.4 dictionary, an `ironfix-dictionary` test fixture
+/// (`tests/fixtures/quickfix/FIX44.xml`, not published), with only
+/// Heartbeat (0), Logon (A) and NewOrderSingle (D) kept. Its components
+/// (Parties, PreAllocGrp, ...) exercise the component paths of the views.
 #[track_caller]
 #[must_use]
 pub fn fix44_order_dictionary() -> Dictionary {
-    let mut dict = match Dictionary::fix44() {
-        Ok(dict) => dict.clone(),
-        Err(err) => panic!("the embedded FIX 4.4 dictionary must load: {err}"),
-    };
+    let mut dict = quickfix_fix44();
     dict.messages
         .retain(|msg_type, _| matches!(msg_type.as_str(), "0" | "A" | "D"));
     dict
+}
+
+/// The QuickFIX FIX 4.4 test fixture of `ironfix-dictionary`.
+#[track_caller]
+#[must_use]
+pub fn quickfix_fix44() -> Dictionary {
+    match Dictionary::from_quickfix_xml(include_str!(
+        "../../../ironfix-dictionary/tests/fixtures/quickfix/FIX44.xml"
+    )) {
+        Ok(dict) => dict,
+        Err(err) => panic!("the QuickFIX FIX 4.4 fixture must load: {err}"),
+    }
 }
 
 /// Generates views from `dict`, failing the test on a generator error.

@@ -51,7 +51,7 @@ pub mod fields {
     pub const HANDL_INST: u32 = 21;
     /// IDSource (tag 22).
     pub const IDSOURCE: u32 = 22;
-    /// IOIid (tag 23).
+    /// IOIID (tag 23).
     pub const IOIID: u32 = 23;
     /// IOIOthSvc (tag 24).
     pub const IOIOTH_SVC: u32 = 24;
@@ -517,8 +517,8 @@ pub mod fields {
     pub const NO_QUOTE_ENTRIES: u32 = 295;
     /// NoQuoteSets (tag 296).
     pub const NO_QUOTE_SETS: u32 = 296;
-    /// QuoteStatus (tag 297).
-    pub const QUOTE_STATUS: u32 = 297;
+    /// QuoteAckStatus (tag 297).
+    pub const QUOTE_ACK_STATUS: u32 = 297;
     /// QuoteCancelType (tag 298).
     pub const QUOTE_CANCEL_TYPE: u32 = 298;
     /// QuoteEntryID (tag 299).
@@ -577,8 +577,8 @@ pub mod fields {
     pub const UNSOLICITED_INDICATOR: u32 = 325;
     /// SecurityTradingStatus (tag 326).
     pub const SECURITY_TRADING_STATUS: u32 = 326;
-    /// HaltReasonChar (tag 327).
-    pub const HALT_REASON_CHAR: u32 = 327;
+    /// HaltReason (tag 327).
+    pub const HALT_REASON: u32 = 327;
     /// InViewOfCommon (tag 328).
     pub const IN_VIEW_OF_COMMON: u32 = 328;
     /// DueToRelated (tag 329).
@@ -888,7 +888,7 @@ pub mod messages {
     /// IOI message (MsgType=6).
     #[derive(Debug, Clone)]
     pub struct IOI {
-        /// IOIid (tag 23).
+        /// IOIID (tag 23).
         pub ioiid: ::std::string::String,
         /// IOITransType (tag 28).
         pub ioitrans_type: char,
@@ -1597,7 +1597,7 @@ pub mod messages {
         pub compliance_id: ::core::option::Option<::std::string::String>,
         /// SolicitedFlag (tag 377).
         pub solicited_flag: ::core::option::Option<bool>,
-        /// IOIid (tag 23).
+        /// IOIID (tag 23).
         pub ioiid: ::core::option::Option<::std::string::String>,
         /// QuoteID (tag 117).
         pub quote_id: ::core::option::Option<::std::string::String>,
@@ -1795,7 +1795,7 @@ pub mod messages {
         pub compliance_id: ::core::option::Option<::std::string::String>,
         /// SolicitedFlag (tag 377).
         pub solicited_flag: ::core::option::Option<bool>,
-        /// IOIid (tag 23).
+        /// IOIID (tag 23).
         pub ioiid: ::core::option::Option<::std::string::String>,
         /// QuoteID (tag 117).
         pub quote_id: ::core::option::Option<::std::string::String>,
@@ -2442,9 +2442,9 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
-    /// AllocationInstructionAck message (MsgType=P).
+    /// AllocationAck message (MsgType=P).
     #[derive(Debug, Clone)]
-    pub struct AllocationInstructionAck {
+    pub struct AllocationAck {
         /// ClientID (tag 109).
         pub client_id: ::core::option::Option<::std::string::String>,
         /// ExecBroker (tag 76).
@@ -3214,8 +3214,8 @@ pub mod messages {
         pub quote_req_id: ::core::option::Option<::std::string::String>,
         /// QuoteID (tag 117).
         pub quote_id: ::core::option::Option<::std::string::String>,
-        /// QuoteStatus (tag 297).
-        pub quote_status: i64,
+        /// QuoteAckStatus (tag 297).
+        pub quote_ack_status: i64,
         /// QuoteRejectReason (tag 300).
         pub quote_reject_reason: ::core::option::Option<i64>,
         /// QuoteResponseLevel (tag 301).
@@ -3650,8 +3650,8 @@ pub mod messages {
         pub financial_status: ::core::option::Option<char>,
         /// CorporateAction (tag 292).
         pub corporate_action: ::core::option::Option<char>,
-        /// HaltReasonChar (tag 327).
-        pub halt_reason_char: ::core::option::Option<char>,
+        /// HaltReason (tag 327).
+        pub halt_reason: ::core::option::Option<char>,
         /// InViewOfCommon (tag 328).
         pub in_view_of_common: ::core::option::Option<bool>,
         /// DueToRelated (tag 329).
@@ -3794,7 +3794,7 @@ pub mod messages {
     #[derive(Debug, Clone)]
     pub struct MassQuoteNoQuoteSetsNoQuoteEntriesEntry {
         /// QuoteEntryID (tag 299).
-        pub quote_entry_id: ::std::string::String,
+        pub quote_entry_id: ::core::option::Option<::std::string::String>,
         /// Symbol (tag 55).
         pub symbol: ::core::option::Option<::std::string::String>,
         /// SymbolSfx (tag 65).

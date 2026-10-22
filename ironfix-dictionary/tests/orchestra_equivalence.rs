@@ -4,9 +4,9 @@
    Date: 22/10/26
 ******************************************************************************/
 
-//! Compares every Orchestra repository vendored under `fixtures/orchestra`
-//! (see its README for provenance) with the embedded QuickFIX dictionary of
-//! the same version: FIX 4.2, FIX 4.4, FIXT 1.1 and FIX 5.0 SP2 (derived from
+//! Compares every Orchestra repository embedded under `spec/orchestra` (see
+//! its README for provenance) with the QuickFIX dictionary of the same
+//! version, kept as a test fixture under `fixtures/quickfix`: FIX 4.2, FIX 4.4, FIXT 1.1 and FIX 5.0 SP2 (derived from
 //! the FIX Latest repository with `Dictionary::from_orchestra_latest_xml`).
 //!
 //! The diff covers fields (tag, name, type, enumeration values), messages
@@ -31,10 +31,15 @@ use ironfix_tagvalue::Decoder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
-const ORCHESTRA_FIX42: &str = include_str!("fixtures/orchestra/OrchestraFIX42.xml");
-const ORCHESTRA_FIX44: &str = include_str!("fixtures/orchestra/OrchestraFIX44.xml");
-const ORCHESTRA_FIXT: &str = include_str!("fixtures/orchestra/FIXTSession.xml");
-const ORCHESTRA_FIX_LATEST: &str = include_str!("fixtures/orchestra/OrchestraFIXLatest.xml");
+const ORCHESTRA_FIX42: &str = include_str!("../spec/orchestra/OrchestraFIX42.xml");
+const ORCHESTRA_FIX44: &str = include_str!("../spec/orchestra/OrchestraFIX44.xml");
+const ORCHESTRA_FIXT: &str = include_str!("../spec/orchestra/FIXTSession.xml");
+const ORCHESTRA_FIX_LATEST: &str = include_str!("../spec/orchestra/OrchestraFIXLatest.xml");
+
+const QUICKFIX_FIX42: &str = include_str!("fixtures/quickfix/FIX42.xml");
+const QUICKFIX_FIX44: &str = include_str!("fixtures/quickfix/FIX44.xml");
+const QUICKFIX_FIXT11: &str = include_str!("fixtures/quickfix/FIXT11.xml");
+const QUICKFIX_FIX50SP2: &str = include_str!("fixtures/quickfix/FIX50SP2.xml");
 
 const ALLOWED_FIX42: &str = include_str!("orchestra_equivalence/fix42.txt");
 const ALLOWED_FIX44: &str = include_str!("orchestra_equivalence/fix44.txt");
@@ -377,6 +382,14 @@ fn allowed(allowlist: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Loads a QuickFIX test fixture (`fixtures/quickfix`, see its README).
+fn quickfix(xml: &str) -> Dictionary {
+    ok(
+        Dictionary::from_quickfix_xml(xml),
+        "the QuickFIX fixture loads",
+    )
+}
+
 /// Loads `xml` with [`Dictionary::from_orchestra_xml`].
 fn load(xml: &str) -> OrchestraImport {
     ok(Dictionary::from_orchestra_xml(xml), "the repository loads")
@@ -425,7 +438,7 @@ fn check(import: &OrchestraImport, version: Version, quickfix: &Dictionary, allo
 
 #[test]
 fn test_orchestra_fix42_matches_quickfix_but_for_the_allowlist() {
-    let quickfix = ok(Dictionary::fix42(), "the embedded FIX 4.2 dictionary loads");
+    let quickfix = &quickfix(QUICKFIX_FIX42);
     check(
         &load(ORCHESTRA_FIX42),
         Version::Fix42,
@@ -436,7 +449,7 @@ fn test_orchestra_fix42_matches_quickfix_but_for_the_allowlist() {
 
 #[test]
 fn test_orchestra_fix44_matches_quickfix_but_for_the_allowlist() {
-    let quickfix = ok(Dictionary::fix44(), "the embedded FIX 4.4 dictionary loads");
+    let quickfix = &quickfix(QUICKFIX_FIX44);
     check(
         &load(ORCHESTRA_FIX44),
         Version::Fix44,
@@ -447,10 +460,7 @@ fn test_orchestra_fix44_matches_quickfix_but_for_the_allowlist() {
 
 #[test]
 fn test_orchestra_fixt_session_matches_quickfix_but_for_the_allowlist() {
-    let quickfix = ok(
-        Dictionary::fixt11(),
-        "the embedded FIXT 1.1 dictionary loads",
-    );
+    let quickfix = &quickfix(QUICKFIX_FIXT11);
     check(
         &load(ORCHESTRA_FIXT),
         Version::Fixt11,
@@ -461,10 +471,7 @@ fn test_orchestra_fixt_session_matches_quickfix_but_for_the_allowlist() {
 
 #[test]
 fn test_orchestra_fix50sp2_matches_quickfix_but_for_the_allowlist() {
-    let quickfix = ok(
-        Dictionary::fix50sp2(),
-        "the embedded FIX 5.0 SP2 dictionary loads",
-    );
+    let quickfix = &quickfix(QUICKFIX_FIX50SP2);
     check(
         &fix50sp2_from_latest(),
         Version::Fix50Sp2,
@@ -493,9 +500,7 @@ fn test_orchestra_fix44_types_its_int_code_sets_int() {
 fn test_fix50sp2_from_latest_holds_every_quickfix_message() {
     let import = fix50sp2_from_latest();
     let derived = import.dictionary();
-    let Ok(quickfix) = Dictionary::fix50sp2() else {
-        panic!("the embedded FIX 5.0 SP2 dictionary loads");
-    };
+    let quickfix = &quickfix(QUICKFIX_FIX50SP2);
     assert_eq!(quickfix.messages.len(), 156);
     // Every QuickFIX message, and the eight FIXT session messages FIX
     // Latest carries and QuickFIX keeps in FIXT11.xml.

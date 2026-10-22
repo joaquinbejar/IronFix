@@ -3204,10 +3204,12 @@ mod tests {
         assert!(fix44.contains("pub struct NewOrderSingleFields<'v> {"));
         assert!(fix44.contains("pub fn price(&self) -> ::core::result::Result<::core::option::Option<Decimal>, DecodeError> {"));
         assert!(fix44.contains("pub price: ::core::option::Option<Decimal>,"));
-        // One view per group definition: Parties is used by many messages.
+        // The embedded FIX 4.4 dictionary comes from FIX Orchestra, which
+        // holds Parties as a group referenced by each message rather than a
+        // shared component: each message has its own view of it.
         assert_eq!(
             fix44
-                .matches("pub struct PartiesNoPartyIDsView<'m, 'a> {")
+                .matches("pub struct NewOrderSingleNoPartyIDsView<'m, 'a> {")
                 .count(),
             1
         );

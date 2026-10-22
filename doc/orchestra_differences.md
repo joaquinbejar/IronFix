@@ -1,17 +1,20 @@
 # FIX Orchestra vs. QuickFIX: dictionary differences
 
-`ironfix-dictionary` embeds four QuickFIX XML dictionaries (FIX 4.2, FIX 4.4,
-FIXT 1.1, FIX 5.0 SP2). Issue #200 loads the FIX Trading Community's FIX
+Up to 0.5, `ironfix-dictionary` embedded four QuickFIX XML dictionaries (FIX
+4.2, FIX 4.4, FIXT 1.1, FIX 5.0 SP2); since #201 it embeds the FIX Orchestra
+repositories below instead, and the QuickFIX files are test fixtures only
+(`ironfix-dictionary/tests/fixtures/quickfix/`). Issue #200 loads the FIX Trading Community's FIX
 Orchestra repository for each of these versions with
 `Dictionary::from_orchestra_xml` (FIX 5.0 SP2 is derived from FIX Latest
 with `Dictionary::from_orchestra_latest_xml`) and diffs it against the embedded QuickFIX
-dictionary. This page records every difference the diff finds and how it is
+dictionary. This page records every difference, which is what a user of
+the embedded dictionaries observes on upgrading, the diff finds and how it is
 decided.
 
 **Policy: on a conflict, Orchestra wins.** Orchestra is the FIX Trading
 Community's own machine-readable standard; QuickFIX is a third party's
-rendering of it. When Orchestra becomes the embedded source (issue #201), the
-dictionary answers what the Orchestra repository says.
+rendering of it. The embedded dictionaries answer what the Orchestra
+repositories say.
 
 ## How the diff is made
 
@@ -40,20 +43,21 @@ longer occurs.
 
 ## Sources
 
-| Version | Orchestra repository (test fixture) | Loaded with | QuickFIX file |
+| Version | Orchestra repository (embedded, `spec/orchestra/`) | Loaded with | QuickFIX file |
 |---|---|---|---|
-| FIX 4.2 | `OrchestraFIX42.xml` (FIX 4.2 as of EP310) | `from_orchestra_xml` | `spec/FIX42.xml` |
-| FIX 4.4 | `OrchestraFIX44.xml` (FIX 4.4 as of EP311) | `from_orchestra_xml` | `spec/FIX44.xml` |
-| FIXT 1.1 | `FIXTSession.xml` (FIXT session layer, declares `FIX.5.0SP2_EP247`) | `from_orchestra_xml` | `spec/FIXT11.xml` |
-| FIX 5.0 SP2 | `OrchestraFIXLatest.xml` (FIX Latest as of EP312) | `from_orchestra_latest_xml(.., Version::Fix50Sp2)` | `spec/FIX50SP2.xml` |
+| FIX 4.2 | `OrchestraFIX42.xml` (FIX 4.2 as of EP310) | `from_orchestra_xml` | `tests/fixtures/quickfix/FIX42.xml` |
+| FIX 4.4 | `OrchestraFIX44.xml` (FIX 4.4 as of EP311) | `from_orchestra_xml` | `tests/fixtures/quickfix/FIX44.xml` |
+| FIXT 1.1 | `FIXTSession.xml` (FIXT session layer, declares `FIX.5.0SP2_EP247`) | `from_orchestra_xml` | `tests/fixtures/quickfix/FIXT11.xml` |
+| FIX 5.0 SP2 | `OrchestraFIXLatest.xml` (FIX Latest as of EP312) | `from_orchestra_latest_xml(.., Version::Fix50Sp2)` | `tests/fixtures/quickfix/FIX50SP2.xml` |
 
 All four were fetched from FIXTradingCommunity/orchestrations at commit
-`cd24169a`. The FIX Trading Community no longer publishes a FIX 5.0 SP2
+`cd24169a` and are embedded from `ironfix-dictionary/spec/orchestra/`; the
+QuickFIX files are under `ironfix-dictionary/tests/fixtures/quickfix/`. The FIX Trading Community no longer publishes a FIX 5.0 SP2
 repository (its last snapshot was replaced by FIX Latest in March 2020, and
 had no extension packs), so FIX 5.0 SP2 is derived from FIX Latest by
 pedigree: what was added at or before FIX 5.0 SP2 and not deprecated by
 then (see the `orchestra` module docs for the rule). See
-`ironfix-dictionary/tests/fixtures/orchestra/README.md` for provenance and
+`ironfix-dictionary/spec/orchestra/README.md` for provenance and
 checksums.
 
 ## Summary
@@ -112,7 +116,7 @@ QuickFIX keeps in `FIXT11.xml`. It holds 5887 fields against QuickFIX's
 | Class | Difference | Decision |
 |---|---|---|
 | Orchestra-only | Session messages `0` to `5`, `A`, `n`, the standard header and trailer, the groups `NoHops(627)` (header) and `NoMsgTypes(384)` (Logon) | Orchestra |
-| Orchestra-only | Code sets, or codes, for 1233 fields: QuickFIX enumerates 668 of its 6028 fields, Orchestra many more | Orchestra; **affects #201**, see below |
+| Orchestra-only | Code sets, or codes, for 1233 fields: QuickFIX enumerates 668 of its 6028 fields, Orchestra many more | Orchestra; a behaviour change, see below |
 | Orchestra-only | Required flags on 44 messages, mostly the flag of a block Orchestra holds as a required group (`Parties`, `PositionQty`, `MDFullGrp`, ...) where QuickFIX holds a required component around an optional group | Orchestra |
 | QuickFIX-only | 141 fields: 86 FIX Latest added after FIX 5.0 SP2 (extension packs 266 to 280, which QuickFIX's file includes) and 55 deprecated at or before FIX 5.0 SP2 (`Signature(89)` and its kin moved to FIXT 1.1, `RepurchaseTerm(226)`, ...), with the members of 121 messages and 22 components, the groups `NoUnderlyingLegs(1342)` and `NoUnderlyingLegSecurityAltID(1334)`, and the required flags on `W` (`779`) and `r` (`37`) | Orchestra: the pedigree places them outside FIX 5.0 SP2 |
 | QuickFIX-only | Codes for 34 fields, added after FIX 5.0 SP2 or deprecated by then | Orchestra |
@@ -120,9 +124,9 @@ QuickFIX keeps in `FIXT11.xml`. It holds 5887 fields against QuickFIX's
 
 No group delimiter, member order or field type differs.
 
-## Differences that matter for #201
+## Behaviour changes since 0.5
 
-When Orchestra replaces the embedded QuickFIX files, these differences change
+With Orchestra as the embedded source (#201), these differences change
 behaviour:
 
 1. **FIXT 1.1: `MsgType(35)` and `RefMsgType(372)` list only the session
@@ -150,5 +154,10 @@ behaviour:
    `297`, `P`, FIX 5.0 SP2 `1225`, `2412`, `2883`, `2884`):
    `Dictionary::get_field_by_name` and generated identifiers follow.
 
-Existing tests that pin QuickFIX content (for example `spec/README.md`'s
-`MsgTypeGrp` deviation and the tests built on it) will need updating in #201.
+7. **FIXT 1.1: the Logon `NoMsgTypes(384)` group is defined**, closing the
+   deviation the QuickFIX `FIXT11.xml` carried; `DefaultApplVerID(1137)` is
+   enumerated, so an unknown application version is `InvalidEnumValue`.
+8. **Generated code changes shape.** Orchestra holds blocks such as
+   `Parties` as groups, not components: `ironfix-codegen` emits one entry
+   type and one view per message (`NewOrderSingleNoPartyIDsEntry`) where it
+   emitted one shared component type (`Parties`, `PartiesNoPartyIDsEntry`).
