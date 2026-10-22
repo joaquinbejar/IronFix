@@ -40,6 +40,12 @@
 //!   header and trailer groups included) resolve against the transport
 //!   dictionary; every other tag resolves against the application
 //!   dictionary.
+//! - a field both dictionaries enumerate admits the values of either: the
+//!   union of the two enumerations. A FIXT.1.1 transport may list only the
+//!   session message types for `MsgType(35)` and `RefMsgType(372)` (the FIX
+//!   Orchestra FIXT repository does), and the application's message types
+//!   are still valid there. The field's type and form come from the
+//!   dictionary that answers the tag, as above.
 //!
 //! ## Differences from QuickFIX
 //!
@@ -447,6 +453,10 @@ pub enum ValidationError {
 struct TagResolver<'d, 's> {
     transport: &'d Dictionary,
     body: &'d Dictionary,
+    /// The application dictionary of a composed session; the same
+    /// dictionary as `transport` for a validator built with
+    /// [`Validator::new`].
+    application: &'d Dictionary,
     /// Sorted and unique.
     envelope: &'s [u32],
 }
@@ -460,6 +470,27 @@ impl<'d> TagResolver<'d, '_> {
         } else {
             self.body.get_field(tag)
         }
+    }
+
+    /// Whether `value` is in the enumeration of `tag` as the other side of
+    /// a composed session defines it: the application dictionary for a
+    /// field the transport answers, and the transport dictionary for one
+    /// the application answers. Under composition a field both sides
+    /// enumerate takes the union of the two enumerations, so a transport
+    /// that lists only the session message types for `MsgType(35)` still
+    /// admits the application's. Always `false` with a single dictionary.
+    fn other_side_admits(&self, tag: u32, answered: &FieldDef, value: &str) -> bool {
+        if std::ptr::eq(self.transport, self.application) {
+            return false;
+        }
+        let other = match self.transport.get_field(tag) {
+            Some(transport) if std::ptr::eq(transport, answered) => self.application,
+            _ => self.transport,
+        };
+        other
+            .get_field(tag)
+            .and_then(|def| def.values.as_ref())
+            .is_some_and(|values| values.contains_key(value))
     }
 }
 
@@ -621,6 +652,7 @@ impl<'d> Validator<'d> {
         let tags = TagResolver {
             transport: self.transport,
             body,
+            application: self.application,
             envelope: &envelope,
         };
 
@@ -1027,10 +1059,12 @@ fn check_value(
     // A multi-value field carries a space-separated list, and every
     // token has to be in the enumeration. The form check above already
     // guarantees the tokens are non-empty.
+    let admits =
+        |token: &str| values.contains_key(token) || tags.other_side_admits(field.tag, def, token);
     let valid = if def.field_type.is_multi_value() {
-        value.split(' ').all(|token| values.contains_key(token))
+        value.split(' ').all(admits)
     } else {
-        values.contains_key(value.as_ref())
+        admits(value.as_ref())
     };
     if !valid {
         errors.push(ValidationError::InvalidEnumValue {
