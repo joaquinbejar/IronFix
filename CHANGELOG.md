@@ -4,11 +4,17 @@ All notable changes to the IronFix workspace are recorded here. Versions
 follow [Semantic Versioning](https://semver.org/); while the workspace is at
 0.x, a change that breaks behaviour or the public API takes a minor bump.
 
+## Unreleased
+
+- Every published crate ships the MIT `LICENSE` file, and
+  `make check-licences` fails if a crate that declares MIT publishes none or
+  one that differs from the workspace `LICENSE`.
+
 ## 0.5.1 (2026-10-22)
 
-Breaking: a minor bump at 0.x. `cargo-semver-checks` against 0.5.0 finds no
-API break in any package; the bump is for the dictionary behaviour changes
-below.
+Released as a patch by owner decision. `cargo-semver-checks` against 0.5.0
+finds no API break in any package, but the embedded dictionaries change
+behaviour (below). Pin `=0.5.0` to keep the QuickFIX-based dictionaries.
 
 ### Changed: published licences are declared and checked (#202)
 
