@@ -45,7 +45,7 @@ These messages are required for establishing and maintaining FIX sessions.
 | 789 | NextExpectedMsgSeqNum | FIX.4.4 and FIXT.1.1 only: the next `MsgSeqNum` the sender expects to receive. Sent and honoured only with `SessionConfig::send_next_expected_msg_seq_num`; see "NextExpectedMsgSeqNum (789), both roles" below |
 | 553 | Username | Authentication username |
 | 554 | Password | Authentication password |
-| 384 | NoMsgTypes | FIXT.1.1 only: repeating group of supported message types (372, 385, 1130, 1406, 1131, 1410). The embedded QuickFIX `FIXT11.xml` does not define it; see "Dictionary side, standalone" below |
+| 384 | NoMsgTypes | FIXT.1.1 only: repeating group of supported message types (372, 385, 1130, 1406, 1131, 1410). The embedded FIXT 1.1 dictionary defines it |
 
 **Server Behavior**:
 1. Validate SenderCompID and TargetCompID (a server fronting several
@@ -1157,8 +1157,9 @@ specification says nothing about bounds or about how a kept message meets a
 | 18 | Invalid/Unsupported application version |
 | 99 | Other |
 
-Codes 12 to 18 are listed as the vendored FIXT.1.1 session dictionary
-(`ironfix-dictionary/spec/FIXT11.xml`, `SessionRejectReason` (373)) defines
+Codes 12 to 18 are listed as the embedded FIXT.1.1 session dictionary
+(`ironfix-dictionary/spec/orchestra/FIXTSession.xml`, `SessionRejectReason`
+(373)) defines
 them; a FIX 4.x dictionary defines a shorter list (FIX 4.4: 0 to 17 and 99).
 Code 18 belongs to the FIXT.1.1 session layer, which governs the Reject
 message on every FIXT.1.1 session whatever application version it carries, so
@@ -2096,7 +2097,7 @@ when the MsgType is valid, `SessionRejectReason` (373) and `RefTagID` (371):
 | Invalid MsgType (35) value | 11 | 35 |
 | Any other body decode failure | 6 | none |
 
-All four codes exist from FIX 4.2 on (`spec/FIX42.xml` defines 0 to 11), so
+All four codes exist from FIX 4.2 on (`spec/orchestra/OrchestraFIX42.xml` defines 0 to 11), so
 the mapping is the same on every version that carries 373. FIX 4.0 and FIX
 4.1 define the Reject as `RefSeqNum` (45) and `Text` (58) only, so on those
 sessions **every** Reject the engine sends, not only this one, omits 371,
@@ -2535,7 +2536,7 @@ and are refused as unknown. Both are reason 18.
 | Initiator, Logon ack | 1137, when present (required in strict mode, `require_ack_default_appl_ver_id`), once and naming an accepted version | Reject (18; 13 when repeated; 1 when missing in strict mode; `RefTagID` 1137) and Logout, filed when a store is attached; `EngineError::ApplVersion` |
 | Both roles, in session | 1128 on an application message, when present, in the standard header, once, naming an accepted version | Reject (18; 13 when repeated in the header; 14 when outside it; `RefTagID` 1128; `RefApplVerID` (1130) = the code, on an 18 for a code that names a version); the number is consumed and persisted, `from_app` is not called, the session stays up |
 
-1128 is a standard-header field (`FIXT11.xml`), so it is read positionally,
+1128 is a standard-header field (FIXT 1.1), so it is read positionally,
 as the CompIDs are: one in the header (the leading run of standard-header
 tags) is the message's version, and one after the header has ended is out of
 order (reason 14) whatever its value, so no 1128 that
@@ -2597,18 +2598,9 @@ Where it differs from QuickFIX:
 - **Group entries.** Required members are enforced in every entry of every
   present group, stricter than QuickFIX; see "Repeating groups in dictionary
   validation" under Error Handling.
-- **`DefaultApplVerID` (1137) values are not checked** by the `Validator`.
-  `FIXT11.xml` declares it as a STRING with no enumeration, so any value
-  passes. (The engine checks it on the Logon exchange; see above.)
-
-**Known upstream deviation.** FIXT 1.1 defines the Logon `MsgTypeGrp` component
-as the `NoMsgTypes` (384) group (`RefMsgType` 372, `MsgDirection` 385,
-`RefApplVerID` 1130, `RefApplExtID` 1406, `RefCstmApplVerID` 1131,
-`DefaultVerIndicator` 1410). The vendored QuickFIX `FIXT11.xml` defines
-`MsgTypeGrp` with no members and does not define 384 or 385, so a Logon carrying
-the group is reported as invalid against `Dictionary::fixt11()`. The file stays
-unpatched; to accept the group, load a FIXT 1.1 dictionary that defines it with
-`Dictionary::from_quickfix_xml` and compose that instead.
+- **`DefaultApplVerID` (1137) values are checked** by the `Validator`
+  against the enumeration of the embedded FIXT 1.1 dictionary. (The engine
+  also checks it on the Logon exchange; see above.)
 
 ---
 

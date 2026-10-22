@@ -338,10 +338,13 @@ TCP or any caller stream behind its optional `fixp` feature (#96).
 - **A typestate session FSM** and checked sequence arithmetic in
   `ironfix-session`.
 - **A QuickFIX XML dictionary loader** and a `Validator` in
-  `ironfix-dictionary`, with four QuickFIX dictionaries embedded verbatim:
+  `ironfix-dictionary`, with four dictionaries embedded from the FIX Trading
+  Community's FIX Orchestra repositories (Apache-2.0, vendored verbatim):
   FIX 4.2 (`Dictionary::fix42()`), FIX 4.4 (`Dictionary::fix44()`), the
-  FIXT 1.1 transport dictionary (`Dictionary::fixt11()`) and the FIX 5.0 SP2
-  application dictionary (`Dictionary::fix50sp2()`). `SessionDictionary`
+  FIXT 1.1 transport dictionary (`Dictionary::fixt11()`) and FIX 5.0 SP2
+  (`Dictionary::fix50sp2()`, derived from FIX Latest by pedigree). The crate
+  ships no QuickFIX file; the differences from the QuickFIX dictionaries it
+  embedded up to 0.5 are in `doc/orchestra_differences.md`. `SessionDictionary`
   composes FIXT 1.1 with an application dictionary of any version FIXT 1.1
   carries (FIX 4.0 through 5.0 SP2), and `Validator::for_session` validates
   against the pair with QuickFIX-like semantics: `BeginString` must be
@@ -365,9 +368,11 @@ TCP or any caller stream behind its optional `fixp` feature (#96).
   repository into the same `Dictionary` model and returns, next to it, an
   `OrchestraReport` of what the model cannot hold (other scenarios,
   conditional rules, forbidden or constant presence, value constraints,
-  workflow). It is tested against the FIX Trading Community's FIX 4.4
-  repository, compared with the embedded QuickFIX FIX 4.4 dictionary
-  (`doc/adr/0013-load-fix-orchestra-repositories.md`).
+  workflow). `Dictionary::from_orchestra_latest_xml` derives FIX 5.0 SP2
+  from a FIX Latest repository. Both are tested on the four embedded
+  repositories, each diffed against the QuickFIX dictionary of its version
+  (`doc/adr/0013-load-fix-orchestra-repositories.md`,
+  `doc/orchestra_differences.md`).
 - **A zero-copy repeating-group reader** in `ironfix-dictionary`. Build a
   `MessageLayout` once per message type from a dictionary (or describe the
   groups at compile time with `GroupSpec` / `GroupSet`), then read a decoded
@@ -500,9 +505,10 @@ around it.
   initiator session, no TLS, no throttle, no gap queue. No latency or
   throughput figure exists for it.
 - **Only four dictionaries are embedded**: FIX 4.2, FIX 4.4, FIXT 1.1 and
-  FIX 5.0 SP2 (`ironfix-dictionary/spec/`, vendored verbatim from QuickFIX).
-  FIX 4.0, 4.1, 4.3, 5.0 and 5.0 SP1 require
-  `Dictionary::from_quickfix_xml` with your own XML
+  FIX 5.0 SP2 (`ironfix-dictionary/spec/orchestra/`, FIX Orchestra
+  repositories vendored verbatim). FIX 4.0, 4.1, 4.3, 5.0 and 5.0 SP1
+  require `Dictionary::from_quickfix_xml` or `Dictionary::from_orchestra_xml`
+  with your own XML
   (`ironfix-dictionary/src/loader.rs`). `SessionDictionary` does not read
   `ApplVerID(1128)`: you choose the application dictionary when you build it.
   `Validator::new` does not check `BeginString`; only `Validator::for_session`
@@ -511,27 +517,19 @@ around it.
   with a policy other than `Off` (`ironfix-engine/src/validation.rs`). The
   validator is not chosen per `ApplVerID`, and administrative messages are
   not validated against a dictionary.
-- **The embedded FIXT 1.1 dictionary deviates from FIXT 1.1 on Logon.** The
-  vendored QuickFIX `FIXT11.xml` defines the `MsgTypeGrp` component with no
-  members and does not define `NoMsgTypes(384)` or `MsgDirection(385)`, so a
-  Logon carrying the `NoMsgTypes` group is reported as invalid. The file is
-  kept verbatim; to accept the group, load a FIXT 1.1 dictionary that defines
-  it with `Dictionary::from_quickfix_xml` and compose that
-  (`ironfix-dictionary/spec/README.md`).
-- **Orchestra loading is tested on FIX 4.4 only.** The only Orchestra
-  repository exercised is the FIX Trading Community's `OrchestraFIX44.xml`, a
-  test fixture that is not embedded or published. `FIX.Latest` repositories
-  are rejected (`DictionaryError::UnsupportedVersion`): FIX Latest names no
-  fixed FIX version. So is a repository named `FIXT` whose version is not
-  `FIXT.1.1`, which includes the FIX Trading Community's FIXT session
-  repository (it declares `FIX.5.0SP2_EP247`). Only the `base` scenario is
-  loaded.
+- **Orchestra loading is tested on the four embedded repositories only.**
+  `FIX.Latest` repositories are rejected by `Dictionary::from_orchestra_xml`
+  (`DictionaryError::UnsupportedVersion`): FIX Latest names no fixed FIX
+  version; `Dictionary::from_orchestra_latest_xml` reads one as FIX 5.0 SP2
+  only, keeping the latest form of each element it keeps. A repository named
+  `FIXT` must declare `FIXT.1.1` or be the FIXT session layer published
+  under a FIX 5.0 SP2 extension pack. Only the `base` scenario is loaded.
 - **Generated code has no consumer.** Nothing in the workspace uses the
   derives or `ironfix-codegen` output (data structs or views) at run time
   (`ironfix-codegen-check` only compiles generated code: the data structs
   of the four embedded dictionaries, the views of the embedded FIX 4.4,
   FIX 4.2 and FIXT 1.1 dictionaries, and both outputs for the FIX 4.4
-  Orchestra repository), so field
+  Orchestra repository, loaded directly), so field
   access on the session path is untyped tag lookup
   (`ironfix-codegen/src/lib.rs`). Generated views cover the message body
   only, and are generated from one dictionary: a FIXT.1.1 + FIX 5.0
@@ -584,17 +582,13 @@ dictionary, for a counterparty that carries FIX 4.x messages over FIXT 1.1
 | FIX 5.0 SP1 | `FIXT.1.1` | yes | transport only (FIXT 1.1); application no |
 | FIX 5.0 SP2 | `FIXT.1.1` | yes | **yes** (`Dictionary::fixt11()` + `Dictionary::fix50sp2()`) |
 
-The embedded dictionaries are the QuickFIX data dictionaries, redistributed
-under the QuickFIX Software License, Version 1.0
-(`ironfix-dictionary/spec/LICENSE-QUICKFIX`; provenance and checksums in
-`ironfix-dictionary/spec/README.md`). This product includes software developed
-by quickfixengine.org (<http://www.quickfixengine.org/>).
-
-The FIX 4.4 Orchestra repository the tests load is the FIX Trading
-Community's, under the Apache License, Version 2.0
-(`ironfix-dictionary/tests/fixtures/orchestra/LICENSE`; provenance and
-checksums in `ironfix-dictionary/tests/fixtures/orchestra/README.md`). It is a
-test fixture only, left out of the published `ironfix-dictionary` package.
+The embedded dictionaries are built from the FIX Trading Community's FIX
+Orchestra repositories, redistributed under the Apache License, Version 2.0
+(`ironfix-dictionary/spec/orchestra/LICENSE`; provenance and checksums in
+`ironfix-dictionary/spec/orchestra/README.md`). Up to 0.5 they were QuickFIX
+data dictionaries; those are now test fixtures only
+(`ironfix-dictionary/tests/fixtures/quickfix/`, under the QuickFIX Software
+License, Version 1.0, left out of the published package).
 
 The FIXP SBE message schema the `ironfix-fixp` conformance test reads is FIX
 Protocol Ltd.'s, published by FIX Trading Community under the Creative Commons
@@ -943,12 +937,14 @@ maintainer:
 
 We appreciate your interest and look forward to your contributions!
 
-**License**: MIT. The QuickFIX data dictionaries vendored in
-`ironfix-dictionary/spec/` remain under the QuickFIX Software License,
-Version 1.0 (`ironfix-dictionary/spec/LICENSE-QUICKFIX`). The FIXP SBE schema
-vendored in `ironfix-fixp/spec/` remains under CC BY-ND 4.0
-(`ironfix-fixp/spec/LICENSE-FIXP`) and, like the Orchestra test fixture, is
-not part of any published package.
+**License**: MIT. The FIX Orchestra repositories embedded from
+`ironfix-dictionary/spec/orchestra/` remain under the Apache License,
+Version 2.0 (`ironfix-dictionary/spec/orchestra/LICENSE`). The QuickFIX data
+dictionaries kept as test fixtures in
+`ironfix-dictionary/tests/fixtures/quickfix/` remain under the QuickFIX
+Software License, Version 1.0, and the FIXP SBE schema vendored in
+`ironfix-fixp/spec/` under CC BY-ND 4.0 (`ironfix-fixp/spec/LICENSE-FIXP`);
+neither is part of any published package.
 
 <!-- related-projects:start -->
 ## Related projects
