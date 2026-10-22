@@ -103,20 +103,62 @@ check-tls-deps:
 		|| { echo "check-tls-deps: rustls is missing with the tls feature on"; exit 1; }
 	@echo "check-tls-deps: no TLS crate without the feature; no crypto provider forced with it."
 
-# Proves the published ironfix-fixp package carries no FIXP specification
-# content (issue #203). The FIXP SBE schema under ironfix-fixp/spec/ is
-# CC BY-ND 4.0: it may be redistributed only unmodified and only in the
-# repository, as the input of a test, never in the MIT crate.
+# Proves every publishable crate declares the licences of what it publishes
+# (issue #202). For each crate without `publish = false`, `cargo package
+# --list` is the list of published files; each licence file and vendored
+# specification in it maps to the SPDX id it needs, and the crate's `license`
+# expression (from `cargo metadata`) must name that id:
+#   - QuickFIX content (LICENSE-QUICKFIX, any path naming quickfix): never
+#     allowed, whatever the crate declares;
+#   - FIXP specification content (LICENSE-FIXP, SBEschema*, anything under
+#     ironfix-fixp's spec/): CC BY-ND 4.0, never allowed (issue #203);
+#   - spec/orchestra/*: the FIX Orchestra repositories, Apache-2.0;
+#   - LICENSE, LICENSE-MIT: MIT; LICENSE-APACHE, NOTICE: Apache-2.0;
+#   - any other licence file (LICENSE*, LICENCE*, COPYING*, NOTICE*) or other
+#     path under spec/: unknown, so it fails until mapped here.
+.PHONY: check-licences
+check-licences:
+	@command -v jq >/dev/null || { echo "check-licences: jq is required"; exit 1; }
+	@crates=$$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | "\(.name)\t\(.license)"') \
+		|| { echo "check-licences: cargo metadata failed"; exit 1; }; \
+	printf '%s\n' "$$crates" | { \
+	failed=0; tab=$$(printf '\t'); \
+	while IFS="$$tab" read -r crate licence; do \
+		list=$$(cargo package -p "$$crate" --list --allow-dirty 2>/dev/null) \
+			|| { echo "check-licences: cargo package --list failed for $$crate"; failed=1; continue; }; \
+		ids=" $$(printf '%s' "$$licence" | tr '()/' '   ' | sed 's/ AND / /g; s/ OR / /g; s/ WITH [^ ]*//g') "; \
+		for path in $$list; do \
+			base=$${path##*/}; need=""; \
+			lower=$$(printf '%s' "$$path" | tr 'A-Z' 'a-z'); \
+			case "$$lower" in *quickfix*) need="forbidden:QuickFIX Software License";; esac; \
+			if [ -z "$$need" ]; then case "$$base" in LICENSE-FIXP|SBEschema*) need="forbidden:CC-BY-ND-4.0";; esac; fi; \
+			if [ -z "$$need" ] && [ "$$crate" = ironfix-fixp ]; then case "$$path" in spec/*) need="forbidden:CC-BY-ND-4.0";; esac; fi; \
+			if [ -z "$$need" ]; then case "$$path" in \
+				spec/orchestra/*) need=Apache-2.0;; \
+				spec/*) need="unknown:vendored specification";; \
+			esac; fi; \
+			if [ -z "$$need" ]; then case "$$base" in \
+				LICENSE|LICENSE-MIT|LICENSE.md|LICENSE.txt) need=MIT;; \
+				LICENSE-APACHE|NOTICE|NOTICE.md|NOTICE.txt) need=Apache-2.0;; \
+				LICEN[CS]E*|COPYING*|NOTICE*) need="unknown:licence file";; \
+			esac; fi; \
+			case "$$need" in \
+				"") ;; \
+				forbidden:*) echo "check-licences: $$crate publishes $$path, which may never be published ($${need#forbidden:})"; failed=1;; \
+				unknown:*) echo "check-licences: $$crate publishes $$path, an unmapped $${need#unknown:}; map it to an SPDX id in the Makefile"; failed=1;; \
+				*) case "$$ids" in *" $$need "*) ;; \
+					*) echo "check-licences: $$crate publishes $$path ($$need) but declares license = \"$$licence\""; failed=1;; \
+				esac;; \
+			esac; \
+		done; \
+	done; \
+	exit $$failed; \
+	} || exit 1
+	@echo "check-licences: every published licence file and vendored specification is declared."
+
+# Kept as an alias: the FIXP rule is part of check-licences (issue #202).
 .PHONY: check-package-fixp
-check-package-fixp:
-	@list=$$(cargo package -p ironfix-fixp --list --allow-dirty) || { echo "check-package-fixp: cargo package --list failed"; exit 1; }; \
-	leaked=$$(printf '%s\n' "$$list" | grep -E '^spec/|SBEschema|LICENSE-FIXP' || true); \
-	if [ -n "$$leaked" ]; then \
-		echo "check-package-fixp: FIXP specification files would be published:"; \
-		printf '%s\n' "$$leaked"; \
-		exit 1; \
-	fi
-	@echo "check-package-fixp: no FIXP specification file in the published package."
+check-package-fixp: check-licences
 
 # Proves the engine's optional `fixp` feature is additive (issue #96,
 # ADR-0003): with it off, neither FIXP crate nor the SBE codec is in

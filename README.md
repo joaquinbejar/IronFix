@@ -626,8 +626,8 @@ Each crate is published separately on crates.io. For the engine:
 
 ```toml
 [dependencies]
-ironfix-core = "0.5"
-ironfix-engine = "0.5"
+ironfix-core = "0.6"
+ironfix-engine = "0.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 ```
 
@@ -728,7 +728,7 @@ you want (here `aws-lc-rs`, rustls' default; `ring` works too):
 
 ```toml
 [dependencies]
-ironfix-engine = { version = "0.5", features = ["tls"] }
+ironfix-engine = { version = "0.6", features = ["tls"] }
 rustls = "0.23"
 ```
 

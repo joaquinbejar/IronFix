@@ -1,0 +1,35 @@
+# cargo-deny configuration (issue #202). Only the licence check is enforced
+# in CI (`cargo deny check licenses`, the `Licences` job in lint.yml).
+
+[graph]
+# Every feature, so the opt-in `tls` feature's graph is checked too.
+all-features = true
+
+[licenses]
+# The workspace's own crates are MIT (ironfix-dictionary is
+# "MIT AND Apache-2.0"); every dependency must be MIT or Apache-2.0, unless
+# it is listed as an exception below.
+allow = ["MIT", "Apache-2.0"]
+confidence-threshold = 0.93
+
+# Each exception names one crate and only the extra permissive licence it
+# needs; a new crate under one of these licences still fails until listed.
+exceptions = [
+    # Build-time only: proc-macro2's identifier tables (via async-trait,
+    # thiserror, serde_derive, tracing-attributes). "(MIT OR Apache-2.0) AND
+    # Unicode-3.0": the Unicode Character Database terms, OSI-approved and
+    # permissive.
+    { crate = "unicode-ident", allow = ["Unicode-3.0"] },
+    # rustls's constant-time primitives, behind ironfix-engine's opt-in
+    # `tls` feature. BSD-3-Clause, permissive.
+    { crate = "subtle", allow = ["BSD-3-Clause"] },
+    # rustls's certificate verifier, behind the `tls` feature. ISC, a
+    # permissive MIT-style licence.
+    { crate = "rustls-webpki", allow = ["ISC"] },
+    # The crypto provider of the TLS tests and examples (rcgen, and the
+    # examples' `tls` feature); never forced on ironfix-engine
+    # (`make check-tls-deps`). "Apache-2.0 AND ISC".
+    { crate = "ring", allow = ["ISC"] },
+    # ring's input parser. ISC.
+    { crate = "untrusted", allow = ["ISC"] },
+]

@@ -377,7 +377,7 @@ impl CodeGenerator {
     ///   `ironfix_engine::OutboundMessage`) implements it.
     ///
     /// The generated code depends on the `ironfix-core`, `rust_decimal` and
-    /// `ironfix-dictionary` `^0.5` crates (it calls `GroupSet::field`,
+    /// `ironfix-dictionary` `^0.6` crates (it calls `GroupSet::field`,
     /// `GroupSet::with_level_tags` and `FieldType::is_valid_value`), and contains no
     /// `#[allow]`. Only [`GeneratorConfig::visibility`] applies: components
     /// are always expanded, because a view must know every group of a

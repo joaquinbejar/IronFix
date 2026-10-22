@@ -34,7 +34,21 @@ jobs:
       - name: English-only check
         run: make check-spanish
 
-      # The CC BY-ND FIXP schema must never ship in the MIT ironfix-fixp crate
-      # (issue #203).
-      - name: FIXP package contents
-        run: make check-package-fixp
+      # Every published crate declares the licences of the files it publishes;
+      # QuickFIX content and the CC BY-ND FIXP schema are never published
+      # (issues #202, #203). jq is preinstalled on the runner.
+      - name: Published licences
+        run: make check-licences
+
+  # Every dependency is MIT or Apache-2.0, or a permissive licence deny.toml
+  # lists for one named crate (issue #202).
+  licences:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: cargo deny check licenses
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check licenses

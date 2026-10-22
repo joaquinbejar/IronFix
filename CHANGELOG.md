@@ -4,7 +4,27 @@ All notable changes to the IronFix workspace are recorded here. Versions
 follow [Semantic Versioning](https://semver.org/); while the workspace is at
 0.x, a change that breaks behaviour or the public API takes a minor bump.
 
-## Unreleased
+## 0.6.0 (2026-10-22)
+
+Breaking: a minor bump at 0.x. `cargo-semver-checks` against 0.5.0 finds no
+API break in any package; the bump is for the dictionary behaviour changes
+below.
+
+### Changed: published licences are declared and checked (#202)
+
+- `ironfix-dictionary` declares `license = "MIT AND Apache-2.0"`: its code is
+  MIT and the FIX Orchestra repositories it embeds are Apache-2.0
+  (`spec/orchestra/LICENSE`, shipped in the crate). Every other crate stays
+  `MIT`.
+- `make check-licences` (CI, `lint.yml`) lists what each publishable crate
+  publishes and fails on a licence file or vendored specification the
+  crate's `license` does not declare, and on any QuickFIX or FIXP
+  specification content. It replaces `make check-package-fixp`, kept as an
+  alias.
+- `deny.toml` and a `cargo deny check licenses` CI job allow MIT and
+  Apache-2.0 for dependencies, plus five named permissive exceptions
+  (Unicode-3.0, BSD-3-Clause, ISC).
+- Generated views require `ironfix-dictionary ^0.6`.
 
 ### Changed: embedded dictionaries come from FIX Orchestra (#201)
 
