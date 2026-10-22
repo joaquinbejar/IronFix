@@ -234,8 +234,6 @@ fn test_orchestra_fix44_report_lists_what_the_model_cannot_hold() {
     // component of the repository references it.
     assert_eq!(unreferenced, ["group ExecsGrp"]);
     let expected: BTreeMap<String, usize> = [
-        // The LENGTH field of each data field (Signature(89) -> 93, ...).
-        ("lengthId", 16),
         // The source field of each identifier (SecurityID(48) -> 22, ...).
         ("discriminatorId", 12),
         // A second type a value may take (IOIQty(27) is S/M/L or a Qty).
@@ -247,7 +245,15 @@ fn test_orchestra_fix44_report_lists_what_the_model_cannot_hold() {
     .map(|(name, count)| (name.to_owned(), count))
     .collect();
     assert_eq!(by_attribute, expected);
-    assert_eq!(import.report().len(), 41);
+    // Each data field's `lengthId` (Signature(89) -> 93, ...) names a
+    // `Length` field, so it is mapped, not reported.
+    assert_eq!(import.report().len(), 25);
+    for tag in [93, 95, 212] {
+        let Some(field) = import.dictionary().get_field(tag) else {
+            panic!("tag {tag} is defined");
+        };
+        assert_eq!(field.field_type, FieldType::Length, "tag {tag}");
+    }
 }
 
 #[test]

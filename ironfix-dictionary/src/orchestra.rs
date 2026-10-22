@@ -15,18 +15,24 @@
 //!
 //! # What is tested
 //!
-//! The loader is exercised against the FIX Trading Community's
-//! `OrchestraFIX44.xml` (FIX 4.4 as of Extension Pack 311), vendored as a
-//! test fixture and compared with the embedded QuickFIX FIX 4.4 dictionary,
-//! and against synthetic documents. No other version's standard repository
-//! is exercised.
+//! The loader is exercised against four of the FIX Trading Community's
+//! repositories, vendored as test fixtures: `OrchestraFIX42.xml` (FIX 4.2 as
+//! of Extension Pack 310), `OrchestraFIX44.xml` (FIX 4.4 as of Extension Pack
+//! 311), `FIXTSession.xml` (the FIXT session layer) and
+//! `FixRepository50SP2.xml` (FIX 5.0 SP2, a 2019 snapshot without extension
+//! packs). Each is compared with the embedded QuickFIX dictionary of its
+//! version, and every difference is listed in `doc/orchestra_differences.md`.
+//! The loader is also exercised against synthetic documents. No other
+//! version's standard repository is exercised.
 //!
 //! # Mapping
 //!
 //! | Orchestra | [`Dictionary`] |
 //! |---|---|
 //! | `repository/@version` (`FIX.4.0` to `FIX.4.4`, `FIX.5.0`, `FIX.5.0SP1`, `FIX.5.0SP2`, `FIXT.1.1`, each optionally `_EP<n>`) | [`Dictionary::version`] |
+//! | `repository` named `FIXT` declaring `FIX.5.0SP2_EP<n>`, when it is the FIXT session layer (see below) | [`Version::Fixt11`] |
 //! | `field` (`id` is the tag) | [`FieldDef`] |
+//! | a field's `lengthId`, naming an `int` field | that field's type becomes [`FieldType::Length`] |
 //! | `datatype`, through `baseType` when its own name is not a FIX type | [`FieldType`] |
 //! | `codeSet` / `code` named by a field's `type` | the field's type and [`FieldDef::values`] (value to code name) |
 //! | `component` named `StandardHeader` / `StandardTrailer` | [`Dictionary::header`] / [`Dictionary::trailer`] and their groups |
@@ -42,12 +48,27 @@
 //! members become optional too (a group's entries keep their own required
 //! members).
 //!
-//! Only the `base` scenario is loaded. Two versions are
-//! [`DictionaryError::UnsupportedVersion`]: `FIX.Latest`, which names no
-//! fixed FIX version, and a repository named `FIXT` whose version is not
-//! `FIXT.1.1`. The FIX Trading Community's FIXT session repository is one:
-//! it declares `FIX.5.0SP2_EP247`, an application version, where it describes
-//! the FIXT.1.1 session layer, so the version cannot be taken from it.
+//! Only the `base` scenario is loaded. `FIX.Latest`, which names no fixed
+//! FIX version, is [`DictionaryError::UnsupportedVersion`].
+//!
+//! A repository named `FIXT` describes the FIXT.1.1 session layer. One that
+//! declares `FIXT.1.1` loads as [`Version::Fixt11`]. The FIX Trading
+//! Community's FIXT session repository declares `FIX.5.0SP2_EP247` instead:
+//! the application version it was published with, not the version it
+//! describes. Such a repository loads as [`Version::Fixt11`] only when its
+//! content is the session layer, checked once it is read:
+//!
+//! - its version is `FIX.5.0SP2` with an extension pack (`_EP<n>`);
+//! - every message is in the `Session` category and is a FIXT.1.1 session
+//!   message: Heartbeat (`0`), TestRequest (`1`), ResendRequest (`2`),
+//!   Reject (`3`), SequenceReset (`4`), Logout (`5`), Logon (`A`) or
+//!   XMLnonFIX (`n`), and a Logon is among them;
+//! - it defines `ApplVerID(1128)` and `DefaultApplVerID(1137)`, through
+//!   which FIXT.1.1 names the application version it carries.
+//!
+//! Any other repository named `FIXT` whose version is not `FIXT.1.1` is
+//! [`DictionaryError::UnsupportedVersion`]; the rule is not a relaxation of
+//! the version check for other repositories.
 //!
 //! # Reported, not mapped
 //!
@@ -65,9 +86,9 @@
 //! - a conditional presence `rule`, with its presence and `when` condition
 //!   (not evaluated: the member keeps its static presence);
 //! - an attribute that constrains values the model cannot hold, such as
-//!   `minInclusive`, `implMaxLength`, `implMaxOccurs`, `lengthId`,
-//!   `discriminatorId` or `unionDataType`, and any attribute Orchestra 1.0
-//!   does not define;
+//!   `minInclusive`, `implMaxLength`, `implMaxOccurs`, `discriminatorId`
+//!   or `unionDataType`, a `lengthId` that names no `int` or `Length` field,
+//!   and any attribute Orchestra 1.0 does not define;
 //! - a group or code set nothing references: the dictionary holds a group
 //!   only where it is referenced, and a code set only on its fields. It is
 //!   still checked like the others.
@@ -500,8 +521,9 @@ impl Dictionary {
     /// # Errors
     /// Returns [`DictionaryError`] if the document is not a well-formed
     /// Orchestra 1.0 repository, declares a version the loader cannot map
-    /// (`FIX.Latest`, or a repository named `FIXT` whose version is not
-    /// `FIXT.1.1`), holds a dangling, duplicate or invalid id, a group or
+    /// (`FIX.Latest`, or a repository named `FIXT` whose version is neither
+    /// `FIXT.1.1` nor, for the FIXT session layer, a FIX 5.0 SP2 extension
+    /// pack), holds a dangling, duplicate or invalid id, a group or
     /// component cycle, a datatype or code set that maps to no FIX data type,
     /// a group without a count field or without members, or exceeds one of
     /// the size, length, report, field-value and depth limits.
@@ -571,6 +593,8 @@ struct RawField {
     id: u32,
     name: String,
     type_name: String,
+    /// `lengthId`: the field that carries this one's length, as written.
+    length_id: Option<String>,
 }
 
 /// A `component` in the `base` scenario.
@@ -795,6 +819,35 @@ fn parse_version(version: &str) -> Result<Version, DictionaryError> {
         "FIXT.1.1" => Ok(Version::Fixt11),
         _ => Err(unsupported()),
     }
+}
+
+/// The message types of the FIXT.1.1 session layer: Heartbeat, TestRequest,
+/// ResendRequest, Reject, SequenceReset, Logout, Logon and XMLnonFIX.
+const FIXT_SESSION_MSG_TYPES: [&str; 8] = ["0", "1", "2", "3", "4", "5", "A", "n"];
+
+/// `ApplVerID(1128)` and `DefaultApplVerID(1137)`: the fields through which
+/// FIXT.1.1 names the application version it carries.
+const FIXT_APPL_VER_ID_TAGS: [u32; 2] = [1128, 1137];
+
+/// The error for a repository named `FIXT` that declares `declared`.
+fn fixt_unsupported(declared: &str) -> DictionaryError {
+    DictionaryError::UnsupportedVersion(format!("{declared} (repository FIXT)"))
+}
+
+/// Whether a repository named `FIXT` that declares an extension pack of FIX
+/// 5.0 SP2 describes the FIXT.1.1 session layer: it defines a Logon, every
+/// message it defines is a FIXT.1.1 session message of the `Session`
+/// category, and it defines `ApplVerID(1128)` and `DefaultApplVerID(1137)`.
+fn is_fixt_session_layer(raw: &Raw) -> bool {
+    let session_only = raw.messages.iter().all(|message| {
+        message.category == MessageCategory::Admin
+            && FIXT_SESSION_MSG_TYPES.contains(&message.msg_type.as_str())
+    });
+    let has_logon = raw.messages.iter().any(|message| message.msg_type == "A");
+    let has_appl_ver_id = FIXT_APPL_VER_ID_TAGS
+        .iter()
+        .all(|tag| raw.fields.iter().any(|field| field.id == *tag));
+    session_only && has_logon && has_appl_ver_id
 }
 
 fn xml_err(e: impl fmt::Display) -> DictionaryError {
@@ -1023,14 +1076,20 @@ impl<'i> Parser<'i> {
         let declared = attrs.required("repository", "version")?;
         let version = parse_version(&declared)?;
         // The stable name (`FIX.4.4`, `FIXT`) is descriptive, except that a
-        // FIXT repository can only describe FIXT.1.1: one that declares
-        // another version (the FIX Trading Community's session repository
-        // declares `FIX.5.0SP2_EP247`) names no version the loader can map.
-        if attrs.take("name").as_deref() == Some("FIXT") && version != Version::Fixt11 {
-            return Err(DictionaryError::UnsupportedVersion(format!(
-                "{declared} (repository FIXT)"
-            )));
-        }
+        // FIXT repository can only describe FIXT.1.1. One that declares
+        // another version names no version the loader can map, unless it is
+        // the session layer published under an extension pack of FIX 5.0
+        // SP2 (the FIX Trading Community's session repository declares
+        // `FIX.5.0SP2_EP247`): that is decided once its content is read.
+        let fixt_session =
+            if attrs.take("name").as_deref() == Some("FIXT") && version != Version::Fixt11 {
+                if version != Version::Fix50Sp2 || !declared.contains("_EP") {
+                    return Err(fixt_unsupported(&declared));
+                }
+                true
+            } else {
+                false
+            };
         attrs.report_rest("repository", &mut self.report)?;
         let mut raw = Raw::new(version);
         if !root.empty {
@@ -1061,6 +1120,12 @@ impl<'i> Parser<'i> {
             }
         }
         self.rest()?;
+        if fixt_session {
+            if !is_fixt_session_layer(&raw) {
+                return Err(fixt_unsupported(&declared));
+            }
+            raw.version = Version::Fixt11;
+        }
         Ok(raw)
     }
 
@@ -1236,6 +1301,7 @@ impl<'i> Parser<'i> {
             let name = attrs.required("field", "name")?;
             let type_name = attrs.required("field", "type")?;
             let scenario = attrs.take("scenario");
+            let length_id = attrs.take("lengthId");
             let location = format!("field {name}");
             attrs.report_rest(&location, &mut self.report)?;
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
@@ -1252,6 +1318,7 @@ impl<'i> Parser<'i> {
                 id,
                 name,
                 type_name,
+                length_id,
             });
         }
         Ok(())
@@ -1977,6 +2044,44 @@ fn report_unreferenced(
 
 /// Builds the dictionary from the parsed definitions, adding the
 /// unreferenced definitions to `report`.
+/// Maps each field's `lengthId`: the field it names carries the field's
+/// length, so an `int` one is typed [`FieldType::Length`], as FIX types it
+/// from 4.3 on (FIX 4.2 has no `Length` datatype, and its repository types
+/// these fields `int`). A `lengthId` that is not an id, that names no
+/// field, or that names a field of another type than `int` or `Length` is
+/// reported instead.
+fn map_length_ids(
+    raw: &Raw,
+    field_defs: &mut [FieldDef],
+    report: &mut Report,
+) -> Result<(), DictionaryError> {
+    let positions: HashMap<u32, usize> = field_defs
+        .iter()
+        .enumerate()
+        .map(|(position, def)| (def.tag, position))
+        .collect();
+    for field in &raw.fields {
+        let Some(value) = &field.length_id else {
+            continue;
+        };
+        let target = value
+            .parse::<u32>()
+            .ok()
+            .and_then(|id| positions.get(&id))
+            .and_then(|position| field_defs.get_mut(*position))
+            .filter(|def| matches!(def.field_type, FieldType::Int | FieldType::Length));
+        match target {
+            Some(def) => def.field_type = FieldType::Length,
+            None => report.push(UnmappedConstruct::Attribute {
+                location: format!("field {}", field.name),
+                name: "lengthId".to_owned(),
+                value: value.clone(),
+            })?,
+        }
+    }
+    Ok(())
+}
+
 fn build(raw: &Raw, report: &mut Report) -> Result<Dictionary, DictionaryError> {
     let types = Types::new(raw)?;
 
@@ -2007,6 +2112,7 @@ fn build(raw: &Raw, report: &mut Report) -> Result<Dictionary, DictionaryError> 
         }
         field_defs.push(def);
     }
+    map_length_ids(raw, &mut field_defs, report)?;
 
     let components = by_id(&raw.components, |c| c.id, OrchestraKind::Component)?;
     let groups = by_id(&raw.groups, |g| g.id, OrchestraKind::Group)?;
@@ -3320,6 +3426,184 @@ mod tests {
         .xml()
         .replace(r#"name="FIX.4.4""#, r#"name="FIXT""#);
         assert_eq!(load(&transport).dictionary().version, Version::Fixt11);
+    }
+
+    #[test]
+    fn test_length_id_types_an_int_length_field_length() {
+        let doc = Doc::with_fields(
+            r#"
+            <fixr:field id="95" name="RawDataLength" type="int"/>
+            <fixr:field id="96" name="RawData" type="String" lengthId="95"/>"#,
+        );
+        let import = load(&doc.xml());
+        let Some(length) = import.dictionary().get_field(95) else {
+            panic!("tag 95 is defined");
+        };
+        assert_eq!(length.field_type, FieldType::Length);
+        assert!(import.report().is_empty(), "{:?}", import.report());
+    }
+
+    #[test]
+    fn test_length_id_that_names_no_int_field_is_reported() {
+        for (length_id, extra) in [
+            // Names no field.
+            ("9999", ""),
+            // Not an id.
+            ("x", ""),
+            // Names a String field: its type is kept.
+            ("97", r#"<fixr:field id="97" name="Text" type="String"/>"#),
+        ] {
+            let doc = Doc::with_fields(&format!(
+                r#"{extra}<fixr:field id="96" name="RawData" type="String" lengthId="{length_id}"/>"#
+            ));
+            let import = load(&doc.xml());
+            assert_eq!(
+                import.report().entries(),
+                [UnmappedConstruct::Attribute {
+                    location: "field RawData".to_owned(),
+                    name: "lengthId".to_owned(),
+                    value: length_id.to_owned(),
+                }],
+                "{length_id}"
+            );
+        }
+        let doc = Doc::with_fields(
+            r#"<fixr:field id="97" name="Text" type="String"/>
+               <fixr:field id="96" name="RawData" type="String" lengthId="97"/>"#,
+        );
+        let import = load(&doc.xml());
+        let Some(text) = import.dictionary().get_field(97) else {
+            panic!("tag 97 is defined");
+        };
+        assert_eq!(text.field_type, FieldType::String);
+    }
+
+    /// A repository named `FIXT` holding only the Heartbeat and a Logon, with
+    /// the fields named in `appl_ver_id_fields`.
+    fn fixt_session(version: &str, appl_ver_id_fields: &str, extra_message: &str) -> String {
+        let mut doc = Doc {
+            version: version.to_owned(),
+            ..Doc::default()
+        };
+        doc.fields.push_str(appl_ver_id_fields);
+        doc.messages = format!(
+            r#"
+            <fixr:message id="1" name="Heartbeat" msgType="0" category="Session">
+              <fixr:structure>
+                <fixr:componentRef id="1024" presence="required"/>
+                <fixr:fieldRef id="112"/>
+                <fixr:componentRef id="1025" presence="required"/>
+              </fixr:structure>
+            </fixr:message>
+            <fixr:message id="11" name="Logon" msgType="A" category="Session">
+              <fixr:structure>
+                <fixr:componentRef id="1024" presence="required"/>
+                <fixr:componentRef id="1025" presence="required"/>
+              </fixr:structure>
+            </fixr:message>{extra_message}"#
+        );
+        doc.xml().replace(r#"name="FIX.4.4""#, r#"name="FIXT""#)
+    }
+
+    const APPL_VER_ID_FIELDS: &str = r#"
+        <fixr:field id="1128" name="ApplVerID" type="String"/>
+        <fixr:field id="1137" name="DefaultApplVerID" type="String"/>"#;
+
+    #[test]
+    fn test_fixt_session_layer_under_fix50sp2_extension_pack_is_fixt11() {
+        let import = load(&fixt_session("FIX.5.0SP2_EP247", APPL_VER_ID_FIELDS, ""));
+        assert_eq!(import.dictionary().version, Version::Fixt11);
+        assert!(import.dictionary().get_message("A").is_some());
+        assert!(import.dictionary().get_field(1137).is_some());
+        // XMLnonFIX (n) is a FIXT.1.1 session message too.
+        let xml_non_fix = r#"
+            <fixr:message id="47" name="XMLnonFIX" msgType="n" category="Session">
+              <fixr:structure>
+                <fixr:componentRef id="1024" presence="required"/>
+                <fixr:componentRef id="1025" presence="required"/>
+              </fixr:structure>
+            </fixr:message>"#;
+        let import = load(&fixt_session(
+            "FIX.5.0SP2_EP247",
+            APPL_VER_ID_FIELDS,
+            xml_non_fix,
+        ));
+        assert_eq!(import.dictionary().version, Version::Fixt11);
+    }
+
+    #[test]
+    fn test_fixt_repository_that_is_not_the_session_layer_is_still_rejected() {
+        let rejected = |xml: &str, declared: &str| {
+            assert_eq!(
+                load_err(xml),
+                DictionaryError::UnsupportedVersion(format!("{declared} (repository FIXT)")),
+                "{declared}"
+            );
+        };
+        // An application message.
+        let order = r#"
+            <fixr:message id="14" name="NewOrderSingle" msgType="D" category="Session">
+              <fixr:structure>
+                <fixr:fieldRef id="11" presence="required"/>
+              </fixr:structure>
+            </fixr:message>"#;
+        rejected(
+            &fixt_session("FIX.5.0SP2_EP247", APPL_VER_ID_FIELDS, order),
+            "FIX.5.0SP2_EP247",
+        );
+        // A session message type outside the Session category.
+        let app_heartbeat = r#"
+            <fixr:message id="2" name="TestRequest" msgType="1" category="Other">
+              <fixr:structure>
+                <fixr:fieldRef id="112" presence="required"/>
+              </fixr:structure>
+            </fixr:message>"#;
+        rejected(
+            &fixt_session("FIX.5.0SP2_EP247", APPL_VER_ID_FIELDS, app_heartbeat),
+            "FIX.5.0SP2_EP247",
+        );
+        // Without DefaultApplVerID(1137), or without both.
+        let appl_ver_id_only = r#"<fixr:field id="1128" name="ApplVerID" type="String"/>"#;
+        rejected(
+            &fixt_session("FIX.5.0SP2_EP247", appl_ver_id_only, ""),
+            "FIX.5.0SP2_EP247",
+        );
+        rejected(
+            &fixt_session("FIX.5.0SP2_EP247", "", ""),
+            "FIX.5.0SP2_EP247",
+        );
+        // Without a Logon.
+        let mut no_logon = Doc {
+            version: "FIX.5.0SP2_EP247".to_owned(),
+            ..Doc::default()
+        };
+        no_logon.fields.push_str(APPL_VER_ID_FIELDS);
+        no_logon.messages = r#"
+            <fixr:message id="1" name="Heartbeat" msgType="0" category="Session">
+              <fixr:structure>
+                <fixr:fieldRef id="112"/>
+              </fixr:structure>
+            </fixr:message>"#
+            .to_owned();
+        rejected(
+            &no_logon
+                .xml()
+                .replace(r#"name="FIX.4.4""#, r#"name="FIXT""#),
+            "FIX.5.0SP2_EP247",
+        );
+        // FIX 5.0 SP2 without an extension pack, and another version.
+        rejected(
+            &fixt_session("FIX.5.0SP2", APPL_VER_ID_FIELDS, ""),
+            "FIX.5.0SP2",
+        );
+        rejected(
+            &fixt_session("FIX.4.4_EP247", APPL_VER_ID_FIELDS, ""),
+            "FIX.4.4_EP247",
+        );
+        rejected(
+            &fixt_session("FIX.5.0SP1_EP97", APPL_VER_ID_FIELDS, ""),
+            "FIX.5.0SP1_EP97",
+        );
     }
 
     #[test]
