@@ -1,0 +1,39 @@
+# Known differences between the FIX Orchestra repository OrchestraFIX42.xml (FIX 4.2 EP310) and the
+# embedded QuickFIX dictionary spec/FIX42.xml, one per line, exactly as
+# tests/orchestra_equivalence.rs prints them. `orchestra-only` is in the
+# Orchestra repository only, `quickfix-only` in the QuickFIX file only,
+# `conflict` in both with different content; the policy is that Orchestra
+# wins. doc/orchestra_differences.md summarises and justifies each class.
+# A line here that the diff no longer finds fails the test, as does a
+# difference missing from here. Lines starting with `#` are comments.
+
+# Field names: Orchestra uses the names FIX settled on later (IOIID,
+# QuoteAckStatus, HaltReason); QuickFIX keeps older spellings.
+conflict field 23 name: orchestra IOIID quickfix IOIid
+conflict field 297 name: orchestra QuoteAckStatus quickfix QuoteStatus
+conflict field 327 name: orchestra HaltReason quickfix HaltReasonChar
+
+# Message names: AllocationAck (P) is the FIX 4.2 name; QuickFIX uses
+# the FIX 4.4 name AllocationInstructionAck.
+conflict message P name: orchestra AllocationAck quickfix AllocationInstructionAck
+
+# Session messages: the FIX 4.2 repository gives its messages no
+# category, so none is mapped to Admin; QuickFIX marks the session
+# messages admin. The engine decides what is administrative by message
+# type, not by this category.
+conflict message 0 category: orchestra App quickfix Admin
+conflict message 1 category: orchestra App quickfix Admin
+conflict message 2 category: orchestra App quickfix Admin
+conflict message 3 category: orchestra App quickfix Admin
+conflict message 4 category: orchestra App quickfix Admin
+conflict message 5 category: orchestra App quickfix Admin
+conflict message A category: orchestra App quickfix Admin
+
+# Code sets Orchestra carries and QuickFIX leaves out.
+orchestra-only field 156 values ["D", "M"]
+orchestra-only field 172 values ["0", "1"]
+orchestra-only field 394 values ["1", "2", "3"]
+orchestra-only field 399 values ["1", "2", "3"]
+orchestra-only field 401 values ["1", "2"]
+orchestra-only field 429 values ["1", "2", "3", "4", "5", "6"]
+orchestra-only field 431 values ["1", "2", "3", "4", "5", "6", "7"]
