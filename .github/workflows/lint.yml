@@ -33,3 +33,8 @@ jobs:
       # enforcement of that rule; `make check-spanish` is a self-contained grep.
       - name: English-only check
         run: make check-spanish
+
+      # The CC BY-ND FIXP schema must never ship in the MIT ironfix-fixp crate
+      # (issue #203).
+      - name: FIXP package contents
+        run: make check-package-fixp

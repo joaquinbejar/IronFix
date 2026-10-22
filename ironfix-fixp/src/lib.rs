@@ -34,6 +34,10 @@
 //! `ironsbe-core`'s SBE primitives, and that test checks it field by field
 //! against the schema.
 //!
+//! The schema is never edited, never used to generate shipped code, and only
+//! read by tests; `make check-package-fixp` (run in CI) fails if it, or any
+//! other file under `spec/`, appears in the published package.
+//!
 //! ## Sans-IO
 //!
 //! Following ADR-0002 the core performs no I/O, runs no timers and reads no
