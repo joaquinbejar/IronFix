@@ -1,0 +1,71 @@
+# Known differences between the FIX Orchestra repository OrchestraFIX44.xml (FIX 4.4 EP311) and the
+# embedded QuickFIX dictionary spec/FIX44.xml, one per line, exactly as
+# tests/orchestra_equivalence.rs prints them. `orchestra-only` is in the
+# Orchestra repository only, `quickfix-only` in the QuickFIX file only,
+# `conflict` in both with different content; the policy is that Orchestra
+# wins. doc/orchestra_differences.md summarises and justifies each class.
+# A line here that the diff no longer finds fails the test, as does a
+# difference missing from here. Lines starting with `#` are comments.
+
+# The two files name tag 327 differently.
+conflict field 327 name: orchestra HaltReason quickfix HaltReasonChar
+
+# Orchestra types both fields' code sets `int`; QuickFIX types the fields
+# STRING (see the fixture README for 532).
+conflict field 532 type: orchestra Int quickfix String
+conflict field 674 type: orchestra Int quickfix String
+
+# Code sets, or single codes, Orchestra carries and QuickFIX leaves out:
+# the nested party roles and sources, the security identifier sources,
+# RefMsgType(372), ExecInst(18) T, OrdStatus(39) 5, OrdRejReason(103) 12.
+orchestra-only field 103 values ["12"]
+orchestra-only field 18 values ["T"]
+orchestra-only field 221 values ["EONIA", "EUREPO", "Euribor", "FutureSWAP", "LIBID", "LIBOR", "MuniAAA", "OTHER", "Pfandbriefe", "SONIA", "SWAP", "Treasury"]
+orchestra-only field 305 values ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+orchestra-only field 368 values ["1", "2", "3", "4", "5", "6", "7", "8", "9", "99"]
+orchestra-only field 372 values ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK", "AL", "AM", "AN", "AO", "AP", "AQ", "AR", "AS", "AT", "AU", "AV", "AW", "AX", "AY", "AZ", "B", "BA", "BB", "BC", "BD", "BE", "BF", "BG", "BH", "C", "D", "E", "F", "G", "H", "J", "K", "L", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "X", "Y", "Z", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"]
+orchestra-only field 39 values ["5"]
+orchestra-only field 456 values ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+orchestra-only field 459 values ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+orchestra-only field 487 values ["0", "1", "2", "3", "4"]
+orchestra-only field 525 values ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F", "G", "H", "I"]
+orchestra-only field 538 values ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "2", "20", "21", "22", "24", "25", "26", "27", "28", "29", "3", "30", "31", "32", "33", "34", "35", "36", "37", "38", "4", "5", "6", "7", "8", "9"]
+orchestra-only field 564 values ["C", "F", "O", "R"]
+orchestra-only field 587 values ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+orchestra-only field 603 values ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+orchestra-only field 606 values ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+orchestra-only field 661 values ["1", "2", "3", "4", "5", "99"]
+orchestra-only field 674 values ["1", "2", "3", "4", "5", "99"]
+orchestra-only field 677 values ["EONIA", "EUREPO", "Euribor", "FutureSWAP", "LIBID", "LIBOR", "MuniAAA", "OTHER", "Pfandbriefe", "SONIA", "SWAP", "Treasury"]
+orchestra-only field 758 values ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F", "G", "H", "I"]
+orchestra-only field 759 values ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "2", "20", "21", "22", "24", "25", "26", "27", "28", "29", "3", "30", "31", "32", "33", "34", "35", "36", "37", "38", "4", "5", "6", "7", "8", "9"]
+orchestra-only field 761 values ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"]
+orchestra-only field 776 values ["0", "1", "10", "11", "12", "13", "2", "3", "4", "5", "6", "7", "8", "9"]
+orchestra-only field 783 values ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F", "G", "H", "I"]
+orchestra-only field 784 values ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "2", "20", "21", "22", "24", "25", "26", "27", "28", "29", "3", "30", "31", "32", "33", "34", "35", "36", "37", "38", "4", "5", "6", "7", "8", "9"]
+orchestra-only field 786 values ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "2", "20", "21", "22", "23", "24", "25", "26", "3", "4", "5", "6", "7", "8", "9"]
+orchestra-only field 805 values ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "2", "20", "21", "22", "23", "24", "25", "26", "3", "4", "5", "6", "7", "8", "9"]
+orchestra-only field 807 values ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "2", "20", "21", "22", "23", "24", "25", "26", "3", "4", "5", "6", "7", "8", "9"]
+orchestra-only field 888 values ["AMT", "AUTOREINV", "BANKQUAL", "BGNCON", "COUPON", "CURRENCY", "CUSTOMDATE", "GEOG", "HAIRCUT", "INSURED", "ISSUE", "ISSUER", "ISSUESIZE", "LOOKBACK", "LOT", "LOTVAR", "MAT", "MATURITY", "MAXSUBS", "MINDNOM", "MININCR", "MINQTY", "PAYFREQ", "PIECES", "PMAX", "PPL", "PPM", "PPT", "PRICE", "PRICEFREQ", "PROD", "PROTECT", "PURPOSE", "PXSOURCE", "RATING", "REDEMPTION", "RESTRICTED", "SECTOR", "SECTYPE", "STRUCT", "SUBSFREQ", "SUBSLEFT", "TEXT", "TRDVAR", "WAC", "WAL", "WALA", "WAM", "WHOLE", "YIELD"]
+orchestra-only field 950 values ["1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F", "G", "H", "I"]
+orchestra-only field 951 values ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "2", "20", "21", "22", "24", "25", "26", "27", "28", "29", "3", "30", "31", "32", "33", "34", "35", "36", "37", "38", "4", "5", "6", "7", "8", "9"]
+orchestra-only field 954 values ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "2", "20", "21", "22", "23", "24", "25", "26", "3", "4", "5", "6", "7", "8", "9"]
+
+# Orchestra lists ClearingFeeIndicator(635) in TrdCapRptSideGrp and
+# OrigOrdModTime(586) in SideCrossOrdModGrp; QuickFIX leaves them out.
+orchestra-only message AE tags [635]
+orchestra-only message s tags [586]
+orchestra-only message t tags [586]
+
+# Orchestra models these blocks as groups and marks the reference
+# required; QuickFIX wraps an optional group in a component and marks the
+# component required. Flattened, the required flag lands on the count tag
+# only in Orchestra. CollInquiryID(909) is required in Orchestra only.
+orchestra-only message AK required [555, 711]
+orchestra-only message AL required [453, 702]
+orchestra-only message AM required [702, 753]
+orchestra-only message AN required [453]
+orchestra-only message AO required [453]
+orchestra-only message AP required [453, 702, 753]
+orchestra-only message AW required [453, 702, 753]
+orchestra-only message BB required [909]

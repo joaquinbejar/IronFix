@@ -1,0 +1,33 @@
+# Known differences between the FIX Orchestra repository FIXTSession.xml (FIXT session layer, FIX.5.0SP2_EP247) and the
+# embedded QuickFIX dictionary spec/FIXT11.xml, one per line, exactly as
+# tests/orchestra_equivalence.rs prints them. `orchestra-only` is in the
+# Orchestra repository only, `quickfix-only` in the QuickFIX file only,
+# `conflict` in both with different content; the policy is that Orchestra
+# wins. doc/orchestra_differences.md summarises and justifies each class.
+# A line here that the diff no longer finds fails the test, as does a
+# difference missing from here. Lines starting with `#` are comments.
+
+# Code sets Orchestra carries and QuickFIX leaves out. MsgType(35) and
+# RefMsgType(372) list only the session message types here; composed
+# with an application dictionary, Validator::for_session admits the union
+# of both enumerations (see doc/orchestra_differences.md).
+orchestra-only field 1128 values ["10"]
+orchestra-only field 1130 values ["0", "1", "10", "2", "3", "4", "5", "6", "7", "8", "9"]
+orchestra-only field 1137 values ["0", "1", "10", "2", "3", "4", "5", "6", "7", "8", "9"]
+orchestra-only field 1409 values ["10", "9"]
+orchestra-only field 35 values ["0", "1", "2", "3", "4", "5", "A", "j", "n"]
+orchestra-only field 372 values ["0", "1", "2", "3", "4", "5", "A", "j", "n"]
+
+# The NoMsgTypes(384) Logon group, XMLnonFIX's NoMessageEvents group, the
+# Logon session-qualifier fields and the extension-pack fields: QuickFIX's
+# FIXT11.xml predates or omits them (see spec/README.md).
+orchestra-only fields [384, 385, 1410, 1600, 1601, 1602, 1603, 1604, 1605, 1744, 2104, 2105, 2106, 2107, 2108, 2109, 2110, 2111, 2112, 2113, 2114]
+orchestra-only groups [384, 2104, 2113]
+orchestra-only message 4 tags [1744]
+orchestra-only message 5 tags [789]
+orchestra-only message A tags [372, 384, 385, 1130, 1131, 1406, 1410, 1600, 1601, 1602, 1603, 1604, 1605]
+orchestra-only message n tags [2104, 2105, 2106, 2107, 2108, 2109, 2110, 2111, 2112, 2113, 2114]
+
+# QuickFIX defines MsgTypeGrp as an empty component and HopGrp, which
+# Orchestra holds as a group.
+quickfix-only component MsgTypeGrp

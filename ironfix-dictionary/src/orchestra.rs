@@ -15,24 +15,31 @@
 //!
 //! # What is tested
 //!
-//! The loader is exercised against the FIX Trading Community's
-//! `OrchestraFIX44.xml` (FIX 4.4 as of Extension Pack 311), vendored as a
-//! test fixture and compared with the embedded QuickFIX FIX 4.4 dictionary,
-//! and against synthetic documents. No other version's standard repository
-//! is exercised.
+//! The loader is exercised against four of the FIX Trading Community's
+//! repositories, vendored as test fixtures: `OrchestraFIX42.xml` (FIX 4.2 as
+//! of Extension Pack 310), `OrchestraFIX44.xml` (FIX 4.4 as of Extension Pack
+//! 311), `FIXTSession.xml` (the FIXT session layer) and
+//! `OrchestraFIXLatest.xml` (FIX Latest as of Extension Pack 312, read as FIX
+//! 5.0 SP2 by [`Dictionary::from_orchestra_latest_xml`]). Each result is
+//! compared with the embedded QuickFIX dictionary of its version, and every
+//! difference is listed in `doc/orchestra_differences.md`.
+//! The loader is also exercised against synthetic documents. No other
+//! version's standard repository is exercised.
 //!
 //! # Mapping
 //!
 //! | Orchestra | [`Dictionary`] |
 //! |---|---|
 //! | `repository/@version` (`FIX.4.0` to `FIX.4.4`, `FIX.5.0`, `FIX.5.0SP1`, `FIX.5.0SP2`, `FIXT.1.1`, each optionally `_EP<n>`) | [`Dictionary::version`] |
+//! | `repository` named `FIXT` declaring `FIX.5.0SP2_EP<n>`, when it is the FIXT session layer (see below) | [`Version::Fixt11`] |
 //! | `field` (`id` is the tag) | [`FieldDef`] |
+//! | a field's `lengthId`, naming an `int` field | that field's type becomes [`FieldType::Length`] |
 //! | `datatype`, through `baseType` when its own name is not a FIX type | [`FieldType`] |
 //! | `codeSet` / `code` named by a field's `type` | the field's type and [`FieldDef::values`] (value to code name) |
 //! | `component` named `StandardHeader` / `StandardTrailer` | [`Dictionary::header`] / [`Dictionary::trailer`] and their groups |
 //! | any other `component` | [`ComponentDef`](crate::ComponentDef) |
 //! | `group`, at each `groupRef` | a [`GroupDef`](crate::GroupDef) named after its `numInGroup` field, as QuickFIX names groups (`NoPartyIDs`, not `Parties`) |
-//! | `message` | [`MessageDef`](crate::MessageDef): category `Session` is [`MessageCategory::Admin`], any other [`MessageCategory::App`] |
+//! | `message` | [`MessageDef`](crate::MessageDef): category `Session` is [`MessageCategory::Admin`], any other [`MessageCategory::App`]; when no message has a category, the session message types (see below) are [`MessageCategory::Admin`] |
 //! | `presence="required"` / `"optional"` | `required` |
 //!
 //! Members keep the order the repository lists them in. A group's delimiter
@@ -42,12 +49,60 @@
 //! members become optional too (a group's entries keep their own required
 //! members).
 //!
-//! Only the `base` scenario is loaded. Two versions are
-//! [`DictionaryError::UnsupportedVersion`]: `FIX.Latest`, which names no
-//! fixed FIX version, and a repository named `FIXT` whose version is not
-//! `FIXT.1.1`. The FIX Trading Community's FIXT session repository is one:
-//! it declares `FIX.5.0SP2_EP247`, an application version, where it describes
-//! the FIXT.1.1 session layer, so the version cannot be taken from it.
+//! Only the `base` scenario is loaded. `FIX.Latest`, which names no fixed
+//! FIX version, is [`DictionaryError::UnsupportedVersion`]; see below for
+//! the import that reads it as FIX 5.0 SP2.
+//!
+//! A repository whose messages carry no `category` attribute at all (the
+//! FIX Trading Community's FIX 4.2 one) does not say which are session
+//! messages. There the FIX session message types, Heartbeat (`0`) to
+//! Logout (`5`), Logon (`A`) and XMLnonFIX (`n`), are
+//! [`MessageCategory::Admin`]; every other message is
+//! [`MessageCategory::App`]. When any message has a category, the
+//! categories are the repository's.
+//!
+//! A repository named `FIXT` describes the FIXT.1.1 session layer. One that
+//! declares `FIXT.1.1` loads as [`Version::Fixt11`]. The FIX Trading
+//! Community's FIXT session repository declares `FIX.5.0SP2_EP247` instead:
+//! the application version it was published with, not the version it
+//! describes. Such a repository loads as [`Version::Fixt11`] only when its
+//! content is the session layer, checked once it is read:
+//!
+//! - its version is `FIX.5.0SP2` with an extension pack (`_EP<n>`);
+//! - every message is in the `Session` category and is a FIXT.1.1 session
+//!   message: Heartbeat (`0`), TestRequest (`1`), ResendRequest (`2`),
+//!   Reject (`3`), SequenceReset (`4`), Logout (`5`), Logon (`A`) or
+//!   XMLnonFIX (`n`), and a Logon is among them;
+//! - it defines `ApplVerID(1128)` and `DefaultApplVerID(1137)`, through
+//!   which FIXT.1.1 names the application version it carries.
+//!
+//! Any other repository named `FIXT` whose version is not `FIXT.1.1` is
+//! [`DictionaryError::UnsupportedVersion`]; the rule is not a relaxation of
+//! the version check for other repositories.
+//!
+//! # FIX Latest read as FIX 5.0 SP2
+//!
+//! FIX Latest is FIX 5.0 SP2 with every extension pack published since, and
+//! the FIX Trading Community no longer publishes a FIX 5.0 SP2 repository.
+//! [`Dictionary::from_orchestra_latest_xml`] derives one from a FIX Latest
+//! repository (version `FIX.Latest`, optionally `_EP<n>`) by its pedigree,
+//! and accepts no other target than [`Version::Fix50Sp2`]:
+//!
+//! - a field, code, component, group, message or member reference is kept
+//!   when its `added` names FIX 5.0 SP2 or an earlier version, and left out
+//!   when it names `FIX.Latest`; FIXT.1.1 counts as FIX 5.0, and an extension
+//!   pack within a version (`addedEP`) does not matter;
+//! - one whose `deprecated` names FIX 5.0 SP2 or earlier is left out too;
+//! - an element without `added` is kept, and a pedigree value that names no
+//!   FIX version is reported and does not leave the element out;
+//! - a reference to a left-out definition is dropped, and so is a group
+//!   whose count field, or every member, is left out that way; a reference
+//!   to an id the repository never defined is still a dangling id;
+//! - datatypes and code sets are kept whole; their codes are filtered.
+//!
+//! Left-out elements are not reported. The pedigree says when an element
+//! entered and left the standard, not what it looked like then: an element
+//! changed after FIX 5.0 SP2 (`updated`) keeps its latest form.
 //!
 //! # Reported, not mapped
 //!
@@ -65,9 +120,9 @@
 //! - a conditional presence `rule`, with its presence and `when` condition
 //!   (not evaluated: the member keeps its static presence);
 //! - an attribute that constrains values the model cannot hold, such as
-//!   `minInclusive`, `implMaxLength`, `implMaxOccurs`, `lengthId`,
-//!   `discriminatorId` or `unionDataType`, and any attribute Orchestra 1.0
-//!   does not define;
+//!   `minInclusive`, `implMaxLength`, `implMaxOccurs`, `discriminatorId`
+//!   or `unionDataType`, a `lengthId` that names no `int` or `Length` field,
+//!   and any attribute Orchestra 1.0 does not define;
 //! - a group or code set nothing references: the dictionary holds a group
 //!   only where it is referenced, and a code set only on its fields. It is
 //!   still checked like the others.
@@ -500,8 +555,9 @@ impl Dictionary {
     /// # Errors
     /// Returns [`DictionaryError`] if the document is not a well-formed
     /// Orchestra 1.0 repository, declares a version the loader cannot map
-    /// (`FIX.Latest`, or a repository named `FIXT` whose version is not
-    /// `FIXT.1.1`), holds a dangling, duplicate or invalid id, a group or
+    /// (`FIX.Latest`, or a repository named `FIXT` whose version is neither
+    /// `FIXT.1.1` nor, for the FIXT session layer, a FIX 5.0 SP2 extension
+    /// pack), holds a dangling, duplicate or invalid id, a group or
     /// component cycle, a datatype or code set that maps to no FIX data type,
     /// a group without a count field or without members, or exceeds one of
     /// the size, length, report, field-value and depth limits.
@@ -512,17 +568,65 @@ impl Dictionary {
                 limit: MAX_ORCHESTRA_DOCUMENT_LEN,
             });
         }
-        let mut parser = Parser::new(xml);
-        let raw = parser.repository()?;
-        let mut report = parser.report;
-        let dictionary = build(&raw, &mut report)?;
-        Ok(OrchestraImport {
-            dictionary,
-            report: OrchestraReport {
-                entries: report.entries,
-            },
-        })
+        let parser = Parser::new(xml);
+        load(parser)
     }
+
+    /// Derives a FIX 5.0 SP2 dictionary from a FIX Latest Orchestra
+    /// repository.
+    ///
+    /// FIX Latest is FIX 5.0 SP2 with every extension pack since, and names
+    /// no fixed version, so [`Dictionary::from_orchestra_xml`] rejects it.
+    /// This import reads it as `target` instead, keeping only what its
+    /// pedigree places in that version: every field, code, component,
+    /// group, message and member reference added at or before `target`
+    /// (`added`) and not deprecated at or before it (`deprecated`).
+    /// References to what is left out are dropped, and so is a group that
+    /// loses its count field or every member that way. See the
+    /// [`orchestra`](crate::orchestra) module docs for the rule and its
+    /// limits: an element changed after `target` (`updated`) keeps its
+    /// latest form.
+    ///
+    /// # Arguments
+    /// * `xml` - The FIX Latest repository document
+    /// * `target` - The version to derive; only [`Version::Fix50Sp2`]
+    ///
+    /// # Errors
+    /// [`DictionaryError::UnsupportedVersion`] if `target` is not
+    /// [`Version::Fix50Sp2`] or the repository is not `FIX.Latest`, and
+    /// otherwise every error [`Dictionary::from_orchestra_xml`] returns.
+    pub fn from_orchestra_latest_xml(
+        xml: &str,
+        target: Version,
+    ) -> Result<OrchestraImport, DictionaryError> {
+        if target != Version::Fix50Sp2 {
+            return Err(DictionaryError::UnsupportedVersion(format!(
+                "{target:?} from FIX.Latest"
+            )));
+        }
+        if xml.len() > MAX_ORCHESTRA_DOCUMENT_LEN {
+            return Err(DictionaryError::DocumentTooLarge {
+                len: xml.len(),
+                limit: MAX_ORCHESTRA_DOCUMENT_LEN,
+            });
+        }
+        let mut parser = Parser::new(xml);
+        parser.target = Some(target);
+        load(parser)
+    }
+}
+
+/// Reads and builds a repository with `parser`.
+fn load(mut parser: Parser<'_>) -> Result<OrchestraImport, DictionaryError> {
+    let raw = parser.repository()?;
+    let mut report = parser.report;
+    let dictionary = build(&raw, &mut report)?;
+    Ok(OrchestraImport {
+        dictionary,
+        report: OrchestraReport {
+            entries: report.entries,
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +634,7 @@ impl Dictionary {
 // ---------------------------------------------------------------------------
 
 /// The kind of definition a member references.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum RefKind {
     /// A `fieldRef`.
     Field,
@@ -571,6 +675,8 @@ struct RawField {
     id: u32,
     name: String,
     type_name: String,
+    /// `lengthId`: the field that carries this one's length, as written.
+    length_id: Option<String>,
 }
 
 /// A `component` in the `base` scenario.
@@ -611,6 +717,11 @@ struct Raw {
     components: Vec<RawComponent>,
     groups: Vec<RawGroup>,
     messages: Vec<RawMessage>,
+    /// Whether any message carries a `category` attribute.
+    categorized: bool,
+    /// Definitions left out by their pedigree ([`Parser::in_target`]), so
+    /// that references to them are pruned rather than dangling.
+    excluded: HashSet<(RefKind, u32)>,
 }
 
 impl Raw {
@@ -623,6 +734,86 @@ impl Raw {
             components: Vec::new(),
             groups: Vec::new(),
             messages: Vec::new(),
+            categorized: false,
+            excluded: HashSet::new(),
+        }
+    }
+
+    /// Removes every reference to a definition left out by its pedigree,
+    /// and every group that loses its count field or all its members that
+    /// way. A reference to an id the repository never defined is left
+    /// alone, so it is still a dangling id, and a group the repository
+    /// defines without members is still an empty group.
+    ///
+    /// Linear in the members of the repository: a reverse index from each
+    /// definition to the groups that reference it drives a worklist, so a
+    /// chain of nested groups is pruned in one pass rather than one pass per
+    /// level.
+    fn prune_excluded(&mut self) {
+        if self.excluded.is_empty() {
+            return;
+        }
+        // Per group, how many of its members are still in; per definition,
+        // the groups that list it as a member. A count field is a field, and
+        // only fields excluded by pedigree are excluded, so the count fields
+        // are checked once, up front.
+        let mut live: Vec<usize> = Vec::with_capacity(self.groups.len());
+        let mut used_by: HashMap<(RefKind, u32), Vec<usize>> = HashMap::new();
+        let mut gone: HashSet<usize> = HashSet::new();
+        let mut work: Vec<usize> = Vec::new();
+        for (index, group) in self.groups.iter().enumerate() {
+            let mut members = 0;
+            for member in &group.members {
+                if !self.excluded.contains(&(member.kind, member.id)) {
+                    members += 1;
+                    used_by
+                        .entry((member.kind, member.id))
+                        .or_default()
+                        .push(index);
+                }
+            }
+            live.push(members);
+            let lost_count = group
+                .count
+                .is_some_and(|count| self.excluded.contains(&(RefKind::Field, count)));
+            let emptied = members == 0 && !group.members.is_empty();
+            if (lost_count || emptied) && gone.insert(index) {
+                work.push(index);
+            }
+        }
+        while let Some(index) = work.pop() {
+            let Some(group) = self.groups.get(index) else {
+                continue;
+            };
+            let key = (RefKind::Group, group.id);
+            self.excluded.insert(key);
+            for &user in used_by.get(&key).map_or(&[][..], Vec::as_slice) {
+                if let Some(members) = live.get_mut(user)
+                    && let Some(left) = members.checked_sub(1)
+                {
+                    *members = left;
+                    if left == 0 && gone.insert(user) {
+                        work.push(user);
+                    }
+                }
+            }
+        }
+        let excluded = &self.excluded;
+        let kept = |member: &RawRef| !excluded.contains(&(member.kind, member.id));
+        for component in &mut self.components {
+            component.members.retain(kept);
+        }
+        for message in &mut self.messages {
+            message.members.retain(kept);
+        }
+        let mut index = 0;
+        self.groups.retain(|_| {
+            let keep = !gone.contains(&index);
+            index += 1;
+            keep
+        });
+        for group in &mut self.groups {
+            group.members.retain(kept);
         }
     }
 }
@@ -797,6 +988,92 @@ fn parse_version(version: &str) -> Result<Version, DictionaryError> {
     }
 }
 
+/// The message types of the FIXT.1.1 session layer: Heartbeat, TestRequest,
+/// ResendRequest, Reject, SequenceReset, Logout, Logon and XMLnonFIX.
+///
+/// These are the administrative messages the FIX Transport (FIXT) 1.1
+/// specification defines in its "Administrative Messages" section (the
+/// FIX Session Protocol's session-level messages, carried over unchanged
+/// by FIXT.1.1); every other message type is application-level. See also
+/// `doc/fix_operations.md`, "Session Layer Messages".
+const FIXT_SESSION_MSG_TYPES: [&str; 8] = ["0", "1", "2", "3", "4", "5", "A", "n"];
+
+/// `ApplVerID(1128)` and `DefaultApplVerID(1137)`: the fields through which
+/// FIXT.1.1 names the application version it carries.
+///
+/// The FIXT 1.1 specification's application version selection rules put
+/// `DefaultApplVerID(1137)` in the Logon (required: the session's default
+/// application version) and `ApplVerID(1128)` in the standard header (a
+/// per-message override); a session layer that defines neither cannot
+/// carry an application version. See `doc/fix_operations.md`, "Logon
+/// (MsgType = A)" (tag 1137).
+const FIXT_APPL_VER_ID_TAGS: [u32; 2] = [1128, 1137];
+
+/// The error for a repository named `FIXT` that declares `declared`.
+fn fixt_unsupported(declared: &str) -> DictionaryError {
+    DictionaryError::UnsupportedVersion(format!("{declared} (repository FIXT)"))
+}
+
+/// Whether a repository named `FIXT` that declares an extension pack of FIX
+/// 5.0 SP2 describes the FIXT.1.1 session layer: it defines a Logon, every
+/// message it defines is a FIXT.1.1 session message of the `Session`
+/// category, and it defines `ApplVerID(1128)` and `DefaultApplVerID(1137)`.
+fn is_fixt_session_layer(raw: &Raw) -> bool {
+    let session_only = raw.messages.iter().all(|message| {
+        message.category == MessageCategory::Admin
+            && FIXT_SESSION_MSG_TYPES.contains(&message.msg_type.as_str())
+    });
+    let has_logon = raw.messages.iter().any(|message| message.msg_type == "A");
+    let has_appl_ver_id = FIXT_APPL_VER_ID_TAGS
+        .iter()
+        .all(|tag| raw.fields.iter().any(|field| field.id == *tag));
+    session_only && has_logon && has_appl_ver_id
+}
+
+/// Whether `version` is `FIX.Latest`, optionally with an extension pack.
+fn is_fix_latest(version: &str) -> bool {
+    match version.split_once("_EP") {
+        Some((name, pack)) => {
+            name == "FIX.Latest" && !pack.is_empty() && pack.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => version == "FIX.Latest",
+    }
+}
+
+/// The order of the FIX versions a pedigree attribute names: FIX.2.7 first,
+/// FIX Latest last. FIXT.1.1 was published with FIX 5.0.
+fn pedigree_rank(version: &str) -> Option<u32> {
+    let name = version.split_once("_EP").map_or(version, |(name, _)| name);
+    match name {
+        "FIX.2.7" => Some(27),
+        "FIX.3.0" => Some(30),
+        "FIX.4.0" => Some(40),
+        "FIX.4.1" => Some(41),
+        "FIX.4.2" => Some(42),
+        "FIX.4.3" => Some(43),
+        "FIX.4.4" => Some(44),
+        "FIX.5.0" | "FIXT.1.1" => Some(50),
+        "FIX.5.0SP1" => Some(51),
+        "FIX.5.0SP2" => Some(52),
+        "FIX.Latest" => Some(99),
+        _ => None,
+    }
+}
+
+/// The [`pedigree_rank`] of `version`.
+const fn version_rank(version: Version) -> u32 {
+    match version {
+        Version::Fix40 => 40,
+        Version::Fix41 => 41,
+        Version::Fix42 => 42,
+        Version::Fix43 => 43,
+        Version::Fix44 => 44,
+        Version::Fix50 | Version::Fixt11 => 50,
+        Version::Fix50Sp1 => 51,
+        Version::Fix50Sp2 => 52,
+    }
+}
+
 fn xml_err(e: impl fmt::Display) -> DictionaryError {
     DictionaryError::Xml(e.to_string())
 }
@@ -811,6 +1088,9 @@ struct Parser<'i> {
     /// Depth of the element the reader is inside; the root is 1.
     depth: usize,
     report: Report,
+    /// The version a FIX Latest repository is filtered to by pedigree, or
+    /// `None` to read the repository as the version it declares.
+    target: Option<Version>,
 }
 
 impl<'i> Parser<'i> {
@@ -819,7 +1099,41 @@ impl<'i> Parser<'i> {
             reader: NsReader::from_str(xml),
             depth: 0,
             report: Report::default(),
+            target: None,
         }
+    }
+
+    /// Whether the element whose attributes are `attrs` is part of the
+    /// target version, by its pedigree: added at or before it, and not
+    /// deprecated at or before it. Always `true` without a target. An
+    /// element without an `added` attribute is kept; a pedigree value that
+    /// names no FIX version is reported, and does not exclude the element.
+    fn in_target(&mut self, attrs: &mut Attrs, location: &str) -> Result<bool, DictionaryError> {
+        let Some(target) = self.target else {
+            return Ok(true);
+        };
+        let target = version_rank(target);
+        let mut keep = true;
+        for (name, excludes) in [
+            (
+                "added",
+                (|rank, target| rank > target) as fn(u32, u32) -> bool,
+            ),
+            ("deprecated", |rank, target| rank <= target),
+        ] {
+            let Some(value) = attrs.take(name) else {
+                continue;
+            };
+            match pedigree_rank(&value) {
+                Some(rank) => keep &= !excludes(rank, target),
+                None => self.report.push(UnmappedConstruct::Attribute {
+                    location: location.to_owned(),
+                    name: name.to_owned(),
+                    value,
+                })?,
+            }
+        }
+        Ok(keep)
     }
 
     /// Records entering an element, refusing nesting past
@@ -1021,16 +1335,32 @@ impl<'i> Parser<'i> {
         let root = self.root()?;
         let mut attrs = Attrs::read(&root.start)?;
         let declared = attrs.required("repository", "version")?;
-        let version = parse_version(&declared)?;
+        let version = match self.target {
+            Some(target) => {
+                if !is_fix_latest(&declared) {
+                    return Err(DictionaryError::UnsupportedVersion(format!(
+                        "{declared} (expected FIX.Latest)"
+                    )));
+                }
+                target
+            }
+            None => parse_version(&declared)?,
+        };
         // The stable name (`FIX.4.4`, `FIXT`) is descriptive, except that a
-        // FIXT repository can only describe FIXT.1.1: one that declares
-        // another version (the FIX Trading Community's session repository
-        // declares `FIX.5.0SP2_EP247`) names no version the loader can map.
-        if attrs.take("name").as_deref() == Some("FIXT") && version != Version::Fixt11 {
-            return Err(DictionaryError::UnsupportedVersion(format!(
-                "{declared} (repository FIXT)"
-            )));
-        }
+        // FIXT repository can only describe FIXT.1.1. One that declares
+        // another version names no version the loader can map, unless it is
+        // the session layer published under an extension pack of FIX 5.0
+        // SP2 (the FIX Trading Community's session repository declares
+        // `FIX.5.0SP2_EP247`): that is decided once its content is read.
+        let fixt_session =
+            if attrs.take("name").as_deref() == Some("FIXT") && version != Version::Fixt11 {
+                if version != Version::Fix50Sp2 || !declared.contains("_EP") {
+                    return Err(fixt_unsupported(&declared));
+                }
+                true
+            } else {
+                false
+            };
         attrs.report_rest("repository", &mut self.report)?;
         let mut raw = Raw::new(version);
         if !root.empty {
@@ -1061,6 +1391,22 @@ impl<'i> Parser<'i> {
             }
         }
         self.rest()?;
+        raw.prune_excluded();
+        // A repository whose messages carry no category (the FIX Trading
+        // Community's FIX 4.2 one) still holds the session messages.
+        if !raw.categorized {
+            for message in &mut raw.messages {
+                if FIXT_SESSION_MSG_TYPES.contains(&message.msg_type.as_str()) {
+                    message.category = MessageCategory::Admin;
+                }
+            }
+        }
+        if fixt_session {
+            if !is_fixt_session_layer(&raw) {
+                return Err(fixt_unsupported(&declared));
+            }
+            raw.version = Version::Fixt11;
+        }
         Ok(raw)
     }
 
@@ -1200,8 +1546,12 @@ impl<'i> Parser<'i> {
             let value = attrs.required("code", "value")?;
             let scenario = attrs.take("scenario");
             let location = format!("{set_location}/code {name}");
+            let in_target = self.in_target(&mut attrs, &location)?;
             attrs.report_rest(&location, &mut self.report)?;
             self.leaf_children(&child, &location, &[])?;
+            if !in_target {
+                continue;
+            }
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
                 self.report.push(UnmappedConstruct::Scenario {
                     kind: OrchestraKind::Code,
@@ -1236,8 +1586,15 @@ impl<'i> Parser<'i> {
             let name = attrs.required("field", "name")?;
             let type_name = attrs.required("field", "type")?;
             let scenario = attrs.take("scenario");
+            let length_id = attrs.take("lengthId");
             let location = format!("field {name}");
+            let in_target = self.in_target(&mut attrs, &location)?;
             attrs.report_rest(&location, &mut self.report)?;
+            if !in_target {
+                raw.excluded.insert((RefKind::Field, id));
+                self.skip(&child)?;
+                continue;
+            }
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
                 self.report.push(UnmappedConstruct::Scenario {
                     kind: OrchestraKind::Field,
@@ -1252,6 +1609,7 @@ impl<'i> Parser<'i> {
                 id,
                 name,
                 type_name,
+                length_id,
             });
         }
         Ok(())
@@ -1272,7 +1630,13 @@ impl<'i> Parser<'i> {
             let name = attrs.required("component", "name")?;
             let scenario = attrs.take("scenario");
             let location = format!("component {name}");
+            let in_target = self.in_target(&mut attrs, &location)?;
             attrs.report_rest(&location, &mut self.report)?;
+            if !in_target {
+                raw.excluded.insert((RefKind::Component, id));
+                self.skip(&child)?;
+                continue;
+            }
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
                 self.report.push(UnmappedConstruct::Scenario {
                     kind: OrchestraKind::Component,
@@ -1303,7 +1667,13 @@ impl<'i> Parser<'i> {
             let name = attrs.required("group", "name")?;
             let scenario = attrs.take("scenario");
             let location = format!("group {name}");
+            let in_target = self.in_target(&mut attrs, &location)?;
             attrs.report_rest(&location, &mut self.report)?;
+            if !in_target {
+                raw.excluded.insert((RefKind::Group, id));
+                self.skip(&child)?;
+                continue;
+            }
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
                 self.report.push(UnmappedConstruct::Scenario {
                     kind: OrchestraKind::Group,
@@ -1339,13 +1709,20 @@ impl<'i> Parser<'i> {
             let name = attrs.required("message", "name")?;
             let msg_type = attrs.required("message", "msgType")?;
             let scenario = attrs.take("scenario");
-            let category = if attrs.take("category").as_deref() == Some(ADMIN_CATEGORY) {
+            let category = attrs.take("category");
+            raw.categorized |= category.is_some();
+            let category = if category.as_deref() == Some(ADMIN_CATEGORY) {
                 MessageCategory::Admin
             } else {
                 MessageCategory::App
             };
             let location = format!("message {name}");
+            let in_target = self.in_target(&mut attrs, &location)?;
             attrs.report_rest(&location, &mut self.report)?;
+            if !in_target {
+                self.skip(&child)?;
+                continue;
+            }
             if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
                 self.report.push(UnmappedConstruct::Scenario {
                     kind: OrchestraKind::Message,
@@ -1498,6 +1875,7 @@ impl<'i> Parser<'i> {
                 false
             }
         };
+        let in_target = self.in_target(&mut attrs, &member_location)?;
         attrs.report_rest(&member_location, &mut self.report)?;
         self.leaf_children(child, &member_location, &[])?;
         if let Some(scenario) = scenario.filter(|s| s != BASE_SCENARIO) {
@@ -1507,7 +1885,7 @@ impl<'i> Parser<'i> {
             })?;
             return Ok(None);
         }
-        Ok(keep.then_some(RawRef { kind, id, required }))
+        Ok((keep && in_target).then_some(RawRef { kind, id, required }))
     }
 }
 
@@ -1975,6 +2353,44 @@ fn report_unreferenced(
     Ok(())
 }
 
+/// Maps each field's `lengthId`: the field it names carries the field's
+/// length, so an `int` one is typed [`FieldType::Length`], as FIX types it
+/// from 4.3 on (FIX 4.2 has no `Length` datatype, and its repository types
+/// these fields `int`). A `lengthId` that is not an id, that names no
+/// field, or that names a field of another type than `int` or `Length` is
+/// reported instead.
+fn map_length_ids(
+    raw: &Raw,
+    field_defs: &mut [FieldDef],
+    report: &mut Report,
+) -> Result<(), DictionaryError> {
+    let positions: HashMap<u32, usize> = field_defs
+        .iter()
+        .enumerate()
+        .map(|(position, def)| (def.tag, position))
+        .collect();
+    for field in &raw.fields {
+        let Some(value) = &field.length_id else {
+            continue;
+        };
+        let target = value
+            .parse::<u32>()
+            .ok()
+            .and_then(|id| positions.get(&id))
+            .and_then(|position| field_defs.get_mut(*position))
+            .filter(|def| matches!(def.field_type, FieldType::Int | FieldType::Length));
+        match target {
+            Some(def) => def.field_type = FieldType::Length,
+            None => report.push(UnmappedConstruct::Attribute {
+                location: format!("field {}", field.name),
+                name: "lengthId".to_owned(),
+                value: value.clone(),
+            })?,
+        }
+    }
+    Ok(())
+}
+
 /// Builds the dictionary from the parsed definitions, adding the
 /// unreferenced definitions to `report`.
 fn build(raw: &Raw, report: &mut Report) -> Result<Dictionary, DictionaryError> {
@@ -2007,6 +2423,7 @@ fn build(raw: &Raw, report: &mut Report) -> Result<Dictionary, DictionaryError> 
         }
         field_defs.push(def);
     }
+    map_length_ids(raw, &mut field_defs, report)?;
 
     let components = by_id(&raw.components, |c| c.id, OrchestraKind::Component)?;
     let groups = by_id(&raw.groups, |g| g.id, OrchestraKind::Group)?;
@@ -3320,6 +3737,379 @@ mod tests {
         .xml()
         .replace(r#"name="FIX.4.4""#, r#"name="FIXT""#);
         assert_eq!(load(&transport).dictionary().version, Version::Fixt11);
+    }
+
+    /// A FIX Latest repository whose definitions carry pedigrees.
+    fn latest_doc() -> Doc {
+        let mut doc = Doc {
+            version: "FIX.Latest_EP312".to_owned(),
+            ..Doc::default()
+        };
+        doc.fields.push_str(
+            r#"
+            <fixr:field id="1" name="Account" type="String" added="FIX.4.4"/>
+            <fixr:field id="2" name="AdvId" type="String" added="FIX.Latest" addedEP="281"/>
+            <fixr:field id="3" name="AdvRefID" type="String" added="FIX.4.2" deprecated="FIX.5.0"/>
+            <fixr:field id="4" name="LateCount" type="NumInGroup" added="FIX.Latest"/>"#,
+        );
+        doc.code_sets = r#"
+            <fixr:codeSet id="54" name="SideCodeSet" type="char">
+              <fixr:code id="54001" name="Buy" value="1" added="FIX.2.7"/>
+              <fixr:code id="54002" name="Sell" value="2" added="FIX.2.7"/>
+              <fixr:code id="54003" name="Late" value="Z" added="FIX.Latest"/>
+            </fixr:codeSet>"#
+            .to_owned();
+        doc.groups.push_str(
+            r#"
+            <fixr:group id="2001" name="LateGrp" added="FIX.5.0SP2">
+              <fixr:numInGroup id="4"/>
+              <fixr:fieldRef id="1"/>
+            </fixr:group>"#,
+        );
+        doc.messages.push_str(
+            r#"
+            <fixr:message id="15" name="Late" msgType="EC" category="Other" added="FIX.Latest">
+              <fixr:structure>
+                <fixr:fieldRef id="11" presence="required"/>
+              </fixr:structure>
+            </fixr:message>
+            <fixr:message id="16" name="Advert" msgType="7" category="Other" added="FIX.2.7">
+              <fixr:structure>
+                <fixr:fieldRef id="1" added="FIX.4.4"/>
+                <fixr:fieldRef id="2" added="FIX.Latest"/>
+                <fixr:fieldRef id="3" added="FIX.4.2" deprecated="FIX.5.0"/>
+                <fixr:fieldRef id="55" added="FIX.Latest"/>
+                <fixr:groupRef id="2001" added="FIX.5.0SP2"/>
+              </fixr:structure>
+            </fixr:message>"#,
+        );
+        doc
+    }
+
+    fn load_latest(xml: &str) -> OrchestraImport {
+        match Dictionary::from_orchestra_latest_xml(xml, Version::Fix50Sp2) {
+            Ok(import) => import,
+            Err(err) => panic!("expected the FIX Latest repository to load: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_latest_import_keeps_what_its_pedigree_places_in_fix50sp2() {
+        let import = load_latest(&latest_doc().xml());
+        let dict = import.dictionary();
+        assert_eq!(dict.version, Version::Fix50Sp2);
+        // Added at or before FIX 5.0 SP2: kept. Added later, or deprecated
+        // by then: left out.
+        assert!(dict.get_field(1).is_some());
+        assert!(dict.get_field(2).is_none());
+        assert!(dict.get_field(3).is_none());
+        assert!(dict.get_field(4).is_none());
+        assert!(dict.get_message("EC").is_none());
+        let Some(side) = dict.get_field(54) else {
+            panic!("Side is defined");
+        };
+        let mut values: Vec<&String> = side.values.iter().flat_map(|v| v.keys()).collect();
+        values.sort();
+        assert_eq!(values, ["1", "2"]);
+        // The references to what is left out are pruned, the group whose
+        // count field is left out with them.
+        let Some(advert) = dict.get_message("7") else {
+            panic!("Advertisement is defined");
+        };
+        assert_eq!(listed(advert.members()), ["field 1"]);
+        assert!(import.report().is_empty(), "{:?}", import.report());
+    }
+
+    #[test]
+    fn test_latest_import_prunes_a_deep_chain_of_nested_groups_in_one_pass() {
+        // Group i nests group i + 1 and nothing else; the last one holds
+        // only a field FIX Latest added. Leaving that field out empties the
+        // last group, which empties the one before it, and so on: the whole
+        // chain goes, and so does the message's reference to its head.
+        const DEPTH: u32 = 5_000;
+        let mut doc = latest_doc();
+        let mut groups = String::new();
+        for i in 0..DEPTH {
+            let count = 100_000 + i;
+            doc.fields.push_str(&format!(
+                r#"<fixr:field id="{count}" name="NoChain{i}" type="NumInGroup" added="FIX.4.4"/>"#
+            ));
+            let member = if i + 1 == DEPTH {
+                r#"<fixr:fieldRef id="2" added="FIX.4.4"/>"#.to_owned()
+            } else {
+                format!(
+                    r#"<fixr:groupRef id="{}" added="FIX.4.4"/>"#,
+                    300_000 + i + 1
+                )
+            };
+            groups.push_str(&format!(
+                r#"<fixr:group id="{}" name="Chain{i}" added="FIX.4.4"><fixr:numInGroup id="{count}"/>{member}</fixr:group>"#,
+                300_000 + i
+            ));
+        }
+        doc.groups.push_str(&groups);
+        doc.messages.push_str(
+            r#"
+            <fixr:message id="17" name="Chained" msgType="8" category="Other" added="FIX.4.4">
+              <fixr:structure>
+                <fixr:fieldRef id="1"/>
+                <fixr:groupRef id="300000"/>
+              </fixr:structure>
+            </fixr:message>"#,
+        );
+        let import = load_latest(&doc.xml());
+        let Some(chained) = import.dictionary().get_message("8") else {
+            panic!("Chained is defined");
+        };
+        assert_eq!(listed(chained.members()), ["field 1"]);
+    }
+
+    #[test]
+    fn test_latest_import_reports_an_unknown_pedigree_and_keeps_the_element() {
+        let doc =
+            Doc::with_fields(r#"<fixr:field id="5" name="Odd" type="String" added="FIX.9.9"/>"#);
+        let xml = doc.xml().replace("FIX.4.4_EP311", "FIX.Latest");
+        let import = load_latest(&xml);
+        assert!(import.dictionary().get_field(5).is_some());
+        assert_eq!(
+            import.report().entries(),
+            [UnmappedConstruct::Attribute {
+                location: "field Odd".to_owned(),
+                name: "added".to_owned(),
+                value: "FIX.9.9".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_latest_import_requires_fix_latest_and_targets_fix50sp2_only() {
+        let latest = latest_doc().xml();
+        assert_eq!(
+            load_err(&latest),
+            DictionaryError::UnsupportedVersion("FIX.Latest_EP312".to_owned())
+        );
+        assert_eq!(
+            Dictionary::from_orchestra_latest_xml(&latest, Version::Fix50Sp1).err(),
+            Some(DictionaryError::UnsupportedVersion(
+                "Fix50Sp1 from FIX.Latest".to_owned()
+            ))
+        );
+        assert_eq!(
+            Dictionary::from_orchestra_latest_xml(&Doc::default().xml(), Version::Fix50Sp2).err(),
+            Some(DictionaryError::UnsupportedVersion(
+                "FIX.4.4_EP311 (expected FIX.Latest)".to_owned()
+            ))
+        );
+        // Without a target, pedigree is descriptive: everything loads.
+        let plain = latest_doc()
+            .xml()
+            .replace("FIX.Latest_EP312", "FIX.5.0SP2_EP312");
+        let import = load(&plain);
+        assert!(import.dictionary().get_field(2).is_some());
+        assert!(import.dictionary().get_message("EC").is_some());
+    }
+
+    #[test]
+    fn test_session_messages_are_admin_when_no_message_has_a_category() {
+        let uncategorized = Doc::default()
+            .xml()
+            .replace(r#" category="Session""#, "")
+            .replace(r#" category="SingleGeneralOrderHandling""#, "");
+        let import = load(&uncategorized);
+        let category = |msg_type: &str| match import.dictionary().get_message(msg_type) {
+            Some(message) => message.category,
+            None => panic!("message {msg_type} is defined"),
+        };
+        assert_eq!(category("0"), MessageCategory::Admin);
+        assert_eq!(category("D"), MessageCategory::App);
+        // With categories, the category is the repository's.
+        let categorized = Doc::default().xml().replace(
+            r#"msgType="0" category="Session""#,
+            r#"msgType="0" category="Other""#,
+        );
+        let import = load(&categorized);
+        let Some(heartbeat) = import.dictionary().get_message("0") else {
+            panic!("Heartbeat is defined");
+        };
+        assert_eq!(heartbeat.category, MessageCategory::App);
+    }
+
+    #[test]
+    fn test_length_id_types_an_int_length_field_length() {
+        let doc = Doc::with_fields(
+            r#"
+            <fixr:field id="95" name="RawDataLength" type="int"/>
+            <fixr:field id="96" name="RawData" type="String" lengthId="95"/>"#,
+        );
+        let import = load(&doc.xml());
+        let Some(length) = import.dictionary().get_field(95) else {
+            panic!("tag 95 is defined");
+        };
+        assert_eq!(length.field_type, FieldType::Length);
+        assert!(import.report().is_empty(), "{:?}", import.report());
+    }
+
+    #[test]
+    fn test_length_id_that_names_no_int_field_is_reported() {
+        for (length_id, extra) in [
+            // Names no field.
+            ("9999", ""),
+            // Not an id.
+            ("x", ""),
+            // Names a String field: its type is kept.
+            ("97", r#"<fixr:field id="97" name="Text" type="String"/>"#),
+        ] {
+            let doc = Doc::with_fields(&format!(
+                r#"{extra}<fixr:field id="96" name="RawData" type="String" lengthId="{length_id}"/>"#
+            ));
+            let import = load(&doc.xml());
+            assert_eq!(
+                import.report().entries(),
+                [UnmappedConstruct::Attribute {
+                    location: "field RawData".to_owned(),
+                    name: "lengthId".to_owned(),
+                    value: length_id.to_owned(),
+                }],
+                "{length_id}"
+            );
+        }
+        let doc = Doc::with_fields(
+            r#"<fixr:field id="97" name="Text" type="String"/>
+               <fixr:field id="96" name="RawData" type="String" lengthId="97"/>"#,
+        );
+        let import = load(&doc.xml());
+        let Some(text) = import.dictionary().get_field(97) else {
+            panic!("tag 97 is defined");
+        };
+        assert_eq!(text.field_type, FieldType::String);
+    }
+
+    /// A repository named `FIXT` holding only the Heartbeat and a Logon, with
+    /// the fields named in `appl_ver_id_fields`.
+    fn fixt_session(version: &str, appl_ver_id_fields: &str, extra_message: &str) -> String {
+        let mut doc = Doc {
+            version: version.to_owned(),
+            ..Doc::default()
+        };
+        doc.fields.push_str(appl_ver_id_fields);
+        doc.messages = format!(
+            r#"
+            <fixr:message id="1" name="Heartbeat" msgType="0" category="Session">
+              <fixr:structure>
+                <fixr:componentRef id="1024" presence="required"/>
+                <fixr:fieldRef id="112"/>
+                <fixr:componentRef id="1025" presence="required"/>
+              </fixr:structure>
+            </fixr:message>
+            <fixr:message id="11" name="Logon" msgType="A" category="Session">
+              <fixr:structure>
+                <fixr:componentRef id="1024" presence="required"/>
+                <fixr:componentRef id="1025" presence="required"/>
+              </fixr:structure>
+            </fixr:message>{extra_message}"#
+        );
+        doc.xml().replace(r#"name="FIX.4.4""#, r#"name="FIXT""#)
+    }
+
+    const APPL_VER_ID_FIELDS: &str = r#"
+        <fixr:field id="1128" name="ApplVerID" type="String"/>
+        <fixr:field id="1137" name="DefaultApplVerID" type="String"/>"#;
+
+    #[test]
+    fn test_fixt_session_layer_under_fix50sp2_extension_pack_is_fixt11() {
+        let import = load(&fixt_session("FIX.5.0SP2_EP247", APPL_VER_ID_FIELDS, ""));
+        assert_eq!(import.dictionary().version, Version::Fixt11);
+        assert!(import.dictionary().get_message("A").is_some());
+        assert!(import.dictionary().get_field(1137).is_some());
+        // XMLnonFIX (n) is a FIXT.1.1 session message too.
+        let xml_non_fix = r#"
+            <fixr:message id="47" name="XMLnonFIX" msgType="n" category="Session">
+              <fixr:structure>
+                <fixr:componentRef id="1024" presence="required"/>
+                <fixr:componentRef id="1025" presence="required"/>
+              </fixr:structure>
+            </fixr:message>"#;
+        let import = load(&fixt_session(
+            "FIX.5.0SP2_EP247",
+            APPL_VER_ID_FIELDS,
+            xml_non_fix,
+        ));
+        assert_eq!(import.dictionary().version, Version::Fixt11);
+    }
+
+    #[test]
+    fn test_fixt_repository_that_is_not_the_session_layer_is_still_rejected() {
+        let rejected = |xml: &str, declared: &str| {
+            assert_eq!(
+                load_err(xml),
+                DictionaryError::UnsupportedVersion(format!("{declared} (repository FIXT)")),
+                "{declared}"
+            );
+        };
+        // An application message.
+        let order = r#"
+            <fixr:message id="14" name="NewOrderSingle" msgType="D" category="Session">
+              <fixr:structure>
+                <fixr:fieldRef id="11" presence="required"/>
+              </fixr:structure>
+            </fixr:message>"#;
+        rejected(
+            &fixt_session("FIX.5.0SP2_EP247", APPL_VER_ID_FIELDS, order),
+            "FIX.5.0SP2_EP247",
+        );
+        // A session message type outside the Session category.
+        let app_heartbeat = r#"
+            <fixr:message id="2" name="TestRequest" msgType="1" category="Other">
+              <fixr:structure>
+                <fixr:fieldRef id="112" presence="required"/>
+              </fixr:structure>
+            </fixr:message>"#;
+        rejected(
+            &fixt_session("FIX.5.0SP2_EP247", APPL_VER_ID_FIELDS, app_heartbeat),
+            "FIX.5.0SP2_EP247",
+        );
+        // Without DefaultApplVerID(1137), or without both.
+        let appl_ver_id_only = r#"<fixr:field id="1128" name="ApplVerID" type="String"/>"#;
+        rejected(
+            &fixt_session("FIX.5.0SP2_EP247", appl_ver_id_only, ""),
+            "FIX.5.0SP2_EP247",
+        );
+        rejected(
+            &fixt_session("FIX.5.0SP2_EP247", "", ""),
+            "FIX.5.0SP2_EP247",
+        );
+        // Without a Logon.
+        let mut no_logon = Doc {
+            version: "FIX.5.0SP2_EP247".to_owned(),
+            ..Doc::default()
+        };
+        no_logon.fields.push_str(APPL_VER_ID_FIELDS);
+        no_logon.messages = r#"
+            <fixr:message id="1" name="Heartbeat" msgType="0" category="Session">
+              <fixr:structure>
+                <fixr:fieldRef id="112"/>
+              </fixr:structure>
+            </fixr:message>"#
+            .to_owned();
+        rejected(
+            &no_logon
+                .xml()
+                .replace(r#"name="FIX.4.4""#, r#"name="FIXT""#),
+            "FIX.5.0SP2_EP247",
+        );
+        // FIX 5.0 SP2 without an extension pack, and another version.
+        rejected(
+            &fixt_session("FIX.5.0SP2", APPL_VER_ID_FIELDS, ""),
+            "FIX.5.0SP2",
+        );
+        rejected(
+            &fixt_session("FIX.4.4_EP247", APPL_VER_ID_FIELDS, ""),
+            "FIX.4.4_EP247",
+        );
+        rejected(
+            &fixt_session("FIX.5.0SP1_EP97", APPL_VER_ID_FIELDS, ""),
+            "FIX.5.0SP1_EP97",
+        );
     }
 
     #[test]
