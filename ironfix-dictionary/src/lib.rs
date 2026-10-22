@@ -68,19 +68,20 @@
 //!
 //! **Orchestra loading is tested on the four embedded versions only.** The
 //! Orchestra repositories the tests load are the FIX Trading Community's FIX
-//! 4.2, FIX 4.4, FIXT session layer and FIX 5.0 SP2 ones, test fixtures that
-//! are neither embedded nor published. Each is diffed against the embedded
-//! QuickFIX dictionary of its version, and every difference is listed in
+//! 4.2, FIX 4.4, FIXT session layer and FIX Latest ones, test fixtures that
+//! are neither embedded nor published; FIX 5.0 SP2 is derived from FIX
+//! Latest by pedigree with [`Dictionary::from_orchestra_latest_xml`]. Each
+//! is diffed against the embedded QuickFIX dictionary of its version, and
+//! every difference is listed in
 //! [`doc/orchestra_differences.md`](https://github.com/joaquinbejar/IronFix/blob/main/doc/orchestra_differences.md)
-//! (Orchestra wins on a conflict). The only
-//! FIX 5.0 SP2 repository upstream is a 2019 snapshot without extension
-//! packs, so it lacks messages and fields the embedded QuickFIX FIX 5.0 SP2
-//! file has. `FIX.Latest` repositories are rejected with
+//! (Orchestra wins on a conflict). [`Dictionary::from_orchestra_xml`]
+//! rejects `FIX.Latest` repositories with
 //! [`DictionaryError::UnsupportedVersion`], because FIX Latest names no
-//! fixed FIX version. A repository named `FIXT` must declare `FIXT.1.1`, or
-//! be the FIXT session layer published under a FIX 5.0 SP2 extension pack
-//! (the FIX Trading Community's declares `FIX.5.0SP2_EP247`), which loads as
-//! FIXT 1.1; see the [`orchestra`] module docs for the rule.
+//! fixed FIX version; only the targeted import reads them. A repository
+//! named `FIXT` must declare `FIXT.1.1`, or be the FIXT session layer
+//! published under a FIX 5.0 SP2 extension pack (the FIX Trading
+//! Community's declares `FIX.5.0SP2_EP247`), which loads as FIXT 1.1; see
+//! the [`orchestra`] module docs for the rule.
 //!
 //! **[`SessionDictionary`] does not read `ApplVerID(1128)`.** The caller picks
 //! the application dictionary when building the pair; a message whose

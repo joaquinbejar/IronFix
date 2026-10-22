@@ -8,9 +8,9 @@
 # difference missing from here. Lines starting with `#` are comments.
 
 # Code sets Orchestra carries and QuickFIX leaves out. MsgType(35) and
-# RefMsgType(372) list only the session message types here: validated
-# as the transport side of a session, a 35 of an application message is
-# an invalid enum value (see doc/orchestra_differences.md).
+# RefMsgType(372) list only the session message types here; composed
+# with an application dictionary, Validator::for_session admits the union
+# of both enumerations (see doc/orchestra_differences.md).
 orchestra-only field 1128 values ["10"]
 orchestra-only field 1130 values ["0", "1", "10", "2", "3", "4", "5", "6", "7", "8", "9"]
 orchestra-only field 1137 values ["0", "1", "10", "2", "3", "4", "5", "6", "7", "8", "9"]

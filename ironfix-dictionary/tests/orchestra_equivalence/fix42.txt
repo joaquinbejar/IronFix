@@ -17,18 +17,6 @@ conflict field 327 name: orchestra HaltReason quickfix HaltReasonChar
 # the FIX 4.4 name AllocationInstructionAck.
 conflict message P name: orchestra AllocationAck quickfix AllocationInstructionAck
 
-# Session messages: the FIX 4.2 repository gives its messages no
-# category, so none is mapped to Admin; QuickFIX marks the session
-# messages admin. The engine decides what is administrative by message
-# type, not by this category.
-conflict message 0 category: orchestra App quickfix Admin
-conflict message 1 category: orchestra App quickfix Admin
-conflict message 2 category: orchestra App quickfix Admin
-conflict message 3 category: orchestra App quickfix Admin
-conflict message 4 category: orchestra App quickfix Admin
-conflict message 5 category: orchestra App quickfix Admin
-conflict message A category: orchestra App quickfix Admin
-
 # Code sets Orchestra carries and QuickFIX leaves out.
 orchestra-only field 156 values ["D", "M"]
 orchestra-only field 172 values ["0", "1"]

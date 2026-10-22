@@ -6,7 +6,8 @@
 
 //! Compares every Orchestra repository vendored under `fixtures/orchestra`
 //! (see its README for provenance) with the embedded QuickFIX dictionary of
-//! the same version: FIX 4.2, FIX 4.4, FIXT 1.1 and FIX 5.0 SP2.
+//! the same version: FIX 4.2, FIX 4.4, FIXT 1.1 and FIX 5.0 SP2 (derived from
+//! the FIX Latest repository with `Dictionary::from_orchestra_latest_xml`).
 //!
 //! The diff covers fields (tag, name, type, enumeration values), messages
 //! (message type, name, category, required fields), components (name, the
@@ -22,14 +23,18 @@
 //! summarises and justifies them. A difference missing from the allowlist
 //! fails the test, and so does an allowlisted one that no longer occurs.
 
-use ironfix_dictionary::{Dictionary, FieldType, MemberRef, Version};
+use ironfix_dictionary::{
+    Dictionary, DictionaryError, FieldType, MemberRef, MessageCategory, OrchestraImport,
+    SessionDictionary, Validator, Version,
+};
+use ironfix_tagvalue::Decoder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
 const ORCHESTRA_FIX42: &str = include_str!("fixtures/orchestra/OrchestraFIX42.xml");
 const ORCHESTRA_FIX44: &str = include_str!("fixtures/orchestra/OrchestraFIX44.xml");
 const ORCHESTRA_FIXT: &str = include_str!("fixtures/orchestra/FIXTSession.xml");
-const ORCHESTRA_FIX50SP2: &str = include_str!("fixtures/orchestra/FixRepository50SP2.xml");
+const ORCHESTRA_FIX_LATEST: &str = include_str!("fixtures/orchestra/OrchestraFIXLatest.xml");
 
 const ALLOWED_FIX42: &str = include_str!("orchestra_equivalence/fix42.txt");
 const ALLOWED_FIX44: &str = include_str!("orchestra_equivalence/fix44.txt");
@@ -372,11 +377,23 @@ fn allowed(allowlist: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Loads `xml`, checks its version, and compares it with `quickfix` against
+/// Loads `xml` with [`Dictionary::from_orchestra_xml`].
+fn load(xml: &str) -> OrchestraImport {
+    ok(Dictionary::from_orchestra_xml(xml), "the repository loads")
+}
+
+/// Derives the FIX 5.0 SP2 dictionary from the FIX Latest repository.
+fn fix50sp2_from_latest() -> OrchestraImport {
+    ok(
+        Dictionary::from_orchestra_latest_xml(ORCHESTRA_FIX_LATEST, Version::Fix50Sp2),
+        "FIX 5.0 SP2 derives from FIX Latest",
+    )
+}
+
+/// Checks the version of `import`, and compares it with `quickfix` against
 /// `allowlist`.
 #[track_caller]
-fn check(xml: &str, version: Version, quickfix: &Dictionary, allowlist: &str) {
-    let import = ok(Dictionary::from_orchestra_xml(xml), "the repository loads");
+fn check(import: &OrchestraImport, version: Version, quickfix: &Dictionary, allowlist: &str) {
     assert_eq!(import.dictionary().version, version);
     assert_eq!(quickfix.version, version);
     let found = differences(import.dictionary(), quickfix);
@@ -409,13 +426,23 @@ fn check(xml: &str, version: Version, quickfix: &Dictionary, allowlist: &str) {
 #[test]
 fn test_orchestra_fix42_matches_quickfix_but_for_the_allowlist() {
     let quickfix = ok(Dictionary::fix42(), "the embedded FIX 4.2 dictionary loads");
-    check(ORCHESTRA_FIX42, Version::Fix42, quickfix, ALLOWED_FIX42);
+    check(
+        &load(ORCHESTRA_FIX42),
+        Version::Fix42,
+        quickfix,
+        ALLOWED_FIX42,
+    );
 }
 
 #[test]
 fn test_orchestra_fix44_matches_quickfix_but_for_the_allowlist() {
     let quickfix = ok(Dictionary::fix44(), "the embedded FIX 4.4 dictionary loads");
-    check(ORCHESTRA_FIX44, Version::Fix44, quickfix, ALLOWED_FIX44);
+    check(
+        &load(ORCHESTRA_FIX44),
+        Version::Fix44,
+        quickfix,
+        ALLOWED_FIX44,
+    );
 }
 
 #[test]
@@ -424,7 +451,12 @@ fn test_orchestra_fixt_session_matches_quickfix_but_for_the_allowlist() {
         Dictionary::fixt11(),
         "the embedded FIXT 1.1 dictionary loads",
     );
-    check(ORCHESTRA_FIXT, Version::Fixt11, quickfix, ALLOWED_FIXT11);
+    check(
+        &load(ORCHESTRA_FIXT),
+        Version::Fixt11,
+        quickfix,
+        ALLOWED_FIXT11,
+    );
 }
 
 #[test]
@@ -434,7 +466,7 @@ fn test_orchestra_fix50sp2_matches_quickfix_but_for_the_allowlist() {
         "the embedded FIX 5.0 SP2 dictionary loads",
     );
     check(
-        ORCHESTRA_FIX50SP2,
+        &fix50sp2_from_latest(),
         Version::Fix50Sp2,
         quickfix,
         ALLOWED_FIX50SP2,
@@ -455,4 +487,131 @@ fn test_orchestra_fix44_types_its_int_code_sets_int() {
         };
         assert_eq!(field.field_type, FieldType::Int, "tag {tag}");
     }
+}
+
+#[test]
+fn test_fix50sp2_from_latest_holds_every_quickfix_message() {
+    let import = fix50sp2_from_latest();
+    let derived = import.dictionary();
+    let Ok(quickfix) = Dictionary::fix50sp2() else {
+        panic!("the embedded FIX 5.0 SP2 dictionary loads");
+    };
+    assert_eq!(quickfix.messages.len(), 156);
+    // Every QuickFIX message, and the eight FIXT session messages FIX
+    // Latest carries and QuickFIX keeps in FIXT11.xml.
+    assert_eq!(derived.messages.len(), 164);
+    for msg_type in quickfix.messages.keys() {
+        assert!(derived.get_message(msg_type).is_some(), "{msg_type}");
+    }
+    let session: BTreeSet<&str> = derived
+        .messages()
+        .filter(|message| message.category == MessageCategory::Admin)
+        .map(|message| message.msg_type.as_str())
+        .collect();
+    assert_eq!(
+        session,
+        BTreeSet::from(["0", "1", "2", "3", "4", "5", "A", "n"])
+    );
+    // Added after FIX 5.0 SP2, in FIX Latest: left out.
+    assert!(derived.get_message("EC").is_none());
+}
+
+#[test]
+fn test_fix_latest_is_only_read_through_the_targeted_import() {
+    assert_eq!(
+        Dictionary::from_orchestra_xml(ORCHESTRA_FIX_LATEST).err(),
+        Some(DictionaryError::UnsupportedVersion(
+            "FIX.Latest_EP312".to_owned()
+        ))
+    );
+    assert_eq!(
+        Dictionary::from_orchestra_latest_xml(ORCHESTRA_FIX_LATEST, Version::Fix44).err(),
+        Some(DictionaryError::UnsupportedVersion(
+            "Fix44 from FIX.Latest".to_owned()
+        ))
+    );
+    assert_eq!(
+        Dictionary::from_orchestra_latest_xml(ORCHESTRA_FIX44, Version::Fix50Sp2).err(),
+        Some(DictionaryError::UnsupportedVersion(
+            "FIX.4.4_EP311 (expected FIX.Latest)".to_owned()
+        ))
+    );
+}
+
+#[test]
+fn test_orchestra_fix42_session_messages_are_admin_without_categories() {
+    let import = load(ORCHESTRA_FIX42);
+    let admin: BTreeSet<&str> = import
+        .dictionary()
+        .messages()
+        .filter(|message| message.category == MessageCategory::Admin)
+        .map(|message| message.msg_type.as_str())
+        .collect();
+    assert_eq!(admin, BTreeSet::from(["0", "1", "2", "3", "4", "5", "A"]));
+}
+
+/// Builds a FIXT.1.1 frame with a computed body length and a placeholder
+/// checksum (the decoder below does not check it).
+fn fixt_frame(body: &[&str]) -> String {
+    let body: String = body.iter().map(|field| format!("{field}\x01")).collect();
+    format!("8=FIXT.1.1\x019={}\x01{body}10=000\x01", body.len())
+}
+
+/// The Orchestra FIXT session repository lists only the session message
+/// types for MsgType(35) and RefMsgType(372); composed with an application
+/// dictionary, the application's message types are valid too.
+#[test]
+fn test_orchestra_fixt_composed_with_fix50sp2_accepts_application_msg_types() {
+    let transport = load(ORCHESTRA_FIXT);
+    let application = fix50sp2_from_latest();
+    let session = ok(
+        SessionDictionary::new(transport.dictionary(), application.dictionary()),
+        "FIXT 1.1 composes with FIX 5.0 SP2",
+    );
+    let validator = Validator::for_session(&session);
+    let order = fixt_frame(&[
+        "35=D",
+        "49=CLIENT",
+        "56=BROKER",
+        "34=2",
+        "52=20260718-10:00:00",
+        "1128=9",
+        "11=ORDER-1",
+        "55=EURUSD",
+        "54=1",
+        "60=20260718-10:00:00",
+        "38=100",
+        "40=1",
+    ]);
+    let mut decoder = Decoder::new(order.as_bytes()).with_checksum_validation(false);
+    let msg = ok(decoder.decode(), "the order decodes");
+    assert_eq!(validator.validate(&msg), Ok(()));
+
+    // A session Reject naming an application message type.
+    let reject = fixt_frame(&[
+        "35=3",
+        "49=CLIENT",
+        "56=BROKER",
+        "34=3",
+        "52=20260718-10:00:00",
+        "45=2",
+        "372=D",
+    ]);
+    let mut decoder = Decoder::new(reject.as_bytes()).with_checksum_validation(false);
+    let msg = ok(decoder.decode(), "the reject decodes");
+    assert_eq!(validator.validate(&msg), Ok(()));
+
+    // A message type neither side defines is still unknown.
+    let bogus = fixt_frame(&[
+        "35=3",
+        "49=CLIENT",
+        "56=BROKER",
+        "34=4",
+        "52=20260718-10:00:00",
+        "45=2",
+        "372=ZZ",
+    ]);
+    let mut decoder = Decoder::new(bogus.as_bytes()).with_checksum_validation(false);
+    let msg = ok(decoder.decode(), "the bogus reject decodes");
+    assert!(validator.validate(&msg).is_err());
 }

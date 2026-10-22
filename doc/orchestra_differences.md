@@ -3,7 +3,8 @@
 `ironfix-dictionary` embeds four QuickFIX XML dictionaries (FIX 4.2, FIX 4.4,
 FIXT 1.1, FIX 5.0 SP2). Issue #200 loads the FIX Trading Community's FIX
 Orchestra repository for each of these versions with
-`Dictionary::from_orchestra_xml` and diffs it against the embedded QuickFIX
+`Dictionary::from_orchestra_xml` (FIX 5.0 SP2 is derived from FIX Latest
+with `Dictionary::from_orchestra_latest_xml`) and diffs it against the embedded QuickFIX
 dictionary. This page records every difference the diff finds and how it is
 decided.
 
@@ -39,18 +40,19 @@ longer occurs.
 
 ## Sources
 
-| Version | Orchestra repository (test fixture) | Upstream commit | QuickFIX file |
+| Version | Orchestra repository (test fixture) | Loaded with | QuickFIX file |
 |---|---|---|---|
-| FIX 4.2 | `OrchestraFIX42.xml` (FIX 4.2 as of EP310) | `cd24169a` | `spec/FIX42.xml` |
-| FIX 4.4 | `OrchestraFIX44.xml` (FIX 4.4 as of EP311) | `cd24169a` | `spec/FIX44.xml` |
-| FIXT 1.1 | `FIXTSession.xml` (FIXT session layer, declares `FIX.5.0SP2_EP247`) | `cd24169a` | `spec/FIXT11.xml` |
-| FIX 5.0 SP2 | `FixRepository50SP2.xml` (FIX 5.0 SP2, generated 2019-03-12, no extension pack) | `fe873abc` | `spec/FIX50SP2.xml` |
+| FIX 4.2 | `OrchestraFIX42.xml` (FIX 4.2 as of EP310) | `from_orchestra_xml` | `spec/FIX42.xml` |
+| FIX 4.4 | `OrchestraFIX44.xml` (FIX 4.4 as of EP311) | `from_orchestra_xml` | `spec/FIX44.xml` |
+| FIXT 1.1 | `FIXTSession.xml` (FIXT session layer, declares `FIX.5.0SP2_EP247`) | `from_orchestra_xml` | `spec/FIXT11.xml` |
+| FIX 5.0 SP2 | `OrchestraFIXLatest.xml` (FIX Latest as of EP312) | `from_orchestra_latest_xml(.., Version::Fix50Sp2)` | `spec/FIX50SP2.xml` |
 
-The FIX Trading Community publishes no FIX 5.0 SP2 Orchestra repository
-today: `FixRepository50SP2.xml` was replaced by FIX Latest in March 2020
-(upstream `d0ad0cd`), and `fe873abc` is its last version. FIX Latest is FIX
-5.0 SP2 plus every extension pack since, but it names no fixed FIX version, so
-the loader rejects it. See
+All four were fetched from FIXTradingCommunity/orchestrations at commit
+`cd24169a`. The FIX Trading Community no longer publishes a FIX 5.0 SP2
+repository (its last snapshot was replaced by FIX Latest in March 2020, and
+had no extension packs), so FIX 5.0 SP2 is derived from FIX Latest by
+pedigree: what was added at or before FIX 5.0 SP2 and not deprecated by
+then (see the `orchestra` module docs for the rule). See
 `ironfix-dictionary/tests/fixtures/orchestra/README.md` for provenance and
 checksums.
 
@@ -58,10 +60,10 @@ checksums.
 
 | Version | Orchestra-only | QuickFIX-only | Conflicting | Total |
 |---|---:|---:|---:|---:|
-| FIX 4.2 | 7 | 0 | 11 | 18 |
+| FIX 4.2 | 7 | 0 | 4 | 11 |
 | FIX 4.4 | 43 | 0 | 3 | 46 |
 | FIXT 1.1 | 12 | 1 | 0 | 13 |
-| FIX 5.0 SP2 | 153 | 415 | 19 | 587 |
+| FIX 5.0 SP2 | 1290 | 181 | 5 | 1476 |
 
 ## FIX 4.2
 
@@ -69,14 +71,17 @@ checksums.
 |---|---|---|
 | Conflicting | Field names: `IOIID(23)` vs `IOIid`, `QuoteAckStatus(297)` vs `QuoteStatus`, `HaltReason(327)` vs `HaltReasonChar` | Orchestra |
 | Conflicting | Message name: `AllocationAck (P)` vs `AllocationInstructionAck` | Orchestra |
-| Conflicting | Category of `0`, `1`, `2`, `3`, `4`, `5`, `A`: the repository gives its messages no category, so they load as application messages; QuickFIX marks them admin | Orchestra; see below |
 | Orchestra-only | Code sets for `156`, `172`, `394`, `399`, `401`, `429`, `431` | Orchestra |
 
-Messages, required fields, header, trailer and groups agree. Every data
-field's length field (`RawDataLength(95)`, ...) is typed `int` in the FIX 4.2
-repository, which has no `Length` datatype; the loader maps each field's
-`lengthId` and types the field it names `Length`, as QuickFIX does, so these
-fields do not differ.
+Messages, required fields, header, trailer and groups agree. Two loader
+rules close what would otherwise differ:
+
+- the FIX 4.2 repository gives its messages no category; when no message
+  of a repository has one, the loader marks the session message types
+  (`0` to `5`, `A`, `n`) admin, as QuickFIX does;
+- every data field's length field (`RawDataLength(95)`, ...) is typed `int`
+  in the FIX 4.2 repository, which has no `Length` datatype; the loader
+  maps each data field's `lengthId` and types the field it names `Length`.
 
 ## FIX 4.4
 
@@ -92,61 +97,58 @@ fields do not differ.
 
 | Class | Difference | Decision |
 |---|---|---|
-| Orchestra-only | Code sets for `MsgType(35)` and `RefMsgType(372)`, listing only the session message types (`0`-`5`, `A`, `j`, `n`) | Orchestra; **affects #201**, see below |
+| Orchestra-only | Code sets for `MsgType(35)` and `RefMsgType(372)`, listing only the session message types (`0`-`5`, `A`, `j`, `n`) | Orchestra; under composition the validator takes the union with the application's message types, see below |
 | Orchestra-only | Code sets, or codes, for `ApplVerID(1128)`, `RefApplVerID(1130)`, `DefaultApplVerID(1137)`, `SessionStatus(1409)` | Orchestra |
 | Orchestra-only | The Logon `NoMsgTypes(384)` group (`372`, `385`, `1130`, `1131`, `1406`, `1410`), the Logon session qualifiers (`1600`-`1605`), `XMLnonFIX`'s `NoMessageEvents(2104)` group, `1744` in `SequenceReset`, `NextExpectedMsgSeqNum(789)` in `Logout` | Orchestra: this also closes the `MsgTypeGrp` deviation documented in `spec/README.md` |
 | QuickFIX-only | Component `MsgTypeGrp` (empty in QuickFIX) | Orchestra |
 
 ## FIX 5.0 SP2
 
-Most differences come from the two files' vintages, not from modelling: the
-Orchestra snapshot is FIX 5.0 SP2 without extension packs, and QuickFIX's
-`FIX50SP2.xml` includes later extension packs.
+The derived dictionary holds 164 messages: all 156 of QuickFIX's
+`FIX50SP2.xml`, and the eight session messages (`0` to `5`, `A`, `n`) that
+QuickFIX keeps in `FIXT11.xml`. It holds 5887 fields against QuickFIX's
+6028 and 163 components.
 
 | Class | Difference | Decision |
 |---|---|---|
-| Orchestra-only | Session messages `0`-`5`, `A`, `n`, the standard header and trailer (QuickFIX keeps them in `FIXT11.xml`; its `FIX50SP2.xml` header and trailer are empty) | Orchestra |
-| Orchestra-only | Members in `BZ` and `r` (`41`), required flags on 32 messages (mostly the flattened flag of a block held as a required group), codes for 106 fields, groups `NoMsgTypes(384)` and `NoHops(627)` | Orchestra |
-| QuickFIX-only | 48 messages (`CF` to `EB`), 4 576 fields, their groups and 154 components, members of 95 messages, codes for 115 fields, `W` requiring `779`: all from extension packs after the snapshot | Orchestra; **affects #201**, see below |
-| Conflicting | 11 fields: names (`1008`, `327`) and types (`1009`, `1193`, `1283`, `1317`, `1492`, `1493`, `213`, `674`, `877`) | Orchestra |
-| Conflicting | Message names: `ExecutionAcknowledgement (BN)`, `MassQuoteAcknowledgement (b)` | Orchestra |
-| Conflicting | `NoOrders(534)` delimiter (`41` vs `1824`), and the member order of `NoLegs(555)` in five layouts | Orchestra |
+| Orchestra-only | Session messages `0` to `5`, `A`, `n`, the standard header and trailer, the groups `NoHops(627)` (header) and `NoMsgTypes(384)` (Logon) | Orchestra |
+| Orchestra-only | Code sets, or codes, for 1233 fields: QuickFIX enumerates 668 of its 6028 fields, Orchestra many more | Orchestra; **affects #201**, see below |
+| Orchestra-only | Required flags on 44 messages, mostly the flag of a block Orchestra holds as a required group (`Parties`, `PositionQty`, `MDFullGrp`, ...) where QuickFIX holds a required component around an optional group | Orchestra |
+| QuickFIX-only | 141 fields: 86 FIX Latest added after FIX 5.0 SP2 (extension packs 266 to 280, which QuickFIX's file includes) and 55 deprecated at or before FIX 5.0 SP2 (`Signature(89)` and its kin moved to FIXT 1.1, `RepurchaseTerm(226)`, ...), with the members of 121 messages and 22 components, the groups `NoUnderlyingLegs(1342)` and `NoUnderlyingLegSecurityAltID(1334)`, and the required flags on `W` (`779`) and `r` (`37`) | Orchestra: the pedigree places them outside FIX 5.0 SP2 |
+| QuickFIX-only | Codes for 34 fields, added after FIX 5.0 SP2 or deprecated by then | Orchestra |
+| Conflicting | Field names: `HaltReason(327)`, `DerivativeOptPayoutAmount(1225)`, and QuickFIX misspellings `RateSourceReferemcePageHeading(2412)`, `RoutingArrangmentIndicator(2883)`, `ContraRoutingArrangmentIndicator(2884)` | Orchestra |
+
+No group delimiter, member order or field type differs.
 
 ## Differences that matter for #201
 
 When Orchestra replaces the embedded QuickFIX files, these differences change
 behaviour:
 
-1. **FIXT 1.1: `MsgType(35)` gains an enumeration of the session message
-   types only.** Composed as the transport side of a `SessionDictionary`,
-   the header comes from the transport dictionary, so
-   `Validator::for_session` reports every application message as
-   `InvalidEnumValue { tag: 35 }` (checked: a `35=D` that validates against
-   QuickFIX `FIXT11.xml` + `FIX50SP2.xml` fails against the Orchestra FIXT
-   repository + `FIX50SP2.xml`). `RefMsgType(372)` in `Reject` is restricted
-   the same way. #201 must decide how the transport enumeration of these two
-   fields composes with the application dictionary before switching.
-2. **FIX 5.0 SP2: the only Orchestra source loses 48 messages and 4 576
-   fields** that the embedded QuickFIX file carries today, and every type
-   and layout change the extension packs made. Switching to it is a
-   regression for any user of those messages. The FIX Latest repository has
-   them, but the loader rejects FIX Latest by design; #201 needs an owner
-   decision on the FIX 5.0 SP2 source.
-3. **FIX 5.0 SP2: the dictionary gains a header, a trailer and the session
+1. **FIXT 1.1: `MsgType(35)` and `RefMsgType(372)` list only the session
+   message types.** Resolved in #200: under `Validator::for_session`, a
+   field both dictionaries enumerate admits the values of either, so an
+   application message type is valid in a FIXT.1.1 header and in a session
+   Reject (tested against the Orchestra FIXT repository composed with the
+   derived FIX 5.0 SP2 dictionary).
+2. **FIX 5.0 SP2: 1233 fields gain an enumeration.** The validator then
+   rejects a value outside it with `InvalidEnumValue` where it accepted any
+   value before. Counterparties that send unlisted or user-defined codes
+   (the `Reserved100Plus` ranges Orchestra marks with `unionDataType`, which
+   the loader reports but does not map) will see Rejects when validation is
+   on.
+3. **FIX 5.0 SP2: 141 fields leave the dictionary**: those FIX Latest added
+   after FIX 5.0 SP2 and those deprecated by FIX 5.0 SP2. A message that
+   carries one is reported as `UnknownTag` when validated.
+4. **FIX 5.0 SP2: the dictionary gains a header, a trailer and the session
    messages.** Composed with a FIXT 1.1 transport this is harmless (admin
    messages and the envelope come from the transport side), but used alone
    the dictionary now validates the header.
-4. **FIX 4.2: session messages lose the admin category.** No engine path
-   reads the category (the engine decides what is administrative by message
-   type), and `SessionDictionary` only takes it from the transport side,
-   which is FIXT 1.1; generated code and any caller filtering on
-   `MessageCategory::Admin` would see the change.
-5. **Field types change** (FIX 4.4 `532`, `674`; FIX 5.0 SP2 `1009`, `1193`,
-   `1283`, `1317`, `1492`, `1493`, `213`, `674`, `877`): the validator checks
-   values against the new types, and generated code changes type.
+5. **Field types change** (FIX 4.4 `532`, `674`): the validator checks values
+   against the new types, and generated code changes type.
 6. **Field and message names change** (`327` in every version, FIX 4.2 `23`,
-   `297`, `P`, FIX 5.0 SP2 `1008`, `BN`, `b`): `Dictionary::get_field_by_name`
-   and generated identifiers follow.
+   `297`, `P`, FIX 5.0 SP2 `1225`, `2412`, `2883`, `2884`):
+   `Dictionary::get_field_by_name` and generated identifiers follow.
 
 Existing tests that pin QuickFIX content (for example `spec/README.md`'s
 `MsgTypeGrp` deviation and the tests built on it) will need updating in #201.
