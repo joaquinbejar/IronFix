@@ -4,7 +4,10 @@ description = "FIX specification parsing and dictionary management for IronFix"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+# The crate's own code is MIT; the FIX Orchestra repositories it embeds from
+# spec/orchestra are Apache-2.0 (spec/orchestra/LICENSE). `make
+# check-licences` keeps this in step with what the package publishes.
+license = "MIT AND Apache-2.0"
 repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true

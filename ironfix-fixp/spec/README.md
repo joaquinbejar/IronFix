@@ -47,9 +47,9 @@ included.
   script, macro or code generator reads it, and nothing derived from it is
   published. The codec in `src/codec.rs` stays hand-written.
 - It is **only read by tests** (`tests/schema_conformance.rs`).
-- It is **never published**: `make check-package-fixp`, run in CI by
-  `lint.yml`, fails if any file under `spec/` appears in
-  `cargo package -p ironfix-fixp --list`.
+- It is **never published**: `make check-licences` (alias
+  `make check-package-fixp`), run in CI by `lint.yml`, fails if any file
+  under `spec/` appears in `cargo package -p ironfix-fixp --list`.
 
 ## Known upstream quirks
 
