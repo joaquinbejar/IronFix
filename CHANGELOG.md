@@ -4,7 +4,7 @@ All notable changes to the IronFix workspace are recorded here. Versions
 follow [Semantic Versioning](https://semver.org/); while the workspace is at
 0.x, a change that breaks behaviour or the public API takes a minor bump.
 
-## 0.6.0 (2026-10-22)
+## 0.5.1 (2026-10-22)
 
 Breaking: a minor bump at 0.x. `cargo-semver-checks` against 0.5.0 finds no
 API break in any package; the bump is for the dictionary behaviour changes
@@ -24,7 +24,6 @@ below.
 - `deny.toml` and a `cargo deny check licenses` CI job allow MIT and
   Apache-2.0 for dependencies, plus five named permissive exceptions
   (Unicode-3.0, BSD-3-Clause, ISC).
-- Generated views require `ironfix-dictionary ^0.6`.
 
 ### Changed: embedded dictionaries come from FIX Orchestra (#201)
 
@@ -36,8 +35,11 @@ repositories (Apache-2.0, vendored verbatim under
 Latest by pedigree. `Dictionary::from_quickfix_xml` stays for your own
 QuickFIX files.
 
-**Semver impact: breaking (minor bump at 0.x).** No public item changes, but
-the dictionaries answer differently. Every difference is listed in
+**Semver impact: released as a patch (0.5.1), by owner decision.**
+`cargo-semver-checks` reports no API break against 0.5.0, but the
+dictionaries answer differently, so a `cargo update` within 0.5 changes
+validation results and generated code. Pin `=0.5.0` to keep the QuickFIX-based
+dictionaries. Every difference is listed in
 `doc/orchestra_differences.md`; the ones users observe:
 
 - **FIX 5.0 SP2 validates more strictly.** 1233 more fields carry an
