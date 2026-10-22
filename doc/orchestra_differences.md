@@ -43,12 +43,12 @@ longer occurs.
 
 ## Sources
 
-| Version | Orchestra repository (test fixture) | Loaded with | QuickFIX file |
+| Version | Orchestra repository (embedded, `spec/orchestra/`) | Loaded with | QuickFIX file |
 |---|---|---|---|
-| FIX 4.2 | `OrchestraFIX42.xml` (FIX 4.2 as of EP310) | `from_orchestra_xml` | `spec/FIX42.xml` |
-| FIX 4.4 | `OrchestraFIX44.xml` (FIX 4.4 as of EP311) | `from_orchestra_xml` | `spec/FIX44.xml` |
-| FIXT 1.1 | `FIXTSession.xml` (FIXT session layer, declares `FIX.5.0SP2_EP247`) | `from_orchestra_xml` | `spec/FIXT11.xml` |
-| FIX 5.0 SP2 | `OrchestraFIXLatest.xml` (FIX Latest as of EP312) | `from_orchestra_latest_xml(.., Version::Fix50Sp2)` | `spec/FIX50SP2.xml` |
+| FIX 4.2 | `OrchestraFIX42.xml` (FIX 4.2 as of EP310) | `from_orchestra_xml` | `tests/fixtures/quickfix/FIX42.xml` |
+| FIX 4.4 | `OrchestraFIX44.xml` (FIX 4.4 as of EP311) | `from_orchestra_xml` | `tests/fixtures/quickfix/FIX44.xml` |
+| FIXT 1.1 | `FIXTSession.xml` (FIXT session layer, declares `FIX.5.0SP2_EP247`) | `from_orchestra_xml` | `tests/fixtures/quickfix/FIXT11.xml` |
+| FIX 5.0 SP2 | `OrchestraFIXLatest.xml` (FIX Latest as of EP312) | `from_orchestra_latest_xml(.., Version::Fix50Sp2)` | `tests/fixtures/quickfix/FIX50SP2.xml` |
 
 All four were fetched from FIXTradingCommunity/orchestrations at commit
 `cd24169a` and are embedded from `ironfix-dictionary/spec/orchestra/`; the
