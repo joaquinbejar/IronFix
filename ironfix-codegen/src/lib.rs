@@ -30,7 +30,7 @@
 //!   XML order (an entry: its delimiter first) to a generated `Sink`: a
 //!   `FnMut(u32, &[u8])` closure, or a target that frames LENGTH/DATA pairs
 //!   itself. The generated code depends on `ironfix-core`, `rust_decimal`
-//!   and `ironfix-dictionary` `^0.5` (it calls `GroupSet::field`,
+//!   and `ironfix-dictionary` `^0.6` (it calls `GroupSet::field`,
 //!   `GroupSet::with_level_tags` and `FieldType::is_valid_value`).
 //!
 //! In both, FIX `Price`, `Qty`, `Amt`, `PriceOffset`, `Percentage` and

@@ -94,9 +94,10 @@ const RESERVED_ENUM_NAMES: [&str; 2] = ["Tokens", OTHER];
 const PRELUDE_VARIANTS: [&str; 4] = ["None", "Some", "Ok", "Err"];
 
 /// The ironfix-dictionary versions the generated code compiles against, as a
-/// Cargo requirement: the release that carries every API it calls
-/// ([`DICTIONARY_APIS`]), 0.5, and the releases compatible with it.
-const DICTIONARY_REQUIREMENT: &str = "^0.5";
+/// Cargo requirement: the release line the workspace ships in lockstep,
+/// 0.6, which carries every API it calls ([`DICTIONARY_APIS`], present since
+/// 0.5), and the releases compatible with it.
+const DICTIONARY_REQUIREMENT: &str = "^0.6";
 
 /// The ironfix-dictionary APIs the generated code calls beyond its types: the
 /// first two are new after 0.4.1, the last release without them.
@@ -3197,7 +3198,7 @@ mod tests {
         let fix44 = views(embedded(Dictionary::fix44()));
         assert!(fix44.contains("pub struct NewOrderSingleView<'m, 'a> {"));
         // The header names the bounded dictionary requirement and the APIs.
-        assert!(fix44.contains("ironfix-dictionary ^0.5\n"));
+        assert!(fix44.contains("ironfix-dictionary ^0.6\n"));
         assert!(fix44.contains(
             "(it calls GroupSet::field, GroupSet::with_level_tags and FieldType::is_valid_value)."
         ));
