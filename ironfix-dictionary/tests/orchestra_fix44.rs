@@ -5,8 +5,9 @@
 ******************************************************************************/
 
 //! Loads the FIX Trading Community's FIX 4.4 Orchestra repository
-//! (`fixtures/orchestra/OrchestraFIX44.xml`, see its README for provenance)
-//! and compares it with the embedded QuickFIX FIX 4.4 dictionary.
+//! (`spec/orchestra/OrchestraFIX44.xml`, see its README for provenance)
+//! and compares it with the QuickFIX FIX 4.4 dictionary kept as a test
+//! fixture (`fixtures/quickfix/FIX44.xml`).
 //!
 //! Orchestra holds some blocks as repeating groups where QuickFIX wraps the
 //! group in a component (`Parties` is a group in Orchestra, a component
@@ -24,7 +25,7 @@ use ironfix_tagvalue::Decoder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
-const ORCHESTRA_FIX44: &str = include_str!("fixtures/orchestra/OrchestraFIX44.xml");
+const ORCHESTRA_FIX44: &str = include_str!("../spec/orchestra/OrchestraFIX44.xml");
 
 /// Unwraps a `Result` with test context instead of `.unwrap()`.
 #[track_caller]
@@ -43,7 +44,13 @@ fn orchestra() -> OrchestraImport {
 }
 
 fn quickfix() -> &'static Dictionary {
-    ok(Dictionary::fix44(), "the embedded FIX 4.4 dictionary loads")
+    static QUICKFIX: std::sync::OnceLock<Dictionary> = std::sync::OnceLock::new();
+    QUICKFIX.get_or_init(|| {
+        ok(
+            Dictionary::from_quickfix_xml(include_str!("fixtures/quickfix/FIX44.xml")),
+            "the QuickFIX FIX 4.4 fixture loads",
+        )
+    })
 }
 
 /// A member list flattened through components and groups.

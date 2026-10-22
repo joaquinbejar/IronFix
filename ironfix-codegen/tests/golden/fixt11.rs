@@ -98,6 +98,10 @@ pub mod fields {
     pub const SESSION_REJECT_REASON: u32 = 373;
     /// MaxMessageSize (tag 383).
     pub const MAX_MESSAGE_SIZE: u32 = 383;
+    /// NoMsgTypes (tag 384).
+    pub const NO_MSG_TYPES: u32 = 384;
+    /// MsgDirection (tag 385).
+    pub const MSG_DIRECTION: u32 = 385;
     /// TestMessageIndicator (tag 464).
     pub const TEST_MESSAGE_INDICATOR: u32 = 464;
     /// Username (tag 553).
@@ -146,6 +150,44 @@ pub mod fields {
     pub const DEFAULT_CSTM_APPL_VER_ID: u32 = 1408;
     /// SessionStatus (tag 1409).
     pub const SESSION_STATUS: u32 = 1409;
+    /// DefaultVerIndicator (tag 1410).
+    pub const DEFAULT_VER_INDICATOR: u32 = 1410;
+    /// FIXEngineName (tag 1600).
+    pub const FIXENGINE_NAME: u32 = 1600;
+    /// FIXEngineVersion (tag 1601).
+    pub const FIXENGINE_VERSION: u32 = 1601;
+    /// FIXEngineVendor (tag 1602).
+    pub const FIXENGINE_VENDOR: u32 = 1602;
+    /// ApplicationSystemName (tag 1603).
+    pub const APPLICATION_SYSTEM_NAME: u32 = 1603;
+    /// ApplicationSystemVersion (tag 1604).
+    pub const APPLICATION_SYSTEM_VERSION: u32 = 1604;
+    /// ApplicationSystemVendor (tag 1605).
+    pub const APPLICATION_SYSTEM_VENDOR: u32 = 1605;
+    /// ApplLevelRecoveryIndicator (tag 1744).
+    pub const APPL_LEVEL_RECOVERY_INDICATOR: u32 = 1744;
+    /// NoAttachments (tag 2104).
+    pub const NO_ATTACHMENTS: u32 = 2104;
+    /// AttachmentName (tag 2105).
+    pub const ATTACHMENT_NAME: u32 = 2105;
+    /// AttachmentMediaType (tag 2106).
+    pub const ATTACHMENT_MEDIA_TYPE: u32 = 2106;
+    /// AttachmentClassification (tag 2107).
+    pub const ATTACHMENT_CLASSIFICATION: u32 = 2107;
+    /// AttachmentExternalURL (tag 2108).
+    pub const ATTACHMENT_EXTERNAL_URL: u32 = 2108;
+    /// AttachmentEncodingType (tag 2109).
+    pub const ATTACHMENT_ENCODING_TYPE: u32 = 2109;
+    /// UnencodedAttachmentLen (tag 2110).
+    pub const UNENCODED_ATTACHMENT_LEN: u32 = 2110;
+    /// EncodedAttachmentLen (tag 2111).
+    pub const ENCODED_ATTACHMENT_LEN: u32 = 2111;
+    /// EncodedAttachment (tag 2112).
+    pub const ENCODED_ATTACHMENT: u32 = 2112;
+    /// NoAttachmentKeywords (tag 2113).
+    pub const NO_ATTACHMENT_KEYWORDS: u32 = 2113;
+    /// AttachmentKeyword (tag 2114).
+    pub const ATTACHMENT_KEYWORD: u32 = 2114;
 }
 
 /// Message type definitions, and the entries of the repeating groups messages declare.
@@ -205,6 +247,8 @@ pub mod messages {
         pub gap_fill_flag: ::core::option::Option<bool>,
         /// NewSeqNo (tag 36).
         pub new_seq_no: i64,
+        /// ApplLevelRecoveryIndicator (tag 1744).
+        pub appl_level_recovery_indicator: ::core::option::Option<i64>,
     }
 
     /// Logout message (MsgType=5).
@@ -212,6 +256,8 @@ pub mod messages {
     pub struct Logout {
         /// SessionStatus (tag 1409).
         pub session_status: ::core::option::Option<i64>,
+        /// NextExpectedMsgSeqNum (tag 789).
+        pub next_expected_msg_seq_num: ::core::option::Option<i64>,
         /// Text (tag 58).
         pub text: ::core::option::Option<::std::string::String>,
         /// EncodedTextLen (tag 354).
@@ -237,8 +283,8 @@ pub mod messages {
         pub next_expected_msg_seq_num: ::core::option::Option<i64>,
         /// MaxMessageSize (tag 383).
         pub max_message_size: ::core::option::Option<i64>,
-        /// MsgTypeGrp component.
-        pub msg_type_grp: ::core::option::Option<super::components::MsgTypeGrp>,
+        /// NoMsgTypes (tag 384) repeating group; its length is the count field.
+        pub no_msg_types: ::core::option::Option<::std::vec::Vec<LogonNoMsgTypesEntry>>,
         /// TestMessageIndicator (tag 464).
         pub test_message_indicator: ::core::option::Option<bool>,
         /// Username (tag 553).
@@ -265,6 +311,18 @@ pub mod messages {
         pub default_appl_ext_id: ::core::option::Option<i64>,
         /// DefaultCstmApplVerID (tag 1408).
         pub default_cstm_appl_ver_id: ::core::option::Option<::std::string::String>,
+        /// FIXEngineName (tag 1600).
+        pub fixengine_name: ::core::option::Option<::std::string::String>,
+        /// FIXEngineVersion (tag 1601).
+        pub fixengine_version: ::core::option::Option<::std::string::String>,
+        /// FIXEngineVendor (tag 1602).
+        pub fixengine_vendor: ::core::option::Option<::std::string::String>,
+        /// ApplicationSystemName (tag 1603).
+        pub application_system_name: ::core::option::Option<::std::string::String>,
+        /// ApplicationSystemVersion (tag 1604).
+        pub application_system_version: ::core::option::Option<::std::string::String>,
+        /// ApplicationSystemVendor (tag 1605).
+        pub application_system_vendor: ::core::option::Option<::std::string::String>,
         /// Text (tag 58).
         pub text: ::core::option::Option<::std::string::String>,
         /// EncodedTextLen (tag 354).
@@ -273,16 +331,58 @@ pub mod messages {
         pub encoded_text: ::core::option::Option<::std::vec::Vec<u8>>,
     }
 
+    /// One entry of the NoMsgTypes (tag 384) repeating group in Logon.
+    #[derive(Debug, Clone)]
+    pub struct LogonNoMsgTypesEntry {
+        /// RefMsgType (tag 372).
+        pub ref_msg_type: ::core::option::Option<::std::string::String>,
+        /// MsgDirection (tag 385).
+        pub msg_direction: ::core::option::Option<char>,
+        /// RefApplVerID (tag 1130).
+        pub ref_appl_ver_id: ::core::option::Option<::std::string::String>,
+        /// RefApplExtID (tag 1406).
+        pub ref_appl_ext_id: ::core::option::Option<i64>,
+        /// RefCstmApplVerID (tag 1131).
+        pub ref_cstm_appl_ver_id: ::core::option::Option<::std::string::String>,
+        /// DefaultVerIndicator (tag 1410).
+        pub default_ver_indicator: ::core::option::Option<bool>,
+    }
+
     /// XMLnonFIX message (MsgType=n).
     #[derive(Debug, Clone)]
-    pub struct XMLnonFIX {}
+    pub struct XMLnonFIX {
+        /// NoAttachments (tag 2104) repeating group; its length is the count field.
+        pub no_attachments: ::core::option::Option<::std::vec::Vec<XMLnonFIXNoAttachmentsEntry>>,
+    }
 
-}
-
-/// Component type definitions, one per component a message reaches, and the entries of the repeating groups components declare.
-pub mod components {
-    /// MsgTypeGrp component, one type shared by every message, component and group entry that lists it.
+    /// One entry of the NoAttachments (tag 2104) repeating group in XMLnonFIX.
     #[derive(Debug, Clone)]
-    pub struct MsgTypeGrp {}
+    pub struct XMLnonFIXNoAttachmentsEntry {
+        /// AttachmentName (tag 2105).
+        pub attachment_name: ::core::option::Option<::std::string::String>,
+        /// AttachmentMediaType (tag 2106).
+        pub attachment_media_type: ::core::option::Option<::std::string::String>,
+        /// AttachmentClassification (tag 2107).
+        pub attachment_classification: ::core::option::Option<::std::string::String>,
+        /// AttachmentExternalURL (tag 2108).
+        pub attachment_external_url: ::core::option::Option<::std::string::String>,
+        /// AttachmentEncodingType (tag 2109).
+        pub attachment_encoding_type: ::core::option::Option<i64>,
+        /// UnencodedAttachmentLen (tag 2110).
+        pub unencoded_attachment_len: ::core::option::Option<i64>,
+        /// EncodedAttachmentLen (tag 2111).
+        pub encoded_attachment_len: ::core::option::Option<i64>,
+        /// EncodedAttachment (tag 2112).
+        pub encoded_attachment: ::core::option::Option<::std::vec::Vec<u8>>,
+        /// NoAttachmentKeywords (tag 2113) repeating group; its length is the count field.
+        pub no_attachment_keywords: ::core::option::Option<::std::vec::Vec<XMLnonFIXNoAttachmentsNoAttachmentKeywordsEntry>>,
+    }
+
+    /// One entry of the NoAttachmentKeywords (tag 2113) repeating group in XMLnonFIXNoAttachmentsEntry.
+    #[derive(Debug, Clone)]
+    pub struct XMLnonFIXNoAttachmentsNoAttachmentKeywordsEntry {
+        /// AttachmentKeyword (tag 2114).
+        pub attachment_keyword: ::core::option::Option<::std::string::String>,
+    }
 
 }

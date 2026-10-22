@@ -9,10 +9,10 @@
 //! - the views of the embedded FIX 4.4, FIX 4.2 and FIXT 1.1 dictionaries;
 //! - the data definitions (the default output) of the embedded FIX 4.4,
 //!   FIX 4.2, FIXT 1.1 and FIX 5.0 SP2 dictionaries;
-//! - the default output and the views of the dictionary loaded from the
-//!   FIX Trading Community's FIX 4.4 Orchestra repository, the
-//!   `ironfix-dictionary` test fixture (which is not published, like this
-//!   crate).
+//! - the default output and the views of the dictionary loaded directly
+//!   from the FIX Trading Community's FIX 4.4 Orchestra repository that
+//!   `ironfix-dictionary` embeds (the same source as `Dictionary::fix44`,
+//!   loaded through `Dictionary::from_orchestra_xml`).
 //!
 //! The `cargo::` lines are build-script directives to Cargo, which reads them
 //! from standard output; they are not logging.
@@ -26,7 +26,7 @@ use std::path::PathBuf;
 type Loader = fn() -> Result<&'static Dictionary, DictionaryError>;
 
 /// The FIX 4.4 Orchestra repository, relative to this crate.
-const ORCHESTRA_FIX44: &str = "../ironfix-dictionary/tests/fixtures/orchestra/OrchestraFIX44.xml";
+const ORCHESTRA_FIX44: &str = "../ironfix-dictionary/spec/orchestra/OrchestraFIX44.xml";
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo::rerun-if-changed=build.rs");

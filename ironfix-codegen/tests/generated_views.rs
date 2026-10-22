@@ -140,10 +140,12 @@ fn encode(msg_type: &str, write: impl FnOnce(&mut Encoder) -> Result<(), EncodeE
     ok(encoder.finish(), "the frame encodes").to_vec()
 }
 
-/// The embedded FIX 4.4 dictionary.
+/// The QuickFIX FIX 4.4 test fixture, the dictionary the FIX 4.4 order
+/// golden is generated from (see `views_common::fix44_order_dictionary`).
 #[track_caller]
 fn fix44_dictionary() -> &'static Dictionary {
-    ok(Dictionary::fix44(), "the embedded FIX 4.4 dictionary loads")
+    static FIX44: std::sync::OnceLock<Dictionary> = std::sync::OnceLock::new();
+    FIX44.get_or_init(views_common::quickfix_fix44)
 }
 
 #[test]
@@ -961,7 +963,7 @@ fn test_fixt11_views_read_a_logon() {
     assert_eq!(ok(logon.heart_bt_int(), "HeartBtInt"), 30);
     assert_eq!(
         ok(logon.encrypt_method(), "EncryptMethod"),
-        fixt11::enums::EncryptMethod::NoneOther
+        fixt11::enums::EncryptMethod::None0
     );
 }
 

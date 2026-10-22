@@ -760,12 +760,21 @@ mod tests {
         ComponentDef, ComponentRef, GroupDef, MessageCategory, MessageDef, Version,
     };
 
-    /// The vendored FIX 4.4 dictionary.
+    /// The QuickFIX FIX 4.4 dictionary, a test fixture of
+    /// `ironfix-dictionary` (`tests/fixtures/quickfix`, not published). Its
+    /// components (Parties, Instrument, PreAllocGrp, ...) exercise the
+    /// component paths of the generator, which the embedded FIX Orchestra
+    /// dictionary, holding most blocks as groups, reaches less.
     fn fix44() -> &'static Dictionary {
-        match Dictionary::fix44() {
-            Ok(dict) => dict,
-            Err(err) => panic!("the embedded FIX 4.4 dictionary must load: {err}"),
-        }
+        static FIX44: std::sync::OnceLock<Dictionary> = std::sync::OnceLock::new();
+        FIX44.get_or_init(|| {
+            match Dictionary::from_quickfix_xml(include_str!(
+                "../../ironfix-dictionary/tests/fixtures/quickfix/FIX44.xml"
+            )) {
+                Ok(dict) => dict,
+                Err(err) => panic!("the QuickFIX FIX 4.4 fixture must load: {err}"),
+            }
+        })
     }
 
     /// Generates from `dict`, failing the test with the generator error.
@@ -1258,8 +1267,9 @@ mod tests {
                 .filter(|base| !messages.contains(base))
                 .collect();
             assert_eq!(entries, group_views, "{what}");
-            // FIXT 1.1 has no group in a message body; the others do.
-            assert_eq!(entries.is_empty(), what == "FIXT 1.1", "{what}");
+            // Every embedded dictionary has groups in message bodies (FIXT
+            // 1.1 in the Logon and XMLnonFIX).
+            assert!(!entries.is_empty(), "{what}");
         }
     }
 
@@ -1440,15 +1450,10 @@ mod tests {
             "{logon}"
         );
         assert!(logon.contains("pub heart_bt_int: i64,"), "{logon}");
-        // The vendored FIXT11.xml defines MsgTypeGrp with no members, so its
-        // struct is empty, and Logon references it.
-        assert!(
-            logon.contains(
-                "pub msg_type_grp: ::core::option::Option<super::components::MsgTypeGrp>,"
-            ),
-            "{logon}"
-        );
-        assert!(code.contains("pub struct MsgTypeGrp {}"));
+        // The embedded FIXT 1.1 dictionary defines the Logon NoMsgTypes(384)
+        // group.
+        assert!(logon.contains("pub no_msg_types:"), "{logon}");
+        assert!(code.contains("pub struct LogonNoMsgTypesEntry {"));
         assert!(!code.contains("f64"));
     }
 
@@ -1476,7 +1481,12 @@ mod tests {
         );
         // One struct per component, however many messages list it.
         assert_eq!(code.matches("pub struct Instrument {").count(), 1);
-        assert_eq!(code.matches("pub struct Parties {").count(), 1);
+        // Orchestra holds Parties as a group: one entry type per message.
+        assert_eq!(
+            code.matches("pub struct NewOrderSingleNoPartyIDsEntry {")
+                .count(),
+            1
+        );
         // XID-typed fields (FIX 5.0 SP2 only) are emitted as String.
         assert!(
             code.contains(

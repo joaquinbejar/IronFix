@@ -9,11 +9,12 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-# The FIX Orchestra test fixtures are distributed under their own license
-# (Apache-2.0, see their README): keep them, and the tests that include
-# them, out of the published package.
+# The test fixtures are not part of the published package: the QuickFIX
+# dictionaries (QuickFIX Software License 1.0, see their README) and the
+# tests that include them. The embedded FIX Orchestra repositories under
+# spec/orchestra (Apache-2.0) are packaged.
 exclude = [
-    "tests/fixtures/orchestra",
+    "tests/fixtures",
     "tests/orchestra_fix44.rs",
     "tests/orchestra_equivalence.rs",
     "tests/orchestra_equivalence",

@@ -25,16 +25,21 @@
 //!   ([`Validator`]): known message type, defined and allowed tags, required
 //!   fields, enum values, repeating-group count and delimiter, and the
 //!   required members of every group entry
-//! - **Embedded dictionaries**: four QuickFIX specifications vendored verbatim
-//!   under the QuickFIX Software License, Version 1.0 (see
-//!   `spec/LICENSE-QUICKFIX` and `spec/README.md`):
+//! - **Embedded dictionaries**: four FIX Trading Community FIX Orchestra
+//!   repositories vendored verbatim under the Apache License, Version 2.0
+//!   (see `spec/orchestra/LICENSE` and `spec/orchestra/README.md`); the
+//!   crate ships no QuickFIX file:
 //!
-//!   | Constructor | Version | Role |
-//!   |---|---|---|
-//!   | [`Dictionary::fix42`] | FIX 4.2 | complete (header, trailer, all messages) |
-//!   | [`Dictionary::fix44`] | FIX 4.4 | complete (header, trailer, all messages) |
-//!   | [`Dictionary::fixt11`] | FIXT 1.1 | transport (header, trailer, admin messages) |
-//!   | [`Dictionary::fix50sp2`] | FIX 5.0 SP2 | application (messages only) |
+//!   | Constructor | Version | Source | Role |
+//!   |---|---|---|---|
+//!   | [`Dictionary::fix42`] | FIX 4.2 | `OrchestraFIX42.xml` | complete (header, trailer, all messages) |
+//!   | [`Dictionary::fix44`] | FIX 4.4 | `OrchestraFIX44.xml` | complete (header, trailer, all messages) |
+//!   | [`Dictionary::fixt11`] | FIXT 1.1 | `FIXTSession.xml` | transport (header, trailer, admin messages) |
+//!   | [`Dictionary::fix50sp2`] | FIX 5.0 SP2 | `OrchestraFIXLatest.xml`, filtered to FIX 5.0 SP2 | complete (header, trailer, session and application messages) |
+//!
+//!   Up to 0.5 these were QuickFIX files; the differences users may observe
+//!   are listed in
+//!   [`doc/orchestra_differences.md`](https://github.com/joaquinbejar/IronFix/blob/main/doc/orchestra_differences.md).
 //!
 //! - **Transport plus application composition**: [`SessionDictionary`] pairs
 //!   a FIXT.1.1 transport dictionary with an application dictionary of any
@@ -56,46 +61,39 @@
 //!   groups of up to 512 entry-level members (every embedded group); see the
 //!   [`group`] module docs for the error paths that do
 //!
-//! This product includes software developed by quickfixengine.org
-//! (<http://www.quickfixengine.org/>).
-//!
 //! ## Current limitations
 //!
 //! **Only FIX 4.2, FIX 4.4, FIXT 1.1 and FIX 5.0 SP2 are embedded.** FIX 4.0,
-//! 4.1, 4.3, 5.0 and 5.0 SP1 require you to supply the QuickFIX XML yourself
-//! via [`Dictionary::from_quickfix_xml`]; the [`Version`] enum naming a version
-//! does not imply a bundled schema for it.
+//! 4.1, 4.3, 5.0 and 5.0 SP1 require you to supply the XML yourself, a
+//! QuickFIX file via [`Dictionary::from_quickfix_xml`] or an Orchestra
+//! repository via [`Dictionary::from_orchestra_xml`]; the [`Version`] enum
+//! naming a version does not imply a bundled schema for it.
 //!
 //! **Orchestra loading is tested on the four embedded versions only.** The
-//! Orchestra repositories the tests load are the FIX Trading Community's FIX
-//! 4.2, FIX 4.4, FIXT session layer and FIX Latest ones, test fixtures that
-//! are neither embedded nor published; FIX 5.0 SP2 is derived from FIX
-//! Latest by pedigree with [`Dictionary::from_orchestra_latest_xml`]. Each
-//! is diffed against the embedded QuickFIX dictionary of its version, and
-//! every difference is listed in
+//! repositories the tests load are the embedded ones. Each was diffed
+//! against the QuickFIX dictionary of its version the crate embedded up to
+//! 0.5 (kept as a test fixture, not published), and every difference is
+//! listed in
 //! [`doc/orchestra_differences.md`](https://github.com/joaquinbejar/IronFix/blob/main/doc/orchestra_differences.md)
 //! (Orchestra wins on a conflict). [`Dictionary::from_orchestra_xml`]
 //! rejects `FIX.Latest` repositories with
 //! [`DictionaryError::UnsupportedVersion`], because FIX Latest names no
-//! fixed FIX version; only the targeted import reads them. A repository
-//! named `FIXT` must declare `FIXT.1.1`, or be the FIXT session layer
-//! published under a FIX 5.0 SP2 extension pack (the FIX Trading
-//! Community's declares `FIX.5.0SP2_EP247`), which loads as FIXT 1.1; see
-//! the [`orchestra`] module docs for the rule.
+//! fixed FIX version; only [`Dictionary::from_orchestra_latest_xml`] reads
+//! them, and only as FIX 5.0 SP2. A repository named `FIXT` must declare
+//! `FIXT.1.1`, or be the FIXT session layer published under a FIX 5.0 SP2
+//! extension pack (the FIX Trading Community's declares
+//! `FIX.5.0SP2_EP247`), which loads as FIXT 1.1; see the [`orchestra`]
+//! module docs for the rule.
+//!
+//! **The embedded FIX 5.0 SP2 dictionary keeps the latest form of each
+//! element.** It is derived from FIX Latest by pedigree (what was added at
+//! or before FIX 5.0 SP2 and not deprecated by then); an element changed
+//! after FIX 5.0 SP2 keeps its FIX Latest form.
 //!
 //! **[`SessionDictionary`] does not read `ApplVerID(1128)`.** The caller picks
 //! the application dictionary when building the pair; a message whose
 //! `ApplVerID` names a different application version is still validated
 //! against that one.
-//!
-//! **The embedded FIXT 1.1 dictionary deviates from FIXT 1.1 upstream.** The
-//! vendored QuickFIX `FIXT11.xml` defines the Logon `MsgTypeGrp` component
-//! with no members and does not define `NoMsgTypes(384)` or
-//! `MsgDirection(385)`, where FIXT 1.1 defines the `NoMsgTypes` group
-//! (`372`, `385`, `1130`, `1406`, `1131`, `1410`). A Logon carrying the group
-//! is therefore reported as invalid against [`Dictionary::fixt11`]. The file
-//! stays unpatched; to accept the group, load a FIXT 1.1 dictionary that
-//! defines it with [`Dictionary::from_quickfix_xml`] and compose that.
 //!
 //! **[`Validator::new`] does not check `BeginString(8)`**; only
 //! [`Validator::for_session`] does.
