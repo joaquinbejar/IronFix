@@ -4,7 +4,7 @@ All notable changes to the IronFix workspace are recorded here. Versions
 follow [Semantic Versioning](https://semver.org/); while the workspace is at
 0.x, a change that breaks behaviour or the public API takes a minor bump.
 
-## Unreleased
+## 0.5.2 (2026-11-12)
 
 - `ironfix-fixp` (and `ironfix-engine` with the `fixp` feature) depend on
   `ironsbe-core` 0.8 instead of 0.7, so a project can use IronFix's FIXP
