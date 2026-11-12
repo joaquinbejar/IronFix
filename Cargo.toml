@@ -75,8 +75,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 
 # SBE codec for the FIXP session messages (ironfix-fixp only). Approved by
-# ADR-0003; compatible 0.7 range, same author (joaquinbejar/IronSBE).
-ironsbe-core = "0.7.1"
+# ADR-0003; compatible 0.8 range, same author (joaquinbejar/IronSBE).
+ironsbe-core = "0.8"
 
 # Benchmark harness (dev-dependency only; never linked into a published library)
 criterion = { version = "0.8", features = ["html_reports"] }
