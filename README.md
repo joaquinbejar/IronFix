@@ -608,8 +608,8 @@ against it.
 | `ironfix-session` | Session-layer protocol logic: typestate FSM, sequences, heartbeats. No I/O |
 | `ironfix-store` | The `MessageStore` trait, `MemoryStore`, and the persistent `FileStore` |
 | `ironfix-transport` | `FixCodec`, a Tokio codec that frames FIX messages; depends on `ironfix-tagvalue` only. No TCP helpers, no TLS (TLS lives behind `ironfix-engine`'s `tls` feature) |
-| `ironfix-sofh` | `SofhCodec`, a Tokio codec for the Simple Open Framing Header v1.0 that frames SBE and other binary encodings; depends on no other IronFix crate. Not published yet |
-| `ironfix-fixp` | The FIXP v1.1 session core, sans-IO: `FixpClient`, `FixpServer`, and the SBE session messages on `ironsbe-core`; depends on `ironfix-core` and `ironsbe-core` only; driven by `ironfix-engine`'s `fixp` feature. Not published yet |
+| `ironfix-sofh` | `SofhCodec`, a Tokio codec for the Simple Open Framing Header v1.0 that frames SBE and other binary encodings; depends on no other IronFix crate |
+| `ironfix-fixp` | The FIXP v1.1 session core, sans-IO: `FixpClient`, `FixpServer`, and the SBE session messages on `ironsbe-core`; depends on `ironfix-core` and `ironsbe-core` only; driven by `ironfix-engine`'s `fixp` feature |
 | `ironfix-fast` | FAST encoding/decoding primitives: stop-bit, presence maps, the operator table; depends on no other IronFix crate. No template layer |
 | `ironfix-codegen` | Build-time Rust generation from a `Dictionary`: data structs, and opt-in views, enumerations and writers (no in-workspace consumer) |
 | `ironfix-codegen-check` | Not published. A CI check: its build script generates the full views of the embedded FIX 4.4, FIX 4.2 and FIXT 1.1 dictionaries and the workspace lints compile them |
