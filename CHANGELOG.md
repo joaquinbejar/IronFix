@@ -6,6 +6,14 @@ follow [Semantic Versioning](https://semver.org/); while the workspace is at
 
 ## Unreleased
 
+- `ironfix-fixp` (and `ironfix-engine` with the `fixp` feature) depend on
+  `ironsbe-core` 0.8 instead of 0.7, so a project can use IronFix's FIXP
+  session and IronSBE 0.8 codecs with a single `ironsbe-core` in its
+  dependency graph. The SBE primitives IronFix uses (`MessageHeader`,
+  `VarDataHeader`, `ReadBuffer`, `WriteBuffer`) are unchanged in 0.8, so FIXP
+  wire format and session behaviour do not change. No `ironsbe-core` type
+  appears in IronFix's public API, and `cargo-semver-checks` finds no break
+  in `ironfix-fixp` or `ironfix-engine`: this fits a patch release.
 - Every published crate ships the MIT `LICENSE` file, and
   `make check-licences` fails if a crate that declares MIT publishes none or
   one that differs from the workspace `LICENSE`.
