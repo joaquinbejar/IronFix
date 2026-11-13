@@ -61,7 +61,7 @@ tracing = "0.1"
 num-traits = "0.2"
 num-derive = "0.5"
 rust_decimal = "1.43"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
 itoa = "1.0"
 quick-xml = "0.42"
 

@@ -631,6 +631,11 @@ ironfix-engine = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 ```
 
+IronFix depends on `chrono` without its default features (only `std` and
+`serde`), so it never turns on chrono's `clock`, `now` or `wasmbind` in your
+build. An application that wants `Utc::now()` enables `clock` on its own
+`chrono` dependency.
+
 ## Quick Start
 
 ### Client
@@ -769,6 +774,7 @@ make run EXAMPLE=fix44_server   # Run one example (the workspace has no binaries
 ```sh
 make test          # Run all tests (and the engine's TLS tests, with --features tls)
 make check-tls-deps # Prove the tls feature adds no TLS crate when off, and no crypto provider when on
+make check-chrono-features # Prove no ironfix crate enables chrono's clock, now, wasmbind or oldtime
 make fmt           # Format code
 make fmt-check     # Check formatting without applying
 make lint          # Run clippy with warnings as errors

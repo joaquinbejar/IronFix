@@ -183,6 +183,22 @@ check-fixp-deps:
 		|| { echo "check-fixp-deps: ironfix-sofh is missing with the fixp feature on"; exit 1; }
 	@echo "check-fixp-deps: no FIXP crate without the feature; both with it."
 
+# Issue #213: no ironfix crate turns on chrono's wall-clock or wasm features.
+# ironfix-core only uses chrono's types, so the workspace declares chrono
+# without default features; Cargo unifies features across a build, so a
+# `clock` here would reach every application that depends on IronFix.
+CHRONO_FORBIDDEN := ^chrono feature "(default|clock|now|wasmbind|oldtime|iana-time-zone|winapi|js-sys|wasm-bindgen)"
+.PHONY: check-chrono-features
+check-chrono-features:
+	@for args in "-p ironfix-core" "-p ironfix-engine" "-p ironfix-engine --all-features"; do \
+		if cargo tree $$args -e features -i chrono --prefix none | grep -Eq '$(CHRONO_FORBIDDEN)'; then \
+			echo "check-chrono-features: cargo tree $$args enables a chrono feature that reads the wall clock or targets wasm:"; \
+			cargo tree $$args -e features -i chrono --prefix none | grep -E '$(CHRONO_FORBIDDEN)' | sort -u; \
+			exit 1; \
+		fi; \
+	done
+	@echo "check-chrono-features: chrono's clock, now, wasmbind and oldtime are off for ironfix-core and ironfix-engine."
+
 # Format the code
 .PHONY: fmt
 fmt:
