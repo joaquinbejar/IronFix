@@ -288,7 +288,9 @@ pub mod validation;
 mod wire;
 
 pub use acceptor::Acceptor;
-pub use application::{Application, NoOpApplication, RejectReason, SendVerdict, SessionId};
+pub use application::{
+    Application, LogoutHold, NoOpApplication, RejectReason, SendVerdict, SessionId,
+};
 pub use builder::EngineBuilder;
 pub use close::{CloseReason, LogoutCause, LogoutInitiator};
 pub use connection::Connection;

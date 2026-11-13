@@ -278,6 +278,9 @@ pub struct Initiator<A: Application = NoOpApplication> {
     outbound_capacity: usize,
     /// Capacity of the inbound application queue.
     app_queue_capacity: usize,
+    /// Whether the counterparty's Logout waits for
+    /// [`Application::on_peer_logout`] (issue #214).
+    peer_logout_hold: bool,
     /// The optional message store, its failure policy, its call timeout and
     /// the owed-reset record: outbound frames are filed in the store and
     /// replayed from it when the counterparty asks for a resend.
@@ -304,6 +307,7 @@ impl<A: Application> std::fmt::Debug for Initiator<A> {
             .field("initial_sequences", &self.initial_sequences)
             .field("outbound_capacity", &self.outbound_capacity)
             .field("app_queue_capacity", &self.app_queue_capacity)
+            .field("peer_logout_hold", &self.peer_logout_hold)
             .field("store", &self.store)
             .field("store_timeout", &self.store.timeout(self.write_timeout))
             .field("throttle", &self.throttle)
@@ -352,6 +356,7 @@ impl<A: Application + 'static> Initiator<A> {
             initial_sequences: None,
             outbound_capacity: DEFAULT_OUTBOUND_CAPACITY,
             app_queue_capacity: DEFAULT_APP_QUEUE_CAPACITY,
+            peer_logout_hold: false,
             store: StoreAttachment::default(),
             throttle: None,
             observer: None,
@@ -537,6 +542,33 @@ impl<A: Application + 'static> Initiator<A> {
     pub fn with_app_queue_capacity(mut self, capacity: usize) -> Self {
         self.app_queue_capacity = capacity.max(1);
         self
+    }
+
+    /// Lets the application hold the reply to the counterparty's Logout
+    /// (issue #214). Off by default: the reply then goes out as soon as
+    /// [`Application::from_admin`] accepts the Logout, as before.
+    ///
+    /// When on, the counterparty's Logout is answered only once
+    /// [`Application::on_peer_logout`] has run, after every earlier
+    /// `from_app`, and returned [`LogoutHold::Reply`](crate::LogoutHold::Reply),
+    /// or, if it returned [`LogoutHold::Hold`](crate::LogoutHold::Hold), once
+    /// the application calls
+    /// [`Connection::reply_logout`](crate::Connection::reply_logout). The
+    /// session's `logout_timeout`, counted from the Logout's arrival, bounds
+    /// the whole wait. Meanwhile the session stays Active for writes, and
+    /// application messages the counterparty sends after its Logout are
+    /// logged, their sequence numbers consumed, and not delivered.
+    #[must_use]
+    pub const fn with_peer_logout_hold(mut self, hold: bool) -> Self {
+        self.peer_logout_hold = hold;
+        self
+    }
+
+    /// Returns whether the application may hold the reply to the
+    /// counterparty's Logout ([`Self::with_peer_logout_hold`]).
+    #[must_use]
+    pub const fn peer_logout_hold(&self) -> bool {
+        self.peer_logout_hold
     }
 
     /// Seeds the session with initial sequence numbers, for continuity with
@@ -1884,6 +1916,7 @@ impl<A: Application + 'static> Initiator<A> {
             write_timeout,
             outbound_capacity: self.outbound_capacity,
             app_queue_capacity: self.app_queue_capacity,
+            peer_logout_hold: self.peer_logout_hold,
             throttle: self.throttle.clone(),
             capture: self.capture(&session_id),
             validation: self.validation.clone(),

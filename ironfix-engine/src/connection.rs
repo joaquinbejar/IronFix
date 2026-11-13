@@ -38,6 +38,8 @@ pub(crate) enum Command {
     },
     /// Initiate a graceful logout, for the cause given.
     Logout(LogoutCause),
+    /// End the hold on the reply to the counterparty's Logout (issue #214).
+    ReplyLogout,
 }
 
 /// The most bytes [`Connection::logout_with_text`] accepts for `Text` (58).
@@ -463,6 +465,28 @@ impl Connection {
             .send(Command::Logout(LogoutCause::Requested {
                 text: Some(text.to_string()),
             }))
+            .await
+            .map_err(|_| EngineError::Closed)
+    }
+
+    /// Sends the reply to the counterparty's Logout that
+    /// [`Application::on_peer_logout`](crate::Application::on_peer_logout)
+    /// held back with [`LogoutHold::Hold`](crate::LogoutHold::Hold), then
+    /// closes the session (issue #214).
+    ///
+    /// The reply is queued behind every message this session's handles
+    /// queued before the call, so a report sent with [`Connection::send`]
+    /// before `reply_logout` is on the wire before the reply. A call made
+    /// before `on_peer_logout` has answered ends the hold in advance: the
+    /// reply goes out as soon as it is owed. With no reply owed (no Logout
+    /// received, or a session built without `with_peer_logout_hold`) the
+    /// call does nothing.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Closed`] if the session is already closed.
+    pub async fn reply_logout(&self) -> Result<(), EngineError> {
+        self.commands
+            .send(Command::ReplyLogout)
             .await
             .map_err(|_| EngineError::Closed)
     }
