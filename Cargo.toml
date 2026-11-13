@@ -18,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 license = "MIT"
@@ -29,18 +29,18 @@ categories = ["finance", "data-structures"]
 
 [workspace.dependencies]
 # Internal crates
-ironfix-core = { path = "ironfix-core", version = "0.5.2" }
-ironfix-dictionary = { path = "ironfix-dictionary", version = "0.5.2" }
-ironfix-tagvalue = { path = "ironfix-tagvalue", version = "0.5.2" }
-ironfix-session = { path = "ironfix-session", version = "0.5.2" }
-ironfix-store = { path = "ironfix-store", version = "0.5.2" }
-ironfix-transport = { path = "ironfix-transport", version = "0.5.2" }
-ironfix-sofh = { path = "ironfix-sofh", version = "0.5.2" }
-ironfix-fixp = { path = "ironfix-fixp", version = "0.5.2" }
-ironfix-fast = { path = "ironfix-fast", version = "0.5.2" }
-ironfix-codegen = { path = "ironfix-codegen", version = "0.5.2" }
-ironfix-derive = { path = "ironfix-derive", version = "0.5.2" }
-ironfix-engine = { path = "ironfix-engine", version = "0.5.2" }
+ironfix-core = { path = "ironfix-core", version = "0.5.3" }
+ironfix-dictionary = { path = "ironfix-dictionary", version = "0.5.3" }
+ironfix-tagvalue = { path = "ironfix-tagvalue", version = "0.5.3" }
+ironfix-session = { path = "ironfix-session", version = "0.5.3" }
+ironfix-store = { path = "ironfix-store", version = "0.5.3" }
+ironfix-transport = { path = "ironfix-transport", version = "0.5.3" }
+ironfix-sofh = { path = "ironfix-sofh", version = "0.5.3" }
+ironfix-fixp = { path = "ironfix-fixp", version = "0.5.3" }
+ironfix-fast = { path = "ironfix-fast", version = "0.5.3" }
+ironfix-codegen = { path = "ironfix-codegen", version = "0.5.3" }
+ironfix-derive = { path = "ironfix-derive", version = "0.5.3" }
+ironfix-engine = { path = "ironfix-engine", version = "0.5.3" }
 
 # External dependencies
 thiserror = "2.0"
@@ -50,10 +50,10 @@ bytes = { version = "1.12", features = ["serde"] }
 smallvec = { version = "1.16", features = ["union", "const_generics"] }
 memchr = "2.8"
 arrayvec = { version = "0.7", features = ["serde"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 crossbeam-channel = "0.5"
 crossbeam-queue = "0.3"
-tokio = { version = "1.53", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }
 async-trait = "0.1"
@@ -83,7 +83,7 @@ criterion = { version = "0.8", features = ["html_reports"] }
 
 # Heap profiler used as a counting allocator by ironfix-dictionary's
 # zero-allocation test (dev-dependency only; never linked into a library)
-dhat = "=0.3.3"
+dhat = "0.3"
 
 [profile.release]
 opt-level = 3
