@@ -1420,10 +1420,10 @@ impl Command {
     #[allow(clippy::unused_self)]
     const fn is_probe(&self) -> bool {
         #[cfg(test)]
-        if matches!(self, Self::Probe(_)) {
-            return true;
-        }
-        false
+        let probe = matches!(self, Self::Probe(_));
+        #[cfg(not(test))]
+        let probe = false;
+        probe
     }
 }
 
