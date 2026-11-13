@@ -213,6 +213,41 @@ pub trait Application: Send + Sync {
     /// * `session_id` - The session identifier
     async fn on_logout(&self, session_id: &SessionId);
 
+    /// Called when the counterparty's Logout (35=5) is owed a reply, to ask
+    /// whether the reply may go out now or must wait (issue #214).
+    ///
+    /// Consulted only on a session whose engine was built with
+    /// `with_peer_logout_hold(true)`
+    /// ([`Initiator::with_peer_logout_hold`](crate::Initiator::with_peer_logout_hold),
+    /// [`Acceptor::with_peer_logout_hold`](crate::Acceptor::with_peer_logout_hold),
+    /// [`EngineBuilder::with_peer_logout_hold`](crate::EngineBuilder::with_peer_logout_hold));
+    /// otherwise the reply goes out as soon as `from_admin` accepts the
+    /// Logout, and this method is never called.
+    ///
+    /// When it is consulted, it runs on the dispatcher task after
+    /// [`Application::from_app`] has returned for every application message
+    /// numbered below the Logout, so an order sent just before the Logout has
+    /// been processed. Returning [`LogoutHold::Hold`] keeps the reply back
+    /// until the application calls
+    /// [`Connection::reply_logout`](crate::Connection::reply_logout), or the
+    /// session's `logout_timeout`, counted from the Logout's arrival, runs out.
+    /// While the reply waits (from the Logout's arrival until it is sent),
+    /// the session stays Active for writes: messages queued with
+    /// [`Connection::send`](crate::Connection::send), heartbeats and a resend
+    /// the session owes all go out, in order, before the reply. Application
+    /// messages the counterparty sends after its Logout are not delivered:
+    /// each is logged, its sequence number is consumed, and `from_app` does
+    /// not see it.
+    ///
+    /// The default returns [`LogoutHold::Reply`].
+    ///
+    /// # Arguments
+    /// * `session_id` - The session identifier
+    async fn on_peer_logout(&self, session_id: &SessionId) -> LogoutHold {
+        let _ = session_id;
+        LogoutHold::Reply
+    }
+
     /// Called once when a session ends, with the reason it ended.
     ///
     /// The engine calls this, not [`Application::on_logout`], on every close
@@ -677,6 +712,19 @@ impl std::fmt::Debug for SendVerdict<'_> {
         };
         f.debug_struct("SendVerdict").field("form", &form).finish()
     }
+}
+
+/// Whether the reply to a counterparty's Logout may go out now
+/// ([`Application::on_peer_logout`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum LogoutHold {
+    /// Reply now: what a session does without a hold.
+    #[default]
+    Reply,
+    /// Keep the reply back until
+    /// [`Connection::reply_logout`](crate::Connection::reply_logout) or the
+    /// logout timeout.
+    Hold,
 }
 
 /// Default no-op application implementation.

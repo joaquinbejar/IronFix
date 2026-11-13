@@ -277,7 +277,7 @@
 //! [`SequenceManager::try_increment_target_seq`]; an exhausted counter tears the
 //! session down rather than wrapping.
 
-use crate::application::{Application, RejectReason, SessionId};
+use crate::application::{Application, LogoutHold, RejectReason, SessionId};
 use crate::close::{CloseReason, LogoutCause, bounded_peer_text};
 use crate::command_queue::{CommandReceiver, CommandSender, command_queue};
 use crate::connection::{Command, SessionRuntime};
@@ -961,6 +961,43 @@ struct AppFrame {
     seq: u64,
 }
 
+/// What the reactor hands the application dispatcher, in inbound order.
+#[derive(Debug)]
+enum AppItem {
+    /// An application message for `from_app`.
+    Frame(AppFrame),
+    /// The counterparty's Logout, on a session with the peer logout hold:
+    /// `on_peer_logout` runs once every frame queued before it has been
+    /// delivered (issue #214).
+    PeerLogout,
+}
+
+/// Where the reply to the counterparty's Logout stands on a session built
+/// with the peer logout hold (issue #214). Always [`PeerLogoutHold::Idle`]
+/// without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerLogoutHold {
+    /// No Logout from the counterparty yet.
+    Idle,
+    /// `on_peer_logout` has not answered yet.
+    Asking {
+        /// `Connection::reply_logout` was called meanwhile: the answer is
+        /// not waited on past its arrival.
+        released: bool,
+    },
+    /// The application holds the reply.
+    Held,
+    /// The reply may go out: once any resend owed is done, or at once.
+    Released,
+}
+
+impl PeerLogoutHold {
+    /// Whether the reply is held back by the application.
+    const fn holds_reply(self) -> bool {
+        matches!(self, Self::Asking { .. } | Self::Held)
+    }
+}
+
 /// A rejection the application returned from `from_app`, on its way back to
 /// the reactor as a session-level Reject.
 #[derive(Debug)]
@@ -982,6 +1019,8 @@ enum DispatcherEvent {
     /// [`StoreFailurePolicy::CloseSession`]: the dispatcher has stopped
     /// delivering, and the session must close.
     StoreFailed(StoreError),
+    /// What `on_peer_logout` answered (issue #214).
+    PeerLogout(LogoutHold),
 }
 
 /// Where the dispatcher persists the inbound application watermark: the
@@ -1057,6 +1096,22 @@ impl<A: Application> AppDispatcher<A> {
                 // session it would have closed no longer exists.
                 let _ = self.events.send(DispatcherEvent::StoreFailed(err)).await;
                 false
+            }
+        }
+    }
+
+    /// Handles one item from the reactor: a frame for `from_app`, or the
+    /// counterparty's Logout for `on_peer_logout`, whose answer goes back to
+    /// the reactor. Returns `false` when the dispatcher must stop.
+    async fn handle(&mut self, item: AppItem) -> bool {
+        match item {
+            AppItem::Frame(frame) => self.deliver(frame).await,
+            AppItem::PeerLogout => {
+                let hold = self.application.on_peer_logout(&self.session_id).await;
+                self.events
+                    .send(DispatcherEvent::PeerLogout(hold))
+                    .await
+                    .is_ok()
             }
         }
     }
@@ -1145,7 +1200,7 @@ impl<A: Application> AppDispatcher<A> {
 /// write fails under [`StoreFailurePolicy::CloseSession`].
 async fn run_app_dispatcher<A: Application>(
     mut dispatcher: AppDispatcher<A>,
-    mut frames: mpsc::Receiver<AppFrame>,
+    mut frames: mpsc::Receiver<AppItem>,
     mut marks: watch::Receiver<u64>,
 ) {
     // The opening mark was persisted by the reactor before it acted on any
@@ -1158,8 +1213,8 @@ async fn run_app_dispatcher<A: Application>(
         tokio::select! {
             biased;
             frame = frames.recv() => match frame {
-                Some(frame) => {
-                    if !dispatcher.deliver(frame).await {
+                Some(item) => {
+                    if !dispatcher.handle(item).await {
                         return;
                     }
                 }
@@ -1173,8 +1228,8 @@ async fn run_app_dispatcher<A: Application>(
                 let mark = *marks.borrow_and_update();
                 // Every frame queued before the mark was published is
                 // visible now: deliver them before accounting for it.
-                while let Ok(frame) = frames.try_recv() {
-                    if !dispatcher.deliver(frame).await {
+                while let Ok(item) = frames.try_recv() {
+                    if !dispatcher.handle(item).await {
                         return;
                     }
                 }
@@ -2031,7 +2086,12 @@ struct Reactor<A: Application> {
     /// The write buffer's state and the write timeout's clock.
     writer: Writer,
     /// Hand-off queue to the application dispatcher.
-    app_tx: mpsc::Sender<AppFrame>,
+    app_tx: mpsc::Sender<AppItem>,
+    /// Whether the application is asked, with `on_peer_logout`, before the
+    /// counterparty's Logout is answered (issue #214).
+    peer_logout_hold_enabled: bool,
+    /// Where that reply stands; [`PeerLogoutHold::Idle`] without the hold.
+    peer_logout_hold: PeerLogoutHold,
     /// Garbled-frame count against [`SessionConfig::garbled_frame_limit`], or
     /// `None` when no limit is configured.
     garbled: Option<GarbledFrameWindow>,
@@ -2304,6 +2364,9 @@ async fn run_reactor<A: Application + 'static>(
             // a full hold it waits, as reading does.
             event = app_rejects.recv(), if rejects_open && !hold_full => match event {
                 Some(DispatcherEvent::StoreFailed(err)) => Err(ctx.close_on_store_failure(current, &err)),
+                Some(DispatcherEvent::PeerLogout(hold)) => {
+                    ctx.on_peer_logout_answer(&mut framed, current, hold).await
+                }
                 Some(DispatcherEvent::Reject(rejection)) => {
                     let ref_msg_type = rejection.ref_msg_type.as_str().to_string();
                     ctx.send_session_reject(
@@ -3488,6 +3551,7 @@ impl<A: Application> Reactor<A> {
                 self.send_application(framed, phase, budget, message, receipt)
                     .await
             }
+            Command::ReplyLogout => self.on_reply_logout(framed, phase).await,
             Command::Logout(cause) => match (decide_local_logout(phase.logout_phase()), phase) {
                 (LocalLogoutDecision::Send, Phase::Active(session)) => {
                     self.begin_logout(framed, session, cause).await
@@ -3795,6 +3859,10 @@ impl<A: Application> Reactor<A> {
                 return Err(self.close_on_write_failure(phase, close, UnknownReason::WriteTimeout));
             }
         }
+
+        // A Logout reply the application holds is released by the logout
+        // timeout, counted from the Logout's arrival (issue #214).
+        let phase = self.end_peer_logout_hold_on_timeout(framed, phase).await?;
 
         // The core decides the tick; the driver acts on it. The heartbeat
         // guard is a std mutex, dropped at the end of this statement, before
@@ -4900,7 +4968,7 @@ impl<A: Application> Reactor<A> {
                 Ok(_) => {}
             }
         }
-        if self.core.logout_owed() {
+        if self.core.logout_owed() && !self.peer_logout_hold.holds_reply() {
             return self.reply_owed_logout(framed, phase, false).await;
         }
         // Messages queued above a gap whose release paused on a full hold.
@@ -4990,6 +5058,91 @@ impl<A: Application> Reactor<A> {
     fn owed_logout_due(&self) -> bool {
         self.core
             .owed_logout_due(driver_now(), self.config.logout_timeout)
+    }
+
+    /// Acts on what `on_peer_logout` answered (issue #214).
+    ///
+    /// # Errors
+    /// The session closes with the Logout exchange when the reply goes out.
+    async fn on_peer_logout_answer(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+        hold: LogoutHold,
+    ) -> Result<Phase, SessionClosed> {
+        match (self.peer_logout_hold, hold) {
+            (PeerLogoutHold::Asking { released: false }, LogoutHold::Hold) => {
+                tracing::debug!(
+                    session = %self.session_id,
+                    "the application holds the reply to the counterparty's Logout"
+                );
+                self.peer_logout_hold = PeerLogoutHold::Held;
+                Ok(phase)
+            }
+            (PeerLogoutHold::Asking { .. }, _) => self.release_peer_logout(framed, phase).await,
+            // The reply already went out, or the timeout ended the wait.
+            _ => Ok(phase),
+        }
+    }
+
+    /// Acts on [`Connection::reply_logout`](crate::Connection::reply_logout)
+    /// (issue #214): ends the hold, or marks it ended in advance while
+    /// `on_peer_logout` has not answered. Does nothing when no reply is held.
+    ///
+    /// # Errors
+    /// The session closes with the Logout exchange when the reply goes out.
+    async fn on_reply_logout(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+    ) -> Result<Phase, SessionClosed> {
+        match self.peer_logout_hold {
+            PeerLogoutHold::Asking { .. } => {
+                self.peer_logout_hold = PeerLogoutHold::Asking { released: true };
+                Ok(phase)
+            }
+            PeerLogoutHold::Held => self.release_peer_logout(framed, phase).await,
+            PeerLogoutHold::Idle | PeerLogoutHold::Released => Ok(phase),
+        }
+    }
+
+    /// Lets the reply to the counterparty's Logout go out: now, or once the
+    /// resend this session owes is done ([`Reactor::finish_resends`]).
+    async fn release_peer_logout(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+    ) -> Result<Phase, SessionClosed> {
+        self.peer_logout_hold = PeerLogoutHold::Released;
+        if self.resend_in_progress() || !self.core.logout_owed() {
+            return Ok(phase);
+        }
+        self.reply_owed_logout(framed, phase, false).await
+    }
+
+    /// Replies to a held Logout once the logout timeout has run out since
+    /// it arrived, whatever the application did (issue #214); otherwise
+    /// hands the phase back untouched. A resend still owed is cut, as
+    /// [`Reactor::cut_resend_for_owed_logout`] does.
+    ///
+    /// # Errors
+    /// The session closes with the Logout exchange when the reply was due.
+    async fn end_peer_logout_hold_on_timeout(
+        &mut self,
+        framed: &mut FixFramed,
+        phase: Phase,
+    ) -> Result<Phase, SessionClosed> {
+        if !self.peer_logout_hold.holds_reply() || !self.owed_logout_due() {
+            return Ok(phase);
+        }
+        tracing::warn!(
+            session = %self.session_id,
+            "the application did not release the reply to the counterparty's Logout within \
+             the logout timeout: replying now"
+        );
+        self.peer_logout_hold = PeerLogoutHold::Released;
+        let abandoned = self.resend_in_progress();
+        self.reply_owed_logout(framed, phase, abandoned).await
     }
 
     /// Holds `entry` back behind the resend under way, counting its bytes.
@@ -5085,7 +5238,7 @@ impl<A: Application> Reactor<A> {
         let discarded = std::iter::from_fn(|| commands.try_recv())
             .filter_map(|command| match command {
                 Command::Send { receipt, .. } => Some(receipt),
-                Command::Logout(_) => None,
+                Command::Logout(_) | Command::ReplyLogout => None,
             })
             .map(|receipt| {
                 settle(
@@ -6062,16 +6215,31 @@ impl<A: Application> Reactor<A> {
         seq: u64,
         frame: &Bytes,
     ) -> Result<Phase, SessionClosed> {
-        let permit = match self.app_tx.try_reserve() {
-            Ok(permit) => permit,
-            Err(mpsc::error::TrySendError::Full(())) => {
-                teardown(phase);
-                return Err(closed(CloseReason::ApplicationQueueFull {}));
-            }
-            Err(mpsc::error::TrySendError::Closed(())) => {
-                teardown(phase);
-                return Err(closed(CloseReason::DispatcherStopped {}));
-            }
+        // After the counterparty's Logout, on a session with the peer logout
+        // hold, application messages are not delivered: the number is
+        // consumed below, and `from_app` does not see the message.
+        let ignored = self.peer_logout_hold != PeerLogoutHold::Idle;
+        if ignored {
+            tracing::warn!(
+                session = %self.session_id,
+                seq,
+                "ignoring an application message the counterparty sent after its Logout"
+            );
+        }
+        let permit = if ignored {
+            None
+        } else {
+            Some(match self.app_tx.try_reserve() {
+                Ok(permit) => permit,
+                Err(mpsc::error::TrySendError::Full(())) => {
+                    teardown(phase);
+                    return Err(closed(CloseReason::ApplicationQueueFull {}));
+                }
+                Err(mpsc::error::TrySendError::Closed(())) => {
+                    teardown(phase);
+                    return Err(closed(CloseReason::DispatcherStopped {}));
+                }
+            })
         };
         let Some(next) = seq.checked_add(1) else {
             return Err(exhausted(
@@ -6092,10 +6260,13 @@ impl<A: Application> Reactor<A> {
         {
             return Err(self.close_on_store_failure(phase, &err));
         }
-        permit.send(AppFrame {
+        let Some(permit) = permit else {
+            return Ok(phase);
+        };
+        permit.send(AppItem::Frame(AppFrame {
             frame: frame.clone(),
             seq,
-        });
+        }));
         // The reactor is the only writer of this count, which is why the
         // record is a plain load and store rather than an atomic add.
         self.runtime.record_inbound_app_message();
@@ -6176,6 +6347,7 @@ impl<A: Application> Reactor<A> {
         // counterparty that keeps logging out cannot keep pushing the reply
         // back (issue #128).
         let resending = self.resend_in_progress();
+        let first = !self.core.logout_owed();
         let decision = self.core.decide_peer_logout(
             phase.logout_phase(),
             driver_now(),
@@ -6183,6 +6355,45 @@ impl<A: Application> Reactor<A> {
             resending,
         );
         match (decision, phase) {
+            // The peer logout hold (issue #214): the application is asked,
+            // after every earlier `from_app`, whether the reply may go out.
+            // The session stays Active for writes meanwhile; the logout
+            // timeout, from the first Logout, bounds the wait.
+            (
+                PeerLogoutDecision::AwaitResend | PeerLogoutDecision::Reply,
+                Phase::Active(session),
+            ) if self.peer_logout_hold.holds_reply()
+                || (self.peer_logout_hold == PeerLogoutHold::Released && resending) =>
+            {
+                Ok(Phase::Active(session))
+            }
+            (
+                PeerLogoutDecision::AwaitResend | PeerLogoutDecision::Reply,
+                Phase::Active(session),
+            ) if first && self.peer_logout_hold_enabled => {
+                match self.app_tx.try_send(AppItem::PeerLogout) {
+                    Ok(()) => {
+                        self.peer_logout_hold = PeerLogoutHold::Asking { released: false };
+                        Ok(Phase::Active(session))
+                    }
+                    Err(_) => {
+                        // A full or stopped queue cannot carry the question:
+                        // the Logout is answered as without the hold.
+                        tracing::warn!(
+                            session = %self.session_id,
+                            "the application queue cannot take the counterparty's Logout: \
+                             replying without asking on_peer_logout"
+                        );
+                        self.peer_logout_hold = PeerLogoutHold::Released;
+                        if resending {
+                            Ok(Phase::Active(session))
+                        } else {
+                            self.reply_owed_logout(framed, Phase::Active(session), false)
+                                .await
+                        }
+                    }
+                }
+            }
             (PeerLogoutDecision::CompleteLocal { .. }, Phase::LogoutPending(session)) => {
                 // Typestate: LogoutPending -> Disconnected.
                 let _ = session.on_logout_ack();
@@ -6290,6 +6501,9 @@ pub(crate) struct SessionParams<A: Application> {
     pub(crate) outbound_capacity: usize,
     /// Capacity of the inbound application queue.
     pub(crate) app_queue_capacity: usize,
+    /// Whether the counterparty's Logout waits for `on_peer_logout`
+    /// (issue #214).
+    pub(crate) peer_logout_hold: bool,
     /// The outbound throttle, when the engine has one: the session gets its
     /// own budgets, full, from it.
     pub(crate) throttle: Option<ThrottleConfig>,
@@ -6342,6 +6556,7 @@ where
         write_timeout,
         outbound_capacity,
         app_queue_capacity,
+        peer_logout_hold,
         throttle,
         capture,
     } = params;
@@ -6447,6 +6662,8 @@ where
         write_timeout,
         writer,
         app_tx,
+        peer_logout_hold_enabled: peer_logout_hold,
+        peer_logout_hold: PeerLogoutHold::Idle,
         garbled,
         throttle,
         inbound_index,

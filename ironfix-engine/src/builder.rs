@@ -64,6 +64,8 @@ pub struct EngineBuilder<A: Application = NoOpApplication> {
     observer: Option<Arc<dyn FrameObserver>>,
     /// Inbound validation attached by every terminal method, if any.
     validation: Option<InboundValidation>,
+    /// Whether every terminal method enables the peer logout hold.
+    peer_logout_hold: bool,
 }
 
 /// Written by hand rather than derived: `dyn MessageStore` is not `Debug`, and
@@ -77,6 +79,7 @@ impl<A: Application> std::fmt::Debug for EngineBuilder<A> {
             .field("throttle", &self.throttle)
             .field("frame_observer", &self.observer.is_some())
             .field("inbound_validation", &self.validation)
+            .field("peer_logout_hold", &self.peer_logout_hold)
             .finish_non_exhaustive()
     }
 }
@@ -99,6 +102,7 @@ impl EngineBuilder<NoOpApplication> {
             throttle: None,
             observer: None,
             validation: None,
+            peer_logout_hold: false,
         }
     }
 }
@@ -115,6 +119,7 @@ impl<A: Application + 'static> EngineBuilder<A> {
             throttle: self.throttle,
             observer: self.observer,
             validation: self.validation,
+            peer_logout_hold: self.peer_logout_hold,
         }
     }
 
@@ -190,6 +195,17 @@ impl<A: Application + 'static> EngineBuilder<A> {
         self
     }
 
+    /// Enables the peer logout hold on the engine a terminal method produces:
+    /// [`Initiator::with_peer_logout_hold`] for
+    /// [`EngineBuilder::into_initiator`], [`Acceptor::with_peer_logout_hold`]
+    /// for [`EngineBuilder::into_acceptor`] and every [`Acceptor`] of
+    /// [`EngineBuilder::into_acceptor_registry`] (issue #214). Off by default.
+    #[must_use]
+    pub const fn with_peer_logout_hold(mut self, hold: bool) -> Self {
+        self.peer_logout_hold = hold;
+        self
+    }
+
     /// Returns the inbound validation set with `with_inbound_validation`,
     /// if any.
     #[must_use]
@@ -236,8 +252,9 @@ impl<A: Application + 'static> EngineBuilder<A> {
     /// been added.
     pub fn into_initiator(self) -> Result<Initiator<A>, EngineError> {
         let config = self.single_session()?;
-        let initiator =
-            Initiator::new(config, self.application).with_connect_timeout(self.connect_timeout);
+        let initiator = Initiator::new(config, self.application)
+            .with_connect_timeout(self.connect_timeout)
+            .with_peer_logout_hold(self.peer_logout_hold);
         let initiator = match self.throttle {
             Some(throttle) => initiator.with_throttle(throttle),
             None => initiator,
@@ -265,7 +282,8 @@ impl<A: Application + 'static> EngineBuilder<A> {
     /// been added.
     pub fn into_acceptor(self) -> Result<Acceptor<A>, EngineError> {
         let config = self.single_session()?;
-        let acceptor = Acceptor::new(config, self.application);
+        let acceptor =
+            Acceptor::new(config, self.application).with_peer_logout_hold(self.peer_logout_hold);
         let acceptor = match self.throttle {
             Some(throttle) => acceptor.with_throttle(throttle),
             None => acceptor,
@@ -315,7 +333,8 @@ impl<A: Application + 'static> EngineBuilder<A> {
         }
         let registry = AcceptorRegistry::new();
         for config in self.sessions {
-            let acceptor = Acceptor::new(config, Arc::clone(&self.application));
+            let acceptor = Acceptor::new(config, Arc::clone(&self.application))
+                .with_peer_logout_hold(self.peer_logout_hold);
             let acceptor = match &self.throttle {
                 Some(throttle) => acceptor.with_throttle(throttle.clone()),
                 None => acceptor,

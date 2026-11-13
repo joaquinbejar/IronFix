@@ -4,6 +4,24 @@ All notable changes to the IronFix workspace are recorded here. Versions
 follow [Semantic Versioning](https://semver.org/); while the workspace is at
 0.x, a change that breaks behaviour or the public API takes a minor bump.
 
+## Unreleased
+
+- An application can hold its reply to the counterparty's Logout (#214).
+  Opt in with `with_peer_logout_hold(true)` on `Initiator`, `Acceptor` or
+  `EngineBuilder`; without it nothing changes, and the reply goes out as
+  soon as `from_admin` accepts the Logout. With it, the new
+  `Application::on_peer_logout` (default: `LogoutHold::Reply`) runs on the
+  dispatcher after `from_app` has returned for every earlier application
+  message. Returning `LogoutHold::Hold` keeps the reply back until the
+  application calls the new `Connection::reply_logout`, so a report it
+  queued with `Connection::send` before that call is on the wire before the
+  reply. The session's `logout_timeout`, counted from the Logout's arrival,
+  ends a hold the application never releases. While the reply waits, the
+  session stays Active for writes (sends, heartbeats, an owed resend), and
+  application messages the counterparty sends after its Logout are logged,
+  their sequence numbers consumed, and not delivered to `from_app`. Both
+  additions are backward compatible: `on_peer_logout` has a default body.
+
 ## 0.5.2 (2026-11-12)
 
 - `ironfix-fixp` (and `ironfix-engine` with the `fixp` feature) depend on
