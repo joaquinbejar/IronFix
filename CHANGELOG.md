@@ -4,10 +4,27 @@ All notable changes to the IronFix workspace are recorded here. Versions
 follow [Semantic Versioning](https://semver.org/); while the workspace is at
 0.x, a change that breaks behaviour or the public API takes a minor bump.
 
-## Unreleased
+## 0.5.3 (2026-11-13)
 
-- An application can hold its reply to the counterparty's Logout (#214).
-  Opt in with `with_peer_logout_hold(true)` on `Initiator`, `Acceptor` or
+Both changes below are backward compatible; `cargo-semver-checks` finds no
+API break, so this is a patch release.
+
+### Changed: chrono without default features (#213)
+
+- The workspace depends on `chrono` with `default-features = false` and only
+  `std` and `serde`. `ironfix-core` uses chrono's types only and never reads
+  the clock, so no IronFix crate turns on chrono's `clock`, `now`,
+  `wasmbind` or `oldtime` in an application's build any more. An
+  application that wants `Utc::now()` enables `clock` on its own `chrono`.
+- `make check-chrono-features` (CI, `tests.yml`) fails if any of those
+  features comes back for `ironfix-core`, or for `ironfix-engine` with
+  default or all features.
+- `ironfix-store`: `Command::is_probe` is written so the current stable
+  clippy (`needless_bool`) passes; no behaviour change.
+
+### Added: an application can hold its reply to a peer Logout (#214)
+
+- Opt in with `with_peer_logout_hold(true)` on `Initiator`, `Acceptor` or
   `EngineBuilder`; without it nothing changes, and the reply goes out as
   soon as `from_admin` accepts the Logout. With it, the new
   `Application::on_peer_logout` (default: `LogoutHold::Reply`) runs on the
@@ -21,6 +38,13 @@ follow [Semantic Versioning](https://semver.org/); while the workspace is at
   application messages the counterparty sends after its Logout are logged,
   their sequence numbers consumed, and not delivered to `from_app`. Both
   additions are backward compatible: `on_peer_logout` has a default body.
+
+### Dependencies
+
+- `tokio` 1.54, `parking_lot` 0.13 (used only inside `ironfix-session`,
+  `ironfix-store` and the examples; no `parking_lot` type is in a public
+  API), and the dev-only `dhat` written as `0.3` instead of `=0.3.3`. Every
+  other dependency was already at its latest stable release.
 
 ## 0.5.2 (2026-11-12)
 
