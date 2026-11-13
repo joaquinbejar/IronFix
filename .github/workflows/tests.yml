@@ -39,6 +39,12 @@ jobs:
       - name: FIXP feature dependency check
         run: make check-fixp-deps
 
+      # Issue #213: chrono is used for its types only. No ironfix crate may
+      # enable chrono's `clock`, `now`, `wasmbind` or `oldtime` features,
+      # since Cargo would turn them on for every application downstream.
+      - name: chrono feature check
+        run: make check-chrono-features
+
       # Compiles the criterion benchmarks without running them. A timing taken
       # on a shared runner is not a measurement, but a benchmark that stops
       # compiling is a real regression, and this catches it.
