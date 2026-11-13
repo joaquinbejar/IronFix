@@ -967,7 +967,7 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [fauxchange](https://github.com/joaquinbejar/fauxchange) | Exchange-in-a-box: local options exchange simulator with realistic matching, FIX/WS/REST APIs and historical replay. |
-| [otc-rfq](https://github.com/joaquinbejar/otc-rfq) | OTC Request-for-Quote engine with REST, SBE streaming and FIX/WebSocket/gRPC venue connectivity. |
+| [fauxchange](https://github.com/joaquinbejar/fauxchange) | Exchange-in-a-box options exchange simulator; its FIX 4.4 gateway is built on `ironfix-core`, `ironfix-tagvalue` and `ironfix-session`. |
+| [otc-rfq](https://github.com/joaquinbejar/otc-rfq) | OTC Request-for-Quote engine; it uses IronFix for FIX 4.4 venue connectivity. |
 
 <!-- related-projects:end -->
