@@ -91,7 +91,7 @@ pub use file::{
     FileStore, FileStoreConfig, FileStoreConfigError, SyncPolicy, Truncation, TruncationCause,
 };
 pub use memory::MemoryStore;
-pub use pending::{PendingError, PendingStore, Ticket};
+pub use pending::{PendingError, PendingStore, TargetTicket, Ticket};
 pub use stored::StoredMessage;
 pub use sync_traits::SyncMessageStore;
 #[cfg(feature = "async")]

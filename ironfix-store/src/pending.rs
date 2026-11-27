@@ -62,7 +62,12 @@
 //!   before it, so it cannot persist ahead of an earlier outbound frame
 //!   (the call-order rule of the [`traits`](crate::traits) module), with
 //!   the same bound, `Busy` and fail-closed behaviour.
-//!   [`PendingStore::durable_target`] reports the last one applied.
+//!   It returns a [`TargetTicket`], checked with
+//!   [`PendingStore::is_target_applied`];
+//!   [`PendingStore::durable_target`] reports the last number applied.
+//! - Sent reports are contiguous ([`PendingStore::mark_sent`] refuses a
+//!   number that skips an unreported frame), so every readable frame was
+//!   reported sent.
 //! - Dropping a [`PendingStore`] finishes the writes already queued and
 //!   joins the worker, so it blocks for up to the bound times one write.
 //!
@@ -150,6 +155,25 @@ pub struct Ticket {
 impl Ticket {
     /// The sequence number the frame was submitted under; it is durable once
     /// [`PendingStore::durable`] reaches it.
+    #[must_use]
+    pub const fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+/// Receipt for one target (inbound) counter write; see
+/// [`PendingStore::is_target_applied`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a target ticket names the write to wait on"]
+pub struct TargetTicket {
+    /// The target sequence number submitted.
+    seq: u64,
+    /// The write's position among the target writes submitted.
+    index: u64,
+}
+
+impl TargetTicket {
+    /// The target sequence number submitted.
     #[must_use]
     pub const fn seq(&self) -> u64 {
         self.seq
@@ -248,6 +272,9 @@ pub struct PendingStore<S: SyncMessageStore + 'static> {
     sent: Option<u64>,
     /// The last target number the worker applied.
     durable_target: Option<u64>,
+    /// Target writes submitted, and applied, so far.
+    targets_submitted: u64,
+    targets_applied: u64,
 }
 
 impl<S: SyncMessageStore + 'static> PendingStore<S> {
@@ -300,6 +327,8 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
             deferred: None,
             sent: None,
             durable_target: None,
+            targets_submitted: 0,
+            targets_applied: 0,
             floor,
             durable: None,
         })
@@ -486,23 +515,33 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     }
 
     /// Records that the frame under `seq` was written to the socket, so a
-    /// resend may read it. Reporting a number at or below the current sent
-    /// watermark is a no-op.
+    /// resend may read it. Reports are contiguous: `seq` must be the number
+    /// right after the last readable one, so no frame is made readable
+    /// without its own report. Reporting a number already readable is a
+    /// no-op.
     ///
     /// # Errors
+    /// [`PendingError::NotNext`] when `seq` skips an unreported frame;
     /// [`PendingError::NotDurable`] when `seq` is above the durable
     /// watermark: a frame must be durable before it is sent.
     pub fn mark_sent(&mut self, seq: u64) -> Result<(), PendingError> {
+        let expected = match self.confirmed() {
+            Some(readable) => match readable.checked_add(1) {
+                Some(next) => next,
+                None => return Ok(()),
+            },
+            None => 1,
+        };
+        if seq < expected {
+            return Ok(());
+        }
+        if seq != expected {
+            return Err(PendingError::NotNext { expected, seq });
+        }
         if self.durable.is_none_or(|durable| seq > durable) {
-            if seq < self.floor {
-                // History held at construction: already readable.
-                return Ok(());
-            }
             return Err(PendingError::NotDurable { seq });
         }
-        if self.sent.is_none_or(|sent| seq > sent) {
-            self.sent = Some(seq);
-        }
+        self.sent = Some(seq);
         Ok(())
     }
 
@@ -514,14 +553,14 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
 
     /// Queues the next target (inbound) sequence number behind every write
     /// submitted before it, and returns at once. Its durability is
-    /// collected by [`PendingStore::poll_durable`] and reported by
-    /// [`PendingStore::durable_target`].
+    /// collected by [`PendingStore::poll_durable`]; check the returned
+    /// [`TargetTicket`] with [`PendingStore::is_target_applied`].
     ///
     /// # Errors
     /// As [`PendingStore::submit`]: [`PendingError::Full`],
     /// [`PendingError::Busy`], [`PendingError::Failed`] and
     /// [`PendingError::Closed`].
-    pub fn submit_target(&mut self, seq: u64) -> Result<Ticket, PendingError> {
+    pub fn submit_target(&mut self, seq: u64) -> Result<TargetTicket, PendingError> {
         if self.is_failed() {
             return Err(PendingError::Failed);
         }
@@ -533,10 +572,22 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
                 bound: self.bound.get(),
             });
         }
+        let Some(index) = self.targets_submitted.checked_add(1) else {
+            return Err(PendingError::SequenceExhausted { seq });
+        };
         enqueue(&self.shared, || Job::Target { seq })?;
         // `in_flight < bound <= usize::MAX`, checked above.
         self.in_flight += 1;
-        Ok(Ticket { seq })
+        self.targets_submitted = index;
+        Ok(TargetTicket { seq, index })
+    }
+
+    /// Whether the target write behind `ticket` has been applied, as of
+    /// the last poll. Target writes run in submit order, so a later one
+    /// being applied implies this one was.
+    #[must_use]
+    pub const fn is_target_applied(&self, ticket: &TargetTicket) -> bool {
+        self.targets_applied >= ticket.index
     }
 
     /// The last target number the worker applied, as of the last poll.
@@ -644,6 +695,11 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
             }
             Done::TargetSet(seq) => {
                 self.durable_target = Some(seq);
+                // One per submitted target, at most `targets_submitted`.
+                match self.targets_applied.checked_add(1) {
+                    Some(applied) => self.targets_applied = applied,
+                    None => debug_assert!(false, "more targets applied than submitted"),
+                }
                 Ok(())
             }
             Done::Failed(err) => {
@@ -953,7 +1009,9 @@ mod tests {
             p.get_range(1, 3),
             Err(StoreError::RangeNotAvailable { begin: 1, end: 3 })
         );
-        assert_eq!(p.mark_sent(3), Ok(()));
+        for seq in 1..=3 {
+            assert_eq!(p.mark_sent(seq), Ok(()));
+        }
         match p.get_range(1, 3) {
             Ok(messages) => assert_eq!(messages.len(), 3),
             Err(err) => panic!("range: {err:?}"),
@@ -1316,15 +1374,21 @@ mod tests {
                 other => break other,
             }
         };
-        assert!(target.is_ok_and(|ticket| ticket.seq() == 9));
+        let ticket = match target {
+            Ok(ticket) => ticket,
+            Err(err) => panic!("target: {err:?}"),
+        };
+        assert_eq!(ticket.seq(), 9);
         assert_eq!(p.in_flight(), 2);
         // Frame 1 is held at the gate, so the target write behind it in
         // the one worker queue cannot have run.
         assert_eq!(p.store.inner.next_target_seq(), 1);
         assert_eq!(p.durable_target(), None);
+        assert!(!p.is_target_applied(&ticket));
         assert!(open.send(()).is_ok());
         assert_eq!(p.drain(), Ok(Some(1)));
         assert_eq!(p.durable_target(), Some(9));
+        assert!(p.is_target_applied(&ticket));
         assert_eq!(p.next_target_seq(), 9);
     }
 
@@ -1351,7 +1415,14 @@ mod tests {
         assert!(inner.contains(4));
         // Durable, not sent: only history is readable.
         assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2]);
-        assert_eq!(p.mark_sent(5), Err(PendingError::NotDurable { seq: 5 }));
+        // Frame 3 is unreported: reporting 4 would make it readable.
+        assert_eq!(
+            p.mark_sent(4),
+            Err(PendingError::NotNext {
+                expected: 3,
+                seq: 4
+            })
+        );
         assert_eq!(p.mark_sent(3), Ok(()));
         assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2, 3]);
         assert_eq!(seqs(p.get_page(1, 10, 10)), vec![1, 2, 3]);
@@ -1360,6 +1431,7 @@ mod tests {
         assert_eq!(p.sent(), Some(3));
         assert_eq!(p.mark_sent(4), Ok(()));
         assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2, 3, 4]);
+        assert_eq!(p.mark_sent(5), Err(PendingError::NotDurable { seq: 5 }));
     }
 
     #[test]
