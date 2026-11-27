@@ -256,20 +256,12 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         let Some(next_sender) = seq.checked_add(1) else {
             return Err(PendingError::SequenceExhausted { seq });
         };
-        // `try_lock`: the worker holds the lock only to pop, and a submit
-        // must not wait for it.
-        let Some(mut jobs) = self.shared.jobs.try_lock() else {
-            return Err(PendingError::Busy);
-        };
-        // One push into reserved capacity (`in_flight < bound`).
-        jobs.queue.push_back(Job {
+        enqueue(&self.shared, || Job {
             seq,
             msg_type: msg_type.clone(),
             message: message.to_vec(),
             next_sender,
-        });
-        drop(jobs);
-        self.shared.job_ready.notify_one();
+        })?;
         // `in_flight < bound <= usize::MAX`, checked above.
         self.in_flight += 1;
         self.last_submitted = Some(seq);
@@ -433,6 +425,25 @@ impl<S: SyncMessageStore + 'static> std::fmt::Debug for PendingStore<S> {
     }
 }
 
+/// Queues the job built by `job`, or refuses it. `try_lock`: the worker
+/// holds the lock only to pop or to publish a failure, and a submit must
+/// not wait for it. The worker publishes a failure under this lock, so
+/// under it the flag is exact: a job is either queued before the failure
+/// was published or refused with [`PendingError::Failed`].
+fn enqueue(shared: &Shared, job: impl FnOnce() -> Job) -> Result<(), PendingError> {
+    let Some(mut jobs) = shared.jobs.try_lock() else {
+        return Err(PendingError::Busy);
+    };
+    if shared.failed.load(Ordering::Acquire) {
+        return Err(PendingError::Failed);
+    }
+    // One push into reserved capacity (the caller checked the bound).
+    jobs.queue.push_back(job());
+    drop(jobs);
+    shared.job_ready.notify_one();
+    Ok(())
+}
+
 /// Replaces a backend error with one that carries no backend text; only
 /// the kind of error and the sequence number survive.
 fn sanitise(seq_num: u64, err: &StoreError) -> StoreError {
@@ -474,9 +485,12 @@ fn run_worker<S: SyncMessageStore>(store: &S, shared: &Shared) {
                 Ok(()) => Done::Filed(job.seq),
                 Err(err) => {
                     failed = true;
-                    // Published before the outcome, so a submit after it is
-                    // refused rather than handed a ticket that is skipped.
-                    shared.failed.store(true, Ordering::Release);
+                    // Published under the job lock, before the outcome, so
+                    // every submit is either queued before it or refused.
+                    {
+                        let _jobs = shared.jobs.lock();
+                        shared.failed.store(true, Ordering::Release);
+                    }
                     Done::Failed(sanitise(job.seq, &err))
                 }
             }
@@ -501,16 +515,25 @@ mod tests {
         gate: Option<Mutex<mpsc::Receiver<()>>>,
         fail_at: Option<u64>,
         fail_with: StoreError,
+        /// Signalled when a write starts (before the gate), and again once
+        /// the `fail_at` write has decided to fail.
+        failing: Option<Mutex<mpsc::Sender<()>>>,
     }
 
     impl SyncMessageStore for GatedStore {
         fn store(&self, seq: u64, msg_type: &MsgType, message: &[u8]) -> Result<(), StoreError> {
+            if let Some(failing) = &self.failing {
+                let _ = failing.lock().send(());
+            }
             if let Some(gate) = &self.gate
                 && gate.lock().recv_timeout(Duration::from_secs(5)).is_err()
             {
                 return Err(StoreError::Io("gate timed out".to_owned()));
             }
             if self.fail_at == Some(seq) {
+                if let Some(failing) = &self.failing {
+                    let _ = failing.lock().send(());
+                }
                 return Err(self.fail_with.clone());
             }
             self.inner.store(seq, msg_type, message)
@@ -563,6 +586,7 @@ mod tests {
             gate: Some(Mutex::new(gate)),
             fail_at,
             fail_with,
+            failing: None,
         };
         match PendingStore::new(Arc::new(store), bound(n)) {
             Ok(p) => (p, open),
@@ -675,6 +699,55 @@ mod tests {
         ));
     }
 
+    /// The failure is published under the job lock: while a submit holds
+    /// it, the flag cannot change, so the check under the lock is exact.
+    #[test]
+    fn test_pending_store_publishes_a_failure_only_under_the_job_lock() {
+        let (open, gate) = mpsc::channel();
+        let (failing, failed_write) = mpsc::channel();
+        let store = GatedStore {
+            inner: MemoryStore::new(),
+            gate: Some(Mutex::new(gate)),
+            fail_at: Some(1),
+            fail_with: injected(1),
+            failing: Some(Mutex::new(failing)),
+        };
+        let mut p = match PendingStore::new(Arc::new(store), bound(4)) {
+            Ok(p) => p,
+            Err(err) => panic!("new: {err:?}"),
+        };
+        assert!(submit(&mut p, 1).is_ok());
+        // The worker has popped write 1 and waits at the gate.
+        assert!(failed_write.recv_timeout(Duration::from_secs(5)).is_ok());
+        {
+            // Stand where a submit stands between its lock and its push.
+            let jobs = p.shared.jobs.lock();
+            assert!(open.send(()).is_ok());
+            // The worker has decided to fail and now needs this lock.
+            assert!(failed_write.recv_timeout(Duration::from_secs(5)).is_ok());
+            assert!(!p.shared.failed.load(Ordering::Acquire));
+            drop(jobs);
+        }
+        // Once the lock is free the worker publishes the flag.
+        while !p.shared.failed.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        // An enqueue that passed the unlocked fast check before the failure
+        // is refused under the lock: no job is built, no ticket issued.
+        loop {
+            match enqueue(&p.shared, || panic!("a job built after the failure")) {
+                Err(PendingError::Failed) => break,
+                Err(PendingError::Busy) => std::thread::yield_now(),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(submit(&mut p, 2), Err(PendingError::Failed));
+        assert!(matches!(
+            p.drain(),
+            Err(StoreError::StoreFailed { seq_num: 1, .. })
+        ));
+    }
+
     #[test]
     fn test_pending_store_error_carries_no_backend_text() {
         let secret = "8=FIX.4.4\x0135=A\x01554=hunter2\x01";
@@ -714,6 +787,7 @@ mod tests {
             gate: None,
             fail_at: None,
             fail_with: injected(0),
+            failing: None,
         });
         let mut p = match PendingStore::new(Arc::clone(&store), bound(8)) {
             Ok(p) => p,
