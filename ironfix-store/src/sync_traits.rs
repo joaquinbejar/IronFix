@@ -26,7 +26,9 @@
 //! mutation in full or not started it, so the call-order rule holds.
 
 use crate::stored::StoredMessage;
+#[cfg(feature = "async")]
 use crate::traits::MessageStore;
+#[cfg(feature = "async")]
 use async_trait::async_trait;
 use ironfix_core::error::StoreError;
 use ironfix_core::message::MsgType;
@@ -168,7 +170,9 @@ pub trait SyncMessageStore: Send + Sync {
     }
 }
 
-/// A [`SyncMessageStore`] used as a [`MessageStore`].
+/// A [`SyncMessageStore`] used as a [`MessageStore`]. Needs the `async`
+/// feature.
+#[cfg(feature = "async")]
 ///
 /// Every async method runs the synchronous method of the same name inline;
 /// see the [module docs](self) for when that is sound.
@@ -178,6 +182,7 @@ pub struct SyncStoreAdapter<S> {
     inner: S,
 }
 
+#[cfg(feature = "async")]
 impl<S> SyncStoreAdapter<S> {
     /// Wraps `inner`.
     #[must_use]
@@ -198,6 +203,7 @@ impl<S> SyncStoreAdapter<S> {
     }
 }
 
+#[cfg(feature = "async")]
 #[async_trait]
 impl<S: SyncMessageStore> MessageStore for SyncStoreAdapter<S> {
     async fn store(
