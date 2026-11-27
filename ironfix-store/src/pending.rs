@@ -88,6 +88,15 @@ pub enum PendingError {
         /// The sequence number refused.
         seq: u64,
     },
+    /// `seq` is below the inner store's next sender sequence number at
+    /// construction: that number is resend history.
+    #[error("sequence {seq} is below the store's next sender sequence {next}")]
+    BelowNextSender {
+        /// The inner store's next sender sequence number at construction.
+        next: u64,
+        /// The sequence number refused.
+        seq: u64,
+    },
     /// `seq` is `u64::MAX`, so the next sender sequence number cannot be
     /// persisted.
     #[error("sequence {seq} leaves no next sender sequence number")]
@@ -188,6 +197,8 @@ pub struct PendingStore<S: SyncMessageStore + 'static> {
     bound: NonZeroUsize,
     in_flight: usize,
     last_submitted: Option<u64>,
+    /// The inner store's next sender number when this wrapper was built.
+    floor: u64,
     durable: Option<u64>,
 }
 
@@ -196,15 +207,23 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     /// flight.
     ///
     /// # Errors
-    /// [`StoreError::Io`] if the worker thread cannot be spawned.
+    /// [`StoreError::Io`] if the queues for `bound` writes cannot be
+    /// reserved or the worker thread cannot be spawned.
     pub fn new(store: Arc<S>, bound: NonZeroUsize) -> Result<Self, StoreError> {
+        let jobs = reserve::<Job>(bound)?;
+        let outcomes = reserve::<Done>(bound)?;
+        // A frame already filed below the store's next sender number is
+        // resend history; refilling it would replace the frame and move the
+        // counter back. The number itself may be refilled (a crash between
+        // filing and persisting the counter).
+        let floor = store.next_sender_seq();
         let shared = Arc::new(Shared {
             jobs: Mutex::new(Jobs {
-                queue: VecDeque::with_capacity(bound.get()),
+                queue: jobs,
                 closed: false,
             }),
             job_ready: Condvar::new(),
-            outcomes: Mutex::new(VecDeque::with_capacity(bound.get())),
+            outcomes: Mutex::new(outcomes),
             outcome_ready: Condvar::new(),
             failed: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -222,6 +241,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
             bound,
             in_flight: 0,
             last_submitted: None,
+            floor,
             durable: None,
         })
     }
@@ -234,7 +254,9 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     /// [`PendingError::Full`] when `bound` writes are in flight,
     /// [`PendingError::Failed`] after a failed write,
     /// [`PendingError::OutOfOrder`] when `seq` is not above the last
-    /// submitted, [`PendingError::SequenceExhausted`] for `u64::MAX`,
+    /// submitted, [`PendingError::BelowNextSender`] when `seq` is below the
+    /// store's next sender number at construction,
+    /// [`PendingError::SequenceExhausted`] for `u64::MAX`,
     /// [`PendingError::Busy`] when the worker held the queue lock at that
     /// instant, and [`PendingError::Closed`] when the worker is gone.
     pub fn submit(
@@ -252,6 +274,12 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         if self.in_flight >= self.bound.get() {
             return Err(PendingError::Full {
                 bound: self.bound.get(),
+            });
+        }
+        if seq < self.floor {
+            return Err(PendingError::BelowNextSender {
+                next: self.floor,
+                seq,
             });
         }
         if let Some(last) = self.last_submitted
@@ -429,6 +457,18 @@ impl<S: SyncMessageStore + 'static> std::fmt::Debug for PendingStore<S> {
             .field("failed", &self.is_failed())
             .finish_non_exhaustive()
     }
+}
+
+/// An empty queue with room for `bound` entries, or an error instead of
+/// the allocation panic `with_capacity` would raise.
+fn reserve<T>(bound: NonZeroUsize) -> Result<VecDeque<T>, StoreError> {
+    let mut queue = VecDeque::new();
+    queue.try_reserve_exact(bound.get()).map_err(|err| {
+        StoreError::Io(format!(
+            "reserve pending store queue for {bound} writes: {err}"
+        ))
+    })?;
+    Ok(queue)
 }
 
 /// Queues the job built by `job`, or refuses it. `try_lock`: the worker
@@ -793,6 +833,45 @@ mod tests {
         }
         assert_eq!(submit(&mut p, 2), Err(PendingError::Closed));
         assert!(matches!(p.drain(), Err(StoreError::Io(_))));
+    }
+
+    #[test]
+    fn test_pending_store_refuses_a_sequence_below_the_store_next_sender() {
+        let store = GatedStore {
+            inner: MemoryStore::new(),
+            gate: None,
+            fail_at: None,
+            fail_with: injected(0),
+            failing: None,
+            panic_at: None,
+        };
+        assert!(
+            store
+                .inner
+                .store(4, &MsgType::Heartbeat, b"history")
+                .is_ok()
+        );
+        assert!(store.inner.set_next_sender_seq(5).is_ok());
+        let mut p = match PendingStore::new(Arc::new(store), bound(2)) {
+            Ok(p) => p,
+            Err(err) => panic!("new: {err:?}"),
+        };
+        assert_eq!(
+            submit(&mut p, 4),
+            Err(PendingError::BelowNextSender { next: 5, seq: 4 })
+        );
+        assert!(submit(&mut p, 5).is_ok());
+        assert_eq!(p.drain(), Ok(Some(5)));
+        assert_eq!(p.store().next_sender_seq(), 6);
+    }
+
+    #[test]
+    fn test_pending_store_oversized_bound_is_an_error_not_a_panic() {
+        let store = Arc::new(MemoryStore::new());
+        assert!(matches!(
+            PendingStore::new(store, NonZeroUsize::MAX),
+            Err(StoreError::Io(_))
+        ));
     }
 
     #[test]
