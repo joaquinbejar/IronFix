@@ -55,7 +55,10 @@
 //!   queues ([`SessionPhase`], [`SessionPayloads`], [`HeldEntry`],
 //!   [`ReplayJob`], [`GapEntry`]); stage 6c the outbound throttle's token
 //!   buckets and the messages they hold, owned by the session core
-//!   ([`Throttle`], [`TokenBucketSpec`]); the Tokio reactor in
+//!   ([`Throttle`], [`TokenBucketSpec`]); the fail-closed persistence
+//!   policy, fed the result of each store write and deciding whether to
+//!   deliver, hold or close ([`StoreFailurePolicy`], [`StoreGate`], issue
+//!   #224); the Tokio reactor in
 //!   `ironfix-engine` is its first driver
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
@@ -77,6 +80,7 @@ pub mod sans_io;
 pub mod sequence;
 mod session_core;
 pub mod state;
+mod store_policy;
 mod throttle;
 
 pub use config::{
@@ -127,6 +131,10 @@ pub use sans_io::{
     LogoutTextError, MAX_LOGOUT_TEXT_LEN, OwedLogout, PeerLogoutDecision, check_logout_text,
     close_resets, decide_local_logout, decide_logout_advance, decide_peer_logout, owed_logout_due,
     reply_close, resend_stalled_text, settle_close,
+};
+pub use sans_io::{
+    PersistedCounters, StoreFailurePolicy, StoreGate, StoreRelease, StoreResult, StoreVerdict,
+    StoreWrite,
 };
 pub use sequence::{SequenceCounter, SequenceExhausted, SequenceManager, SequenceResult};
 pub use state::{

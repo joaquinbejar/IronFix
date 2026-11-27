@@ -215,8 +215,9 @@ use ironfix_core::error::StoreError;
 use ironfix_core::message::MsgType;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_session::{
-    SeedSource, SequenceManager, StoreSeed, decide_seed_source, initial_below_store,
-    seed_from_initial, seed_from_store,
+    SeedSource, SequenceManager, StoreGate, StoreRelease, StoreResult, StoreSeed, StoreVerdict,
+    StoreWrite as CoreWrite, decide_seed_source, initial_below_store, seed_from_initial,
+    seed_from_store,
 };
 use ironfix_store::MessageStore;
 use std::sync::Arc;
@@ -225,18 +226,11 @@ use std::time::Duration;
 
 /// What the engine does when a write to the attached [`MessageStore`] fails.
 ///
-/// Applies to every write the engine makes during a session: filing an
-/// outbound frame, persisting the next sender sequence number, and persisting
-/// the next target sequence number. A call that does not finish within the
-/// store timeout counts as a failed write. Without a store attached there is
-/// nothing to fail and the policy has no effect.
-///
-/// The resets and the refresh fail closed whatever the policy, because
-/// carrying on past any of them would run one sequence stream over another:
-/// the reset for a `ResetSeqNumFlag` (141) Logon, the reset when the
-/// counterparty declares `ResetSeqNumFlag` on its Logon acknowledgement, a
-/// reset owed by the previous session, and the refresh that recovers the
-/// counters (see the [module documentation](self)).
+/// The policy and its decision rule live in the sans-IO core
+/// ([`ironfix_session::StoreFailurePolicy`], issue #224) so every driver gets
+/// the same fail-closed behaviour; the engine re-exports it and applies
+/// [`StoreFailurePolicy::decide`] to every failed store call. Without a store
+/// attached there is nothing to fail and the policy has no effect.
 ///
 /// # Example
 ///
@@ -258,42 +252,7 @@ use std::time::Duration;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum StoreFailurePolicy {
-    /// Log a warning and carry on: the frame is written anyway, the message
-    /// is acted on anyway, and a counter that could not be persisted is simply
-    /// not durable.
-    ///
-    /// A frame whose filing failed is not confirmed as filed; a later
-    /// `ResendRequest` covering it replays it if the store saved it despite
-    /// the error, and gets a `SequenceReset`-GapFill otherwise. This
-    /// is the default, and what the engine always did before store writes were
-    /// fallible. It gives **no** crash guarantee: after a failed write, a crash
-    /// can leave the store behind what the counterparty has seen.
-    #[default]
-    Continue,
-    /// Fail closed: a frame whose filing or sender-counter write fails is not
-    /// written at all (the counterparty reads no bytes for it), an inbound
-    /// message whose target-counter write fails is not acted on, and the
-    /// session closes, not gracefully. During the Logon handshake the failure
-    /// is returned as [`EngineError::Store`], also when it happens while a
-    /// Logon is being refused.
-    ///
-    /// No Logout is sent on the way out: it would have to be filed like any
-    /// other frame, through the store that just failed. The failure is logged
-    /// at error level.
-    CloseSession,
-}
-
-impl StoreFailurePolicy {
-    /// Returns whether a failed store write ends the session under this
-    /// policy.
-    #[must_use]
-    pub const fn closes_session(self) -> bool {
-        matches!(self, Self::CloseSession)
-    }
-}
+pub use ironfix_session::StoreFailurePolicy;
 
 /// Which store call failed, for the log line.
 #[derive(Debug, Clone, Copy)]
@@ -304,6 +263,8 @@ enum StoreWrite<'m> {
         seq: u64,
         /// Its `MsgType` (35).
         msg_type: &'m MsgType,
+        /// The next sender number filed with it.
+        next_sender: u64,
     },
     /// Persisting the next sender sequence number.
     NextSender(u64),
@@ -311,6 +272,20 @@ enum StoreWrite<'m> {
     NextTarget(u64),
     /// Persisting the inbound application watermark (ADR-0030).
     AppWatermark(u64),
+}
+
+impl StoreWrite<'_> {
+    /// The write as the sans-IO core names it.
+    const fn core(self) -> CoreWrite {
+        match self {
+            Self::Frame {
+                seq, next_sender, ..
+            } => CoreWrite::OutboundFrame { seq, next_sender },
+            Self::NextSender(next) => CoreWrite::NextSender { next },
+            Self::NextTarget(next) => CoreWrite::NextTarget { next },
+            Self::AppWatermark(watermark) => CoreWrite::AppWatermark { watermark },
+        }
+    }
 }
 
 /// Runs one store call bounded by `timeout`, reporting an overrun as
@@ -435,17 +410,51 @@ impl<'s> SessionStore<'s> {
         frame: &[u8],
         next_sender: u64,
     ) -> Result<bool, StoreError> {
+        // The core's gate decides the order (issue #224): the frame is
+        // released only once the filing, and after a failed one under
+        // Continue the standalone sender-counter fallback, has a result.
+        let gate = StoreGate::hold(CoreWrite::OutboundFrame { seq, next_sender }, ());
         let filed = self
             .mutate(self.store.file_outbound(seq, msg_type, frame, next_sender))
             .await;
-        match filed {
-            Ok(()) => Ok(true),
-            Err(err) => {
-                self.on_failure(session_id, StoreWrite::Frame { seq, msg_type }, err)?;
-                self.persist_sender(session_id, next_sender)
-                    .await
-                    .map(|()| false)
+        let release = gate.resolve(self.policy, StoreResult::of(&filed));
+        let write = StoreWrite::Frame {
+            seq,
+            msg_type,
+            next_sender,
+        };
+        let fallback = match (release, filed) {
+            (StoreRelease::Deliver(()), _) => return Ok(true),
+            (StoreRelease::Fallback(fallback), Err(err)) => {
+                self.on_failure(session_id, write, err)?;
+                fallback
             }
+            (StoreRelease::DeliverUnpersisted(()), _) => return Ok(false),
+            (StoreRelease::Close { .. }, Err(err)) => {
+                return self.on_failure(session_id, write, err).map(|()| false);
+            }
+            // A release other than Deliver comes only from a failed filing.
+            (StoreRelease::Fallback(_) | StoreRelease::Close { .. }, Ok(())) => {
+                debug_assert!(false, "a filed frame released as a failure");
+                return Ok(true);
+            }
+        };
+        let CoreWrite::NextSender { next } = fallback.write() else {
+            debug_assert!(false, "the filing fallback is not the sender counter");
+            return Ok(false);
+        };
+        let persisted = self.mutate(self.store.set_next_sender_seq(next)).await;
+        // The fallback releases the frame unpersisted whatever its result:
+        // the frame itself is not confirmed as filed. A failed fallback is
+        // logged under the policy like any failed write.
+        match (
+            fallback.resolve(self.policy, StoreResult::of(&persisted)),
+            persisted,
+        ) {
+            (_, Err(err)) => self
+                .on_failure(session_id, StoreWrite::NextSender(next), err)
+                .map(|()| false),
+            (_, Ok(())) => Ok(false),
         }
     }
 
@@ -537,7 +546,7 @@ impl<'s> SessionStore<'s> {
         write: StoreWrite<'_>,
         err: StoreError,
     ) -> Result<(), StoreError> {
-        if self.policy.closes_session() {
+        if self.policy.decide(write.core(), StoreResult::Failed) == StoreVerdict::Close {
             tracing::error!(
                 session = %session_id,
                 write = ?write,
@@ -548,7 +557,7 @@ impl<'s> SessionStore<'s> {
             return Err(err);
         }
         match write {
-            StoreWrite::Frame { seq, msg_type } => tracing::warn!(
+            StoreWrite::Frame { seq, msg_type, .. } => tracing::warn!(
                 session = %session_id,
                 seq,
                 msg_type = msg_type.as_str(),
@@ -1263,46 +1272,8 @@ pub(crate) async fn file_and_spend(
     Ok(filed)
 }
 
-/// The counter values last written to the store, so that a counter is written
-/// only when it changed.
-///
-/// The reactor checks after every event, the 100 ms tick included; without
-/// this every tick would cost two store writes. A value is recorded once its
-/// write was attempted: under [`StoreFailurePolicy::Continue`] a failed write
-/// is not retried every tick, only when the counter moves again.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PersistedCounters {
-    /// Last next-sender value written, if any.
-    sender: Option<u64>,
-    /// Last next-target value written, if any.
-    target: Option<u64>,
-}
-
-impl PersistedCounters {
-    /// Returns `current` if it differs from the last next-sender value
-    /// written.
-    #[must_use]
-    pub(crate) fn sender_to_write(self, current: u64) -> Option<u64> {
-        (self.sender != Some(current)).then_some(current)
-    }
-
-    /// Returns `current` if it differs from the last next-target value
-    /// written.
-    #[must_use]
-    pub(crate) fn target_to_write(self, current: u64) -> Option<u64> {
-        (self.target != Some(current)).then_some(current)
-    }
-
-    /// Records that `value` was written as the next sender sequence number.
-    pub(crate) const fn record_sender(&mut self, value: u64) {
-        self.sender = Some(value);
-    }
-
-    /// Records that `value` was written as the next target sequence number.
-    pub(crate) const fn record_target(&mut self, value: u64) {
-        self.target = Some(value);
-    }
-}
+/// The counter values last written to the store; the sans-IO core's type.
+pub(crate) use ironfix_session::PersistedCounters;
 
 #[cfg(test)]
 mod tests {

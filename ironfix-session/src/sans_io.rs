@@ -183,6 +183,10 @@ pub use crate::replay::{
 pub use crate::session_core::{
     HeldEntry, HeldLogonRelease, ReplayJob, SessionCore, SessionPayloads, TickDecision, TickInput,
 };
+pub use crate::store_policy::{
+    PersistedCounters, StoreFailurePolicy, StoreGate, StoreRelease, StoreResult, StoreVerdict,
+    StoreWrite,
+};
 pub use crate::throttle::{
     DEFAULT_BUDGET, Throttle, ThrottleAdmission, ThrottleDrain, ThrottleRelease, TokenBucketSpec,
 };
