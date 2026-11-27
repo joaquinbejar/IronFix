@@ -1531,9 +1531,144 @@ async fn test_observer_verdicts_under_the_gap_queue() {
             },
             InboundVerdict::Accepted { seq: 2 },
             InboundVerdict::Accepted { seq: 3 },
+            // The kept TestRequest's number, consumed in turn.
+            InboundVerdict::Accepted { seq: 4 },
             InboundVerdict::Accepted { seq: 5 },
         ]
     );
+}
+
+/// A frame observer recording every verdict with the capture id it names,
+/// and every inbound frame's capture id with its `MsgSeqNum`.
+#[derive(Debug, Default)]
+struct IdVerdicts {
+    frames: Mutex<Vec<(Option<u64>, Option<u64>)>>,
+    verdicts: Mutex<Vec<(Option<u64>, InboundVerdict)>>,
+}
+
+impl FrameObserver for IdVerdicts {
+    fn on_inbound(&self, _frame: &[u8], observation: &Observation<'_>) {
+        locked(&self.frames).push((observation.frame_id(), observation.msg_seq_num()));
+    }
+
+    fn on_outbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, observation: &Observation<'_>) {
+        locked(&self.verdicts).push((observation.frame_id(), *verdict));
+    }
+}
+
+/// A kept administrative number gets exactly one `Accepted`, naming the
+/// kept frame, once its number is consumed in turn.
+#[tokio::test]
+async fn test_kept_number_accepted_once_consumed_with_its_frame_id() {
+    let recorder = Arc::new(IdVerdicts::default());
+    let config = member_config().with_gap_policy(GapPolicy::Queue {
+        max_messages: 16,
+        max_bytes: 1024 * 1024,
+    });
+    let initiator = Initiator::new(config, Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("1", 3, &[(112, "KEPT")])).await;
+    while header(&venue.next().await).0 != "0" {}
+    venue
+        .send(venue_msg("4", 2, &[(123, "Y"), (36, "3")]))
+        .await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the kept number is consumed",
+    );
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 4, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let kept = some(
+        locked(&recorder.frames)
+            .iter()
+            .find(|(_, seq)| *seq == Some(3))
+            .map(|(id, _)| *id),
+        "the TestRequest was observed",
+    );
+    assert!(kept.is_some());
+    let on_3: Vec<(Option<u64>, InboundVerdict)> = locked(&recorder.verdicts)
+        .iter()
+        .filter(|(_, verdict)| verdict.seq() == 3)
+        .copied()
+        .collect();
+    assert_eq!(
+        on_3,
+        vec![
+            (
+                kept,
+                InboundVerdict::AcceptedAhead {
+                    seq: 3,
+                    expected: 2
+                }
+            ),
+            (kept, InboundVerdict::Accepted { seq: 3 }),
+        ]
+    );
+}
+
+/// A kept number the queue discards (a Reset renumbers the stream) is never
+/// reported accepted.
+#[tokio::test]
+async fn test_discarded_kept_number_is_never_accepted() {
+    let recorder = Arc::new(IdVerdicts::default());
+    let config = member_config().with_gap_policy(GapPolicy::Queue {
+        max_messages: 16,
+        max_bytes: 1024 * 1024,
+    });
+    let initiator = Initiator::new(config, Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("1", 3, &[(112, "KEPT")])).await;
+    while header(&venue.next().await).0 != "0" {}
+    // Reset mode renumbers the stream to 10: the queue is cleared.
+    venue.send(venue_msg("4", 2, &[(36, "10")])).await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 10 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the Reset moves the cursor to 10",
+    );
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 10, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let verdicts = locked(&recorder.verdicts).clone();
+    let on_3: Vec<InboundVerdict> = verdicts
+        .iter()
+        .filter(|(_, verdict)| verdict.seq() == 3)
+        .map(|(_, verdict)| *verdict)
+        .collect();
+    assert_eq!(
+        on_3,
+        vec![InboundVerdict::AcceptedAhead {
+            seq: 3,
+            expected: 2
+        }],
+        "no acceptance for a discarded kept number: {verdicts:?}"
+    );
+    // The Reset itself is accepted once applied, exactly once.
+    let reset_accepted = verdicts
+        .iter()
+        .filter(|(_, verdict)| *verdict == InboundVerdict::Accepted { seq: 2 })
+        .count();
+    assert_eq!(reset_accepted, 1, "{verdicts:?}");
 }
 
 /// A store whose next-target writes fail from `fail_from` on.

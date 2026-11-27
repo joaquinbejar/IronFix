@@ -4556,6 +4556,8 @@ impl<A: Application> Reactor<A> {
     /// disturb the stall clock.
     fn consume_rejected_fill(&mut self, gap_fill: bool, seq: u64) -> Result<(), SequenceExhausted> {
         if self.consume_if_in_sequence(gap_fill, seq)? {
+            // The refused fill's number is consumed (issue #223).
+            self.capture_verdict(in_sequence_verdict(seq));
             self.note_inbound_progress();
         }
         Ok(())
@@ -4694,10 +4696,6 @@ impl<A: Application> Reactor<A> {
         // The fill is in sequence (or this is Reset mode): the application may
         // now inspect it.
         if let Err(reason) = self.application.from_admin(raw, &self.session_id).await {
-            self.capture_verdict(InboundVerdict::Rejected {
-                seq,
-                reason: InboundRefusal::Refused,
-            });
             // An in-sequence GapFill occupies its own MsgSeqNum. Rejecting it
             // without consuming that number leaves the inbound expectation
             // parked on it forever: every later message then looks gapped, is
@@ -4707,6 +4705,11 @@ impl<A: Application> Reactor<A> {
             if let Err(err) = self.consume_rejected_fill(gap_fill, seq) {
                 return Err(exhausted(phase, err));
             }
+            // After the consumption (reported as Accepted), the refusal.
+            self.capture_verdict(InboundVerdict::Rejected {
+                seq,
+                reason: InboundRefusal::Refused,
+            });
             return self
                 .send_session_reject(framed, phase, seq, MsgType::SequenceReset.as_str(), &reason)
                 .await;
@@ -4715,14 +4718,9 @@ impl<A: Application> Reactor<A> {
         let new_seq_no = raw.get_field_str(36).and_then(|s| s.parse::<u64>().ok());
         let expected = self.runtime.sequences.next_target_seq().value();
         let decision = decide_sequence_reset(gap_fill, seq, new_seq_no, expected);
-        // A refusal is reported now; an applied GapFill's acceptance once the
-        // cursor has moved past it, below.
+        // Acceptance is reported once the cursor has moved (Apply, or the
+        // consumption of a refused fill's number); a refusal after that.
         let verdict = sequence_reset_verdict(&decision, seq);
-        if !matches!(decision, ResetDecision::Apply { .. })
-            && let Some(verdict) = verdict
-        {
-            self.capture_verdict(verdict);
-        }
         let reason = match decision {
             ResetDecision::MissingNewSeqNo => {
                 // Same hazard as the rejection path above: the fill still
@@ -4739,6 +4737,7 @@ impl<A: Application> Reactor<A> {
                 if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
                     return Err(exhausted(phase, err));
                 }
+                self.capture_verdict(in_sequence_verdict(seq));
                 // The consumed number is real progress: keep an outstanding
                 // resend from re-requesting it.
                 self.note_inbound_progress();
@@ -4785,6 +4784,9 @@ impl<A: Application> Reactor<A> {
                 return Ok(phase);
             }
         };
+        if let Some(verdict) = verdict {
+            self.capture_verdict(verdict);
+        }
         self.send_session_reject(framed, phase, seq, MsgType::SequenceReset.as_str(), &reason)
             .await
     }
@@ -5627,7 +5629,9 @@ impl<A: Application> Reactor<A> {
                     }
                     self.release_frame(framed, phase, expected, &frame).await?
                 }
-                GapEntry::Processed => self.consume_processed(phase, expected).await?,
+                GapEntry::Processed { frame_id } => {
+                    self.consume_processed(phase, expected, frame_id).await?
+                }
             };
             phase = self.release_held_logon(phase).await?;
         }
@@ -5669,8 +5673,18 @@ impl<A: Application> Reactor<A> {
     /// Consumes the number of a queued administrative message, acted on when
     /// it arrived: `seq + 1` is persisted as the next target number before the
     /// expectation moves, as for one in sequence.
-    async fn consume_processed(&mut self, phase: Phase, seq: u64) -> Result<Phase, SessionClosed> {
+    async fn consume_processed(
+        &mut self,
+        phase: Phase,
+        seq: u64,
+        frame_id: Option<u64>,
+    ) -> Result<Phase, SessionClosed> {
+        // Verdicts now name the frame whose number this is (issue #223).
+        if let Some(capture) = &self.writer.capture {
+            capture.resume_frame(frame_id);
+        }
         let Some(next) = seq.checked_add(1) else {
+            self.capture_verdict(in_sequence_verdict(seq));
             return Err(exhausted(
                 phase,
                 SequenceExhausted {
@@ -5684,6 +5698,8 @@ impl<A: Application> Reactor<A> {
         if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
             return Err(exhausted(phase, err));
         }
+        // Its number is consumed now: the one Accepted for this frame.
+        self.capture_verdict(in_sequence_verdict(seq));
         self.note_inbound_progress();
         Ok(phase)
     }
@@ -6111,7 +6127,13 @@ impl<A: Application> Reactor<A> {
                     // kept to be consumed in turn. A copy of a number
                     // already held is dropped, not acted on a second time.
                     GapDisposition::KeepNumber => {
-                        if self.queue_gapped(&phase, seq, GapEntry::Processed) {
+                        if self.queue_gapped(
+                            &phase,
+                            seq,
+                            GapEntry::Processed {
+                                frame_id: self.capture_frame_id(),
+                            },
+                        ) {
                             return Ok(phase);
                         }
                         self.dispatch_admin(framed, phase, &raw, seq).await
