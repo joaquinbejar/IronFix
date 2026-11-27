@@ -58,8 +58,9 @@
 //!   ([`Throttle`], [`TokenBucketSpec`]); the fail-closed persistence
 //!   policy, fed the result of each store write and deciding whether to
 //!   deliver, hold or close ([`StoreFailurePolicy`], [`StoreGate`], issue
-//!   #224); the Tokio reactor in
-//!   `ironfix-engine` is its first driver
+//!   #224); the capture points every driver reports the same way
+//!   ([`CapturePoint`], [`InboundVerdict`], [`FrameCapture`], issue
+//!   #223); the Tokio reactor in `ironfix-engine` is its first driver
 //!
 //! Note that the `Resending` state is only the FSM marker for "a resend is in
 //! progress". The decisions of answering a `ResendRequest` (which range, what
@@ -68,6 +69,7 @@
 //! `ironfix-engine`, because they need the wire layer, the store and the
 //! application.
 
+pub mod capture;
 pub mod config;
 mod gap_queue;
 pub mod header;
@@ -83,6 +85,11 @@ pub mod state;
 mod store_policy;
 mod throttle;
 
+pub use capture::{
+    CapturePoint, FrameCapture, InboundRefusal, InboundVerdict, WriteClass, gap_verdict,
+    in_sequence_verdict, inbound_verdict, malformed_verdict, released_verdict,
+    sequence_reset_screen_verdict, sequence_reset_verdict,
+};
 pub use config::{
     GapPolicy, GarbledFrameLimit, SessionConfig, SessionConfigBuilder, SessionConfigError,
 };

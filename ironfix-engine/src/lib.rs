@@ -298,7 +298,10 @@ pub use error::EngineError;
 pub use initiator::Initiator;
 pub use loss::{InboundLoss, InboundLossCause};
 pub use mismatch::{InboundMismatch, OutboundMismatch, SequenceMismatch};
-pub use observer::{Direction, FrameKind, FrameObserver, Observation, OutboundResult};
+pub use observer::{
+    Direction, FrameKind, FrameObserver, InboundRefusal, InboundVerdict, Observation,
+    OutboundResult,
+};
 pub use outbound::{OutboundField, OutboundMessage};
 pub use outcome::{NotSentReason, SendOutcome, UnknownReason};
 pub use persistence::StoreFailurePolicy;

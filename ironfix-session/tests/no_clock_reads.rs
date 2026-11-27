@@ -16,6 +16,7 @@
 /// Every source file of the crate, embedded at compile time.
 const SOURCES: &[(&str, &str)] = &[
     ("lib.rs", include_str!("../src/lib.rs")),
+    ("capture.rs", include_str!("../src/capture.rs")),
     ("config.rs", include_str!("../src/config.rs")),
     ("gap_queue.rs", include_str!("../src/gap_queue.rs")),
     ("header.rs", include_str!("../src/header.rs")),

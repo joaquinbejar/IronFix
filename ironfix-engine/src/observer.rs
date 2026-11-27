@@ -39,6 +39,56 @@
 //!   never "written". Whether the write then completed is reported by
 //!   [`FrameObserver::on_outbound_result`].
 //!
+//! # Inbound verdicts
+//!
+//! The capture points are the sans-IO core's
+//! ([`ironfix_session::CapturePoint`], issue #223): the engine reports each
+//! one through this observer, and a driver without Tokio reports the same
+//! points through [`ironfix_session::FrameCapture`]. For an inbound frame of
+//! the established session, [`FrameObserver::on_inbound_verdict`] follows
+//! [`FrameObserver::on_inbound`] with the core's [`InboundVerdict`] once it
+//! has routed the frame, before the session acts on it: accepted into the
+//! sequence, accepted ahead of a gap (an administrative message inside it:
+//! a routing verdict, reported before the `ResendRequest` (2) it causes,
+//! which says neither that its number was consumed nor that the request
+//! succeeded; if the request fails, the close and its `CloseReason` are the
+//! record; only `Accepted` means the number was consumed),
+//! deferred behind a gap, or rejected with an [`InboundRefusal`] (a
+//! duplicate, a number too low, an exhausted counter, a refused
+//! `SequenceReset` (4), or one `from_admin` refused). An administrative
+//! message `from_admin` refuses gets its routing verdict first and then
+//! [`InboundRefusal::Refused`]: its number is consumed as routed, the
+//! message is not acted on. A frame above the expectation gets its verdict
+//! before the gap is requested. A frame the session
+//! closes over before routing it (the wrong CompID, a `SendingTime` out of
+//! tolerance, a header without a usable `MsgSeqNum` (34)) and a handshake
+//! frame get no verdict. A frame whose header is sound and whose body does
+//! not decode gets the verdict of its number; above a gap it is never
+//! queued and is rejected as [`InboundRefusal::Malformed`]. A
+//! `SequenceReset` (4) that reaches the application is reported once it is
+//! applied and the receive cursor stands at its `NewSeqNo` (36): an
+//! in-sequence GapFill as accepted, a Reset as
+//! [`InboundVerdict::ResetApplied`] (Reset mode ignores its `MsgSeqNum`, so
+//! that number is not consumed); or rejected when `from_admin` or the core
+//! refuses it. A kept administrative number gets its accepted verdict,
+//! naming the kept frame, when its number is consumed in turn; none if the
+//! queue discards it. Under
+//! `GapPolicy::Queue`, an
+//! message whose number is already queued is rejected as a
+//! [`InboundRefusal::QueuedCopy`], and the one frame deferred into the queue
+//! under a number gets a second verdict, accepted, when it is released in
+//! order, without a second [`FrameObserver::on_inbound`]. Every inbound
+//! frame of the established session carries a capture id
+//! ([`Observation::frame_id`]), and every verdict names the id of the frame
+//! it is about: when two frames under one number were both deferred (the
+//! first one past the queue's bound), the release verdict names the one that
+//! was kept. An in-sequence message is reported accepted only once the
+//! receive cursor has advanced past it: a target-counter write that fails
+//! under `StoreFailurePolicy::CloseSession` closes the session with no
+//! acceptance reported. An accepted
+//! message can still be answered with a session Reject (3) for its content;
+//! the number is consumed either way.
+//!
 //! # Write results
 //!
 //! Every frame passed to [`FrameObserver::on_outbound`] is followed by
@@ -110,8 +160,11 @@
 
 use crate::application::SessionId;
 use crate::outcome::{NotSentReason, SendOutcome, UnknownReason};
+use ironfix_session::{CapturePoint, WriteClass};
 use ironfix_tagvalue::Decoder;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 /// Which way a frame travels.
@@ -156,6 +209,46 @@ impl FrameKind {
     }
 }
 
+impl Direction {
+    /// The engine's direction for the core's one. The core enum is
+    /// `#[non_exhaustive]`; a direction added later maps to `Inbound` until
+    /// the engine names it.
+    fn from_core(direction: ironfix_session::capture::Direction) -> Self {
+        match direction {
+            ironfix_session::capture::Direction::Outbound => Self::Outbound,
+            _ => Self::Inbound,
+        }
+    }
+}
+
+impl FrameKind {
+    /// The sans-IO core's frame kind for this one (issue #223).
+    const fn core(self) -> ironfix_session::capture::FrameKind {
+        match self {
+            Self::Handshake => ironfix_session::capture::FrameKind::Handshake,
+            Self::Session => ironfix_session::capture::FrameKind::Session,
+            Self::Replay => ironfix_session::capture::FrameKind::Replay,
+            Self::GapFill => ironfix_session::capture::FrameKind::GapFill,
+        }
+    }
+
+    /// The engine's frame kind for the core's one. The core enum is
+    /// `#[non_exhaustive]`; a kind added later maps to `Session` until the
+    /// engine names it.
+    fn from_core(kind: ironfix_session::capture::FrameKind) -> Self {
+        match kind {
+            ironfix_session::capture::FrameKind::Handshake => Self::Handshake,
+            ironfix_session::capture::FrameKind::Replay => Self::Replay,
+            ironfix_session::capture::FrameKind::GapFill => Self::GapFill,
+            _ => Self::Session,
+        }
+    }
+}
+
+/// The core's verdict on an inbound frame, and why it refused one, for
+/// [`FrameObserver::on_inbound_verdict`] (issue #223).
+pub use ironfix_session::{InboundRefusal, InboundVerdict};
+
 /// What the engine knows about one observed frame, or one write result.
 ///
 /// Borrowed for the call only. Fields are read through getters, so one added
@@ -166,6 +259,7 @@ pub struct Observation<'a> {
     direction: Direction,
     kind: FrameKind,
     msg_seq_num: Option<u64>,
+    frame_id: Option<u64>,
     at: Instant,
     session_id: &'a SessionId,
 }
@@ -177,6 +271,7 @@ impl<'a> Observation<'a> {
         direction: Direction,
         kind: FrameKind,
         msg_seq_num: Option<u64>,
+        frame_id: Option<u64>,
         at: Instant,
         session_id: &'a SessionId,
     ) -> Self {
@@ -184,6 +279,7 @@ impl<'a> Observation<'a> {
             direction,
             kind,
             msg_seq_num,
+            frame_id,
             at,
             session_id,
         }
@@ -208,6 +304,17 @@ impl<'a> Observation<'a> {
     #[must_use]
     pub const fn msg_seq_num(&self) -> Option<u64> {
         self.msg_seq_num
+    }
+
+    /// The capture id of the inbound frame the observation is about: unique
+    /// and increasing within the session, assigned when the frame is passed
+    /// to [`FrameObserver::on_inbound`] and carried into every
+    /// [`FrameObserver::on_inbound_verdict`] about that frame, including the
+    /// verdict given when it is released from the gap queue. `None` for an
+    /// outbound observation and for a handshake frame, which gets no verdict.
+    #[must_use]
+    pub const fn frame_id(&self) -> Option<u64> {
+        self.frame_id
     }
 
     /// When the observation was made, on the engine's monotonic clock.
@@ -248,6 +355,16 @@ pub enum OutboundResult {
 }
 
 impl OutboundResult {
+    /// The core's class of this result.
+    #[must_use]
+    pub const fn class(&self) -> WriteClass {
+        match self {
+            Self::Written => WriteClass::Written,
+            Self::NotSent { .. } => WriteClass::NotSent,
+            Self::Unknown { .. } => WriteClass::Unknown,
+        }
+    }
+
     /// The result a send outcome maps to, with the `MsgSeqNum` it carries.
     #[must_use]
     pub(crate) fn from_outcome(outcome: &SendOutcome) -> (Self, Option<u64>) {
@@ -285,6 +402,15 @@ pub trait FrameObserver: Send + Sync + 'static {
     fn on_outbound_result(&self, result: &OutboundResult, observation: &Observation<'_>) {
         let _ = (result, observation);
     }
+
+    /// Called with the sans-IO core's verdict on an inbound frame of the
+    /// established session, after [`FrameObserver::on_inbound`] for it and
+    /// before the session acts on it: accepted into the sequence, accepted
+    /// ahead of a gap, deferred behind one, or rejected, with the reason.
+    /// Handshake frames get no verdict. Does nothing by default.
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, observation: &Observation<'_>) {
+        let _ = (verdict, observation);
+    }
 }
 
 /// An attached observer bound to the session it observes.
@@ -294,6 +420,14 @@ pub(crate) struct Capture {
     observer: Arc<dyn FrameObserver>,
     /// The session every observation names.
     session_id: SessionId,
+    /// The last inbound capture id handed out; ids start at 1.
+    last_frame_id: Arc<AtomicU64>,
+    /// The capture id of the inbound frame being acted on, 0 for none.
+    current_frame_id: Arc<AtomicU64>,
+    /// The capture ids of administrative frames whose numbers the gap queue
+    /// keeps, by `MsgSeqNum` (34): bounded by the queue, pruned as the
+    /// expectation moves.
+    kept: Arc<Mutex<BTreeMap<u64, u64>>>,
 }
 
 impl std::fmt::Debug for Capture {
@@ -319,37 +453,152 @@ impl Capture {
         observer.map(|observer| Self {
             observer: Arc::clone(observer),
             session_id: session_id.clone(),
+            last_frame_id: Arc::new(AtomicU64::new(0)),
+            current_frame_id: Arc::new(AtomicU64::new(0)),
+            kept: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
-    /// Observes an inbound `frame` of `kind`.
-    pub(crate) fn inbound(&self, frame: &[u8], kind: FrameKind) {
+    /// Hands one core capture point to the observer: the single place a
+    /// [`CapturePoint`] becomes a [`FrameObserver`] call. `frame` is the
+    /// bytes of a framed or queued frame; `result` is the engine's detailed
+    /// write result, whose class the point carries.
+    fn emit(&self, point: &CapturePoint, frame: &[u8], result: Option<&OutboundResult>) {
         let observation = Observation::new(
-            Direction::Inbound,
-            kind,
-            peek_msg_seq_num(frame),
+            Direction::from_core(point.direction()),
+            FrameKind::from_core(point.kind()),
+            point.seq(),
+            point.frame_id(),
             now(),
             &self.session_id,
         );
-        self.observer.on_inbound(frame, &observation);
+        match (point, result) {
+            (CapturePoint::InboundFramed { .. }, _) => {
+                self.observer.on_inbound(frame, &observation);
+            }
+            (CapturePoint::Inbound { verdict, .. }, _) => {
+                self.observer.on_inbound_verdict(verdict, &observation);
+            }
+            (CapturePoint::OutboundQueued { .. }, _) => {
+                self.observer.on_outbound(frame, &observation);
+            }
+            (CapturePoint::OutboundResult { result: class, .. }, Some(result)) => {
+                debug_assert_eq!(
+                    *class,
+                    result.class(),
+                    "a result emitted under another class"
+                );
+                self.observer.on_outbound_result(result, &observation);
+            }
+            // The core's point without the engine's reason: never emitted.
+            (CapturePoint::OutboundResult { .. }, None) => {
+                debug_assert!(false, "an outbound result emitted without its detail");
+            }
+            // A capture point added to the core later is not observed until
+            // the engine maps it.
+            _ => {}
+        }
+    }
+
+    /// Observes an inbound `frame` of `kind`. A frame of the established
+    /// session gets a new capture id, which becomes the current frame's; a
+    /// handshake frame gets none (it gets no verdict to link).
+    pub(crate) fn inbound(&self, frame: &[u8], kind: FrameKind) {
+        let frame_id = (kind != FrameKind::Handshake).then(|| {
+            // One reactor task per session: a relaxed counter is enough. A
+            // session cannot read 2^64 frames, so the add cannot overflow;
+            // if it ever did, ids stop increasing rather than wrapping.
+            let last = self.last_frame_id.load(Ordering::Relaxed);
+            debug_assert!(last < u64::MAX, "inbound capture ids exhausted");
+            let frame_id = last.checked_add(1).unwrap_or(last);
+            self.last_frame_id.store(frame_id, Ordering::Relaxed);
+            self.current_frame_id.store(frame_id, Ordering::Relaxed);
+            frame_id
+        });
+        let point = CapturePoint::InboundFramed {
+            kind: kind.core(),
+            seq: peek_msg_seq_num(frame),
+            frame_id,
+        };
+        self.emit(&point, frame, None);
+    }
+
+    /// The capture id of the inbound frame being acted on, if any.
+    pub(crate) fn current_frame(&self) -> Option<u64> {
+        match self.current_frame_id.load(Ordering::Relaxed) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    /// Makes `frame_id` the frame being acted on: a frame released from the
+    /// gap queue, observed earlier under that id.
+    pub(crate) fn resume_frame(&self, frame_id: Option<u64>) {
+        self.current_frame_id
+            .store(frame_id.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Remembers the current frame as the one whose number `seq` the gap
+    /// queue keeps.
+    pub(crate) fn keep_frame(&self, seq: u64) {
+        if let Some(frame_id) = self.current_frame() {
+            self.kept_ids().insert(seq, frame_id);
+        }
+    }
+
+    /// Takes the capture id kept for `seq`, as its number is consumed.
+    pub(crate) fn take_kept(&self, seq: u64) -> Option<u64> {
+        self.kept_ids().remove(&seq)
+    }
+
+    /// Forgets the kept ids below `seq`: numbers dropped unconsumed.
+    pub(crate) fn forget_kept_below(&self, seq: u64) {
+        // In place, from the front: no allocation, and nothing to do when
+        // no id is below `seq`.
+        let mut kept = self.kept_ids();
+        while let Some(entry) = kept.first_entry() {
+            if *entry.key() >= seq {
+                break;
+            }
+            entry.remove();
+        }
+    }
+
+    /// The kept ids. The lock is held for one map operation and never
+    /// across an await; a poisoned lock still holds a usable map.
+    fn kept_ids(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, u64>> {
+        self.kept.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Reports the core's `verdict` on the inbound frame being acted on.
+    pub(crate) fn verdict(&self, verdict: InboundVerdict) {
+        let point = CapturePoint::Inbound {
+            verdict,
+            frame_id: self.current_frame(),
+        };
+        self.emit(&point, &[], None);
     }
 
     /// Observes an outbound `frame` of `kind`, numbered `seq`.
     pub(crate) fn outbound(&self, frame: &[u8], kind: FrameKind, seq: u64) {
-        let observation = Observation::new(
-            Direction::Outbound,
-            kind,
-            Some(seq),
-            now(),
-            &self.session_id,
+        self.emit(
+            &CapturePoint::OutboundQueued {
+                kind: kind.core(),
+                seq,
+            },
+            frame,
+            None,
         );
-        self.observer.on_outbound(frame, &observation);
     }
 
     /// Reports the write `result` of a frame of `kind`, numbered `seq`.
     pub(crate) fn result(&self, result: &OutboundResult, kind: FrameKind, seq: Option<u64>) {
-        let observation = Observation::new(Direction::Outbound, kind, seq, now(), &self.session_id);
-        self.observer.on_outbound_result(result, &observation);
+        let point = CapturePoint::OutboundResult {
+            kind: kind.core(),
+            seq,
+            result: result.class(),
+        };
+        self.emit(&point, &[], Some(result));
     }
 
     /// Reports a send `outcome` that was never observed as a frame.
@@ -397,6 +646,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_frame_kind_is_replay() {
+        assert!(FrameKind::Replay.is_replay());
+        assert!(FrameKind::GapFill.is_replay());
+        assert!(!FrameKind::Session.is_replay());
+        assert!(!FrameKind::Handshake.is_replay());
+    }
+
+    #[test]
+    fn test_kinds_round_trip_through_the_core() {
+        for kind in [
+            FrameKind::Handshake,
+            FrameKind::Session,
+            FrameKind::Replay,
+            FrameKind::GapFill,
+        ] {
+            assert_eq!(FrameKind::from_core(kind.core()), kind);
+            assert_eq!(kind.core().is_replay(), kind.is_replay());
+        }
+        assert_eq!(
+            Direction::from_core(ironfix_session::capture::Direction::Inbound),
+            Direction::Inbound
+        );
+        assert_eq!(
+            Direction::from_core(ironfix_session::capture::Direction::Outbound),
+            Direction::Outbound
+        );
+    }
+
+    #[test]
+    fn test_kept_ids_are_taken_once_and_pruned() {
+        struct Quiet;
+        impl FrameObserver for Quiet {
+            fn on_inbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+            fn on_outbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+        }
+        let observer: Arc<dyn FrameObserver> = Arc::new(Quiet);
+        let session = SessionId::new("FIX.4.4", "A", "B");
+        let Some(capture) = Capture::bind(Some(&observer), &session) else {
+            panic!("an observer binds");
+        };
+        capture.inbound(b"8=FIX.4.4\x0134=4\x01", FrameKind::Session);
+        capture.keep_frame(4);
+        capture.inbound(b"8=FIX.4.4\x0134=6\x01", FrameKind::Session);
+        capture.keep_frame(6);
+        assert_eq!(capture.take_kept(4), Some(1));
+        assert_eq!(capture.take_kept(4), None);
+        capture.forget_kept_below(7);
+        assert_eq!(capture.take_kept(6), None);
+    }
+
+    #[test]
     fn test_peek_msg_seq_num_reads_the_header_field() {
         let frame = b"8=FIX.4.4\x019=5\x0135=0\x0149=A\x0156=B\x0134=42\x0110=000\x01";
         assert_eq!(peek_msg_seq_num(frame), Some(42));
@@ -426,14 +726,6 @@ mod tests {
     #[test]
     fn test_peek_msg_seq_num_does_not_take_a_tag_ending_in_34() {
         assert_eq!(peek_msg_seq_num(b"8=FIX.4.4\x01134=7\x0134=3\x01"), Some(3));
-    }
-
-    #[test]
-    fn test_frame_kind_is_replay() {
-        assert!(FrameKind::Replay.is_replay());
-        assert!(FrameKind::GapFill.is_replay());
-        assert!(!FrameKind::Session.is_replay());
-        assert!(!FrameKind::Handshake.is_replay());
     }
 
     #[test]

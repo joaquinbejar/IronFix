@@ -30,10 +30,11 @@ use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::{CompId, Timestamp};
 use ironfix_engine::application::{Application, RejectReason, SendVerdict, SessionId};
 use ironfix_engine::{
-    Acceptor, Connection, Direction, FrameKind, FrameObserver, Initiator, NotSentReason,
-    Observation, OutboundMessage, OutboundResult, SendOutcome, UnknownReason,
+    Acceptor, Connection, Direction, FrameKind, FrameObserver, InboundRefusal, InboundVerdict,
+    Initiator, NotSentReason, Observation, OutboundMessage, OutboundResult, SendOutcome,
+    UnknownReason,
 };
-use ironfix_session::SessionConfig;
+use ironfix_session::{GapPolicy, SessionConfig};
 use ironfix_store::{MemoryStore, MessageStore};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
@@ -1336,4 +1337,798 @@ async fn test_resend_retry_cannot_bypass_a_full_observation_backlog() {
         "every observed frame got its result at the close"
     );
     reader.abort();
+}
+
+/// A frame observer recording the core's inbound verdicts (issue #223).
+#[derive(Debug, Default)]
+struct VerdictRecorder {
+    inbound: Mutex<Vec<Option<u64>>>,
+    verdicts: Mutex<Vec<(FrameKind, Option<u64>, InboundVerdict)>>,
+}
+
+impl FrameObserver for VerdictRecorder {
+    fn on_inbound(&self, _frame: &[u8], observation: &Observation<'_>) {
+        locked(&self.inbound).push(observation.msg_seq_num());
+    }
+
+    fn on_outbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, observation: &Observation<'_>) {
+        assert_eq!(observation.direction(), Direction::Inbound);
+        assert_eq!(observation.msg_seq_num(), Some(verdict.seq()));
+        // A frame released from the gap queue gets its second verdict
+        // without being framed again; every other verdict follows its frame.
+        let framed = locked(&self.inbound).contains(&Some(verdict.seq()));
+        assert!(framed, "a verdict is about a frame already observed");
+        locked(&self.verdicts).push((observation.kind(), observation.msg_seq_num(), *verdict));
+    }
+}
+
+/// The core's verdicts reach the observer after the frame and before the
+/// session acts: accepted, rejected as a duplicate, deferred behind a gap,
+/// and a GapFill accepted once applied.
+#[tokio::test]
+async fn test_observer_receives_the_core_verdicts() {
+    let recorder = Arc::new(VerdictRecorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("0", 2, &[])).await;
+    // A duplicate below the expectation, flagged PossDupFlag (43) = Y.
+    venue
+        .send(venue_msg(
+            "0",
+            2,
+            &[(43, "Y"), (122, "20260101-00:00:00.000")],
+        ))
+        .await;
+    // A gap: 3 and 4 are missing.
+    venue
+        .send(venue_msg(
+            "D",
+            5,
+            &[(11, "GAP"), (55, "EUR/USD"), (54, "1"), (38, "1")],
+        ))
+        .await;
+    let request = venue.next().await;
+    assert_eq!(header(&request).0, "2");
+    // The venue fills 3 to 5.
+    venue
+        .send(venue_msg("4", 3, &[(123, "Y"), (36, "6")]))
+        .await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 6 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the fill moves the expectation to 6",
+    );
+
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 6, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let verdicts = locked(&recorder.verdicts).clone();
+    assert_eq!(
+        verdicts,
+        vec![
+            (
+                FrameKind::Session,
+                Some(2),
+                InboundVerdict::Accepted { seq: 2 }
+            ),
+            (
+                FrameKind::Session,
+                Some(2),
+                InboundVerdict::Rejected {
+                    seq: 2,
+                    reason: InboundRefusal::Duplicate
+                }
+            ),
+            (
+                FrameKind::Session,
+                Some(5),
+                InboundVerdict::Deferred {
+                    seq: 5,
+                    expected: 3
+                }
+            ),
+            (
+                FrameKind::Session,
+                Some(3),
+                InboundVerdict::Accepted { seq: 3 }
+            ),
+            (
+                FrameKind::Session,
+                Some(6),
+                InboundVerdict::Accepted { seq: 6 }
+            ),
+        ]
+    );
+}
+
+/// Under `GapPolicy::Queue`: an administrative message kept above a gap is
+/// accepted ahead, a copy of its number is rejected as a queued copy, and an
+/// application message deferred behind the gap is reported accepted when it
+/// is released in order.
+#[tokio::test]
+async fn test_observer_verdicts_under_the_gap_queue() {
+    let recorder = Arc::new(VerdictRecorder::default());
+    let config = member_config().with_gap_policy(GapPolicy::Queue {
+        max_messages: 16,
+        max_bytes: 1024 * 1024,
+    });
+    let initiator = Initiator::new(config, Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    // 2 is missing: the application message at 3 is queued.
+    venue
+        .send(venue_msg(
+            "D",
+            3,
+            &[(11, "QUEUED"), (55, "EUR/USD"), (54, "1"), (38, "1")],
+        ))
+        .await;
+    assert_eq!(header(&venue.next().await).0, "2");
+    // A copy of 3: dropped, the queued one stays.
+    venue
+        .send(venue_msg(
+            "D",
+            3,
+            &[(11, "QUEUED"), (55, "EUR/USD"), (54, "1"), (38, "1")],
+        ))
+        .await;
+    // A TestRequest at 4 is answered and its number kept; then a copy.
+    venue.send(venue_msg("1", 4, &[(112, "T-1")])).await;
+    while header(&venue.next().await).0 != "0" {}
+    venue.send(venue_msg("1", 4, &[(112, "T-1")])).await;
+    venue
+        .send(venue_msg("4", 2, &[(123, "Y"), (36, "3")]))
+        .await;
+    // The fill releases 3, then consumes the kept 4.
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 5 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the queue is released up to 5",
+    );
+
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 5, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let verdicts: Vec<InboundVerdict> = locked(&recorder.verdicts)
+        .iter()
+        .map(|(_, _, verdict)| *verdict)
+        .collect();
+    assert_eq!(
+        verdicts,
+        vec![
+            InboundVerdict::Deferred {
+                seq: 3,
+                expected: 2
+            },
+            InboundVerdict::Rejected {
+                seq: 3,
+                reason: InboundRefusal::QueuedCopy
+            },
+            InboundVerdict::AcceptedAhead {
+                seq: 4,
+                expected: 2
+            },
+            InboundVerdict::Rejected {
+                seq: 4,
+                reason: InboundRefusal::QueuedCopy
+            },
+            InboundVerdict::Accepted { seq: 2 },
+            InboundVerdict::Accepted { seq: 3 },
+            // The kept TestRequest's number, consumed in turn.
+            InboundVerdict::Accepted { seq: 4 },
+            InboundVerdict::Accepted { seq: 5 },
+        ]
+    );
+}
+
+/// A frame observer recording every verdict with the capture id it names,
+/// and every inbound frame's capture id with its `MsgSeqNum`.
+#[derive(Debug, Default)]
+struct IdVerdicts {
+    frames: Mutex<Vec<(Option<u64>, Option<u64>)>>,
+    verdicts: Mutex<Vec<(Option<u64>, InboundVerdict)>>,
+}
+
+impl FrameObserver for IdVerdicts {
+    fn on_inbound(&self, _frame: &[u8], observation: &Observation<'_>) {
+        locked(&self.frames).push((observation.frame_id(), observation.msg_seq_num()));
+    }
+
+    fn on_outbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, observation: &Observation<'_>) {
+        locked(&self.verdicts).push((observation.frame_id(), *verdict));
+    }
+}
+
+/// A kept administrative number gets exactly one `Accepted`, naming the
+/// kept frame, once its number is consumed in turn.
+#[tokio::test]
+async fn test_kept_number_accepted_once_consumed_with_its_frame_id() {
+    let recorder = Arc::new(IdVerdicts::default());
+    let config = member_config().with_gap_policy(GapPolicy::Queue {
+        max_messages: 16,
+        max_bytes: 1024 * 1024,
+    });
+    let initiator = Initiator::new(config, Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("1", 3, &[(112, "KEPT")])).await;
+    while header(&venue.next().await).0 != "0" {}
+    venue
+        .send(venue_msg("4", 2, &[(123, "Y"), (36, "3")]))
+        .await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the kept number is consumed",
+    );
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 4, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let kept = some(
+        locked(&recorder.frames)
+            .iter()
+            .find(|(_, seq)| *seq == Some(3))
+            .map(|(id, _)| *id),
+        "the TestRequest was observed",
+    );
+    assert!(kept.is_some());
+    let on_3: Vec<(Option<u64>, InboundVerdict)> = locked(&recorder.verdicts)
+        .iter()
+        .filter(|(_, verdict)| verdict.seq() == 3)
+        .copied()
+        .collect();
+    assert_eq!(
+        on_3,
+        vec![
+            (
+                kept,
+                InboundVerdict::AcceptedAhead {
+                    seq: 3,
+                    expected: 2
+                }
+            ),
+            (kept, InboundVerdict::Accepted { seq: 3 }),
+        ]
+    );
+}
+
+/// A kept number the queue discards (a Reset renumbers the stream) is never
+/// reported accepted.
+#[tokio::test]
+async fn test_discarded_kept_number_is_never_accepted() {
+    let recorder = Arc::new(IdVerdicts::default());
+    let config = member_config().with_gap_policy(GapPolicy::Queue {
+        max_messages: 16,
+        max_bytes: 1024 * 1024,
+    });
+    let initiator = Initiator::new(config, Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("1", 3, &[(112, "KEPT")])).await;
+    while header(&venue.next().await).0 != "0" {}
+    // Reset mode renumbers the stream to 10: the queue is cleared.
+    venue.send(venue_msg("4", 2, &[(36, "10")])).await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 10 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the Reset moves the cursor to 10",
+    );
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 10, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let verdicts = locked(&recorder.verdicts).clone();
+    let on_3: Vec<InboundVerdict> = verdicts
+        .iter()
+        .filter(|(_, verdict)| verdict.seq() == 3)
+        .map(|(_, verdict)| *verdict)
+        .collect();
+    assert_eq!(
+        on_3,
+        vec![InboundVerdict::AcceptedAhead {
+            seq: 3,
+            expected: 2
+        }],
+        "no acceptance for a discarded kept number: {verdicts:?}"
+    );
+    // The Reset itself is reported applied, with its cursor, exactly once.
+    let reset_accepted = verdicts
+        .iter()
+        .filter(|(_, verdict)| *verdict == InboundVerdict::ResetApplied { seq: 2, next: 10 })
+        .count();
+    assert_eq!(reset_accepted, 1, "{verdicts:?}");
+}
+
+/// A store whose next-target writes fail from `fail_from` on.
+struct FailingTargetStore {
+    inner: MemoryStore,
+    fail_from: u64,
+}
+
+#[async_trait]
+impl MessageStore for FailingTargetStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.store(seq_num, msg_type, message).await
+    }
+    async fn get_range(
+        &self,
+        begin: u64,
+        end: u64,
+    ) -> Result<Vec<ironfix_store::StoredMessage>, ironfix_core::error::StoreError> {
+        self.inner.get_range(begin, end).await
+    }
+    fn next_sender_seq(&self) -> u64 {
+        self.inner.next_sender_seq()
+    }
+    fn next_target_seq(&self) -> u64 {
+        self.inner.next_target_seq()
+    }
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.set_next_sender_seq(seq).await
+    }
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), ironfix_core::error::StoreError> {
+        if seq >= self.fail_from {
+            return Err(ironfix_core::error::StoreError::StoreFailed {
+                seq_num: seq,
+                reason: "refused by the test store".to_string(),
+            });
+        }
+        self.inner.set_next_target_seq(seq).await
+    }
+    async fn reset(&self) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.reset().await
+    }
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.inner.creation_time()
+    }
+}
+
+/// Under `StoreFailurePolicy::CloseSession`, an in-sequence Heartbeat whose
+/// target-counter write fails closes the session and is never reported
+/// accepted: acceptance follows the receive cursor.
+#[tokio::test]
+async fn test_failed_target_write_is_not_reported_accepted() {
+    let recorder = Arc::new(VerdictRecorder::default());
+    let store = Arc::new(FailingTargetStore {
+        inner: MemoryStore::new(),
+        fail_from: 3,
+    });
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_store(store as Arc<dyn MessageStore>)
+        .with_store_failure_policy(ironfix_engine::StoreFailurePolicy::CloseSession)
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("0", 2, &[])).await;
+    closed(&member, "the failed target write closes the session").await;
+
+    assert!(
+        locked(&recorder.inbound).contains(&Some(2)),
+        "the Heartbeat was observed"
+    );
+    let verdicts = locked(&recorder.verdicts).clone();
+    assert!(
+        verdicts
+            .iter()
+            .all(|(_, _, verdict)| !verdict.is_accepted()),
+        "nothing was accepted past a failed target write: {verdicts:?}"
+    );
+    assert!(
+        verdicts.iter().any(|(_, _, verdict)| *verdict
+            == InboundVerdict::Rejected {
+                seq: 2,
+                reason: InboundRefusal::Unpersisted
+            }),
+        "the frame is reported rejected as unpersisted: {verdicts:?}"
+    );
+    assert_eq!(member.next_target_seq(), 2, "the cursor did not move");
+}
+
+/// One observed inbound frame: capture id, `MsgSeqNum` (34), length.
+type ObservedFrame = (Option<u64>, Option<u64>, usize);
+
+/// A frame observer recording capture ids: each inbound frame's id with its
+/// `MsgSeqNum`, and each verdict with the id it names.
+#[derive(Debug, Default)]
+struct IdRecorder {
+    frames: Mutex<Vec<ObservedFrame>>,
+    verdicts: Mutex<Vec<(Option<u64>, InboundVerdict)>>,
+}
+
+impl FrameObserver for IdRecorder {
+    fn on_inbound(&self, frame: &[u8], observation: &Observation<'_>) {
+        locked(&self.frames).push((
+            observation.frame_id(),
+            observation.msg_seq_num(),
+            frame.len(),
+        ));
+    }
+
+    fn on_outbound(&self, _frame: &[u8], observation: &Observation<'_>) {
+        assert_eq!(observation.frame_id(), None);
+    }
+
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, observation: &Observation<'_>) {
+        locked(&self.verdicts).push((observation.frame_id(), *verdict));
+    }
+}
+
+/// Under `GapPolicy::Queue`, an oversized frame past the queue's byte bound
+/// is deferred but not stored, and a smaller frame under the same number is
+/// stored: the release verdict names the stored frame's capture id.
+#[tokio::test]
+async fn test_release_verdict_names_the_stored_frame() {
+    let recorder = Arc::new(IdRecorder::default());
+    let config = member_config().with_gap_policy(GapPolicy::Queue {
+        max_messages: 16,
+        max_bytes: 400,
+    });
+    let initiator = Initiator::new(config, Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    let padding = "X".repeat(600);
+    venue
+        .send(venue_msg(
+            "D",
+            3,
+            &[
+                (11, "BIG"),
+                (55, "EUR/USD"),
+                (54, "1"),
+                (38, "1"),
+                (58, &padding),
+            ],
+        ))
+        .await;
+    assert_eq!(header(&venue.next().await).0, "2");
+    venue
+        .send(venue_msg(
+            "D",
+            3,
+            &[(11, "SMALL"), (55, "EUR/USD"), (54, "1"), (38, "1")],
+        ))
+        .await;
+    venue
+        .send(venue_msg("4", 2, &[(123, "Y"), (36, "3")]))
+        .await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the stored frame is released",
+    );
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 4, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let frames = locked(&recorder.frames).clone();
+    let ids_of_3: Vec<(Option<u64>, usize)> = frames
+        .iter()
+        .filter(|(_, seq, _)| *seq == Some(3))
+        .map(|(id, _, len)| (*id, *len))
+        .collect();
+    assert_eq!(ids_of_3.len(), 2, "both copies of 3 observed: {frames:?}");
+    let (big, small) = (ids_of_3[0], ids_of_3[1]);
+    assert!(big.1 > small.1, "the first copy is the oversized one");
+    assert!(big.0.is_some() && small.0.is_some() && big.0 != small.0);
+    let ids: Vec<Option<u64>> = frames.iter().map(|(id, _, _)| *id).collect();
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids increase: {ids:?}");
+
+    let verdicts = locked(&recorder.verdicts).clone();
+    let on_3: Vec<(Option<u64>, InboundVerdict)> = verdicts
+        .iter()
+        .filter(|(_, verdict)| verdict.seq() == 3)
+        .copied()
+        .collect();
+    assert_eq!(
+        on_3,
+        vec![
+            (
+                big.0,
+                InboundVerdict::Deferred {
+                    seq: 3,
+                    expected: 2
+                }
+            ),
+            (
+                small.0,
+                InboundVerdict::Deferred {
+                    seq: 3,
+                    expected: 2
+                }
+            ),
+            (small.0, InboundVerdict::Accepted { seq: 3 }),
+        ],
+        "the release verdict names the stored (smaller) frame"
+    );
+}
+
+/// A frame observer reading the session's receive cursor when a verdict
+/// arrives.
+#[derive(Default)]
+struct CursorRecorder {
+    connection: Mutex<Option<Connection>>,
+    seen: Mutex<Vec<(InboundVerdict, u64)>>,
+}
+
+impl FrameObserver for CursorRecorder {
+    fn on_inbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+
+    fn on_outbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, _observation: &Observation<'_>) {
+        if let Some(connection) = locked(&self.connection).as_ref() {
+            locked(&self.seen).push((*verdict, connection.next_target_seq()));
+        }
+    }
+}
+
+/// An accepted message is reported after the receive cursor moved past it,
+/// for an application message as for an administrative one.
+#[tokio::test]
+async fn test_accepted_verdict_follows_the_cursor() {
+    let recorder = Arc::new(CursorRecorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+    *locked(&recorder.connection) = Some(member.clone());
+
+    venue
+        .send(venue_msg(
+            "D",
+            2,
+            &[(11, "IN"), (55, "EUR/USD"), (54, "1"), (38, "1")],
+        ))
+        .await;
+    venue.send(venue_msg("0", 3, &[])).await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "both messages consumed",
+    );
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 4, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+    *locked(&recorder.connection) = None;
+
+    let seen = locked(&recorder.seen).clone();
+    assert_eq!(
+        &seen[..2],
+        &[
+            (InboundVerdict::Accepted { seq: 2 }, 3),
+            (InboundVerdict::Accepted { seq: 3 }, 4),
+        ],
+        "each acceptance is reported with the cursor past it: {seen:?}"
+    );
+}
+
+/// An in-sequence GapFill is reported accepted once the receive cursor has
+/// moved to its `NewSeqNo` (36).
+#[tokio::test]
+async fn test_gap_fill_accepted_after_the_cursor_moves() {
+    let recorder = Arc::new(CursorRecorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+    *locked(&recorder.connection) = Some(member.clone());
+
+    venue
+        .send(venue_msg("4", 2, &[(123, "Y"), (36, "5")]))
+        .await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 5 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the fill moves the cursor to 5",
+    );
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 5, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+    *locked(&recorder.connection) = None;
+
+    let seen = locked(&recorder.seen).clone();
+    assert_eq!(
+        seen.first(),
+        Some(&(InboundVerdict::Accepted { seq: 2 }, 5)),
+        "the fill is accepted with the cursor at its NewSeqNo: {seen:?}"
+    );
+}
+
+/// One callback an [`OrderRecorder`] saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Callback {
+    Inbound(Option<u64>),
+    Verdict(InboundVerdict),
+    Outbound(String),
+}
+
+/// A frame observer recording the order of its callbacks.
+#[derive(Debug, Default)]
+struct OrderRecorder {
+    calls: Mutex<Vec<Callback>>,
+}
+
+impl FrameObserver for OrderRecorder {
+    fn on_inbound(&self, _frame: &[u8], observation: &Observation<'_>) {
+        locked(&self.calls).push(Callback::Inbound(observation.msg_seq_num()));
+    }
+
+    fn on_outbound(&self, frame: &[u8], _observation: &Observation<'_>) {
+        let msg_type = field(frame, 35).unwrap_or_default();
+        locked(&self.calls).push(Callback::Outbound(msg_type));
+    }
+
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, _observation: &Observation<'_>) {
+        locked(&self.calls).push(Callback::Verdict(*verdict));
+    }
+}
+
+/// An administrative frame opening a new gap: its routing verdict
+/// (`AcceptedAhead`) comes after the frame and before the `ResendRequest`
+/// it causes.
+#[tokio::test]
+async fn test_accepted_ahead_precedes_the_resend_request() {
+    let recorder = Arc::new(OrderRecorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("1", 3, &[(112, "T-GAP")])).await;
+    assert_eq!(header(&venue.next().await).0, "2");
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 4, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let calls = locked(&recorder.calls).clone();
+    let from = some(
+        calls
+            .iter()
+            .position(|call| *call == Callback::Inbound(Some(3))),
+        "the TestRequest was observed",
+    );
+    assert_eq!(
+        &calls[from..from + 3],
+        &[
+            Callback::Inbound(Some(3)),
+            Callback::Verdict(InboundVerdict::AcceptedAhead {
+                seq: 3,
+                expected: 2
+            }),
+            Callback::Outbound("2".to_string()),
+        ],
+        "frame, routing verdict, then the ResendRequest: {calls:?}"
+    );
+}
+
+/// A store that refuses to file a `ResendRequest` (2).
+struct RefuseResendStore {
+    inner: MemoryStore,
+}
+
+#[async_trait]
+impl MessageStore for RefuseResendStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), ironfix_core::error::StoreError> {
+        if msg_type.as_str() == "2" {
+            return Err(ironfix_core::error::StoreError::StoreFailed {
+                seq_num,
+                reason: "refused by the test store".to_string(),
+            });
+        }
+        self.inner.store(seq_num, msg_type, message).await
+    }
+    async fn get_range(
+        &self,
+        begin: u64,
+        end: u64,
+    ) -> Result<Vec<ironfix_store::StoredMessage>, ironfix_core::error::StoreError> {
+        self.inner.get_range(begin, end).await
+    }
+    fn next_sender_seq(&self) -> u64 {
+        self.inner.next_sender_seq()
+    }
+    fn next_target_seq(&self) -> u64 {
+        self.inner.next_target_seq()
+    }
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.set_next_sender_seq(seq).await
+    }
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.set_next_target_seq(seq).await
+    }
+    async fn reset(&self) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.reset().await
+    }
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.inner.creation_time()
+    }
+}
+
+/// When the `ResendRequest` cannot be written (its filing fails under
+/// `CloseSession`), the routing verdict is still reported, and the session
+/// then closes: the close is the record that the request failed.
+#[tokio::test]
+async fn test_accepted_ahead_is_reported_when_the_resend_request_fails() {
+    let recorder = Arc::new(OrderRecorder::default());
+    let store = Arc::new(RefuseResendStore {
+        inner: MemoryStore::new(),
+    });
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_store(store as Arc<dyn MessageStore>)
+        .with_store_failure_policy(ironfix_engine::StoreFailurePolicy::CloseSession)
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("1", 3, &[(112, "T-GAP")])).await;
+    closed(&member, "the failed ResendRequest closes the session").await;
+
+    let calls = locked(&recorder.calls).clone();
+    assert!(
+        calls.contains(&Callback::Verdict(InboundVerdict::AcceptedAhead {
+            seq: 3,
+            expected: 2
+        })),
+        "the routing verdict is reported: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&Callback::Outbound("2".to_string())),
+        "no ResendRequest was written: {calls:?}"
+    );
+    assert!(member.close_reason().is_some(), "the close is the record");
 }

@@ -872,6 +872,22 @@ impl<P: SessionPayloads> SessionCore<P> {
         self.gap_queue.is_some()
     }
 
+    /// Whether [`SessionCore::queue_gapped`] would answer
+    /// [`GapAdmission::Duplicate`] for `seq` in `phase`: the session queues
+    /// and a message under this number is already held. Read-only, so a
+    /// driver can report the frame's capture verdict
+    /// ([`gap_verdict`](crate::gap_verdict)) before it requests the gap.
+    #[must_use]
+    pub fn gap_copy_queued(&self, phase: &SessionPhase, seq: u64) -> bool {
+        if !phase.is_active() || self.logout_owed.is_some() {
+            return false;
+        }
+        match &self.gap_queue {
+            Some(queue) => queue.holds(seq),
+            None => false,
+        }
+    }
+
     /// Offers a message received above the expectation, numbered `seq`, to
     /// the gap queue ([`GapAdmission`]).
     ///
@@ -1221,10 +1237,15 @@ pub(crate) mod tests {
             GapAdmission::Bypassed,
             "a session on its way out queues nothing"
         );
+        assert!(!core.gap_copy_queued(&active(), 5));
         assert_eq!(
             core.queue_gapped(&active(), 5, GapEntry::Frame(vec![1])),
             GapAdmission::Queued
         );
+        // The peek predicts the Duplicate admission, and only while queueing.
+        assert!(core.gap_copy_queued(&active(), 5));
+        assert!(!core.gap_copy_queued(&queued, 5));
+        assert!(!discard.gap_copy_queued(&active(), 5));
         assert_eq!(
             core.queue_gapped(&active(), 5, GapEntry::Processed),
             GapAdmission::Duplicate
