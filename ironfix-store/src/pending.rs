@@ -233,6 +233,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     /// for as long as it lives (see the [module docs](self)).
     ///
     /// # Errors
+    /// [`StoreError::InvalidRange`] if the store's next sender number is 0;
     /// [`StoreError::Io`] if the queues for `bound` writes cannot be
     /// reserved or the worker thread cannot be spawned.
     pub fn new(store: S, bound: NonZeroUsize) -> Result<Self, StoreError> {
@@ -243,6 +244,11 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         // counter back. The number itself may be refilled (a crash between
         // filing and persisting the counter).
         let floor = store.next_sender_seq();
+        if floor == 0 {
+            // Sequence 0 is never valid in FIX, and no resend read can
+            // return it: refuse rather than confirm an unreplayable frame.
+            return Err(StoreError::InvalidRange { begin: 0, end: 0 });
+        }
         let store = Arc::new(store);
         let shared = Arc::new(Shared {
             jobs: Mutex::new(Jobs {
@@ -472,7 +478,8 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         }
     }
 
-    /// Up to `limit` confirmed frames in `begin..=end`, as
+    /// Up to `limit` confirmed frames in `begin..=end` (`end` absolute,
+    /// never infinity), as
     /// [`SyncMessageStore::get_page`]; an empty page when nothing
     /// confirmed is in the range.
     ///
@@ -485,6 +492,10 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         end: u64,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StoreError> {
+        // `end` is absolute here: 0 is not infinity (see the trait).
+        if begin == 0 || begin > end {
+            return Err(StoreError::InvalidRange { begin, end });
+        }
         match self.capped(begin, end)? {
             Some(capped) => self.store.get_page(begin, capped, limit),
             None => Ok(Vec::new()),
@@ -1072,7 +1083,7 @@ mod tests {
         assert!(filed.recv_timeout(Duration::from_secs(5)).is_ok());
         assert!(inner.contains(3));
         assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2]);
-        assert_eq!(seqs(p.get_page(1, 0, 10)), vec![1, 2]);
+        assert_eq!(seqs(p.get_page(1, 10, 10)), vec![1, 2]);
         assert_eq!(
             p.get_range(3, 3),
             Err(StoreError::RangeNotAvailable { begin: 3, end: 3 })
@@ -1094,7 +1105,7 @@ mod tests {
         // Filed in the inner store, never confirmed: never read back.
         assert!(inner.contains(3));
         assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2]);
-        assert!(p.get_page(3, 0, 10).is_ok_and(|page| page.is_empty()));
+        assert!(p.get_page(3, 10, 10).is_ok_and(|page| page.is_empty()));
         assert_eq!(p.next_sender_seq(), 3);
     }
 
@@ -1137,6 +1148,25 @@ mod tests {
         assert!(p.set_next_target_seq(7).is_ok());
         assert_eq!(p.next_target_seq(), 7);
         assert_eq!(p.next_sender_seq(), 3);
+    }
+
+    #[test]
+    fn test_pending_store_get_page_zero_end_is_invalid_not_infinity() {
+        let (p, _inner, _filed, _setter) = setter_gated();
+        assert_eq!(
+            p.get_page(1, 0, 10),
+            Err(StoreError::InvalidRange { begin: 1, end: 0 })
+        );
+    }
+
+    #[test]
+    fn test_pending_store_refuses_a_store_whose_next_sender_is_zero() {
+        let store = MemoryStore::new();
+        assert!(store.set_next_sender_seq(0).is_ok());
+        assert!(matches!(
+            PendingStore::new(store, bound(1)),
+            Err(StoreError::InvalidRange { .. })
+        ));
     }
 
     #[test]
