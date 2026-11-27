@@ -28,6 +28,16 @@
 //!
 //! ## Guarantees
 //!
+//! These hold only while the [`PendingStore`] is the **single outbound
+//! writer** of its inner store: no second [`PendingStore`] over the same
+//! store, and no `store`, `file_outbound`, `set_next_sender_seq`,
+//! `reset` or `reset_to` through another handle while it is alive. Two
+//! writers would each accept the same sequence number and the later frame
+//! would replace the earlier one, so a resend could replay a frame that was
+//! never sent under that number. The type does not enforce this: the
+//! `Arc` is shared so that resends can read through
+//! [`PendingStore::store`].
+//!
 //! - Writes run in submit order, one at a time, through
 //!   [`SyncMessageStore::file_outbound`], which files the frame and then
 //!   persists `seq + 1` as the next sender sequence number.
@@ -204,7 +214,8 @@ pub struct PendingStore<S: SyncMessageStore + 'static> {
 
 impl<S: SyncMessageStore + 'static> PendingStore<S> {
     /// Starts the worker thread for `store`, with at most `bound` writes in
-    /// flight.
+    /// flight. The caller must make this the store's only outbound writer
+    /// for as long as it lives (see the [module docs](self)).
     ///
     /// # Errors
     /// [`StoreError::Io`] if the queues for `bound` writes cannot be
