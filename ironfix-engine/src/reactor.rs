@@ -6083,13 +6083,21 @@ impl<A: Application> Reactor<A> {
                 received,
                 then,
             } => {
-                // Reported before the gap is requested, from the queue as it
-                // stands (issue #223).
+                // Decided from the queue as it stands (issue #223). A frame
+                // that is not acted on is reported before the gap is
+                // requested; one acted on ahead of the gap only once the
+                // request is out, just before it is dispatched.
                 let queued_copy = self.core.gap_copy_queued(&phase, seq);
-                self.capture_verdict(gap_verdict(then, queued_copy, seq, expected));
+                let verdict = gap_verdict(then, queued_copy, seq, expected);
+                if !verdict.is_accepted() {
+                    self.capture_verdict(verdict);
+                }
                 let phase = self
                     .request_resend(framed, phase, expected, received)
                     .await?;
+                if verdict.is_accepted() {
+                    self.capture_verdict(verdict);
+                }
                 match then {
                     // Application messages inside a gap will be resent in
                     // order; under the Queue policy this copy is kept and
