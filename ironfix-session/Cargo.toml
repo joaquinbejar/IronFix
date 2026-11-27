@@ -13,7 +13,6 @@ categories.workspace = true
 [dependencies]
 ironfix-core.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 

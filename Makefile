@@ -84,6 +84,30 @@ test:
 	LOGLEVEL=WARN cargo test -p ironfix-engine --features tls
 	LOGLEVEL=WARN cargo test -p ironfix-engine --features fixp
 
+# Proves ironfix-session stays sans-IO (issue #219): its resolved normal
+# dependency graph, over every feature and every target platform, holds only
+# crates on a reviewed allowlist. A new direct or transitive crate fails the
+# check until it is reviewed and added here, so no async runtime or I/O crate
+# can arrive unnoticed through any path.
+SESSION_ALLOWED_DEPS := arrayvec bitflags bytes chrono ironfix-core ironfix-session libc lock_api \
+	num-derive num-traits once_cell parking_lot parking_lot_core pin-project-lite proc-macro2 quote \
+	redox_syscall rust_decimal scopeguard serde serde_core serde_derive smallvec syn thiserror \
+	thiserror-impl tracing tracing-attributes tracing-core unicode-ident windows-link
+.PHONY: check-session-deps
+check-session-deps:
+	@deps=$$(cargo tree -p ironfix-session -e normal --all-features --target all --prefix none) \
+		|| { echo "check-session-deps: cargo tree failed"; exit 1; }; \
+	names=$$(printf '%s\n' "$$deps" | sed 's/ .*//' | sort -u); \
+	printf '%s\n' "$$names" | grep -qx 'ironfix-core' \
+		|| { echo "check-session-deps: ironfix-core is missing from the graph, so the check saw nothing"; exit 1; }; \
+	unknown=$$(printf '%s\n' "$$names" | grep -vxF $(patsubst %,-e %,$(SESSION_ALLOWED_DEPS))); \
+	if [ -n "$$unknown" ]; then \
+		echo "check-session-deps: crates outside the reviewed allowlist in ironfix-session's normal graph:"; \
+		printf '%s\n' "$$unknown"; \
+		exit 1; \
+	fi; \
+	echo "check-session-deps: ironfix-session's normal graph holds only reviewed crates."
+
 # Proves the engine's optional `tls` feature is additive (ADR-0009): with it
 # off, no TLS crate is in ironfix-engine's normal dependency graph, and with it
 # on, no crypto provider is (the caller's rustls configuration brings one).
