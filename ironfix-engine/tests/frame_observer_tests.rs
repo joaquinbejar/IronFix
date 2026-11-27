@@ -34,7 +34,7 @@ use ironfix_engine::{
     Initiator, NotSentReason, Observation, OutboundMessage, OutboundResult, SendOutcome,
     UnknownReason,
 };
-use ironfix_session::SessionConfig;
+use ironfix_session::{GapPolicy, SessionConfig};
 use ironfix_store::{MemoryStore, MessageStore};
 use ironfix_tagvalue::{Decoder, Encoder};
 use ironfix_transport::FixCodec;
@@ -1355,11 +1355,11 @@ impl FrameObserver for VerdictRecorder {
 
     fn on_inbound_verdict(&self, verdict: &InboundVerdict, observation: &Observation<'_>) {
         assert_eq!(observation.direction(), Direction::Inbound);
-        assert_eq!(
-            locked(&self.inbound).last().copied().flatten(),
-            Some(verdict.seq()),
-            "a verdict follows the frame it is about"
-        );
+        assert_eq!(observation.msg_seq_num(), Some(verdict.seq()));
+        // A frame released from the gap queue gets its second verdict
+        // without being framed again; every other verdict follows its frame.
+        let framed = locked(&self.inbound).contains(&Some(verdict.seq()));
+        assert!(framed, "a verdict is about a frame already observed");
         locked(&self.verdicts).push((observation.kind(), observation.msg_seq_num(), *verdict));
     }
 }
@@ -1438,6 +1438,69 @@ async fn test_observer_receives_the_core_verdicts() {
                 Some(6),
                 InboundVerdict::Accepted { seq: 6 }
             ),
+        ]
+    );
+}
+
+/// Under `GapPolicy::Queue`: an administrative message kept above a gap is
+/// accepted ahead, a copy of its number is rejected as a queued copy, and an
+/// application message deferred behind the gap is reported accepted when it
+/// is released in order.
+#[tokio::test]
+async fn test_observer_verdicts_under_the_gap_queue() {
+    let recorder = Arc::new(VerdictRecorder::default());
+    let config = member_config().with_gap_policy(GapPolicy::Queue {
+        max_messages: 16,
+        max_bytes: 1024 * 1024,
+    });
+    let initiator = Initiator::new(config, Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    // 2 is missing: the application message at 3 is queued.
+    venue
+        .send(venue_msg(
+            "D",
+            3,
+            &[(11, "QUEUED"), (55, "EUR/USD"), (54, "1"), (38, "1")],
+        ))
+        .await;
+    assert_eq!(header(&venue.next().await).0, "2");
+    // A TestRequest at 4 is answered and its number kept; then a copy.
+    venue.send(venue_msg("1", 4, &[(112, "T-1")])).await;
+    assert_eq!(header(&venue.next().await).0, "0");
+    venue.send(venue_msg("1", 4, &[(112, "T-1")])).await;
+    venue
+        .send(venue_msg("4", 2, &[(123, "Y"), (36, "3")]))
+        .await;
+
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 5, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let verdicts: Vec<InboundVerdict> = locked(&recorder.verdicts)
+        .iter()
+        .map(|(_, _, verdict)| *verdict)
+        .collect();
+    assert_eq!(
+        verdicts,
+        vec![
+            InboundVerdict::Deferred {
+                seq: 3,
+                expected: 2
+            },
+            InboundVerdict::AcceptedAhead {
+                seq: 4,
+                expected: 2
+            },
+            InboundVerdict::Rejected {
+                seq: 4,
+                reason: InboundRefusal::QueuedCopy
+            },
+            InboundVerdict::Accepted { seq: 2 },
+            InboundVerdict::Accepted { seq: 3 },
+            InboundVerdict::Accepted { seq: 5 },
         ]
     );
 }

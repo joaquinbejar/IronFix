@@ -331,8 +331,8 @@ use ironfix_session::{
     TestRequestOutcome,
 };
 use ironfix_session::{
-    InboundRefusal, InboundVerdict, inbound_verdict, sequence_reset_screen_verdict,
-    sequence_reset_verdict,
+    InboundRefusal, InboundVerdict, inbound_verdict, kept_number_verdict, released_verdict,
+    sequence_reset_screen_verdict, sequence_reset_verdict, sequence_verdict,
 };
 use ironfix_store::{MessageStore, StoredMessage};
 use ironfix_tagvalue::{FieldIndex, recycle_field_refs};
@@ -4286,7 +4286,9 @@ impl<A: Application> Reactor<A> {
                 .close_on_missing_seq_num(framed, phase, header.msg_type.unwrap_or(""))
                 .await);
         };
-        match classify_inbound(&self.runtime.sequences, seq, || header.poss_dup) {
+        let sequence = classify_inbound(&self.runtime.sequences, seq, || header.poss_dup);
+        self.capture_verdict(sequence_verdict(&sequence, seq));
+        match sequence {
             InboundSequence::InSequence => {
                 tracing::warn!(
                     session = %self.session_id,
@@ -5618,6 +5620,8 @@ impl<A: Application> Reactor<A> {
                 .on_sequence_reset(framed, phase, &raw, seq, frame)
                 .await;
         }
+        // Deferred when it arrived; in sequence now (issue #223).
+        self.capture_verdict(released_verdict(seq));
         self.on_app_in_sequence(framed, phase, &raw, seq, frame)
             .await
     }
@@ -5658,15 +5662,22 @@ impl<A: Application> Reactor<A> {
     /// on a number an application message already claimed does not run. An
     /// overflow returns `false`: the message is acted on as under `Discard`.
     fn queue_gapped(&mut self, phase: &Phase, seq: u64, entry: GapEntry<Bytes>) -> bool {
-        match self.core.queue_gapped(phase, seq, entry) {
-            GapAdmission::Bypassed | GapAdmission::Queued | GapAdmission::Overflow => false,
+        self.admit_gapped(phase, seq, entry) == GapAdmission::Duplicate
+    }
+
+    /// The gap queue's admission of a message above the expectation, logged:
+    /// [`Reactor::queue_gapped`] with the core's answer kept, for the capture
+    /// verdict of a kept number.
+    fn admit_gapped(&mut self, phase: &Phase, seq: u64, entry: GapEntry<Bytes>) -> GapAdmission {
+        let admission = self.core.queue_gapped(phase, seq, entry);
+        match admission {
+            GapAdmission::Bypassed | GapAdmission::Queued | GapAdmission::Overflow => {}
             GapAdmission::Duplicate => {
                 tracing::debug!(
                     session = %self.session_id,
                     seq,
                     "a message with this number is already queued above the gap: dropping the copy"
                 );
-                true
             }
             GapAdmission::FirstOverflow => {
                 tracing::warn!(
@@ -5675,9 +5686,9 @@ impl<A: Application> Reactor<A> {
                     "the gap queue is full: discarding further messages above the gap until \
                      it drains; the resend delivers them"
                 );
-                false
             }
         }
+        admission
     }
 
     /// Drops every queued message, logging why when there were any.
@@ -6042,7 +6053,9 @@ impl<A: Application> Reactor<A> {
                     // kept to be consumed in turn. A copy of a number
                     // already held is dropped, not acted on a second time.
                     GapDisposition::KeepNumber => {
-                        if self.queue_gapped(&phase, seq, GapEntry::Processed) {
+                        let admission = self.admit_gapped(&phase, seq, GapEntry::Processed);
+                        self.capture_verdict(kept_number_verdict(&admission, seq, expected));
+                        if admission == GapAdmission::Duplicate {
                             return Ok(phase);
                         }
                         self.dispatch_admin(framed, phase, &raw, seq).await

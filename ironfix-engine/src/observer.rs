@@ -53,8 +53,13 @@
 //! duplicate, a number too low, an exhausted counter, a refused
 //! `SequenceReset` (4), or one `from_admin` refused). A frame the session
 //! closes over before routing it (the wrong CompID, a `SendingTime` out of
-//! tolerance, a header that does not decode) and a handshake frame get no
-//! verdict. An accepted message can still be answered with a session Reject
+//! tolerance, a header without a usable `MsgSeqNum` (34)) and a handshake
+//! frame get no verdict. A frame whose header is sound and whose body does
+//! not decode gets the verdict of its number. Under `GapPolicy::Queue`, an
+//! administrative message whose number is already queued is rejected as a
+//! [`InboundRefusal::QueuedCopy`], and a frame deferred behind a gap gets a
+//! second verdict, accepted, when it is released in order, without a second
+//! [`FrameObserver::on_inbound`]. An accepted message can still be answered with a session Reject
 //! (3) for its content; the number is consumed either way.
 //!
 //! # Write results

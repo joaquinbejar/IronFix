@@ -37,7 +37,9 @@
 
 use std::time::Instant;
 
-use crate::sans_io::{GapDisposition, InboundRoute, ResetDecision, ResetScreen};
+use crate::sans_io::{
+    GapAdmission, GapDisposition, InboundRoute, InboundSequence, ResetDecision, ResetScreen,
+};
 
 /// Which way a frame travels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -105,6 +107,9 @@ pub enum InboundRefusal {
     /// `from_admin` returned an error). Reported by the driver: the core
     /// cannot see the application's answer.
     Refused,
+    /// Above the expectation, and a message with the same number is already
+    /// queued above the gap: the copy is dropped.
+    QueuedCopy,
 }
 
 /// The core's verdict on an inbound frame, relative to sequence handling.
@@ -167,7 +172,11 @@ impl InboundVerdict {
 ///
 /// `None` for a `SequenceReset` (4): it has its own rules, and its verdict
 /// comes from [`sequence_reset_screen_verdict`] and, once the application
-/// has seen it, [`sequence_reset_verdict`].
+/// has seen it, [`sequence_reset_verdict`]. `None` too for an administrative
+/// message inside a gap whose number the gap queue keeps
+/// ([`GapDisposition::KeepNumber`]): a copy of a number already queued is
+/// not acted on, so its verdict comes from [`kept_number_verdict`] once the
+/// queue has admitted it or not.
 #[must_use]
 pub const fn inbound_verdict(route: &InboundRoute, seq: u64) -> Option<InboundVerdict> {
     let verdict = match *route {
@@ -187,12 +196,65 @@ pub const fn inbound_verdict(route: &InboundRoute, seq: u64) -> Option<InboundVe
         },
         InboundRoute::Gap { expected, then, .. } => match then {
             GapDisposition::QueueFrame => InboundVerdict::Deferred { seq, expected },
-            GapDisposition::KeepNumber | GapDisposition::Dispatch => {
-                InboundVerdict::AcceptedAhead { seq, expected }
-            }
+            GapDisposition::Dispatch => InboundVerdict::AcceptedAhead { seq, expected },
+            // Whether it is acted on depends on the gap queue's admission.
+            GapDisposition::KeepNumber => return None,
         },
     };
     Some(verdict)
+}
+
+/// The verdict on an administrative message of number `seq` inside a gap
+/// starting at `expected`, once the gap queue has answered `admission` for
+/// its number ([`GapDisposition::KeepNumber`]): a copy of a number already
+/// queued is dropped, anything else is acted on now.
+#[must_use]
+pub const fn kept_number_verdict(
+    admission: &GapAdmission,
+    seq: u64,
+    expected: u64,
+) -> InboundVerdict {
+    match admission {
+        GapAdmission::Duplicate => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::QueuedCopy,
+        },
+        GapAdmission::Bypassed
+        | GapAdmission::Queued
+        | GapAdmission::Overflow
+        | GapAdmission::FirstOverflow => InboundVerdict::AcceptedAhead { seq, expected },
+    }
+}
+
+/// The verdict on an inbound frame of number `seq` from its sequence
+/// classification alone ([`classify_inbound`](crate::sans_io::classify_inbound)),
+/// for a driver path that classifies without routing: in the engine, a frame
+/// whose header is sound and whose body does not decode. In sequence it is
+/// accepted (its number is consumed; the driver answers it with a session
+/// Reject (3)); above the expectation it is deferred to its resend.
+#[must_use]
+pub const fn sequence_verdict(sequence: &InboundSequence, seq: u64) -> InboundVerdict {
+    match *sequence {
+        InboundSequence::InSequence => InboundVerdict::Accepted { seq },
+        InboundSequence::Duplicate { .. } => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::Duplicate,
+        },
+        InboundSequence::TooLow { expected, .. } => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::TooLow { expected },
+        },
+        InboundSequence::Gap { expected, .. } => InboundVerdict::Deferred { seq, expected },
+    }
+}
+
+/// The verdict on a frame of number `seq` queued above a gap and released
+/// once the expectation reached it: it is now in sequence and acted on. It
+/// follows the [`InboundVerdict::Deferred`] the frame got when it arrived,
+/// without the frame being framed again.
+#[must_use]
+pub const fn released_verdict(seq: u64) -> InboundVerdict {
+    InboundVerdict::Accepted { seq }
 }
 
 /// The verdict on a `SequenceReset` (4) of number `seq` from its screen
@@ -368,7 +430,7 @@ pub trait FrameCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sans_io::{route_inbound, screen_sequence_reset};
+    use crate::sans_io::{classify_inbound, route_inbound, screen_sequence_reset};
     use crate::sequence::SequenceManager;
     use ironfix_core::message::MsgType;
     use std::cell::RefCell;
@@ -433,18 +495,76 @@ mod tests {
                 expected: 5
             })
         );
-        for msg_type in [MsgType::Heartbeat, MsgType::Logout] {
-            let route = route_inbound(&sequences, &msg_type, 9, || false);
-            let verdict = inbound_verdict(&route, 9);
+        let route = route_inbound(&sequences, &MsgType::Logout, 9, || false);
+        let verdict = inbound_verdict(&route, 9);
+        assert_eq!(
+            verdict,
+            Some(InboundVerdict::AcceptedAhead {
+                seq: 9,
+                expected: 5
+            })
+        );
+        assert!(verdict.is_some_and(|v| v.is_accepted()));
+        // A kept number waits for the gap queue's admission.
+        let route = route_inbound(&sequences, &MsgType::Heartbeat, 9, || false);
+        assert_eq!(inbound_verdict(&route, 9), None);
+    }
+
+    #[test]
+    fn test_kept_number_verdict_drops_a_queued_copy() {
+        assert_eq!(
+            kept_number_verdict(&GapAdmission::Duplicate, 9, 5),
+            InboundVerdict::Rejected {
+                seq: 9,
+                reason: InboundRefusal::QueuedCopy
+            }
+        );
+        for admission in [
+            GapAdmission::Bypassed,
+            GapAdmission::Queued,
+            GapAdmission::Overflow,
+            GapAdmission::FirstOverflow,
+        ] {
             assert_eq!(
-                verdict,
-                Some(InboundVerdict::AcceptedAhead {
+                kept_number_verdict(&admission, 9, 5),
+                InboundVerdict::AcceptedAhead {
                     seq: 9,
                     expected: 5
-                })
+                }
             );
-            assert!(verdict.is_some_and(|v| v.is_accepted()));
         }
+    }
+
+    #[test]
+    fn test_sequence_verdict_follows_the_classification() {
+        let sequences = expecting(5);
+        let classify = |seq, poss_dup| classify_inbound(&sequences, seq, || poss_dup);
+        assert_eq!(
+            sequence_verdict(&classify(5, false), 5),
+            InboundVerdict::Accepted { seq: 5 }
+        );
+        assert_eq!(
+            sequence_verdict(&classify(3, true), 3),
+            InboundVerdict::Rejected {
+                seq: 3,
+                reason: InboundRefusal::Duplicate
+            }
+        );
+        assert_eq!(
+            sequence_verdict(&classify(3, false), 3),
+            InboundVerdict::Rejected {
+                seq: 3,
+                reason: InboundRefusal::TooLow { expected: 5 }
+            }
+        );
+        assert_eq!(
+            sequence_verdict(&classify(8, false), 8),
+            InboundVerdict::Deferred {
+                seq: 8,
+                expected: 5
+            }
+        );
+        assert_eq!(released_verdict(8), InboundVerdict::Accepted { seq: 8 });
     }
 
     #[test]
