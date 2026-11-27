@@ -327,21 +327,31 @@ impl PersistedCounters {
     ///
     /// Planning records nothing: a planned write that the driver defers or
     /// drops is planned again next time. The driver calls
-    /// [`record_attempt`](Self::record_attempt) when it starts the call.
+    /// [`record`](Self::record) once the call has a result.
     #[must_use]
     pub fn plan_target(self, next: u64) -> Option<StoreWrite> {
         self.target_to_write(next)?;
         Some(StoreWrite::NextTarget { next })
     }
 
-    /// Records that the driver started `write`, so the counters it carries
-    /// are not written again until they move. Call it when the store call
-    /// starts (under [`StoreFailurePolicy::Continue`] a failed attempt is not
-    /// retried until the counter moves), never when the write is only
-    /// planned. A write that carries no counter records nothing.
-    pub const fn record_attempt(&mut self, write: StoreWrite) {
+    /// Records that `write` was made with `result`, so the counters it
+    /// carries are not written again until they move. Call it once the call
+    /// has a result, never when the write is only planned.
+    ///
+    /// A counter write is recorded whatever its result: under
+    /// [`StoreFailurePolicy::Continue`] a failed one is not retried until the
+    /// counter moves. A combined outbound filing records its sender number
+    /// only when it was [`StoreResult::Written`]: a failed filing may have
+    /// failed before the counter, so the sender number is still due on its
+    /// own (the driver's fallback [`StoreWrite::NextSender`]). A write that
+    /// carries no counter records nothing.
+    pub const fn record(&mut self, write: StoreWrite, result: StoreResult) {
         match write {
-            StoreWrite::OutboundFrame { next_sender, .. } => self.record_sender(next_sender),
+            StoreWrite::OutboundFrame { next_sender, .. } => {
+                if matches!(result, StoreResult::Written) {
+                    self.record_sender(next_sender);
+                }
+            }
             StoreWrite::NextSender { next } => self.record_sender(next),
             StoreWrite::NextTarget { next } => self.record_target(next),
             StoreWrite::Reset {
@@ -506,7 +516,7 @@ mod tests {
             persisted.plan_target(5),
             Some(StoreWrite::NextTarget { next: 5 })
         );
-        persisted.record_attempt(StoreWrite::NextTarget { next: 5 });
+        persisted.record(StoreWrite::NextTarget { next: 5 }, StoreResult::Failed);
         assert_eq!(persisted.plan_target(5), None);
         assert_eq!(
             persisted.plan_target(6),
@@ -525,21 +535,34 @@ mod tests {
     }
 
     #[test]
-    fn test_record_attempt_covers_every_counter_a_write_carries() {
+    fn test_record_covers_every_counter_a_write_carries() {
         let mut persisted = PersistedCounters::new();
-        persisted.record_attempt(StoreWrite::OutboundFrame {
+        let frame = StoreWrite::OutboundFrame {
             seq: 4,
             next_sender: 5,
-        });
+        };
+        // A failed filing may not have reached the counter: still due.
+        persisted.record(frame, StoreResult::Failed);
+        assert_eq!(persisted.sender_to_write(5), Some(5));
+        persisted.record(frame, StoreResult::Written);
         assert_eq!(persisted.sender_to_write(5), None);
-        persisted.record_attempt(StoreWrite::Reset {
-            next_sender: 2,
-            next_target: 3,
-        });
+        // The standalone fallback is recorded whatever its result.
+        persisted.record(StoreWrite::NextSender { next: 6 }, StoreResult::Failed);
+        assert_eq!(persisted.sender_to_write(6), None);
+        persisted.record(
+            StoreWrite::Reset {
+                next_sender: 2,
+                next_target: 3,
+            },
+            StoreResult::Written,
+        );
         assert_eq!(persisted.sender_to_write(2), None);
         assert_eq!(persisted.target_to_write(3), None);
-        persisted.record_attempt(StoreWrite::Refresh);
-        persisted.record_attempt(StoreWrite::AppWatermark { watermark: 9 });
+        persisted.record(StoreWrite::Refresh, StoreResult::Written);
+        persisted.record(
+            StoreWrite::AppWatermark { watermark: 9 },
+            StoreResult::Written,
+        );
         assert_eq!(persisted.target_to_write(3), None);
     }
 
@@ -560,7 +583,7 @@ mod tests {
                 continue;
             };
             let gate = StoreGate::hold(write, seq);
-            persisted.record_attempt(gate.write());
+            persisted.record(gate.write(), result);
             match gate.resolve(StoreFailurePolicy::CloseSession, result) {
                 StoreRelease::Deliver(msg) | StoreRelease::DeliverUnpersisted(msg) => {
                     delivered.push(msg);

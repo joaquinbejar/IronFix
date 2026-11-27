@@ -327,7 +327,8 @@ use ironfix_session::sans_io::{
 };
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_session::{
-    Active, HeartbeatManager, SequenceManager, Session, SessionConfig, TestRequestOutcome,
+    Active, HeartbeatManager, SequenceManager, Session, SessionConfig, StoreResult,
+    TestRequestOutcome,
 };
 use ironfix_store::{MessageStore, StoredMessage};
 use ironfix_tagvalue::{FieldIndex, recycle_field_refs};
@@ -2606,10 +2607,10 @@ async fn persist_target_with(
     let Some(write) = persisted.plan_target(next) else {
         return Ok(());
     };
-    // Recorded as attempted once the call is about to start, not when it was
-    // planned.
-    persisted.record_attempt(write);
-    store.persist_target(session_id, next).await
+    // Recorded once the call has a result, not when it was planned.
+    let result = store.persist_target(session_id, next).await;
+    persisted.record(write, StoreResult::of(&result));
+    result
 }
 
 /// Why an outbound message never reached the transport.
