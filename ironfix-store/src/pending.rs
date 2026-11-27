@@ -55,7 +55,12 @@
 //!   history the store held at construction (every number below its next
 //!   sender number then). A frame in flight, failed, or durable but not
 //!   yet written is never returned, so a resend never replays a frame that
-//!   may still go out under the same number.
+//!   may still go out under the same number. History held at construction
+//!   is readable whether or not an earlier run wrote it to the socket: the
+//!   sent watermark lives in memory only, and after a restart no number
+//!   below the persisted counter is ever sent fresh again (the session
+//!   resumes at the counter), so replaying such a frame as a possible
+//!   duplicate (43=Y) is the only way the peer can receive it.
 //!   [`PendingStore::next_sender_seq`] is the confirmed (durable) counter.
 //! - The target (inbound) counter goes through the same queue:
 //!   [`PendingStore::submit_target`] queues it behind every write submitted
