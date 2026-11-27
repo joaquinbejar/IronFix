@@ -312,7 +312,10 @@ pub const fn sequence_reset_screen_verdict(
             seq,
             reason: InboundRefusal::Exhausted,
         },
-        ResetScreen::FillInSequence { .. } | ResetScreen::Reset => in_sequence_verdict(seq),
+        ResetScreen::FillInSequence { .. } => in_sequence_verdict(seq),
+        // Reset mode has no place in the sequence: its MsgSeqNum is not
+        // counted, so it cannot exhaust the counter.
+        ResetScreen::Reset => InboundVerdict::Accepted { seq },
     };
     Some(verdict)
 }
@@ -678,6 +681,13 @@ mod tests {
         assert_eq!(
             sequence_reset_screen_verdict(&reset, false, 1),
             Some(InboundVerdict::Accepted { seq: 1 })
+        );
+        // Reset mode ignores its MsgSeqNum: even u64::MAX is not exhaustion.
+        let reset = screen_sequence_reset(&sequences, None, u64::MAX, || false);
+        assert_eq!(reset, ResetScreen::Reset);
+        assert_eq!(
+            sequence_reset_screen_verdict(&reset, false, u64::MAX),
+            Some(InboundVerdict::Accepted { seq: u64::MAX })
         );
     }
 

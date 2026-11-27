@@ -66,7 +66,10 @@
 //! message whose number is already queued is rejected as a
 //! [`InboundRefusal::QueuedCopy`], and the one frame deferred into the queue
 //! under a number gets a second verdict, accepted, when it is released in
-//! order, without a second [`FrameObserver::on_inbound`]. An accepted
+//! order, without a second [`FrameObserver::on_inbound`]. A verdict names a
+//! `MsgSeqNum` (34), not a captured frame: when two frames under one number
+//! were both deferred (the first one past the queue's bound), the release
+//! verdict does not say which bytes were kept. An accepted
 //! message can still be answered with a session Reject (3) for its content;
 //! the number is consumed either way.
 //!
