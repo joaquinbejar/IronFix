@@ -48,6 +48,7 @@ use ironfix_core::error::StoreError;
 use ironfix_core::message::MsgType;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 /// Why [`PendingStore::submit`] refused a write.
@@ -130,7 +131,9 @@ pub struct PendingStore<S: SyncMessageStore + 'static> {
     in_flight: usize,
     last_submitted: Option<u64>,
     durable: Option<u64>,
-    failed: bool,
+    /// Set by the worker the moment a write fails, before its outcome is
+    /// collected, so a submit after it is refused at once.
+    failed: Arc<AtomicBool>,
 }
 
 impl<S: SyncMessageStore + 'static> PendingStore<S> {
@@ -145,9 +148,11 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         // sending an outcome.
         let (outcomes, done) = crossbeam_channel::bounded::<Done>(bound.get());
         let worker_store = Arc::clone(&store);
+        let failed = Arc::new(AtomicBool::new(false));
+        let worker_failed = Arc::clone(&failed);
         let worker = std::thread::Builder::new()
             .name("ironfix-store-pending".to_owned())
-            .spawn(move || run_worker(&*worker_store, &job_queue, &outcomes))
+            .spawn(move || run_worker(&*worker_store, &job_queue, &outcomes, &worker_failed))
             .map_err(|err| StoreError::Io(format!("spawn pending store worker: {err}")))?;
         Ok(Self {
             store,
@@ -158,7 +163,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
             in_flight: 0,
             last_submitted: None,
             durable: None,
-            failed: false,
+            failed,
         })
     }
 
@@ -178,7 +183,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         msg_type: &MsgType,
         message: &[u8],
     ) -> Result<Ticket, PendingError> {
-        if self.failed {
+        if self.is_failed() {
             return Err(PendingError::Failed);
         }
         if self.in_flight >= self.bound.get() {
@@ -292,8 +297,8 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
 
     /// Whether a write failed; every later submit is refused.
     #[must_use]
-    pub const fn is_failed(&self) -> bool {
-        self.failed
+    pub fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
     }
 
     /// The inner store, for reads such as a resend's `get_range`. Writing
@@ -305,15 +310,17 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
 
     fn apply(&mut self, done: Done) -> Result<(), StoreError> {
         // `in_flight > 0` whenever an outcome arrives: one per submit.
-        debug_assert!(self.in_flight > 0);
-        self.in_flight = self.in_flight.checked_sub(1).unwrap_or(0);
+        match self.in_flight.checked_sub(1) {
+            Some(n) => self.in_flight = n,
+            None => debug_assert!(false, "outcome with nothing in flight"),
+        }
         match done {
             Done::Filed(seq) => {
                 self.durable = Some(seq);
                 Ok(())
             }
             Done::Failed(err) => {
-                self.failed = true;
+                self.failed.store(true, Ordering::Release);
                 Err(err)
             }
             Done::Skipped => Ok(()),
@@ -321,7 +328,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     }
 
     fn worker_lost(&mut self) -> StoreError {
-        self.failed = true;
+        self.failed.store(true, Ordering::Release);
         self.in_flight = 0;
         StoreError::Io("pending store worker stopped with writes in flight".to_owned())
     }
@@ -344,13 +351,18 @@ impl<S: SyncMessageStore + 'static> std::fmt::Debug for PendingStore<S> {
             .field("bound", &self.bound)
             .field("in_flight", &self.in_flight)
             .field("durable", &self.durable)
-            .field("failed", &self.failed)
+            .field("failed", &self.is_failed())
             .finish_non_exhaustive()
     }
 }
 
 /// Applies the queued writes in order; after a failure, skips the rest.
-fn run_worker<S: SyncMessageStore>(store: &S, jobs: &Receiver<Job>, outcomes: &Sender<Done>) {
+fn run_worker<S: SyncMessageStore>(
+    store: &S,
+    jobs: &Receiver<Job>,
+    outcomes: &Sender<Done>,
+    failed_flag: &AtomicBool,
+) {
     let mut failed = false;
     for job in jobs {
         let done = if failed {
@@ -360,6 +372,9 @@ fn run_worker<S: SyncMessageStore>(store: &S, jobs: &Receiver<Job>, outcomes: &S
                 Ok(()) => Done::Filed(job.seq),
                 Err(err) => {
                     failed = true;
+                    // Published before the outcome, so a submit racing it is
+                    // refused rather than handed a ticket that is skipped.
+                    failed_flag.store(true, Ordering::Release);
                     Done::Failed(err)
                 }
             }
@@ -522,6 +537,24 @@ mod tests {
         // The write queued behind the failure was skipped, not applied.
         assert!(!p.store().inner.contains(3));
         assert_eq!(submit(&mut p, 4), Err(PendingError::Failed));
+    }
+
+    #[test]
+    fn test_pending_store_refuses_a_submit_once_the_worker_failed_before_any_poll() {
+        let (mut p, open) = pending(4, Some(1));
+        assert!(submit(&mut p, 1).is_ok());
+        assert!(open.send(()).is_ok());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !p.is_failed() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(p.is_failed());
+        // No poll has collected the failure, and the queue has room.
+        assert_eq!(submit(&mut p, 2), Err(PendingError::Failed));
+        assert!(matches!(
+            p.poll_durable(),
+            Err(StoreError::StoreFailed { seq_num: 1, .. })
+        ));
     }
 
     #[test]
