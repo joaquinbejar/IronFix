@@ -16,7 +16,9 @@
 //!   [`PendingError::Full`] when the configured bound of in-flight writes
 //!   is reached;
 //! - [`PendingStore::poll_durable`] collects the writes the worker finished
-//!   and reports the highest sequence number now durable.
+//!   and reports the highest sequence number now durable. It never waits on
+//!   the worker: if the worker is publishing an outcome at that instant, the
+//!   poll collects nothing and the next one does.
 //!
 //! The session holds a frame off the wire until its sequence number is
 //! durable, which keeps the engine's write order (file, persist, then
@@ -31,25 +33,30 @@
 //! - "Durable" means what the inner store's `file_outbound` returning `Ok`
 //!   means; for a store that does not sync to disk, that is nothing more
 //!   than "applied".
-//! - The store fails closed: after the first failed write, every write
-//!   still queued is skipped (not applied), the error is returned once by
-//!   [`PendingStore::poll_durable`] or [`PendingStore::drain`], and every
-//!   later submit is refused with [`PendingError::Failed`].
+//! - The store fails closed: the worker publishes a failed write at once,
+//!   so every submit after it is refused with [`PendingError::Failed`]; any
+//!   write already queued behind it is skipped (not applied); the error is
+//!   returned once by [`PendingStore::poll_durable`] or
+//!   [`PendingStore::drain`].
 //! - Dropping a [`PendingStore`] finishes the writes already queued and
 //!   joins the worker, so it blocks for up to the bound times one write.
 //!
-//! Each submit copies the frame into one owned buffer for the worker. Error
-//! values never contain frame bytes: an outbound Logon carries `Password`
-//! (554).
+//! Each submit copies the frame into one owned buffer for the worker; the
+//! queues themselves are reserved up front. Error values never contain frame
+//! bytes or backend text: an outbound Logon carries `Password` (554), and a
+//! custom store may quote the frame, so a failed write is reported with its
+//! sequence number and the kind of error only.
 
 use crate::sync_traits::SyncMessageStore;
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use ironfix_core::error::StoreError;
 use ironfix_core::message::MsgType;
+use parking_lot::{Condvar, Mutex};
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// Why [`PendingStore::submit`] refused a write.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -114,26 +121,63 @@ struct Job {
 enum Done {
     /// `file_outbound` returned `Ok` for this sequence number.
     Filed(u64),
-    /// `file_outbound` failed.
+    /// `file_outbound` failed; the error is already sanitised.
     Failed(StoreError),
     /// Not applied: an earlier write failed.
     Skipped,
 }
 
+/// The worker's input.
+struct Jobs {
+    queue: VecDeque<Job>,
+    /// Set by the caller's drop: finish the queue, then exit.
+    closed: bool,
+}
+
+/// What the caller and the worker share. Every critical section is one push
+/// or one pop; no guard is held across a store call.
+struct Shared {
+    jobs: Mutex<Jobs>,
+    /// Signalled when a job is queued or the queue is closed.
+    job_ready: Condvar,
+    outcomes: Mutex<VecDeque<Done>>,
+    /// Signalled when an outcome is pushed or the worker exits.
+    outcome_ready: Condvar,
+    /// Set by the worker the moment a write fails, before its outcome is
+    /// collected, so a submit after it is refused at once.
+    failed: AtomicBool,
+    /// Set when the worker exits, however it exits, after its last push.
+    stopped: AtomicBool,
+}
+
+/// Marks the worker stopped when it returns or unwinds.
+struct Stopped<'a>(&'a Shared);
+
+impl Drop for Stopped<'_> {
+    fn drop(&mut self) {
+        {
+            // Under the lock, so a drain that saw the queue empty and the
+            // flag clear is already waiting when it is notified.
+            let _outcomes = self.0.outcomes.lock();
+            self.0.stopped.store(true, Ordering::Release);
+        }
+        self.0.outcome_ready.notify_all();
+    }
+}
+
+/// How long [`PendingStore::drain`] waits before re-checking the worker.
+const DRAIN_RECHECK: Duration = Duration::from_millis(50);
+
 /// A [`SyncMessageStore`] whose outbound writes are submitted and polled
 /// rather than called; see the [module docs](self).
 pub struct PendingStore<S: SyncMessageStore + 'static> {
     store: Arc<S>,
-    jobs: Option<Sender<Job>>,
-    done: Receiver<Done>,
+    shared: Arc<Shared>,
     worker: Option<JoinHandle<()>>,
     bound: NonZeroUsize,
     in_flight: usize,
     last_submitted: Option<u64>,
     durable: Option<u64>,
-    /// Set by the worker the moment a write fails, before its outcome is
-    /// collected, so a submit after it is refused at once.
-    failed: Arc<AtomicBool>,
 }
 
 impl<S: SyncMessageStore + 'static> PendingStore<S> {
@@ -143,27 +187,31 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     /// # Errors
     /// [`StoreError::Io`] if the worker thread cannot be spawned.
     pub fn new(store: Arc<S>, bound: NonZeroUsize) -> Result<Self, StoreError> {
-        let (jobs, job_queue) = crossbeam_channel::bounded::<Job>(bound.get());
-        // At most `bound` writes are in flight, so the worker never blocks
-        // sending an outcome.
-        let (outcomes, done) = crossbeam_channel::bounded::<Done>(bound.get());
+        let shared = Arc::new(Shared {
+            jobs: Mutex::new(Jobs {
+                queue: VecDeque::with_capacity(bound.get()),
+                closed: false,
+            }),
+            job_ready: Condvar::new(),
+            outcomes: Mutex::new(VecDeque::with_capacity(bound.get())),
+            outcome_ready: Condvar::new(),
+            failed: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+        });
         let worker_store = Arc::clone(&store);
-        let failed = Arc::new(AtomicBool::new(false));
-        let worker_failed = Arc::clone(&failed);
+        let worker_shared = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
             .name("ironfix-store-pending".to_owned())
-            .spawn(move || run_worker(&*worker_store, &job_queue, &outcomes, &worker_failed))
+            .spawn(move || run_worker(&*worker_store, &worker_shared))
             .map_err(|err| StoreError::Io(format!("spawn pending store worker: {err}")))?;
         Ok(Self {
             store,
-            jobs: Some(jobs),
-            done,
+            shared,
             worker: Some(worker),
             bound,
             in_flight: 0,
             last_submitted: None,
             durable: None,
-            failed,
         })
     }
 
@@ -186,6 +234,9 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         if self.is_failed() {
             return Err(PendingError::Failed);
         }
+        if self.shared.stopped.load(Ordering::Acquire) {
+            return Err(PendingError::Closed);
+        }
         if self.in_flight >= self.bound.get() {
             return Err(PendingError::Full {
                 bound: self.bound.get(),
@@ -199,33 +250,23 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         let Some(next_sender) = seq.checked_add(1) else {
             return Err(PendingError::SequenceExhausted { seq });
         };
-        let Some(jobs) = self.jobs.as_ref() else {
-            return Err(PendingError::Closed);
-        };
         let job = Job {
             seq,
             msg_type: msg_type.clone(),
             message: message.to_vec(),
             next_sender,
         };
-        match jobs.try_send(job) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                // Unreachable while `in_flight` tracks the queue; refuse
-                // rather than block.
-                return Err(PendingError::Full {
-                    bound: self.bound.get(),
-                });
-            }
-            Err(TrySendError::Disconnected(_)) => return Err(PendingError::Closed),
-        }
+        // One push into reserved capacity (`in_flight < bound`); the worker
+        // holds this lock only to pop.
+        self.shared.jobs.lock().queue.push_back(job);
+        self.shared.job_ready.notify_one();
         // `in_flight < bound <= usize::MAX`, checked above.
         self.in_flight += 1;
         self.last_submitted = Some(seq);
         Ok(Ticket { seq })
     }
 
-    /// Collects every write the worker has finished, without blocking.
+    /// Collects the writes the worker has finished, without blocking.
     ///
     /// Returns `Some(seq)` when the durable sequence number advanced to
     /// `seq`, `None` when it did not.
@@ -237,10 +278,20 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     pub fn poll_durable(&mut self) -> Result<Option<u64>, StoreError> {
         let before = self.durable;
         while self.in_flight > 0 {
-            match self.done.try_recv() {
-                Ok(done) => self.apply(done)?,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return Err(self.worker_lost()),
+            // `try_lock`: the worker holds the lock only to push, and a poll
+            // must not wait for it.
+            let (next, stopped) = match self.shared.outcomes.try_lock() {
+                Some(mut outcomes) => (
+                    outcomes.pop_front(),
+                    self.shared.stopped.load(Ordering::Acquire),
+                ),
+                None => break,
+            };
+            match next {
+                Some(done) => self.apply(done)?,
+                // Read under the lock, after the worker's last push: final.
+                None if stopped => return Err(self.worker_lost()),
+                None => break,
             }
         }
         Ok(if self.durable == before {
@@ -259,13 +310,28 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     pub fn drain(&mut self) -> Result<Option<u64>, StoreError> {
         let mut first_error = None;
         while self.in_flight > 0 {
-            match self.done.recv() {
-                Ok(done) => {
+            let next = {
+                let mut outcomes = self.shared.outcomes.lock();
+                loop {
+                    if let Some(done) = outcomes.pop_front() {
+                        break Some(done);
+                    }
+                    if self.shared.stopped.load(Ordering::Acquire) {
+                        break None;
+                    }
+                    let _ = self
+                        .shared
+                        .outcome_ready
+                        .wait_for(&mut outcomes, DRAIN_RECHECK);
+                }
+            };
+            match next {
+                Some(done) => {
                     if let Err(err) = self.apply(done) {
                         first_error.get_or_insert(err);
                     }
                 }
-                Err(_) => {
+                None => {
                     let err = self.worker_lost();
                     first_error.get_or_insert(err);
                 }
@@ -298,7 +364,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     /// Whether a write failed; every later submit is refused.
     #[must_use]
     pub fn is_failed(&self) -> bool {
-        self.failed.load(Ordering::Acquire)
+        self.shared.failed.load(Ordering::Acquire)
     }
 
     /// The inner store, for reads such as a resend's `get_range`. Writing
@@ -320,7 +386,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
                 Ok(())
             }
             Done::Failed(err) => {
-                self.failed.store(true, Ordering::Release);
+                self.shared.failed.store(true, Ordering::Release);
                 Err(err)
             }
             Done::Skipped => Ok(()),
@@ -328,7 +394,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     }
 
     fn worker_lost(&mut self) -> StoreError {
-        self.failed.store(true, Ordering::Release);
+        self.shared.failed.store(true, Ordering::Release);
         self.in_flight = 0;
         StoreError::Io("pending store worker stopped with writes in flight".to_owned())
     }
@@ -336,8 +402,9 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
 
 impl<S: SyncMessageStore + 'static> Drop for PendingStore<S> {
     fn drop(&mut self) {
-        // Closing the queue lets the worker finish what is queued and exit.
-        self.jobs = None;
+        // The worker finishes what is queued, then exits.
+        self.shared.jobs.lock().closed = true;
+        self.shared.job_ready.notify_all();
         if let Some(worker) = self.worker.take() {
             // A worker that panicked has nothing left to finish.
             let _ = worker.join();
@@ -356,15 +423,40 @@ impl<S: SyncMessageStore + 'static> std::fmt::Debug for PendingStore<S> {
     }
 }
 
+/// Replaces a backend error with one that carries no backend text; only
+/// the kind of error and the sequence number survive.
+fn sanitise(seq_num: u64, err: &StoreError) -> StoreError {
+    let kind = match err {
+        StoreError::Timeout { timeout } => return StoreError::Timeout { timeout: *timeout },
+        StoreError::StoreFailed { .. } => "store failed",
+        StoreError::Corrupted { .. } => "store corrupted",
+        StoreError::Io(_) => "i/o error",
+        _ => "store error",
+    };
+    StoreError::StoreFailed {
+        seq_num,
+        reason: format!("inner store write failed ({kind})"),
+    }
+}
+
 /// Applies the queued writes in order; after a failure, skips the rest.
-fn run_worker<S: SyncMessageStore>(
-    store: &S,
-    jobs: &Receiver<Job>,
-    outcomes: &Sender<Done>,
-    failed_flag: &AtomicBool,
-) {
+/// Returns once the caller closed the queue and it is empty.
+fn run_worker<S: SyncMessageStore>(store: &S, shared: &Shared) {
+    let _stopped = Stopped(shared);
     let mut failed = false;
-    for job in jobs {
+    loop {
+        let job = {
+            let mut jobs = shared.jobs.lock();
+            loop {
+                if let Some(job) = jobs.queue.pop_front() {
+                    break job;
+                }
+                if jobs.closed {
+                    return;
+                }
+                shared.job_ready.wait(&mut jobs);
+            }
+        };
         let done = if failed {
             Done::Skipped
         } else {
@@ -372,17 +464,15 @@ fn run_worker<S: SyncMessageStore>(
                 Ok(()) => Done::Filed(job.seq),
                 Err(err) => {
                     failed = true;
-                    // Published before the outcome, so a submit racing it is
+                    // Published before the outcome, so a submit after it is
                     // refused rather than handed a ticket that is skipped.
-                    failed_flag.store(true, Ordering::Release);
-                    Done::Failed(err)
+                    shared.failed.store(true, Ordering::Release);
+                    Done::Failed(sanitise(job.seq, &err))
                 }
             }
         };
-        if outcomes.send(done).is_err() {
-            // The caller is gone; keep applying so queued writes still land.
-            continue;
-        }
+        shared.outcomes.lock().push_back(done);
+        shared.outcome_ready.notify_all();
     }
 }
 
@@ -391,29 +481,27 @@ mod tests {
     use super::*;
     use crate::memory::MemoryStore;
     use crate::stored::StoredMessage;
-    use crossbeam_channel::Receiver as GateReceiver;
-    use std::time::{Duration, Instant, SystemTime};
+    use std::sync::mpsc;
+    use std::time::{Instant, SystemTime};
 
     /// A store whose writes wait for one token each on `gate`, and whose
-    /// `fail_at` write fails.
+    /// `fail_at` write fails with `fail_with`.
     struct GatedStore {
         inner: MemoryStore,
-        gate: Option<GateReceiver<()>>,
+        gate: Option<Mutex<mpsc::Receiver<()>>>,
         fail_at: Option<u64>,
+        fail_with: StoreError,
     }
 
     impl SyncMessageStore for GatedStore {
         fn store(&self, seq: u64, msg_type: &MsgType, message: &[u8]) -> Result<(), StoreError> {
             if let Some(gate) = &self.gate
-                && gate.recv_timeout(Duration::from_secs(5)).is_err()
+                && gate.lock().recv_timeout(Duration::from_secs(5)).is_err()
             {
                 return Err(StoreError::Io("gate timed out".to_owned()));
             }
             if self.fail_at == Some(seq) {
-                return Err(StoreError::StoreFailed {
-                    seq_num: seq,
-                    reason: "injected".to_owned(),
-                });
+                return Err(self.fail_with.clone());
             }
             self.inner.store(seq, msg_type, message)
         }
@@ -447,20 +535,33 @@ mod tests {
         }
     }
 
-    fn pending(
+    fn injected(seq: u64) -> StoreError {
+        StoreError::StoreFailed {
+            seq_num: seq,
+            reason: "injected".to_owned(),
+        }
+    }
+
+    fn pending_with(
         n: usize,
         fail_at: Option<u64>,
-    ) -> (PendingStore<GatedStore>, crossbeam_channel::Sender<()>) {
-        let (open, gate) = crossbeam_channel::unbounded();
+        fail_with: StoreError,
+    ) -> (PendingStore<GatedStore>, mpsc::Sender<()>) {
+        let (open, gate) = mpsc::channel();
         let store = GatedStore {
             inner: MemoryStore::new(),
-            gate: Some(gate),
+            gate: Some(Mutex::new(gate)),
             fail_at,
+            fail_with,
         };
         match PendingStore::new(Arc::new(store), bound(n)) {
             Ok(p) => (p, open),
             Err(err) => panic!("new: {err:?}"),
         }
+    }
+
+    fn pending(n: usize, fail_at: Option<u64>) -> (PendingStore<GatedStore>, mpsc::Sender<()>) {
+        pending_with(n, fail_at, injected(fail_at.unwrap_or(0)))
     }
 
     fn submit(p: &mut PendingStore<GatedStore>, seq: u64) -> Result<Ticket, PendingError> {
@@ -551,10 +652,27 @@ mod tests {
         assert!(p.is_failed());
         // No poll has collected the failure, and the queue has room.
         assert_eq!(submit(&mut p, 2), Err(PendingError::Failed));
+        // The outcome may still be on its way: wait for it.
         assert!(matches!(
-            p.poll_durable(),
+            p.drain(),
             Err(StoreError::StoreFailed { seq_num: 1, .. })
         ));
+    }
+
+    #[test]
+    fn test_pending_store_error_carries_no_backend_text() {
+        let secret = "8=FIX.4.4\x0135=A\x01554=hunter2\x01";
+        let (mut p, open) = pending_with(2, Some(1), StoreError::Io(secret.to_owned()));
+        assert!(submit(&mut p, 1).is_ok());
+        assert!(open.send(()).is_ok());
+        match p.drain() {
+            Err(err @ StoreError::StoreFailed { seq_num: 1, .. }) => {
+                let text = format!("{err} {err:?}");
+                assert!(!text.contains("hunter2"), "leaked: {text}");
+                assert!(text.contains("i/o error"));
+            }
+            other => panic!("expected a sanitised StoreFailed, got {other:?}"),
+        }
     }
 
     #[test]
@@ -579,6 +697,7 @@ mod tests {
             inner: MemoryStore::new(),
             gate: None,
             fail_at: None,
+            fail_with: injected(0),
         });
         let mut p = match PendingStore::new(Arc::clone(&store), bound(8)) {
             Ok(p) => p,

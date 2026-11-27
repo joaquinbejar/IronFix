@@ -17,7 +17,7 @@ async-trait = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 parking_lot.workspace = true
 bytes.workspace = true
-crossbeam-channel.workspace = true
+crossbeam-channel = { workspace = true, optional = true }
 
 [features]
 default = ["async"]
@@ -25,7 +25,7 @@ default = ["async"]
 # and `FileStore`, which pull in `tokio` and `async-trait`. With it off, the
 # crate is `SyncMessageStore` plus `MemoryStore`, and neither crate is in its
 # normal dependency graph (`make check-store-deps`).
-async = ["dep:async-trait", "dep:tokio"]
+async = ["dep:async-trait", "dep:tokio", "dep:crossbeam-channel"]
 
 [dev-dependencies]
 tokio.workspace = true
