@@ -108,6 +108,9 @@ pub enum InboundRefusal {
     /// Above the expectation, and a message with the same number is already
     /// queued above the gap: the copy is dropped.
     QueuedCopy,
+    /// Above the expectation with a body that does not decode: not queued,
+    /// and left to its resend.
+    Malformed,
 }
 
 /// The core's verdict on an inbound frame, relative to sequence handling.
@@ -236,14 +239,15 @@ pub const fn gap_verdict(
     }
 }
 
-/// The verdict on an inbound frame of number `seq` from its sequence
-/// classification alone ([`classify_inbound`](crate::sans_io::classify_inbound)),
-/// for a driver path that classifies without routing: in the engine, a frame
-/// whose header is sound and whose body does not decode. In sequence it is
-/// accepted (its number is consumed; the driver answers it with a session
-/// Reject (3)); above the expectation it is deferred to its resend.
+/// The verdict on a frame of number `seq` whose header is sound and whose
+/// body does not decode, from its sequence classification
+/// ([`classify_inbound`](crate::sans_io::classify_inbound)). In sequence its
+/// number is consumed and the driver answers it with a session Reject (3),
+/// so it is accepted into the sequence. Above the expectation it is never
+/// queued (its body cannot be acted on): it is rejected as
+/// [`InboundRefusal::Malformed`], and its resend gets its own verdict.
 #[must_use]
-pub const fn sequence_verdict(sequence: &InboundSequence, seq: u64) -> InboundVerdict {
+pub const fn malformed_verdict(sequence: &InboundSequence, seq: u64) -> InboundVerdict {
     match *sequence {
         InboundSequence::InSequence => in_sequence_verdict(seq),
         InboundSequence::Duplicate { .. } => InboundVerdict::Rejected {
@@ -254,7 +258,10 @@ pub const fn sequence_verdict(sequence: &InboundSequence, seq: u64) -> InboundVe
             seq,
             reason: InboundRefusal::TooLow { expected },
         },
-        InboundSequence::Gap { expected, .. } => InboundVerdict::Deferred { seq, expected },
+        InboundSequence::Gap { .. } => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::Malformed,
+        },
     }
 }
 
@@ -272,9 +279,11 @@ pub const fn released_verdict(seq: u64) -> InboundVerdict {
 /// `queued_copy` is whether the gap queue already holds a message under
 /// this number: a gapped fill that is such a copy is dropped.
 ///
-/// `None` when the screen lets it reach the application (an in-sequence
-/// GapFill, or Reset mode): its verdict then comes from the application's
-/// answer ([`InboundRefusal::Refused`]) or [`sequence_reset_verdict`].
+/// An in-sequence GapFill, or a Reset (which has no place in the sequence),
+/// reaches the application and is reported accepted before the
+/// application runs; a refusal by the application
+/// ([`InboundRefusal::Refused`]) or by the core
+/// ([`sequence_reset_verdict`]) follows as a second verdict.
 #[must_use]
 pub const fn sequence_reset_screen_verdict(
     screen: &ResetScreen,
@@ -303,23 +312,27 @@ pub const fn sequence_reset_screen_verdict(
             seq,
             reason: InboundRefusal::Exhausted,
         },
-        ResetScreen::FillInSequence { .. } | ResetScreen::Reset => return None,
+        ResetScreen::FillInSequence { .. } | ResetScreen::Reset => in_sequence_verdict(seq),
     };
     Some(verdict)
 }
 
-/// The verdict on a `SequenceReset` (4) of number `seq` from the core's
-/// decision on it ([`decide_sequence_reset`](crate::sans_io::decide_sequence_reset)).
+/// The second verdict on a `SequenceReset` (4) of number `seq`, from the
+/// core's decision on it
+/// ([`decide_sequence_reset`](crate::sans_io::decide_sequence_reset)), made
+/// once the application has accepted it: `None` when it is applied (its
+/// screen verdict already said accepted), a rejection when the core refuses
+/// it.
 #[must_use]
-pub const fn sequence_reset_verdict(decision: &ResetDecision, seq: u64) -> InboundVerdict {
+pub const fn sequence_reset_verdict(decision: &ResetDecision, seq: u64) -> Option<InboundVerdict> {
     match decision {
-        ResetDecision::Apply { .. } => InboundVerdict::Accepted { seq },
+        ResetDecision::Apply { .. } => None,
         ResetDecision::MissingNewSeqNo
         | ResetDecision::FillNotAdvancing { .. }
-        | ResetDecision::ResetBelowExpected { .. } => InboundVerdict::Rejected {
+        | ResetDecision::ResetBelowExpected { .. } => Some(InboundVerdict::Rejected {
             seq,
             reason: InboundRefusal::InvalidSequenceReset,
-        },
+        }),
     }
 }
 
@@ -564,39 +577,39 @@ mod tests {
             Some(exhausted)
         );
         assert_eq!(
-            sequence_verdict(&InboundSequence::InSequence, u64::MAX),
+            malformed_verdict(&InboundSequence::InSequence, u64::MAX),
             exhausted
         );
         assert_eq!(in_sequence_verdict(7), InboundVerdict::Accepted { seq: 7 });
     }
 
     #[test]
-    fn test_sequence_verdict_follows_the_classification() {
+    fn test_malformed_verdict_follows_the_classification() {
         let sequences = expecting(5);
         let classify = |seq, poss_dup| classify_inbound(&sequences, seq, || poss_dup);
         assert_eq!(
-            sequence_verdict(&classify(5, false), 5),
+            malformed_verdict(&classify(5, false), 5),
             InboundVerdict::Accepted { seq: 5 }
         );
         assert_eq!(
-            sequence_verdict(&classify(3, true), 3),
+            malformed_verdict(&classify(3, true), 3),
             InboundVerdict::Rejected {
                 seq: 3,
                 reason: InboundRefusal::Duplicate
             }
         );
         assert_eq!(
-            sequence_verdict(&classify(3, false), 3),
+            malformed_verdict(&classify(3, false), 3),
             InboundVerdict::Rejected {
                 seq: 3,
                 reason: InboundRefusal::TooLow { expected: 5 }
             }
         );
         assert_eq!(
-            sequence_verdict(&classify(8, false), 8),
-            InboundVerdict::Deferred {
+            malformed_verdict(&classify(8, false), 8),
+            InboundVerdict::Rejected {
                 seq: 8,
-                expected: 5
+                reason: InboundRefusal::Malformed
             }
         );
         assert_eq!(released_verdict(8), InboundVerdict::Accepted { seq: 8 });
@@ -657,9 +670,15 @@ mod tests {
             })
         );
         let in_sequence = screen_sequence_reset(&sequences, Some("Y"), 5, || false);
-        assert_eq!(sequence_reset_screen_verdict(&in_sequence, false, 5), None);
+        assert_eq!(
+            sequence_reset_screen_verdict(&in_sequence, false, 5),
+            Some(InboundVerdict::Accepted { seq: 5 })
+        );
         let reset = screen_sequence_reset(&sequences, None, 1, || false);
-        assert_eq!(sequence_reset_screen_verdict(&reset, false, 1), None);
+        assert_eq!(
+            sequence_reset_screen_verdict(&reset, false, 1),
+            Some(InboundVerdict::Accepted { seq: 1 })
+        );
     }
 
     #[test]
@@ -673,7 +692,7 @@ mod tests {
                 },
                 5
             ),
-            InboundVerdict::Accepted { seq: 5 }
+            None
         );
         for decision in [
             ResetDecision::MissingNewSeqNo,
@@ -685,10 +704,10 @@ mod tests {
         ] {
             assert_eq!(
                 sequence_reset_verdict(&decision, 5),
-                InboundVerdict::Rejected {
+                Some(InboundVerdict::Rejected {
                     seq: 5,
                     reason: InboundRefusal::InvalidSequenceReset
-                }
+                })
             );
         }
     }

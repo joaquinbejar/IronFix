@@ -331,8 +331,8 @@ use ironfix_session::{
     TestRequestOutcome,
 };
 use ironfix_session::{
-    InboundRefusal, InboundVerdict, gap_verdict, inbound_verdict, released_verdict,
-    sequence_reset_screen_verdict, sequence_reset_verdict, sequence_verdict,
+    InboundRefusal, InboundVerdict, gap_verdict, inbound_verdict, malformed_verdict,
+    released_verdict, sequence_reset_screen_verdict, sequence_reset_verdict,
 };
 use ironfix_store::{MessageStore, StoredMessage};
 use ironfix_tagvalue::{FieldIndex, recycle_field_refs};
@@ -4287,7 +4287,7 @@ impl<A: Application> Reactor<A> {
                 .await);
         };
         let sequence = classify_inbound(&self.runtime.sequences, seq, || header.poss_dup);
-        self.capture_verdict(sequence_verdict(&sequence, seq));
+        self.capture_verdict(malformed_verdict(&sequence, seq));
         match sequence {
             InboundSequence::InSequence => {
                 tracing::warn!(
@@ -4703,7 +4703,9 @@ impl<A: Application> Reactor<A> {
         let new_seq_no = raw.get_field_str(36).and_then(|s| s.parse::<u64>().ok());
         let expected = self.runtime.sequences.next_target_seq().value();
         let decision = decide_sequence_reset(gap_fill, seq, new_seq_no, expected);
-        self.capture_verdict(sequence_reset_verdict(&decision, seq));
+        if let Some(verdict) = sequence_reset_verdict(&decision, seq) {
+            self.capture_verdict(verdict);
+        }
         let reason = match decision {
             ResetDecision::MissingNewSeqNo => {
                 // Same hazard as the rejection path above: the fill still

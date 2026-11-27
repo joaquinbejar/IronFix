@@ -59,12 +59,16 @@
 //! closes over before routing it (the wrong CompID, a `SendingTime` out of
 //! tolerance, a header without a usable `MsgSeqNum` (34)) and a handshake
 //! frame get no verdict. A frame whose header is sound and whose body does
-//! not decode gets the verdict of its number. Under `GapPolicy::Queue`, an
-//! administrative message whose number is already queued is rejected as a
-//! [`InboundRefusal::QueuedCopy`], and a frame deferred behind a gap gets a
-//! second verdict, accepted, when it is released in order, without a second
-//! [`FrameObserver::on_inbound`]. An accepted message can still be answered with a session Reject
-//! (3) for its content; the number is consumed either way.
+//! not decode gets the verdict of its number; above a gap it is never
+//! queued and is rejected as [`InboundRefusal::Malformed`]. A
+//! `SequenceReset` (4) the application is about to see is reported accepted
+//! before `from_admin` runs. Under `GapPolicy::Queue`, an
+//! message whose number is already queued is rejected as a
+//! [`InboundRefusal::QueuedCopy`], and the one frame deferred into the queue
+//! under a number gets a second verdict, accepted, when it is released in
+//! order, without a second [`FrameObserver::on_inbound`]. An accepted
+//! message can still be answered with a session Reject (3) for its content;
+//! the number is consumed either way.
 //!
 //! # Write results
 //!
