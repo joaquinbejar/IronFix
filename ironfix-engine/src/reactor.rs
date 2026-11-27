@@ -4289,7 +4289,7 @@ impl<A: Application> Reactor<A> {
         };
         let sequence = classify_inbound(&self.runtime.sequences, seq, || header.poss_dup);
         // In sequence, acceptance is reported once the cursor has advanced.
-        if !matches!(sequence, InboundSequence::InSequence) {
+        if !matches!(sequence, InboundSequence::InSequence) || seq == u64::MAX {
             self.capture_verdict(malformed_verdict(&sequence, seq));
         }
         match sequence {
@@ -6017,7 +6017,9 @@ impl<A: Application> Reactor<A> {
         // An in-sequence message is reported accepted only once the receive
         // cursor has advanced past it (persisted, then consumed): a failed
         // target write closes the session without it having been accepted.
-        if !matches!(route, InboundRoute::Admin { .. } | InboundRoute::App)
+        // At u64::MAX the number cannot be consumed: the exhaustion verdict
+        // is reported now, before the session closes on it.
+        if (!matches!(route, InboundRoute::Admin { .. } | InboundRoute::App) || seq == u64::MAX)
             && let Some(verdict) = inbound_verdict(&route, seq)
         {
             self.capture_verdict(verdict);
@@ -6167,10 +6169,8 @@ impl<A: Application> Reactor<A> {
                     .await;
             }
         }
+        // `deliver_app` consumes the number.
         let phase = self.deliver_app(phase, seq, frame).await?;
-        if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
-            return Err(exhausted(phase, err));
-        }
         // In-order progress: reconcile recovery rather than clearing it on
         // the first message back.
         self.note_inbound_progress();
@@ -6341,7 +6341,11 @@ impl<A: Application> Reactor<A> {
         {
             return Err(self.close_on_store_failure(phase, &err));
         }
-        // The cursor includes this message now (issue #223).
+        // The number is consumed once its write landed, before the message
+        // is reported accepted (issue #223) and handed to the dispatcher.
+        if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
+            return Err(exhausted(phase, err));
+        }
         self.capture_verdict(in_sequence_verdict(seq));
         let Some(permit) = permit else {
             return Ok(phase);

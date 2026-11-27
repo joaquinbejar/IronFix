@@ -1741,3 +1741,67 @@ async fn test_release_verdict_names_the_stored_frame() {
         "the release verdict names the stored (smaller) frame"
     );
 }
+
+/// A frame observer reading the session's receive cursor when a verdict
+/// arrives.
+#[derive(Default)]
+struct CursorRecorder {
+    connection: Mutex<Option<Connection>>,
+    seen: Mutex<Vec<(InboundVerdict, u64)>>,
+}
+
+impl FrameObserver for CursorRecorder {
+    fn on_inbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+
+    fn on_outbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, _observation: &Observation<'_>) {
+        if let Some(connection) = locked(&self.connection).as_ref() {
+            locked(&self.seen).push((*verdict, connection.next_target_seq()));
+        }
+    }
+}
+
+/// An accepted message is reported after the receive cursor moved past it,
+/// for an application message as for an administrative one.
+#[tokio::test]
+async fn test_accepted_verdict_follows_the_cursor() {
+    let recorder = Arc::new(CursorRecorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+    *locked(&recorder.connection) = Some(member.clone());
+
+    venue
+        .send(venue_msg(
+            "D",
+            2,
+            &[(11, "IN"), (55, "EUR/USD"), (54, "1"), (38, "1")],
+        ))
+        .await;
+    venue.send(venue_msg("0", 3, &[])).await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "both messages consumed",
+    );
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 4, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+    *locked(&recorder.connection) = None;
+
+    let seen = locked(&recorder.seen).clone();
+    assert_eq!(
+        &seen[..2],
+        &[
+            (InboundVerdict::Accepted { seq: 2 }, 3),
+            (InboundVerdict::Accepted { seq: 3 }, 4),
+        ],
+        "each acceptance is reported with the cursor past it: {seen:?}"
+    );
+}
