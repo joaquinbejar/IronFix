@@ -502,7 +502,11 @@ around it.
   surface without `tokio` or `async-trait`; its default `async` feature
   carries `MessageStore`, `SyncStoreAdapter` and `FileStore` (#221). The
   fail-closed store policy is in that core too
-  (`ironfix_session::StoreFailurePolicy` and `StoreGate`, #224). A
+  (`ironfix_session::StoreFailurePolicy` and `StoreGate`, #224).
+  `PendingStore` wraps any `SyncMessageStore` in a bounded submit/poll form
+  (`submit` returns a `Ticket` or `PendingError::Full`; `poll_durable`
+  reports the highest durable sequence number without blocking; #222). It
+  is not wired into either engine. A
   driver without Tokio is shown, not shipped: `fix44_poll_client` is a
   single-threaded, poll-driven FIX 4.4 initiator over non-blocking
   `std::net` sockets, built on those pieces in the example crate, and
