@@ -553,9 +553,15 @@ impl Capture {
 
     /// Forgets the kept ids below `seq`: numbers dropped unconsumed.
     pub(crate) fn forget_kept_below(&self, seq: u64) {
+        // In place, from the front: no allocation, and nothing to do when
+        // no id is below `seq`.
         let mut kept = self.kept_ids();
-        let rest = kept.split_off(&seq);
-        *kept = rest;
+        while let Some(entry) = kept.first_entry() {
+            if *entry.key() >= seq {
+                break;
+            }
+            entry.remove();
+        }
     }
 
     /// The kept ids. The lock is held for one map operation and never

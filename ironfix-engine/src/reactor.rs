@@ -332,7 +332,7 @@ use ironfix_session::{
 };
 use ironfix_session::{
     InboundRefusal, InboundVerdict, gap_verdict, in_sequence_verdict, inbound_verdict,
-    malformed_verdict, released_verdict, sequence_reset_screen_verdict, sequence_reset_verdict,
+    malformed_verdict, sequence_reset_screen_verdict, sequence_reset_verdict,
 };
 use ironfix_store::{MessageStore, StoredMessage};
 use ironfix_tagvalue::{FieldIndex, recycle_field_refs};
@@ -4289,7 +4289,7 @@ impl<A: Application> Reactor<A> {
         };
         let sequence = classify_inbound(&self.runtime.sequences, seq, || header.poss_dup);
         // In sequence, acceptance is reported once the cursor has advanced.
-        if !matches!(sequence, InboundSequence::InSequence) || seq == u64::MAX {
+        if !matches!(sequence, InboundSequence::InSequence) {
             self.capture_verdict(malformed_verdict(&sequence, seq));
         }
         match sequence {
@@ -4301,6 +4301,8 @@ impl<A: Application> Reactor<A> {
                     "rejecting a message whose body does not decode: MsgSeqNum consumed"
                 );
                 let Some(next) = seq.checked_add(1) else {
+                    // The exhaustion is what stops this frame: report it (issue #223).
+                    self.capture_verdict(in_sequence_verdict(seq));
                     return Err(exhausted(
                         phase,
                         SequenceExhausted {
@@ -5611,7 +5613,9 @@ impl<A: Application> Reactor<A> {
                 return Ok(phase);
             };
             // Kept numbers the expectation moved past were dropped unconsumed.
-            if let Some(capture) = &self.writer.capture {
+            if ready.superseded > 0
+                && let Some(capture) = &self.writer.capture
+            {
                 capture.forget_kept_below(expected);
             }
             if ready.superseded > 0 {
@@ -5668,12 +5672,6 @@ impl<A: Application> Reactor<A> {
             return self
                 .on_sequence_reset(framed, phase, &raw, seq, frame)
                 .await;
-        }
-        // At u64::MAX the released number cannot be consumed: its exhaustion
-        // verdict is reported before the session closes on it, as for a
-        // fresh frame.
-        if seq == u64::MAX {
-            self.capture_verdict(released_verdict(seq));
         }
         self.on_app_in_sequence(framed, phase, &raw, seq, frame)
             .await
@@ -6057,9 +6055,7 @@ impl<A: Application> Reactor<A> {
         // An in-sequence message is reported accepted only once the receive
         // cursor has advanced past it (persisted, then consumed): a failed
         // target write closes the session without it having been accepted.
-        // At u64::MAX the number cannot be consumed: the exhaustion verdict
-        // is reported now, before the session closes on it.
-        if (!matches!(route, InboundRoute::Admin { .. } | InboundRoute::App) || seq == u64::MAX)
+        if !matches!(route, InboundRoute::Admin { .. } | InboundRoute::App)
             && let Some(verdict) = inbound_verdict(&route, seq)
         {
             self.capture_verdict(verdict);
@@ -6280,6 +6276,8 @@ impl<A: Application> Reactor<A> {
     /// [`StoreFailurePolicy::CloseSession`].
     async fn consume_rejected(&mut self, phase: Phase, seq: u64) -> Result<Phase, SessionClosed> {
         let Some(next) = seq.checked_add(1) else {
+            // The exhaustion is what stops this frame: report it (issue #223).
+            self.capture_verdict(in_sequence_verdict(seq));
             return Err(exhausted(
                 phase,
                 SequenceExhausted {
@@ -6374,6 +6372,8 @@ impl<A: Application> Reactor<A> {
             })
         };
         let Some(next) = seq.checked_add(1) else {
+            // The exhaustion is what stops this frame: report it (issue #223).
+            self.capture_verdict(in_sequence_verdict(seq));
             return Err(exhausted(
                 phase,
                 SequenceExhausted {
