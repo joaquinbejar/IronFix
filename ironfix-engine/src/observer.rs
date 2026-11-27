@@ -51,7 +51,11 @@
 //! sequence, accepted ahead of a gap (an administrative message inside it),
 //! deferred behind a gap, or rejected with an [`InboundRefusal`] (a
 //! duplicate, a number too low, an exhausted counter, a refused
-//! `SequenceReset` (4), or one `from_admin` refused). A frame the session
+//! `SequenceReset` (4), or one `from_admin` refused). An administrative
+//! message `from_admin` refuses gets its routing verdict first and then
+//! [`InboundRefusal::Refused`]: its number is consumed as routed, the
+//! message is not acted on. A frame above the expectation gets its verdict
+//! before the gap is requested. A frame the session
 //! closes over before routing it (the wrong CompID, a `SendingTime` out of
 //! tolerance, a header without a usable `MsgSeqNum` (34)) and a handshake
 //! frame get no verdict. A frame whose header is sound and whose body does

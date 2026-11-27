@@ -331,7 +331,7 @@ use ironfix_session::{
     TestRequestOutcome,
 };
 use ironfix_session::{
-    InboundRefusal, InboundVerdict, inbound_verdict, kept_number_verdict, released_verdict,
+    InboundRefusal, InboundVerdict, gap_verdict, inbound_verdict, released_verdict,
     sequence_reset_screen_verdict, sequence_reset_verdict, sequence_verdict,
 };
 use ironfix_store::{MessageStore, StoredMessage};
@@ -4601,7 +4601,8 @@ impl<A: Application> Reactor<A> {
             screen_sequence_reset(&self.runtime.sequences, raw.get_field_str(123), seq, || {
                 raw.get_field_str(43) == Some("Y")
             });
-        if let Some(verdict) = sequence_reset_screen_verdict(&screen, seq) {
+        let queued_copy = self.core.gap_copy_queued(&phase, seq);
+        if let Some(verdict) = sequence_reset_screen_verdict(&screen, queued_copy, seq) {
             self.capture_verdict(verdict);
         }
         let gap_fill = match screen {
@@ -5662,22 +5663,15 @@ impl<A: Application> Reactor<A> {
     /// on a number an application message already claimed does not run. An
     /// overflow returns `false`: the message is acted on as under `Discard`.
     fn queue_gapped(&mut self, phase: &Phase, seq: u64, entry: GapEntry<Bytes>) -> bool {
-        self.admit_gapped(phase, seq, entry) == GapAdmission::Duplicate
-    }
-
-    /// The gap queue's admission of a message above the expectation, logged:
-    /// [`Reactor::queue_gapped`] with the core's answer kept, for the capture
-    /// verdict of a kept number.
-    fn admit_gapped(&mut self, phase: &Phase, seq: u64, entry: GapEntry<Bytes>) -> GapAdmission {
-        let admission = self.core.queue_gapped(phase, seq, entry);
-        match admission {
-            GapAdmission::Bypassed | GapAdmission::Queued | GapAdmission::Overflow => {}
+        match self.core.queue_gapped(phase, seq, entry) {
+            GapAdmission::Bypassed | GapAdmission::Queued | GapAdmission::Overflow => false,
             GapAdmission::Duplicate => {
                 tracing::debug!(
                     session = %self.session_id,
                     seq,
                     "a message with this number is already queued above the gap: dropping the copy"
                 );
+                true
             }
             GapAdmission::FirstOverflow => {
                 tracing::warn!(
@@ -5686,9 +5680,9 @@ impl<A: Application> Reactor<A> {
                     "the gap queue is full: discarding further messages above the gap until \
                      it drains; the resend delivers them"
                 );
+                false
             }
         }
-        admission
     }
 
     /// Drops every queued message, logging why when there were any.
@@ -6037,6 +6031,10 @@ impl<A: Application> Reactor<A> {
                 received,
                 then,
             } => {
+                // Reported before the gap is requested, from the queue as it
+                // stands (issue #223).
+                let queued_copy = self.core.gap_copy_queued(&phase, seq);
+                self.capture_verdict(gap_verdict(then, queued_copy, seq, expected));
                 let phase = self
                     .request_resend(framed, phase, expected, received)
                     .await?;
@@ -6053,9 +6051,7 @@ impl<A: Application> Reactor<A> {
                     // kept to be consumed in turn. A copy of a number
                     // already held is dropped, not acted on a second time.
                     GapDisposition::KeepNumber => {
-                        let admission = self.admit_gapped(&phase, seq, GapEntry::Processed);
-                        self.capture_verdict(kept_number_verdict(&admission, seq, expected));
-                        if admission == GapAdmission::Duplicate {
+                        if self.queue_gapped(&phase, seq, GapEntry::Processed) {
                             return Ok(phase);
                         }
                         self.dispatch_admin(framed, phase, &raw, seq).await
@@ -6331,6 +6327,11 @@ impl<A: Application> Reactor<A> {
     ) -> Result<Phase, SessionClosed> {
         let msg_type = raw.msg_type();
         if let Err(reason) = self.application.from_admin(raw, &self.session_id).await {
+            // The number is consumed as routed; the message is not acted on.
+            self.capture_verdict(InboundVerdict::Rejected {
+                seq,
+                reason: InboundRefusal::Refused,
+            });
             return self
                 .send_session_reject(framed, phase, seq, msg_type.as_str(), &reason)
                 .await;

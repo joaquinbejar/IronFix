@@ -37,9 +37,7 @@
 
 use std::time::Instant;
 
-use crate::sans_io::{
-    GapAdmission, GapDisposition, InboundRoute, InboundSequence, ResetDecision, ResetScreen,
-};
+use crate::sans_io::{GapDisposition, InboundRoute, InboundSequence, ResetDecision, ResetScreen};
 
 /// Which way a frame travels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -167,21 +165,33 @@ impl InboundVerdict {
     }
 }
 
+/// The verdict on an in-sequence frame of number `seq`: accepted, unless
+/// `seq` is `u64::MAX`, past which the next inbound number cannot be
+/// counted and the session ends.
+#[must_use]
+pub const fn in_sequence_verdict(seq: u64) -> InboundVerdict {
+    match seq.checked_add(1) {
+        Some(_) => InboundVerdict::Accepted { seq },
+        None => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::Exhausted,
+        },
+    }
+}
+
 /// The verdict on an inbound frame of number `seq` the core routed as
 /// `route` ([`route_inbound`](crate::sans_io::route_inbound)).
 ///
 /// `None` for a `SequenceReset` (4): it has its own rules, and its verdict
 /// comes from [`sequence_reset_screen_verdict`] and, once the application
-/// has seen it, [`sequence_reset_verdict`]. `None` too for an administrative
-/// message inside a gap whose number the gap queue keeps
-/// ([`GapDisposition::KeepNumber`]): a copy of a number already queued is
-/// not acted on, so its verdict comes from [`kept_number_verdict`] once the
-/// queue has admitted it or not.
+/// has seen it, [`sequence_reset_verdict`]. `None` too for a frame above the
+/// expectation: whether it is acted on, queued or dropped as a copy depends
+/// on the gap queue, so its verdict comes from [`gap_verdict`].
 #[must_use]
 pub const fn inbound_verdict(route: &InboundRoute, seq: u64) -> Option<InboundVerdict> {
     let verdict = match *route {
-        InboundRoute::SequenceReset => return None,
-        InboundRoute::Admin { .. } | InboundRoute::App => InboundVerdict::Accepted { seq },
+        InboundRoute::SequenceReset | InboundRoute::Gap { .. } => return None,
+        InboundRoute::Admin { .. } | InboundRoute::App => in_sequence_verdict(seq),
         InboundRoute::Duplicate => InboundVerdict::Rejected {
             seq,
             reason: InboundRefusal::Duplicate,
@@ -194,35 +204,35 @@ pub const fn inbound_verdict(route: &InboundRoute, seq: u64) -> Option<InboundVe
             seq,
             reason: InboundRefusal::Exhausted,
         },
-        InboundRoute::Gap { expected, then, .. } => match then {
-            GapDisposition::QueueFrame => InboundVerdict::Deferred { seq, expected },
-            GapDisposition::Dispatch => InboundVerdict::AcceptedAhead { seq, expected },
-            // Whether it is acted on depends on the gap queue's admission.
-            GapDisposition::KeepNumber => return None,
-        },
     };
     Some(verdict)
 }
 
-/// The verdict on an administrative message of number `seq` inside a gap
-/// starting at `expected`, once the gap queue has answered `admission` for
-/// its number ([`GapDisposition::KeepNumber`]): a copy of a number already
-/// queued is dropped, anything else is acted on now.
+/// The verdict on a frame of number `seq` above the expectation `expected`,
+/// handled as `then` says, reported before the gap is requested.
+///
+/// `queued_copy` is whether the gap queue already holds a message under
+/// this number ([`SessionCore::gap_copy_queued`](crate::SessionCore::gap_copy_queued)):
+/// such a copy is dropped, unless it is a Logout, which is acted on and
+/// empties the queue. Otherwise an application message is deferred to its
+/// resend, and an administrative message is acted on ahead of the gap.
 #[must_use]
-pub const fn kept_number_verdict(
-    admission: &GapAdmission,
+pub const fn gap_verdict(
+    then: GapDisposition,
+    queued_copy: bool,
     seq: u64,
     expected: u64,
 ) -> InboundVerdict {
-    match admission {
-        GapAdmission::Duplicate => InboundVerdict::Rejected {
-            seq,
-            reason: InboundRefusal::QueuedCopy,
-        },
-        GapAdmission::Bypassed
-        | GapAdmission::Queued
-        | GapAdmission::Overflow
-        | GapAdmission::FirstOverflow => InboundVerdict::AcceptedAhead { seq, expected },
+    match then {
+        GapDisposition::Dispatch => InboundVerdict::AcceptedAhead { seq, expected },
+        GapDisposition::QueueFrame | GapDisposition::KeepNumber if queued_copy => {
+            InboundVerdict::Rejected {
+                seq,
+                reason: InboundRefusal::QueuedCopy,
+            }
+        }
+        GapDisposition::QueueFrame => InboundVerdict::Deferred { seq, expected },
+        GapDisposition::KeepNumber => InboundVerdict::AcceptedAhead { seq, expected },
     }
 }
 
@@ -235,7 +245,7 @@ pub const fn kept_number_verdict(
 #[must_use]
 pub const fn sequence_verdict(sequence: &InboundSequence, seq: u64) -> InboundVerdict {
     match *sequence {
-        InboundSequence::InSequence => InboundVerdict::Accepted { seq },
+        InboundSequence::InSequence => in_sequence_verdict(seq),
         InboundSequence::Duplicate { .. } => InboundVerdict::Rejected {
             seq,
             reason: InboundRefusal::Duplicate,
@@ -254,11 +264,13 @@ pub const fn sequence_verdict(sequence: &InboundSequence, seq: u64) -> InboundVe
 /// without the frame being framed again.
 #[must_use]
 pub const fn released_verdict(seq: u64) -> InboundVerdict {
-    InboundVerdict::Accepted { seq }
+    in_sequence_verdict(seq)
 }
 
 /// The verdict on a `SequenceReset` (4) of number `seq` from its screen
 /// ([`screen_sequence_reset`](crate::sans_io::screen_sequence_reset)).
+/// `queued_copy` is whether the gap queue already holds a message under
+/// this number: a gapped fill that is such a copy is dropped.
 ///
 /// `None` when the screen lets it reach the application (an in-sequence
 /// GapFill, or Reset mode): its verdict then comes from the application's
@@ -266,9 +278,14 @@ pub const fn released_verdict(seq: u64) -> InboundVerdict {
 #[must_use]
 pub const fn sequence_reset_screen_verdict(
     screen: &ResetScreen,
+    queued_copy: bool,
     seq: u64,
 ) -> Option<InboundVerdict> {
     let verdict = match *screen {
+        ResetScreen::GappedFill { .. } if queued_copy => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::QueuedCopy,
+        },
         ResetScreen::BadGapFillFlag => InboundVerdict::Rejected {
             seq,
             reason: InboundRefusal::InvalidSequenceReset,
@@ -485,54 +502,72 @@ mod tests {
     }
 
     #[test]
-    fn test_gapped_messages_are_deferred_or_accepted_ahead() {
+    fn test_gapped_messages_wait_for_the_gap_verdict() {
         let sequences = expecting(5);
-        let route = route_inbound(&sequences, &MsgType::NewOrderSingle, 9, || false);
-        assert_eq!(
-            inbound_verdict(&route, 9),
-            Some(InboundVerdict::Deferred {
-                seq: 9,
-                expected: 5
-            })
-        );
-        let route = route_inbound(&sequences, &MsgType::Logout, 9, || false);
-        let verdict = inbound_verdict(&route, 9);
-        assert_eq!(
-            verdict,
-            Some(InboundVerdict::AcceptedAhead {
-                seq: 9,
-                expected: 5
-            })
-        );
-        assert!(verdict.is_some_and(|v| v.is_accepted()));
-        // A kept number waits for the gap queue's admission.
-        let route = route_inbound(&sequences, &MsgType::Heartbeat, 9, || false);
-        assert_eq!(inbound_verdict(&route, 9), None);
+        for msg_type in [MsgType::NewOrderSingle, MsgType::Heartbeat, MsgType::Logout] {
+            let route = route_inbound(&sequences, &msg_type, 9, || false);
+            assert!(matches!(route, InboundRoute::Gap { .. }));
+            assert_eq!(inbound_verdict(&route, 9), None);
+        }
     }
 
     #[test]
-    fn test_kept_number_verdict_drops_a_queued_copy() {
+    fn test_gap_verdict_defers_accepts_ahead_or_drops_a_copy() {
         assert_eq!(
-            kept_number_verdict(&GapAdmission::Duplicate, 9, 5),
-            InboundVerdict::Rejected {
+            gap_verdict(GapDisposition::QueueFrame, false, 9, 5),
+            InboundVerdict::Deferred {
                 seq: 9,
-                reason: InboundRefusal::QueuedCopy
+                expected: 5
             }
         );
-        for admission in [
-            GapAdmission::Bypassed,
-            GapAdmission::Queued,
-            GapAdmission::Overflow,
-            GapAdmission::FirstOverflow,
-        ] {
+        let ahead = gap_verdict(GapDisposition::KeepNumber, false, 9, 5);
+        assert_eq!(
+            ahead,
+            InboundVerdict::AcceptedAhead {
+                seq: 9,
+                expected: 5
+            }
+        );
+        assert!(ahead.is_accepted());
+        for then in [GapDisposition::QueueFrame, GapDisposition::KeepNumber] {
             assert_eq!(
-                kept_number_verdict(&admission, 9, 5),
+                gap_verdict(then, true, 9, 5),
+                InboundVerdict::Rejected {
+                    seq: 9,
+                    reason: InboundRefusal::QueuedCopy
+                }
+            );
+        }
+        // A Logout is acted on even over a queued number: it empties the
+        // queue.
+        for copy in [false, true] {
+            assert_eq!(
+                gap_verdict(GapDisposition::Dispatch, copy, 9, 5),
                 InboundVerdict::AcceptedAhead {
                     seq: 9,
                     expected: 5
                 }
             );
         }
+    }
+
+    #[test]
+    fn test_in_sequence_at_the_last_number_is_exhausted() {
+        let exhausted = InboundVerdict::Rejected {
+            seq: u64::MAX,
+            reason: InboundRefusal::Exhausted,
+        };
+        assert_eq!(in_sequence_verdict(u64::MAX), exhausted);
+        assert_eq!(released_verdict(u64::MAX), exhausted);
+        assert_eq!(
+            inbound_verdict(&InboundRoute::App, u64::MAX),
+            Some(exhausted)
+        );
+        assert_eq!(
+            sequence_verdict(&InboundSequence::InSequence, u64::MAX),
+            exhausted
+        );
+        assert_eq!(in_sequence_verdict(7), InboundVerdict::Accepted { seq: 7 });
     }
 
     #[test]
@@ -584,15 +619,22 @@ mod tests {
         let sequences = expecting(5);
         let gapped = screen_sequence_reset(&sequences, Some("Y"), 9, || false);
         assert_eq!(
-            sequence_reset_screen_verdict(&gapped, 9),
+            sequence_reset_screen_verdict(&gapped, false, 9),
             Some(InboundVerdict::Deferred {
                 seq: 9,
                 expected: 5
             })
         );
+        assert_eq!(
+            sequence_reset_screen_verdict(&gapped, true, 9),
+            Some(InboundVerdict::Rejected {
+                seq: 9,
+                reason: InboundRefusal::QueuedCopy
+            })
+        );
         let bad = screen_sequence_reset(&sequences, Some("X"), 5, || false);
         assert_eq!(
-            sequence_reset_screen_verdict(&bad, 5),
+            sequence_reset_screen_verdict(&bad, false, 5),
             Some(InboundVerdict::Rejected {
                 seq: 5,
                 reason: InboundRefusal::InvalidSequenceReset
@@ -600,7 +642,7 @@ mod tests {
         );
         let duplicate = screen_sequence_reset(&sequences, Some("Y"), 3, || true);
         assert_eq!(
-            sequence_reset_screen_verdict(&duplicate, 3),
+            sequence_reset_screen_verdict(&duplicate, false, 3),
             Some(InboundVerdict::Rejected {
                 seq: 3,
                 reason: InboundRefusal::Duplicate
@@ -608,16 +650,16 @@ mod tests {
         );
         let too_low = screen_sequence_reset(&sequences, Some("Y"), 3, || false);
         assert_eq!(
-            sequence_reset_screen_verdict(&too_low, 3),
+            sequence_reset_screen_verdict(&too_low, false, 3),
             Some(InboundVerdict::Rejected {
                 seq: 3,
                 reason: InboundRefusal::TooLow { expected: 5 }
             })
         );
         let in_sequence = screen_sequence_reset(&sequences, Some("Y"), 5, || false);
-        assert_eq!(sequence_reset_screen_verdict(&in_sequence, 5), None);
+        assert_eq!(sequence_reset_screen_verdict(&in_sequence, false, 5), None);
         let reset = screen_sequence_reset(&sequences, None, 1, || false);
-        assert_eq!(sequence_reset_screen_verdict(&reset, 1), None);
+        assert_eq!(sequence_reset_screen_verdict(&reset, false, 1), None);
     }
 
     #[test]

@@ -86,9 +86,9 @@ mod store_policy;
 mod throttle;
 
 pub use capture::{
-    CapturePoint, FrameCapture, InboundRefusal, InboundVerdict, WriteClass, inbound_verdict,
-    kept_number_verdict, released_verdict, sequence_reset_screen_verdict, sequence_reset_verdict,
-    sequence_verdict,
+    CapturePoint, FrameCapture, InboundRefusal, InboundVerdict, WriteClass, gap_verdict,
+    in_sequence_verdict, inbound_verdict, released_verdict, sequence_reset_screen_verdict,
+    sequence_reset_verdict, sequence_verdict,
 };
 pub use config::{
     GapPolicy, GarbledFrameLimit, SessionConfig, SessionConfigBuilder, SessionConfigError,

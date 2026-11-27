@@ -225,6 +225,12 @@ impl<P: SessionPayloads> GapQueue<P> {
         self.entries.is_empty()
     }
 
+    /// Whether a message numbered `seq` is held.
+    #[must_use]
+    pub(crate) fn holds(&self, seq: u64) -> bool {
+        self.entries.contains_key(&seq)
+    }
+
     /// How many messages are held.
     #[must_use]
     pub(crate) fn len(&self) -> usize {

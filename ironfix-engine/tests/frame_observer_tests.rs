@@ -1397,6 +1397,15 @@ async fn test_observer_receives_the_core_verdicts() {
     venue
         .send(venue_msg("4", 3, &[(123, "Y"), (36, "6")]))
         .await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 6 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the fill moves the expectation to 6",
+    );
 
     ok(member.logout().await, "the member logs out");
     while header(&venue.next().await).0 != "5" {}
@@ -1466,13 +1475,31 @@ async fn test_observer_verdicts_under_the_gap_queue() {
         ))
         .await;
     assert_eq!(header(&venue.next().await).0, "2");
+    // A copy of 3: dropped, the queued one stays.
+    venue
+        .send(venue_msg(
+            "D",
+            3,
+            &[(11, "QUEUED"), (55, "EUR/USD"), (54, "1"), (38, "1")],
+        ))
+        .await;
     // A TestRequest at 4 is answered and its number kept; then a copy.
     venue.send(venue_msg("1", 4, &[(112, "T-1")])).await;
-    assert_eq!(header(&venue.next().await).0, "0");
+    while header(&venue.next().await).0 != "0" {}
     venue.send(venue_msg("1", 4, &[(112, "T-1")])).await;
     venue
         .send(venue_msg("4", 2, &[(123, "Y"), (36, "3")]))
         .await;
+    // The fill releases 3, then consumes the kept 4.
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 5 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the queue is released up to 5",
+    );
 
     ok(member.logout().await, "the member logs out");
     while header(&venue.next().await).0 != "5" {}
@@ -1489,6 +1516,10 @@ async fn test_observer_verdicts_under_the_gap_queue() {
             InboundVerdict::Deferred {
                 seq: 3,
                 expected: 2
+            },
+            InboundVerdict::Rejected {
+                seq: 3,
+                reason: InboundRefusal::QueuedCopy
             },
             InboundVerdict::AcceptedAhead {
                 seq: 4,
