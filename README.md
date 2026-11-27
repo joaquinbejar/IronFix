@@ -631,10 +631,15 @@ ironfix-engine = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 ```
 
-IronFix depends on `chrono` without its default features (only `std` and
-`serde`), so it never turns on chrono's `clock`, `now` or `wasmbind` in your
-build. An application that wants `Utc::now()` enables `clock` on its own
-`chrono` dependency.
+IronFix does not depend on `chrono` by default (issue #225,
+RUSTSEC-2026-0543): `Timestamp` has its own calendar, with civil accessors
+(`year`, `month`, `day`, `hour`, `minute`, `second`, `nanosecond`,
+`iso_weekday`), a checked `Timestamp::from_utc_ymd_hms_nanos`, Unix second
+conversions and the FIX UTCTimestamp formatters, all cross-checked against
+chrono in the tests. The off-by-default `chrono` feature of `ironfix-core`
+adds `Timestamp::to_datetime` and `TryFrom<chrono::DateTime<Utc>>`; it pulls
+`chrono` without its default features (only `std` and `serde`), so it never
+turns on chrono's `clock`, `now` or `wasmbind` in your build.
 
 ## Quick Start
 

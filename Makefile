@@ -187,17 +187,37 @@ check-fixp-deps:
 # ironfix-core only uses chrono's types, so the workspace declares chrono
 # without default features; Cargo unifies features across a build, so a
 # `clock` here would reach every application that depends on IronFix.
-CHRONO_FORBIDDEN := ^chrono feature "(default|clock|now|wasmbind|oldtime|iana-time-zone|winapi|js-sys|wasm-bindgen)"
+# Issue #225: and none has chrono in its normal graph unless ironfix-core's
+# `chrono` feature is asked for.
+CHRONO_FREE_PACKAGES := ironfix-core ironfix-derive ironfix-tagvalue ironfix-dictionary ironfix-store ironfix-session ironfix-transport ironfix-fast ironfix-codegen ironfix-engine ironfix-sofh ironfix-fixp ironfix-example ironfix-codegen-check
+CHRONO_FORBIDDEN :=^chrono feature "(default|clock|now|wasmbind|oldtime|iana-time-zone|winapi|js-sys|wasm-bindgen)"
 .PHONY: check-chrono-features
 check-chrono-features:
-	@for args in "-p ironfix-core" "-p ironfix-engine" "-p ironfix-engine --all-features"; do \
-		if cargo tree $$args -e features -i chrono --prefix none | grep -Eq '$(CHRONO_FORBIDDEN)'; then \
+	@for args in "-p ironfix-core" "-p ironfix-core --features chrono" "-p ironfix-engine" "-p ironfix-engine --all-features"; do \
+		tree=$$(cargo tree $$args -e features --prefix none) \
+			|| { echo "check-chrono-features: cargo tree $$args failed"; exit 1; }; \
+		if printf '%s\n' "$$tree" | grep -Eq '$(CHRONO_FORBIDDEN)'; then \
 			echo "check-chrono-features: cargo tree $$args enables a chrono feature that reads the wall clock or targets wasm:"; \
-			cargo tree $$args -e features -i chrono --prefix none | grep -E '$(CHRONO_FORBIDDEN)' | sort -u; \
+			printf '%s\n' "$$tree" | grep -E '$(CHRONO_FORBIDDEN)' | sort -u; \
 			exit 1; \
 		fi; \
 	done
+	@cargo tree -p ironfix-core --features chrono -e normal --prefix none | grep -Eq '^chrono ' \
+		|| { echo "check-chrono-features: ironfix-core's chrono feature does not pull chrono, so the feature check inspected nothing"; exit 1; }
 	@echo "check-chrono-features: chrono's clock, now, wasmbind and oldtime are off for ironfix-core and ironfix-engine."
+	@# Issue #225 (RUSTSEC-2026-0543): with default features no ironfix crate
+	@# has chrono in its normal graph; it is only a dev-dependency and the
+	@# opt-in `chrono` feature of ironfix-core.
+	@for pkg in $(CHRONO_FREE_PACKAGES); do \
+		tree=$$(cargo tree -p $$pkg -e normal --prefix none) \
+			|| { echo "check-chrono-features: cargo tree -p $$pkg failed"; exit 1; }; \
+		if printf '%s\n' "$$tree" | grep -Eq '^chrono '; then \
+			echo "check-chrono-features: $$pkg has chrono in its default normal dependency graph:"; \
+			cargo tree -p $$pkg -e normal -i chrono; \
+			exit 1; \
+		fi; \
+	done
+	@echo "check-chrono-features: no ironfix crate has chrono in its default normal graph."
 
 # Format the code
 .PHONY: fmt

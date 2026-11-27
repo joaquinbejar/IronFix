@@ -466,6 +466,19 @@ pub enum TimestampError {
         /// Whole seconds from the Unix epoch, negative before 1970.
         seconds: i64,
     },
+
+    /// A civil (calendar or clock) field is outside its range: a month
+    /// outside `1..=12`, a day past the month's last, an hour past 23, a
+    /// minute past 59, a second past 59 (60 only at `23:59:60`, a leap
+    /// second), or nanoseconds past 999_999_999.
+    #[error("civil field {field} = {value} is out of range")]
+    CivilFieldOutOfRange {
+        /// The field's name: `month`, `day`, `hour`, `minute`, `second` or
+        /// `nanosecond`.
+        field: &'static str,
+        /// The offered value.
+        value: u32,
+    },
 }
 
 /// A number that is not a legal FIX field tag.
