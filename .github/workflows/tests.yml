@@ -27,6 +27,11 @@ jobs:
       - name: Run tests
         run: make test
 
+      # Issue #219: ironfix-session is sans-IO. No async runtime may enter
+      # its normal dependency graph, on any feature set or target.
+      - name: Session dependency check
+        run: make check-session-deps
+
       # ADR-0009: the engine's `tls` feature is additive. With it off, no TLS
       # crate may enter ironfix-engine's normal dependency graph; with it on,
       # no crypto provider may be forced on the consumer.
