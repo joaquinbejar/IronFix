@@ -19,10 +19,18 @@ arrayvec.workspace = true
 num-traits.workspace = true
 num-derive.workspace = true
 rust_decimal.workspace = true
-chrono.workspace = true
+chrono = { workspace = true, optional = true }
+
+[features]
+default = []
+# `Timestamp::to_datetime` and `TryFrom<chrono::DateTime<Utc>>`. Off by default
+# so that chrono (RUSTSEC-2026-0543, unmaintained) is not in a consumer's graph.
+chrono = ["dep:chrono"]
 
 [dev-dependencies]
 dhat.workspace = true
+# The formatter tests compare byte for byte against chrono's `format`.
+chrono.workspace = true
 
 # Installs dhat as the global allocator to count the allocations of the
 # `Timestamp` formatters, so it runs as its own binary without the libtest
