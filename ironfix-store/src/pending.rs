@@ -32,6 +32,10 @@
 //! its single outbound writer: no other handle can file a frame, move the
 //! sender counter or reset it while the wrapper lives.
 //!
+//! - Sequence numbers are submitted contiguously from the store's next
+//!   sender number at construction ([`PendingError::NotNext`] otherwise),
+//!   so every number below the durable watermark was confirmed or is
+//!   history the store held at construction.
 //! - Writes run in submit order, one at a time, through
 //!   [`SyncMessageStore::file_outbound`], which files the frame and then
 //!   persists `seq + 1` as the next sender sequence number.
@@ -98,11 +102,13 @@ pub enum PendingError {
     /// The worker thread is gone.
     #[error("pending store worker has stopped")]
     Closed,
-    /// `seq` is not above the last sequence number submitted.
-    #[error("sequence {seq} is not above the last submitted {last}")]
-    OutOfOrder {
-        /// The last sequence number submitted.
-        last: u64,
+    /// `seq` is not the next contiguous sequence number. Submissions run
+    /// from the store's next sender number at construction without a gap,
+    /// so no frame left unconfirmed below a later one can be read back.
+    #[error("sequence {seq} is not the next contiguous {expected}")]
+    NotNext {
+        /// The only sequence number `submit` accepts now.
+        expected: u64,
         /// The sequence number refused.
         seq: u64,
     },
@@ -214,7 +220,8 @@ pub struct PendingStore<S: SyncMessageStore + 'static> {
     worker: Option<JoinHandle<()>>,
     bound: NonZeroUsize,
     in_flight: usize,
-    last_submitted: Option<u64>,
+    /// The only sequence number `submit` accepts now.
+    next_to_submit: u64,
     /// The inner store's next sender number when this wrapper was built.
     floor: u64,
     durable: Option<u64>,
@@ -260,7 +267,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
             worker: Some(worker),
             bound,
             in_flight: 0,
-            last_submitted: None,
+            next_to_submit: floor,
             floor,
             durable: None,
         })
@@ -273,8 +280,8 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     /// # Errors
     /// [`PendingError::Full`] when `bound` writes are in flight,
     /// [`PendingError::Failed`] after a failed write,
-    /// [`PendingError::OutOfOrder`] when `seq` is not above the last
-    /// submitted, [`PendingError::BelowNextSender`] when `seq` is below the
+    /// [`PendingError::NotNext`] when `seq` is not the next contiguous
+    /// number, [`PendingError::BelowNextSender`] when `seq` is below the
     /// store's next sender number at construction,
     /// [`PendingError::SequenceExhausted`] for `u64::MAX`,
     /// [`PendingError::Busy`] when the worker held the queue lock at that
@@ -302,14 +309,15 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
                 seq,
             });
         }
-        if let Some(last) = self.last_submitted
-            && seq <= last
-        {
-            return Err(PendingError::OutOfOrder { last, seq });
-        }
         let Some(next_sender) = seq.checked_add(1) else {
             return Err(PendingError::SequenceExhausted { seq });
         };
+        if seq != self.next_to_submit {
+            return Err(PendingError::NotNext {
+                expected: self.next_to_submit,
+                seq,
+            });
+        }
         enqueue(&self.shared, || Job {
             seq,
             msg_type: msg_type.clone(),
@@ -318,7 +326,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         })?;
         // `in_flight < bound <= usize::MAX`, checked above.
         self.in_flight += 1;
-        self.last_submitted = Some(seq);
+        self.next_to_submit = next_sender;
         Ok(Ticket { seq })
     }
 
@@ -765,7 +773,10 @@ mod tests {
     }
 
     /// Submits, retrying while the queue is busy.
-    fn submit(p: &mut PendingStore<GatedStore>, seq: u64) -> Result<Ticket, PendingError> {
+    fn submit<S: SyncMessageStore>(
+        p: &mut PendingStore<S>,
+        seq: u64,
+    ) -> Result<Ticket, PendingError> {
         loop {
             match p.submit(seq, &MsgType::Heartbeat, b"8=FIX.4.4\x0135=0\x0110=000\x01") {
                 Err(PendingError::Busy) => std::thread::yield_now(),
@@ -1056,7 +1067,7 @@ mod tests {
     #[test]
     fn test_pending_store_resend_read_excludes_a_write_in_flight() {
         let (mut p, inner, filed, setter) = setter_gated();
-        assert!(p.submit(3, &MsgType::Heartbeat, b"new").is_ok());
+        assert!(submit(&mut p, 3).is_ok());
         // The frame is in the inner store; its counter write is held.
         assert!(filed.recv_timeout(Duration::from_secs(5)).is_ok());
         assert!(inner.contains(3));
@@ -1076,7 +1087,7 @@ mod tests {
     #[test]
     fn test_pending_store_resend_read_excludes_a_write_whose_setter_failed() {
         let (mut p, inner, filed, setter) = setter_gated();
-        assert!(p.submit(3, &MsgType::Heartbeat, b"new").is_ok());
+        assert!(submit(&mut p, 3).is_ok());
         assert!(filed.recv_timeout(Duration::from_secs(5)).is_ok());
         assert!(setter.send(Err(StoreError::Io("disk".to_owned()))).is_ok());
         assert!(p.drain().is_err());
@@ -1085,6 +1096,34 @@ mod tests {
         assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2]);
         assert!(p.get_page(3, 0, 10).is_ok_and(|page| page.is_empty()));
         assert_eq!(p.next_sender_seq(), 3);
+    }
+
+    /// Frame 3 filed by an earlier run whose counter write failed: hidden at
+    /// construction, and no gap can later put it under a confirmed number.
+    #[test]
+    fn test_pending_store_never_exposes_an_unconfirmed_frame_across_a_gap() {
+        let (mut p, inner, filed, setter) = setter_gated();
+        assert!(inner.store(3, &MsgType::Heartbeat, b"stale").is_ok());
+        assert_eq!(
+            submit(&mut p, 5),
+            Err(PendingError::NotNext {
+                expected: 3,
+                seq: 5
+            })
+        );
+        assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2]);
+        // Refiling 3 replaces the stale frame before it can be confirmed.
+        assert!(submit(&mut p, 3).is_ok());
+        assert!(filed.recv_timeout(Duration::from_secs(5)).is_ok());
+        assert!(setter.send(Ok(())).is_ok());
+        assert_eq!(p.drain(), Ok(Some(3)));
+        match p.get_range(3, 3) {
+            Ok(messages) => assert_eq!(
+                messages.first().map(|m| m.payload().as_ref()),
+                Some(&b"8=FIX.4.4\x0135=0\x0110=000\x01"[..])
+            ),
+            Err(err) => panic!("range: {err:?}"),
+        }
     }
 
     #[test]
@@ -1127,17 +1166,35 @@ mod tests {
     #[test]
     fn test_pending_store_refuses_out_of_order_and_exhausted_sequences() {
         let (mut p, open) = pending(4, None);
-        assert!(submit(&mut p, 5).is_ok());
         assert_eq!(
-            submit(&mut p, 5),
-            Err(PendingError::OutOfOrder { last: 5, seq: 5 })
+            submit(&mut p, 2),
+            Err(PendingError::NotNext {
+                expected: 1,
+                seq: 2
+            })
+        );
+        assert!(submit(&mut p, 1).is_ok());
+        assert_eq!(
+            submit(&mut p, 1),
+            Err(PendingError::NotNext {
+                expected: 2,
+                seq: 1
+            })
+        );
+        // A gap is refused: frame 2 would be skipped and 3 confirmed.
+        assert_eq!(
+            submit(&mut p, 3),
+            Err(PendingError::NotNext {
+                expected: 2,
+                seq: 3
+            })
         );
         assert_eq!(
             submit(&mut p, u64::MAX),
             Err(PendingError::SequenceExhausted { seq: u64::MAX })
         );
         assert!(open.send(()).is_ok());
-        assert_eq!(p.drain(), Ok(Some(5)));
+        assert_eq!(p.drain(), Ok(Some(1)));
     }
 
     #[test]
