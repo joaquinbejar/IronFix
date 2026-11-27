@@ -55,6 +55,11 @@
 //!   still in flight or failed, is never returned, so a resend never
 //!   replays a frame that may not have been sent.
 //!   [`PendingStore::next_sender_seq`] is the confirmed counter likewise.
+//! - Confirmed means durable, not sent: a frame is readable as soon as
+//!   [`PendingStore::poll_durable`] reports it, before the driver has
+//!   written it to the socket. A driver answering a `ResendRequest` (35=2)
+//!   must cap the range at its own **sent** watermark, or it could replay a
+//!   frame and later send it again under the same number.
 //! - Inbound-side state is a pass-through:
 //!   [`PendingStore::next_target_seq`],
 //!   [`PendingStore::set_next_target_seq`] and
@@ -222,6 +227,9 @@ pub struct PendingStore<S: SyncMessageStore + 'static> {
     in_flight: usize,
     /// The only sequence number `submit` accepts now.
     next_to_submit: u64,
+    /// A failure collected by a poll that also reported progress; the next
+    /// poll returns it.
+    deferred: Option<StoreError>,
     /// The inner store's next sender number when this wrapper was built.
     floor: u64,
     durable: Option<u64>,
@@ -274,6 +282,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
             bound,
             in_flight: 0,
             next_to_submit: floor,
+            deferred: None,
             floor,
             durable: None,
         })
@@ -343,9 +352,13 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     ///
     /// # Errors
     /// The [`StoreError`] of a failed write, once; the store then refuses
-    /// every later submit. [`StoreError::Io`] if the worker stopped with
+    /// every later submit. When the same poll also confirmed earlier writes,
+    /// it returns that progress and the next poll returns the error. [`StoreError::Io`] if the worker stopped with
     /// writes in flight.
     pub fn poll_durable(&mut self) -> Result<Option<u64>, StoreError> {
+        if let Some(err) = self.deferred.take() {
+            return Err(err);
+        }
         let before = self.durable;
         while self.in_flight > 0 {
             // `try_lock`: the worker holds the lock only to push, and a poll
@@ -357,11 +370,19 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
                 ),
                 None => break,
             };
-            match next {
-                Some(done) => self.apply(done)?,
+            let failure = match next {
+                Some(done) => self.apply(done).err(),
                 // Read under the lock, after the worker's last push: final.
-                None if stopped => return Err(self.worker_lost()),
+                None if stopped => Some(self.worker_lost()),
                 None => break,
+            };
+            if let Some(err) = failure {
+                if self.durable == before {
+                    return Err(err);
+                }
+                // Report this poll's progress first; the error comes next.
+                self.deferred = Some(err);
+                break;
             }
         }
         Ok(if self.durable == before {
@@ -378,7 +399,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     /// As [`PendingStore::poll_durable`]; on a failed write it still waits
     /// for the skipped writes queued behind it before returning the error.
     pub fn drain(&mut self) -> Result<Option<u64>, StoreError> {
-        let mut first_error = None;
+        let mut first_error = self.deferred.take();
         while self.in_flight > 0 {
             let next = {
                 let mut outcomes = self.shared.outcomes.lock();
@@ -1167,6 +1188,27 @@ mod tests {
             PendingStore::new(store, bound(1)),
             Err(StoreError::InvalidRange { .. })
         ));
+    }
+
+    #[test]
+    fn test_pending_store_poll_reports_progress_before_a_later_failure() {
+        let (mut p, open) = pending(4, Some(2));
+        assert!(submit(&mut p, 1).is_ok());
+        assert!(submit(&mut p, 2).is_ok());
+        assert!(open.send(()).is_ok());
+        assert!(open.send(()).is_ok());
+        // Wait until both outcomes are queued, without collecting them.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while p.shared.outcomes.lock().len() < 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(p.poll_durable(), Ok(Some(1)));
+        assert!(matches!(
+            p.poll_durable(),
+            Err(StoreError::StoreFailed { seq_num: 2, .. })
+        ));
+        assert_eq!(p.poll_durable(), Ok(None));
+        assert_eq!(submit(&mut p, 3), Err(PendingError::Failed));
     }
 
     #[test]
