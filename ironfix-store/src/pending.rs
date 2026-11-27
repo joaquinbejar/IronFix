@@ -49,22 +49,20 @@
 //!   [`PendingStore::drain`].
 //! - Reads see confirmed frames only. [`PendingStore::get_range`] and
 //!   [`PendingStore::get_page`] cap the range at the last confirmed
-//!   sequence number: the durable watermark as of the last poll, or, before
-//!   any, the history the store held at construction (every number below
-//!   its next sender number then). A frame submitted but not confirmed,
-//!   still in flight or failed, is never returned, so a resend never
-//!   replays a frame that may not have been sent.
-//!   [`PendingStore::next_sender_seq`] is the confirmed counter likewise.
-//! - Confirmed means durable, not sent: a frame is readable as soon as
-//!   [`PendingStore::poll_durable`] reports it, before the driver has
-//!   written it to the socket. A driver answering a `ResendRequest` (35=2)
-//!   must cap the range at its own **sent** watermark, or it could replay a
-//!   frame and later send it again under the same number.
-//! - Inbound-side state is a pass-through:
-//!   [`PendingStore::next_target_seq`],
-//!   [`PendingStore::set_next_target_seq`] and
-//!   [`PendingStore::creation_time`] call the inner store on the caller's
-//!   thread and do not touch outbound state.
+//!   sequence number that is both durable and **sent**: the driver reports
+//!   each frame it wrote to the socket with [`PendingStore::mark_sent`],
+//!   which refuses a number not yet durable. Before any, the cap is the
+//!   history the store held at construction (every number below its next
+//!   sender number then). A frame in flight, failed, or durable but not
+//!   yet written is never returned, so a resend never replays a frame that
+//!   may still go out under the same number.
+//!   [`PendingStore::next_sender_seq`] is the confirmed (durable) counter.
+//! - The target (inbound) counter goes through the same queue:
+//!   [`PendingStore::submit_target`] queues it behind every write submitted
+//!   before it, so it cannot persist ahead of an earlier outbound frame
+//!   (the call-order rule of the [`traits`](crate::traits) module), with
+//!   the same bound, `Busy` and fail-closed behaviour.
+//!   [`PendingStore::durable_target`] reports the last one applied.
 //! - Dropping a [`PendingStore`] finishes the writes already queued and
 //!   joins the worker, so it blocks for up to the bound times one write.
 //!
@@ -117,6 +115,12 @@ pub enum PendingError {
         /// The sequence number refused.
         seq: u64,
     },
+    /// [`PendingStore::mark_sent`] named a number that is not durable yet.
+    #[error("sequence {seq} is not durable, so it cannot have been sent")]
+    NotDurable {
+        /// The sequence number refused.
+        seq: u64,
+    },
     /// `seq` is below the inner store's next sender sequence number at
     /// construction: that number is resend history.
     #[error("sequence {seq} is below the store's next sender sequence {next}")]
@@ -153,17 +157,24 @@ impl Ticket {
 }
 
 /// One write handed to the worker.
-struct Job {
-    seq: u64,
-    msg_type: MsgType,
-    message: Vec<u8>,
-    next_sender: u64,
+enum Job {
+    /// File an outbound frame and persist the next sender number.
+    Outbound {
+        seq: u64,
+        msg_type: MsgType,
+        message: Vec<u8>,
+        next_sender: u64,
+    },
+    /// Persist the next target (inbound) number.
+    Target { seq: u64 },
 }
 
 /// One write's outcome, sent back by the worker.
 enum Done {
     /// `file_outbound` returned `Ok` for this sequence number.
     Filed(u64),
+    /// `set_next_target_seq` returned `Ok` for this number.
+    TargetSet(u64),
     /// `file_outbound` failed; the error is already sanitised.
     Failed(StoreError),
     /// Not applied: an earlier write failed.
@@ -233,6 +244,10 @@ pub struct PendingStore<S: SyncMessageStore + 'static> {
     /// The inner store's next sender number when this wrapper was built.
     floor: u64,
     durable: Option<u64>,
+    /// The last frame the driver reported written to the socket.
+    sent: Option<u64>,
+    /// The last target number the worker applied.
+    durable_target: Option<u64>,
 }
 
 impl<S: SyncMessageStore + 'static> PendingStore<S> {
@@ -283,6 +298,8 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
             in_flight: 0,
             next_to_submit: floor,
             deferred: None,
+            sent: None,
+            durable_target: None,
             floor,
             durable: None,
         })
@@ -333,7 +350,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
                 seq,
             });
         }
-        enqueue(&self.shared, || Job {
+        enqueue(&self.shared, || Job::Outbound {
             seq,
             msg_type: msg_type.clone(),
             message: message.to_vec(),
@@ -458,13 +475,74 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         self.shared.failed.load(Ordering::Acquire)
     }
 
-    /// The last confirmed outbound sequence number: the durable watermark,
-    /// or before any, the last number the store held at construction.
+    /// The last readable outbound sequence number: the sent watermark
+    /// (never above the durable one), or the history held at construction.
     fn confirmed(&self) -> Option<u64> {
-        match self.durable {
-            Some(seq) => Some(seq),
-            None => self.floor.checked_sub(1).filter(|&seq| seq > 0),
+        let history = self.floor.checked_sub(1).filter(|&seq| seq > 0);
+        match (self.sent, history) {
+            (Some(sent), Some(history)) => Some(sent.max(history)),
+            (sent, history) => sent.or(history),
         }
+    }
+
+    /// Records that the frame under `seq` was written to the socket, so a
+    /// resend may read it. Reporting a number at or below the current sent
+    /// watermark is a no-op.
+    ///
+    /// # Errors
+    /// [`PendingError::NotDurable`] when `seq` is above the durable
+    /// watermark: a frame must be durable before it is sent.
+    pub fn mark_sent(&mut self, seq: u64) -> Result<(), PendingError> {
+        if self.durable.is_none_or(|durable| seq > durable) {
+            if seq < self.floor {
+                // History held at construction: already readable.
+                return Ok(());
+            }
+            return Err(PendingError::NotDurable { seq });
+        }
+        if self.sent.is_none_or(|sent| seq > sent) {
+            self.sent = Some(seq);
+        }
+        Ok(())
+    }
+
+    /// The last frame reported with [`PendingStore::mark_sent`].
+    #[must_use]
+    pub const fn sent(&self) -> Option<u64> {
+        self.sent
+    }
+
+    /// Queues the next target (inbound) sequence number behind every write
+    /// submitted before it, and returns at once. Its durability is
+    /// collected by [`PendingStore::poll_durable`] and reported by
+    /// [`PendingStore::durable_target`].
+    ///
+    /// # Errors
+    /// As [`PendingStore::submit`]: [`PendingError::Full`],
+    /// [`PendingError::Busy`], [`PendingError::Failed`] and
+    /// [`PendingError::Closed`].
+    pub fn submit_target(&mut self, seq: u64) -> Result<Ticket, PendingError> {
+        if self.is_failed() {
+            return Err(PendingError::Failed);
+        }
+        if self.shared.stopped.load(Ordering::Acquire) {
+            return Err(PendingError::Closed);
+        }
+        if self.in_flight >= self.bound.get() {
+            return Err(PendingError::Full {
+                bound: self.bound.get(),
+            });
+        }
+        enqueue(&self.shared, || Job::Target { seq })?;
+        // `in_flight < bound <= usize::MAX`, checked above.
+        self.in_flight += 1;
+        Ok(Ticket { seq })
+    }
+
+    /// The last target number the worker applied, as of the last poll.
+    #[must_use]
+    pub const fn durable_target(&self) -> Option<u64> {
+        self.durable_target
     }
 
     /// The end of `begin..=end` (`end` 0 meaning infinity) capped at the
@@ -540,20 +618,11 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         }
     }
 
-    /// The inner store's next target (inbound) sequence number.
+    /// The inner store's next target (inbound) sequence number, as last
+    /// applied by the worker.
     #[must_use]
     pub fn next_target_seq(&self) -> u64 {
         self.store.next_target_seq()
-    }
-
-    /// Persists the next target (inbound) sequence number through the inner
-    /// store, on the caller's thread: it blocks for as long as the store's
-    /// call does, and does not touch outbound state.
-    ///
-    /// # Errors
-    /// The inner store's error.
-    pub fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
-        self.store.set_next_target_seq(seq)
     }
 
     /// The inner store's creation time.
@@ -571,6 +640,10 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         match done {
             Done::Filed(seq) => {
                 self.durable = Some(seq);
+                Ok(())
+            }
+            Done::TargetSet(seq) => {
+                self.durable_target = Some(seq);
                 Ok(())
             }
             Done::Failed(err) => {
@@ -682,8 +755,21 @@ fn run_worker<S: SyncMessageStore>(store: &S, shared: &Shared) {
         let done = if failed {
             Done::Skipped
         } else {
-            match store.file_outbound(job.seq, &job.msg_type, &job.message, job.next_sender) {
-                Ok(()) => Done::Filed(job.seq),
+            let (seq, result, ok) = match job {
+                Job::Outbound {
+                    seq,
+                    msg_type,
+                    message,
+                    next_sender,
+                } => (
+                    seq,
+                    store.file_outbound(seq, &msg_type, &message, next_sender),
+                    Done::Filed(seq),
+                ),
+                Job::Target { seq } => (seq, store.set_next_target_seq(seq), Done::TargetSet(seq)),
+            };
+            match result {
+                Ok(()) => ok,
                 Err(err) => {
                     failed = true;
                     // Published under the job lock, before the outcome, so
@@ -692,7 +778,7 @@ fn run_worker<S: SyncMessageStore>(store: &S, shared: &Shared) {
                         let _jobs = shared.jobs.lock();
                         shared.failed.store(true, Ordering::Release);
                     }
-                    Done::Failed(sanitise(job.seq, &err))
+                    Done::Failed(sanitise(seq, &err))
                 }
             }
         };
@@ -862,6 +948,12 @@ mod tests {
         assert_eq!(poll_until(&mut p, 3), Ok(()));
         assert_eq!(p.durable(), Some(3));
         assert_eq!(p.in_flight(), 0);
+        // Durable but not sent: not readable yet.
+        assert_eq!(
+            p.get_range(1, 3),
+            Err(StoreError::RangeNotAvailable { begin: 1, end: 3 })
+        );
+        assert_eq!(p.mark_sent(3), Ok(()));
         match p.get_range(1, 3) {
             Ok(messages) => assert_eq!(messages.len(), 3),
             Err(err) => panic!("range: {err:?}"),
@@ -1112,6 +1204,8 @@ mod tests {
         assert_eq!(p.next_sender_seq(), 3);
         assert!(setter.send(Ok(())).is_ok());
         assert_eq!(p.drain(), Ok(Some(3)));
+        assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2]);
+        assert_eq!(p.mark_sent(3), Ok(()));
         assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2, 3]);
         assert_eq!(p.next_sender_seq(), 4);
     }
@@ -1149,6 +1243,7 @@ mod tests {
         assert!(filed.recv_timeout(Duration::from_secs(5)).is_ok());
         assert!(setter.send(Ok(())).is_ok());
         assert_eq!(p.drain(), Ok(Some(3)));
+        assert_eq!(p.mark_sent(3), Ok(()));
         match p.get_range(3, 3) {
             Ok(messages) => assert_eq!(
                 messages.first().map(|m| m.payload().as_ref()),
@@ -1160,14 +1255,14 @@ mod tests {
 
     #[test]
     fn test_pending_store_reads_pre_existing_history_and_pass_through_target() {
-        let (p, _inner, _filed, _setter) = setter_gated();
+        let (mut p, _inner, _filed, _setter) = setter_gated();
         assert_eq!(seqs(p.get_range(2, 2)), vec![2]);
         assert_eq!(
             p.get_range(0, 2),
             Err(StoreError::InvalidRange { begin: 0, end: 2 })
         );
-        assert!(p.set_next_target_seq(7).is_ok());
-        assert_eq!(p.next_target_seq(), 7);
+        assert_eq!(p.mark_sent(2), Ok(()));
+        assert_eq!(p.sent(), None);
         assert_eq!(p.next_sender_seq(), 3);
     }
 
@@ -1209,6 +1304,62 @@ mod tests {
         ));
         assert_eq!(p.poll_durable(), Ok(None));
         assert_eq!(submit(&mut p, 3), Err(PendingError::Failed));
+    }
+
+    #[test]
+    fn test_pending_store_target_write_cannot_overtake_a_queued_outbound_frame() {
+        let (mut p, open) = pending(4, None);
+        assert!(submit(&mut p, 1).is_ok());
+        let target = loop {
+            match p.submit_target(9) {
+                Err(PendingError::Busy) => std::thread::yield_now(),
+                other => break other,
+            }
+        };
+        assert!(target.is_ok_and(|ticket| ticket.seq() == 9));
+        assert_eq!(p.in_flight(), 2);
+        // Frame 1 is held at the gate, so the target write behind it in
+        // the one worker queue cannot have run.
+        assert_eq!(p.store.inner.next_target_seq(), 1);
+        assert_eq!(p.durable_target(), None);
+        assert!(open.send(()).is_ok());
+        assert_eq!(p.drain(), Ok(Some(1)));
+        assert_eq!(p.durable_target(), Some(9));
+        assert_eq!(p.next_target_seq(), 9);
+    }
+
+    #[test]
+    fn test_pending_store_target_submit_is_bounded_and_fails_closed() {
+        let (mut p, open) = pending(1, Some(1));
+        assert!(submit(&mut p, 1).is_ok());
+        assert_eq!(p.submit_target(5), Err(PendingError::Full { bound: 1 }));
+        assert!(open.send(()).is_ok());
+        assert!(p.drain().is_err());
+        assert_eq!(p.submit_target(5), Err(PendingError::Failed));
+        assert_eq!(p.store.inner.next_target_seq(), 1);
+    }
+
+    #[test]
+    fn test_pending_store_resend_reads_cap_at_the_sent_watermark() {
+        let (mut p, inner, filed, setter) = setter_gated();
+        for seq in 3..=4 {
+            assert!(submit(&mut p, seq).is_ok());
+            assert!(filed.recv_timeout(Duration::from_secs(5)).is_ok());
+            assert!(setter.send(Ok(())).is_ok());
+        }
+        assert_eq!(p.drain(), Ok(Some(4)));
+        assert!(inner.contains(4));
+        // Durable, not sent: only history is readable.
+        assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2]);
+        assert_eq!(p.mark_sent(5), Err(PendingError::NotDurable { seq: 5 }));
+        assert_eq!(p.mark_sent(3), Ok(()));
+        assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2, 3]);
+        assert_eq!(seqs(p.get_page(1, 10, 10)), vec![1, 2, 3]);
+        // A lower report does not move the watermark back.
+        assert_eq!(p.mark_sent(1), Ok(()));
+        assert_eq!(p.sent(), Some(3));
+        assert_eq!(p.mark_sent(4), Ok(()));
+        assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2, 3, 4]);
     }
 
     #[test]

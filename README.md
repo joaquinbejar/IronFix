@@ -510,7 +510,8 @@ around it.
   `PendingStore` owns a `SyncMessageStore` and gives it a bounded
   submit/poll form (`submit` returns a `Ticket` or `PendingError::Full`;
   `poll_durable` reports the highest durable sequence number without
-  blocking; its resend reads return confirmed frames only; #222). It is
+  blocking; its resend reads return only frames both durable and marked
+  sent, and the target counter is queued in call order; #222). It is
   not wired into either engine. A
   driver without Tokio is shown, not shipped: `fix44_poll_client` is a
   single-threaded, poll-driven FIX 4.4 initiator over non-blocking
