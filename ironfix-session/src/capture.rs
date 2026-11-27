@@ -207,12 +207,19 @@ pub const fn in_sequence_verdict(seq: u64) -> InboundVerdict {
 /// comes from [`sequence_reset_screen_verdict`] and, once the application
 /// has seen it, [`sequence_reset_verdict`]. `None` too for a frame above the
 /// expectation: whether it is acted on, queued or dropped as a copy depends
-/// on the gap queue, so its verdict comes from [`gap_verdict`].
+/// on the gap queue, so its verdict comes from [`gap_verdict`]. `None` for
+/// an in-sequence message: the driver reports [`in_sequence_verdict`] only
+/// once its receive cursor has advanced past the number (or the exhaustion
+/// that stops it), never from routing alone.
 #[must_use]
 pub const fn inbound_verdict(route: &InboundRoute, seq: u64) -> Option<InboundVerdict> {
     let verdict = match *route {
-        InboundRoute::SequenceReset | InboundRoute::Gap { .. } => return None,
-        InboundRoute::Admin { .. } | InboundRoute::App => in_sequence_verdict(seq),
+        // In sequence: the driver reports acceptance ([`in_sequence_verdict`])
+        // only once its receive cursor has advanced past the number.
+        InboundRoute::SequenceReset
+        | InboundRoute::Gap { .. }
+        | InboundRoute::Admin { .. }
+        | InboundRoute::App => return None,
         InboundRoute::Duplicate => InboundVerdict::Rejected {
             seq,
             reason: InboundRefusal::Duplicate,
@@ -533,14 +540,12 @@ mod tests {
     }
 
     #[test]
-    fn test_in_sequence_messages_are_accepted() {
+    fn test_in_sequence_routes_report_nothing() {
         let sequences = expecting(5);
         for msg_type in [MsgType::Heartbeat, MsgType::NewOrderSingle] {
             let route = route_inbound(&sequences, &msg_type, 5, || false);
-            assert_eq!(
-                inbound_verdict(&route, 5),
-                Some(InboundVerdict::Accepted { seq: 5 })
-            );
+            // Routing alone reports nothing: acceptance waits for the cursor.
+            assert_eq!(inbound_verdict(&route, 5), None);
         }
     }
 
@@ -627,7 +632,8 @@ mod tests {
         assert_eq!(released_verdict(u64::MAX), exhausted);
         assert_eq!(
             inbound_verdict(&InboundRoute::App, u64::MAX),
-            Some(exhausted)
+            None,
+            "exhaustion is reported by the check that stops the frame"
         );
         assert_eq!(
             malformed_verdict(&InboundSequence::InSequence, u64::MAX),
@@ -844,16 +850,20 @@ mod tests {
             Some(b"35=0"),
             at,
         );
-        if let Some(verdict) = inbound_verdict(&route, 1) {
-            sink.on_capture(
-                &CapturePoint::Inbound {
-                    verdict,
-                    frame_id: Some(1),
-                },
-                None,
-                at,
-            );
-        }
+        // Routing reports nothing for an in-sequence message; the driver
+        // persists and consumes the number, then reports acceptance.
+        assert!(matches!(route, InboundRoute::Admin { next: 2 }));
+        assert_eq!(inbound_verdict(&route, 1), None);
+        let consumed = sequences.try_increment_target_seq().is_ok();
+        assert!(consumed && sequences.next_target_seq().value() == 2);
+        sink.on_capture(
+            &CapturePoint::Inbound {
+                verdict: in_sequence_verdict(1),
+                frame_id: Some(1),
+            },
+            None,
+            at,
+        );
         let points = sink.0.into_inner();
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].1.as_deref(), Some(&b"35=0"[..]));
