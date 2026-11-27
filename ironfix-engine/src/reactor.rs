@@ -4720,7 +4720,7 @@ impl<A: Application> Reactor<A> {
         let decision = decide_sequence_reset(gap_fill, seq, new_seq_no, expected);
         // Acceptance is reported once the cursor has moved (Apply, or the
         // consumption of a refused fill's number); a refusal after that.
-        let verdict = sequence_reset_verdict(&decision, seq);
+        let verdict = sequence_reset_verdict(&decision, gap_fill, seq);
         let reason = match decision {
             ResetDecision::MissingNewSeqNo => {
                 // Same hazard as the rejection path above: the fill still
@@ -5610,6 +5610,10 @@ impl<A: Application> Reactor<A> {
             let Some(ready) = self.core.take_gap_ready(expected) else {
                 return Ok(phase);
             };
+            // Kept numbers the expectation moved past were dropped unconsumed.
+            if let Some(capture) = &self.writer.capture {
+                capture.forget_kept_below(expected);
+            }
             if ready.superseded > 0 {
                 tracing::debug!(
                     session = %self.session_id,
@@ -5629,7 +5633,12 @@ impl<A: Application> Reactor<A> {
                     }
                     self.release_frame(framed, phase, expected, &frame).await?
                 }
-                GapEntry::Processed { frame_id } => {
+                GapEntry::Processed => {
+                    let frame_id = self
+                        .writer
+                        .capture
+                        .as_ref()
+                        .and_then(|capture| capture.take_kept(expected));
                     self.consume_processed(phase, expected, frame_id).await?
                 }
             };
@@ -5748,6 +5757,9 @@ impl<A: Application> Reactor<A> {
     /// Drops every queued message, logging why when there were any.
     fn clear_gap_queue(&mut self, why: &'static str) {
         let dropped = self.core.clear_gap_queue();
+        if let Some(capture) = &self.writer.capture {
+            capture.forget_kept_below(u64::MAX);
+        }
         self.log_gap_queue_dropped(dropped, why);
     }
 
@@ -6127,14 +6139,15 @@ impl<A: Application> Reactor<A> {
                     // kept to be consumed in turn. A copy of a number
                     // already held is dropped, not acted on a second time.
                     GapDisposition::KeepNumber => {
-                        if self.queue_gapped(
-                            &phase,
-                            seq,
-                            GapEntry::Processed {
-                                frame_id: self.capture_frame_id(),
-                            },
-                        ) {
+                        if self.queue_gapped(&phase, seq, GapEntry::Processed) {
                             return Ok(phase);
+                        }
+                        // The queue holds the number now: remember which
+                        // frame it was, to name it when it is consumed.
+                        if self.core.gap_copy_queued(&phase, seq)
+                            && let Some(capture) = &self.writer.capture
+                        {
+                            capture.keep_frame(seq);
                         }
                         self.dispatch_admin(framed, phase, &raw, seq).await
                     }

@@ -1222,7 +1222,7 @@ pub(crate) mod tests {
         let mut discard = SessionCore::<TestPayloads>::new();
         assert!(!discard.queues_gaps());
         assert_eq!(
-            discard.queue_gapped(&active(), 5, GapEntry::Processed { frame_id: None }),
+            discard.queue_gapped(&active(), 5, GapEntry::Processed),
             GapAdmission::Bypassed
         );
         assert_eq!(discard.take_gap_ready(5).map(|r| r.superseded), None);
@@ -1233,7 +1233,7 @@ pub(crate) mod tests {
         let queued =
             SessionPhase::LogoutQueued(Session::new("S").connect().send_logon(now).on_logon_ack());
         assert_eq!(
-            core.queue_gapped(&queued, 5, GapEntry::Processed { frame_id: None }),
+            core.queue_gapped(&queued, 5, GapEntry::Processed),
             GapAdmission::Bypassed,
             "a session on its way out queues nothing"
         );
@@ -1247,19 +1247,19 @@ pub(crate) mod tests {
         assert!(!core.gap_copy_queued(&queued, 5));
         assert!(!discard.gap_copy_queued(&active(), 5));
         assert_eq!(
-            core.queue_gapped(&active(), 5, GapEntry::Processed { frame_id: None }),
+            core.queue_gapped(&active(), 5, GapEntry::Processed),
             GapAdmission::Duplicate
         );
         assert_eq!(
-            core.queue_gapped(&active(), 6, GapEntry::Processed { frame_id: None }),
+            core.queue_gapped(&active(), 6, GapEntry::Processed),
             GapAdmission::Queued
         );
         assert_eq!(
-            core.queue_gapped(&active(), 7, GapEntry::Processed { frame_id: None }),
+            core.queue_gapped(&active(), 7, GapEntry::Processed),
             GapAdmission::FirstOverflow
         );
         assert_eq!(
-            core.queue_gapped(&active(), 8, GapEntry::Processed { frame_id: None }),
+            core.queue_gapped(&active(), 8, GapEntry::Processed),
             GapAdmission::Overflow
         );
         assert_eq!(core.gap_queued(), Some((2, 1)));
@@ -1280,7 +1280,7 @@ pub(crate) mod tests {
         let _ = core.decide_peer_logout(LogoutPhase::Active, Instant::now(), || None, true);
         assert!(core.logout_owed());
         assert_eq!(
-            core.queue_gapped(&active(), 5, GapEntry::Processed { frame_id: None }),
+            core.queue_gapped(&active(), 5, GapEntry::Processed),
             GapAdmission::Bypassed
         );
     }

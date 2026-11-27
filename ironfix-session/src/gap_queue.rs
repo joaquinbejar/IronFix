@@ -32,13 +32,7 @@ pub enum GapEntry<F> {
     /// An administrative message already acted on when it arrived (a
     /// TestRequest answered, a ResendRequest served): only its number is
     /// left to consume.
-    Processed {
-        /// The driver's capture id of the frame
-        /// ([`CapturePoint::InboundFramed`](crate::CapturePoint::InboundFramed)),
-        /// so the driver can report its number's consumption against it.
-        /// `None` when the driver assigns no ids.
-        frame_id: Option<u64>,
-    },
+    Processed,
 }
 
 /// What offering a message to the gap queue did
@@ -135,7 +129,7 @@ impl<P: SessionPayloads> GapQueue<P> {
     fn entry_bytes(entry: &GapEntry<P::Gapped>) -> usize {
         match entry {
             GapEntry::Frame(frame) => P::gapped_bytes(frame),
-            GapEntry::Processed { .. } => 0,
+            GapEntry::Processed => 0,
         }
     }
 
@@ -295,7 +289,7 @@ mod tests {
     fn test_take_ready_drops_numbers_the_expectation_jumped_past() {
         let mut q = queue(8, 1024);
         q.insert(5, frame(3));
-        q.insert(6, GapEntry::Processed { frame_id: None });
+        q.insert(6, GapEntry::Processed);
         q.insert(9, frame(4));
         let ready = q.take_ready(8);
         assert_eq!(ready.superseded, 2);
@@ -317,10 +311,7 @@ mod tests {
     fn test_overflow_by_count_keeps_what_is_held() {
         let mut q = queue(2, 1024);
         assert_eq!(q.insert(5, frame(1)), Insert::Queued);
-        assert_eq!(
-            q.insert(6, GapEntry::Processed { frame_id: None }),
-            Insert::Queued
-        );
+        assert_eq!(q.insert(6, GapEntry::Processed), Insert::Queued);
         assert_eq!(q.insert(7, frame(1)), Insert::Overflow);
         assert_eq!(q.len(), 2);
         assert!(q.first_overflow());
@@ -332,10 +323,7 @@ mod tests {
         let mut q = queue(8, 10);
         assert_eq!(q.insert(5, frame(6)), Insert::Queued);
         assert_eq!(q.insert(6, frame(5)), Insert::Overflow);
-        assert_eq!(
-            q.insert(6, GapEntry::Processed { frame_id: None }),
-            Insert::Queued
-        );
+        assert_eq!(q.insert(6, GapEntry::Processed), Insert::Queued);
         assert_eq!(q.insert(7, frame(4)), Insert::Queued);
         assert_eq!(q.bytes(), 10);
     }

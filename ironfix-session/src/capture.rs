@@ -26,8 +26,8 @@
 //!   reading (the core reads no clock, ADR-0002).
 //!
 //! `ironfix-engine` is the first driver: its `FrameObserver` is fed from
-//! these points, and its `Direction` and `FrameKind` are the types defined
-//! here.
+//! these points; its own published `Direction` and `FrameKind` convert to
+//! and from the types defined here.
 //!
 //! # Credentials
 //!
@@ -144,6 +144,16 @@ pub enum InboundVerdict {
         /// The number the session expected: the start of the gap.
         expected: u64,
     },
+    /// A `SequenceReset` (4) in Reset mode was applied: the receive cursor
+    /// now stands at `next`. Reset mode ignores `MsgSeqNum` (34), so `seq`
+    /// (its header number) was **not** consumed; this is not
+    /// [`Accepted`](Self::Accepted).
+    ResetApplied {
+        /// The frame's header `MsgSeqNum` (34), not consumed.
+        seq: u64,
+        /// The next inbound number the session expects after the reset.
+        next: u64,
+    },
     /// Not acted on.
     Rejected {
         /// The frame's `MsgSeqNum` (34).
@@ -161,14 +171,18 @@ impl InboundVerdict {
             Self::Accepted { seq }
             | Self::AcceptedAhead { seq, .. }
             | Self::Deferred { seq, .. }
-            | Self::Rejected { seq, .. } => seq,
+            | Self::Rejected { seq, .. }
+            | Self::ResetApplied { seq, .. } => seq,
         }
     }
 
     /// Whether the driver acts on the message now.
     #[must_use]
     pub const fn is_accepted(&self) -> bool {
-        matches!(self, Self::Accepted { .. } | Self::AcceptedAhead { .. })
+        matches!(
+            self,
+            Self::Accepted { .. } | Self::AcceptedAhead { .. } | Self::ResetApplied { .. }
+        )
     }
 }
 
@@ -328,11 +342,21 @@ pub const fn sequence_reset_screen_verdict(
 /// core's decision on it
 /// ([`decide_sequence_reset`](crate::sans_io::decide_sequence_reset)), made
 /// once the application has accepted it: a rejection when the core refuses
-/// it; for an applied GapFill or Reset, its acceptance, which the driver
-/// reports once the new receive cursor has taken effect.
+/// it; for an applied GapFill (`gap_fill`), its acceptance; for an applied
+/// Reset, [`InboundVerdict::ResetApplied`] with the resulting cursor (its
+/// header number is not consumed). The driver reports either once the new
+/// receive cursor has taken effect.
 #[must_use]
-pub const fn sequence_reset_verdict(decision: &ResetDecision, seq: u64) -> Option<InboundVerdict> {
+pub const fn sequence_reset_verdict(
+    decision: &ResetDecision,
+    gap_fill: bool,
+    seq: u64,
+) -> Option<InboundVerdict> {
     match decision {
+        ResetDecision::Apply { new_seq, .. } if !gap_fill => Some(InboundVerdict::ResetApplied {
+            seq,
+            next: *new_seq,
+        }),
         ResetDecision::Apply { .. } => Some(InboundVerdict::Accepted { seq }),
         ResetDecision::MissingNewSeqNo
         | ResetDecision::FillNotAdvancing { .. }
@@ -714,18 +738,32 @@ mod tests {
 
     #[test]
     fn test_sequence_reset_decision_verdicts() {
-        // An applied GapFill or Reset is accepted with the decision, once
-        // the new cursor has taken effect.
+        // An applied GapFill is accepted; an applied Reset is reported with
+        // its resulting cursor, its header number not consumed.
+        let apply = ResetDecision::Apply {
+            new_seq: 9,
+            renumbers: false,
+            advances: true,
+        };
         assert_eq!(
-            sequence_reset_verdict(
-                &ResetDecision::Apply {
-                    new_seq: 9,
-                    renumbers: false,
-                    advances: true
-                },
-                5
-            ),
+            sequence_reset_verdict(&apply, true, 5),
             Some(InboundVerdict::Accepted { seq: 5 })
+        );
+        let applied = sequence_reset_verdict(&apply, false, 5);
+        assert_eq!(
+            applied,
+            Some(InboundVerdict::ResetApplied { seq: 5, next: 9 })
+        );
+        assert!(applied.is_some_and(|v| v.is_accepted() && v.seq() == 5));
+        // A Reset to the current cursor moves nothing: still ResetApplied.
+        let still = ResetDecision::Apply {
+            new_seq: 5,
+            renumbers: true,
+            advances: false,
+        };
+        assert_eq!(
+            sequence_reset_verdict(&still, false, 1),
+            Some(InboundVerdict::ResetApplied { seq: 1, next: 5 })
         );
         for decision in [
             ResetDecision::MissingNewSeqNo,
@@ -736,7 +774,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                sequence_reset_verdict(&decision, 5),
+                sequence_reset_verdict(&decision, true, 5),
                 Some(InboundVerdict::Rejected {
                     seq: 5,
                     reason: InboundRefusal::InvalidSequenceReset

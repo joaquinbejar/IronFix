@@ -1663,10 +1663,10 @@ async fn test_discarded_kept_number_is_never_accepted() {
         }],
         "no acceptance for a discarded kept number: {verdicts:?}"
     );
-    // The Reset itself is accepted once applied, exactly once.
+    // The Reset itself is reported applied, with its cursor, exactly once.
     let reset_accepted = verdicts
         .iter()
-        .filter(|(_, verdict)| *verdict == InboundVerdict::Accepted { seq: 2 })
+        .filter(|(_, verdict)| *verdict == InboundVerdict::ResetApplied { seq: 2, next: 10 })
         .count();
     assert_eq!(reset_accepted, 1, "{verdicts:?}");
 }

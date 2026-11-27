@@ -65,10 +65,14 @@
 //! frame get no verdict. A frame whose header is sound and whose body does
 //! not decode gets the verdict of its number; above a gap it is never
 //! queued and is rejected as [`InboundRefusal::Malformed`]. A
-//! `SequenceReset` (4) that reaches the application (an in-sequence
-//! GapFill, or Reset mode) is reported accepted once it is applied and the
-//! receive cursor stands at its `NewSeqNo` (36), or rejected when
-//! `from_admin` or the core refuses it. Under
+//! `SequenceReset` (4) that reaches the application is reported once it is
+//! applied and the receive cursor stands at its `NewSeqNo` (36): an
+//! in-sequence GapFill as accepted, a Reset as
+//! [`InboundVerdict::ResetApplied`] (Reset mode ignores its `MsgSeqNum`, so
+//! that number is not consumed); or rejected when `from_admin` or the core
+//! refuses it. A kept administrative number gets its accepted verdict,
+//! naming the kept frame, when its number is consumed in turn; none if the
+//! queue discards it. Under
 //! `GapPolicy::Queue`, an
 //! message whose number is already queued is rejected as a
 //! [`InboundRefusal::QueuedCopy`], and the one frame deferred into the queue
@@ -158,13 +162,89 @@ use crate::application::SessionId;
 use crate::outcome::{NotSentReason, SendOutcome, UnknownReason};
 use ironfix_session::{CapturePoint, WriteClass};
 use ironfix_tagvalue::Decoder;
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-/// Which way a frame travels, and what kind of frame an [`Observation`] is
-/// about: the sans-IO core's capture vocabulary (issue #223), re-exported.
-pub use ironfix_session::capture::{Direction, FrameKind};
+/// Which way a frame travels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum Direction {
+    /// Read from the counterparty.
+    Inbound,
+    /// Written to the counterparty.
+    Outbound,
+}
+
+/// What kind of frame an [`Observation`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum FrameKind {
+    /// A frame of the Logon handshake, before the session is Active: the
+    /// Logons themselves, frames read while waiting for one, and the Rejects
+    /// and Logouts that refuse one.
+    Handshake,
+    /// A frame of the established session that is not a replay: application
+    /// and administrative messages under a new `MsgSeqNum` (34), and every
+    /// inbound frame once the session is Active.
+    Session,
+    /// A stored message resent, with `PossDupFlag` (43) = Y, under the
+    /// number it was first sent with: the answer to a `ResendRequest` (2) or
+    /// the resend a `NextExpectedMsgSeqNum` (789) asked for.
+    Replay,
+    /// A `SequenceReset`-GapFill (4, 123 = Y) written in a resend, under the
+    /// first number it fills.
+    GapFill,
+}
+
+impl FrameKind {
+    /// Whether the frame re-occupies a number already spent: a
+    /// [`FrameKind::Replay`] or a [`FrameKind::GapFill`].
+    #[must_use]
+    pub const fn is_replay(self) -> bool {
+        matches!(self, Self::Replay | Self::GapFill)
+    }
+}
+
+impl Direction {
+    /// The engine's direction for the core's one. The core enum is
+    /// `#[non_exhaustive]`; a direction added later maps to `Inbound` until
+    /// the engine names it.
+    fn from_core(direction: ironfix_session::capture::Direction) -> Self {
+        match direction {
+            ironfix_session::capture::Direction::Outbound => Self::Outbound,
+            _ => Self::Inbound,
+        }
+    }
+}
+
+impl FrameKind {
+    /// The sans-IO core's frame kind for this one (issue #223).
+    const fn core(self) -> ironfix_session::capture::FrameKind {
+        match self {
+            Self::Handshake => ironfix_session::capture::FrameKind::Handshake,
+            Self::Session => ironfix_session::capture::FrameKind::Session,
+            Self::Replay => ironfix_session::capture::FrameKind::Replay,
+            Self::GapFill => ironfix_session::capture::FrameKind::GapFill,
+        }
+    }
+
+    /// The engine's frame kind for the core's one. The core enum is
+    /// `#[non_exhaustive]`; a kind added later maps to `Session` until the
+    /// engine names it.
+    fn from_core(kind: ironfix_session::capture::FrameKind) -> Self {
+        match kind {
+            ironfix_session::capture::FrameKind::Handshake => Self::Handshake,
+            ironfix_session::capture::FrameKind::Replay => Self::Replay,
+            ironfix_session::capture::FrameKind::GapFill => Self::GapFill,
+            _ => Self::Session,
+        }
+    }
+}
+
 /// The core's verdict on an inbound frame, and why it refused one, for
 /// [`FrameObserver::on_inbound_verdict`] (issue #223).
 pub use ironfix_session::{InboundRefusal, InboundVerdict};
@@ -344,6 +424,10 @@ pub(crate) struct Capture {
     last_frame_id: Arc<AtomicU64>,
     /// The capture id of the inbound frame being acted on, 0 for none.
     current_frame_id: Arc<AtomicU64>,
+    /// The capture ids of administrative frames whose numbers the gap queue
+    /// keeps, by `MsgSeqNum` (34): bounded by the queue, pruned as the
+    /// expectation moves.
+    kept: Arc<Mutex<BTreeMap<u64, u64>>>,
 }
 
 impl std::fmt::Debug for Capture {
@@ -371,6 +455,7 @@ impl Capture {
             session_id: session_id.clone(),
             last_frame_id: Arc::new(AtomicU64::new(0)),
             current_frame_id: Arc::new(AtomicU64::new(0)),
+            kept: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -380,8 +465,8 @@ impl Capture {
     /// write result, whose class the point carries.
     fn emit(&self, point: &CapturePoint, frame: &[u8], result: Option<&OutboundResult>) {
         let observation = Observation::new(
-            point.direction(),
-            point.kind(),
+            Direction::from_core(point.direction()),
+            FrameKind::from_core(point.kind()),
             point.seq(),
             point.frame_id(),
             now(),
@@ -431,7 +516,7 @@ impl Capture {
             frame_id
         });
         let point = CapturePoint::InboundFramed {
-            kind,
+            kind: kind.core(),
             seq: peek_msg_seq_num(frame),
             frame_id,
         };
@@ -453,6 +538,32 @@ impl Capture {
             .store(frame_id.unwrap_or(0), Ordering::Relaxed);
     }
 
+    /// Remembers the current frame as the one whose number `seq` the gap
+    /// queue keeps.
+    pub(crate) fn keep_frame(&self, seq: u64) {
+        if let Some(frame_id) = self.current_frame() {
+            self.kept_ids().insert(seq, frame_id);
+        }
+    }
+
+    /// Takes the capture id kept for `seq`, as its number is consumed.
+    pub(crate) fn take_kept(&self, seq: u64) -> Option<u64> {
+        self.kept_ids().remove(&seq)
+    }
+
+    /// Forgets the kept ids below `seq`: numbers dropped unconsumed.
+    pub(crate) fn forget_kept_below(&self, seq: u64) {
+        let mut kept = self.kept_ids();
+        let rest = kept.split_off(&seq);
+        *kept = rest;
+    }
+
+    /// The kept ids. The lock is held for one map operation and never
+    /// across an await; a poisoned lock still holds a usable map.
+    fn kept_ids(&self) -> std::sync::MutexGuard<'_, BTreeMap<u64, u64>> {
+        self.kept.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Reports the core's `verdict` on the inbound frame being acted on.
     pub(crate) fn verdict(&self, verdict: InboundVerdict) {
         let point = CapturePoint::Inbound {
@@ -464,13 +575,20 @@ impl Capture {
 
     /// Observes an outbound `frame` of `kind`, numbered `seq`.
     pub(crate) fn outbound(&self, frame: &[u8], kind: FrameKind, seq: u64) {
-        self.emit(&CapturePoint::OutboundQueued { kind, seq }, frame, None);
+        self.emit(
+            &CapturePoint::OutboundQueued {
+                kind: kind.core(),
+                seq,
+            },
+            frame,
+            None,
+        );
     }
 
     /// Reports the write `result` of a frame of `kind`, numbered `seq`.
     pub(crate) fn result(&self, result: &OutboundResult, kind: FrameKind, seq: Option<u64>) {
         let point = CapturePoint::OutboundResult {
-            kind,
+            kind: kind.core(),
             seq,
             result: result.class(),
         };
@@ -520,6 +638,57 @@ fn peek_msg_seq_num(frame: &[u8]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_frame_kind_is_replay() {
+        assert!(FrameKind::Replay.is_replay());
+        assert!(FrameKind::GapFill.is_replay());
+        assert!(!FrameKind::Session.is_replay());
+        assert!(!FrameKind::Handshake.is_replay());
+    }
+
+    #[test]
+    fn test_kinds_round_trip_through_the_core() {
+        for kind in [
+            FrameKind::Handshake,
+            FrameKind::Session,
+            FrameKind::Replay,
+            FrameKind::GapFill,
+        ] {
+            assert_eq!(FrameKind::from_core(kind.core()), kind);
+            assert_eq!(kind.core().is_replay(), kind.is_replay());
+        }
+        assert_eq!(
+            Direction::from_core(ironfix_session::capture::Direction::Inbound),
+            Direction::Inbound
+        );
+        assert_eq!(
+            Direction::from_core(ironfix_session::capture::Direction::Outbound),
+            Direction::Outbound
+        );
+    }
+
+    #[test]
+    fn test_kept_ids_are_taken_once_and_pruned() {
+        struct Quiet;
+        impl FrameObserver for Quiet {
+            fn on_inbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+            fn on_outbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+        }
+        let observer: Arc<dyn FrameObserver> = Arc::new(Quiet);
+        let session = SessionId::new("FIX.4.4", "A", "B");
+        let Some(capture) = Capture::bind(Some(&observer), &session) else {
+            panic!("an observer binds");
+        };
+        capture.inbound(b"8=FIX.4.4\x0134=4\x01", FrameKind::Session);
+        capture.keep_frame(4);
+        capture.inbound(b"8=FIX.4.4\x0134=6\x01", FrameKind::Session);
+        capture.keep_frame(6);
+        assert_eq!(capture.take_kept(4), Some(1));
+        assert_eq!(capture.take_kept(4), None);
+        capture.forget_kept_below(7);
+        assert_eq!(capture.take_kept(6), None);
+    }
 
     #[test]
     fn test_peek_msg_seq_num_reads_the_header_field() {
