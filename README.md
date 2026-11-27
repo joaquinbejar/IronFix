@@ -500,7 +500,9 @@ around it.
   `ironfix_store::SyncMessageStore`, implemented by `MemoryStore`; #92).
   With `default-features = false`, `ironfix-store` builds that synchronous
   surface without `tokio` or `async-trait`; its default `async` feature
-  carries `MessageStore`, `SyncStoreAdapter` and `FileStore` (#221). A
+  carries `MessageStore`, `SyncStoreAdapter` and `FileStore` (#221). The
+  fail-closed store policy is in that core too
+  (`ironfix_session::StoreFailurePolicy` and `StoreGate`, #224). A
   driver without Tokio is shown, not shipped: `fix44_poll_client` is a
   single-threaded, poll-driven FIX 4.4 initiator over non-blocking
   `std::net` sockets, built on those pieces in the example crate, and

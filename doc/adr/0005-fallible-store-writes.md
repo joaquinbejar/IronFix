@@ -348,6 +348,9 @@ accepted.
   (`SessionStore`), with no extra `Arc` traffic per call. No figure is stated:
   there is no measurement on named hardware (ADR-0001).
 - The crate DAG is unchanged: `ironfix-store` still depends on `core` only, and
-  the policy lives in `ironfix-engine`. The ordering and policy decisions are
+  the policy lived in `ironfix-engine` until issue #224 moved it into the
+  sans-IO core (`ironfix_session::StoreFailurePolicy`, re-exported by the
+  engine): a driver feeds each write's result and the core decides whether to
+  deliver, hold (`StoreGate`) or close. The ordering and policy decisions are
   synchronous and read no clock (ADR-0002); only the store calls are async, and
   their timeout is the driver's.

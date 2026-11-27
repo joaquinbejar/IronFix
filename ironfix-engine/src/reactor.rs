@@ -2603,10 +2603,9 @@ async fn persist_target_with(
     let Some(store) = store else {
         return Ok(());
     };
-    if persisted.target_to_write(next).is_none() {
+    if persisted.plan_target(next).is_none() {
         return Ok(());
     }
-    persisted.record_target(next);
     store.persist_target(session_id, next).await
 }
 
