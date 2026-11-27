@@ -365,9 +365,22 @@ pub enum CapturePoint {
         kind: FrameKind,
         /// Its `MsgSeqNum` (34), when the driver could read one.
         seq: Option<u64>,
+        /// The driver's capture id for this frame, unique and increasing
+        /// within the established session, so later points can name this
+        /// exact frame. `None` for a handshake frame (it gets no verdict) or
+        /// a driver that assigns no ids.
+        frame_id: Option<u64>,
     },
     /// The core's verdict on an inbound frame of the established session.
-    Inbound(InboundVerdict),
+    Inbound {
+        /// The verdict.
+        verdict: InboundVerdict,
+        /// The capture id of the frame the verdict is about
+        /// ([`CapturePoint::InboundFramed`]): for a frame released from the
+        /// gap queue, the id of the frame that was queued. `None` when the
+        /// driver assigns no ids.
+        frame_id: Option<u64>,
+    },
     /// An outbound frame was built and queued for the wire, before any byte
     /// of it goes to the stream. A resend is [`FrameKind::Replay`] or
     /// [`FrameKind::GapFill`].
@@ -414,7 +427,7 @@ impl CapturePoint {
     #[must_use]
     pub const fn direction(&self) -> Direction {
         match self {
-            Self::InboundFramed { .. } | Self::Inbound(_) => Direction::Inbound,
+            Self::InboundFramed { .. } | Self::Inbound { .. } => Direction::Inbound,
             Self::OutboundQueued { .. } | Self::OutboundResult { .. } => Direction::Outbound,
         }
     }
@@ -427,7 +440,7 @@ impl CapturePoint {
             Self::InboundFramed { kind, .. }
             | Self::OutboundQueued { kind, .. }
             | Self::OutboundResult { kind, .. } => kind,
-            Self::Inbound(_) => FrameKind::Session,
+            Self::Inbound { .. } => FrameKind::Session,
         }
     }
 
@@ -436,8 +449,17 @@ impl CapturePoint {
     pub const fn seq(&self) -> Option<u64> {
         match *self {
             Self::InboundFramed { seq, .. } | Self::OutboundResult { seq, .. } => seq,
-            Self::Inbound(verdict) => Some(verdict.seq()),
+            Self::Inbound { verdict, .. } => Some(verdict.seq()),
             Self::OutboundQueued { seq, .. } => Some(seq),
+        }
+    }
+
+    /// The capture id of the inbound frame the point is about, when known.
+    #[must_use]
+    pub const fn frame_id(&self) -> Option<u64> {
+        match *self {
+            Self::InboundFramed { frame_id, .. } | Self::Inbound { frame_id, .. } => frame_id,
+            Self::OutboundQueued { .. } | Self::OutboundResult { .. } => None,
         }
     }
 
@@ -727,12 +749,19 @@ mod tests {
         let framed = CapturePoint::InboundFramed {
             kind: FrameKind::Handshake,
             seq: None,
+            frame_id: Some(1),
         };
+        assert_eq!(framed.frame_id(), Some(1));
         assert_eq!(framed.direction(), Direction::Inbound);
         assert_eq!(framed.kind(), FrameKind::Handshake);
         assert_eq!(framed.seq(), None);
 
-        let verdict = CapturePoint::Inbound(InboundVerdict::Accepted { seq: 7 });
+        let verdict = CapturePoint::Inbound {
+            verdict: InboundVerdict::Accepted { seq: 7 },
+            frame_id: Some(3),
+        };
+        assert_eq!(verdict.frame_id(), Some(3));
+        assert_eq!(CapturePoint::replayed(3).frame_id(), None);
         assert_eq!(verdict.direction(), Direction::Inbound);
         assert_eq!(verdict.kind(), FrameKind::Session);
         assert_eq!(verdict.seq(), Some(7));
@@ -771,19 +800,30 @@ mod tests {
             &CapturePoint::InboundFramed {
                 kind: FrameKind::Session,
                 seq: Some(1),
+                frame_id: Some(1),
             },
             Some(b"35=0"),
             at,
         );
         if let Some(verdict) = inbound_verdict(&route, 1) {
-            sink.on_capture(&CapturePoint::Inbound(verdict), None, at);
+            sink.on_capture(
+                &CapturePoint::Inbound {
+                    verdict,
+                    frame_id: Some(1),
+                },
+                None,
+                at,
+            );
         }
         let points = sink.0.into_inner();
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].1.as_deref(), Some(&b"35=0"[..]));
         assert_eq!(
             points[1].0,
-            CapturePoint::Inbound(InboundVerdict::Accepted { seq: 1 })
+            CapturePoint::Inbound {
+                verdict: InboundVerdict::Accepted { seq: 1 },
+                frame_id: Some(1),
+            }
         );
     }
 }

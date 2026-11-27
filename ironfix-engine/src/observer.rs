@@ -66,10 +66,15 @@
 //! message whose number is already queued is rejected as a
 //! [`InboundRefusal::QueuedCopy`], and the one frame deferred into the queue
 //! under a number gets a second verdict, accepted, when it is released in
-//! order, without a second [`FrameObserver::on_inbound`]. A verdict names a
-//! `MsgSeqNum` (34), not a captured frame: when two frames under one number
-//! were both deferred (the first one past the queue's bound), the release
-//! verdict does not say which bytes were kept. An accepted
+//! order, without a second [`FrameObserver::on_inbound`]. Every inbound
+//! frame of the established session carries a capture id
+//! ([`Observation::frame_id`]), and every verdict names the id of the frame
+//! it is about: when two frames under one number were both deferred (the
+//! first one past the queue's bound), the release verdict names the one that
+//! was kept. An in-sequence message is reported accepted only once the
+//! receive cursor has advanced past it: a target-counter write that fails
+//! under `StoreFailurePolicy::CloseSession` closes the session with no
+//! acceptance reported. An accepted
 //! message can still be answered with a session Reject (3) for its content;
 //! the number is consumed either way.
 //!
@@ -147,6 +152,7 @@ use crate::outcome::{NotSentReason, SendOutcome, UnknownReason};
 use ironfix_session::{CapturePoint, WriteClass};
 use ironfix_tagvalue::Decoder;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Which way a frame travels, and what kind of frame an [`Observation`] is
@@ -166,6 +172,7 @@ pub struct Observation<'a> {
     direction: Direction,
     kind: FrameKind,
     msg_seq_num: Option<u64>,
+    frame_id: Option<u64>,
     at: Instant,
     session_id: &'a SessionId,
 }
@@ -177,6 +184,7 @@ impl<'a> Observation<'a> {
         direction: Direction,
         kind: FrameKind,
         msg_seq_num: Option<u64>,
+        frame_id: Option<u64>,
         at: Instant,
         session_id: &'a SessionId,
     ) -> Self {
@@ -184,6 +192,7 @@ impl<'a> Observation<'a> {
             direction,
             kind,
             msg_seq_num,
+            frame_id,
             at,
             session_id,
         }
@@ -208,6 +217,17 @@ impl<'a> Observation<'a> {
     #[must_use]
     pub const fn msg_seq_num(&self) -> Option<u64> {
         self.msg_seq_num
+    }
+
+    /// The capture id of the inbound frame the observation is about: unique
+    /// and increasing within the session, assigned when the frame is passed
+    /// to [`FrameObserver::on_inbound`] and carried into every
+    /// [`FrameObserver::on_inbound_verdict`] about that frame, including the
+    /// verdict given when it is released from the gap queue. `None` for an
+    /// outbound observation and for a handshake frame, which gets no verdict.
+    #[must_use]
+    pub const fn frame_id(&self) -> Option<u64> {
+        self.frame_id
     }
 
     /// When the observation was made, on the engine's monotonic clock.
@@ -313,6 +333,10 @@ pub(crate) struct Capture {
     observer: Arc<dyn FrameObserver>,
     /// The session every observation names.
     session_id: SessionId,
+    /// The last inbound capture id handed out; ids start at 1.
+    last_frame_id: Arc<AtomicU64>,
+    /// The capture id of the inbound frame being acted on, 0 for none.
+    current_frame_id: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Capture {
@@ -338,6 +362,8 @@ impl Capture {
         observer.map(|observer| Self {
             observer: Arc::clone(observer),
             session_id: session_id.clone(),
+            last_frame_id: Arc::new(AtomicU64::new(0)),
+            current_frame_id: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -350,6 +376,7 @@ impl Capture {
             point.direction(),
             point.kind(),
             point.seq(),
+            point.frame_id(),
             now(),
             &self.session_id,
         );
@@ -357,7 +384,7 @@ impl Capture {
             (CapturePoint::InboundFramed { .. }, _) => {
                 self.observer.on_inbound(frame, &observation);
             }
-            (CapturePoint::Inbound(verdict), _) => {
+            (CapturePoint::Inbound { verdict, .. }, _) => {
                 self.observer.on_inbound_verdict(verdict, &observation);
             }
             (CapturePoint::OutboundQueued { .. }, _) => {
@@ -381,19 +408,51 @@ impl Capture {
         }
     }
 
-    /// Observes an inbound `frame` of `kind`.
+    /// Observes an inbound `frame` of `kind`. A frame of the established
+    /// session gets a new capture id, which becomes the current frame's; a
+    /// handshake frame gets none (it gets no verdict to link).
     pub(crate) fn inbound(&self, frame: &[u8], kind: FrameKind) {
+        let frame_id = (kind != FrameKind::Handshake).then(|| {
+            // One reactor task per session: a relaxed counter is enough. A
+            // session cannot read 2^64 frames, so the add cannot overflow;
+            // if it ever did, ids stop increasing rather than wrapping.
+            let last = self.last_frame_id.load(Ordering::Relaxed);
+            debug_assert!(last < u64::MAX, "inbound capture ids exhausted");
+            let frame_id = last.checked_add(1).unwrap_or(last);
+            self.last_frame_id.store(frame_id, Ordering::Relaxed);
+            self.current_frame_id.store(frame_id, Ordering::Relaxed);
+            frame_id
+        });
         let point = CapturePoint::InboundFramed {
             kind,
             seq: peek_msg_seq_num(frame),
+            frame_id,
         };
         self.emit(&point, frame, None);
     }
 
-    /// Reports the core's `verdict` on an inbound frame of the established
-    /// session.
+    /// The capture id of the inbound frame being acted on, if any.
+    pub(crate) fn current_frame(&self) -> Option<u64> {
+        match self.current_frame_id.load(Ordering::Relaxed) {
+            0 => None,
+            id => Some(id),
+        }
+    }
+
+    /// Makes `frame_id` the frame being acted on: a frame released from the
+    /// gap queue, observed earlier under that id.
+    pub(crate) fn resume_frame(&self, frame_id: Option<u64>) {
+        self.current_frame_id
+            .store(frame_id.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// Reports the core's `verdict` on the inbound frame being acted on.
     pub(crate) fn verdict(&self, verdict: InboundVerdict) {
-        self.emit(&CapturePoint::Inbound(verdict), &[], None);
+        let point = CapturePoint::Inbound {
+            verdict,
+            frame_id: self.current_frame(),
+        };
+        self.emit(&point, &[], None);
     }
 
     /// Observes an outbound `frame` of `kind`, numbered `seq`.

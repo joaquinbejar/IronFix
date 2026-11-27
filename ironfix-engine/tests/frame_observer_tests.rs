@@ -1535,3 +1535,209 @@ async fn test_observer_verdicts_under_the_gap_queue() {
         ]
     );
 }
+
+/// A store whose next-target writes fail from `fail_from` on.
+struct FailingTargetStore {
+    inner: MemoryStore,
+    fail_from: u64,
+}
+
+#[async_trait]
+impl MessageStore for FailingTargetStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.store(seq_num, msg_type, message).await
+    }
+    async fn get_range(
+        &self,
+        begin: u64,
+        end: u64,
+    ) -> Result<Vec<ironfix_store::StoredMessage>, ironfix_core::error::StoreError> {
+        self.inner.get_range(begin, end).await
+    }
+    fn next_sender_seq(&self) -> u64 {
+        self.inner.next_sender_seq()
+    }
+    fn next_target_seq(&self) -> u64 {
+        self.inner.next_target_seq()
+    }
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.set_next_sender_seq(seq).await
+    }
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), ironfix_core::error::StoreError> {
+        if seq >= self.fail_from {
+            return Err(ironfix_core::error::StoreError::StoreFailed {
+                seq_num: seq,
+                reason: "refused by the test store".to_string(),
+            });
+        }
+        self.inner.set_next_target_seq(seq).await
+    }
+    async fn reset(&self) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.reset().await
+    }
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.inner.creation_time()
+    }
+}
+
+/// Under `StoreFailurePolicy::CloseSession`, an in-sequence Heartbeat whose
+/// target-counter write fails closes the session and is never reported
+/// accepted: acceptance follows the receive cursor.
+#[tokio::test]
+async fn test_failed_target_write_is_not_reported_accepted() {
+    let recorder = Arc::new(VerdictRecorder::default());
+    let store = Arc::new(FailingTargetStore {
+        inner: MemoryStore::new(),
+        fail_from: 3,
+    });
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_store(store as Arc<dyn MessageStore>)
+        .with_store_failure_policy(ironfix_engine::StoreFailurePolicy::CloseSession)
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("0", 2, &[])).await;
+    closed(&member, "the failed target write closes the session").await;
+
+    assert!(
+        locked(&recorder.inbound).contains(&Some(2)),
+        "the Heartbeat was observed"
+    );
+    let verdicts = locked(&recorder.verdicts).clone();
+    assert!(
+        verdicts
+            .iter()
+            .all(|(_, _, verdict)| !verdict.is_accepted()),
+        "nothing was accepted past a failed target write: {verdicts:?}"
+    );
+    assert_eq!(member.next_target_seq(), 2, "the cursor did not move");
+}
+
+/// One observed inbound frame: capture id, `MsgSeqNum` (34), length.
+type ObservedFrame = (Option<u64>, Option<u64>, usize);
+
+/// A frame observer recording capture ids: each inbound frame's id with its
+/// `MsgSeqNum`, and each verdict with the id it names.
+#[derive(Debug, Default)]
+struct IdRecorder {
+    frames: Mutex<Vec<ObservedFrame>>,
+    verdicts: Mutex<Vec<(Option<u64>, InboundVerdict)>>,
+}
+
+impl FrameObserver for IdRecorder {
+    fn on_inbound(&self, frame: &[u8], observation: &Observation<'_>) {
+        locked(&self.frames).push((
+            observation.frame_id(),
+            observation.msg_seq_num(),
+            frame.len(),
+        ));
+    }
+
+    fn on_outbound(&self, _frame: &[u8], observation: &Observation<'_>) {
+        assert_eq!(observation.frame_id(), None);
+    }
+
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, observation: &Observation<'_>) {
+        locked(&self.verdicts).push((observation.frame_id(), *verdict));
+    }
+}
+
+/// Under `GapPolicy::Queue`, an oversized frame past the queue's byte bound
+/// is deferred but not stored, and a smaller frame under the same number is
+/// stored: the release verdict names the stored frame's capture id.
+#[tokio::test]
+async fn test_release_verdict_names_the_stored_frame() {
+    let recorder = Arc::new(IdRecorder::default());
+    let config = member_config().with_gap_policy(GapPolicy::Queue {
+        max_messages: 16,
+        max_bytes: 400,
+    });
+    let initiator = Initiator::new(config, Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    let padding = "X".repeat(600);
+    venue
+        .send(venue_msg(
+            "D",
+            3,
+            &[
+                (11, "BIG"),
+                (55, "EUR/USD"),
+                (54, "1"),
+                (38, "1"),
+                (58, &padding),
+            ],
+        ))
+        .await;
+    assert_eq!(header(&venue.next().await).0, "2");
+    venue
+        .send(venue_msg(
+            "D",
+            3,
+            &[(11, "SMALL"), (55, "EUR/USD"), (54, "1"), (38, "1")],
+        ))
+        .await;
+    venue
+        .send(venue_msg("4", 2, &[(123, "Y"), (36, "3")]))
+        .await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the stored frame is released",
+    );
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 4, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let frames = locked(&recorder.frames).clone();
+    let ids_of_3: Vec<(Option<u64>, usize)> = frames
+        .iter()
+        .filter(|(_, seq, _)| *seq == Some(3))
+        .map(|(id, _, len)| (*id, *len))
+        .collect();
+    assert_eq!(ids_of_3.len(), 2, "both copies of 3 observed: {frames:?}");
+    let (big, small) = (ids_of_3[0], ids_of_3[1]);
+    assert!(big.1 > small.1, "the first copy is the oversized one");
+    assert!(big.0.is_some() && small.0.is_some() && big.0 != small.0);
+    let ids: Vec<Option<u64>> = frames.iter().map(|(id, _, _)| *id).collect();
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids increase: {ids:?}");
+
+    let verdicts = locked(&recorder.verdicts).clone();
+    let on_3: Vec<(Option<u64>, InboundVerdict)> = verdicts
+        .iter()
+        .filter(|(_, verdict)| verdict.seq() == 3)
+        .copied()
+        .collect();
+    assert_eq!(
+        on_3,
+        vec![
+            (
+                big.0,
+                InboundVerdict::Deferred {
+                    seq: 3,
+                    expected: 2
+                }
+            ),
+            (
+                small.0,
+                InboundVerdict::Deferred {
+                    seq: 3,
+                    expected: 2
+                }
+            ),
+            (small.0, InboundVerdict::Accepted { seq: 3 }),
+        ],
+        "the release verdict names the stored (smaller) frame"
+    );
+}
