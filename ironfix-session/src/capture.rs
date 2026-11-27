@@ -283,12 +283,11 @@ pub const fn released_verdict(seq: u64) -> InboundVerdict {
 /// `queued_copy` is whether the gap queue already holds a message under
 /// this number: a gapped fill that is such a copy is dropped.
 ///
-/// A Reset (which has no place in the sequence) reaches the application and
-/// is reported accepted before the application runs; a refusal by the
-/// application ([`InboundRefusal::Refused`]) or by the core
-/// ([`sequence_reset_verdict`]) follows as a second verdict. An in-sequence
-/// GapFill gets `None` here: its acceptance is reported with the decision
-/// ([`sequence_reset_verdict`]), once the receive cursor has moved past it.
+/// `None` for a message that reaches the application, an in-sequence
+/// GapFill or a Reset: its verdict is the application's refusal
+/// ([`InboundRefusal::Refused`]) or the core's decision
+/// ([`sequence_reset_verdict`]), which says accepted only once the new
+/// cursor has taken effect.
 #[must_use]
 pub const fn sequence_reset_screen_verdict(
     screen: &ResetScreen,
@@ -317,10 +316,10 @@ pub const fn sequence_reset_screen_verdict(
             seq,
             reason: InboundRefusal::Exhausted,
         },
-        ResetScreen::FillInSequence { .. } => return None,
-        // Reset mode has no place in the sequence: its MsgSeqNum is not
-        // counted, so it cannot exhaust the counter.
-        ResetScreen::Reset => InboundVerdict::Accepted { seq },
+        // Reset mode has no place in the sequence (its MsgSeqNum is not
+        // counted, so it cannot exhaust the counter): like an in-sequence
+        // fill, it is reported once it is applied or refused.
+        ResetScreen::FillInSequence { .. } | ResetScreen::Reset => return None,
     };
     Some(verdict)
 }
@@ -329,18 +328,12 @@ pub const fn sequence_reset_screen_verdict(
 /// core's decision on it
 /// ([`decide_sequence_reset`](crate::sans_io::decide_sequence_reset)), made
 /// once the application has accepted it: a rejection when the core refuses
-/// it; for an applied GapFill (`gap_fill`), its acceptance, which the driver
-/// reports once the receive cursor has moved; `None` for an applied Reset
-/// (its screen verdict already said accepted).
+/// it; for an applied GapFill or Reset, its acceptance, which the driver
+/// reports once the new receive cursor has taken effect.
 #[must_use]
-pub const fn sequence_reset_verdict(
-    decision: &ResetDecision,
-    gap_fill: bool,
-    seq: u64,
-) -> Option<InboundVerdict> {
+pub const fn sequence_reset_verdict(decision: &ResetDecision, seq: u64) -> Option<InboundVerdict> {
     match decision {
-        ResetDecision::Apply { .. } if gap_fill => Some(InboundVerdict::Accepted { seq }),
-        ResetDecision::Apply { .. } => None,
+        ResetDecision::Apply { .. } => Some(InboundVerdict::Accepted { seq }),
         ResetDecision::MissingNewSeqNo
         | ResetDecision::FillNotAdvancing { .. }
         | ResetDecision::ResetBelowExpected { .. } => Some(InboundVerdict::Rejected {
@@ -710,19 +703,19 @@ mod tests {
         let reset = screen_sequence_reset(&sequences, None, 1, || false);
         assert_eq!(
             sequence_reset_screen_verdict(&reset, false, 1),
-            Some(InboundVerdict::Accepted { seq: 1 })
+            None,
+            "a Reset is reported once applied or refused, never on routing"
         );
         // Reset mode ignores its MsgSeqNum: even u64::MAX is not exhaustion.
         let reset = screen_sequence_reset(&sequences, None, u64::MAX, || false);
         assert_eq!(reset, ResetScreen::Reset);
-        assert_eq!(
-            sequence_reset_screen_verdict(&reset, false, u64::MAX),
-            Some(InboundVerdict::Accepted { seq: u64::MAX })
-        );
+        assert_eq!(sequence_reset_screen_verdict(&reset, false, u64::MAX), None);
     }
 
     #[test]
     fn test_sequence_reset_decision_verdicts() {
+        // An applied GapFill or Reset is accepted with the decision, once
+        // the new cursor has taken effect.
         assert_eq!(
             sequence_reset_verdict(
                 &ResetDecision::Apply {
@@ -730,21 +723,6 @@ mod tests {
                     renumbers: false,
                     advances: true
                 },
-                false,
-                5
-            ),
-            None
-        );
-        // An applied GapFill is accepted with the decision, once the cursor
-        // has moved.
-        assert_eq!(
-            sequence_reset_verdict(
-                &ResetDecision::Apply {
-                    new_seq: 9,
-                    renumbers: false,
-                    advances: true
-                },
-                true,
                 5
             ),
             Some(InboundVerdict::Accepted { seq: 5 })
@@ -758,7 +736,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                sequence_reset_verdict(&decision, true, 5),
+                sequence_reset_verdict(&decision, 5),
                 Some(InboundVerdict::Rejected {
                     seq: 5,
                     reason: InboundRefusal::InvalidSequenceReset

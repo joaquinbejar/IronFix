@@ -4717,7 +4717,7 @@ impl<A: Application> Reactor<A> {
         let decision = decide_sequence_reset(gap_fill, seq, new_seq_no, expected);
         // A refusal is reported now; an applied GapFill's acceptance once the
         // cursor has moved past it, below.
-        let verdict = sequence_reset_verdict(&decision, gap_fill, seq);
+        let verdict = sequence_reset_verdict(&decision, seq);
         if !matches!(decision, ResetDecision::Apply { .. })
             && let Some(verdict) = verdict
         {
