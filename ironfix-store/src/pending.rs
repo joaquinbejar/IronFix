@@ -161,6 +161,12 @@ struct Stopped<'a>(&'a Shared);
 impl Drop for Stopped<'_> {
     fn drop(&mut self) {
         {
+            // Under the job lock too, so an enqueue either lands before the
+            // worker is gone or is refused with `Closed`.
+            let _jobs = self.0.jobs.lock();
+            self.0.stopped.store(true, Ordering::Release);
+        }
+        {
             // Under the lock, so a drain that saw the queue empty and the
             // flag clear is already waiting when it is notified.
             let _outcomes = self.0.outcomes.lock();
@@ -437,6 +443,9 @@ fn enqueue(shared: &Shared, job: impl FnOnce() -> Job) -> Result<(), PendingErro
     if shared.failed.load(Ordering::Acquire) {
         return Err(PendingError::Failed);
     }
+    if shared.stopped.load(Ordering::Acquire) {
+        return Err(PendingError::Closed);
+    }
     // One push into reserved capacity (the caller checked the bound).
     jobs.queue.push_back(job());
     drop(jobs);
@@ -515,6 +524,8 @@ mod tests {
         gate: Option<Mutex<mpsc::Receiver<()>>>,
         fail_at: Option<u64>,
         fail_with: StoreError,
+        /// Panics in the `panic_at` write, to stop the worker.
+        panic_at: Option<u64>,
         /// Signalled when a write starts (before the gate), and again once
         /// the `fail_at` write has decided to fail.
         failing: Option<Mutex<mpsc::Sender<()>>>,
@@ -529,6 +540,9 @@ mod tests {
                 && gate.lock().recv_timeout(Duration::from_secs(5)).is_err()
             {
                 return Err(StoreError::Io("gate timed out".to_owned()));
+            }
+            if self.panic_at == Some(seq) {
+                panic!("injected backend panic");
             }
             if self.fail_at == Some(seq) {
                 if let Some(failing) = &self.failing {
@@ -587,6 +601,7 @@ mod tests {
             fail_at,
             fail_with,
             failing: None,
+            panic_at: None,
         };
         match PendingStore::new(Arc::new(store), bound(n)) {
             Ok(p) => (p, open),
@@ -711,6 +726,7 @@ mod tests {
             fail_at: Some(1),
             fail_with: injected(1),
             failing: Some(Mutex::new(failing)),
+            panic_at: None,
         };
         let mut p = match PendingStore::new(Arc::new(store), bound(4)) {
             Ok(p) => p,
@@ -746,6 +762,37 @@ mod tests {
             p.drain(),
             Err(StoreError::StoreFailed { seq_num: 1, .. })
         ));
+    }
+
+    /// A worker that dies is published under the job lock: an enqueue that
+    /// passed the unlocked check is refused with `Closed`, not ticketed.
+    #[test]
+    fn test_pending_store_refuses_an_enqueue_once_the_worker_stopped() {
+        let store = GatedStore {
+            inner: MemoryStore::new(),
+            gate: None,
+            fail_at: None,
+            fail_with: injected(0),
+            failing: None,
+            panic_at: Some(1),
+        };
+        let mut p = match PendingStore::new(Arc::new(store), bound(4)) {
+            Ok(p) => p,
+            Err(err) => panic!("new: {err:?}"),
+        };
+        assert!(submit(&mut p, 1).is_ok());
+        while !p.shared.stopped.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        loop {
+            match enqueue(&p.shared, || panic!("a job built after the worker stopped")) {
+                Err(PendingError::Closed) => break,
+                Err(PendingError::Busy) => std::thread::yield_now(),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(submit(&mut p, 2), Err(PendingError::Closed));
+        assert!(matches!(p.drain(), Err(StoreError::Io(_))));
     }
 
     #[test]
@@ -788,6 +835,7 @@ mod tests {
             fail_at: None,
             fail_with: injected(0),
             failing: None,
+            panic_at: None,
         });
         let mut p = match PendingStore::new(Arc::clone(&store), bound(8)) {
             Ok(p) => p,
