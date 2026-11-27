@@ -323,12 +323,36 @@ impl PersistedCounters {
 
     /// Plans the target write that must come before an inbound message that
     /// moved the next target number to `next` is acted on: `Some` when the
-    /// value changed (and records it as attempted), `None` when nothing needs
-    /// writing.
-    pub fn plan_target(&mut self, next: u64) -> Option<StoreWrite> {
+    /// value changed, `None` when nothing needs writing.
+    ///
+    /// Planning records nothing: a planned write that the driver defers or
+    /// drops is planned again next time. The driver calls
+    /// [`record_attempt`](Self::record_attempt) when it starts the call.
+    #[must_use]
+    pub fn plan_target(self, next: u64) -> Option<StoreWrite> {
         self.target_to_write(next)?;
-        self.record_target(next);
         Some(StoreWrite::NextTarget { next })
+    }
+
+    /// Records that the driver started `write`, so the counters it carries
+    /// are not written again until they move. Call it when the store call
+    /// starts (under [`StoreFailurePolicy::Continue`] a failed attempt is not
+    /// retried until the counter moves), never when the write is only
+    /// planned. A write that carries no counter records nothing.
+    pub const fn record_attempt(&mut self, write: StoreWrite) {
+        match write {
+            StoreWrite::OutboundFrame { next_sender, .. } => self.record_sender(next_sender),
+            StoreWrite::NextSender { next } => self.record_sender(next),
+            StoreWrite::NextTarget { next } => self.record_target(next),
+            StoreWrite::Reset {
+                next_sender,
+                next_target,
+            } => {
+                self.record_sender(next_sender);
+                self.record_target(next_target);
+            }
+            StoreWrite::AppWatermark { .. } | StoreWrite::Refresh => {}
+        }
     }
 }
 
@@ -482,11 +506,41 @@ mod tests {
             persisted.plan_target(5),
             Some(StoreWrite::NextTarget { next: 5 })
         );
+        persisted.record_attempt(StoreWrite::NextTarget { next: 5 });
         assert_eq!(persisted.plan_target(5), None);
         assert_eq!(
             persisted.plan_target(6),
             Some(StoreWrite::NextTarget { next: 6 })
         );
+    }
+
+    #[test]
+    fn test_a_planned_but_unattempted_write_is_planned_again() {
+        // A poll driver that plans, then defers the call, must not be told
+        // later that nothing needs writing.
+        let persisted = PersistedCounters::new();
+        let first = persisted.plan_target(7);
+        assert_eq!(first, Some(StoreWrite::NextTarget { next: 7 }));
+        assert_eq!(persisted.plan_target(7), first);
+    }
+
+    #[test]
+    fn test_record_attempt_covers_every_counter_a_write_carries() {
+        let mut persisted = PersistedCounters::new();
+        persisted.record_attempt(StoreWrite::OutboundFrame {
+            seq: 4,
+            next_sender: 5,
+        });
+        assert_eq!(persisted.sender_to_write(5), None);
+        persisted.record_attempt(StoreWrite::Reset {
+            next_sender: 2,
+            next_target: 3,
+        });
+        assert_eq!(persisted.sender_to_write(2), None);
+        assert_eq!(persisted.target_to_write(3), None);
+        persisted.record_attempt(StoreWrite::Refresh);
+        persisted.record_attempt(StoreWrite::AppWatermark { watermark: 9 });
+        assert_eq!(persisted.target_to_write(3), None);
     }
 
     #[test]
@@ -505,7 +559,9 @@ mod tests {
             let Some(write) = persisted.plan_target(seq + 1) else {
                 continue;
             };
-            match StoreGate::hold(write, seq).resolve(StoreFailurePolicy::CloseSession, result) {
+            let gate = StoreGate::hold(write, seq);
+            persisted.record_attempt(gate.write());
+            match gate.resolve(StoreFailurePolicy::CloseSession, result) {
                 StoreRelease::Deliver(msg) | StoreRelease::DeliverUnpersisted(msg) => {
                     delivered.push(msg);
                 }

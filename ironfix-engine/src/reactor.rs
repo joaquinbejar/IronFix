@@ -2603,9 +2603,12 @@ async fn persist_target_with(
     let Some(store) = store else {
         return Ok(());
     };
-    if persisted.plan_target(next).is_none() {
+    let Some(write) = persisted.plan_target(next) else {
         return Ok(());
-    }
+    };
+    // Recorded as attempted once the call is about to start, not when it was
+    // planned.
+    persisted.record_attempt(write);
     store.persist_target(session_id, next).await
 }
 
