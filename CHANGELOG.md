@@ -4,6 +4,27 @@ All notable changes to the IronFix workspace are recorded here. Versions
 follow [Semantic Versioning](https://semver.org/); while the workspace is at
 0.x, a change that breaks behaviour or the public API takes a minor bump.
 
+## Unreleased
+
+### Breaking: chrono is an opt-in feature of ironfix-core (#225)
+
+RUSTSEC-2026-0543 marks `chrono` unmaintained. With default features no
+IronFix crate has `chrono` in its normal dependency graph; this change needs
+a minor bump (0.6.0).
+
+- `Timestamp::to_datetime` and `TryFrom<chrono::DateTime<Utc>> for
+  Timestamp` are behind the new `chrono` feature of `ironfix-core`, off by
+  default. Migration: enable `ironfix-core/chrono`, or use the new calendar
+  API below.
+- New on `Timestamp`, no dependency: `date`, `year`, `month`, `day`, `hour`,
+  `minute`, `second`, `nanosecond`, `iso_weekday`, `as_unix_seconds`,
+  `from_unix_seconds`, `from_unix_parts` and the checked
+  `from_utc_ymd_hms_nanos` (a `23:59:60` leap second folds onto the next day,
+  as the chrono conversion did). New `TimestampError::CivilFieldOutOfRange`.
+- The UTCTimestamp formatters use hand-written civil-date arithmetic and stay
+  byte-identical to chrono and allocation-free; the tests keep chrono as a
+  dev-dependency to prove it.
+
 ## 0.5.3 (2026-11-13)
 
 Both changes below are backward compatible; `cargo-semver-checks` finds no
