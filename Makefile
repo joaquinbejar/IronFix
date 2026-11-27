@@ -113,6 +113,8 @@ check-store-deps:
 		exit 1; \
 	fi
 	@cargo build -q -p ironfix-store --no-default-features
+	@cargo test -q -p ironfix-store --no-default-features
+	@RUSTDOCFLAGS="-D warnings" cargo doc -q -p ironfix-store --no-default-features --no-deps
 	@echo "check-store-deps: ironfix-store builds without tokio and async-trait."
 
 # Proves every publishable crate declares the licences of what it publishes

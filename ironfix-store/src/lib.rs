@@ -65,6 +65,12 @@
 //!   no synchronous file store yet: [`FileStore`] answers through its writer
 //!   thread with `tokio` oneshot replies and needs the feature.
 
+// The synchronous contract is stated once, on `MessageStore`, and
+// `SyncMessageStore` points at it method by method. Without the `async`
+// feature those targets are not compiled, so the links cannot resolve; the
+// published docs build with default features, where every link resolves.
+#![cfg_attr(not(feature = "async"), allow(rustdoc::broken_intra_doc_links))]
+
 #[cfg(feature = "async")]
 pub mod file;
 pub mod memory;
