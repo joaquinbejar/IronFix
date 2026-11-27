@@ -65,10 +65,11 @@
 //!   no synchronous file store yet: [`FileStore`] answers through its writer
 //!   thread with `tokio` oneshot replies and needs the feature.
 
-// The synchronous contract is stated once, on `MessageStore`, and
-// `SyncMessageStore` points at it method by method. Without the `async`
-// feature those targets are not compiled, so the links cannot resolve; the
-// published docs build with default features, where every link resolves.
+// The store contract (persistence order, call order, frame requirements) is
+// in the `traits` module docs, built in every configuration. Method-level
+// links from `SyncMessageStore` to `MessageStore`, and links to
+// `FileStore`, target items the `async` feature compiles; without it they
+// cannot resolve. The published docs build with default features.
 #![cfg_attr(not(feature = "async"), allow(rustdoc::broken_intra_doc_links))]
 
 #[cfg(feature = "async")]
@@ -76,7 +77,6 @@ pub mod file;
 pub mod memory;
 pub mod stored;
 pub mod sync_traits;
-#[cfg(feature = "async")]
 pub mod traits;
 
 #[cfg(feature = "async")]

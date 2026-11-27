@@ -43,6 +43,11 @@ use ironfix_core::message::MsgType;
 pub trait SyncMessageStore: Send + Sync {
     /// See [`MessageStore::store`].
     ///
+    /// `message` must be the **complete frame**, from `BeginString` (8)
+    /// through `CheckSum` (10), because a resend rebuilds from it verbatim.
+    /// Filing under a `seq_num` that is already filed **replaces** the frame
+    /// there.
+    ///
     /// # Errors
     /// Returns `StoreError` if the message cannot be stored.
     fn store(&self, seq_num: u64, msg_type: &MsgType, message: &[u8]) -> Result<(), StoreError>;
