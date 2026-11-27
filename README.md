@@ -503,10 +503,6 @@ around it.
   carries `MessageStore`, `SyncStoreAdapter` and `FileStore` (#221). The
   fail-closed store policy is in that core too
   (`ironfix_session::StoreFailurePolicy` and `StoreGate`, #224).
-  `PendingStore` wraps any `SyncMessageStore` in a bounded submit/poll form
-  (`submit` returns a `Ticket` or `PendingError::Full`; `poll_durable`
-  reports the highest durable sequence number without blocking; #222). It
-  is not wired into either engine.
   `PendingStore` owns a `SyncMessageStore` and gives it a bounded
   submit/poll form (`submit` returns a `Ticket` or `PendingError::Full`;
   `poll_durable` reports the highest durable sequence number without
