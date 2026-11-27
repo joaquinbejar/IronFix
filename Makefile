@@ -103,6 +103,20 @@ check-tls-deps:
 		|| { echo "check-tls-deps: rustls is missing with the tls feature on"; exit 1; }
 	@echo "check-tls-deps: no TLS crate without the feature; no crypto provider forced with it."
 
+# Issue #221: ironfix-store's `async` feature is additive. With default
+# features off, neither tokio nor async-trait may enter its normal graph.
+.PHONY: check-store-deps
+check-store-deps:
+	@if cargo tree -p ironfix-store --no-default-features -e normal --prefix none | grep -Eq '^(tokio|async-trait) '; then \
+		echo "check-store-deps: tokio or async-trait is in ironfix-store's normal graph without the async feature:"; \
+		cargo tree -p ironfix-store --no-default-features -e normal --prefix none | grep -E '^(tokio|async-trait) ' | sort -u; \
+		exit 1; \
+	fi
+	@cargo build -q -p ironfix-store --no-default-features
+	@cargo test -q -p ironfix-store --no-default-features
+	@RUSTDOCFLAGS="-D warnings" cargo doc -q -p ironfix-store --no-default-features --no-deps
+	@echo "check-store-deps: ironfix-store builds without tokio and async-trait."
+
 # Proves every publishable crate declares the licences of what it publishes
 # (issue #202). For each crate without `publish = false`, `cargo package
 # --list` is the list of published files; each licence file and vendored

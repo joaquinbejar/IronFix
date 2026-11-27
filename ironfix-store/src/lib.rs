@@ -54,17 +54,39 @@
 //! after which the session must reset its sequence. It never returns a record
 //! it cannot vouch for (see the [`file`](mod@file) module and
 //! `doc/adr/0006-file-store.md`). There is no memory-mapped store.
+//!
+//! ## Features
+//!
+//! - **`async`** (default): [`MessageStore`], [`SyncStoreAdapter`] and
+//!   [`FileStore`], which depend on `tokio` and `async-trait`. With
+//!   `default-features = false` the crate is [`SyncMessageStore`],
+//!   [`MemoryStore`] and [`StoredMessage`], and neither `tokio` nor
+//!   `async-trait` is in its normal dependency graph (issue #221). There is
+//!   no synchronous file store yet: [`FileStore`] answers through its writer
+//!   thread with `tokio` oneshot replies and needs the feature.
 
+// The store contract (persistence order, call order, frame requirements) is
+// in the `traits` module docs, built in every configuration. Method-level
+// links from `SyncMessageStore` to `MessageStore`, and links to
+// `FileStore`, target items the `async` feature compiles; without it they
+// cannot resolve. The published docs build with default features.
+#![cfg_attr(not(feature = "async"), allow(rustdoc::broken_intra_doc_links))]
+
+#[cfg(feature = "async")]
 pub mod file;
 pub mod memory;
 pub mod stored;
 pub mod sync_traits;
 pub mod traits;
 
+#[cfg(feature = "async")]
 pub use file::{
     FileStore, FileStoreConfig, FileStoreConfigError, SyncPolicy, Truncation, TruncationCause,
 };
 pub use memory::MemoryStore;
 pub use stored::StoredMessage;
-pub use sync_traits::{SyncMessageStore, SyncStoreAdapter};
+pub use sync_traits::SyncMessageStore;
+#[cfg(feature = "async")]
+pub use sync_traits::SyncStoreAdapter;
+#[cfg(feature = "async")]
 pub use traits::MessageStore;

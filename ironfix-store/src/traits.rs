@@ -93,15 +93,23 @@
 //! Error values must never contain frame bytes: an outbound Logon carries
 //! `Password` (554), and the engine logs store errors.
 
+#[cfg(feature = "async")]
 use crate::stored::StoredMessage;
+#[cfg(feature = "async")]
 use async_trait::async_trait;
+#[cfg(feature = "async")]
 use ironfix_core::error::StoreError;
+#[cfg(feature = "async")]
 use ironfix_core::message::MsgType;
 
 /// Abstract interface for FIX message storage.
 ///
 /// Implementations of this trait provide persistence for outgoing messages
 /// to support resend requests and session recovery.
+///
+/// Needs the `async` feature; the contract in the module docs above binds
+/// [`SyncMessageStore`](crate::SyncMessageStore) with or without it.
+#[cfg(feature = "async")]
 #[async_trait]
 pub trait MessageStore: Send + Sync {
     /// Stores an outgoing message for potential resend.
@@ -438,7 +446,7 @@ pub trait MessageStore: Send + Sync {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "async"))]
 mod tests {
     use super::*;
 

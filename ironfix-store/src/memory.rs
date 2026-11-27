@@ -10,7 +10,9 @@
 //! testing and applications that don't require persistence.
 
 use crate::stored::StoredMessage;
+#[cfg(feature = "async")]
 use crate::traits::MessageStore;
+#[cfg(feature = "async")]
 use async_trait::async_trait;
 use bytes::Bytes;
 use ironfix_core::error::StoreError;
@@ -232,6 +234,7 @@ impl crate::sync_traits::SyncMessageStore for MemoryStore {
 /// The async trait runs the synchronous methods inline: each call completes
 /// within one poll of its future, so a dropped future has either applied its
 /// mutation in full or not started it.
+#[cfg(feature = "async")]
 #[async_trait]
 impl MessageStore for MemoryStore {
     async fn store(
@@ -304,7 +307,7 @@ impl MessageStore for MemoryStore {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "async"))]
 mod tests {
     use super::*;
 
@@ -645,5 +648,27 @@ mod tests {
         assert_eq!(store.message_count(), 0);
         assert_eq!(store.next_sender_seq(), 1);
         assert_eq!(store.next_target_seq(), 1);
+    }
+}
+
+/// Runs with or without the `async` feature: the synchronous surface needs
+/// no runtime (issue #221).
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use crate::sync_traits::SyncMessageStore;
+
+    #[test]
+    fn test_memory_store_sync_store_and_range_without_a_runtime() {
+        let store = MemoryStore::new();
+        assert!(SyncMessageStore::store(&store, 1, &MsgType::Heartbeat, b"8=FIX.4.4\x01").is_ok());
+        assert!(SyncMessageStore::set_next_sender_seq(&store, 2).is_ok());
+        assert_eq!(SyncMessageStore::next_sender_seq(&store), 2);
+        match SyncMessageStore::get_range(&store, 1, 1) {
+            Ok(messages) => assert_eq!(messages.len(), 1),
+            Err(err) => panic!("range: {err:?}"),
+        }
+        assert!(SyncMessageStore::reset(&store).is_ok());
+        assert_eq!(SyncMessageStore::next_sender_seq(&store), 1);
     }
 }

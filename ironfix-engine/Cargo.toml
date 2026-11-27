@@ -13,7 +13,7 @@ categories.workspace = true
 [dependencies]
 ironfix-core.workspace = true
 ironfix-session.workspace = true
-ironfix-store.workspace = true
+ironfix-store = { workspace = true, features = ["async"] }
 ironfix-transport.workspace = true
 ironfix-tagvalue.workspace = true
 thiserror.workspace = true
