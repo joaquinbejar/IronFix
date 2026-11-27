@@ -14,7 +14,8 @@
 //! - [`PendingStore::submit`] queues one outbound frame under its sequence
 //!   number and returns a [`Ticket`] at once, or
 //!   [`PendingError::Full`] when the configured bound of in-flight writes
-//!   is reached;
+//!   is reached (or the retryable [`PendingError::Busy`] if the worker held
+//!   the queue lock at that instant);
 //! - [`PendingStore::poll_durable`] collects the writes the worker finished
 //!   and reports the highest sequence number now durable. It never waits on
 //!   the worker: if the worker is publishing an outcome at that instant, the
@@ -72,6 +73,10 @@ pub enum PendingError {
     /// A write failed earlier; the store refuses every later write.
     #[error("pending store refused the write: an earlier write failed")]
     Failed,
+    /// The worker held the queue lock at that instant (it holds it only to
+    /// take one job); nothing was queued. Retry on the next duty cycle.
+    #[error("pending store queue is busy; retry")]
+    Busy,
     /// The worker thread is gone.
     #[error("pending store worker has stopped")]
     Closed,
@@ -223,8 +228,9 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     /// [`PendingError::Full`] when `bound` writes are in flight,
     /// [`PendingError::Failed`] after a failed write,
     /// [`PendingError::OutOfOrder`] when `seq` is not above the last
-    /// submitted, [`PendingError::SequenceExhausted`] for `u64::MAX`, and
-    /// [`PendingError::Closed`] when the worker is gone.
+    /// submitted, [`PendingError::SequenceExhausted`] for `u64::MAX`,
+    /// [`PendingError::Busy`] when the worker held the queue lock at that
+    /// instant, and [`PendingError::Closed`] when the worker is gone.
     pub fn submit(
         &mut self,
         seq: u64,
@@ -250,15 +256,19 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         let Some(next_sender) = seq.checked_add(1) else {
             return Err(PendingError::SequenceExhausted { seq });
         };
-        let job = Job {
+        // `try_lock`: the worker holds the lock only to pop, and a submit
+        // must not wait for it.
+        let Some(mut jobs) = self.shared.jobs.try_lock() else {
+            return Err(PendingError::Busy);
+        };
+        // One push into reserved capacity (`in_flight < bound`).
+        jobs.queue.push_back(Job {
             seq,
             msg_type: msg_type.clone(),
             message: message.to_vec(),
             next_sender,
-        };
-        // One push into reserved capacity (`in_flight < bound`); the worker
-        // holds this lock only to pop.
-        self.shared.jobs.lock().queue.push_back(job);
+        });
+        drop(jobs);
         self.shared.job_ready.notify_one();
         // `in_flight < bound <= usize::MAX`, checked above.
         self.in_flight += 1;
@@ -564,8 +574,14 @@ mod tests {
         pending_with(n, fail_at, injected(fail_at.unwrap_or(0)))
     }
 
+    /// Submits, retrying while the queue is busy.
     fn submit(p: &mut PendingStore<GatedStore>, seq: u64) -> Result<Ticket, PendingError> {
-        p.submit(seq, &MsgType::Heartbeat, b"8=FIX.4.4\x0135=0\x0110=000\x01")
+        loop {
+            match p.submit(seq, &MsgType::Heartbeat, b"8=FIX.4.4\x0135=0\x0110=000\x01") {
+                Err(PendingError::Busy) => std::thread::yield_now(),
+                other => return other,
+            }
+        }
     }
 
     /// Polls until the durable sequence number reaches `seq` or 5 s pass.
@@ -704,7 +720,15 @@ mod tests {
             Err(err) => panic!("new: {err:?}"),
         };
         for seq in 1..=8 {
-            assert!(p.submit(seq, &MsgType::Heartbeat, b"8=FIX.4.4\x01").is_ok());
+            loop {
+                match p.submit(seq, &MsgType::Heartbeat, b"8=FIX.4.4\x01") {
+                    Err(PendingError::Busy) => std::thread::yield_now(),
+                    other => {
+                        assert!(other.is_ok());
+                        break;
+                    }
+                }
+            }
         }
         drop(p);
         assert_eq!(store.inner.message_count(), 8);
