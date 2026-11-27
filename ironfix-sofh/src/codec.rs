@@ -4,7 +4,9 @@
    Date: 18/10/26
 ******************************************************************************/
 
-//! Tokio codec for SOFH message framing.
+//! SOFH message framing: a sync frame decoder and encoder over `&[u8]` and
+//! `BytesMut`, plus (behind the default `codec` feature) the `tokio_util`
+//! codec impls, which delegate to it.
 //!
 //! [`SofhCodec`] is the binary counterpart of `ironfix_transport::FixCodec`.
 //! It splits a byte stream into [`SofhFrame`]s by the `Message_Length` of each
@@ -59,6 +61,7 @@
 use std::fmt;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+#[cfg(feature = "codec")]
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::encoding::EncodingType;
@@ -228,11 +231,164 @@ impl SofhCodec {
         })
     }
 
+    /// Validates the header at the front of `src` and returns its declared
+    /// `Message_Length`, raw encoding type and frame length, or `None` while
+    /// fewer than six bytes are buffered.
+    ///
+    /// # Errors
+    /// [`SofhError::MessageLengthTooSmall`] or [`SofhError::MessageTooLarge`]
+    /// for a header that cannot frame a legal message.
+    #[inline]
+    fn header_at(&self, src: &[u8]) -> Result<Option<(u32, [u8; 2], usize)>, SofhError> {
+        let Some(&[l0, l1, l2, l3, e0, e1]) = src.first_chunk::<{ SofhHeader::LEN }>() else {
+            return Ok(None);
+        };
+        let message_length = u32::from_be_bytes([l0, l1, l2, l3]);
+        if message_length < SofhHeader::MIN_MESSAGE_LENGTH {
+            return Err(length_too_small(message_length));
+        }
+        let frame_len = self.frame_len(message_length)?;
+        Ok(Some((message_length, [e0, e1], frame_len)))
+    }
+
+    /// The error for a non-empty input that ends inside a frame: the header's
+    /// own error when the buffered header is invalid, otherwise
+    /// [`SofhError::Truncated`].
+    #[cold]
+    fn truncated(&self, src: &[u8]) -> SofhError {
+        let expected = match self.header_at(src) {
+            Ok(Some((_, _, frame_len))) => frame_len,
+            Ok(None) => SofhHeader::LEN,
+            Err(error) => return error,
+        };
+        SofhError::Truncated {
+            received: src.len(),
+            expected,
+        }
+    }
+
+    /// Extracts one complete frame from the front of `src`. The sync
+    /// equivalent of the `tokio_util` `Decoder::decode`, which delegates here.
+    ///
+    /// Returns `Ok(None)` while fewer than six bytes, or fewer than the
+    /// declared `Message_Length`, are buffered; in the second case the rest of
+    /// the frame is reserved in `src` (at most the ceiling). A complete frame
+    /// is split off the front of `src` without copying its payload.
+    ///
+    /// # Errors
+    /// [`SofhError::MessageLengthTooSmall`] or [`SofhError::MessageTooLarge`]
+    /// for a header that cannot frame a legal message. Nothing is consumed:
+    /// the error is fatal for the stream.
+    #[inline]
+    pub fn decode_frame(&self, src: &mut BytesMut) -> Result<Option<SofhFrame>, SofhError> {
+        self.decode_inner(src, true)
+    }
+
+    /// Extracts the last frames at the end of the stream. The sync equivalent
+    /// of the `tokio_util` `Decoder::decode_eof`, which delegates here.
+    ///
+    /// Never reserves: no more bytes will arrive to fill the space.
+    ///
+    /// # Errors
+    /// [`SofhError::Truncated`] when the stream ends inside a frame (bytes are
+    /// buffered but do not complete one), plus every error of
+    /// [`SofhCodec::decode_frame`].
+    pub fn decode_frame_eof(&self, src: &mut BytesMut) -> Result<Option<SofhFrame>, SofhError> {
+        if let Some(frame) = self.decode_inner(src, false)? {
+            return Ok(Some(frame));
+        }
+        if src.is_empty() {
+            return Ok(None);
+        }
+        Err(self.truncated(src))
+    }
+
+    /// Frames one message at the front of a borrowed slice, without copying
+    /// or allocating.
+    ///
+    /// Returns the header and the payload, which borrows `src`. The frame
+    /// occupies the first `SofhHeader::LEN + payload.len()` bytes of `src`
+    /// (that is, `header.message_length()`), so the caller advances by that
+    /// many. Returns `Ok(None)` while `src` holds less than one frame.
+    ///
+    /// # Errors
+    /// The same as [`SofhCodec::decode_frame`], under the same ceiling.
+    #[inline]
+    pub fn frame_slice<'a>(
+        &self,
+        src: &'a [u8],
+    ) -> Result<Option<(SofhHeader, &'a [u8])>, SofhError> {
+        let Some((message_length, [e0, e1], frame_len)) = self.header_at(src)? else {
+            return Ok(None);
+        };
+        let Some(payload) = src.get(SofhHeader::LEN..frame_len) else {
+            return Ok(None);
+        };
+        let header = SofhHeader::new(
+            EncodingType::from_u16(u16::from_be_bytes([e0, e1])),
+            message_length,
+        )?;
+        Ok(Some((header, payload)))
+    }
+
+    /// [`SofhCodec::frame_slice`] at the end of the input: a non-empty `src`
+    /// that holds less than one frame is an error instead of `Ok(None)`.
+    ///
+    /// # Errors
+    /// [`SofhError::Truncated`] when `src` ends inside a frame, plus every
+    /// error of [`SofhCodec::frame_slice`].
+    pub fn frame_slice_eof<'a>(
+        &self,
+        src: &'a [u8],
+    ) -> Result<Option<(SofhHeader, &'a [u8])>, SofhError> {
+        if let Some(frame) = self.frame_slice(src)? {
+            return Ok(Some(frame));
+        }
+        if src.is_empty() {
+            return Ok(None);
+        }
+        Err(self.truncated(src))
+    }
+
+    /// Appends `frame` to `dst`, header then payload, exactly as it would have
+    /// arrived on the wire. The sync equivalent of `Encoder<SofhFrame>`.
+    ///
+    /// # Errors
+    /// [`SofhError::MessageTooLarge`] when the frame is above the ceiling, so
+    /// the codec never sends a frame it would refuse to receive. Nothing is
+    /// written on error.
+    #[inline]
+    pub fn encode_frame(&self, frame: &SofhFrame, dst: &mut BytesMut) -> Result<(), SofhError> {
+        self.put_frame(frame.header, &frame.payload, dst)
+    }
+
+    /// Frames a borrowed payload with the given encoding type and appends the
+    /// frame to `dst`. The sync equivalent of
+    /// `Encoder<(EncodingType, &[u8])>`.
+    ///
+    /// # Errors
+    /// - [`SofhError::MessageLengthTooSmall`] for an empty payload;
+    /// - [`SofhError::PayloadTooLong`] when the payload cannot fit the
+    ///   4-octet `Message_Length` field;
+    /// - [`SofhError::MessageTooLarge`] when the frame is above the ceiling.
+    ///
+    /// Nothing is written on error.
+    #[inline]
+    pub fn encode_payload(
+        &self,
+        encoding_type: EncodingType,
+        payload: &[u8],
+        dst: &mut BytesMut,
+    ) -> Result<(), SofhError> {
+        let header = SofhHeader::for_payload(encoding_type, payload.len())?;
+        self.put_frame(header, payload, dst)
+    }
+
     /// One framing attempt over `src`.
     ///
     /// `reserve` says whether an incomplete frame may grow `src` to hold the
-    /// rest of it: `true` for [`Decoder::decode`], `false` for
-    /// [`Decoder::decode_eof`], where no more bytes will arrive.
+    /// rest of it: `true` for [`SofhCodec::decode_frame`], `false` for
+    /// [`SofhCodec::decode_frame_eof`], where no more bytes will arrive.
     ///
     /// # Errors
     /// [`SofhError::MessageLengthTooSmall`] or [`SofhError::MessageTooLarge`]
@@ -243,17 +399,11 @@ impl SofhCodec {
         src: &mut BytesMut,
         reserve: bool,
     ) -> Result<Option<SofhFrame>, SofhError> {
-        let Some(&[l0, l1, l2, l3, e0, e1]) = src.first_chunk::<{ SofhHeader::LEN }>() else {
-            return Ok(None);
-        };
-
         // Length and completeness are settled before the encoding type is
         // classified, so an incomplete frame costs no classification.
-        let message_length = u32::from_be_bytes([l0, l1, l2, l3]);
-        if message_length < SofhHeader::MIN_MESSAGE_LENGTH {
-            return Err(length_too_small(message_length));
-        }
-        let frame_len = self.frame_len(message_length)?;
+        let Some((message_length, [e0, e1], frame_len)) = self.header_at(src)? else {
+            return Ok(None);
+        };
         // A plain comparison, the exact inverse of `split_to`'s bound below,
         // so the optimiser can drop that bound's panic branch.
         if src.len() < frame_len {
@@ -320,95 +470,51 @@ impl Default for SofhCodec {
     }
 }
 
+#[cfg(feature = "codec")]
 impl Decoder for SofhCodec {
     type Item = SofhFrame;
     type Error = SofhError;
 
-    /// Extracts one complete frame from `src`.
-    ///
-    /// Returns `Ok(None)` while fewer than six bytes, or fewer than the
-    /// declared `Message_Length`, are buffered; in the second case the rest of
-    /// the frame is reserved in `src` (at most the ceiling). A complete frame
-    /// is split off the front of `src` without copying its payload.
-    ///
-    /// # Errors
-    /// [`SofhError::MessageLengthTooSmall`] or [`SofhError::MessageTooLarge`]
-    /// for a header that cannot frame a legal message. Nothing is consumed:
-    /// the error is fatal for the stream.
+    /// Delegates to [`SofhCodec::decode_frame`]: same contract, same errors.
     #[inline]
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        self.decode_inner(src, true)
+        self.decode_frame(src)
     }
 
-    /// Extracts the last frames at the end of the stream.
-    ///
-    /// Never reserves: no more bytes will arrive to fill the space.
-    ///
-    /// # Errors
-    /// [`SofhError::Truncated`] when the stream ends inside a frame (bytes are
-    /// buffered but do not complete one), plus every error of
-    /// [`Decoder::decode`].
+    /// Delegates to [`SofhCodec::decode_frame_eof`]: same contract, same
+    /// errors.
     fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        if let Some(frame) = self.decode_inner(src, false)? {
-            return Ok(Some(frame));
-        }
-        if src.is_empty() {
-            return Ok(None);
-        }
-        // `decode_inner` returned Ok(None) on a non-empty buffer: either the
-        // header is incomplete, or it is valid and the frame is not.
-        let expected = match SofhHeader::decode(src)? {
-            Some(header) => self.frame_len(header.message_length())?,
-            None => SofhHeader::LEN,
-        };
-        Err(SofhError::Truncated {
-            received: src.len(),
-            expected,
-        })
+        self.decode_frame_eof(src)
     }
 }
 
+#[cfg(feature = "codec")]
 impl Encoder<SofhFrame> for SofhCodec {
     type Error = SofhError;
 
-    /// Appends the frame to `dst`, header then payload, exactly as it would
-    /// have arrived on the wire.
-    ///
-    /// # Errors
-    /// [`SofhError::MessageTooLarge`] when the frame is above the ceiling, so
-    /// the codec never sends a frame it would refuse to receive. Nothing is
-    /// written on error.
+    /// Delegates to [`SofhCodec::encode_frame`]: same contract, same errors.
     #[inline]
     fn encode(&mut self, item: SofhFrame, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        self.put_frame(item.header, &item.payload, dst)
+        self.encode_frame(&item, dst)
     }
 }
 
+#[cfg(feature = "codec")]
 impl<'a> Encoder<(EncodingType, &'a [u8])> for SofhCodec {
     type Error = SofhError;
 
-    /// Frames a borrowed payload with the given encoding type and appends the
-    /// frame to `dst`.
-    ///
-    /// # Errors
-    /// - [`SofhError::MessageLengthTooSmall`] for an empty payload;
-    /// - [`SofhError::PayloadTooLong`] when the payload cannot fit the
-    ///   4-octet `Message_Length` field;
-    /// - [`SofhError::MessageTooLarge`] when the frame is above the ceiling.
-    ///
-    /// Nothing is written on error.
+    /// Delegates to [`SofhCodec::encode_payload`]: same contract, same errors.
     #[inline]
     fn encode(
         &mut self,
         (encoding_type, payload): (EncodingType, &'a [u8]),
         dst: &mut BytesMut,
     ) -> Result<(), Self::Error> {
-        let header = SofhHeader::for_payload(encoding_type, payload.len())?;
-        self.put_frame(header, payload, dst)
+        self.encode_payload(encoding_type, payload, dst)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "codec"))]
 mod tests {
     use super::*;
 
@@ -1022,5 +1128,233 @@ mod tests {
                 .max_message_size(),
             4096
         );
+    }
+}
+
+/// Tests of the sync API; they run with and without the `codec` feature.
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    fn wire(encoding: u16, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(payload.len() + 6);
+        let Some(length) = u32::try_from(payload.len() + 6).ok() else {
+            panic!("fixture payload fits a frame");
+        };
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&encoding.to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn test_decode_frame_then_eof_on_empty_buffer() {
+        let codec = SofhCodec::new();
+        let mut buf = BytesMut::from(&wire(0xEB50, b"abc")[..]);
+        let Ok(Some(frame)) = codec.decode_frame(&mut buf) else {
+            panic!("expected a frame");
+        };
+        assert_eq!(frame.payload(), b"abc");
+        assert_eq!(frame.encoding_type(), EncodingType::SbeV1LittleEndian);
+        assert!(buf.is_empty());
+        assert_eq!(codec.decode_frame_eof(&mut buf), Ok(None));
+    }
+
+    #[test]
+    fn test_decode_frame_partial_is_none_and_reserves() {
+        let codec = SofhCodec::new();
+        let bytes = wire(0xEB50, &[7; 100]);
+        let mut buf = BytesMut::from(&bytes[..10]);
+        assert_eq!(codec.decode_frame(&mut buf), Ok(None));
+        assert_eq!(buf.len(), 10);
+        assert!(buf.capacity() >= 106);
+    }
+
+    #[test]
+    fn test_decode_frame_eof_inside_payload_is_truncated() {
+        let codec = SofhCodec::new();
+        let bytes = wire(0xEB50, &[7; 10]);
+        let mut buf = BytesMut::from(&bytes[..8]);
+        assert_eq!(
+            codec.decode_frame_eof(&mut buf),
+            Err(SofhError::Truncated {
+                received: 8,
+                expected: 16
+            })
+        );
+        let mut header = BytesMut::from(&bytes[..3]);
+        assert_eq!(
+            codec.decode_frame_eof(&mut header),
+            Err(SofhError::Truncated {
+                received: 3,
+                expected: 6
+            })
+        );
+    }
+
+    #[test]
+    fn test_frame_slice_borrows_the_payload_and_frames_back_to_back() {
+        let codec = SofhCodec::new();
+        let mut bytes = wire(0xEB50, b"first");
+        bytes.extend_from_slice(&wire(0xF000, b"second"));
+        let Ok(Some((header, payload))) = codec.frame_slice(&bytes) else {
+            panic!("expected a frame");
+        };
+        assert_eq!(payload, b"first");
+        assert_eq!(payload.as_ptr(), bytes[6..].as_ptr());
+        assert_eq!(header.message_length(), 11);
+        let Some(rest) = bytes.get(11..) else {
+            panic!("rest in bounds");
+        };
+        let Ok(Some((header, payload))) = codec.frame_slice_eof(rest) else {
+            panic!("expected a frame");
+        };
+        assert_eq!(payload, b"second");
+        assert_eq!(header.encoding_type(), EncodingType::from_u16(0xF000));
+    }
+
+    #[test]
+    fn test_frame_slice_partial_is_none_and_eof_is_truncated() {
+        let codec = SofhCodec::new();
+        let bytes = wire(0xEB50, b"abcdef");
+        for cut in 0..bytes.len() {
+            let Some(src) = bytes.get(..cut) else {
+                panic!("cut in bounds");
+            };
+            assert_eq!(codec.frame_slice(src), Ok(None), "cut {cut}");
+            let expected = if cut == 0 {
+                Ok(None)
+            } else {
+                Err(SofhError::Truncated {
+                    received: cut,
+                    expected: if cut < 6 { 6 } else { 12 },
+                })
+            };
+            assert_eq!(codec.frame_slice_eof(src), expected, "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn test_frame_slice_length_below_minimum_is_an_error() {
+        let codec = SofhCodec::new();
+        for length in 0..SofhHeader::MIN_MESSAGE_LENGTH {
+            let mut src = length.to_be_bytes().to_vec();
+            src.extend_from_slice(&[0xEB, 0x50, 1, 2, 3]);
+            let expected = SofhError::MessageLengthTooSmall {
+                length,
+                min_length: SofhHeader::MIN_MESSAGE_LENGTH,
+            };
+            assert_eq!(codec.frame_slice(&src).err(), Some(expected.clone()));
+            assert_eq!(codec.frame_slice_eof(&src).err(), Some(expected.clone()));
+            let mut buf = BytesMut::from(&src[..]);
+            assert_eq!(codec.decode_frame(&mut buf).err(), Some(expected.clone()));
+            assert_eq!(buf.len(), src.len());
+        }
+    }
+
+    #[test]
+    fn test_frame_slice_over_ceiling_is_refused_from_the_header_alone() {
+        let codec = SofhCodec::new().with_max_message_size(16);
+        let mut src = 17u32.to_be_bytes().to_vec();
+        src.extend_from_slice(&[0xEB, 0x50]);
+        let expected = SofhError::MessageTooLarge {
+            size: 17,
+            max_size: 16,
+        };
+        assert_eq!(codec.frame_slice(&src).err(), Some(expected.clone()));
+        assert_eq!(codec.frame_slice_eof(&src).err(), Some(expected.clone()));
+        let mut buf = BytesMut::from(&src[..]);
+        assert_eq!(codec.decode_frame(&mut buf).err(), Some(expected.clone()));
+        assert_eq!(
+            codec.decode_frame_eof(&mut buf).err(),
+            Some(expected.clone())
+        );
+        assert_eq!(buf.len(), 6);
+        let max = u32::MAX.to_be_bytes();
+        let mut src = max.to_vec();
+        src.extend_from_slice(&[0, 0]);
+        assert_eq!(
+            SofhCodec::new().frame_slice(&src),
+            Err(SofhError::MessageTooLarge {
+                size: u32::MAX,
+                max_size: SofhCodec::DEFAULT_MAX_MESSAGE_SIZE,
+            })
+        );
+    }
+
+    #[test]
+    fn test_encode_payload_and_frame_match_the_wire_and_round_trip() {
+        let codec = SofhCodec::new();
+        let mut dst = BytesMut::new();
+        assert_eq!(
+            codec.encode_payload(EncodingType::SbeV1LittleEndian, b"hello", &mut dst),
+            Ok(())
+        );
+        assert_eq!(&dst[..], &wire(0xEB50, b"hello")[..]);
+        let Ok(Some(frame)) = codec.decode_frame(&mut dst) else {
+            panic!("expected a frame");
+        };
+        let mut again = BytesMut::new();
+        assert_eq!(codec.encode_frame(&frame, &mut again), Ok(()));
+        assert_eq!(&again[..], &wire(0xEB50, b"hello")[..]);
+    }
+
+    #[test]
+    fn test_encode_refusals_write_nothing() {
+        let codec = SofhCodec::new().with_max_message_size(10);
+        let mut dst = BytesMut::new();
+        assert!(matches!(
+            codec.encode_payload(EncodingType::SbeV1LittleEndian, b"", &mut dst),
+            Err(SofhError::MessageLengthTooSmall { .. })
+        ));
+        assert_eq!(
+            codec.encode_payload(EncodingType::SbeV1LittleEndian, b"12345", &mut dst),
+            Err(SofhError::MessageTooLarge {
+                size: 11,
+                max_size: 10
+            })
+        );
+        let Ok(frame) = SofhFrame::new(EncodingType::SbeV1LittleEndian, &b"12345"[..]) else {
+            panic!("fixture frame is valid");
+        };
+        assert_eq!(
+            codec.encode_frame(&frame, &mut dst),
+            Err(SofhError::MessageTooLarge {
+                size: 11,
+                max_size: 10
+            })
+        );
+        assert!(dst.is_empty());
+    }
+
+    /// The `tokio_util` impls are pure delegation: same results on the same
+    /// input, valid or hostile.
+    #[cfg(feature = "codec")]
+    #[test]
+    fn test_tokio_impls_agree_with_the_sync_api() {
+        use tokio_util::codec::{Decoder, Encoder};
+        let inputs: Vec<Vec<u8>> = vec![
+            wire(0xEB50, b"abc"),
+            wire(0xEB50, b"abc")[..4].to_vec(),
+            vec![0, 0, 0, 3, 0xEB, 0x50],
+            vec![0x7F, 0, 0, 0, 0xEB, 0x50],
+        ];
+        for input in inputs {
+            let mut sync = SofhCodec::new();
+            let mut a = BytesMut::from(&input[..]);
+            let mut b = a.clone();
+            assert_eq!(sync.decode_frame(&mut a), sync.decode(&mut b));
+            let mut a = BytesMut::from(&input[..]);
+            let mut b = a.clone();
+            assert_eq!(sync.decode_frame_eof(&mut a), sync.decode_eof(&mut b));
+        }
+        let mut codec = SofhCodec::new();
+        let mut a = BytesMut::new();
+        let mut b = BytesMut::new();
+        assert_eq!(
+            codec.encode_payload(EncodingType::SbeV1LittleEndian, b"x", &mut a),
+            codec.encode((EncodingType::SbeV1LittleEndian, &b"x"[..]), &mut b)
+        );
+        assert_eq!(a, b);
     }
 }

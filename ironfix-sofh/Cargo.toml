@@ -16,7 +16,14 @@ categories.workspace = true
 [dependencies]
 thiserror.workspace = true
 bytes.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, optional = true }
+
+# `codec` (default) adds the `tokio_util::codec::{Decoder, Encoder}` impls on
+# `SofhCodec`. Without it the crate has no `tokio` in its graph; the sync
+# `SofhCodec::decode_frame` / `encode_frame` / `frame_slice` API is always on.
+[features]
+default = ["codec"]
+codec = ["dep:tokio-util"]
 
 [dev-dependencies]
 criterion.workspace = true
@@ -24,3 +31,4 @@ criterion.workspace = true
 [[bench]]
 name = "sofh_codec"
 harness = false
+required-features = ["codec"]

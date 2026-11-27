@@ -18,9 +18,13 @@
 //!   and a `decode` that reads it off the front of a buffer;
 //! - [`EncodingType`]: the registered encoding types, with unregistered values
 //!   preserved;
-//! - [`SofhCodec`]: a `tokio_util` `Decoder` yielding [`SofhFrame`]s and an
-//!   `Encoder` framing payloads, with a size ceiling. A decoded payload is a
-//!   `Bytes` view of the read buffer, not a copy; read
+//! - [`SofhCodec`]: a sync frame decoder and encoder with a size ceiling
+//!   ([`SofhCodec::decode_frame`] / [`SofhCodec::decode_frame_eof`] over
+//!   `BytesMut`, [`SofhCodec::frame_slice`] / [`SofhCodec::frame_slice_eof`]
+//!   over a borrowed `&[u8]`, [`SofhCodec::encode_frame`] /
+//!   [`SofhCodec::encode_payload`]) and, behind the `codec` feature, the
+//!   `tokio_util` `Decoder` / `Encoder` impls that delegate to it. A decoded
+//!   payload is a `Bytes` view of the read buffer, not a copy; read
 //!   [Retaining frames](codec#retaining-frames) before keeping frames;
 //! - [`SofhError`]: every framing failure, typed.
 //!
@@ -64,22 +68,28 @@
 //!   trusted the next frame boundary is unknown. The decoder consumes nothing
 //!   on error, and the caller must close the connection. See [`SofhError`].
 //!
+//! ## Features
+//!
+//! - `codec` (default): the `tokio_util::codec::{Decoder, Encoder}` impls on
+//!   [`SofhCodec`]. With `default-features = false` the crate depends on
+//!   neither `tokio-util` nor `tokio`; the sync API is identical either way,
+//!   with the same ceiling and the same errors.
+//!
 //! ## Example
 //!
 //! ```
 //! use bytes::BytesMut;
 //! use ironfix_sofh::{EncodingType, SofhCodec, SofhError};
-//! use tokio_util::codec::{Decoder, Encoder};
 //!
 //! fn main() -> Result<(), SofhError> {
-//!     let mut codec = SofhCodec::new().with_max_message_size(64 * 1024);
+//!     let codec = SofhCodec::new().with_max_message_size(64 * 1024);
 //!
 //!     let mut wire = BytesMut::new();
-//!     codec.encode((EncodingType::SbeV1LittleEndian, &b"an sbe message"[..]), &mut wire)?;
+//!     codec.encode_payload(EncodingType::SbeV1LittleEndian, b"an sbe message", &mut wire)?;
 //!     // Message_Length 20 (6 + 14), then Encoding_Type 0xEB50, both big-endian.
 //!     assert_eq!(wire.get(..6), Some(&[0, 0, 0, 20, 0xEB, 0x50][..]));
 //!
-//!     if let Some(frame) = codec.decode(&mut wire)? {
+//!     if let Some(frame) = codec.decode_frame(&mut wire)? {
 //!         assert_eq!(frame.encoding_type(), EncodingType::SbeV1LittleEndian);
 //!         assert_eq!(frame.payload(), b"an sbe message");
 //!     }

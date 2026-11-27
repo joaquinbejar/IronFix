@@ -25,7 +25,7 @@ bytes.workspace = true
 tracing.workspace = true
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
-ironfix-sofh = { workspace = true, optional = true }
+ironfix-sofh = { workspace = true, optional = true, features = ["codec"] }
 ironfix-fixp = { workspace = true, optional = true }
 
 [features]
