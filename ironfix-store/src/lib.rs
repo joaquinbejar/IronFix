@@ -25,6 +25,12 @@
 //!   expected (see the [`sync_traits`] module docs for when that is sound)
 //! - **[`StoredMessage`]**: one message as it was filed — verbatim frame bytes,
 //!   its sequence number, and its recorded `MsgType`
+//! - **[`PendingStore`]**: a bounded submit/poll form of any
+//!   [`SyncMessageStore`] (issue #222): [`PendingStore::submit`] queues an
+//!   outbound frame for a worker thread and returns a [`Ticket`] at once, or
+//!   [`PendingError::Full`] at the configured bound, and
+//!   [`PendingStore::poll_durable`] reports the highest durable sequence
+//!   number without blocking. Built with or without the `async` feature.
 //! - **[`MemoryStore`]**: an in-memory implementation, backed by a
 //!   `parking_lot::RwLock<BTreeMap<..>>` and two atomics. Nothing in it
 //!   survives the process.
@@ -75,6 +81,7 @@
 #[cfg(feature = "async")]
 pub mod file;
 pub mod memory;
+pub mod pending;
 pub mod stored;
 pub mod sync_traits;
 pub mod traits;
@@ -84,6 +91,7 @@ pub use file::{
     FileStore, FileStoreConfig, FileStoreConfigError, SyncPolicy, Truncation, TruncationCause,
 };
 pub use memory::MemoryStore;
+pub use pending::{PendingError, PendingStore, TargetTicket, Ticket};
 pub use stored::StoredMessage;
 pub use sync_traits::SyncMessageStore;
 #[cfg(feature = "async")]
