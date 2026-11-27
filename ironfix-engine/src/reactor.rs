@@ -6083,21 +6083,17 @@ impl<A: Application> Reactor<A> {
                 received,
                 then,
             } => {
-                // Decided from the queue as it stands (issue #223). A frame
-                // that is not acted on is reported before the gap is
-                // requested; one acted on ahead of the gap only once the
-                // request is out, just before it is dispatched.
+                // A routing verdict, decided from the queue as it stands and
+                // always reported before the gap is requested (issue #223):
+                // the inbound verdict precedes the outbound ResendRequest and
+                // is never lost. `AcceptedAhead` does not mean the number was
+                // consumed or that the request succeeded; if the request
+                // fails, the session's close is the record.
                 let queued_copy = self.core.gap_copy_queued(&phase, seq);
-                let verdict = gap_verdict(then, queued_copy, seq, expected);
-                if !verdict.is_accepted() {
-                    self.capture_verdict(verdict);
-                }
+                self.capture_verdict(gap_verdict(then, queued_copy, seq, expected));
                 let phase = self
                     .request_resend(framed, phase, expected, received)
                     .await?;
-                if verdict.is_accepted() {
-                    self.capture_verdict(verdict);
-                }
                 match then {
                     // Application messages inside a gap will be resent in
                     // order; under the Queue policy this copy is kept and

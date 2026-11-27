@@ -1841,3 +1841,151 @@ async fn test_gap_fill_accepted_after_the_cursor_moves() {
         "the fill is accepted with the cursor at its NewSeqNo: {seen:?}"
     );
 }
+
+/// One callback an [`OrderRecorder`] saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Callback {
+    Inbound(Option<u64>),
+    Verdict(InboundVerdict),
+    Outbound(String),
+}
+
+/// A frame observer recording the order of its callbacks.
+#[derive(Debug, Default)]
+struct OrderRecorder {
+    calls: Mutex<Vec<Callback>>,
+}
+
+impl FrameObserver for OrderRecorder {
+    fn on_inbound(&self, _frame: &[u8], observation: &Observation<'_>) {
+        locked(&self.calls).push(Callback::Inbound(observation.msg_seq_num()));
+    }
+
+    fn on_outbound(&self, frame: &[u8], _observation: &Observation<'_>) {
+        let msg_type = field(frame, 35).unwrap_or_default();
+        locked(&self.calls).push(Callback::Outbound(msg_type));
+    }
+
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, _observation: &Observation<'_>) {
+        locked(&self.calls).push(Callback::Verdict(*verdict));
+    }
+}
+
+/// An administrative frame opening a new gap: its routing verdict
+/// (`AcceptedAhead`) comes after the frame and before the `ResendRequest`
+/// it causes.
+#[tokio::test]
+async fn test_accepted_ahead_precedes_the_resend_request() {
+    let recorder = Arc::new(OrderRecorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("1", 3, &[(112, "T-GAP")])).await;
+    assert_eq!(header(&venue.next().await).0, "2");
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 4, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let calls = locked(&recorder.calls).clone();
+    let from = some(
+        calls
+            .iter()
+            .position(|call| *call == Callback::Inbound(Some(3))),
+        "the TestRequest was observed",
+    );
+    assert_eq!(
+        &calls[from..from + 3],
+        &[
+            Callback::Inbound(Some(3)),
+            Callback::Verdict(InboundVerdict::AcceptedAhead {
+                seq: 3,
+                expected: 2
+            }),
+            Callback::Outbound("2".to_string()),
+        ],
+        "frame, routing verdict, then the ResendRequest: {calls:?}"
+    );
+}
+
+/// A store that refuses to file a `ResendRequest` (2).
+struct RefuseResendStore {
+    inner: MemoryStore,
+}
+
+#[async_trait]
+impl MessageStore for RefuseResendStore {
+    async fn store(
+        &self,
+        seq_num: u64,
+        msg_type: &MsgType,
+        message: &[u8],
+    ) -> Result<(), ironfix_core::error::StoreError> {
+        if msg_type.as_str() == "2" {
+            return Err(ironfix_core::error::StoreError::StoreFailed {
+                seq_num,
+                reason: "refused by the test store".to_string(),
+            });
+        }
+        self.inner.store(seq_num, msg_type, message).await
+    }
+    async fn get_range(
+        &self,
+        begin: u64,
+        end: u64,
+    ) -> Result<Vec<ironfix_store::StoredMessage>, ironfix_core::error::StoreError> {
+        self.inner.get_range(begin, end).await
+    }
+    fn next_sender_seq(&self) -> u64 {
+        self.inner.next_sender_seq()
+    }
+    fn next_target_seq(&self) -> u64 {
+        self.inner.next_target_seq()
+    }
+    async fn set_next_sender_seq(&self, seq: u64) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.set_next_sender_seq(seq).await
+    }
+    async fn set_next_target_seq(&self, seq: u64) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.set_next_target_seq(seq).await
+    }
+    async fn reset(&self) -> Result<(), ironfix_core::error::StoreError> {
+        self.inner.reset().await
+    }
+    fn creation_time(&self) -> std::time::SystemTime {
+        self.inner.creation_time()
+    }
+}
+
+/// When the `ResendRequest` cannot be written (its filing fails under
+/// `CloseSession`), the routing verdict is still reported, and the session
+/// then closes: the close is the record that the request failed.
+#[tokio::test]
+async fn test_accepted_ahead_is_reported_when_the_resend_request_fails() {
+    let recorder = Arc::new(OrderRecorder::default());
+    let store = Arc::new(RefuseResendStore {
+        inner: MemoryStore::new(),
+    });
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_store(store as Arc<dyn MessageStore>)
+        .with_store_failure_policy(ironfix_engine::StoreFailurePolicy::CloseSession)
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("1", 3, &[(112, "T-GAP")])).await;
+    closed(&member, "the failed ResendRequest closes the session").await;
+
+    let calls = locked(&recorder.calls).clone();
+    assert!(
+        calls.contains(&Callback::Verdict(InboundVerdict::AcceptedAhead {
+            seq: 3,
+            expected: 2
+        })),
+        "the routing verdict is reported: {calls:?}"
+    );
+    assert!(
+        !calls.contains(&Callback::Outbound("2".to_string())),
+        "no ResendRequest was written: {calls:?}"
+    );
+    assert!(member.close_reason().is_some(), "the close is the record");
+}

@@ -48,7 +48,11 @@
 //! the established session, [`FrameObserver::on_inbound_verdict`] follows
 //! [`FrameObserver::on_inbound`] with the core's [`InboundVerdict`] once it
 //! has routed the frame, before the session acts on it: accepted into the
-//! sequence, accepted ahead of a gap (an administrative message inside it),
+//! sequence, accepted ahead of a gap (an administrative message inside it:
+//! a routing verdict, reported before the `ResendRequest` (2) it causes,
+//! which says neither that its number was consumed nor that the request
+//! succeeded; if the request fails, the close and its `CloseReason` are the
+//! record; only `Accepted` means the number was consumed),
 //! deferred behind a gap, or rejected with an [`InboundRefusal`] (a
 //! duplicate, a number too low, an exhausted counter, a refused
 //! `SequenceReset` (4), or one `from_admin` refused). An administrative

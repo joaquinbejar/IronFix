@@ -124,8 +124,12 @@ pub enum InboundVerdict {
         /// The frame's `MsgSeqNum` (34).
         seq: u64,
     },
-    /// Above the expectation, and acted on now without consuming its number:
-    /// an administrative message inside a gap (a Logout among them).
+    /// A routing verdict: above the expectation, and routed to be acted on
+    /// ahead of the gap, an administrative message inside it (a Logout
+    /// among them). It is reported before the gap is requested. It does
+    /// **not** mean the number was consumed (only [`Accepted`](Self::Accepted)
+    /// does) nor that the gap request succeeded: if requesting the gap
+    /// fails, the session closes and its close reason is the record.
     AcceptedAhead {
         /// The frame's `MsgSeqNum` (34).
         seq: u64,
