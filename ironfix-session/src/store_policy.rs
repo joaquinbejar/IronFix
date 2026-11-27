@@ -217,11 +217,22 @@ pub enum StoreVerdict {
 /// result ([`StoreGate::resolve`]); the action comes back only then, as a
 /// [`StoreRelease`]. The gate is the "hold" output of the core: while it
 /// exists, the action is neither delivered nor dropped.
-#[derive(Debug)]
+///
+/// A failed outbound filing under [`StoreFailurePolicy::Continue`] does not
+/// release the frame at once: the filing may have failed before it reached
+/// the sender counter, so the gate comes back as
+/// [`StoreRelease::Fallback`], holding the frame behind the standalone
+/// [`StoreWrite::NextSender`] write. Resolving that one releases the frame
+/// as [`StoreRelease::DeliverUnpersisted`] whatever its result, since the
+/// frame itself is not confirmed as filed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "the guarded action is only released by resolving the gate"]
 pub struct StoreGate<T> {
     /// The write the action waits for.
     write: StoreWrite,
+    /// Whether an earlier write for the same action failed, so the action
+    /// is released unpersisted even if this write lands.
+    degraded: bool,
     /// The held action.
     action: T,
 }
@@ -229,7 +240,11 @@ pub struct StoreGate<T> {
 impl<T> StoreGate<T> {
     /// Holds `action` until `write` has a result.
     pub const fn hold(write: StoreWrite, action: T) -> Self {
-        Self { write, action }
+        Self {
+            write,
+            degraded: false,
+            action,
+        }
     }
 
     /// The write the action waits for.
@@ -239,11 +254,20 @@ impl<T> StoreGate<T> {
     }
 
     /// Resolves the gate with the write's `result` under `policy`, releasing
-    /// the action for delivery or for the close.
+    /// the action for delivery or for the close, or holding it behind the
+    /// sender-counter fallback of a failed outbound filing.
     pub fn resolve(self, policy: StoreFailurePolicy, result: StoreResult) -> StoreRelease<T> {
         match policy.decide(self.write, result) {
+            StoreVerdict::Proceed if self.degraded => StoreRelease::DeliverUnpersisted(self.action),
             StoreVerdict::Proceed => StoreRelease::Deliver(self.action),
-            StoreVerdict::ProceedUnpersisted => StoreRelease::DeliverUnpersisted(self.action),
+            StoreVerdict::ProceedUnpersisted => match self.write {
+                StoreWrite::OutboundFrame { next_sender, .. } => StoreRelease::Fallback(Self {
+                    write: StoreWrite::NextSender { next: next_sender },
+                    degraded: true,
+                    action: self.action,
+                }),
+                _ => StoreRelease::DeliverUnpersisted(self.action),
+            },
             StoreVerdict::Close => StoreRelease::Close {
                 write: self.write,
                 action: self.action,
@@ -254,13 +278,18 @@ impl<T> StoreGate<T> {
 
 /// A held action released by [`StoreGate::resolve`].
 #[derive(Debug, PartialEq, Eq)]
-#[must_use = "a released action must be delivered or dropped with the close"]
+#[must_use = "a released action must be delivered, held again or dropped with the close"]
 pub enum StoreRelease<T> {
     /// The write landed: deliver the action.
     Deliver(T),
-    /// The write failed under [`StoreFailurePolicy::Continue`]: deliver the
-    /// action; the write is not durable.
+    /// A write failed under [`StoreFailurePolicy::Continue`]: deliver the
+    /// action; the write is not durable (a frame is not confirmed as filed).
     DeliverUnpersisted(T),
+    /// An outbound filing failed under [`StoreFailurePolicy::Continue`]: the
+    /// frame stays held behind the standalone sender-counter write the gate
+    /// now names ([`StoreGate::write`]). Make that write, then resolve the
+    /// gate again.
+    Fallback(StoreGate<T>),
     /// The session closes: the action must not be acted on. It is handed
     /// back so the driver can account for it (report it, free it).
     Close {
@@ -484,6 +513,46 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_filing_under_continue_holds_the_frame_behind_the_sender_fallback() {
+        let gate = StoreGate::hold(
+            StoreWrite::OutboundFrame {
+                seq: 4,
+                next_sender: 5,
+            },
+            "frame 4",
+        );
+        let StoreRelease::Fallback(fallback) =
+            gate.resolve(StoreFailurePolicy::Continue, StoreResult::Failed)
+        else {
+            panic!("a failed filing under Continue must hold the frame for the fallback");
+        };
+        assert_eq!(fallback.write(), StoreWrite::NextSender { next: 5 });
+        // The fallback landing does not make the frame filed.
+        let landed = fallback.clone();
+        assert_eq!(
+            landed.resolve(StoreFailurePolicy::Continue, StoreResult::Written),
+            StoreRelease::DeliverUnpersisted("frame 4")
+        );
+        assert_eq!(
+            fallback.resolve(StoreFailurePolicy::Continue, StoreResult::Failed),
+            StoreRelease::DeliverUnpersisted("frame 4")
+        );
+    }
+
+    #[test]
+    fn test_failed_filing_under_close_session_closes_without_a_fallback() {
+        let write = StoreWrite::OutboundFrame {
+            seq: 4,
+            next_sender: 5,
+        };
+        assert_eq!(
+            StoreGate::hold(write, ())
+                .resolve(StoreFailurePolicy::CloseSession, StoreResult::Failed),
+            StoreRelease::Close { write, action: () }
+        );
+    }
+
+    #[test]
     fn test_gate_closes_on_a_failed_reset_even_under_continue() {
         let write = StoreWrite::Reset {
             next_sender: 2,
@@ -592,6 +661,7 @@ mod tests {
                     closed = Some((write, action));
                     break;
                 }
+                StoreRelease::Fallback(_) => unreachable!("a target write has no fallback"),
             }
         }
         assert_eq!(delivered, vec![1]);
