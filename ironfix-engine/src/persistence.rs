@@ -215,8 +215,9 @@ use ironfix_core::error::StoreError;
 use ironfix_core::message::MsgType;
 use ironfix_session::sequence::{SequenceCounter, SequenceExhausted};
 use ironfix_session::{
-    SeedSource, SequenceManager, StoreResult, StoreSeed, StoreVerdict, StoreWrite as CoreWrite,
-    decide_seed_source, initial_below_store, seed_from_initial, seed_from_store,
+    SeedSource, SequenceManager, StoreGate, StoreRelease, StoreResult, StoreSeed, StoreVerdict,
+    StoreWrite as CoreWrite, decide_seed_source, initial_below_store, seed_from_initial,
+    seed_from_store,
 };
 use ironfix_store::MessageStore;
 use std::sync::Arc;
@@ -409,25 +410,51 @@ impl<'s> SessionStore<'s> {
         frame: &[u8],
         next_sender: u64,
     ) -> Result<bool, StoreError> {
+        // The core's gate decides the order (issue #224): the frame is
+        // released only once the filing, and after a failed one under
+        // Continue the standalone sender-counter fallback, has a result.
+        let gate = StoreGate::hold(CoreWrite::OutboundFrame { seq, next_sender }, ());
         let filed = self
             .mutate(self.store.file_outbound(seq, msg_type, frame, next_sender))
             .await;
-        match filed {
-            Ok(()) => Ok(true),
-            Err(err) => {
-                self.on_failure(
-                    session_id,
-                    StoreWrite::Frame {
-                        seq,
-                        msg_type,
-                        next_sender,
-                    },
-                    err,
-                )?;
-                self.persist_sender(session_id, next_sender)
-                    .await
-                    .map(|()| false)
+        let release = gate.resolve(self.policy, StoreResult::of(&filed));
+        let write = StoreWrite::Frame {
+            seq,
+            msg_type,
+            next_sender,
+        };
+        let fallback = match (release, filed) {
+            (StoreRelease::Deliver(()), _) => return Ok(true),
+            (StoreRelease::Fallback(fallback), Err(err)) => {
+                self.on_failure(session_id, write, err)?;
+                fallback
             }
+            (StoreRelease::DeliverUnpersisted(()), _) => return Ok(false),
+            (StoreRelease::Close { .. }, Err(err)) => {
+                return self.on_failure(session_id, write, err).map(|()| false);
+            }
+            // A release other than Deliver comes only from a failed filing.
+            (StoreRelease::Fallback(_) | StoreRelease::Close { .. }, Ok(())) => {
+                debug_assert!(false, "a filed frame released as a failure");
+                return Ok(true);
+            }
+        };
+        let CoreWrite::NextSender { next } = fallback.write() else {
+            debug_assert!(false, "the filing fallback is not the sender counter");
+            return Ok(false);
+        };
+        let persisted = self.mutate(self.store.set_next_sender_seq(next)).await;
+        // The fallback releases the frame unpersisted whatever its result:
+        // the frame itself is not confirmed as filed. A failed fallback is
+        // logged under the policy like any failed write.
+        match (
+            fallback.resolve(self.policy, StoreResult::of(&persisted)),
+            persisted,
+        ) {
+            (_, Err(err)) => self
+                .on_failure(session_id, StoreWrite::NextSender(next), err)
+                .map(|()| false),
+            (_, Ok(())) => Ok(false),
         }
     }
 
