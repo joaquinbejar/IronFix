@@ -4,7 +4,11 @@ All notable changes to the IronFix workspace are recorded here. Versions
 follow [Semantic Versioning](https://semver.org/); while the workspace is at
 0.x, a change that breaks behaviour or the public API takes a minor bump.
 
-## Unreleased
+## 0.6.0 (2026-11-27)
+
+A sans-IO consumer can now build the session core and the synchronous store
+without `tokio`, and no IronFix crate pulls `chrono` by default. Breaking
+changes are listed first.
 
 ### Breaking: chrono is an opt-in feature of ironfix-core (#225)
 
@@ -24,6 +28,44 @@ a minor bump (0.6.0).
 - The UTCTimestamp formatters use hand-written civil-date arithmetic and stay
   byte-identical to chrono and allocation-free; the tests keep chrono as a
   dev-dependency to prove it.
+
+### Breaking: ironfix-store `async` feature (#221)
+
+`MessageStore`, `SyncStoreAdapter`, `FileStore` and the async half of
+`MemoryStore` are behind the new default `async` feature. With
+`default-features = false` the crate builds `SyncMessageStore` and
+`MemoryStore` without `tokio` or `async-trait`. Migration: a crate that set
+`default-features = false` and uses the async surface adds
+`features = ["async"]`. `make check-store-deps` gates it.
+
+### ironfix-sofh `codec` feature (#220)
+
+The `tokio-util` `Decoder`/`Encoder` impls on `SofhCodec` are behind the new
+default `codec` feature; new sync methods `decode_frame`, `decode_frame_eof`,
+`frame_slice`, `frame_slice_eof`, `encode_frame` and `encode_payload` work
+without it. A crate that set `default-features = false` adds
+`features = ["codec"]` to keep the tokio impls.
+
+### ironfix-session
+
+- `tokio` removed from its dependencies (#219); `make check-session-deps`
+  checks the resolved graph against an allowlist.
+- Fail-closed store policy in the sans-IO core (#224):
+  `StoreFailurePolicy`, `StoreGate` and `PersistedCounters` now live in
+  `ironfix-session`; `ironfix_engine::StoreFailurePolicy` is a re-export.
+- Capture points in the sans-IO core (#223): the `capture` module and the
+  `FrameCapture` trait report inbound verdicts and outbound writes for any
+  driver. `FrameObserver` gains `on_inbound_verdict` (default no-op) and
+  `Observation::frame_id`. Only `Accepted` means a sequence number was
+  consumed; `AcceptedAhead` is a routing verdict.
+
+### ironfix-store `PendingStore` (#222)
+
+A bounded submit/poll wrapper that owns a `SyncMessageStore`: `submit` and
+`submit_target` never block (`Full`, `Busy`), `poll_durable` reports
+progress, resend reads return only frames both durable and marked sent with
+`mark_sent`, and it fails closed after the first failed write. Not wired into
+either engine.
 
 ## 0.5.3 (2026-11-13)
 
