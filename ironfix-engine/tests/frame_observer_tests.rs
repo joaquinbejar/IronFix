@@ -1750,6 +1750,14 @@ async fn test_failed_target_write_is_not_reported_accepted() {
             .all(|(_, _, verdict)| !verdict.is_accepted()),
         "nothing was accepted past a failed target write: {verdicts:?}"
     );
+    assert!(
+        verdicts.iter().any(|(_, _, verdict)| *verdict
+            == InboundVerdict::Rejected {
+                seq: 2,
+                reason: InboundRefusal::Unpersisted
+            }),
+        "the frame is reported rejected as unpersisted: {verdicts:?}"
+    );
     assert_eq!(member.next_target_seq(), 2, "the cursor did not move");
 }
 

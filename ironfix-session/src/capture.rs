@@ -111,6 +111,14 @@ pub enum InboundRefusal {
     /// Above the expectation with a body that does not decode: not queued,
     /// and left to its resend.
     Malformed,
+    /// In sequence, but the driver could not hand it to its application (in
+    /// the engine, the application queue is full or its dispatcher has
+    /// stopped): the session closes and the number is **not** consumed.
+    Undeliverable,
+    /// The target-counter write that must precede acting on it failed under
+    /// a fail-closed policy: the session closes and the number is **not**
+    /// consumed.
+    Unpersisted,
 }
 
 /// The core's verdict on an inbound frame, relative to sequence handling.

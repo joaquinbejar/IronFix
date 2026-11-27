@@ -4311,6 +4311,7 @@ impl<A: Application> Reactor<A> {
                     ));
                 };
                 if let Err(err) = self.persist_target(next).await {
+                    self.capture_unpersisted(seq);
                     return Err(self.close_on_store_failure(phase, &err));
                 }
                 if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
@@ -4688,6 +4689,7 @@ impl<A: Application> Reactor<A> {
                 // is persisted before `from_admin` sees it, as for every
                 // other in-sequence message.
                 if let Err(err) = self.persist_target(next).await {
+                    self.capture_unpersisted(seq);
                     return Err(self.close_on_store_failure(phase, &err));
                 }
                 true
@@ -4763,6 +4765,7 @@ impl<A: Application> Reactor<A> {
                 // Reset has no place in the sequence, so it reached
                 // `from_admin` before any write; this is its first.
                 if let Err(err) = self.persist_target(new_seq).await {
+                    self.capture_unpersisted(seq);
                     return Err(self.close_on_store_failure(phase, &err));
                 }
                 self.runtime.sequences.set_target_seq(new_seq);
@@ -5548,6 +5551,24 @@ impl<A: Application> Reactor<A> {
         }
     }
 
+    /// Reports that the frame numbered `seq` was not acted on because the
+    /// target-counter write before it failed and the session closes.
+    fn capture_unpersisted(&self, seq: u64) {
+        self.capture_verdict(InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::Unpersisted,
+        });
+    }
+
+    /// Reports that the in-sequence frame numbered `seq` could not be handed
+    /// to the application: rejected, its number not consumed.
+    fn capture_undeliverable(&self, seq: u64) {
+        self.capture_verdict(InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::Undeliverable,
+        });
+    }
+
     /// The capture id of the inbound frame being acted on, when a frame
     /// observer is attached.
     fn capture_frame_id(&self) -> Option<u64> {
@@ -5700,6 +5721,7 @@ impl<A: Application> Reactor<A> {
             ));
         };
         if let Err(err) = self.persist_target(next).await {
+            self.capture_unpersisted(seq);
             return Err(self.close_on_store_failure(phase, &err));
         }
         if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
@@ -6071,6 +6093,7 @@ impl<A: Application> Reactor<A> {
                 // in-memory expectation moves only once that write has been
                 // accepted, as for an application message.
                 if let Err(err) = self.persist_target(next).await {
+                    self.capture_unpersisted(seq);
                     return Err(self.close_on_store_failure(phase, &err));
                 }
                 // Consume the number before the admin handler runs: any
@@ -6286,6 +6309,7 @@ impl<A: Application> Reactor<A> {
             ));
         };
         if let Err(err) = self.persist_target(next).await {
+            self.capture_unpersisted(seq);
             return Err(self.close_on_store_failure(phase, &err));
         }
         if let Err(err) = self.runtime.sequences.try_increment_target_seq() {
@@ -6362,10 +6386,12 @@ impl<A: Application> Reactor<A> {
             Some(match self.app_tx.try_reserve() {
                 Ok(permit) => permit,
                 Err(mpsc::error::TrySendError::Full(())) => {
+                    self.capture_undeliverable(seq);
                     teardown(phase);
                     return Err(closed(CloseReason::ApplicationQueueFull {}));
                 }
                 Err(mpsc::error::TrySendError::Closed(())) => {
+                    self.capture_undeliverable(seq);
                     teardown(phase);
                     return Err(closed(CloseReason::DispatcherStopped {}));
                 }
@@ -6390,6 +6416,7 @@ impl<A: Application> Reactor<A> {
         if let Err(err) =
             persist_target_with(store, &mut self.persisted, &self.session_id, next).await
         {
+            self.capture_unpersisted(seq);
             return Err(self.close_on_store_failure(phase, &err));
         }
         // The number is consumed once its write landed, before the message
