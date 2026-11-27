@@ -332,7 +332,7 @@ use ironfix_session::{
 };
 use ironfix_session::{
     InboundRefusal, InboundVerdict, gap_verdict, in_sequence_verdict, inbound_verdict,
-    malformed_verdict, sequence_reset_screen_verdict, sequence_reset_verdict,
+    malformed_verdict, released_verdict, sequence_reset_screen_verdict, sequence_reset_verdict,
 };
 use ironfix_store::{MessageStore, StoredMessage};
 use ironfix_tagvalue::{FieldIndex, recycle_field_refs};
@@ -4686,8 +4686,6 @@ impl<A: Application> Reactor<A> {
                 if let Err(err) = self.persist_target(next).await {
                     return Err(self.close_on_store_failure(phase, &err));
                 }
-                // The receive cursor includes the fill now (issue #223).
-                self.capture_verdict(in_sequence_verdict(seq));
                 true
             }
             ResetScreen::Reset => false,
@@ -4717,7 +4715,12 @@ impl<A: Application> Reactor<A> {
         let new_seq_no = raw.get_field_str(36).and_then(|s| s.parse::<u64>().ok());
         let expected = self.runtime.sequences.next_target_seq().value();
         let decision = decide_sequence_reset(gap_fill, seq, new_seq_no, expected);
-        if let Some(verdict) = sequence_reset_verdict(&decision, seq) {
+        // A refusal is reported now; an applied GapFill's acceptance once the
+        // cursor has moved past it, below.
+        let verdict = sequence_reset_verdict(&decision, gap_fill, seq);
+        if !matches!(decision, ResetDecision::Apply { .. })
+            && let Some(verdict) = verdict
+        {
             self.capture_verdict(verdict);
         }
         let reason = match decision {
@@ -4762,6 +4765,9 @@ impl<A: Application> Reactor<A> {
                     return Err(self.close_on_store_failure(phase, &err));
                 }
                 self.runtime.sequences.set_target_seq(new_seq);
+                if let Some(verdict) = verdict {
+                    self.capture_verdict(verdict);
+                }
                 // A Reset renumbers the stream: what was queued above the gap
                 // was numbered before it, so none of it is released. A Gap
                 // Fill keeps the numbering; queued messages it jumped past
@@ -5649,6 +5655,12 @@ impl<A: Application> Reactor<A> {
             return self
                 .on_sequence_reset(framed, phase, &raw, seq, frame)
                 .await;
+        }
+        // At u64::MAX the released number cannot be consumed: its exhaustion
+        // verdict is reported before the session closes on it, as for a
+        // fresh frame.
+        if seq == u64::MAX {
+            self.capture_verdict(released_verdict(seq));
         }
         self.on_app_in_sequence(framed, phase, &raw, seq, frame)
             .await

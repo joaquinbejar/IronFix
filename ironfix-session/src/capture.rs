@@ -279,11 +279,12 @@ pub const fn released_verdict(seq: u64) -> InboundVerdict {
 /// `queued_copy` is whether the gap queue already holds a message under
 /// this number: a gapped fill that is such a copy is dropped.
 ///
-/// An in-sequence GapFill, or a Reset (which has no place in the sequence),
-/// reaches the application and is reported accepted before the
-/// application runs; a refusal by the application
-/// ([`InboundRefusal::Refused`]) or by the core
-/// ([`sequence_reset_verdict`]) follows as a second verdict.
+/// A Reset (which has no place in the sequence) reaches the application and
+/// is reported accepted before the application runs; a refusal by the
+/// application ([`InboundRefusal::Refused`]) or by the core
+/// ([`sequence_reset_verdict`]) follows as a second verdict. An in-sequence
+/// GapFill gets `None` here: its acceptance is reported with the decision
+/// ([`sequence_reset_verdict`]), once the receive cursor has moved past it.
 #[must_use]
 pub const fn sequence_reset_screen_verdict(
     screen: &ResetScreen,
@@ -312,7 +313,7 @@ pub const fn sequence_reset_screen_verdict(
             seq,
             reason: InboundRefusal::Exhausted,
         },
-        ResetScreen::FillInSequence { .. } => in_sequence_verdict(seq),
+        ResetScreen::FillInSequence { .. } => return None,
         // Reset mode has no place in the sequence: its MsgSeqNum is not
         // counted, so it cannot exhaust the counter.
         ResetScreen::Reset => InboundVerdict::Accepted { seq },
@@ -323,12 +324,18 @@ pub const fn sequence_reset_screen_verdict(
 /// The second verdict on a `SequenceReset` (4) of number `seq`, from the
 /// core's decision on it
 /// ([`decide_sequence_reset`](crate::sans_io::decide_sequence_reset)), made
-/// once the application has accepted it: `None` when it is applied (its
-/// screen verdict already said accepted), a rejection when the core refuses
-/// it.
+/// once the application has accepted it: a rejection when the core refuses
+/// it; for an applied GapFill (`gap_fill`), its acceptance, which the driver
+/// reports once the receive cursor has moved; `None` for an applied Reset
+/// (its screen verdict already said accepted).
 #[must_use]
-pub const fn sequence_reset_verdict(decision: &ResetDecision, seq: u64) -> Option<InboundVerdict> {
+pub const fn sequence_reset_verdict(
+    decision: &ResetDecision,
+    gap_fill: bool,
+    seq: u64,
+) -> Option<InboundVerdict> {
     match decision {
+        ResetDecision::Apply { .. } if gap_fill => Some(InboundVerdict::Accepted { seq }),
         ResetDecision::Apply { .. } => None,
         ResetDecision::MissingNewSeqNo
         | ResetDecision::FillNotAdvancing { .. }
@@ -695,10 +702,7 @@ mod tests {
             })
         );
         let in_sequence = screen_sequence_reset(&sequences, Some("Y"), 5, || false);
-        assert_eq!(
-            sequence_reset_screen_verdict(&in_sequence, false, 5),
-            Some(InboundVerdict::Accepted { seq: 5 })
-        );
+        assert_eq!(sequence_reset_screen_verdict(&in_sequence, false, 5), None);
         let reset = screen_sequence_reset(&sequences, None, 1, || false);
         assert_eq!(
             sequence_reset_screen_verdict(&reset, false, 1),
@@ -722,9 +726,24 @@ mod tests {
                     renumbers: false,
                     advances: true
                 },
+                false,
                 5
             ),
             None
+        );
+        // An applied GapFill is accepted with the decision, once the cursor
+        // has moved.
+        assert_eq!(
+            sequence_reset_verdict(
+                &ResetDecision::Apply {
+                    new_seq: 9,
+                    renumbers: false,
+                    advances: true
+                },
+                true,
+                5
+            ),
+            Some(InboundVerdict::Accepted { seq: 5 })
         );
         for decision in [
             ResetDecision::MissingNewSeqNo,
@@ -735,7 +754,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                sequence_reset_verdict(&decision, 5),
+                sequence_reset_verdict(&decision, true, 5),
                 Some(InboundVerdict::Rejected {
                     seq: 5,
                     reason: InboundRefusal::InvalidSequenceReset

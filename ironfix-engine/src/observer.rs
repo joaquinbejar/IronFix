@@ -61,8 +61,11 @@
 //! frame get no verdict. A frame whose header is sound and whose body does
 //! not decode gets the verdict of its number; above a gap it is never
 //! queued and is rejected as [`InboundRefusal::Malformed`]. A
-//! `SequenceReset` (4) the application is about to see is reported accepted
-//! before `from_admin` runs. Under `GapPolicy::Queue`, an
+//! `SequenceReset` (4) in Reset mode is reported accepted before
+//! `from_admin` runs; an in-sequence GapFill is reported accepted once it is
+//! applied and the receive cursor stands at its `NewSeqNo` (36), or
+//! rejected when `from_admin` or the core refuses it. Under
+//! `GapPolicy::Queue`, an
 //! message whose number is already queued is rejected as a
 //! [`InboundRefusal::QueuedCopy`], and the one frame deferred into the queue
 //! under a number gets a second verdict, accepted, when it is released in

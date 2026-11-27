@@ -1805,3 +1805,39 @@ async fn test_accepted_verdict_follows_the_cursor() {
         "each acceptance is reported with the cursor past it: {seen:?}"
     );
 }
+
+/// An in-sequence GapFill is reported accepted once the receive cursor has
+/// moved to its `NewSeqNo` (36).
+#[tokio::test]
+async fn test_gap_fill_accepted_after_the_cursor_moves() {
+    let recorder = Arc::new(CursorRecorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+    *locked(&recorder.connection) = Some(member.clone());
+
+    venue
+        .send(venue_msg("4", 2, &[(123, "Y"), (36, "5")]))
+        .await;
+    ok(
+        timeout(STEP, async {
+            while member.next_target_seq() != 5 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await,
+        "the fill moves the cursor to 5",
+    );
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 5, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+    *locked(&recorder.connection) = None;
+
+    let seen = locked(&recorder.seen).clone();
+    assert_eq!(
+        seen.first(),
+        Some(&(InboundVerdict::Accepted { seq: 2 }, 5)),
+        "the fill is accepted with the cursor at its NewSeqNo: {seen:?}"
+    );
+}
