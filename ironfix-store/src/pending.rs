@@ -85,7 +85,7 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -170,6 +170,8 @@ pub struct TargetTicket {
     seq: u64,
     /// The write's position among the target writes submitted.
     index: u64,
+    /// The [`PendingStore`] instance that issued it.
+    instance: u64,
 }
 
 impl TargetTicket {
@@ -275,6 +277,8 @@ pub struct PendingStore<S: SyncMessageStore + 'static> {
     /// Target writes submitted, and applied, so far.
     targets_submitted: u64,
     targets_applied: u64,
+    /// This instance's identity, stamped on its target tickets.
+    instance: u64,
 }
 
 impl<S: SyncMessageStore + 'static> PendingStore<S> {
@@ -293,6 +297,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         // resend history; refilling it would replace the frame and move the
         // counter back. The number itself may be refilled (a crash between
         // filing and persisting the counter).
+        let instance = next_instance()?;
         let floor = store.next_sender_seq();
         if floor == 0 {
             // Sequence 0 is never valid in FIX, and no resend read can
@@ -329,6 +334,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
             durable_target: None,
             targets_submitted: 0,
             targets_applied: 0,
+            instance,
             floor,
             durable: None,
         })
@@ -579,15 +585,20 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         // `in_flight < bound <= usize::MAX`, checked above.
         self.in_flight += 1;
         self.targets_submitted = index;
-        Ok(TargetTicket { seq, index })
+        Ok(TargetTicket {
+            seq,
+            index,
+            instance: self.instance,
+        })
     }
 
     /// Whether the target write behind `ticket` has been applied, as of
     /// the last poll. Target writes run in submit order, so a later one
-    /// being applied implies this one was.
+    /// being applied implies this one was. A ticket issued by another
+    /// [`PendingStore`] is never reported applied.
     #[must_use]
     pub const fn is_target_applied(&self, ticket: &TargetTicket) -> bool {
-        self.targets_applied >= ticket.index
+        ticket.instance == self.instance && self.targets_applied >= ticket.index
     }
 
     /// The last target number the worker applied, as of the last poll.
@@ -623,7 +634,10 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     /// range, or the inner store's error.
     pub fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
         match self.capped(begin, end)? {
-            Some(capped) => self.store.get_range(begin, capped),
+            Some(capped) => self
+                .store
+                .get_range(begin, capped)
+                .map_err(|err| sanitise_read(begin, err)),
             None => Err(StoreError::RangeNotAvailable { begin, end }),
         }
     }
@@ -647,7 +661,10 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
             return Err(StoreError::InvalidRange { begin, end });
         }
         match self.capped(begin, end)? {
-            Some(capped) => self.store.get_page(begin, capped, limit),
+            Some(capped) => self
+                .store
+                .get_page(begin, capped, limit)
+                .map_err(|err| sanitise_read(begin, err)),
             None => Ok(Vec::new()),
         }
     }
@@ -772,6 +789,35 @@ fn enqueue(shared: &Shared, job: impl FnOnce() -> Job) -> Result<(), PendingErro
     drop(jobs);
     shared.job_ready.notify_one();
     Ok(())
+}
+
+/// Source of [`PendingStore`] instance identities.
+static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+/// A fresh instance identity, never reused in this process.
+fn next_instance() -> Result<u64, StoreError> {
+    NEXT_INSTANCE
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| StoreError::Io("pending store instance ids exhausted".to_owned()))
+}
+
+/// A read error without backend text: the structured range and lookup
+/// errors pass through; anything else keeps only its kind.
+fn sanitise_read(begin: u64, err: StoreError) -> StoreError {
+    let kind = match err {
+        StoreError::InvalidRange { .. }
+        | StoreError::RangeNotAvailable { .. }
+        | StoreError::NotFound { .. }
+        | StoreError::Timeout { .. } => return err,
+        StoreError::RetrieveFailed { .. } => "retrieve failed",
+        StoreError::Corrupted { .. } => "store corrupted",
+        StoreError::Io(_) => "i/o error",
+        _ => "store error",
+    };
+    StoreError::RetrieveFailed {
+        seq_num: begin,
+        reason: format!("inner store read failed ({kind})"),
+    }
 }
 
 /// Replaces a backend error with one that carries no backend text; only
@@ -1432,6 +1478,77 @@ mod tests {
         assert_eq!(p.mark_sent(4), Ok(()));
         assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2, 3, 4]);
         assert_eq!(p.mark_sent(5), Err(PendingError::NotDurable { seq: 5 }));
+    }
+
+    #[test]
+    fn test_pending_store_target_ticket_is_bound_to_its_store() {
+        let (mut a, open_a) = pending(4, None);
+        let (b, _open_b) = pending(4, None);
+        let ticket = loop {
+            match a.submit_target(3) {
+                Err(PendingError::Busy) => std::thread::yield_now(),
+                Ok(ticket) => break ticket,
+                Err(err) => panic!("target: {err:?}"),
+            }
+        };
+        assert!(open_a.send(()).is_ok());
+        assert_eq!(a.drain(), Ok(None));
+        assert!(a.is_target_applied(&ticket));
+        assert!(!b.is_target_applied(&ticket));
+    }
+
+    /// A backend whose reads fail quoting a Logon.
+    struct LeakyReads(MemoryStore);
+
+    impl SyncMessageStore for LeakyReads {
+        fn store(&self, seq: u64, msg_type: &MsgType, message: &[u8]) -> Result<(), StoreError> {
+            self.0.store(seq, msg_type, message)
+        }
+        fn get_range(&self, _begin: u64, _end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+            Err(StoreError::Io("35=A\x01554=hunter2\x01".to_owned()))
+        }
+        fn next_sender_seq(&self) -> u64 {
+            self.0.next_sender_seq()
+        }
+        fn next_target_seq(&self) -> u64 {
+            self.0.next_target_seq()
+        }
+        fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+            self.0.set_next_sender_seq(seq)
+        }
+        fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+            self.0.set_next_target_seq(seq)
+        }
+        fn reset(&self) -> Result<(), StoreError> {
+            self.0.reset()
+        }
+        fn creation_time(&self) -> SystemTime {
+            self.0.creation_time()
+        }
+    }
+
+    #[test]
+    fn test_pending_store_read_errors_carry_no_backend_text() {
+        let inner = MemoryStore::new();
+        assert!(inner.set_next_sender_seq(3).is_ok());
+        let p = match PendingStore::new(LeakyReads(inner), bound(1)) {
+            Ok(p) => p,
+            Err(err) => panic!("new: {err:?}"),
+        };
+        for result in [p.get_range(1, 0), p.get_page(1, 2, 10)] {
+            match result {
+                Err(err @ StoreError::RetrieveFailed { seq_num: 1, .. }) => {
+                    let text = format!("{err} {err:?}");
+                    assert!(!text.contains("hunter2"), "leaked: {text}");
+                }
+                other => panic!("expected a sanitised RetrieveFailed, got {other:?}"),
+            }
+        }
+        // Structured range errors pass through.
+        assert_eq!(
+            p.get_range(0, 1),
+            Err(StoreError::InvalidRange { begin: 0, end: 1 })
+        );
     }
 
     #[test]
