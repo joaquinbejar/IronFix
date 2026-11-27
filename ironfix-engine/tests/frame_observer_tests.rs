@@ -30,8 +30,9 @@ use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_core::types::{CompId, Timestamp};
 use ironfix_engine::application::{Application, RejectReason, SendVerdict, SessionId};
 use ironfix_engine::{
-    Acceptor, Connection, Direction, FrameKind, FrameObserver, Initiator, NotSentReason,
-    Observation, OutboundMessage, OutboundResult, SendOutcome, UnknownReason,
+    Acceptor, Connection, Direction, FrameKind, FrameObserver, InboundRefusal, InboundVerdict,
+    Initiator, NotSentReason, Observation, OutboundMessage, OutboundResult, SendOutcome,
+    UnknownReason,
 };
 use ironfix_session::SessionConfig;
 use ironfix_store::{MemoryStore, MessageStore};
@@ -1336,4 +1337,107 @@ async fn test_resend_retry_cannot_bypass_a_full_observation_backlog() {
         "every observed frame got its result at the close"
     );
     reader.abort();
+}
+
+/// A frame observer recording the core's inbound verdicts (issue #223).
+#[derive(Debug, Default)]
+struct VerdictRecorder {
+    inbound: Mutex<Vec<Option<u64>>>,
+    verdicts: Mutex<Vec<(FrameKind, Option<u64>, InboundVerdict)>>,
+}
+
+impl FrameObserver for VerdictRecorder {
+    fn on_inbound(&self, _frame: &[u8], observation: &Observation<'_>) {
+        locked(&self.inbound).push(observation.msg_seq_num());
+    }
+
+    fn on_outbound(&self, _frame: &[u8], _observation: &Observation<'_>) {}
+
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, observation: &Observation<'_>) {
+        assert_eq!(observation.direction(), Direction::Inbound);
+        assert_eq!(
+            locked(&self.inbound).last().copied().flatten(),
+            Some(verdict.seq()),
+            "a verdict follows the frame it is about"
+        );
+        locked(&self.verdicts).push((observation.kind(), observation.msg_seq_num(), *verdict));
+    }
+}
+
+/// The core's verdicts reach the observer after the frame and before the
+/// session acts: accepted, rejected as a duplicate, deferred behind a gap,
+/// and a GapFill accepted once applied.
+#[tokio::test]
+async fn test_observer_receives_the_core_verdicts() {
+    let recorder = Arc::new(VerdictRecorder::default());
+    let initiator = Initiator::new(member_config(), Arc::new(GateApp::default()))
+        .with_frame_observer(Arc::clone(&recorder) as Arc<dyn FrameObserver>);
+    let (member, mut venue) = scripted(&initiator, PIPE_CAPACITY).await;
+
+    venue.send(venue_msg("0", 2, &[])).await;
+    // A duplicate below the expectation, flagged PossDupFlag (43) = Y.
+    venue
+        .send(venue_msg(
+            "0",
+            2,
+            &[(43, "Y"), (122, "20260101-00:00:00.000")],
+        ))
+        .await;
+    // A gap: 3 and 4 are missing.
+    venue
+        .send(venue_msg(
+            "D",
+            5,
+            &[(11, "GAP"), (55, "EUR/USD"), (54, "1"), (38, "1")],
+        ))
+        .await;
+    let request = venue.next().await;
+    assert_eq!(header(&request).0, "2");
+    // The venue fills 3 to 5.
+    venue
+        .send(venue_msg("4", 3, &[(123, "Y"), (36, "6")]))
+        .await;
+
+    ok(member.logout().await, "the member logs out");
+    while header(&venue.next().await).0 != "5" {}
+    venue.send(venue_msg("5", 6, &[])).await;
+    closed(&member, "the Logout exchange closes the session").await;
+
+    let verdicts = locked(&recorder.verdicts).clone();
+    assert_eq!(
+        verdicts,
+        vec![
+            (
+                FrameKind::Session,
+                Some(2),
+                InboundVerdict::Accepted { seq: 2 }
+            ),
+            (
+                FrameKind::Session,
+                Some(2),
+                InboundVerdict::Rejected {
+                    seq: 2,
+                    reason: InboundRefusal::Duplicate
+                }
+            ),
+            (
+                FrameKind::Session,
+                Some(5),
+                InboundVerdict::Deferred {
+                    seq: 5,
+                    expected: 3
+                }
+            ),
+            (
+                FrameKind::Session,
+                Some(3),
+                InboundVerdict::Accepted { seq: 3 }
+            ),
+            (
+                FrameKind::Session,
+                Some(6),
+                InboundVerdict::Accepted { seq: 6 }
+            ),
+        ]
+    );
 }

@@ -39,6 +39,24 @@
 //!   never "written". Whether the write then completed is reported by
 //!   [`FrameObserver::on_outbound_result`].
 //!
+//! # Inbound verdicts
+//!
+//! The capture points are the sans-IO core's
+//! ([`ironfix_session::CapturePoint`], issue #223): the engine reports each
+//! one through this observer, and a driver without Tokio reports the same
+//! points through [`ironfix_session::FrameCapture`]. For an inbound frame of
+//! the established session, [`FrameObserver::on_inbound_verdict`] follows
+//! [`FrameObserver::on_inbound`] with the core's [`InboundVerdict`] once it
+//! has routed the frame, before the session acts on it: accepted into the
+//! sequence, accepted ahead of a gap (an administrative message inside it),
+//! deferred behind a gap, or rejected with an [`InboundRefusal`] (a
+//! duplicate, a number too low, an exhausted counter, a refused
+//! `SequenceReset` (4), or one `from_admin` refused). A frame the session
+//! closes over before routing it (the wrong CompID, a `SendingTime` out of
+//! tolerance, a header that does not decode) and a handshake frame get no
+//! verdict. An accepted message can still be answered with a session Reject
+//! (3) for its content; the number is consumed either way.
+//!
 //! # Write results
 //!
 //! Every frame passed to [`FrameObserver::on_outbound`] is followed by
@@ -110,51 +128,17 @@
 
 use crate::application::SessionId;
 use crate::outcome::{NotSentReason, SendOutcome, UnknownReason};
+use ironfix_session::{CapturePoint, WriteClass};
 use ironfix_tagvalue::Decoder;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Which way a frame travels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-#[repr(u8)]
-pub enum Direction {
-    /// Read from the counterparty.
-    Inbound,
-    /// Written to the counterparty.
-    Outbound,
-}
-
-/// What kind of frame an [`Observation`] is about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-#[repr(u8)]
-pub enum FrameKind {
-    /// A frame of the Logon handshake, before the session is Active: the
-    /// Logons themselves, frames read while waiting for one, and the Rejects
-    /// and Logouts that refuse one.
-    Handshake,
-    /// A frame of the established session that is not a replay: application
-    /// and administrative messages under a new `MsgSeqNum` (34), and every
-    /// inbound frame once the session is Active.
-    Session,
-    /// A stored message resent, with `PossDupFlag` (43) = Y, under the
-    /// number it was first sent with: the answer to a `ResendRequest` (2) or
-    /// the resend a `NextExpectedMsgSeqNum` (789) asked for.
-    Replay,
-    /// A `SequenceReset`-GapFill (4, 123 = Y) written in a resend, under the
-    /// first number it fills.
-    GapFill,
-}
-
-impl FrameKind {
-    /// Whether the frame re-occupies a number already spent: a
-    /// [`FrameKind::Replay`] or a [`FrameKind::GapFill`].
-    #[must_use]
-    pub const fn is_replay(self) -> bool {
-        matches!(self, Self::Replay | Self::GapFill)
-    }
-}
+/// Which way a frame travels, and what kind of frame an [`Observation`] is
+/// about: the sans-IO core's capture vocabulary (issue #223), re-exported.
+pub use ironfix_session::capture::{Direction, FrameKind};
+/// The core's verdict on an inbound frame, and why it refused one, for
+/// [`FrameObserver::on_inbound_verdict`] (issue #223).
+pub use ironfix_session::{InboundRefusal, InboundVerdict};
 
 /// What the engine knows about one observed frame, or one write result.
 ///
@@ -248,6 +232,16 @@ pub enum OutboundResult {
 }
 
 impl OutboundResult {
+    /// The core's class of this result.
+    #[must_use]
+    pub const fn class(&self) -> WriteClass {
+        match self {
+            Self::Written => WriteClass::Written,
+            Self::NotSent { .. } => WriteClass::NotSent,
+            Self::Unknown { .. } => WriteClass::Unknown,
+        }
+    }
+
     /// The result a send outcome maps to, with the `MsgSeqNum` it carries.
     #[must_use]
     pub(crate) fn from_outcome(outcome: &SendOutcome) -> (Self, Option<u64>) {
@@ -284,6 +278,15 @@ pub trait FrameObserver: Send + Sync + 'static {
     /// never written. Does nothing by default.
     fn on_outbound_result(&self, result: &OutboundResult, observation: &Observation<'_>) {
         let _ = (result, observation);
+    }
+
+    /// Called with the sans-IO core's verdict on an inbound frame of the
+    /// established session, after [`FrameObserver::on_inbound`] for it and
+    /// before the session acts on it: accepted into the sequence, accepted
+    /// ahead of a gap, deferred behind one, or rejected, with the reason.
+    /// Handshake frames get no verdict. Does nothing by default.
+    fn on_inbound_verdict(&self, verdict: &InboundVerdict, observation: &Observation<'_>) {
+        let _ = (verdict, observation);
     }
 }
 
@@ -322,34 +325,74 @@ impl Capture {
         })
     }
 
-    /// Observes an inbound `frame` of `kind`.
-    pub(crate) fn inbound(&self, frame: &[u8], kind: FrameKind) {
+    /// Hands one core capture point to the observer: the single place a
+    /// [`CapturePoint`] becomes a [`FrameObserver`] call. `frame` is the
+    /// bytes of a framed or queued frame; `result` is the engine's detailed
+    /// write result, whose class the point carries.
+    fn emit(&self, point: &CapturePoint, frame: &[u8], result: Option<&OutboundResult>) {
         let observation = Observation::new(
-            Direction::Inbound,
-            kind,
-            peek_msg_seq_num(frame),
+            point.direction(),
+            point.kind(),
+            point.seq(),
             now(),
             &self.session_id,
         );
-        self.observer.on_inbound(frame, &observation);
+        match (point, result) {
+            (CapturePoint::InboundFramed { .. }, _) => {
+                self.observer.on_inbound(frame, &observation);
+            }
+            (CapturePoint::Inbound(verdict), _) => {
+                self.observer.on_inbound_verdict(verdict, &observation);
+            }
+            (CapturePoint::OutboundQueued { .. }, _) => {
+                self.observer.on_outbound(frame, &observation);
+            }
+            (CapturePoint::OutboundResult { result: class, .. }, Some(result)) => {
+                debug_assert_eq!(
+                    *class,
+                    result.class(),
+                    "a result emitted under another class"
+                );
+                self.observer.on_outbound_result(result, &observation);
+            }
+            // The core's point without the engine's reason: never emitted.
+            (CapturePoint::OutboundResult { .. }, None) => {
+                debug_assert!(false, "an outbound result emitted without its detail");
+            }
+            // A capture point added to the core later is not observed until
+            // the engine maps it.
+            _ => {}
+        }
+    }
+
+    /// Observes an inbound `frame` of `kind`.
+    pub(crate) fn inbound(&self, frame: &[u8], kind: FrameKind) {
+        let point = CapturePoint::InboundFramed {
+            kind,
+            seq: peek_msg_seq_num(frame),
+        };
+        self.emit(&point, frame, None);
+    }
+
+    /// Reports the core's `verdict` on an inbound frame of the established
+    /// session.
+    pub(crate) fn verdict(&self, verdict: InboundVerdict) {
+        self.emit(&CapturePoint::Inbound(verdict), &[], None);
     }
 
     /// Observes an outbound `frame` of `kind`, numbered `seq`.
     pub(crate) fn outbound(&self, frame: &[u8], kind: FrameKind, seq: u64) {
-        let observation = Observation::new(
-            Direction::Outbound,
-            kind,
-            Some(seq),
-            now(),
-            &self.session_id,
-        );
-        self.observer.on_outbound(frame, &observation);
+        self.emit(&CapturePoint::OutboundQueued { kind, seq }, frame, None);
     }
 
     /// Reports the write `result` of a frame of `kind`, numbered `seq`.
     pub(crate) fn result(&self, result: &OutboundResult, kind: FrameKind, seq: Option<u64>) {
-        let observation = Observation::new(Direction::Outbound, kind, seq, now(), &self.session_id);
-        self.observer.on_outbound_result(result, &observation);
+        let point = CapturePoint::OutboundResult {
+            kind,
+            seq,
+            result: result.class(),
+        };
+        self.emit(&point, &[], Some(result));
     }
 
     /// Reports a send `outcome` that was never observed as a frame.
@@ -426,14 +469,6 @@ mod tests {
     #[test]
     fn test_peek_msg_seq_num_does_not_take_a_tag_ending_in_34() {
         assert_eq!(peek_msg_seq_num(b"8=FIX.4.4\x01134=7\x0134=3\x01"), Some(3));
-    }
-
-    #[test]
-    fn test_frame_kind_is_replay() {
-        assert!(FrameKind::Replay.is_replay());
-        assert!(FrameKind::GapFill.is_replay());
-        assert!(!FrameKind::Session.is_replay());
-        assert!(!FrameKind::Handshake.is_replay());
     }
 
     #[test]

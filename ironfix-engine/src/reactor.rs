@@ -330,6 +330,10 @@ use ironfix_session::{
     Active, HeartbeatManager, SequenceManager, Session, SessionConfig, StoreResult,
     TestRequestOutcome,
 };
+use ironfix_session::{
+    InboundRefusal, InboundVerdict, inbound_verdict, sequence_reset_screen_verdict,
+    sequence_reset_verdict,
+};
 use ironfix_store::{MessageStore, StoredMessage};
 use ironfix_tagvalue::{FieldIndex, recycle_field_refs};
 use ironfix_transport::{CodecError, FixCodec};
@@ -4595,6 +4599,9 @@ impl<A: Application> Reactor<A> {
             screen_sequence_reset(&self.runtime.sequences, raw.get_field_str(123), seq, || {
                 raw.get_field_str(43) == Some("Y")
             });
+        if let Some(verdict) = sequence_reset_screen_verdict(&screen, seq) {
+            self.capture_verdict(verdict);
+        }
         let gap_fill = match screen {
             ResetScreen::BadGapFillFlag => {
                 let other = raw.get_field_str(123).unwrap_or_default();
@@ -4672,6 +4679,10 @@ impl<A: Application> Reactor<A> {
         // The fill is in sequence (or this is Reset mode): the application may
         // now inspect it.
         if let Err(reason) = self.application.from_admin(raw, &self.session_id).await {
+            self.capture_verdict(InboundVerdict::Rejected {
+                seq,
+                reason: InboundRefusal::Refused,
+            });
             // An in-sequence GapFill occupies its own MsgSeqNum. Rejecting it
             // without consuming that number leaves the inbound expectation
             // parked on it forever: every later message then looks gapped, is
@@ -4688,7 +4699,9 @@ impl<A: Application> Reactor<A> {
 
         let new_seq_no = raw.get_field_str(36).and_then(|s| s.parse::<u64>().ok());
         let expected = self.runtime.sequences.next_target_seq().value();
-        let reason = match decide_sequence_reset(gap_fill, seq, new_seq_no, expected) {
+        let decision = decide_sequence_reset(gap_fill, seq, new_seq_no, expected);
+        self.capture_verdict(sequence_reset_verdict(&decision, seq));
+        let reason = match decision {
             ResetDecision::MissingNewSeqNo => {
                 // Same hazard as the rejection path above: the fill still
                 // occupies its sequence number even though its NewSeqNo is
@@ -5498,6 +5511,14 @@ impl<A: Application> Reactor<A> {
         }
     }
 
+    /// Reports the sans-IO core's `verdict` on an inbound frame to the frame
+    /// observer, if one is attached (issue #223).
+    fn capture_verdict(&self, verdict: InboundVerdict) {
+        if let Some(capture) = &self.writer.capture {
+            capture.verdict(verdict);
+        }
+    }
+
     /// Handles one inbound frame ([`Reactor::on_frame`]), then consumes a held
     /// Logon whose turn it now is ([`Reactor::release_held_logon`]).
     async fn on_inbound(
@@ -5951,10 +5972,15 @@ impl<A: Application> Reactor<A> {
             TestRequestOutcome::NonePending => {}
         }
 
-        // The core routes the message; the driver acts on the route.
-        match route_inbound(&self.runtime.sequences, &msg_type, seq, || {
+        // The core routes the message; the driver reports the core's verdict
+        // on it (issue #223), then acts on the route.
+        let route = route_inbound(&self.runtime.sequences, &msg_type, seq, || {
             raw.get_field_str(43) == Some("Y")
-        }) {
+        });
+        if let Some(verdict) = inbound_verdict(&route, seq) {
+            self.capture_verdict(verdict);
+        }
+        match route {
             InboundRoute::SequenceReset => {
                 self.on_sequence_reset(framed, phase, &raw, seq, frame)
                     .await

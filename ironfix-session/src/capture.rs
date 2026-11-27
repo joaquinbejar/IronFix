@@ -1,0 +1,598 @@
+/******************************************************************************
+   Author: Joaquín Béjar García
+   Email: jb@taunais.com
+   Date: 27/11/26
+******************************************************************************/
+
+//! Sans-IO core: the capture points of a session (issue #223).
+//!
+//! An audit or replay capture needs to know where each frame stands relative
+//! to the session's sequence handling: read and framed, accepted into the
+//! sequence, held above a gap, refused; queued for the wire, written, or
+//! resent. Those points are protocol decisions, so they live here, and every
+//! driver reports them the same way.
+//!
+//! - [`CapturePoint`] names one point: an inbound frame framed, the core's
+//!   [`InboundVerdict`] on it, an outbound frame queued (a resend replay or
+//!   gap fill is [`FrameKind::Replay`] or [`FrameKind::GapFill`]), and the
+//!   write result of an outbound frame ([`WriteClass`]).
+//! - The verdict comes from the core's own routing decisions:
+//!   [`inbound_verdict`] for an [`InboundRoute`],
+//!   [`sequence_reset_screen_verdict`] for a [`ResetScreen`], and
+//!   [`sequence_reset_verdict`] for a [`ResetDecision`]. A driver does not
+//!   reinterpret the route to decide what to report.
+//! - [`FrameCapture`] is the synchronous sink a driver hands the points to,
+//!   with the frame bytes when there are any and the driver's own clock
+//!   reading (the core reads no clock, ADR-0002).
+//!
+//! `ironfix-engine` is the first driver: its `FrameObserver` is fed from
+//! these points, and its `Direction` and `FrameKind` are the types defined
+//! here.
+//!
+//! # Credentials
+//!
+//! A captured frame is raw bytes. A Logon can carry `Password` (554),
+//! `NewPassword` (925) and `RawData` (96); redacting what a sink stores or
+//! logs is the sink's responsibility.
+
+use std::time::Instant;
+
+use crate::sans_io::{GapDisposition, InboundRoute, ResetDecision, ResetScreen};
+
+/// Which way a frame travels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum Direction {
+    /// Read from the counterparty.
+    Inbound,
+    /// Written to the counterparty.
+    Outbound,
+}
+
+/// What kind of frame a capture point is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum FrameKind {
+    /// A frame of the Logon handshake, before the session is Active: the
+    /// Logons themselves, frames read while waiting for one, and the Rejects
+    /// and Logouts that refuse one.
+    Handshake,
+    /// A frame of the established session that is not a replay: application
+    /// and administrative messages under a new `MsgSeqNum` (34), and every
+    /// inbound frame once the session is Active.
+    Session,
+    /// A stored message resent, with `PossDupFlag` (43) = Y, under the
+    /// number it was first sent with: the answer to a `ResendRequest` (2) or
+    /// the resend a `NextExpectedMsgSeqNum` (789) asked for.
+    Replay,
+    /// A `SequenceReset`-GapFill (4, 123 = Y) written in a resend, under the
+    /// first number it fills.
+    GapFill,
+}
+
+impl FrameKind {
+    /// Whether the frame re-occupies a number already spent: a
+    /// [`FrameKind::Replay`] or a [`FrameKind::GapFill`].
+    #[must_use]
+    pub const fn is_replay(self) -> bool {
+        matches!(self, Self::Replay | Self::GapFill)
+    }
+}
+
+/// Why the core refused an inbound frame's `MsgSeqNum` (34) or the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InboundRefusal {
+    /// Below the expectation with `PossDupFlag` (43) = Y: a duplicate,
+    /// ignored as FIX requires.
+    Duplicate,
+    /// Below the expectation without `PossDupFlag` (43) = Y: the streams have
+    /// diverged and the session ends.
+    TooLow {
+        /// The number the session expected.
+        expected: u64,
+    },
+    /// The inbound counter is at `u64::MAX`: the session ends.
+    Exhausted,
+    /// A `SequenceReset` (4) the core refused: a malformed `GapFillFlag`
+    /// (123), a missing or unusable `NewSeqNo` (36), a GapFill that does not
+    /// advance, or a Reset below the expectation. The driver answers it with
+    /// a session Reject (3).
+    InvalidSequenceReset,
+    /// The driver's application refused the message (in the engine,
+    /// `from_admin` returned an error). Reported by the driver: the core
+    /// cannot see the application's answer.
+    Refused,
+}
+
+/// The core's verdict on an inbound frame, relative to sequence handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InboundVerdict {
+    /// The number is the one expected and the driver acts on the message.
+    /// It may still answer it with a session Reject (3) for its content; the
+    /// number is consumed either way.
+    Accepted {
+        /// The frame's `MsgSeqNum` (34).
+        seq: u64,
+    },
+    /// Above the expectation, and acted on now without consuming its number:
+    /// an administrative message inside a gap (a Logout among them).
+    AcceptedAhead {
+        /// The frame's `MsgSeqNum` (34).
+        seq: u64,
+        /// The number the session expected: the start of the gap.
+        expected: u64,
+    },
+    /// Above the expectation and not acted on now: the gap is requested, and
+    /// the frame may be queued to be released in turn.
+    Deferred {
+        /// The frame's `MsgSeqNum` (34).
+        seq: u64,
+        /// The number the session expected: the start of the gap.
+        expected: u64,
+    },
+    /// Not acted on.
+    Rejected {
+        /// The frame's `MsgSeqNum` (34).
+        seq: u64,
+        /// Why.
+        reason: InboundRefusal,
+    },
+}
+
+impl InboundVerdict {
+    /// The frame's `MsgSeqNum` (34).
+    #[must_use]
+    pub const fn seq(&self) -> u64 {
+        match *self {
+            Self::Accepted { seq }
+            | Self::AcceptedAhead { seq, .. }
+            | Self::Deferred { seq, .. }
+            | Self::Rejected { seq, .. } => seq,
+        }
+    }
+
+    /// Whether the driver acts on the message now.
+    #[must_use]
+    pub const fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted { .. } | Self::AcceptedAhead { .. })
+    }
+}
+
+/// The verdict on an inbound frame of number `seq` the core routed as
+/// `route` ([`route_inbound`](crate::sans_io::route_inbound)).
+///
+/// `None` for a `SequenceReset` (4): it has its own rules, and its verdict
+/// comes from [`sequence_reset_screen_verdict`] and, once the application
+/// has seen it, [`sequence_reset_verdict`].
+#[must_use]
+pub const fn inbound_verdict(route: &InboundRoute, seq: u64) -> Option<InboundVerdict> {
+    let verdict = match *route {
+        InboundRoute::SequenceReset => return None,
+        InboundRoute::Admin { .. } | InboundRoute::App => InboundVerdict::Accepted { seq },
+        InboundRoute::Duplicate => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::Duplicate,
+        },
+        InboundRoute::TooLow { expected, .. } => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::TooLow { expected },
+        },
+        InboundRoute::Exhausted => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::Exhausted,
+        },
+        InboundRoute::Gap { expected, then, .. } => match then {
+            GapDisposition::QueueFrame => InboundVerdict::Deferred { seq, expected },
+            GapDisposition::KeepNumber | GapDisposition::Dispatch => {
+                InboundVerdict::AcceptedAhead { seq, expected }
+            }
+        },
+    };
+    Some(verdict)
+}
+
+/// The verdict on a `SequenceReset` (4) of number `seq` from its screen
+/// ([`screen_sequence_reset`](crate::sans_io::screen_sequence_reset)).
+///
+/// `None` when the screen lets it reach the application (an in-sequence
+/// GapFill, or Reset mode): its verdict then comes from the application's
+/// answer ([`InboundRefusal::Refused`]) or [`sequence_reset_verdict`].
+#[must_use]
+pub const fn sequence_reset_screen_verdict(
+    screen: &ResetScreen,
+    seq: u64,
+) -> Option<InboundVerdict> {
+    let verdict = match *screen {
+        ResetScreen::BadGapFillFlag => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::InvalidSequenceReset,
+        },
+        ResetScreen::GappedFill { expected, .. } => InboundVerdict::Deferred { seq, expected },
+        ResetScreen::DuplicateFill { .. } => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::Duplicate,
+        },
+        ResetScreen::TooLowFill { expected, .. } => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::TooLow { expected },
+        },
+        ResetScreen::Exhausted => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::Exhausted,
+        },
+        ResetScreen::FillInSequence { .. } | ResetScreen::Reset => return None,
+    };
+    Some(verdict)
+}
+
+/// The verdict on a `SequenceReset` (4) of number `seq` from the core's
+/// decision on it ([`decide_sequence_reset`](crate::sans_io::decide_sequence_reset)).
+#[must_use]
+pub const fn sequence_reset_verdict(decision: &ResetDecision, seq: u64) -> InboundVerdict {
+    match decision {
+        ResetDecision::Apply { .. } => InboundVerdict::Accepted { seq },
+        ResetDecision::MissingNewSeqNo
+        | ResetDecision::FillNotAdvancing { .. }
+        | ResetDecision::ResetBelowExpected { .. } => InboundVerdict::Rejected {
+            seq,
+            reason: InboundRefusal::InvalidSequenceReset,
+        },
+    }
+}
+
+/// How the write of an outbound frame ended, or that a message was never
+/// written. The driver may keep a finer reason of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+#[repr(u8)]
+pub enum WriteClass {
+    /// A flush that covers the frame completed: the stream accepted every
+    /// byte of it.
+    Written,
+    /// No byte of the message reached the stream. It was never queued.
+    NotSent,
+    /// A write was started and did not complete: the counterparty may have
+    /// read all, part or none of the frame.
+    Unknown,
+}
+
+/// One capture point of a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CapturePoint {
+    /// An inbound frame passed framing, before the session acts on it.
+    InboundFramed {
+        /// What kind of frame it is.
+        kind: FrameKind,
+        /// Its `MsgSeqNum` (34), when the driver could read one.
+        seq: Option<u64>,
+    },
+    /// The core's verdict on an inbound frame of the established session.
+    Inbound(InboundVerdict),
+    /// An outbound frame was built and queued for the wire, before any byte
+    /// of it goes to the stream. A resend is [`FrameKind::Replay`] or
+    /// [`FrameKind::GapFill`].
+    OutboundQueued {
+        /// What kind of frame it is.
+        kind: FrameKind,
+        /// Its `MsgSeqNum` (34).
+        seq: u64,
+    },
+    /// How the write of a queued frame ended, or that a message was never
+    /// written ([`WriteClass::NotSent`], with no number when none was
+    /// spent).
+    OutboundResult {
+        /// What kind of frame it is.
+        kind: FrameKind,
+        /// Its `MsgSeqNum` (34), when one was spent.
+        seq: Option<u64>,
+        /// How it ended.
+        result: WriteClass,
+    },
+}
+
+impl CapturePoint {
+    /// A resend replay of the stored message numbered `seq`.
+    #[must_use]
+    pub const fn replayed(seq: u64) -> Self {
+        Self::OutboundQueued {
+            kind: FrameKind::Replay,
+            seq,
+        }
+    }
+
+    /// A `SequenceReset`-GapFill written in a resend, under the first number
+    /// `seq` it fills.
+    #[must_use]
+    pub const fn gap_filled(seq: u64) -> Self {
+        Self::OutboundQueued {
+            kind: FrameKind::GapFill,
+            seq,
+        }
+    }
+
+    /// Which way the frame travels.
+    #[must_use]
+    pub const fn direction(&self) -> Direction {
+        match self {
+            Self::InboundFramed { .. } | Self::Inbound(_) => Direction::Inbound,
+            Self::OutboundQueued { .. } | Self::OutboundResult { .. } => Direction::Outbound,
+        }
+    }
+
+    /// What kind of frame the point is about. A verdict is always about a
+    /// frame of the established session.
+    #[must_use]
+    pub const fn kind(&self) -> FrameKind {
+        match *self {
+            Self::InboundFramed { kind, .. }
+            | Self::OutboundQueued { kind, .. }
+            | Self::OutboundResult { kind, .. } => kind,
+            Self::Inbound(_) => FrameKind::Session,
+        }
+    }
+
+    /// The frame's `MsgSeqNum` (34), when known.
+    #[must_use]
+    pub const fn seq(&self) -> Option<u64> {
+        match *self {
+            Self::InboundFramed { seq, .. } | Self::OutboundResult { seq, .. } => seq,
+            Self::Inbound(verdict) => Some(verdict.seq()),
+            Self::OutboundQueued { seq, .. } => Some(seq),
+        }
+    }
+
+    /// Whether the point is about a resend: a replay or a gap fill.
+    #[must_use]
+    pub const fn is_resend(&self) -> bool {
+        self.kind().is_replay()
+    }
+}
+
+/// The synchronous sink a driver reports capture points to.
+///
+/// Called inline on the driver's session task: it must be cheap, must not
+/// block and must not panic. `frame` is the frame's bytes for
+/// [`CapturePoint::InboundFramed`] and [`CapturePoint::OutboundQueued`], and
+/// `None` for a verdict or a write result. `at` is the driver's clock
+/// reading at the point.
+pub trait FrameCapture {
+    /// Reports one capture point.
+    fn on_capture(&self, point: &CapturePoint, frame: Option<&[u8]>, at: Instant);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sans_io::{route_inbound, screen_sequence_reset};
+    use crate::sequence::SequenceManager;
+    use ironfix_core::message::MsgType;
+    use std::cell::RefCell;
+
+    fn expecting(next: u64) -> SequenceManager {
+        let sequences = SequenceManager::new();
+        sequences.set_target_seq(next);
+        sequences
+    }
+
+    #[test]
+    fn test_frame_kind_is_replay() {
+        assert!(FrameKind::Replay.is_replay());
+        assert!(FrameKind::GapFill.is_replay());
+        assert!(!FrameKind::Session.is_replay());
+        assert!(!FrameKind::Handshake.is_replay());
+    }
+
+    #[test]
+    fn test_in_sequence_messages_are_accepted() {
+        let sequences = expecting(5);
+        for msg_type in [MsgType::Heartbeat, MsgType::NewOrderSingle] {
+            let route = route_inbound(&sequences, &msg_type, 5, || false);
+            assert_eq!(
+                inbound_verdict(&route, 5),
+                Some(InboundVerdict::Accepted { seq: 5 })
+            );
+        }
+    }
+
+    #[test]
+    fn test_low_numbers_are_rejected_with_their_reason() {
+        let sequences = expecting(5);
+        let route = route_inbound(&sequences, &MsgType::NewOrderSingle, 3, || false);
+        assert_eq!(
+            inbound_verdict(&route, 3),
+            Some(InboundVerdict::Rejected {
+                seq: 3,
+                reason: InboundRefusal::TooLow { expected: 5 }
+            })
+        );
+        let route = route_inbound(&sequences, &MsgType::NewOrderSingle, 3, || true);
+        let verdict = inbound_verdict(&route, 3);
+        assert!(matches!(
+            verdict,
+            Some(InboundVerdict::Rejected {
+                seq: 3,
+                reason: InboundRefusal::Duplicate
+            })
+        ));
+        assert!(verdict.is_some_and(|v| !v.is_accepted()));
+    }
+
+    #[test]
+    fn test_gapped_messages_are_deferred_or_accepted_ahead() {
+        let sequences = expecting(5);
+        let route = route_inbound(&sequences, &MsgType::NewOrderSingle, 9, || false);
+        assert_eq!(
+            inbound_verdict(&route, 9),
+            Some(InboundVerdict::Deferred {
+                seq: 9,
+                expected: 5
+            })
+        );
+        for msg_type in [MsgType::Heartbeat, MsgType::Logout] {
+            let route = route_inbound(&sequences, &msg_type, 9, || false);
+            let verdict = inbound_verdict(&route, 9);
+            assert_eq!(
+                verdict,
+                Some(InboundVerdict::AcceptedAhead {
+                    seq: 9,
+                    expected: 5
+                })
+            );
+            assert!(verdict.is_some_and(|v| v.is_accepted()));
+        }
+    }
+
+    #[test]
+    fn test_exhausted_and_sequence_reset_routes() {
+        assert_eq!(
+            inbound_verdict(&InboundRoute::Exhausted, u64::MAX),
+            Some(InboundVerdict::Rejected {
+                seq: u64::MAX,
+                reason: InboundRefusal::Exhausted
+            })
+        );
+        assert_eq!(inbound_verdict(&InboundRoute::SequenceReset, 4), None);
+    }
+
+    #[test]
+    fn test_sequence_reset_screen_verdicts() {
+        let sequences = expecting(5);
+        let gapped = screen_sequence_reset(&sequences, Some("Y"), 9, || false);
+        assert_eq!(
+            sequence_reset_screen_verdict(&gapped, 9),
+            Some(InboundVerdict::Deferred {
+                seq: 9,
+                expected: 5
+            })
+        );
+        let bad = screen_sequence_reset(&sequences, Some("X"), 5, || false);
+        assert_eq!(
+            sequence_reset_screen_verdict(&bad, 5),
+            Some(InboundVerdict::Rejected {
+                seq: 5,
+                reason: InboundRefusal::InvalidSequenceReset
+            })
+        );
+        let duplicate = screen_sequence_reset(&sequences, Some("Y"), 3, || true);
+        assert_eq!(
+            sequence_reset_screen_verdict(&duplicate, 3),
+            Some(InboundVerdict::Rejected {
+                seq: 3,
+                reason: InboundRefusal::Duplicate
+            })
+        );
+        let too_low = screen_sequence_reset(&sequences, Some("Y"), 3, || false);
+        assert_eq!(
+            sequence_reset_screen_verdict(&too_low, 3),
+            Some(InboundVerdict::Rejected {
+                seq: 3,
+                reason: InboundRefusal::TooLow { expected: 5 }
+            })
+        );
+        let in_sequence = screen_sequence_reset(&sequences, Some("Y"), 5, || false);
+        assert_eq!(sequence_reset_screen_verdict(&in_sequence, 5), None);
+        let reset = screen_sequence_reset(&sequences, None, 1, || false);
+        assert_eq!(sequence_reset_screen_verdict(&reset, 1), None);
+    }
+
+    #[test]
+    fn test_sequence_reset_decision_verdicts() {
+        assert_eq!(
+            sequence_reset_verdict(
+                &ResetDecision::Apply {
+                    new_seq: 9,
+                    renumbers: false,
+                    advances: true
+                },
+                5
+            ),
+            InboundVerdict::Accepted { seq: 5 }
+        );
+        for decision in [
+            ResetDecision::MissingNewSeqNo,
+            ResetDecision::FillNotAdvancing { new_seq: 5 },
+            ResetDecision::ResetBelowExpected {
+                new_seq: 2,
+                expected: 5,
+            },
+        ] {
+            assert_eq!(
+                sequence_reset_verdict(&decision, 5),
+                InboundVerdict::Rejected {
+                    seq: 5,
+                    reason: InboundRefusal::InvalidSequenceReset
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_capture_point_accessors() {
+        let framed = CapturePoint::InboundFramed {
+            kind: FrameKind::Handshake,
+            seq: None,
+        };
+        assert_eq!(framed.direction(), Direction::Inbound);
+        assert_eq!(framed.kind(), FrameKind::Handshake);
+        assert_eq!(framed.seq(), None);
+
+        let verdict = CapturePoint::Inbound(InboundVerdict::Accepted { seq: 7 });
+        assert_eq!(verdict.direction(), Direction::Inbound);
+        assert_eq!(verdict.kind(), FrameKind::Session);
+        assert_eq!(verdict.seq(), Some(7));
+
+        let replay = CapturePoint::replayed(3);
+        assert_eq!(replay.direction(), Direction::Outbound);
+        assert!(replay.is_resend());
+        assert_eq!(replay.seq(), Some(3));
+        assert!(CapturePoint::gap_filled(4).is_resend());
+
+        let result = CapturePoint::OutboundResult {
+            kind: FrameKind::Session,
+            seq: None,
+            result: WriteClass::NotSent,
+        };
+        assert_eq!(result.direction(), Direction::Outbound);
+        assert!(!result.is_resend());
+        assert_eq!(result.seq(), None);
+    }
+
+    #[test]
+    fn test_a_sync_sink_receives_points_in_order() {
+        struct Recorder(RefCell<Vec<(CapturePoint, Option<Vec<u8>>)>>);
+        impl FrameCapture for Recorder {
+            fn on_capture(&self, point: &CapturePoint, frame: Option<&[u8]>, _at: Instant) {
+                self.0
+                    .borrow_mut()
+                    .push((*point, frame.map(<[u8]>::to_vec)));
+            }
+        }
+        let sink = Recorder(RefCell::new(Vec::new()));
+        let at = Instant::now();
+        let sequences = expecting(1);
+        let route = route_inbound(&sequences, &MsgType::Heartbeat, 1, || false);
+        sink.on_capture(
+            &CapturePoint::InboundFramed {
+                kind: FrameKind::Session,
+                seq: Some(1),
+            },
+            Some(b"35=0"),
+            at,
+        );
+        if let Some(verdict) = inbound_verdict(&route, 1) {
+            sink.on_capture(&CapturePoint::Inbound(verdict), None, at);
+        }
+        let points = sink.0.into_inner();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].1.as_deref(), Some(&b"35=0"[..]));
+        assert_eq!(
+            points[1].0,
+            CapturePoint::Inbound(InboundVerdict::Accepted { seq: 1 })
+        );
+    }
+}
