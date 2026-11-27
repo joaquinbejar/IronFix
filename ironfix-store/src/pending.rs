@@ -28,15 +28,9 @@
 //!
 //! ## Guarantees
 //!
-//! These hold only while the [`PendingStore`] is the **single outbound
-//! writer** of its inner store: no second [`PendingStore`] over the same
-//! store, and no `store`, `file_outbound`, `set_next_sender_seq`,
-//! `reset` or `reset_to` through another handle while it is alive. Two
-//! writers would each accept the same sequence number and the later frame
-//! would replace the earlier one, so a resend could replay a frame that was
-//! never sent under that number. The type does not enforce this: the
-//! `Arc` is shared so that resends can read through
-//! [`PendingStore::store`].
+//! [`PendingStore::new`] takes the store **by value**, so the wrapper is
+//! its single outbound writer: no other handle can file a frame, move the
+//! sender counter or reset it while the wrapper lives.
 //!
 //! - Writes run in submit order, one at a time, through
 //!   [`SyncMessageStore::file_outbound`], which files the frame and then
@@ -49,6 +43,19 @@
 //!   write already queued behind it is skipped (not applied); the error is
 //!   returned once by [`PendingStore::poll_durable`] or
 //!   [`PendingStore::drain`].
+//! - Reads see confirmed frames only. [`PendingStore::get_range`] and
+//!   [`PendingStore::get_page`] cap the range at the last confirmed
+//!   sequence number: the durable watermark as of the last poll, or, before
+//!   any, the history the store held at construction (every number below
+//!   its next sender number then). A frame submitted but not confirmed,
+//!   still in flight or failed, is never returned, so a resend never
+//!   replays a frame that may not have been sent.
+//!   [`PendingStore::next_sender_seq`] is the confirmed counter likewise.
+//! - Inbound-side state is a pass-through:
+//!   [`PendingStore::next_target_seq`],
+//!   [`PendingStore::set_next_target_seq`] and
+//!   [`PendingStore::creation_time`] call the inner store on the caller's
+//!   thread and do not touch outbound state.
 //! - Dropping a [`PendingStore`] finishes the writes already queued and
 //!   joins the worker, so it blocks for up to the bound times one write.
 //!
@@ -58,6 +65,7 @@
 //! custom store may quote the frame, so a failed write is reported with its
 //! sequence number and the kind of error only.
 
+use crate::stored::StoredMessage;
 use crate::sync_traits::SyncMessageStore;
 use ironfix_core::error::StoreError;
 use ironfix_core::message::MsgType;
@@ -220,7 +228,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
     /// # Errors
     /// [`StoreError::Io`] if the queues for `bound` writes cannot be
     /// reserved or the worker thread cannot be spawned.
-    pub fn new(store: Arc<S>, bound: NonZeroUsize) -> Result<Self, StoreError> {
+    pub fn new(store: S, bound: NonZeroUsize) -> Result<Self, StoreError> {
         let jobs = reserve::<Job>(bound)?;
         let outcomes = reserve::<Done>(bound)?;
         // A frame already filed below the store's next sender number is
@@ -228,6 +236,7 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         // counter back. The number itself may be refilled (a crash between
         // filing and persisting the counter).
         let floor = store.next_sender_seq();
+        let store = Arc::new(store);
         let shared = Arc::new(Shared {
             jobs: Mutex::new(Jobs {
                 queue: jobs,
@@ -414,11 +423,103 @@ impl<S: SyncMessageStore + 'static> PendingStore<S> {
         self.shared.failed.load(Ordering::Acquire)
     }
 
-    /// The inner store, for reads such as a resend's `get_range`. Writing
-    /// through it bypasses the submit order.
+    /// The last confirmed outbound sequence number: the durable watermark,
+    /// or before any, the last number the store held at construction.
+    fn confirmed(&self) -> Option<u64> {
+        match self.durable {
+            Some(seq) => Some(seq),
+            None => self.floor.checked_sub(1).filter(|&seq| seq > 0),
+        }
+    }
+
+    /// The end of `begin..=end` (`end` 0 meaning infinity) capped at the
+    /// last confirmed number, or `None` when nothing in it is confirmed.
+    fn capped(&self, begin: u64, end: u64) -> Result<Option<u64>, StoreError> {
+        if begin == 0 || (end != 0 && begin > end) {
+            return Err(StoreError::InvalidRange { begin, end });
+        }
+        let Some(confirmed) = self.confirmed() else {
+            return Ok(None);
+        };
+        let capped = if end == 0 || end > confirmed {
+            confirmed
+        } else {
+            end
+        };
+        Ok((begin <= capped).then_some(capped))
+    }
+
+    /// Confirmed frames in `begin..=end` (`end` 0 meaning infinity), as
+    /// [`SyncMessageStore::get_range`]; frames submitted but not confirmed
+    /// are never returned (see the [module docs](self)).
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidRange`] for `begin` 0 or above `end`,
+    /// [`StoreError::RangeNotAvailable`] when nothing confirmed is in the
+    /// range, or the inner store's error.
+    pub fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+        match self.capped(begin, end)? {
+            Some(capped) => self.store.get_range(begin, capped),
+            None => Err(StoreError::RangeNotAvailable { begin, end }),
+        }
+    }
+
+    /// Up to `limit` confirmed frames in `begin..=end`, as
+    /// [`SyncMessageStore::get_page`]; an empty page when nothing
+    /// confirmed is in the range.
+    ///
+    /// # Errors
+    /// [`StoreError::InvalidRange`] for `begin` 0 or above `end`, or the
+    /// inner store's error.
+    pub fn get_page(
+        &self,
+        begin: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, StoreError> {
+        match self.capped(begin, end)? {
+            Some(capped) => self.store.get_page(begin, capped, limit),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The confirmed next sender sequence number: one above the durable
+    /// watermark, or the store's next sender number at construction.
     #[must_use]
-    pub const fn store(&self) -> &Arc<S> {
-        &self.store
+    pub fn next_sender_seq(&self) -> u64 {
+        match self.durable {
+            // `submit` refuses `u64::MAX`, so a durable number has a next.
+            Some(seq) => match seq.checked_add(1) {
+                Some(next) => next,
+                None => {
+                    debug_assert!(false, "durable u64::MAX");
+                    self.floor
+                }
+            },
+            None => self.floor,
+        }
+    }
+
+    /// The inner store's next target (inbound) sequence number.
+    #[must_use]
+    pub fn next_target_seq(&self) -> u64 {
+        self.store.next_target_seq()
+    }
+
+    /// Persists the next target (inbound) sequence number through the inner
+    /// store, on the caller's thread: it blocks for as long as the store's
+    /// call does, and does not touch outbound state.
+    ///
+    /// # Errors
+    /// The inner store's error.
+    pub fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+        self.store.set_next_target_seq(seq)
+    }
+
+    /// The inner store's creation time.
+    #[must_use]
+    pub fn creation_time(&self) -> std::time::SystemTime {
+        self.store.creation_time()
     }
 
     fn apply(&mut self, done: Done) -> Result<(), StoreError> {
@@ -564,14 +665,13 @@ fn run_worker<S: SyncMessageStore>(store: &S, shared: &Shared) {
 mod tests {
     use super::*;
     use crate::memory::MemoryStore;
-    use crate::stored::StoredMessage;
     use std::sync::mpsc;
     use std::time::{Instant, SystemTime};
 
     /// A store whose writes wait for one token each on `gate`, and whose
     /// `fail_at` write fails with `fail_with`.
     struct GatedStore {
-        inner: MemoryStore,
+        inner: Arc<MemoryStore>,
         gate: Option<Mutex<mpsc::Receiver<()>>>,
         fail_at: Option<u64>,
         fail_with: StoreError,
@@ -647,14 +747,14 @@ mod tests {
     ) -> (PendingStore<GatedStore>, mpsc::Sender<()>) {
         let (open, gate) = mpsc::channel();
         let store = GatedStore {
-            inner: MemoryStore::new(),
+            inner: Arc::new(MemoryStore::new()),
             gate: Some(Mutex::new(gate)),
             fail_at,
             fail_with,
             failing: None,
             panic_at: None,
         };
-        match PendingStore::new(Arc::new(store), bound(n)) {
+        match PendingStore::new(store, bound(n)) {
             Ok(p) => (p, open),
             Err(err) => panic!("new: {err:?}"),
         }
@@ -698,7 +798,7 @@ mod tests {
         assert!(open.send(()).is_ok());
         assert_eq!(p.drain(), Ok(Some(2)));
         assert_eq!(p.in_flight(), 0);
-        assert_eq!(p.store().next_sender_seq(), 3);
+        assert_eq!(p.next_sender_seq(), 3);
         assert!(submit(&mut p, 3).is_ok());
         assert!(open.send(()).is_ok());
         assert_eq!(p.drain(), Ok(Some(3)));
@@ -719,7 +819,7 @@ mod tests {
         assert_eq!(poll_until(&mut p, 3), Ok(()));
         assert_eq!(p.durable(), Some(3));
         assert_eq!(p.in_flight(), 0);
-        match p.store().get_range(1, 3) {
+        match p.get_range(1, 3) {
             Ok(messages) => assert_eq!(messages.len(), 3),
             Err(err) => panic!("range: {err:?}"),
         }
@@ -742,7 +842,7 @@ mod tests {
         assert_eq!(p.durable(), Some(1));
         assert_eq!(p.in_flight(), 0);
         // The write queued behind the failure was skipped, not applied.
-        assert!(!p.store().inner.contains(3));
+        assert!(!p.store.inner.contains(3));
         assert_eq!(submit(&mut p, 4), Err(PendingError::Failed));
     }
 
@@ -772,14 +872,14 @@ mod tests {
         let (open, gate) = mpsc::channel();
         let (failing, failed_write) = mpsc::channel();
         let store = GatedStore {
-            inner: MemoryStore::new(),
+            inner: Arc::new(MemoryStore::new()),
             gate: Some(Mutex::new(gate)),
             fail_at: Some(1),
             fail_with: injected(1),
             failing: Some(Mutex::new(failing)),
             panic_at: None,
         };
-        let mut p = match PendingStore::new(Arc::new(store), bound(4)) {
+        let mut p = match PendingStore::new(store, bound(4)) {
             Ok(p) => p,
             Err(err) => panic!("new: {err:?}"),
         };
@@ -820,14 +920,14 @@ mod tests {
     #[test]
     fn test_pending_store_refuses_an_enqueue_once_the_worker_stopped() {
         let store = GatedStore {
-            inner: MemoryStore::new(),
+            inner: Arc::new(MemoryStore::new()),
             gate: None,
             fail_at: None,
             fail_with: injected(0),
             failing: None,
             panic_at: Some(1),
         };
-        let mut p = match PendingStore::new(Arc::new(store), bound(4)) {
+        let mut p = match PendingStore::new(store, bound(4)) {
             Ok(p) => p,
             Err(err) => panic!("new: {err:?}"),
         };
@@ -849,7 +949,7 @@ mod tests {
     #[test]
     fn test_pending_store_refuses_a_sequence_below_the_store_next_sender() {
         let store = GatedStore {
-            inner: MemoryStore::new(),
+            inner: Arc::new(MemoryStore::new()),
             gate: None,
             fail_at: None,
             fail_with: injected(0),
@@ -863,7 +963,7 @@ mod tests {
                 .is_ok()
         );
         assert!(store.inner.set_next_sender_seq(5).is_ok());
-        let mut p = match PendingStore::new(Arc::new(store), bound(2)) {
+        let mut p = match PendingStore::new(store, bound(2)) {
             Ok(p) => p,
             Err(err) => panic!("new: {err:?}"),
         };
@@ -873,14 +973,137 @@ mod tests {
         );
         assert!(submit(&mut p, 5).is_ok());
         assert_eq!(p.drain(), Ok(Some(5)));
-        assert_eq!(p.store().next_sender_seq(), 6);
+        assert_eq!(p.next_sender_seq(), 6);
+    }
+
+    /// Seq 1 is filed in the inner store but its counter write blocks; a
+    /// resend read must not see it until the write is confirmed.
+    struct SetterGated {
+        inner: Arc<MemoryStore>,
+        /// Signalled once the frame is filed and the setter is about to run.
+        filed: Mutex<mpsc::Sender<()>>,
+        /// One token per setter call; `Err` from the token fails it.
+        setter: Mutex<mpsc::Receiver<Result<(), StoreError>>>,
+    }
+
+    impl SyncMessageStore for SetterGated {
+        fn store(&self, seq: u64, msg_type: &MsgType, message: &[u8]) -> Result<(), StoreError> {
+            self.inner.store(seq, msg_type, message)
+        }
+        fn get_range(&self, begin: u64, end: u64) -> Result<Vec<StoredMessage>, StoreError> {
+            self.inner.get_range(begin, end)
+        }
+        fn next_sender_seq(&self) -> u64 {
+            self.inner.next_sender_seq()
+        }
+        fn next_target_seq(&self) -> u64 {
+            self.inner.next_target_seq()
+        }
+        fn set_next_sender_seq(&self, seq: u64) -> Result<(), StoreError> {
+            let _ = self.filed.lock().send(());
+            match self.setter.lock().recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(())) => self.inner.set_next_sender_seq(seq),
+                Ok(Err(err)) => Err(err),
+                Err(_) => Err(StoreError::Io("setter gate timed out".to_owned())),
+            }
+        }
+        fn set_next_target_seq(&self, seq: u64) -> Result<(), StoreError> {
+            self.inner.set_next_target_seq(seq)
+        }
+        fn reset(&self) -> Result<(), StoreError> {
+            self.inner.reset()
+        }
+        fn creation_time(&self) -> SystemTime {
+            self.inner.creation_time()
+        }
+    }
+
+    /// A store holding seqs 1..=2 as history, whose next setter is gated.
+    /// The wrapper, the inner store, the filed signal and the setter gate.
+    type SetterFixture = (
+        PendingStore<SetterGated>,
+        Arc<MemoryStore>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<Result<(), StoreError>>,
+    );
+
+    fn setter_gated() -> SetterFixture {
+        let inner = Arc::new(MemoryStore::new());
+        for seq in 1..=2 {
+            assert!(inner.store(seq, &MsgType::Heartbeat, b"history").is_ok());
+        }
+        assert!(inner.set_next_sender_seq(3).is_ok());
+        let (filed_tx, filed) = mpsc::channel();
+        let (setter, setter_rx) = mpsc::channel();
+        let store = SetterGated {
+            inner: Arc::clone(&inner),
+            filed: Mutex::new(filed_tx),
+            setter: Mutex::new(setter_rx),
+        };
+        match PendingStore::new(store, bound(4)) {
+            Ok(p) => (p, inner, filed, setter),
+            Err(err) => panic!("new: {err:?}"),
+        }
+    }
+
+    fn seqs(result: Result<Vec<StoredMessage>, StoreError>) -> Vec<u64> {
+        match result {
+            Ok(messages) => messages.iter().map(StoredMessage::seq_num).collect(),
+            Err(err) => panic!("range: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn test_pending_store_resend_read_excludes_a_write_in_flight() {
+        let (mut p, inner, filed, setter) = setter_gated();
+        assert!(p.submit(3, &MsgType::Heartbeat, b"new").is_ok());
+        // The frame is in the inner store; its counter write is held.
+        assert!(filed.recv_timeout(Duration::from_secs(5)).is_ok());
+        assert!(inner.contains(3));
+        assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2]);
+        assert_eq!(seqs(p.get_page(1, 0, 10)), vec![1, 2]);
+        assert_eq!(
+            p.get_range(3, 3),
+            Err(StoreError::RangeNotAvailable { begin: 3, end: 3 })
+        );
+        assert_eq!(p.next_sender_seq(), 3);
+        assert!(setter.send(Ok(())).is_ok());
+        assert_eq!(p.drain(), Ok(Some(3)));
+        assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2, 3]);
+        assert_eq!(p.next_sender_seq(), 4);
+    }
+
+    #[test]
+    fn test_pending_store_resend_read_excludes_a_write_whose_setter_failed() {
+        let (mut p, inner, filed, setter) = setter_gated();
+        assert!(p.submit(3, &MsgType::Heartbeat, b"new").is_ok());
+        assert!(filed.recv_timeout(Duration::from_secs(5)).is_ok());
+        assert!(setter.send(Err(StoreError::Io("disk".to_owned()))).is_ok());
+        assert!(p.drain().is_err());
+        // Filed in the inner store, never confirmed: never read back.
+        assert!(inner.contains(3));
+        assert_eq!(seqs(p.get_range(1, 0)), vec![1, 2]);
+        assert!(p.get_page(3, 0, 10).is_ok_and(|page| page.is_empty()));
+        assert_eq!(p.next_sender_seq(), 3);
+    }
+
+    #[test]
+    fn test_pending_store_reads_pre_existing_history_and_pass_through_target() {
+        let (p, _inner, _filed, _setter) = setter_gated();
+        assert_eq!(seqs(p.get_range(2, 2)), vec![2]);
+        assert_eq!(
+            p.get_range(0, 2),
+            Err(StoreError::InvalidRange { begin: 0, end: 2 })
+        );
+        assert!(p.set_next_target_seq(7).is_ok());
+        assert_eq!(p.next_target_seq(), 7);
+        assert_eq!(p.next_sender_seq(), 3);
     }
 
     #[test]
     fn test_pending_store_oversized_bound_is_an_error_not_a_panic() {
-        let store = Arc::new(MemoryStore::new());
         assert!(matches!(
-            PendingStore::new(store, NonZeroUsize::MAX),
+            PendingStore::new(MemoryStore::new(), NonZeroUsize::MAX),
             Err(StoreError::Io(_))
         ));
     }
@@ -919,15 +1142,16 @@ mod tests {
 
     #[test]
     fn test_pending_store_drop_finishes_queued_writes() {
-        let store = Arc::new(GatedStore {
-            inner: MemoryStore::new(),
+        let inner = Arc::new(MemoryStore::new());
+        let store = GatedStore {
+            inner: Arc::clone(&inner),
             gate: None,
             fail_at: None,
             fail_with: injected(0),
             failing: None,
             panic_at: None,
-        });
-        let mut p = match PendingStore::new(Arc::clone(&store), bound(8)) {
+        };
+        let mut p = match PendingStore::new(store, bound(8)) {
             Ok(p) => p,
             Err(err) => panic!("new: {err:?}"),
         };
@@ -943,7 +1167,7 @@ mod tests {
             }
         }
         drop(p);
-        assert_eq!(store.inner.message_count(), 8);
-        assert_eq!(store.next_sender_seq(), 9);
+        assert_eq!(inner.message_count(), 8);
+        assert_eq!(inner.next_sender_seq(), 9);
     }
 }
